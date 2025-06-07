@@ -1,25 +1,23 @@
-// ========================================================================================
-//                           THE HARDWARE CONTRACT
-// ========================================================================================
-// This file is not a list of suggestions; it is a non-negotiable contract with the
-// underlying hardware. The existence of this engine is predicated on the availability of
-// modern, high-performance CPU features.
-//
-// 1.  **Dependency Selection:** Dependencies are chosen for performance and correctness,
-//     not convenience. `rayon` is mandated for its work-stealing, data-parallel model.
-//     `memmap2` is mandated for zero-copy, kernel-managed file I/O. `clap` is
-//     mandated for a robust, self-documenting CLI interface.
-//
-// 2.  **Enforced Architecture:** The build process itself will be configured via
-//     `RUSTFLAGS="-C target-cpu=native".
-//     This is a critical design choice. We are not building a universally portable
-//     application; we are building a specialized performance engine. This command
-//     instructs the compiler to generate code that uses the most advanced
-//     instruction sets available on the build machine.
-//
-// 3.  **No Fallbacks:** The `kernel.rs` module will use `#[target_feature]` attributes.
-//     If the target CPU does not support these features, the program will fail to
-//     compile. This is a feature, not a bug. It eliminates the immense complexity
-//     and performance penalty of maintaining scalar fallback paths, so that every
-//     line of the computational core is deterministic and maximally performant.
-//     This file asserts that we trade universal compatibility for absolute speed.
+# ========================================================================================
+#
+#                         THE CONSTITUTION OF PROJECT GNOMON
+#
+# ========================================================================================
+
+[package]
+name = "gnomon"
+version = "0.1.0"
+edition = "2024"
+description = "A high-performance engine for polygenic score calculation."
+repository = "https://github.com/SauersML/gnomon/"
+keywords = ["bioinformatics", "genomics"]
+categories = ["science"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
