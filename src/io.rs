@@ -5,5 +5,5 @@
 // engine and the messy, physical reality of the filesystem. It is an airtight
 // abstraction boundary.
 //
-// 3.  **Hiding the Complexity:** The rest of the application does not know what a
+//      The rest of the application does not know what a
 //     "magic number" is, how genotypes are packed, or what a byte offset means.
