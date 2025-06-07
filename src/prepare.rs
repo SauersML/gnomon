@@ -147,3 +147,11 @@
 //    `required_snp_indices`, and `reconciliation_instructions`.
 // 5. Assemble the `PreparationResult` struct with all the final, prepared data.
 // 6. Return `Ok(PreparationResult)`. Any error from the helpers is propagated up.
+
+// TODO: CRITICAL BUG! The indexing formula `score_j * num_reconciled_snps + snp_i`
+// described produces a SCORE-MAJOR memory layout. This is incorrect.
+// The high-performance SIMD kernel (`kernel.rs`) is architected specifically for
+// a SNP-MAJOR layout to enable linear memory reads. The correct formula, which enables
+// the kernel to function as designed, MUST be `(snp_i * num_scores) + score_j`.
+// Leaving this as-is will cause the kernel to read incorrect weights and produce
+// completely invalid results.
