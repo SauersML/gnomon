@@ -1,3 +1,33 @@
+// ========================================================================================
+//
+//               THE HARDENED I/O AND VALIDATION ENGINE
+//
+// ========================================================================================
+//
+// ### 1. Mission and Philosophy ###
+//
+// This module is the "airlock" between the raw, untrusted data on disk and our
+// validated, type-safe pipeline. It is the first and last line of defense against
+// data corruption. Its purpose is not merely to read bytes, but to be the **sole
+// authority on the validity of raw genotype data**.
+//
+// ### 2. Architectural Mandates ###
+//
+//   - **Zero-Trust Validation:** The `MmapBedReader` operates on a zero-trust
+//     principle. It assumes input files may be corrupt. It meticulously validates
+//     every 2-bit genotype code against the PLINK1 specification. Any deviation
+//     is treated as an unrecoverable error, causing an immediate panic.
+//
+//   - **Immutable Contract Enforcement:** This module is the loyal implementation of
+//     the `BedReader` trait defined in `batch.rs`. It respects the sealed,
+//     type-safe `EffectAlleleDosage` newtype, using its fallible constructor as
+//     a validation checkpoint. This ensures that only provably valid dosage
+//     values can ever enter the pipeline.
+//
+//   - **Clarity over Terse-ness:** The decoding logic favors explicit,
+//     self-documenting `match` statements over opaque lookup tables. The flow of
+//     control must be undeniable at a glance.
+
 use crate::batch::{BedReader, EffectAlleleDosage};
 use crate::prepare::Reconciliation;
 use memmap2::Mmap;
@@ -69,8 +99,6 @@ impl MmapBedReader {
 
         // Validate the 3-byte header.
         let mut header = [0u8; 3];
-        // Create a temporary, limited reader just for the header.
-        // This avoids consuming from the file handle that `Mmap` needs.
         let mut header_reader = bed_file.try_clone()?;
         header_reader.read_exact(&mut header)?;
         if header[0] != 0x6c || header[1] != 0x1b || header[2] != 0x01 {
@@ -96,7 +124,6 @@ impl MmapBedReader {
         // This is the only unsafe block, justified by the prior validation of the file handle and size.
         let mmap = unsafe { Mmap::map(&bed_file)? };
 
-        // --- Instantiate and return the reader ---
         Ok(MmapBedReader {
             mmap,
             required_snp_indices,
@@ -115,7 +142,14 @@ impl MmapBedReader {
 impl BedReader for MmapBedReader {
     /// Fulfills the `BedReader` contract. For the next required SNP, it decodes the
     /// raw data, applies the correct reconciliation logic, and generates sparse
-    /// events containing the final, scientifically-correct dosage.
+    /// events containing the final, scientifically-correct dosage. This function
+    /// acts as a validation gatekeeper.
+    ///
+    /// # Panics
+    /// This function **will panic** if it encounters a genotype code in the `.bed`
+    /// file that does not conform to the PLINK1 specification (i.e., a raw dosage
+    /// value greater than 2). This indicates unrecoverable data corruption in the
+    /// input file, and immediate termination is the only correct action.
     fn next_snp_events(
         &mut self,
         events_buffer: &mut Vec<(usize, EffectAlleleDosage)>,
@@ -130,54 +164,52 @@ impl BedReader for MmapBedReader {
             "Logic error: mismatched number of people between I/O and batch layers."
         );
 
-        // --- Step 1: Check if we have processed all required SNPs ---
         if self.cursor >= self.required_snp_indices.len() {
             return Ok(false); // Signal EOF to the producer.
         }
 
-        // --- Step 2: Get the next task (index and instruction) and its data slice ---
         let bed_file_snp_index = self.required_snp_indices[self.cursor];
         let instruction = self.reconciliation_instructions[self.cursor];
 
         let offset = 3 + bed_file_snp_index * self.bytes_per_snp;
         let snp_data_slice = &self.mmap[offset..offset + self.bytes_per_snp];
 
-        // --- Step 3: Decode, Reconcile, and Generate Sparse Events ---
-        events_buffer.clear(); // Reuse the allocation.
-
-        const MISSING_SENTINEL: u8 = u8::MAX;
-        const DOSAGE_LOOKUP: [u8; 4] = [
-            0,                // 00 -> Homozygous for allele #1 (A1/A1)
-            MISSING_SENTINEL, // 01 -> Missing Genotype
-            1,                // 10 -> Heterozygous (A1/A2)
-            2,                // 11 -> Homozygous for allele #2 (A2/A2)
-        ];
+        events_buffer.clear();
 
         for i in 0..self.num_people {
             let byte_index = i / 4;
             let bit_offset = (i % 4) * 2;
             let packed_val = (snp_data_slice[byte_index] >> bit_offset) & 0b11;
-            let raw_dosage = DOSAGE_LOOKUP[packed_val as usize];
 
-            if raw_dosage == MISSING_SENTINEL {
-                continue;
-            }
+            // Directly and explicitly decode the 2-bit genotype code. This replaces
+            // the opaque lookup table with undeniable, self-documenting logic.
+            let raw_dosage = match packed_val {
+                0b00 => 0, // Homozygous for allele #1 (A1/A1)
+                0b10 => 1, // Heterozygous (A1/A2)
+                0b11 => 2, // Homozygous for allele #2 (A2/A2)
+                0b01 => continue, // Missing Genotype. Skip this person for this SNP.
+                _ => unreachable!(), // Masking with `& 0b11` makes other values impossible.
+            };
 
-            // Apply the reconciliation instruction to get the final effect allele dosage.
             let final_dosage = match instruction {
                 Reconciliation::Identity => raw_dosage,
                 Reconciliation::Flip => 2 - raw_dosage,
             };
 
-            // Only create events for non-zero dosages.
             if final_dosage > 0 {
                 let dest_idx = i * num_snps_in_chunk + snp_idx_in_chunk;
-                // Mint the type-safe newtype to guarantee correctness downstream.
-                events_buffer.push((dest_idx, EffectAlleleDosage(final_dosage)));
+
+                // Use the fallible constructor for EffectAlleleDosage as a validation gate.
+                // The PLINK spec guarantees a valid dosage is <= 2. If this is not the
+                // case, the file is corrupt, and we must panic immediately.
+                let valid_dosage = EffectAlleleDosage::new(final_dosage).expect(
+                    "Fatal Error: Corrupt .bed file detected. Found impossible dosage value (>2).",
+                );
+
+                events_buffer.push((dest_idx, valid_dosage));
             }
         }
 
-        // --- Step 4: Advance cursor and signal success ---
         self.cursor += 1;
         Ok(true)
     }
