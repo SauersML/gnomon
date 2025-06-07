@@ -109,7 +109,7 @@ pub fn prepare_for_computation(
     let (num_scores, flat_weights, mut score_map) = parse_scores_and_flatten(score_path)?;
 
     // --- PHASE 2: BUILD RECONCILIATION PLAN ---
-    // **FIX:** `tasks` is now declared as mutable directly.
+    // `tasks` is now declared as mutable directly.
     let (mut tasks, total_snps_in_bim) = build_reconciliation_plan(&bim_path, &mut score_map)?;
     let num_reconciled_snps = tasks.len();
     if num_reconciled_snps == 0 {
@@ -120,7 +120,7 @@ pub fn prepare_for_computation(
     let num_people = parse_fam_file(fam_path)?;
 
     // --- PHASE 3: THE CRITICAL SORT ---
-    // **FIX:** Sorts the mutable `tasks` vector in-place.
+    // Sorts the mutable `tasks` vector in-place.
     tasks.sort_unstable_by_key(|task| task.bed_row_index);
 
     // --- PHASE 4: THE FUSED FINALIZATION PASS ---
