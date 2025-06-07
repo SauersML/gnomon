@@ -50,37 +50,6 @@
 //   - **`unsafe` is possible.
 //
 // ----------------------------------------------------------------------------------------
-//
-// ### 4. The Interleaved-SIMD Kernel Mechanics ###
-//
-// The `accumulate_scores_for_person` function will implement the following steps:
-//
-//   - **STEP 1: PRE-SCAN & INDEXING:**
-//     - It performs a single, fast, linear scan over the input `genotype_row` slice.
-//     - It creates two small `Vec<usize>` lists, `idx_g1` and `idx_g2`, containing
-//       the local indices of SNPs with non-zero dosages. These lists reside in L1.
-//
-//   - **STEP 2: INITIALIZE SIMD ACCUMULATORS:**
-//     - The function initializes an array of `ceil(K / SIMD_LANES)` independent
-//       SIMD vector registers to zero. These registers will
-//       accumulate all scores simultaneously.
-//
-//   - **STEP 3: THE SINGLE, FUSED UPDATE LOOP:**
-//     - The function iterates through the small `idx_g1` list. For each `snp_idx`:
-//       - It performs a tight inner loop from `i = 0` to `ceil(K / SIMD_LANES) - 1`.
-//       - **Linear Load:** It performs a single, contiguous SIMD `LOAD` to fetch the
-//         `i`-th chunk of 16 weights from the interleaved weight matrix for `snp_idx`.
-//       - **FMA:** It performs a single SIMD `FMA` (Fused Multiply-Add) operation to
-//         add these weights directly to the `i`-th accumulator register.
-//     - The process is repeated for the `idx_g2` list, but the loaded weight vector
-//       is first multiplied by a SIMD vector of all `2.0`.
-//
-//   - **STEP 4: FINAL STORE:**
-//     - After the loops over the index lists are complete, the array of SIMD
-//       accumulator registers holds the final, complete score contributions.
-//     - A final, simple loop iterates through the accumulator registers and performs
-//       a SIMD `STORE` operation to write the results into the `scores_out` slice.
-//       This is a direct, high-bandwidth memory write.
 
 use std::simd::{f32x16, Simd};
 
