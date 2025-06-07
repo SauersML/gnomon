@@ -61,7 +61,7 @@
 //
 //    - **MASSIVE PARALLELISM:** The engine's logic is now beautifully simple. It
 //      iterates over the individuals in the pivoted genotype buffer and uses the `rayon`
-//      thread pool to process them in parallel.
+//      thread pool to process them (or rather, chunks of individuals) in parallel.
 //
 //    - For each person, the dispatched `rayon` task has all the data it needs:
 //      1.  The person's full genotype row from the pivoted buffer.
