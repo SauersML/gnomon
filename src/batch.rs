@@ -71,9 +71,9 @@
 pre-allocated, shared pivot buffers. It does not perform any memory allocation itself.
 //
 //     2. **READ AND PIVOT (CACHE-AWARE TRANSPOSE):** It loops through the SNPs in the current chunk.
-For each SNP, it uses the `BedReader` to fetch the genotypes for the target people. A naive implementation
-would write this column via a strided memory access pattern, which is catastrophic for cache performance.
-Instead, this engine employs a **cache-blocked transpose**. The provided buffer is conceptually divided
-into smaller 2D tiles (e.g., 128x128 elements). The pivot operation processes the data one tile at a time,
-so that the working set of both the source (from the `BedReader`) and destination (the tile) fits within the
-CPU's L1/L2 caches. This transforms the slow, DRAM-bound transpose into a series of hyper-fast, in-cache reorganization steps.
+// For each SNP, it uses the `BedReader` to fetch the genotypes for the target people. A naive implementation
+// would write this column via a strided memory access pattern, which is catastrophic for cache performance.
+// Instead, this engine employs a **cache-blocked transpose**. The provided buffer is conceptually divided
+// into smaller 2D tiles (e.g., 128x128 elements). The pivot operation processes the data one tile at a time,
+// so that the working set of both the source (from the `BedReader`) and destination (the tile) fits within the
+// CPU's L1/L2 caches. This transforms the slow, DRAM-bound transpose into a series of hyper-fast, in-cache reorganization steps.
