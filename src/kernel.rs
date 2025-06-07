@@ -103,72 +103,72 @@ impl<'a> InterleavedWeights<'a> {
 /// A "proof token" that all data required for a single person's score
 /// calculation is present, validated, and dimensionally consistent.
 pub struct KernelInput<'a> {
-    genotype_row: &'a [u8],
-    weights: InterleavedWeights<'a>,
-    scores_out: &'a mut [f32],
-    // A mutable slice of SIMD vectors provided by the caller to be used as
-    // temporary storage for the accumulators.
-    accumulator_buffer: &'a mut [SimdVec],
-    // Mutable references to reusable vectors for storing SNP indices.
-    // The caller is responsible for creating these once per thread and reusing them.
-    idx_g1_buffer: &'a mut Vec<usize>,
-    idx_g2_buffer: &'a mut Vec<usize>,
+    genotype_row: &'a [u8],
+    weights: InterleavedWeights<'a>,
+    scores_out: &'a mut [f32],
+    // A mutable slice of SIMD vectors provided by the caller to be used as
+    // temporary storage for the accumulators.
+    accumulator_buffer: &'a mut [SimdVec],
+    // Mutable references to reusable vectors for storing SNP indices.
+    // The caller is responsible for creating these once per thread and reusing them.
+    idx_g1_buffer: &'a mut Vec<usize>,
+    idx_g2_buffer: &'a mut Vec<usize>,
 }
 
 impl<'a> KernelInput<'a> {
-    /// The "smart constructor" and sole entry point for creating a `KernelInput`.
-    ///
-    /// This function acts as the gatekeeper. It performs all necessary validation
-    /// checks upfront, including verifying the size of the provided accumulator
-    /// buffer. If the data is consistent, an `Ok(KernelInput)` is returned.
-    /// Otherwise, an `Err(ValidationError)` specifies the failure.
-    #[inline]
-    #[must_use]
-    pub fn new(
-        genotype_row: &'a [u8],
-        interleaved_weights: &'a [f32],
-        scores_out: &'a mut [f32],
-        accumulator_buffer: &'a mut [SimdVec],
-        idx_g1_buffer: &'a mut Vec<usize>,
-        idx_g2_buffer: &'a mut Vec<usize>,
-        num_snps: usize,
-        num_scores: usize,
-    ) -> Result<Self, ValidationError> {
-        // The #[cold] attribute hints to the compiler that error branches are
-        // unlikely, allowing it to optimize the hot path (the `Ok` return).
-        #[cold]
-        fn fail(err: ValidationError) -> Result<KernelInput<'static>, ValidationError> {
-            Err(err)
-        }
+    /// The "smart constructor" and sole entry point for creating a `KernelInput`.
+    ///
+    /// This function acts as the gatekeeper. It performs all necessary validation
+    /// checks upfront, including verifying the size of the provided accumulator
+    /// buffer. If the data is consistent, an `Ok(KernelInput)` is returned.
+    /// Otherwise, an `Err(ValidationError)` specifies the failure.
+    #[inline]
+    #[must_use]
+    pub fn new(
+        genotype_row: &'a [u8],
+        interleaved_weights: &'a [f32],
+        scores_out: &'a mut [f32],
+        accumulator_buffer: &'a mut [SimdVec],
+        idx_g1_buffer: &'a mut Vec<usize>,
+        idx_g2_buffer: &'a mut Vec<usize>,
+        num_snps: usize,
+        num_scores: usize,
+    ) -> Result<Self, ValidationError> {
+        // The #[cold] attribute hints to the compiler that error branches are
+        // unlikely, allowing it to optimize the hot path (the `Ok` return).
+        #[cold]
+        fn fail(err: ValidationError) -> Result<KernelInput<'static>, ValidationError> {
+            Err(err)
+        }
 
-        if genotype_row.len() != num_snps {
-            return fail(ValidationError::MismatchedGenotypes);
-        }
-        if scores_out.len() != num_scores {
-            return fail(ValidationError::MismatchedScores);
-        }
-        if interleaved_weights.len() != num_snps * num_scores {
-            return fail(ValidationError::MismatchedWeights);
-        }
+        if genotype_row.len() != num_snps {
+            return fail(ValidationError::MismatchedGenotypes);
+        }
+        if scores_out.len() != num_scores {
+            return fail(ValidationError::MismatchedScores);
+        }
+        if interleaved_weights.len() != num_snps * num_scores {
+            return fail(ValidationError::MismatchedWeights);
+        }
 
-        let required_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
-        if accumulator_buffer.len() != required_lanes {
-            return fail(ValidationError::MismatchedAccumulator);
-        }
+        let required_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
+        if accumulator_buffer.len() != required_lanes {
+            return fail(ValidationError::MismatchedAccumulator);
+        }
 
-        Ok(Self {
-            genotype_row,
-            weights: InterleavedWeights {
-                slice: interleaved_weights,
-                num_snps,
-                num_scores,
-            },
-            scores_out,
-            accumulator_buffer,
-            idx_g1_buffer,
-            idx_g2_buffer,
-        })
-    }
+        Ok(Self {
+            genotype_row,
+            weights: InterleavedWeights {
+                slice: interleaved_weights,
+                num_snps,
+                num_scores,
+            },
+            scores_out,
+            accumulator_buffer,
+            idx_g1_buffer,
+            idx_g2_buffer,
+        })
+    }
 }
 
 // ========================================================================================
@@ -182,53 +182,53 @@ impl<'a> KernelInput<'a> {
 /// including the index vectors and the SIMD accumulators.
 #[inline]
 pub fn accumulate_scores_for_person(mut input: KernelInput) {
-    let num_scores = input.weights.num_scores;
-    let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
-    let dosage_2_multiplier = SimdVec::splat(2.0);
+    let num_scores = input.weights.num_scores;
+    let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
+    let dosage_2_multiplier = SimdVec::splat(2.0);
 
-    // --- STEP 1: Pre-scan & Indexing (using reusable buffers) ---
-    // Clear the buffers to reset their length to 0, but retain their capacity.
-    // This avoids heap allocation on every kernel invocation.
-    input.idx_g1_buffer.clear();
-    input.idx_g2_buffer.clear();
-    for (snp_idx, &dosage) in input.genotype_row.iter().enumerate() {
-        match dosage {
-            1 => input.idx_g1_buffer.push(snp_idx),
-            2 => input.idx_g2_buffer.push(snp_idx),
-            _ => (),
-        }
-    }
+    // --- STEP 1: Pre-scan & Indexing (using reusable buffers) ---
+    // Clear the buffers to reset their length to 0, but retain their capacity.
+    // This avoids heap allocation on every kernel invocation.
+    input.idx_g1_buffer.clear();
+    input.idx_g2_buffer.clear();
+    for (snp_idx, &dosage) in input.genotype_row.iter().enumerate() {
+        match dosage {
+            1 => input.idx_g1_buffer.push(snp_idx),
+            2 => input.idx_g2_buffer.push(snp_idx),
+            _ => (),
+        }
+    }
 
-    // --- STEP 2: RESET the Reusable Accumulator Buffer ---
-    // This is the key performance improvement. Instead of allocating, we just
-    // zero-out the buffer provided by the caller. This is a fast, predictable
-    // operation on a buffer that should be hot in the CPU cache.
-    for acc in input.accumulator_buffer.iter_mut() {
-        *acc = SimdVec::splat(0.0);
-    }
+    // --- STEP 2: RESET the Reusable Accumulator Buffer ---
+    // This is the key performance improvement. Instead of allocating, we just
+    // zero-out the buffer provided by the caller. This is a fast, predictable
+    // operation on a buffer that should be hot in the CPU cache.
+    for acc in input.accumulator_buffer.iter_mut() {
+        *acc = SimdVec::splat(0.0);
+    }
 
-    // --- STEP 3: THE FUSED UPDATE LOOP ---
-    // The logic here is simple, but its safety is profound. Every `snp_idx` is
-    // guaranteed to be in-bounds. The `accumulators` buffer is also guaranteed
-    // to have the correct size.
-    for &snp_idx in &*input.idx_g1_buffer {
-        for i in 0..num_accumulator_lanes {
-            let weights_vec = unsafe { input.weights.get_simd_lane_unchecked(snp_idx, i) };
-            input.accumulator_buffer[i] += weights_vec;
-        }
-    }
+    // --- STEP 3: THE FUSED UPDATE LOOP ---
+    // The logic here is simple, but its safety is profound. Every `snp_idx` is
+    // guaranteed to be in-bounds. The `accumulators` buffer is also guaranteed
+    // to have the correct size.
+    for &snp_idx in &*input.idx_g1_buffer {
+        for i in 0..num_accumulator_lanes {
+            let weights_vec = unsafe { input.weights.get_simd_lane_unchecked(snp_idx, i) };
+            input.accumulator_buffer[i] += weights_vec;
+        }
+    }
 
-    for &snp_idx in &*input.idx_g2_buffer {
-        for i in 0..num_accumulator_lanes {
-            let weights_vec = unsafe { input.weights.get_simd_lane_unchecked(snp_idx, i) };
-            input.accumulator_buffer[i] = weights_vec.mul_add(dosage_2_multiplier, input.accumulator_buffer[i]);
-        }
-    }
+    for &snp_idx in &*input.idx_g2_buffer {
+        for i in 0..num_accumulator_lanes {
+            let weights_vec = unsafe { input.weights.get_simd_lane_unchecked(snp_idx, i) };
+            input.accumulator_buffer[i] = weights_vec.mul_add(dosage_2_multiplier, input.accumulator_buffer[i]);
+        }
+    }
 
-    // --- STEP 4: Final Store ---
-    for (i, &acc_vec) in input.accumulator_buffer.iter().enumerate() {
-        let start = i * LANE_COUNT;
-        let end = (start + LANE_COUNT).min(num_scores);
-        acc_vec.write_to_slice(&mut input.scores_out[start..end]);
-    }
+    // --- STEP 4: Final Store ---
+    for (i, &acc_vec) in input.accumulator_buffer.iter().enumerate() {
+        let start = i * LANE_COUNT;
+        let end = (start + LANE_COUNT).min(num_scores);
+        acc_vec.write_to_slice(&mut input.scores_out[start..end]);
+    }
 }
