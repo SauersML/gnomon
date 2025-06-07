@@ -365,3 +365,9 @@ fn pivot_from_sparse_events<R: BedReader>(
     // Completed the full chunk.
     Ok(num_snps_to_read)
 }
+
+
+// TODO: MAJOR PERFORMANCE FLAW! This `ThreadLocal` is re-allocated for every single
+// chunk processed by the consumer. It needs to be initialized only ONCE for the
+// lifetime of the application. The best fix is to hoist this into `main.rs`, create it
+// before the consumer loop, and pass it down by reference, making the dependency explicit.
