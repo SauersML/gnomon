@@ -1,6 +1,9 @@
 // ========================================================================================
+//
 //                         THE STRATEGIC ORCHESTRATOR
+//
 // ========================================================================================
+//
 // This module is the central nervous system and strategic planner of the application.
 // Its primary responsibility is to perform all "thinking" and "planning" upfront,
 // creating an immutable "world view" so that the subsequent parallel computation can
@@ -10,8 +13,7 @@
 //     orchestrate the creation of the `PgsContext`. It calls into `io.rs` to ingest
 //     ALL metadata—every score file, every SNP in the model, every person in the
 //     cohort—and synthesizes it into a single, comprehensive, read-only data
-//     structure. This includes the master transposed weight matrix, the SNP and
-//     person hashmaps, and the pre-calculated BED file offsets.
+//     structure. This includes the creation of the master interleaved weight matrix.
 //
 // 2.  **Immutable Universe:** Once the `PgsContext` is built, it is treated as an
 //     immutable constant for the remainder of the program's lifetime. It is passed
