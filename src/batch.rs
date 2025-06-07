@@ -6,7 +6,7 @@
 //
 // ### 1. High-Level Purpose ###
 //
-// This module implements the Block-Pivoting Matrix-Chunk (BPMC) Engine for the
+// This module implements the Block-Pivoting Matrix-Chunk Engine for the
 // N > 1 "biobank-scale" use case. Its sole responsibility is to orchestrate a
 // massively parallel computation by acting as the master choreographer of data
 // movement between disk, main memory (DRAM), and the CPU caches.
@@ -53,7 +53,8 @@
 //
 //   - **STEP 1: PREPARATION:**
 //     - Resolves `target_people` to a sorted `Vec<usize>` of their original .fam indices.
-//     - Allocates the final `p_final` results matrix (`N_target x K`).
+//     - Allocates the final `p_final` results matrix (`N_target x K`), which will be
+//       updated in place by the parallel compute stage.
 //
 //   - **STEP 2: THE OUTER SNP CHUNKING LOOP:**
 //     - This function iterates serially over the master SNP list in large chunks
@@ -63,7 +64,8 @@
 //
 //   - **STEP 3: DISPATCHING TO HELPERS:**
 //     - Inside the loop, it calls `pivot_genotype_chunk` to perform the pivot.
-//     - It then passes the resulting person-major data block to `compute_on_chunk`.
+//     - It then passes the resulting person-major data block to `compute_on_chunk`,
+//       along with a mutable slice of `p_final` for accumulation.
 //
 // #### 3.2. `pivot_genotype_chunk` - The "Great Pivot" Helper ####
 //
@@ -74,10 +76,17 @@
 //        `g_chunk_person_major` buffer (`N_target x SNP_CHUNK_SIZE`). It is critical
 //        that this is a single, flat, contiguous `Vec<u8>`.
 //
-//     2. **READ AND PIVOT:** It loops through the SNPs in the current chunk. For each
-//        SNP, it uses the `BedReader` to fetch the genotypes for the target people
-//        and writes this column of data into the correct column of the person-major
-//        buffer. This is the **transpose** operation.
+//     2. **READ AND PIVOT (CACHE-AWARE TRANSPOSE):** It loops through the SNPs in the
+//        current chunk. For each SNP, it uses the `BedReader` to fetch the genotypes
+//        for the target people. A naive implementation would write this column via
+//        a strided memory access pattern, which is catastrophic for cache performance.
+//        Instead, this engine employs a **cache-blocked transpose**. The
+//        `g_chunk_person_major` buffer is conceptually divided into smaller 2D tiles
+//        (e.g., 128x128 elements). The pivot operation processes the data one tile
+//        at a time, ensuring that the working set of both the source (from the
+//        `BedReader`) and destination (the tile) fits within the CPU's L1/L2 caches.
+//        This transforms the slow, DRAM-bound transpose into a series of hyper-fast,
+//        in-cache reorganization steps.
 //
 //   - **JUSTIFICATION OF DENSE PIVOT (Rebuttal to Sparse Pivot):**
 //     A sparse pivot (`Vec<Vec<(u16, u8)>>`) is architecturally inferior. It replaces
@@ -93,12 +102,14 @@
 //   - This is the parallel computation engine.
 //
 //   - **PROCESS (THE PARALLELISM MODEL):**
-//     - It uses `rayon::par_iter_mut()` to parallelize over the rows of `p_final`. Each
-//       thread is assigned a unique, non-overlapping slice of people.
-//     - Each thread receives its slice of the `p_final` accumulator and calculates
-//       the pointer to its corresponding contiguous row(s) in the `g_chunk_person_major`
-//       buffer.
+//     - It uses `rayon::par_iter_mut()` to parallelize over the rows of the `p_final`
+//       accumulator slice. `rayon` automatically chunks the work, assigning each
+//       thread a unique, non-overlapping slice of people.
+//     - Each thread receives its mutable slice of the accumulator and calculates
+//       the pointer to its corresponding contiguous row(s) in the read-only
+//       `g_chunk_person_major` buffer.
 //     - **THE KERNEL CALL:** It makes a single call to the hyper-optimized
 //       `kernel::accumulate_scores_for_person` function, passing it the data it needs.
 //       Because each thread has its own input and output slices, there is ZERO
-//       inter-thread communication, achieving perfect scalability.
+//       inter-thread communication or shared-resource contention, achieving perfect
+//       scalability for the compute stage.
