@@ -13,7 +13,7 @@
 //
 // ----------------------------------------------------------------------------------------
 //
-// ### 2. The Architectural Philosophy: The Asymmetrical Pipeline ###
+// ### 2. The Architectural Philosophy: The Pipeline ###
 //
 // The engine is designed as an asymmetrical, producer-consumer pipeline where each
 // stage has a specialized, non-competing role. This resolves the conflicting data
