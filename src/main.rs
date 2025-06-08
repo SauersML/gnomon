@@ -86,7 +86,6 @@ fn main() {
 
     // --- Phase 1: Argument Parsing and Path Resolution ---
     let args = Args::parse();
-
     let plink_prefix = match resolve_plink_prefix(&args.input_path) {
         Ok(prefix) => prefix,
         Err(e) => {
@@ -111,7 +110,6 @@ fn main() {
         "> Preparing data using score file: {}",
         args.score.display()
     );
-    // NOTE: This now passes paths directly, avoiding fragile string conversions.
     let prep_result = match prepare::prepare_for_computation(&plink_prefix, &args.score) {
         Ok(res) => res,
         Err(e) => {
@@ -119,26 +117,29 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // Derive counts from the length of the metadata vectors. This is the single
+    // source of truth for the dimensions of the problem.
+    let num_people = prep_result.person__ids.len();
+    let num_scores = prep_result.score_names.len();
+
     eprintln!(
         "> Preparation complete. Found {} individuals and {} overlapping SNPs.",
-        prep_result.num_people, prep_result.num_reconciled_snps
+        num_people, prep_result.num_reconciled_snps
     );
 
     // --- Phase 3: Resource Allocation ---
-    let mut all_scores =
-        vec![0.0f32; prep_result.num_people * prep_result.num_scores];
+    let mut all_scores = vec![0.0f32; num_people * num_scores];
     let kernel_data_pool = KernelDataPool::new();
-    let pivot_buffer_capacity = prep_result.num_people * PIPELINE_CHUNK_SIZE_SNPS;
+    let pivot_buffer_capacity = num_people * PIPELINE_CHUNK_SIZE_SNPS;
     let pipeline_buffers: Vec<_> = (0..PIPELINE_BUFFER_COUNT)
         .map(|_| PipelineBuffer::new(pivot_buffer_capacity))
         .collect();
 
     // --- Phase 4: Pipeline Construction and Execution ---
     eprintln!("> Starting pipeline with {} buffers...", PIPELINE_BUFFER_COUNT);
-    let (free_buffers_tx, free_buffers_rx) =
-        mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
-    let (filled_buffers_tx, filled_buffers_rx) =
-        mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
+    let (free_buffers_tx, free_buffers_rx) = mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
+    let (filled_buffers_tx, filled_buffers_rx) = mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
 
     thread::scope(|s| {
         // --- 4a: Spawn the Producer Thread ---
@@ -146,19 +147,19 @@ fn main() {
         let producer_handle = s.spawn(move || {
             let bed_reader = MmapBedReader::new(
                 &bed_path,
-                prep_result.num_people,
+                num_people,
                 prep_result.total_snps_in_bim,
                 prep_result.required_snp_indices,
                 prep_result.reconciliation_instructions,
             )
-            .expect("Failed to create .bed file reader"); // Panic is acceptable here per review.
+            .expect("Failed to create .bed file reader");
 
             batch::producer_task(
                 bed_reader,
                 free_buffers_rx,
                 filled_buffers_tx,
                 PIPELINE_CHUNK_SIZE_SNPS,
-                prep_result.num_people,
+                num_people,
             );
         });
 
@@ -170,27 +171,27 @@ fn main() {
         let mut snps_processed = 0;
         while let Ok(filled_buffer) = filled_buffers_rx.recv() {
             let snps_in_chunk = filled_buffer.snps_in_chunk();
-            let pivoted_data = filled_buffer.as_pivoted_data(prep_result.num_people);
+            if snps_in_chunk == 0 { break; } // Producer signals EOF with an empty buffer.
 
-            // This slicing logic is INTENTIONALLY here. The orchestrator owns the
-            // loop state (`snps_processed`) and prepares a self-contained work
-            // package for the stateless consumer function.
-            let weights_chunk = &prep_result.interleaved_weights
-                [snps_processed * prep_result.num_scores..];
+            let pivoted_data = filled_buffer.as_pivoted_data(num_people);
+            let weights_chunk = &prep_result.interleaved_weights[snps_processed * num_scores..];
 
             batch::process_pivoted_chunk(
                 pivoted_data,
                 weights_chunk,
                 &mut all_scores,
-                prep_result.num_people,
+                num_people,
                 snps_in_chunk,
-                prep_result.num_scores,
+                num_scores,
                 0, // No person-chunking implemented yet.
                 &kernel_data_pool,
             );
 
             snps_processed += snps_in_chunk;
-            eprintln!("> Processed chunk: {}/{} SNPs", snps_processed, prep_result.num_reconciled_snps);
+            eprintln!(
+                "> Processed chunk: {}/{} SNPs",
+                snps_processed, prep_result.num_reconciled_snps
+            );
 
             let empty_buffer = filled_buffer.release_for_reuse();
             if free_buffers_tx.send(empty_buffer).is_err() {
@@ -206,13 +207,11 @@ fn main() {
     eprintln!("> Pipeline finished.");
 
     // --- Phase 5: Finalization and Output ---
-    // The output filename is derived from the score file's name. This logic correctly
-    // handles non-UTF8 paths by operating on OsString.
     let out_filename = match args.score.file_name() {
         Some(name) => {
-            let mut os_string = OsString::from(name);
-            os_string.push(".sscore");
-            os_string
+            let mut s = OsString::from(name);
+            s.push(".sscore");
+            s
         }
         None => {
             eprintln!(
@@ -223,10 +222,13 @@ fn main() {
         }
     };
     let out_path = output_dir.join(&out_filename);
-    eprintln!("> Writing {} scores per person to {}", prep_result.num_scores, out_path.display());
+    eprintln!(
+        "> Writing {} scores per person to {}",
+        num_scores,
+        out_path.display()
+    );
 
-    if let Err(e) = write_scores_to_file(&out_path, &all_scores, prep_result.num_scores)
-    {
+    if let Err(e) = write_scores_to_file(&out_path, &prep_result.person_ids, &prep_result.score_names, &all_scores) {
         eprintln!("Error writing output file: {}", e);
         process::exit(1);
     }
@@ -274,36 +276,51 @@ fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Writes the final calculated scores to a tab-separated file.
+/// Writes the final calculated scores to a self-describing, tab-separated file.
 ///
-/// This function minimizes I/O overhead. It formats an entire line into a reusable
-/// in-memory buffer before writing it to the `BufWriter` in a single operation.
+/// The output format includes a header line with the Individual ID (IID) and all
+/// score names. This makes the file human-readable and easily machine-parsable.
+/// This function is optimized to minimize I/O overhead by formatting each line
+/// into a reusable buffer before performing a single write call per line.
 fn write_scores_to_file(
     path: &Path,
+    person_ids: &[String],
+    score_names: &[String],
     scores: &[f32],
-    num_scores: usize,
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
+    let num_scores = score_names.len();
 
-    // Fix later
-    let mut line_buffer = String::with_capacity(num_scores * 12);
+    // --- Write Header ---
+    write!(writer, "#IID")?;
+    for name in score_names {
+        write!(writer, "\t{}", name)?;
+    }
+    writeln!(writer)?;
 
-    for person_scores in scores.chunks_exact(num_scores) {
+    // --- Write Data Rows ---
+    // A reusable buffer avoids repeated memory allocations in this hot loop.
+    let mut line_buffer = String::new();
+    let mut score_chunks = scores.chunks_exact(num_scores);
+
+    // Iterate through the person IDs, pulling the corresponding chunk of scores.
+    for iid in person_ids {
+        let person_scores = score_chunks.next().ok_or_else(|| {
+            // This error indicates a catastrophic logic bug upstream.
+            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write.")
+        })?;
+
         line_buffer.clear();
+        // The `unwrap` is safe because writing to a `String` via `fmt::Write` cannot fail.
+        write!(&mut line_buffer, "{}", iid).unwrap();
 
-        // This pattern efficiently joins numbers into a string without a trailing
-        // separator. `write!` on a String is fast and infallible.
-        if let Some((last_score, head_scores)) = person_scores.split_last() {
-            for score in head_scores {
-                // The `unwrap` is safe because writing to a `String` cannot fail.
-                write!(&mut line_buffer, "{}\t", score).unwrap();
-            }
-            write!(&mut line_buffer, "{}", last_score).unwrap();
+        for score in person_scores {
+            write!(&mut line_buffer, "\t{}", score).unwrap();
         }
 
-        // Write the fully-formed line to the buffer in a single operation.
         writeln!(writer, "{}", line_buffer)?;
     }
+
     Ok(())
 }
