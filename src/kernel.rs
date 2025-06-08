@@ -51,11 +51,11 @@
 //
 // ----------------------------------------------------------------------------------------
 
-use std::simd::{f32x16, Simd};
+use std::simd::{f32x8, Simd};
 
 // --- Type Aliases for Readability ---
 // Public so the caller can correctly size the accumulator buffer.
-pub type SimdVec = f32x16;
+pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LANE_COUNT;
 
 // ========================================================================================
