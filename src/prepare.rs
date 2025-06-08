@@ -97,30 +97,39 @@ pub struct PreparationResult {
 /// The single entry point for the preparation phase. It orchestrates file parsing,
 /// scientific reconciliation, sorting, and data structuring.
 pub fn prepare_for_computation(
-    plink_prefix: &str,
-    score_path: &str,
+    plink_prefix: &Path,
+    score_path: &Path,
 ) -> Result<PreparationResult, PrepError> {
-    // Formulate paths
-    let fam_path = Path::new(&format!("{}.fam", plink_prefix));
-    let bim_path = Path::new(&format!("{}.bim", plink_prefix));
-    let score_path = Path::new(score_path);
+    // Formulate paths using type-safe, allocation-free methods.
+    let fam_path = plink_prefix.with_extension("fam");
+    let bim_path = plink_prefix.with_extension("bim");
 
     // --- PHASE 1: PARSE AND FLATTEN ---
-    let (num_scores, flat_weights, mut score_map) = parse_scores_and_flatten(score_path)?;
+    let (num_scores, flat_weights, mut score_map, score_file_skipped_snps) =
+        parse_scores_and_flatten(score_path)?;
 
     // --- PHASE 2: BUILD RECONCILIATION PLAN ---
-    // `tasks` is now declared as mutable directly.
-    let (mut tasks, total_snps_in_bim) = build_reconciliation_plan(&bim_path, &mut score_map)?;
+    let (mut tasks, total_snps_in_bim, bim_file_skipped_snps) =
+        build_reconciliation_plan(&bim_path, &mut score_map)?;
+
+    // Report summary of skipped SNPs to the user. This is a non-negotiable contract.
+    let total_skipped = score_file_skipped_snps + bim_file_skipped_snps;
+    if total_skipped > 0 {
+        eprintln!(
+            "\nInfo: A total of {} SNPs were skipped due to data inconsistencies. See warnings above for details.",
+            total_skipped
+        );
+    }
+
     let num_reconciled_snps = tasks.len();
     if num_reconciled_snps == 0 {
         return Err(PrepError::Parse(
             "No overlapping SNPs found between the score file and the genotype data.".to_string(),
         ));
     }
-    let num_people = parse_fam_file(fam_path)?;
+    let num_people = parse_fam_file(&fam_path)?;
 
     // --- PHASE 3: THE CRITICAL SORT ---
-    // Sorts the mutable `tasks` vector in-place.
     tasks.sort_unstable_by_key(|task| task.bed_row_index);
 
     // --- PHASE 4: THE FUSED FINALIZATION PASS ---
@@ -142,20 +151,24 @@ pub fn prepare_for_computation(
 //                           PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
 
+/// A temporary data structure holding the plan for a single SNP.
 struct ReconciliationTask {
     bed_row_index: usize,
     instruction: Reconciliation,
     weights_start_index: usize,
 }
 
+/// Counts the number of individuals by counting lines in the .fam file.
 fn parse_fam_file(fam_path: &Path) -> Result<usize, PrepError> {
     let file = File::open(fam_path)?;
     Ok(BufReader::new(file).lines().count())
 }
 
+/// Parses the score file, creating a flattened weight vector and a lookup map.
+/// Returns the number of skipped SNPs for transparent reporting.
 fn parse_scores_and_flatten(
     score_path: &Path,
-) -> Result<(usize, Vec<f32>, AHashMap<String, (usize, u8)>), PrepError> {
+) -> Result<(usize, Vec<f32>, AHashMap<String, (usize, u8)>, usize), PrepError> {
     let file = File::open(score_path)?;
     let mut reader = BufReader::new(file);
     let mut header = String::new();
@@ -169,6 +182,7 @@ fn parse_scores_and_flatten(
 
     let mut flat_weights = Vec::new();
     let mut score_map = AHashMap::new();
+    let mut skipped_snp_count = 0;
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -181,20 +195,24 @@ fn parse_scores_and_flatten(
             Some(a) => a,
             None => continue,
         };
+
         if effect_allele_str.len() != 1 {
+            eprintln!(
+                "Warning: Skipping SNP '{}' in score file due to invalid allele format (must be a single character).",
+                snp_id
+            );
+            skipped_snp_count += 1;
             continue;
         }
         let effect_allele_u8 = effect_allele_str.as_bytes()[0];
         let weights_start_index = flat_weights.len();
 
-        // Manually iterate and push directly to the single flat_weights vector.
         let mut weights_count = 0;
         for part in &mut parts {
             weights_count += 1;
             flat_weights.push(part.parse()?);
         }
 
-        // Validate that the correct number of weights were found for this SNP.
         if weights_count != num_scores {
             return Err(PrepError::InconsistentScores(format!(
                 "SNP '{}' has {} weights, but header implies {}.",
@@ -202,20 +220,26 @@ fn parse_scores_and_flatten(
             )));
         }
 
-        score_map.insert(snp_id.to_string(), (weights_start_index, effect_allele_u8));
+        score_map.insert(
+            snp_id.to_string(),
+            (weights_start_index, effect_allele_u8),
+        );
     }
-    Ok((num_scores, flat_weights, score_map))
+    Ok((num_scores, flat_weights, score_map, skipped_snp_count))
 }
 
+/// Reads the .bim file, compares against the score map, and builds a list of tasks.
+/// Returns the number of skipped SNPs for transparent reporting.
 fn build_reconciliation_plan(
     bim_path: &Path,
     score_map: &mut AHashMap<String, (usize, u8)>,
-) -> Result<(Vec<ReconciliationTask>, usize), PrepError> {
+) -> Result<(Vec<ReconciliationTask>, usize, usize), PrepError> {
     let file = File::open(bim_path)?;
     let reader = BufReader::new(file);
 
     let mut tasks = Vec::new();
     let mut total_bim_snps = 0;
+    let mut skipped_snp_count = 0;
 
     for (line_number, line_result) in reader.lines().enumerate() {
         total_bim_snps += 1;
@@ -230,8 +254,9 @@ fn build_reconciliation_plan(
         let allele2_str = parts.next();
 
         if let (Some(id), Some(a1_str), Some(a2_str)) = (snp_id, allele1_str, allele2_str) {
-            // **FIX:** Perform cheap check before expensive hash map lookup.
+            // All alleles must be a single character to be valid. This is the hot path.
             if a1_str.len() == 1 && a2_str.len() == 1 {
+                // The hash map lookup is only performed if the SNP is potentially valid.
                 if let Some((weights_start_index, effect_allele_u8)) = score_map.remove(id) {
                     let bim_a1 = a1_str.as_bytes()[0];
                     let bim_a2 = a2_str.as_bytes()[0];
@@ -241,7 +266,11 @@ fn build_reconciliation_plan(
                     } else if effect_allele_u8 == bim_a1 {
                         Reconciliation::Flip
                     } else {
-                        eprintln!("Warning: Skipping SNP '{}' due to allele mismatch (effect: {}, bim: {}/{})", id, effect_allele_u8 as char, bim_a1 as char, bim_a2 as char);
+                        eprintln!(
+                            "Warning: Skipping SNP '{}' due to allele mismatch (effect: '{}', bim: '{}/{}').",
+                            id, effect_allele_u8 as char, bim_a1 as char, bim_a2 as char
+                        );
+                        skipped_snp_count += 1;
                         continue;
                     };
 
@@ -251,14 +280,27 @@ fn build_reconciliation_plan(
                         weights_start_index,
                     });
                 }
+            } else {
+                // This is the cold path for corrupt data. The cost of reporting the error
+                // is only paid when the input is wrong.
+                eprintln!(
+                    "Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}'). Alleles must be a single character.",
+                    id, a1_str, a2_str
+                );
+                skipped_snp_count += 1;
             }
         } else {
-            return Err(PrepError::Parse(format!("Malformed line #{} in .bim file: {}", line_number + 1, line)));
+            return Err(PrepError::Parse(format!(
+                "Malformed line #{} in .bim file: {}",
+                line_number + 1,
+                line
+            )));
         }
     }
-    Ok((tasks, total_bim_snps))
+    Ok((tasks, total_bim_snps, skipped_snp_count))
 }
 
+/// Finalizes the data structures from the sorted plan. This is the "gather-scatter" pass.
 fn finalize_from_sorted_plan(
     tasks: Vec<ReconciliationTask>,
     flat_weights: &[f32],
@@ -274,18 +316,26 @@ fn finalize_from_sorted_plan(
         required_snp_indices.push(task.bed_row_index);
         reconciliation_instructions.push(task.instruction);
 
-        let source_slice = &flat_weights[task.weights_start_index..task.weights_start_index + num_scores];
+        let source_slice =
+            &flat_weights[task.weights_start_index..task.weights_start_index + num_scores];
 
-        for (score_j, &weight) in source_slice.iter().enumerate() {
-            let dest_idx = (snp_i * num_scores) + score_j;
-            interleaved_weights[dest_idx] = weight;
-        }
+        // This is the scatter operation. We calculate the destination slice
+        // and perform a single, optimized memory copy. This is guaranteed
+        // to be faster than a manual, element-by-element loop.
+        let dest_start = snp_i * num_scores;
+        let dest_end = dest_start + num_scores;
+        let dest_slice = &mut interleaved_weights[dest_start..dest_end];
+        dest_slice.copy_from_slice(source_slice);
     }
-    (interleaved_weights, required_snp_indices, reconciliation_instructions)
+    (
+        interleaved_weights,
+        required_snp_indices,
+        reconciliation_instructions,
+    )
 }
 
 // ========================================================================================
-//                                 ERROR HANDLING (unchanged)
+//                                 ERROR HANDLING
 // ========================================================================================
 
 impl fmt::Display for PrepError {
