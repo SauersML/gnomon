@@ -1,29 +1,35 @@
 // ========================================================================================
 //
-//               THE PRE-COMPUTATION, RECONCILIATION & PREPARATION ENGINE
+//          THE CONFIGURATION, VALIDATION, AND PREPARATION ENGINE
 //
 // ========================================================================================
 //
 // ### 1. Mission and Philosophy ###
 //
-// This module is the **sole authority on pre-computation**. Its mission is to be the
-// application's "setup phase," transforming raw, un-validated user inputs (file
-// paths) into a single, cohesive, and scientifically correct set of data structures
-// ready for the high-performance pipeline.
+// This module serves as the application's immutable configuration and validation
+// layer. Its mission is to transform raw, untrusted user inputs into a single,
+// cohesive, and scientifically correct "computation blueprint."
 //
-// It serves as a strict "airlock" between the messy reality of file formats and
-// the clean, logical world of the concurrent processing engine. It is responsible
-// for not only structuring data for performance but also for preserving the
-// metadata (individual and score IDs) required for the output.
+// This blueprint, the `PreparationResult` struct, is a proof token guaranteeing that
+// all data has been loaded, validated, reconciled against scientific parameters,
+// and structured for the extreme performance requirements of the Staged
+// Block-Pivoting Engine.
 //
-// The core design principle is to produce a single, immutable "proof token"—the
-// `PreparationResult` struct. The successful creation of this struct is a
-// run-time guarantee that all data has been loaded, validated,
-// scientifically reconciled, and structured for maximum performance.
+// This module is the sole authority on:
+// 1.  **Person Subsetting:** It determines exactly which individuals will be scored.
+// 2.  **SNP Reconciliation:** It determines which SNPs are valid for calculation and
+//     how their alleles must be oriented.
+// 3.  **Data Structuring:** It produces the high-performance interleaved weight
+//     matrix that the compute kernel depends on.
+//
+// By performing these duties upfront, it allows the main engine to operate with
+// zero ambiguity and a minimum of defensive checking, focusing exclusively on
+// execution speed.
 
-use ahash::AHashMap;
+use crate::types::{PersonSubset, PreparationResult};
+use ahash::{AHashMap, AHashSet};
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
@@ -42,54 +48,70 @@ pub enum Reconciliation {
     Flip,
 }
 
-/// A comprehensive error type for the preparation phase.
+/// A comprehensive, production-grade error type for the preparation phase.
 #[derive(Debug)]
 pub enum PrepError {
-    Io(io::Error),
+    /// An error occurred during file I/O.
+    Io(io::Error, PathBuf),
+    /// An error occurred parsing a text file (e.g., malformed lines).
     Parse(String),
+    /// The header of a file was invalid or missing required columns.
     Header(String),
+    /// The number of scores for a SNP did not match the header.
     InconsistentScores(String),
+    /// An error occurred parsing a floating-point number.
     ParseFloat(ParseFloatError),
-}
-
-/// The final, validated, and pipeline-ready data produced by this module.
-/// This struct is a "proof token" that all data and metadata required for
-/// the computation and final output are present and consistent.
-#[derive(Debug)]
-pub struct PreparationResult {
-    /// The weight matrix, interleaved into a SNP-major layout for the compute kernel.
-    pub interleaved_weights: Vec<f32>,
-    /// The sorted list of physical row indices in the .bed file for `io.rs` to read.
-    pub required_snp_indices: Vec<usize>,
-    /// The parallel list of `Identity`/`Flip` instructions for `io.rs`.
-    pub reconciliation_instructions: Vec<Reconciliation>,
-    /// The total number of SNPs in the original .bim file, for validation.
-    pub total_snps_in_bim: usize,
-    /// The number of SNPs that were successfully reconciled between files.
-    pub num_reconciled_snps: usize,
-    /// A vector of Individual IDs (IID), preserving person identity.
-    pub person_ids: Vec<String>,
-    /// The names of the scores, extracted from the score file header.
-    pub score_names: Vec<String>,
+    /// An individual ID in the keep file was not found in the .fam file.
+    InconsistentKeepId(String),
 }
 
 /// The single entry point for the preparation phase. It orchestrates file parsing,
-/// scientific reconciliation, sorting, and data structuring.
+/// individual subsetting, scientific reconciliation, sorting, and data structuring.
 pub fn prepare_for_computation(
     plink_prefix: &Path,
     score_path: &Path,
+    keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
-    // Formulate paths using type-safe, allocation-free methods.
+    // --- Phase 1: Establish the universe of all individuals ---
     let fam_path = plink_prefix.with_extension("fam");
-    let bim_path = plink_prefix.with_extension("bim");
+    let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
+    let total_people_in_fam = all_person_iids.len();
 
-    // --- PHASE 1: PARSE METADATA AND FLATTEN WEIGHTS ---
-    // The order of parsing is intentional: parse metadata first to establish context.
-    let person_ids = parse_fam_file(&fam_path)?;
+    // --- Phase 2: Resolve the target individual subset ---
+    let (person_subset, final_person_iids) = if let Some(path) = keep_file {
+        eprintln!("> Subsetting individuals based on keep file: {}", path.display());
+        let iids_to_keep = read_iids_to_set(path)?;
+
+        let mut final_iids = Vec::with_capacity(iids_to_keep.len());
+        let mut subset_indices = Vec::with_capacity(iids_to_keep.len());
+
+        // Iterate over the canonical FAM file order to maintain a stable output order.
+        for (original_idx, iid) in all_person_iids.iter().enumerate() {
+            if iids_to_keep.contains(iid) {
+                final_iids.push(iid.clone());
+                subset_indices.push(original_idx as u32);
+            }
+        }
+
+        // CRITICAL VALIDATION: Ensure every person in the keep file was found.
+        if final_iids.len() != iids_to_keep.len() {
+            return Err(PrepError::InconsistentKeepId(
+                "One or more individuals in the keep file were not found in the .fam file. Please check for typos."
+                    .to_string(),
+            ));
+        }
+
+        (PersonSubset::Indices(subset_indices), final_iids)
+    } else {
+        // If no keep file, we process everyone.
+        (PersonSubset::All, all_person_iids)
+    };
+    let num_people_to_score = final_person_iids.len();
+
+    // --- Phase 3: Parse score file and reconcile with genotype data ---
+    let bim_path = plink_prefix.with_extension("bim");
     let (score_names, flat_weights, mut score_map, score_file_skipped_snps) =
         parse_scores_and_flatten(score_path)?;
-
-    // --- PHASE 2: BUILD RECONCILIATION PLAN ---
     let (mut tasks, total_snps_in_bim, bim_file_skipped_snps) =
         build_reconciliation_plan(&bim_path, &mut score_map)?;
 
@@ -109,26 +131,30 @@ pub fn prepare_for_computation(
         ));
     }
 
-    // --- PHASE 3: THE CRITICAL SORT ---
+    // --- Phase 4: Sort by .bed file order for sequential access ---
     tasks.sort_unstable_by_key(|task| task.bed_row_index);
 
-    // --- PHASE 4: THE FUSED FINALIZATION PASS ---
+    // --- Phase 5: Finalize data structures for the engine ---
     let (interleaved_weights, required_snp_indices, reconciliation_instructions) =
         finalize_from_sorted_plan(tasks, &flat_weights, score_names.len());
 
+    // --- Phase 6: Construct and return the validated "proof token" ---
     Ok(PreparationResult {
         interleaved_weights,
         required_snp_indices,
         reconciliation_instructions,
-        total_snps_in_bim,
-        num_reconciled_snps,
-        person__ids: person_ids,
+        person_subset,
         score_names,
+        final_person_iids,
+        total_people_in_fam,
+        num_people_to_score,
+        num_reconciled_snps,
+        total_snps_in_bim,
     })
 }
 
 // ========================================================================================
-//                           PRIVATE IMPLEMENTATION HELPERS
+//                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
 
 /// A temporary data structure holding the plan for a single SNP.
@@ -138,52 +164,67 @@ struct ReconciliationTask {
     weights_start_index: usize,
 }
 
-/// Parses the .fam file to extract the Individual ID (IID) for each person.
-fn parse_fam_file(fam_path: &Path) -> Result<Vec<String>, PrepError> {
-    let file = File::open(fam_path)?;
-    BufReader::new(file)
-        .lines()
-        .map(|line_result| {
-            let line = line_result?;
-            let mut parts = line.split_whitespace();
-            // Skip the first field (FID).
-            let _fid = parts
-                .next()
-                .ok_or_else(|| PrepError::Parse("Missing FID in .fam file".to_string()))?;
-            // The second field is the IID, which we need.
-            let iid = parts
-                .next()
-                .ok_or_else(|| PrepError::Parse("Missing IID in .fam file".to_string()))?;
-            Ok(iid.to_string())
-        })
-        .collect()
+/// Parses a .fam file to produce both an ordered list of all individual IDs and
+/// a fast lookup map from IID to its original 0-based index.
+fn parse_fam_and_build_lookup(
+    fam_path: &Path,
+) -> Result<(Vec<String>, AHashMap<String, u32>), PrepError> {
+    let file = File::open(fam_path).map_err(|e| PrepError::Io(e, fam_path.to_path_buf()))?;
+    let reader = BufReader::new(file);
+    let mut person_iids = Vec::new();
+    let mut iid_to_idx = AHashMap::new();
+
+    for (i, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|e| PrepError::Io(e, fam_path.to_path_buf()))?;
+        let mut parts = line.split_whitespace();
+        let _fid = parts.next(); // FID is not used.
+        let iid = parts
+            .next()
+            .ok_or_else(|| PrepError::Parse(format!("Missing IID in .fam file on line {}", i + 1)))?
+            .to_string();
+
+        person_iids.push(iid.clone());
+        iid_to_idx.insert(iid, i as u32);
+    }
+    Ok((person_iids, iid_to_idx))
+}
+
+/// Efficiently reads a file of line-separated IDs into a HashSet for fast lookups.
+fn read_iids_to_set(path: &Path) -> Result<AHashSet<String>, PrepError> {
+    let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
+    let reader = BufReader::new(file);
+    let mut set = AHashSet::new();
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
+        if !line.trim().is_empty() {
+            set.insert(line);
+        }
+    }
+    Ok(set)
 }
 
 /// Parses the score file, extracting score names and creating a flattened weight vector.
 fn parse_scores_and_flatten(
     score_path: &Path,
 ) -> Result<(Vec<String>, Vec<f32>, AHashMap<String, (usize, u8)>, usize), PrepError> {
-    let file = File::open(score_path)?;
+    let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
-    reader.read_line(&mut header_line)?;
+    reader
+        .read_line(&mut header_line)
+        .map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
 
     let mut header_parts = header_line.split_whitespace();
-    // The first two columns ('snp_id', 'effect_allele') are metadata, not scores.
-    // We confirm their presence but do not store them as score names.
-    if header_parts.next().is_none() || header_parts.next().is_none() {
+    if header_parts.next() != Some("snp_id") || header_parts.next() != Some("effect_allele") {
         return Err(PrepError::Header(
-            "Score file header must contain at least 'snp_id' and 'effect_allele' columns."
-                .to_string(),
+            "Score file header must begin with 'snp_id' and 'effect_allele' columns.".to_string(),
         ));
     }
 
-    // The rest of the header parts are the names of the scores.
     let score_names: Vec<String> = header_parts.map(|s| s.to_string()).collect();
     if score_names.is_empty() {
         return Err(PrepError::Header(
-            "No score columns found in score file header after 'snp_id' and 'effect_allele'."
-                .to_string(),
+            "No score columns found in score file header.".to_string(),
         ));
     }
     let num_scores = score_names.len();
@@ -193,7 +234,7 @@ fn parse_scores_and_flatten(
     let mut skipped_snp_count = 0;
 
     for line_result in reader.lines() {
-        let line = line_result?;
+        let line = line_result.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
         let mut parts = line.split_whitespace();
         let snp_id = match parts.next() {
             Some(id) => id,
@@ -238,16 +279,16 @@ fn build_reconciliation_plan(
     bim_path: &Path,
     score_map: &mut AHashMap<String, (usize, u8)>,
 ) -> Result<(Vec<ReconciliationTask>, usize, usize), PrepError> {
-    let file = File::open(bim_path)?;
+    let file = File::open(bim_path).map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
     let reader = BufReader::new(file);
 
-    let mut tasks = Vec::new();
+    let mut tasks = Vec::with_capacity(score_map.len());
     let mut total_bim_snps = 0;
     let mut skipped_snp_count = 0;
 
     for (line_number, line_result) in reader.lines().enumerate() {
         total_bim_snps += 1;
-        let line = line_result?;
+        let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
         let mut parts = line.split_whitespace();
 
         let _chromosome = parts.next();
@@ -258,7 +299,6 @@ fn build_reconciliation_plan(
         let allele2_str = parts.next();
 
         if let (Some(id), Some(a1_str), Some(a2_str)) = (snp_id, allele1_str, allele2_str) {
-            // All alleles must be a single character to be valid. This is the hot path.
             if a1_str.len() == 1 && a2_str.len() == 1 {
                 if let Some((weights_start_index, effect_allele_u8)) = score_map.remove(id) {
                     let bim_a1 = a1_str.as_bytes()[0];
@@ -281,7 +321,7 @@ fn build_reconciliation_plan(
                     });
                 }
             } else {
-                eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}'). Alleles must be a single character.", id, a1_str, a2_str);
+                eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}').", id, a1_str, a2_str);
                 skipped_snp_count += 1;
             }
         } else {
@@ -312,8 +352,7 @@ fn finalize_from_sorted_plan(
         let source_slice =
             &flat_weights[task.weights_start_index..task.weights_start_index + num_scores];
         let dest_start = snp_i * num_scores;
-        let dest_end = dest_start + num_scores;
-        let dest_slice = &mut interleaved_weights[dest_start..dest_end];
+        let dest_slice = &mut interleaved_weights[dest_start..dest_start + num_scores];
         dest_slice.copy_from_slice(source_slice);
     }
     (
@@ -324,17 +363,18 @@ fn finalize_from_sorted_plan(
 }
 
 // ========================================================================================
-//                                 ERROR HANDLING
+//                                    ERROR HANDLING
 // ========================================================================================
 
-impl fmt::Display for PrepError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Display for PrepError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            PrepError::Io(e) => write!(f, "I/O Error: {}", e),
+            PrepError::Io(e, path) => write!(f, "I/O Error for file '{}': {}", path.display(), e),
             PrepError::Parse(s) => write!(f, "Parse Error: {}", s),
             PrepError::Header(s) => write!(f, "Invalid Header: {}", s),
             PrepError::InconsistentScores(s) => write!(f, "Inconsistent Data: {}", s),
-            PrepError::ParseFloat(e) => write!(f, "Float Parse Error: {}", e),
+            PrepError::ParseFloat(e) => write!(f, "Numeric Parse Error: {}", e),
+            PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {}", s),
         }
     }
 }
@@ -342,19 +382,14 @@ impl fmt::Display for PrepError {
 impl Error for PrepError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            PrepError::Io(e) => Some(e),
+            PrepError::Io(e, _) => Some(e),
             PrepError::ParseFloat(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<io::Error> for PrepError {
-    fn from(err: io::Error) -> Self {
-        PrepError::Io(err)
-    }
-}
-
+// Allow `?` to automatically convert from underlying error types.
 impl From<ParseFloatError> for PrepError {
     fn from(err: ParseFloatError) -> Self {
         PrepError::ParseFloat(err)
