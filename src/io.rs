@@ -1,216 +1,128 @@
 // ========================================================================================
 //
-//               THE I/O AND VALIDATION ENGINE
+//                      HIGH-THROUGHPUT BLOCK READER
 //
 // ========================================================================================
-//
-// ### 1. Mission and Philosophy ###
-//
-// This module is the "airlock" between the raw, untrusted data on disk and our
-// validated, type-safe pipeline. It is the first and last line of defense against
-// data corruption. Its purpose is not merely to read bytes, but to be the **sole
-// authority on the validity of raw genotype data**.
-//
-// ### 2. Architectural Mandates ###
-//
-//   - **Zero-Trust Validation:** The `MmapBedReader` operates on a zero-trust
-//     principle. It assumes input files may be corrupt. It meticulously validates
-//     every 2-bit genotype code against the PLINK1 specification. Any deviation
-//     is treated as an unrecoverable error, causing an immediate panic.
-//
-//   - **Immutable Contract Enforcement:** This module is the loyal implementation of
-//     the `BedReader` trait defined in `batch.rs`. It respects the sealed,
-//     type-safe `EffectAlleleDosage` newtype, using its fallible constructor as
-//     a validation checkpoint. This ensures that only provably valid dosage
-//     values can ever enter the pipeline.
-//
-//   - **Clarity over Terse-ness:** The decoding logic favors explicit,
-//     self-documenting `match` statements over opaque lookup tables. The flow of
-//     control must be undeniable at a glance.
 
-use crate::batch::{BedReader, EffectAlleleDosage};
-use crate::prepare::Reconciliation;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::{self, Read, Result as IoResult};
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
 // ========================================================================================
-//                              PUBLIC STRUCT DEFINITION
+//                                  PUBLIC API
 // ========================================================================================
 
-pub struct MmapBedReader {
-    /// A memory map of the entire .bed file. This is a zero-cost "portal" to the
-    /// file on disk, not data loaded into RAM.
+/// A high-performance reader for moving raw, sequential chunks of data from a
+/// memory-mapped .bed file.
+pub struct SnpChunkReader {
+    /// A memory map of the entire .bed file. This provides a zero-cost "view" of
+    /// the file on disk, not data loaded into RAM.
     mmap: Mmap,
 
-    /// A sorted list of the ROW INDICES in the .bed file for the SNPs we actually need.
-    /// This list is provided, pre-sorted, by the `prepare` module.
-    required_snp_indices: Vec<usize>,
+    /// The current read position (in bytes) within the memory map. It is initialized
+    /// to 3 to skip the PLINK magic number.
+    cursor: u64,
 
-    /// A parallel vector containing the `Identity` or `Flip` instruction for each
-    /// corresponding SNP in `required_snp_indices`.
-    reconciliation_instructions: Vec<Reconciliation>,
-
-    /// Our current position in the `required_snp_indices` and `reconciliation_instructions` vectors.
-    cursor: usize,
-
-    /// The total number of individuals in the dataset, provided by the `prepare` module.
-    num_people: usize,
-
-    /// The number of bytes for one SNP's data, pre-calculated as `ceil(num_people / 4)`.
-    bytes_per_snp: usize,
+    /// The total size of the file in bytes, cached at creation time.
+    file_size: u64,
 }
 
-impl MmapBedReader {
-    /// The constructor for the I/O engine. It performs no file parsing itself besides
-    /// validating and mapping the `.bed` file. It relies on the caller to provide all
-    /// necessary, pre-computed metadata.
+impl SnpChunkReader {
+    /// Creates a new `SnpChunkReader` after performing critical validation.
+    ///
+    /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
+    /// file exists, is a valid PLINK .bed file, and has a size consistent with the
+    /// metadata from the `prepare` phase, using overflow-safe arithmetic.
     ///
     /// # Arguments
     /// * `bed_path`: The path to the `.bed` file.
-    /// * `num_people`: The total number of individuals in the study.
-    /// * `total_snps_in_bim`: The total number of SNPs in the corresponding `.bim` file, used for validation.
-    /// * `required_snp_indices`: A **sorted** `Vec` of the physical row indices to read.
-    /// * `reconciliation_instructions`: A parallel `Vec` with the `Flip`/`Identity` instruction for each index.
+    /// * `num_people`: The total number of individuals in the study, from `.fam` file.
+    /// * `num_snps`: The total number of SNPs in the study, from `.bim` file.
     ///
     /// # Errors
-    /// Returns an `IoResult` if the `.bed` file is missing, malformed, or if its size is inconsistent
-    /// with the provided metadata.
-    pub fn new(
-        bed_path: &Path,
-        num_people: usize,
-        total_snps_in_bim: usize,
-        required_snp_indices: Vec<usize>,
-        reconciliation_instructions: Vec<Reconciliation>,
-    ) -> IoResult<Self> {
-        // This assertion is a critical guard against logic errors in the calling module.
-        assert_eq!(
-            required_snp_indices.len(),
-            reconciliation_instructions.len(),
-            "Logic error: Mismatched lengths for SNP indices and reconciliation instructions."
-        );
-
-        let bytes_per_snp = (num_people + 3) / 4;
-
-        // --- BED File Validation & mmap ---
+    /// Returns an `io::Error` if the file is missing, malformed, or if its size is
+    /// inconsistent with the provided metadata, preventing the engine from ever
+    /// operating on corrupt or mismatched data.
+    pub fn new(bed_path: &Path, num_people: usize, num_snps: usize) -> io::Result<Self> {
         let bed_file = File::open(bed_path)?;
-        let bed_metadata = bed_file.metadata()?;
+        let metadata = bed_file.metadata()?;
+        let file_size = metadata.len();
 
-        // Validate the 3-byte header.
-        let mut header = [0u8; 3];
-        let mut header_reader = bed_file.try_clone()?;
-        header_reader.read_exact(&mut header)?;
-        if header[0] != 0x6c || header[1] != 0x1b || header[2] != 0x01 {
+        // The only unsafe block, justified because we will immediately validate the
+        // mapped memory before it can be used.
+        let mmap = unsafe { Mmap::map(&bed_file)? };
+
+        // --- Validation Step 1: Magic Number (from the mmap itself) ---
+        if mmap.get(0..3) != Some(&[0x6c, 0x1b, 0x01]) {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid .bed file magic number or mode. Must be SNP-major.",
+                ErrorKind::InvalidData,
+                "Invalid .bed file magic number. The file may be corrupt or not a valid PLINK .bed file in SNP-major mode.",
             ));
         }
 
-        // Validate file size against the provided metadata.
-        let expected_size = 3 + total_snps_in_bim as u64 * bytes_per_snp as u64;
-        if bed_metadata.len() != expected_size {
+        // --- Validation Step 2: File Size (with checked arithmetic) ---
+        let bytes_per_snp = (num_people as u64 + 3) / 4;
+        let total_snp_bytes = (num_snps as u64).checked_mul(bytes_per_snp)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
+            })?;
+
+        let expected_size = 3u64.checked_add(total_snp_bytes)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
+            })?;
+
+        if file_size != expected_size {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                ErrorKind::InvalidData,
                 format!(
-                    "BED file size mismatch. Expected {} bytes based on metadata, but found {} bytes.",
-                    expected_size,
-                    bed_metadata.len()
+                    "BED file size mismatch. Metadata implies {} bytes, but file is {} bytes.",
+                    expected_size, file_size
                 ),
             ));
         }
 
-        // This is the only unsafe block, justified by the prior validation of the file handle and size.
-        let mmap = unsafe { Mmap::map(&bed_file)? };
-
-        Ok(MmapBedReader {
+        Ok(SnpChunkReader {
             mmap,
-            required_snp_indices,
-            reconciliation_instructions,
-            cursor: 0,
-            num_people,
-            bytes_per_snp,
+            cursor: 3, // Start reading after the 3-byte magic number.
+            file_size,
         })
     }
-}
 
-// ========================================================================================
-//                             TRAIT IMPLEMENTATION
-// ========================================================================================
-
-impl BedReader for MmapBedReader {
-    /// Fulfills the `BedReader` contract. For the next required SNP, it decodes the
-    /// raw data, applies the correct reconciliation logic, and generates sparse
-    /// events containing the final, scientifically-correct dosage. This function
-    /// acts as a validation gatekeeper.
+    /// Reads the next chunk of raw SNP data into the provided buffer.
     ///
-    /// # Panics
-    /// This function **will panic** if it encounters a genotype code in the `.bed`
-    /// file that does not conform to the PLINK1 specification (i.e., a raw dosage
-    /// value greater than 2). This indicates unrecoverable data corruption in the
-    /// input file, and immediate termination is the only correct action.
-    fn next_snp_events(
-        &mut self,
-        events_buffer: &mut Vec<(usize, EffectAlleleDosage)>,
-        snp_idx_in_chunk: usize,
-        num_snps_in_chunk: usize,
-        num_people: usize,
-    ) -> IoResult<bool> {
-        // This assertion ensures the caller (`batch.rs`) and the reader (`io.rs`) agree
-        // on the number of individuals. A mismatch is a fatal logic error.
-        assert_eq!(
-            self.num_people, num_people,
-            "Logic error: mismatched number of people between I/O and batch layers."
-        );
-
-        if self.cursor >= self.required_snp_indices.len() {
-            return Ok(false); // Signal EOF to the producer.
+    /// This method is allocation-free. The caller owns and provides the buffer,
+    /// and this function simply fills it with bytes from the memory map.
+    ///
+    /// # Arguments
+    /// * `buf`: A mutable slice representing the destination buffer.
+    ///
+    /// # Returns
+    /// A `Result` containing the number of bytes read. A value of `Ok(0)`
+    /// indicates that the end of the file has been reached (EOF).
+    pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // If the cursor is at or past the end, we are done.
+        if self.cursor >= self.file_size {
+            return Ok(0);
         }
 
-        let bed_file_snp_index = self.required_snp_indices[self.cursor];
-        let instruction = self.reconciliation_instructions[self.cursor];
+        // Determine how many bytes to copy. It's the smaller of the buffer's
+        // capacity or the number of bytes remaining in the file.
+        let bytes_remaining = self.file_size - self.cursor;
+        let bytes_to_copy = (buf.len() as u64).min(bytes_remaining) as usize;
 
-        let offset = 3 + bed_file_snp_index * self.bytes_per_snp;
-        let snp_data_slice = &self.mmap[offset..offset + self.bytes_per_snp];
+        // Define the source and destination slices for the memory copy.
+        let src_end = self.cursor as usize + bytes_to_copy;
+        let src_slice = &self.mmap[self.cursor as usize..src_end];
+        let dest_slice = &mut buf[..bytes_to_copy];
 
-        events_buffer.clear();
+        // Perform the single, fast memory copy.
+        dest_slice.copy_from_slice(src_slice);
 
-        for i in 0..self.num_people {
-            let byte_index = i / 4;
-            let bit_offset = (i % 4) * 2;
-            let packed_val = (snp_data_slice[byte_index] >> bit_offset) & 0b11;
+        // Advance the cursor for the next read.
+        self.cursor += bytes_to_copy as u64;
 
-            // Directly and explicitly decode the 2-bit genotype code. This replaces
-            // the opaque lookup table with undeniable, self-documenting logic.
-            let raw_dosage = match packed_val {
-                0b00 => 0, // Homozygous for allele #1 (A1/A1)
-                0b10 => 1, // Heterozygous (A1/A2)
-                0b11 => 2, // Homozygous for allele #2 (A2/A2)
-                0b01 => continue, // Missing Genotype. Skip this person for this SNP.
-                _ => unreachable!(), // Masking with `& 0b11` makes other values impossible.
-            };
-
-            let final_dosage = match instruction {
-                Reconciliation::Identity => raw_dosage,
-                Reconciliation::Flip => 2 - raw_dosage,
-            };
-
-            if final_dosage > 0 {
-                let dest_idx = i * num_snps_in_chunk + snp_idx_in_chunk;
-
-                // Use the fallible constructor for EffectAlleleDosage as a validation gate.
-                // The PLINK spec guarantees a valid dosage is <= 2. If this is not the
-                // case, the file is corrupt, and we must panic immediately.
-                let valid_dosage = EffectAlleleDosage::new(final_dosage).expect(
-                    "Fatal Error: Corrupt .bed file detected. Found impossible dosage value (>2).",
-                );
-
-                events_buffer.push((dest_idx, valid_dosage));
-            }
-        }
-
-        self.cursor += 1;
-        Ok(true)
+        Ok(bytes_to_copy)
     }
 }
