@@ -31,6 +31,8 @@ use clap::Parser;
 use gnomon::batch::{self, KernelDataPool, PipelineBuffer};
 use gnomon::io::MmapBedReader;
 use gnomon::prepare;
+use std::ffi::OsString;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -204,9 +206,14 @@ fn main() {
     eprintln!("> Pipeline finished.");
 
     // --- Phase 5: Finalization and Output ---
-    let out_filename = match args.score.file_name().and_then(std::ffi::OsStr::to_str)
-    {
-        Some(name) => name.to_owned() + ".sscore",
+    // The output filename is derived from the score file's name. This logic correctly
+    // handles non-UTF8 paths by operating on OsString.
+    let out_filename = match args.score.file_name() {
+        Some(name) => {
+            let mut os_string = OsString::from(name);
+            os_string.push(".sscore");
+            os_string
+        }
         None => {
             eprintln!(
                 "Error: Could not determine a base name from score file path '{}'.",
@@ -215,7 +222,7 @@ fn main() {
             process::exit(1);
         }
     };
-    let out_path = output_dir.join(out_filename);
+    let out_path = output_dir.join(&out_filename);
     eprintln!("> Writing {} scores per person to {}", prep_result.num_scores, out_path.display());
 
     if let Err(e) = write_scores_to_file(&out_path, &all_scores, prep_result.num_scores)
@@ -268,6 +275,9 @@ fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Writes the final calculated scores to a tab-separated file.
+///
+/// This function minimizes I/O overhead. It formats an entire line into a reusable
+/// in-memory buffer before writing it to the `BufWriter` in a single operation.
 fn write_scores_to_file(
     path: &Path,
     scores: &[f32],
@@ -276,14 +286,24 @@ fn write_scores_to_file(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
+    // Fix later
+    let mut line_buffer = String::with_capacity(num_scores * 12);
+
     for person_scores in scores.chunks_exact(num_scores) {
-        for (i, score) in person_scores.iter().enumerate() {
-            write!(writer, "{}", score)?;
-            if i < num_scores - 1 {
-                write!(writer, "\t")?;
+        line_buffer.clear();
+
+        // This pattern efficiently joins numbers into a string without a trailing
+        // separator. `write!` on a String is fast and infallible.
+        if let Some((last_score, head_scores)) = person_scores.split_last() {
+            for score in head_scores {
+                // The `unwrap` is safe because writing to a `String` cannot fail.
+                write!(&mut line_buffer, "{}\t", score).unwrap();
             }
+            write!(&mut line_buffer, "{}", last_score).unwrap();
         }
-        writeln!(writer)?;
+
+        // Write the fully-formed line to the buffer in a single operation.
+        writeln!(writer, "{}", line_buffer)?;
     }
     Ok(())
 }
