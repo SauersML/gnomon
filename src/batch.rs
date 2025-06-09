@@ -206,7 +206,7 @@ fn process_tile(
             let dense_idx = DensePersonIndex(dense_person_idx_in_tile);
             let overall_person_idx = (block_idx.0 * PERSON_BLOCK_SIZE) + dense_idx.0;
             let score_start_idx = overall_person_idx * num_scores;
-            let scores_out_slice = &mut all_scores_out[score_start_idx..];
+            let scores_out_slice = &mut all_scores_out[score_start_idx..score_start_idx + num_scores];
 
             // Correctly adhere to the kernel's API contract.
             let kernel_input = kernel::KernelInput::new(
