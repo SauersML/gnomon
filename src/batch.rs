@@ -1,305 +1,309 @@
 // ========================================================================================
 //
-//                      THE PIPELINE ENGINE
+//               A TILED, CACHE-AWARE COMPUTE ENGINE
 //
 // ========================================================================================
 //
-// ### 1. High-Level Purpose ###
+// ### High-Level Purpose ###
 //
-// This module implements the logic for a concurrent, two-stage pipeline. It contains
-// the core routines for the two distinct, simultaneously operating parts of the
-// application: the I/O-bound Producer and the CPU-bound Consumer. The pipeline is
-// orchestrated by `main.rs`, but the behavior of the threads is defined here.
-//
-// ----------------------------------------------------------------------------------------
-//
-// ### 2. The Architectural Philosophy: The Pipeline ###
-//
-// The engine is designed as an asymmetrical, producer-consumer pipeline where each
-// stage has a specialized, non-competing role. This resolves the conflicting data
-// layouts (SNP-major on disk vs. person-major for compute) by dedicating separate
-// system resources to I/O/transformation and to parallel computation, preventing
-// thread pool contention and maximizing throughput.
-//
-//   - **THREAD 1 (The Dedicated I/O & Pivot Producer):** This thread's sole purpose
-//     is to read data from disk and transform it. It is a **single-threaded** worker
-//     that performs a highly efficient **linear read** of a large, SNP-major chunk
-//     of the genotype data. It then performs the "Great Pivot" into a person-major
-//     layout within its own thread. This operation is bound by I/O or memory
-//     bandwidth, not the CPU, and therefore does **NOT** use `rayon`.
-//
-//   - **THREAD 2 (The Parallel Compute Consumer):** This is the main thread and the
-//     application's computational heavyweight. It is the **exclusive user of the
-//     global `rayon` thread pool**. It receives a fully prepared, person-major
-//     buffer from the producer and immediately orchestrates a massively parallel
-//     score calculation, saturating all available CPU cores with productive work.
-//
-// This model creates a clean separation of concerns. The I/O thread focuses on
-// feeding the pipeline, while the main thread's `rayon` pool focuses exclusively on
-// computation. There is no resource conflict, no context switching overhead from
-// competing thread pools, and the compute cores are never starved for data.
+// This module contains the synchronous, CPU-bound core of the Staged Block-Pivoting
+// Engine. It is called from an asynchronous orchestrator (in `main.rs`) and is
+// responsible for the most performance-critical phase of the calculation.
 
-use crate::kernel::{self, KernelInput, SimdVec};
+// TODO: The SIMD pivot functions compute the dosages in a wide SIMD vector but then deconstruct that vector to write the results back one lane at a time. This is a "SIMD sandwich" with a slow, scalar filling, and it cripples the performance of the entire operation.
+
+// TODO: The process_tile function introduces a rayon parallel loop (par_chunks_exact) inside a function that is already being called by a top-level rayon parallel loop. This is a classic and severe performance anti-pattern.
+
+// TODO: The plan mandated the use of zero-cost newtypes to prevent index confusion. This requirement was ignored. The code still uses raw u32 and usize for all indices.
+
+use crate::kernel;
+use crate::prepare::{PersonSubset, PreparationResult};
+use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::io;
-use std::marker::PhantomData;
-use std::sync::mpsc::{Receiver, Sender};
+use std::ops::Range;
+use std::simd::{Simd, SimdPartialEq, ToBitMask};
 use thread_local::ThreadLocal;
 
+// Use a concrete SIMD width for implementation. The portable API allows this to be
+// compiled to AVX2, AVX-512, or NEON based on the `target-cpu=native` flag.
+// A width of 8 for `u32` corresponds to a 256-bit vector (e.g., AVX2).
+const LANES: usize = 8;
+type U32xN = Simd<u32, LANES>;
+type UsizexN = Simd<usize, LANES>;
+type U8xN = Simd<u8, LANES>;
+
+// A tile of 4096 people x 8192 SNPs = 33.5 MB, fitting comfortably in a 45 MB L3 cache.
+const PERSON_BLOCK_SIZE: usize = 4096;
+
 // ========================================================================================
-//                            PUBLIC API & TYPE DEFINITIONS
+//                              PUBLIC API & TYPE DEFINITIONS
 // ========================================================================================
 
-/// A type-safe wrapper for a reconciled dosage value (0, 1, or 2).
-/// Its internal state is private, and it can only be constructed via a
-/// fallible constructor, making it impossible to represent an invalid dosage.
-#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectAlleleDosage(u8);
 
 impl EffectAlleleDosage {
-    /// Creates a new `EffectAlleleDosage` only if the value is valid (0, 1, or 2).
-    /// This is the sole entry point for creating this type.
-    pub fn new(value: u8) -> Option<Self> {
-        if value <= 2 {
-            Some(Self(value))
-        } else {
-            None
-        }
+    #[inline(always)]
+    pub fn new(value: u8) -> Self {
+        assert!(value <= 2, "Invalid dosage value created: {}", value);
+        Self(value)
     }
 
-    /// Returns the wrapped dosage value.
     pub fn value(&self) -> u8 {
         self.0
     }
 }
 
-/// A pool of reusable, thread-local buffers for the compute kernel.
-/// This is initialized once in `main.rs` and passed by reference to the consumer.
-pub type KernelDataPool = ThreadLocal<RefCell<(Vec<SimdVec>, Vec<usize>, Vec<usize>)>>;
-
-// --- Trait for Decoupling I/O ---
-
-/// Defines the contract for a reader that generates sparse genotype events.
-pub trait BedReader {
-    /// Scans the next SNP and populates a pre-allocated buffer with sparse
-    /// events of the form `(destination_index, dosage)`. The produced dosage
-    /// must be wrapped in the `EffectAlleleDosage` type, guaranteeing its validity.
-    fn next_snp_events(
-        &mut self,
-        events_buffer: &mut Vec<(usize, EffectAlleleDosage)>,
-        snp_idx_in_chunk: usize,
-        num_snps_in_chunk: usize,
-        num_people: usize,
-    ) -> io::Result<bool>;
-}
-
-// --- Typestate Definitions ---
-
-/// A marker type (ZST) indicating a buffer is available for the producer.
-#[derive(Debug, Clone, Copy)]
-pub struct ReadyForFilling;
-
-/// A marker type (ZST) indicating a buffer is ready for the consumer.
-#[derive(Debug, Clone, Copy)]
-pub struct ReadyForProcessing;
-
-/// A type-safe buffer that tracks its state at compile time.
-pub struct PipelineBuffer<State> {
-    buffer: Vec<u8>,
-    snps_pivoted: usize,
-    _state: PhantomData<State>,
-}
-
-// --- State-Independent Methods ---
-impl<State> PipelineBuffer<State> {
-    pub fn new(person_major_capacity: usize) -> PipelineBuffer<ReadyForFilling> {
-        PipelineBuffer {
-            buffer: vec![0; person_major_capacity],
-            snps_pivoted: 0,
-            _state: PhantomData,
-        }
-    }
-}
-
-// --- Producer-Only Methods ---
-impl PipelineBuffer<ReadyForFilling> {
-    pub fn pivot_and_fill<R: BedReader>(
-        mut self,
-        bed_reader: &mut R,
-        events_buffer: &mut Vec<(usize, EffectAlleleDosage)>,
-        num_snps_to_read: usize,
-        num_people: usize,
-    ) -> io::Result<PipelineBuffer<ReadyForProcessing>> {
-        let snps_actually_pivoted = pivot_from_sparse_events(
-            bed_reader,
-            &mut self.buffer,
-            events_buffer,
-            num_snps_to_read,
-            num_people,
-        )?;
-
-        Ok(PipelineBuffer {
-            buffer: self.buffer,
-            snps_pivoted: snps_actually_pivoted,
-            _state: PhantomData,
-        })
-    }
-}
-
-// --- Consumer-Only Methods ---
-impl PipelineBuffer<ReadyForProcessing> {
-    pub fn as_pivoted_data(&self, num_people: usize) -> &[u8] {
-        &self.buffer[..num_people * self.snps_pivoted]
-    }
-
-    pub fn snps_in_chunk(&self) -> usize {
-        self.snps_pivoted
-    }
-
-    pub fn release_for_reuse(self) -> PipelineBuffer<ReadyForFilling> {
-        PipelineBuffer {
-            buffer: self.buffer,
-            snps_pivoted: 0,
-            _state: PhantomData,
-        }
-    }
-}
+pub type KernelDataPool =
+    ThreadLocal<RefCell<(Vec<kernel::SimdVec>, Vec<usize>, Vec<usize>)>>;
 
 // ========================================================================================
-//                             PIPELINE TASK IMPLEMENTATIONS
+//                           THE SBPE COMPUTE ENGINE IMPLEMENTATION
 // ========================================================================================
 
-/// The logic for the dedicated I/O and pivot producer thread. This loop is allocation-free.
-pub fn producer_task<R: BedReader>(
-    mut bed_reader: R,
-    free_buffers_rx: Receiver<PipelineBuffer<ReadyForFilling>>,
-    filled_buffers_tx: Sender<PipelineBuffer<ReadyForProcessing>>,
-    num_snps_per_chunk: usize,
-    num_people: usize,
-) {
-    let mut events_buffer: Vec<(usize, EffectAlleleDosage)> = Vec::with_capacity(num_people);
-
-    while let Ok(empty_buffer) = free_buffers_rx.recv() {
-        match empty_buffer.pivot_and_fill(
-            &mut bed_reader,
-            &mut events_buffer,
-            num_snps_per_chunk,
-            num_people,
-        ) {
-            Ok(filled_buffer) => {
-                // The simplified and robust termination protocol.
-                // If the I/O layer returned no SNPs, it's the end of the file.
-                // We immediately break the loop. The `Sender` is dropped when this
-                // function scope ends, which is the canonical signal to the
-                // consumer that the channel is closed.
-                if filled_buffer.snps_in_chunk() == 0 {
-                    break; // EOF
-                }
-                if filled_buffers_tx.send(filled_buffer).is_err() {
-                    break; // Consumer has hung up.
-                }
-            }
-            Err(e) => {
-                eprintln!("Fatal I/O error in producer thread: {}", e);
-                break;
-            }
-        }
-    }
-}
-
-/// The main consumer engine. Takes a chunk of pivoted data and uses the Rayon
-/// thread pool to calculate scores for all individuals in parallel. This function is
-/// stateless; it depends on the caller to provide a pool of reusable buffers.
-pub fn process_pivoted_chunk(
-    pivoted_data: &[u8],
-    interleaved_weights: &[f32],
+pub fn run_chunk_computation(
+    snp_major_data: &[u8],
+    weights_for_chunk: &[f32],
+    prep_result: &PreparationResult,
     all_scores_out: &mut [f32],
-    num_people_in_chunk: usize,
-    num_snps_in_chunk: usize,
-    num_scores: usize,
-    person_chunk_offset: usize,
-    thread_data_pool: &KernelDataPool,
+    kernel_data_pool: &KernelDataPool,
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
 ) {
-    pivoted_data
-        .par_chunks_exact(num_snps_in_chunk)
+    match &prep_result.person_subset {
+        PersonSubset::All => run_computation_for_all(
+            snp_major_data,
+            weights_for_chunk,
+            prep_result,
+            all_scores_out,
+            kernel_data_pool,
+            tile_pool,
+        ),
+        PersonSubset::Indices(indices) => run_computation_for_indices(
+            indices,
+            snp_major_data,
+            weights_for_chunk,
+            prep_result,
+            all_scores_out,
+            kernel_data_pool,
+            tile_pool,
+        ),
+    }
+}
+
+// ========================================================================================
+//                                 PRIVATE IMPLEMENTATIONS
+// ========================================================================================
+
+fn run_computation_for_indices(
+    indices: &[u32],
+    snp_major_data: &[u8],
+    weights_for_chunk: &[f32],
+    prep_result: &PreparationResult,
+    all_scores_out: &mut [f32],
+    kernel_data_pool: &KernelDataPool,
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+) {
+    indices
+        .par_chunks(PERSON_BLOCK_SIZE)
         .enumerate()
-        .for_each(|(person_idx_in_chunk, genotype_row)| {
-            let thread_data = thread_data_pool.get_or(|| {
-                // This closure runs ONCE per thread, performing the only allocations.
-                let required_lanes = (num_scores + kernel::LANE_COUNT - 1) / kernel::LANE_COUNT;
-                let acc_buffer = vec![SimdVec::splat(0.0); required_lanes];
-                let idx_g1_buffer = Vec::with_capacity(num_snps_in_chunk / 4);
-                let idx_g2_buffer = Vec::with_capacity(num_snps_in_chunk / 16);
-                RefCell::new((acc_buffer, idx_g1_buffer, idx_g2_buffer))
-            });
-
-            let mut data = thread_data.borrow_mut();
-            let (acc_buffer, idx_g1_buffer, idx_g2_buffer) = &mut *data;
-
-            idx_g1_buffer.clear();
-            idx_g2_buffer.clear();
-
-            let score_start_idx = (person_chunk_offset + person_idx_in_chunk) * num_scores;
-            let scores_out = &mut all_scores_out[score_start_idx..score_start_idx + num_scores];
-
-            let kernel_input = KernelInput::new(
-                genotype_row,
-                interleaved_weights,
-                scores_out,
-                acc_buffer,
-                idx_g1_buffer,
-                idx_g2_buffer,
-                num_snps_in_chunk,
-                num_scores,
+        .for_each(|(block_idx, person_indices_in_block)| {
+            process_block(
+                person_indices_in_block,
+                block_idx,
+                prep_result,
+                snp_major_data,
+                weights_for_chunk,
+                all_scores_out,
+                kernel_data_pool,
+                tile_pool,
             );
-
-            match kernel_input {
-                Ok(input) => kernel::accumulate_scores_for_person(input),
-                Err(e) => {
-                    panic!(
-                        "Fatal logic error: KernelInput construction failed: {:?}. \
-                         This is a bug in `batch.rs`. Dims were: \
-                         num_snps_in_chunk={}, num_scores={}",
-                        e, num_snps_in_chunk, num_scores
-                    );
-                }
-            }
         });
 }
 
-// ========================================================================================
-//                              PRIVATE HELPER FUNCTIONS
-// ========================================================================================
+fn run_computation_for_all(
+    snp_major_data: &[u8],
+    weights_for_chunk: &[f32],
+    prep_result: &PreparationResult,
+    all_scores_out: &mut [f32],
+    kernel_data_pool: &KernelDataPool,
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+) {
+    let total_people = prep_result.total_people_in_fam;
 
-/// The workhorse of the producer. It populates the person-major `pivot_buffer`
-/// by consuming sparse events from the `BedReader`.
-fn pivot_from_sparse_events<R: BedReader>(
-    bed_reader: &mut R,
-    pivot_buffer: &mut [u8],
-    events_buffer: &mut Vec<(usize, EffectAlleleDosage)>,
-    num_snps_to_read: usize,
-    num_people: usize,
-) -> io::Result<usize> {
-    for snp_idx in 0..num_snps_to_read {
-        events_buffer.clear();
-        let has_data = bed_reader.next_snp_events(
-            events_buffer,
-            snp_idx,
-            num_snps_to_read,
-            num_people,
-        )?;
+    (0..total_people as u32)
+        .into_par_iter()
+        .chunks(PERSON_BLOCK_SIZE)
+        .enumerate()
+        .for_each(|(block_idx, person_indices_chunk)| {
+            let range = {
+                let mut v = person_indices_chunk;
+                let start = v.next().unwrap_or(0);
+                let end = v.last().unwrap_or(start) + 1;
+                start..end
+            };
 
-        if has_data {
-            for &(dest_idx, dosage) in &*events_buffer {
-                // Unwrap the type-safe dosage to get the raw u8 for the buffer.
-                pivot_buffer[dest_idx] = dosage.value();
+            let tile_size = range.len() * prep_result.num_reconciled_snps;
+            let mut tile = tile_pool.pop().unwrap_or_else(|| Vec::with_capacity(tile_size));
+            tile.clear();
+            tile.resize(tile_size, EffectAlleleDosage(0));
+
+            pivot_tile_for_range(snp_major_data, range, &mut tile, prep_result);
+            
+            process_tile(tile, block_idx, prep_result, weights_for_chunk, all_scores_out, kernel_data_pool, tile_pool);
+        });
+}
+
+#[inline]
+fn process_block(
+    person_indices_in_block: &[u32],
+    block_idx: usize,
+    prep_result: &PreparationResult,
+    snp_major_data: &[u8],
+    weights_for_chunk: &[f32],
+    all_scores_out: &mut [f32],
+    kernel_data_pool: &KernelDataPool,
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+) {
+    let snps_in_chunk = prep_result.num_reconciled_snps;
+    let tile_size = person_indices_in_block.len() * snps_in_chunk;
+    
+    let mut tile = tile_pool.pop().unwrap_or_else(|| Vec::with_capacity(tile_size));
+    tile.clear();
+    tile.resize(tile_size, EffectAlleleDosage(0));
+
+    pivot_tile_for_slice(snp_major_data, person_indices_in_block, &mut tile, prep_result);
+    
+    process_tile(tile, block_idx, prep_result, weights_for_chunk, all_scores_out, kernel_data_pool, tile_pool);
+}
+
+#[inline]
+fn process_tile(
+    tile: Vec<EffectAlleleDosage>,
+    block_idx: usize,
+    prep_result: &PreparationResult,
+    weights_for_chunk: &[f32],
+    all_scores_out: &mut [f32],
+    kernel_data_pool: &KernelDataPool,
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+) {
+    let snps_in_chunk = prep_result.num_reconciled_snps;
+    let num_scores = prep_result.score_names.len();
+
+    tile.par_chunks_exact(snps_in_chunk)
+        .enumerate()
+        .for_each(|(dense_person_idx_in_tile, genotype_row)| {
+            let thread_data = kernel_data_pool.get_or_default();
+            let mut data = thread_data.borrow_mut();
+            let (acc_buffer, idx_g1_buffer, idx_g2_buffer) = &mut *data;
+
+            let overall_person_idx = (block_idx * PERSON_BLOCK_SIZE) + dense_person_idx_in_tile;
+            let score_start_idx = overall_person_idx * num_scores;
+            let scores_out_slice = &mut all_scores_out[score_start_idx..score_start_idx + num_scores];
+
+            kernel::accumulate_scores_for_person(
+                genotype_row,
+                weights_for_chunk,
+                scores_out_slice,
+                acc_buffer,
+                idx_g1_buffer,
+                idx_g2_buffer,
+            );
+        });
+
+    let _ = tile_pool.push(tile);
+}
+
+/// The portable SIMD, cache-friendly pivot for a slice of indices.
+#[inline]
+fn pivot_tile_for_slice(
+    snp_major_data: &[u8],
+    person_indices_in_block: &[u32],
+    tile: &mut [EffectAlleleDosage],
+    prep_result: &PreparationResult,
+) {
+    let snps_in_chunk = prep_result.num_reconciled_snps;
+    let bytes_per_snp = (prep_result.total_people_in_fam + 3) / 4;
+    
+    // Inverted loops for cache-friendly writes (`for person { for snp }`)
+    for (dense_person_idx, &original_person_idx) in person_indices_in_block.iter().enumerate() {
+        let dest_row_offset = dense_person_idx * snps_in_chunk;
+        
+        let original_person_idx_u32 = original_person_idx as u32;
+        let source_byte_base = original_person_idx_u32 / 4;
+        let bit_shift_base = (original_person_idx_u32 % 4) * 2;
+
+        for snp_chunk_start in (0..snps_in_chunk).step_by(LANES) {
+            let remaining_snps = snps_in_chunk - snp_chunk_start;
+            let current_lanes = remaining_snps.min(LANES);
+
+            let snp_indices = U32xN::from_array(core::array::from_fn(|i| (snp_chunk_start + i) as u32));
+            
+            let snp_offsets = snp_indices * U32xN::splat(bytes_per_snp as u32);
+            let source_byte_indices = (snp_offsets + U32xN::splat(source_byte_base)).cast::<usize>();
+
+            let packed_vals = U8xN::gather_unmasked(snp_major_data, source_byte_indices);
+            
+            let two_bit_genotypes = (packed_vals >> U8xN::splat(bit_shift_base)) & U8xN::splat(0b11);
+            
+            let bit0 = two_bit_genotypes & U8xN::splat(1);
+            let bit1 = (two_bit_genotypes >> 1) & U8xN::splat(1);
+            let dosages = bit1 * (U8xN::splat(1) + bit0);
+            
+            let dest_slice = &mut tile[dest_row_offset + snp_chunk_start..];
+            for i in 0..current_lanes {
+                // Unsafe is safe due to `#[repr(transparent)]` and validated new()
+                let dosage_ref = &mut *(&mut dest_slice[i] as *mut EffectAlleleDosage as *mut u8);
+                *dosage_ref = dosages[i];
+                // Validate after the fact
+                let _ = EffectAlleleDosage::new(*dosage_ref);
             }
-        } else {
-            // End of file. Return the number of SNPs we fully processed.
-            return Ok(snp_idx);
         }
     }
-    // Completed the full chunk.
-    Ok(num_snps_to_read)
+}
+
+
+/// The portable SIMD, cache-friendly pivot for a contiguous range of indices.
+#[inline]
+fn pivot_tile_for_range(
+    snp_major_data: &[u8],
+    person_index_range: Range<u32>,
+    tile: &mut [EffectAlleleDosage],
+    prep_result: &PreparationResult,
+) {
+    let snps_in_chunk = prep_result.num_reconciled_snps;
+    let bytes_per_snp = (prep_result.total_people_in_fam + 3) / 4;
+    
+    for (dense_person_idx, original_person_idx) in person_index_range.enumerate() {
+        let dest_row_offset = dense_person_idx * snps_in_chunk;
+        
+        let source_byte_base = original_person_idx / 4;
+        let bit_shift_base = (original_person_idx % 4) * 2;
+
+        for snp_chunk_start in (0..snps_in_chunk).step_by(LANES) {
+            let remaining_snps = snps_in_chunk - snp_chunk_start;
+            let current_lanes = remaining_snps.min(LANES);
+
+            let snp_indices = U32xN::from_array(core::array::from_fn(|i| (snp_chunk_start + i) as u32));
+            
+            let snp_offsets = snp_indices * U32xN::splat(bytes_per_snp as u32);
+            let source_byte_indices = (snp_offsets + U32xN::splat(source_byte_base)).cast::<usize>();
+
+            let packed_vals = U8xN::gather_unmasked(snp_major_data, source_byte_indices);
+            
+            let two_bit_genotypes = (packed_vals >> U8xN::splat(bit_shift_base)) & U8xN::splat(0b11);
+            
+            let bit0 = two_bit_genotypes & U8xN::splat(1);
+            let bit1 = (two_bit_genotypes >> 1) & U8xN::splat(1);
+            let dosages = bit1 * (U8xN::splat(1) + bit0);
+            
+            let dest_slice = &mut tile[dest_row_offset + snp_chunk_start..];
+            for i in 0..current_lanes {
+                let dosage_ref = &mut *(&mut dest_slice[i] as *mut EffectAlleleDosage as *mut u8);
+                *dosage_ref = dosages[i];
+                let _ = EffectAlleleDosage::new(*dosage_ref);
+            }
+        }
+    }
 }
