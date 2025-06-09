@@ -195,7 +195,13 @@ fn process_tile(
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let num_scores = prep_result.score_names.len();
 
-    // This is a sequential iterator.
+    // Create the validated InterleavedWeights struct once, outside the hot loop.
+    // The new kernel API requires this validated wrapper. A failure here is a
+    // critical logic bug, so we panic with a descriptive message.
+    let weights = kernel::InterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
+        .expect("CRITICAL: Weights matrix validation failed. This is an unrecoverable internal error.");
+
+    // This is a sequential iterator. The parallelism happens at the `process_block` level.
     tile.chunks_exact(snps_in_chunk)
         .enumerate()
         .for_each(|(dense_person_idx_in_tile, genotype_row)| {
@@ -208,32 +214,26 @@ fn process_tile(
             let score_start_idx = overall_person_idx * num_scores;
             let scores_out_slice = &mut all_scores_out[score_start_idx..score_start_idx + num_scores];
 
-            // Correctly adhere to the kernel's API contract.
-            let kernel_input = kernel::KernelInput::new(
-                // This is the idiomatic and explicit way to perform a zero-cost
-                // slice conversion for a `#[repr(transparent)]` newtype.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        genotype_row.as_ptr() as *const u8,
-                        genotype_row.len(),
-                    )
-                },
-                weights_for_chunk,
+            // This is the idiomatic and explicit way to perform a zero-cost
+            // slice conversion for a `#[repr(transparent)]` newtype.
+            let genotype_row_u8: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    genotype_row.as_ptr() as *const u8,
+                    genotype_row.len(),
+                )
+            };
+
+            // Call the simplified kernel function directly with its arguments.
+            // The safety contracts are now documented on the kernel function itself
+            // and upheld by the logic in this orchestrating module.
+            kernel::accumulate_scores_for_person(
+                genotype_row_u8,
+                &weights, // Pass the validated struct.
                 scores_out_slice,
                 acc_buffer,
                 idx_g1_buffer,
                 idx_g2_buffer,
-                snps_in_chunk,
-                num_scores,
             );
-
-            match kernel_input {
-                Ok(input) => kernel::accumulate_scores_for_person(input),
-                Err(validation_err) => {
-                    // This branch should be unreachable if upstream logic is correct.
-                    panic!("CRITICAL: KernelInput validation failed: {:?}. This is an unrecoverable internal error.", validation_err);
-                }
-            }
         });
 
     // Return the tile to the pool for reuse.
