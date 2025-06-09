@@ -1,17 +1,18 @@
 // ========================================================================================
 //
-//                      HIGH-THROUGHPUT BLOCK READER
+//              HIGH-PERFORMANCE, SYNCHRONOUS, ENCAPSULATED BLOCK READER
 //
 // ========================================================================================
+//
+// ### Purpose ###
+//
+// This module provides a high-performance, synchronous reader for moving raw,
+// sequential chunks of data from a memory-mapped .bed file.
 
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
-
-// ========================================================================================
-//                                  PUBLIC API
-// ========================================================================================
 
 /// A high-performance reader for moving raw, sequential chunks of data from a
 /// memory-mapped .bed file.
@@ -26,6 +27,11 @@ pub struct SnpChunkReader {
 
     /// The total size of the file in bytes, cached at creation time.
     file_size: u64,
+
+    /// The number of bytes per SNP, calculated once at construction. This is a
+    /// critical piece of encapsulated state that prevents this logic from
+    /// leaking into other modules.
+    bytes_per_snp: u64,
 }
 
 impl SnpChunkReader {
@@ -34,16 +40,6 @@ impl SnpChunkReader {
     /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
     /// file exists, is a valid PLINK .bed file, and has a size consistent with the
     /// metadata from the `prepare` phase, using overflow-safe arithmetic.
-    ///
-    /// # Arguments
-    /// * `bed_path`: The path to the `.bed` file.
-    /// * `num_people`: The total number of individuals in the study, from `.fam` file.
-    /// * `num_snps`: The total number of SNPs in the study, from `.bim` file.
-    ///
-    /// # Errors
-    /// Returns an `io::Error` if the file is missing, malformed, or if its size is
-    /// inconsistent with the provided metadata, preventing the engine from ever
-    /// operating on corrupt or mismatched data.
     pub fn new(bed_path: &Path, num_people: usize, num_snps: usize) -> io::Result<Self> {
         let bed_file = File::open(bed_path)?;
         let metadata = bed_file.metadata()?;
@@ -87,13 +83,15 @@ impl SnpChunkReader {
             mmap,
             cursor: 3, // Start reading after the 3-byte magic number.
             file_size,
+            // Store the calculated value, encapsulating this logic.
+            bytes_per_snp,
         })
     }
 
     /// Reads the next chunk of raw SNP data into the provided buffer.
     ///
-    /// This method is allocation-free. The caller owns and provides the buffer,
-    /// and this function simply fills it with bytes from the memory map.
+    /// This method is allocation-free and synchronous. The caller owns and provides the buffer,
+    /// and this function simply fills it with bytes from the memory map via `memcpy`.
     ///
     /// # Arguments
     /// * `buf`: A mutable slice representing the destination buffer.
@@ -102,27 +100,40 @@ impl SnpChunkReader {
     /// A `Result` containing the number of bytes read. A value of `Ok(0)`
     /// indicates that the end of the file has been reached (EOF).
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // If the cursor is at or past the end, we are done.
         if self.cursor >= self.file_size {
             return Ok(0);
         }
 
-        // Determine how many bytes to copy. It's the smaller of the buffer's
-        // capacity or the number of bytes remaining in the file.
         let bytes_remaining = self.file_size - self.cursor;
         let bytes_to_copy = (buf.len() as u64).min(bytes_remaining) as usize;
 
-        // Define the source and destination slices for the memory copy.
         let src_end = self.cursor as usize + bytes_to_copy;
         let src_slice = &self.mmap[self.cursor as usize..src_end];
         let dest_slice = &mut buf[..bytes_to_copy];
 
-        // Perform the single, fast memory copy.
         dest_slice.copy_from_slice(src_slice);
 
-        // Advance the cursor for the next read.
         self.cursor += bytes_to_copy as u64;
 
         Ok(bytes_to_copy)
+    }
+
+    /// Calculates the number of SNPs contained within a given number of bytes.
+    ///
+    /// This method is the public face of the file format's layout logic. By
+    /// providing this, we prevent the orchestrator in `main.rs` from needing to
+    /// know these low-level details.
+    #[inline]
+    pub fn snps_in_bytes(&self, num_bytes: usize) -> usize {
+        if self.bytes_per_snp == 0 {
+            return 0;
+        }
+        num_bytes / self.bytes_per_snp as usize
+    }
+
+    /// Returns the number of bytes per SNP for this specific .bed file.
+    #[inline]
+    pub fn bytes_per_snp(&self) -> u64 {
+        self.bytes_per_snp
     }
 }
