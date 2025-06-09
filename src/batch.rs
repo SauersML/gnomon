@@ -34,10 +34,12 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 //                                   PUBLIC API
 // ========================================================================================
 
-/// Processes one chunk of SNP-major data, returning a new `Vec<f32>` of partial scores.
+/// Processes one chunk of SNP-major data, mutating a provided slice with partial scores.
 ///
 /// This is the sole public entry point into the synchronous compute engine. It adheres
-/// to the "return-then-merge" pattern to ensure contention-free parallelism.
+/// to a "mutate-in-place" contract, where the caller provides a buffer that this
+/// function's parallel tasks will fill. This avoids allocations in the compute
+/// hot path and is a key part of the overall application's memory management strategy.
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
@@ -45,8 +47,22 @@ pub fn run_chunk_computation(
     partial_scores_out: &mut [f32],
     kernel_data_pool: &KernelDataPool,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-) -> Result<(), Box<dyn Error + Send + Sync>>
-    // Dispatch to the appropriate generic parallel iterator.
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // --- Entry Point Validation ---
+    // This is the "airlock" for the compute engine. We verify that the mutable
+    // slice provided by the caller has the exact size we expect. This prevents
+    // panics or buffer overruns deep inside the parallel loops.
+    let expected_len = prep_result.num_people_to_score * prep_result.score_names.len();
+    if partial_scores_out.len() != expected_len {
+        return Err(format!(
+            "Mismatched scores buffer: expected length {}, got {}",
+            expected_len,
+            partial_scores_out.len()
+        )
+        .into());
+    }
+
+    // --- Dispatch to Generic Parallel Iterator ---
     match &prep_result.person_subset {
         PersonSubset::All => {
             let iter = (0..prep_result.total_people_in_fam as u32)
@@ -57,7 +73,7 @@ pub fn run_chunk_computation(
                 snp_major_data,
                 weights_for_chunk,
                 prep_result,
-                &mut partial_scores,
+                partial_scores_out,
                 kernel_data_pool,
                 tile_pool,
             );
@@ -69,15 +85,14 @@ pub fn run_chunk_computation(
                 snp_major_data,
                 weights_for_chunk,
                 prep_result,
-                &mut partial_scores,
+                partial_scores_out,
                 kernel_data_pool,
                 tile_pool,
             );
         }
     };
 
-    // Return ownership of the completed partial scores.
-    Ok(partial_scores)
+    Ok(())
 }
 
 // ========================================================================================
