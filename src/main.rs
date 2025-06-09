@@ -121,6 +121,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     // --- Phase 4: True Concurrent Pipeline Execution ---
+    // The message passed from the I/O task to the compute dispatcher.
+    type IoMessage = (Vec<u8>, usize, usize); // (buffer, bytes_read, snps_in_chunk)
+
     // Prime the pipeline by sending the empty I/O buffers to the I/O task.
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
@@ -137,11 +140,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Spawn the dedicated I/O Producer task.
     let io_handle = tokio::spawn(async move {
+        // The I/O task owns the reader and the channels.
         while let Some(mut buffer) = empty_buffer_rx.recv().await {
-            match reader.read_chunk(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(bytes_read) => {
-                    if full_buffer_tx.send((buffer, bytes_read)).await.is_err() {
+            // The synchronous read_chunk call MUST be wrapped in spawn_blocking
+            // to prevent it from blocking the async I/O task on a page fault.
+            let read_result = task::spawn_blocking(move || {
+                let bytes_read = reader.read_chunk(&mut buffer)?;
+                let snps_in_chunk = reader.snps_in_bytes(bytes_read);
+                Ok::<_, io::Error>((buffer, bytes_read, snps_in_chunk))
+            })
+            .await
+            .unwrap(); // Panicking here is acceptable; a JoinError is unrecoverable.
+
+            match read_result {
+                Ok((buffer, 0, _)) => break, // EOF
+                Ok((buffer, bytes_read, snps_in_chunk)) => {
+                    if full_buffer_tx.send((buffer, bytes_read, snps_in_chunk)).await.is_err() {
                         break; // Consumer has disconnected.
                     }
                 }
@@ -151,13 +165,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        // The reader is dropped here when the task finishes.
     });
 
     // The main task becomes the Consumer and Compute Dispatcher.
     let mut snps_processed_so_far = 0;
-    while let Some((full_buffer, bytes_read)) = full_buffer_rx.recv().await {
-        let snps_in_chunk = reader.snps_in_bytes(bytes_read);
+    while let Some((full_buffer, bytes_read, snps_in_chunk)) = full_buffer_rx.recv().await {
         if snps_in_chunk == 0 {
+            // If the chunk was empty, immediately recycle the buffer.
+            if empty_buffer_tx.send(full_buffer).await.is_err() {
+                break;
+            }
             continue;
         }
 
@@ -172,10 +190,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .ok_or("Internal error: Failed to slice weights buffer.")?;
 
         // Acquire a reusable buffer for partial scores to avoid allocation.
-        let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap_or_else(|| {
-            eprintln!("Warning: Partial scores pool was empty, allocating new buffer.");
-            vec![0.0f32; partial_scores_size]
-        });
+        let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
         // Dispatch compute task to the blocking pool.
         let compute_handle = task::spawn_blocking(move || {
@@ -192,27 +207,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok::<_, Box<dyn Error + Send + Sync>>((full_buffer, partial_scores_buffer))
         });
 
-        // Immediately send an empty buffer back to the I/O task so it can start
-        // reading the *next* chunk while we process the current one.
-        // This is the key to achieving I/O and Compute overlap.
-        empty_buffer_tx
-            .send(vec![0u8; chunk_size_bytes])
-            .await?;
-
-        // Await the results of the *previous* computation.
+        // Await the results of the computation.
         let (returned_io_buffer, returned_scores_buffer) = compute_handle.await??;
-        // The I/O buffer is now effectively empty and can be dropped, it will be replaced by new ones from the channel.
-        drop(returned_io_buffer);
+
+        // Recycle the I/O buffer by sending it back to the I/O task.
+        if empty_buffer_tx.send(returned_io_buffer).await.is_err() {
+            // I/O task has shut down, we can't continue.
+            break;
+        }
 
         // Perform the sequential, non-contentious merge step.
         for (master_score, partial_score) in all_scores.iter_mut().zip(returned_scores_buffer.iter()) {
-            *master_score += *partial_score;
+            *master_score += partial_score;
         }
-
-        // Return the partial scores buffer to its pool for reuse.
-        partial_scores_pool_clone
-            .push(returned_scores_buffer)
-            .expect("Partial scores pool should not be full.");
+        
+        // Before returning the scores buffer to the pool, it must be cleared.
+        returned_scores_buffer.iter_mut().for_each(|s| *s = 0.0);
+        partial_scores_pool_clone.push(returned_scores_buffer).unwrap();
 
         snps_processed_so_far += snps_in_chunk;
         eprintln!(
@@ -223,8 +234,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    // Cleanly await the I/O task to ensure it has finished.
-    io_handle.await??;
+    // Await the I/O task to make sure it has finished.
+    io_handle.await?;
     eprintln!("> Computation finished.");
 
     // --- Phase 5: Finalization and Output ---
