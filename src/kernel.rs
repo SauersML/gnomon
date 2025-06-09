@@ -5,11 +5,15 @@
 // ========================================================================================
 
 use std::simd::{f32x8, Simd};
+use std::cell::RefCell;
+use thread_local::ThreadLocal;
 
 // --- Type Aliases for Readability ---
 // Public so the caller can correctly size the accumulator buffer.
 pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LANE_COUNT;
+pub type KernelDataPool =
+    ThreadLocal<RefCell<(Vec<SimdVec>, Vec<usize>, Vec<usize>)>>;
 
 // ========================================================================================
 //                            PUBLIC API & TYPE DEFINITIONS

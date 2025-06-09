@@ -12,7 +12,6 @@
 // a clean, one-way dependency graph where high-level modules can depend on these
 // core types, but not on each other's implementation details.
 
-use crate::kernel;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -157,10 +156,3 @@ impl EffectAlleleDosage {
 // ========================================================================================
 //                                Shared Resource Pools
 // ========================================================================================
-
-/// A pool of reusable, thread-local buffers for the compute kernel.
-///
-/// This avoids allocator contention in the hot `rayon` loops by ensuring each
-/// thread has its own set of scratch buffers. Created in `main`, consumed by `batch`.
-pub type KernelDataPool =
-    ThreadLocal<RefCell<(Vec<kernel::SimdVec>, Vec<usize>, Vec<usize>)>>;

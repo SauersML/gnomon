@@ -10,8 +10,9 @@
 // Engine. It is designed to be called from a higher-level asynchronous
 // orchestrator.
 
-use crate::kernel;
+use crate::kernel::{self, KernelDataPool}; // Modified to directly import KernelDataPool
 use crate::prepare::{PersonSubset, PreparationResult};
+use crate::types::{OriginalPersonIndex, EffectAlleleDosage}; // Added
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -30,11 +31,6 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 //                            TYPE-SAFE INDEX DEFINITIONS
 // ========================================================================================
 
-/// An index into the original, full .fam file (e.g., one of 150,000).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct OriginalPersonIndex(pub u32);
-
 /// A dense, 0-based index within a single processed tile (e.g., 0..4095).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DensePersonIndex(pub usize);
@@ -46,16 +42,6 @@ pub struct BlockIndex(pub usize);
 // ========================================================================================
 //                            PUBLIC API & DATA STRUCTURES
 // ========================================================================================
-
-/// A `#[repr(transparent)]` wrapper for a dosage value, guaranteeing it is <= 2.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EffectAlleleDosage(pub u8);
-
-/// A pool of reusable, thread-local buffers for the compute kernel.
-// Perhaps move to kernel.rs later.
-pub type KernelDataPool =
-    ThreadLocal<RefCell<(Vec<kernel::SimdVec>, Vec<usize>, Vec<usize>)>>;
 
 // ========================================================================================
 //                       THE UNIFIED SBPE COMPUTE ENGINE
@@ -69,14 +55,14 @@ pub fn run_chunk_computation(
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
     all_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+    kernel_data_pool: &KernelDataPool, // Changed to use imported KernelDataPool
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>, // Changed to use imported EffectAlleleDosage
 ) {
     match &prep_result.person_subset {
         PersonSubset::All => {
             let iter = (0..prep_result.total_people_in_fam as u32)
                 .into_par_iter()
-                .map(OriginalPersonIndex);
+                .map(OriginalPersonIndex); // Changed to use imported OriginalPersonIndex
             process_people_iterator(
                 iter,
                 snp_major_data,
@@ -116,10 +102,10 @@ fn process_people_iterator<I>(
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
     all_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+    kernel_data_pool: &KernelDataPool, // Changed to use imported KernelDataPool
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>, // Changed to use imported EffectAlleleDosage
 ) where
-    I: ParallelIterator<Item = OriginalPersonIndex> + Send,
+    I: ParallelIterator<Item = OriginalPersonIndex> + Send, // Changed to use imported OriginalPersonIndex
 {
     // This is the single, coarse-grained parallel loop for the entire engine.
     iter.chunks(PERSON_BLOCK_SIZE)
@@ -142,14 +128,14 @@ fn process_people_iterator<I>(
 /// pivoting the data into it, and dispatching it to the kernel.
 #[inline]
 fn process_block(
-    person_indices_in_block: &[OriginalPersonIndex],
+    person_indices_in_block: &[OriginalPersonIndex], // Changed to use imported OriginalPersonIndex
     block_idx: BlockIndex,
     prep_result: &PreparationResult,
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
     all_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+    kernel_data_pool: &KernelDataPool, // Changed to use imported KernelDataPool
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>, // Changed to use imported EffectAlleleDosage
 ) {
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
@@ -160,7 +146,7 @@ fn process_block(
         Vec::with_capacity(tile_size)
     });
     tile.clear();
-    tile.resize(tile_size, EffectAlleleDosage(0));
+    tile.resize(tile_size, EffectAlleleDosage(0)); // Changed to use imported EffectAlleleDosage
 
     pivot_tile_for_slice(
         snp_major_data,
@@ -184,13 +170,13 @@ fn process_block(
 /// It iterates sequentially over the people in the tile.
 #[inline]
 fn process_tile(
-    tile: Vec<EffectAlleleDosage>,
+    tile: Vec<EffectAlleleDosage>, // Changed to use imported EffectAlleleDosage
     block_idx: BlockIndex,
     prep_result: &PreparationResult,
     weights_for_chunk: &[f32],
     all_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
+    kernel_data_pool: &KernelDataPool, // Changed to use imported KernelDataPool
+    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>, // Changed to use imported EffectAlleleDosage
 ) {
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let num_scores = prep_result.score_names.len();
@@ -245,17 +231,17 @@ fn process_tile(
 #[inline]
 fn pivot_tile_for_slice(
     snp_major_data: &[u8],
-    person_indices_in_block: &[OriginalPersonIndex],
-    tile: &mut [EffectAlleleDosage],
+    person_indices_in_block: &[OriginalPersonIndex], // Changed to use imported OriginalPersonIndex
+    tile: &mut [EffectAlleleDosage], // Changed to use imported EffectAlleleDosage
     prep_result: &PreparationResult,
 ) {
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
 
-    for (dense_person_idx, &original_person_idx) in person_indices_in_block.iter().enumerate() {
+    for (dense_person_idx, &original_person_idx) in person_indices_in_block.iter().enumerate() { // original_person_idx_val renamed to original_person_idx
         let dest_row_offset = dense_person_idx * snps_in_chunk;
 
-        let original_idx_u64 = original_person_idx.0 as u64;
+        let original_idx_u64 = original_person_idx.0 as u64; // original_person_idx_val changed to original_person_idx.0
         let source_byte_base = original_idx_u64 / 4;
         let bit_shift_base = (original_idx_u64 % 4) * 2;
 
