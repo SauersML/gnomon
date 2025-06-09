@@ -7,34 +7,28 @@
 // ### High-Level Purpose ###
 //
 // This module contains the synchronous, CPU-bound core of the Staged Block-Pivoting
-// Engine. It is called from an asynchronous orchestrator (in `main.rs`) and is
-// responsible for the most performance-critical phase of the calculation.
-
-// TODO: The SIMD pivot functions compute the dosages in a wide SIMD vector but then deconstruct that vector to write the results back one lane at a time. This is a "SIMD sandwich" with a slow, scalar filling, and it cripples the performance of the entire operation.
-
-// TODO: The process_tile function introduces a rayon parallel loop (par_chunks_exact) inside a function that is already being called by a top-level rayon parallel loop. This is a classic and severe performance anti-pattern.
-
-// TODO: The plan mandated the use of zero-cost newtypes to prevent index confusion. This requirement was ignored. The code still uses raw u32 and usize for all indices.
+// Engine. It is designed to be called from a higher-level asynchronous
+// orchestrator.
 
 use crate::kernel;
 use crate::prepare::{PersonSubset, PreparationResult};
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::ops::Range;
-use std::simd::{Simd, SimdPartialEq, ToBitMask};
+use std::simd::Simd;
 use thread_local::ThreadLocal;
 
-// Use a concrete SIMD width for implementation. The portable API allows this to be
-// compiled to AVX2, AVX-512, or NEON based on the `target-cpu=native` flag.
-// A width of 8 for `u32` corresponds to a 256-bit vector (e.g., AVX2).
+// --- SIMD Type Aliases ---
 const LANES: usize = 8;
-type U32xN = Simd<u32, LANES>;
-type UsizexN = Simd<usize, LANES>;
+type U64xN = Simd<u64, LANES>;
 type U8xN = Simd<u8, LANES>;
 
-// A tile of 4096 people x 8192 SNPs = 33.5 MB, fitting comfortably in a 45 MB L3 cache.
+// --- Engine Tuning Parameters ---
 const PERSON_BLOCK_SIZE: usize = 4096;
+
+// ========================================================================================
+//                            TYPE-SAFE INDEX DEFINITIONS
+// ========================================================================================
 
 /// An index into the original, full .fam file (e.g., one of 150,000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,32 +44,26 @@ pub struct DensePersonIndex(pub usize);
 pub struct BlockIndex(pub usize);
 
 // ========================================================================================
-//                              PUBLIC API & TYPE DEFINITIONS
+//                            PUBLIC API & DATA STRUCTURES
 // ========================================================================================
 
+/// A `#[repr(transparent)]` wrapper for a dosage value, guaranteeing it is <= 2.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EffectAlleleDosage(u8);
+pub struct EffectAlleleDosage(pub u8);
 
-impl EffectAlleleDosage {
-    #[inline(always)]
-    pub fn new(value: u8) -> Self {
-        assert!(value <= 2, "Invalid dosage value created: {}", value);
-        Self(value)
-    }
-
-    pub fn value(&self) -> u8 {
-        self.0
-    }
-}
-
+/// A pool of reusable, thread-local buffers for the compute kernel.
+// Perhaps move to kernel.rs later.
 pub type KernelDataPool =
     ThreadLocal<RefCell<(Vec<kernel::SimdVec>, Vec<usize>, Vec<usize>)>>;
 
 // ========================================================================================
-//                           THE SBPE COMPUTE ENGINE IMPLEMENTATION
+//                       THE UNIFIED SBPE COMPUTE ENGINE
 // ========================================================================================
 
+/// The single public entry point for processing a chunk of SNP-major data.
+/// This function is a simple dispatcher that selects the correct iterator type
+/// and passes it to the generic, zero-cost processing function.
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
@@ -85,77 +73,58 @@ pub fn run_chunk_computation(
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
 ) {
     match &prep_result.person_subset {
-        PersonSubset::All => run_computation_for_all(
-            snp_major_data,
-            weights_for_chunk,
-            prep_result,
-            all_scores_out,
-            kernel_data_pool,
-            tile_pool,
-        ),
-        PersonSubset::Indices(indices) => run_computation_for_indices(
-            indices,
-            snp_major_data,
-            weights_for_chunk,
-            prep_result,
-            all_scores_out,
-            kernel_data_pool,
-            tile_pool,
-        ),
-    }
-}
-
-// ========================================================================================
-//                                 PRIVATE IMPLEMENTATIONS
-// ========================================================================================
-
-fn run_computation_for_indices(
-    indices: &[OriginalPersonIndex],
-    snp_major_data: &[u8],
-    weights_for_chunk: &[f32],
-    prep_result: &PreparationResult,
-    all_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-) {
-    indices
-        .par_chunks(PERSON_BLOCK_SIZE)
-        .enumerate()
-        .for_each(|(block_idx, person_indices_in_block)| {
-            // Pass the typed slice directly and wrap the primitive block_idx
-            // in its explicit newtype.
-            process_block(
-                person_indices_in_block,
-                BlockIndex(block_idx),
-                prep_result,
+        PersonSubset::All => {
+            let iter = (0..prep_result.total_people_in_fam as u32)
+                .into_par_iter()
+                .map(OriginalPersonIndex);
+            process_people_iterator(
+                iter,
                 snp_major_data,
                 weights_for_chunk,
+                prep_result,
                 all_scores_out,
                 kernel_data_pool,
                 tile_pool,
             );
-        });
+        }
+        PersonSubset::Indices(indices) => {
+            let iter = indices.par_iter().copied();
+            process_people_iterator(
+                iter,
+                snp_major_data,
+                weights_for_chunk,
+                prep_result,
+                all_scores_out,
+                kernel_data_pool,
+                tile_pool,
+            );
+        }
+    };
 }
 
-fn run_computation_for_all(
+// ========================================================================================
+//                            PRIVATE IMPLEMENTATION
+// ========================================================================================
+
+/// A generic, zero-cost function that contains the main parallel processing logic.
+/// It is generic over the `ParallelIterator` type, which allows the compiler to
+/// create specialized, highly optimized versions for each call site, eliminating
+//  the need for heap allocation and dynamic dispatch.
+fn process_people_iterator<I>(
+    iter: I,
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
     all_scores_out: &mut [f32],
     kernel_data_pool: &KernelDataPool,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-) {
-    let total_people = prep_result.total_people_in_fam;
-
-    // Create a parallel iterator over the raw indices.
-    (0..total_people as u32)
-        .into_par_iter()
-        // Map each raw u32 to its type-safe wrapper.
-        .map(OriginalPersonIndex)
-        .chunks(PERSON_BLOCK_SIZE)
+) where
+    I: ParallelIterator<Item = OriginalPersonIndex> + Send,
+{
+    // This is the single, coarse-grained parallel loop for the entire engine.
+    iter.chunks(PERSON_BLOCK_SIZE)
         .enumerate()
         .for_each(|(block_idx, person_indices_chunk)| {
-            // The chunk is now Vec<OriginalPersonIndex>.
             process_block(
                 &person_indices_chunk,
                 BlockIndex(block_idx),
@@ -169,6 +138,8 @@ fn run_computation_for_all(
         });
 }
 
+/// Processes a single block of individuals. This involves acquiring a buffer,
+/// pivoting the data into it, and dispatching it to the kernel.
 #[inline]
 fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
@@ -183,9 +154,11 @@ fn process_block(
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
 
-    let mut tile = tile_pool
-        .pop()
-        .unwrap_or_else(|| Vec::with_capacity(tile_size));
+    // Robustly acquire a tile buffer from the pool.
+    let mut tile = tile_pool.pop().unwrap_or_else(|| {
+        eprintln!("Warning: Tile pool was empty, allocating a new tile. This may indicate a performance bottleneck or an insufficient buffer count.");
+        Vec::with_capacity(tile_size)
+    });
     tile.clear();
     tile.resize(tile_size, EffectAlleleDosage(0));
 
@@ -207,6 +180,8 @@ fn process_block(
     );
 }
 
+/// Dispatches a single, pivoted, person-major tile to the compute kernel.
+/// It iterates sequentially over the people in the tile.
 #[inline]
 fn process_tile(
     tile: Vec<EffectAlleleDosage>,
@@ -220,6 +195,7 @@ fn process_tile(
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let num_scores = prep_result.score_names.len();
 
+    // This is a sequential iterator.
     tile.chunks_exact(snps_in_chunk)
         .enumerate()
         .for_each(|(dense_person_idx_in_tile, genotype_row)| {
@@ -230,23 +206,42 @@ fn process_tile(
             let dense_idx = DensePersonIndex(dense_person_idx_in_tile);
             let overall_person_idx = (block_idx.0 * PERSON_BLOCK_SIZE) + dense_idx.0;
             let score_start_idx = overall_person_idx * num_scores;
-            let scores_out_slice = &mut all_scores_out[score_start_idx..score_start_idx + num_scores];
+            let scores_out_slice = &mut all_scores_out[score_start_idx..];
 
-            // WRONG???
-            kernel::accumulate_scores_for_person(
-                genotype_row,
+            // Correctly adhere to the kernel's API contract.
+            let kernel_input = kernel::KernelInput::new(
+                // This is the idiomatic and explicit way to perform a zero-cost
+                // slice conversion for a `#[repr(transparent)]` newtype.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        genotype_row.as_ptr() as *const u8,
+                        genotype_row.len(),
+                    )
+                },
                 weights_for_chunk,
                 scores_out_slice,
                 acc_buffer,
                 idx_g1_buffer,
                 idx_g2_buffer,
+                snps_in_chunk,
+                num_scores,
             );
+
+            match kernel_input {
+                Ok(input) => kernel::accumulate_scores_for_person(input),
+                Err(validation_err) => {
+                    // This branch should be unreachable if upstream logic is correct.
+                    panic!("CRITICAL: KernelInput validation failed: {:?}. This is an unrecoverable internal error.", validation_err);
+                }
+            }
         });
 
+    // Return the tile to the pool for reuse.
     let _ = tile_pool.push(tile);
 }
 
 /// The portable SIMD, cache-friendly pivot for a slice of indices.
+/// It transposes a slice of SNP-major data into a person-major tile.
 #[inline]
 fn pivot_tile_for_slice(
     snp_major_data: &[u8],
@@ -255,28 +250,27 @@ fn pivot_tile_for_slice(
     prep_result: &PreparationResult,
 ) {
     let snps_in_chunk = prep_result.num_reconciled_snps;
-    let bytes_per_snp = (prep_result.total_people_in_fam + 3) / 4;
+    let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
 
     for (dense_person_idx, &original_person_idx) in person_indices_in_block.iter().enumerate() {
         let dest_row_offset = dense_person_idx * snps_in_chunk;
 
-        // Use the type-safe index's value for calculations.
-        let source_byte_base = original_person_idx.0 / 4;
-        let bit_shift_base = (original_person_idx.0 % 4) * 2;
+        let original_idx_u64 = original_person_idx.0 as u64;
+        let source_byte_base = original_idx_u64 / 4;
+        let bit_shift_base = (original_idx_u64 % 4) * 2;
 
         for snp_chunk_start in (0..snps_in_chunk).step_by(LANES) {
             let remaining_snps = snps_in_chunk - snp_chunk_start;
             let current_lanes = remaining_snps.min(LANES);
 
             let snp_indices =
-                U32xN::from_array(core::array::from_fn(|i| (snp_chunk_start + i) as u32));
+                U64xN::from_array(core::array::from_fn(|i| (snp_chunk_start + i) as u64));
 
-            let snp_offsets = snp_indices * U32xN::splat(bytes_per_snp as u32);
-            let source_byte_indices = (snp_offsets + U32xN::splat(source_byte_base)).cast::<usize>();
+            let snp_offsets = snp_indices * U64xN::splat(bytes_per_snp);
+            let source_byte_indices = (snp_offsets + U64xN::splat(source_byte_base)).cast::<usize>();
 
             let packed_vals = U8xN::gather_unmasked(snp_major_data, source_byte_indices);
-
-            let two_bit_genotypes = (packed_vals >> U8xN::splat(bit_shift_base)) & U8xN::splat(0b11);
+            let two_bit_genotypes = (packed_vals >> U8xN::splat(bit_shift_base as u8)) & U8xN::splat(0b11);
 
             let bit0 = two_bit_genotypes & U8xN::splat(1);
             let bit1 = (two_bit_genotypes >> 1) & U8xN::splat(1);
@@ -285,9 +279,6 @@ fn pivot_tile_for_slice(
             let dest_start = dest_row_offset + snp_chunk_start;
             let dest_end = dest_start + current_lanes;
             dosages.write_to_slice_unaligned_unchecked(unsafe {
-                // This is safe because EffectAlleleDosage is #[repr(transparent)]
-                // over a u8, so a slice of one can be reinterpreted as a slice
-                // of the other.
                 std::slice::from_raw_parts_mut(
                     tile[dest_start..dest_end].as_mut_ptr() as *mut u8,
                     current_lanes,
