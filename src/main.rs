@@ -8,55 +8,23 @@
 // Its sole responsibility is to orchestrate the high-performance pipeline defined in
 // the other modules. It owns all major resources and manages the application lifecycle
 // from argument parsing to final output.
-//
-// ### The Orchestration Mandate ###
-//
-// 1.  **Smart Configuration:** The orchestrator presents a minimal, zero-friction
-//     interface to the user. Complex tuning parameters (chunk sizes, buffer counts)
-//     are internalized as developer-chosen constants, not exposed as user-facing knobs.
-//
-// 2.  **Intelligent Path Resolution:** It handles user-provided paths intelligently,
-//     resolving directory paths to specific files and creating a deterministic output
-//     structure without requiring boilerplate configuration from the user.
-//
-// 3.  **Resource Ownership:** `main` is the sole owner of all major resources: the
-//     in-memory weight matrix, the pool of I/O pivot buffers, the pool of thread-local
-//     kernel buffers, and the communication channels.
-//
-// 4.  **Pipeline Conduction:** It constructs the producer-consumer pipeline, spawns
-//     the dedicated I/O thread, and executes the parallel compute consumer on the
-//     main thread, driving the engine to completion.
 
 use clap::Parser;
-use gnomon::batch::{self, KernelDataPool, PipelineBuffer};
-use gnomon::io::MmapBedReader;
+use crossbeam_queue::ArrayQueue;
+use gnomon::batch::{self, EffectAlleleDosage, KernelDataPool};
+use gnomon::io::SnpChunkReader;
 use gnomon::prepare;
+use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::Arc;
 use std::time::Instant;
-
-// ========================================================================================
-//                           APPLICATION-LEVEL CONSTANTS
-// ========================================================================================
-
-/// The number of SNPs to be read and pivoted in each pipeline chunk.
-/// This value is a large power of two, which is efficient for memory alignment. It is
-/// large enough to amortize the overhead of thread communication but small enough to
-// likely fit the pivoted data for one person within the CPU's L2 cache.
-const PIPELINE_CHUNK_SIZE_SNPS: usize = 8192;
-
-/// The number of large, reusable pivot buffers used in the pipeline.
-/// A value of 3 enables a classic "triple buffering" strategy, which is optimal for
-/// pipeline throughput. At any given time, one buffer can be actively consumed by the
-/// CPU cores, one can be actively produced by the I/O thread, and one remains free,
-/// so neither the producer nor the consumer is ever starved for data.
-const PIPELINE_BUFFER_COUNT: usize = 3;
+use sysinfo::{System, SystemExt};
+use tokio::sync::mpsc;
+use tokio::task;
 
 // ========================================================================================
 //                         COMMAND-LINE INTERFACE DEFINITION
@@ -75,168 +43,222 @@ struct Args {
     /// Path to the score file.
     #[clap(long)]
     score: PathBuf,
+
+    /// Path to a file containing a list of individual IDs (IIDs) to include.
+    /// If not provided, all individuals in the .fam file will be scored.
+    #[clap(long)]
+    keep: Option<PathBuf>,
 }
 
 // ========================================================================================
 //                           THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let start_time = Instant::now();
 
     // --- Phase 1: Argument Parsing and Path Resolution ---
     let args = Args::parse();
-    let plink_prefix = match resolve_plink_prefix(&args.input_path) {
-        Ok(prefix) => prefix,
-        Err(e) => {
-            eprintln!("Error resolving input path: {}", e);
-            process::exit(1);
-        }
-    };
+    let plink_prefix = resolve_plink_prefix(&args.input_path)?;
     eprintln!("> Using PLINK prefix: {}", plink_prefix.display());
 
     let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = fs::create_dir_all(output_dir) {
-        eprintln!(
-            "Error creating output directory '{}': {}",
-            output_dir.display(),
-            e
-        );
-        process::exit(1);
-    }
+    fs::create_dir_all(output_dir)?;
 
     // --- Phase 2: The Preparation Phase ---
     eprintln!(
         "> Preparing data using score file: {}",
         args.score.display()
     );
-    let prep_result = match prepare::prepare_for_computation(&plink_prefix, &args.score) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Fatal error during data preparation: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Derive counts from the length of the metadata vectors. This is the single
-    // source of truth for the dimensions of the problem.
-    let num_people = prep_result.person__ids.len();
-    let num_scores = prep_result.score_names.len();
+    let prep_result = Arc::new(prepare::prepare_for_computation(
+        &plink_prefix,
+        &args.score,
+        args.keep.as_deref(),
+    )?);
 
     eprintln!(
-        "> Preparation complete. Found {} individuals and {} overlapping SNPs.",
-        num_people, prep_result.num_reconciled_snps
+        "> Preparation complete. Found {} individuals to score and {} overlapping SNPs.",
+        prep_result.num_people_to_score, prep_result.num_reconciled_snps
     );
 
-    // --- Phase 3: Resource Allocation ---
-    let mut all_scores = vec![0.0f32; num_people * num_scores];
-    let kernel_data_pool = KernelDataPool::new();
-    let pivot_buffer_capacity = num_people * PIPELINE_CHUNK_SIZE_SNPS;
-    let pipeline_buffers: Vec<_> = (0..PIPELINE_BUFFER_COUNT)
-        .map(|_| PipelineBuffer::new(pivot_buffer_capacity))
-        .collect();
+    if prep_result.num_reconciled_snps == 0 {
+        return Err("No overlapping SNPs found. Cannot proceed.".into());
+    }
 
-    // --- Phase 4: Pipeline Construction and Execution ---
-    eprintln!("> Starting pipeline with {} buffers...", PIPELINE_BUFFER_COUNT);
-    let (free_buffers_tx, free_buffers_rx) = mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
-    let (filled_buffers_tx, filled_buffers_rx) = mpsc::sync_channel(PIPELINE_BUFFER_COUNT);
+    // --- Phase 3: Dynamic Runtime Resource Allocation ---
+    let mut all_scores =
+        vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
+    let kernel_data_pool = Arc::new(KernelDataPool::new());
+    let tile_pool_capacity = num_cpus::get().max(1) * 2;
+    let tile_pool = Arc::new(ArrayQueue::new(tile_pool_capacity));
 
-    thread::scope(|s| {
-        // --- 4a: Spawn the Producer Thread ---
-        let bed_path = plink_prefix.with_extension("bed");
-        let producer_handle = s.spawn(move || {
-            let bed_reader = MmapBedReader::new(
-                &bed_path,
-                num_people,
-                prep_result.total_snps_in_bim,
-                prep_result.required_snp_indices,
-                prep_result.reconciliation_instructions,
-            )
-            .expect("Failed to create .bed file reader");
+    // Determine a safe and effective I/O chunk size.
+    const MIN_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+    const MAX_CHUNK_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let available_mem = sys.available_memory();
+    let chunk_size_bytes = (available_mem / 4).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as usize;
 
-            batch::producer_task(
-                bed_reader,
-                free_buffers_rx,
-                filled_buffers_tx,
-                PIPELINE_CHUNK_SIZE_SNPS,
-                num_people,
-            );
-        });
+    // --- Pipeline Resource Allocation ---
+    const PIPELINE_DEPTH: usize = 2; // Classic double-buffering
+    let partial_scores_size = prep_result.num_people_to_score * prep_result.score_names.len();
+    let partial_scores_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
+    for _ in 0..(PIPELINE_DEPTH + 1) {
+        partial_scores_pool
+            .push(vec![0.0f32; partial_scores_size])
+            .unwrap();
+    }
+    let (full_buffer_tx, mut full_buffer_rx) =
+        mpsc::channel::<(Vec<u8>, usize)>(PIPELINE_DEPTH);
+    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
-        // --- 4b: Execute the Consumer on the Main Thread ---
-        for buffer in pipeline_buffers {
-            let _ = free_buffers_tx.send(buffer);
-        }
+    eprintln!(
+        "> Dynamically configured I/O chunk size to {} MB and pipeline depth to {}",
+        chunk_size_bytes / 1024 / 1024,
+        PIPELINE_DEPTH
+    );
 
-        let mut snps_processed = 0;
-        while let Ok(filled_buffer) = filled_buffers_rx.recv() {
-            let snps_in_chunk = filled_buffer.snps_in_chunk();
-            if snps_in_chunk == 0 { break; } // Producer signals EOF with an empty buffer.
+    // --- Phase 4: True Concurrent Pipeline Execution ---
+    // Prime the pipeline by sending the empty I/O buffers to the I/O task.
+    for _ in 0..PIPELINE_DEPTH {
+        empty_buffer_tx
+            .send(vec![0u8; chunk_size_bytes])
+            .await?;
+    }
 
-            let pivoted_data = filled_buffer.as_pivoted_data(num_people);
-            let weights_chunk = &prep_result.interleaved_weights[snps_processed * num_scores..];
+    let bed_path = plink_prefix.with_extension("bed");
+    let mut reader = SnpChunkReader::new(
+        &bed_path,
+        prep_result.total_people_in_fam,
+        prep_result.total_snps_in_bim,
+    )?;
 
-            batch::process_pivoted_chunk(
-                pivoted_data,
-                weights_chunk,
-                &mut all_scores,
-                num_people,
-                snps_in_chunk,
-                num_scores,
-                0, // No person-chunking implemented yet.
-                &kernel_data_pool,
-            );
-
-            snps_processed += snps_in_chunk;
-            eprintln!(
-                "> Processed chunk: {}/{} SNPs",
-                snps_processed, prep_result.num_reconciled_snps
-            );
-
-            let empty_buffer = filled_buffer.release_for_reuse();
-            if free_buffers_tx.send(empty_buffer).is_err() {
-                break;
+    // Spawn the dedicated I/O Producer task.
+    let io_handle = tokio::spawn(async move {
+        while let Some(mut buffer) = empty_buffer_rx.recv().await {
+            match reader.read_chunk(&mut buffer).await {
+                Ok(0) => break, // EOF
+                Ok(bytes_read) => {
+                    if full_buffer_tx.send((buffer, bytes_read)).await.is_err() {
+                        break; // Consumer has disconnected.
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[I/O Task Error]: {}", e);
+                    break;
+                }
             }
         }
-
-        if let Err(e) = producer_handle.join() {
-            eprintln!("Fatal error: Producer thread panicked.");
-            std::panic::resume_unwind(e);
-        }
     });
-    eprintln!("> Pipeline finished.");
+
+    // The main task becomes the Consumer and Compute Dispatcher.
+    let mut snps_processed_so_far = 0;
+    while let Some((full_buffer, bytes_read)) = full_buffer_rx.recv().await {
+        let snps_in_chunk = reader.snps_in_bytes(bytes_read);
+        if snps_in_chunk == 0 {
+            continue;
+        }
+
+        let prep_clone = Arc::clone(&prep_result);
+        let pool_clone = Arc::clone(&kernel_data_pool);
+        let tile_pool_clone = Arc::clone(&tile_pool);
+        let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
+
+        let weights_start = snps_processed_so_far * prep_clone.score_names.len();
+        let weights_end = (snps_processed_so_far + snps_in_chunk) * prep_clone.score_names.len();
+        let weights_for_chunk = prep_clone.interleaved_weights.get(weights_start..weights_end)
+            .ok_or("Internal error: Failed to slice weights buffer.")?;
+
+        // Acquire a reusable buffer for partial scores to avoid allocation.
+        let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap_or_else(|| {
+            eprintln!("Warning: Partial scores pool was empty, allocating new buffer.");
+            vec![0.0f32; partial_scores_size]
+        });
+
+        // Dispatch compute task to the blocking pool.
+        let compute_handle = task::spawn_blocking(move || {
+            let buffer_slice = &full_buffer[..bytes_read];
+            batch::run_chunk_computation(
+                buffer_slice,
+                weights_for_chunk,
+                &prep_clone,
+                &mut partial_scores_buffer, // Mutates the buffer in-place
+                &pool_clone,
+                &tile_pool_clone,
+            )?;
+            // Return ownership of both buffers for reuse.
+            Ok::<_, Box<dyn Error + Send + Sync>>((full_buffer, partial_scores_buffer))
+        });
+
+        // Immediately send an empty buffer back to the I/O task so it can start
+        // reading the *next* chunk while we process the current one.
+        // This is the key to achieving I/O and Compute overlap.
+        empty_buffer_tx
+            .send(vec![0u8; chunk_size_bytes])
+            .await?;
+
+        // Await the results of the *previous* computation.
+        let (returned_io_buffer, returned_scores_buffer) = compute_handle.await??;
+        // The I/O buffer is now effectively empty and can be dropped, it will be replaced by new ones from the channel.
+        drop(returned_io_buffer);
+
+        // Perform the sequential, non-contentious merge step.
+        for (master_score, partial_score) in all_scores.iter_mut().zip(returned_scores_buffer.iter()) {
+            *master_score += *partial_score;
+        }
+
+        // Return the partial scores buffer to its pool for reuse.
+        partial_scores_pool_clone
+            .push(returned_scores_buffer)
+            .expect("Partial scores pool should not be full.");
+
+        snps_processed_so_far += snps_in_chunk;
+        eprintln!(
+            "> Processed chunk: {}/{} SNPs ({:.1}%)",
+            snps_processed_so_far,
+            prep_result.num_reconciled_snps,
+            (snps_processed_so_far as f32 / prep_result.num_reconciled_snps as f32) * 100.0
+        );
+    }
+
+    // Cleanly await the I/O task to ensure it has finished.
+    io_handle.await??;
+    eprintln!("> Computation finished.");
 
     // --- Phase 5: Finalization and Output ---
     let out_filename = match args.score.file_name() {
         Some(name) => {
             let mut s = OsString::from(name);
             s.push(".sscore");
-            s
+            Ok(s)
         }
-        None => {
-            eprintln!(
-                "Error: Could not determine a base name from score file path '{}'.",
-                args.score.display()
-            );
-            process::exit(1);
-        }
-    };
+        None => Err(format!(
+            "Could not determine a base name from score file path '{}'.",
+            args.score.display()
+        )),
+    }?;
     let out_path = output_dir.join(&out_filename);
     eprintln!(
         "> Writing {} scores per person to {}",
-        num_scores,
+        prep_result.score_names.len(),
         out_path.display()
     );
 
-    if let Err(e) = write_scores_to_file(&out_path, &prep_result.person_ids, &prep_result.score_names, &all_scores) {
-        eprintln!("Error writing output file: {}", e);
-        process::exit(1);
-    }
+    write_scores_to_file(
+        &out_path,
+        &prep_result.final_person_iids,
+        &prep_result.score_names,
+        &all_scores,
+    )?;
 
     eprintln!(
         "\nSuccess! Total execution time: {:.2?}",
         start_time.elapsed()
     );
+
+    Ok(())
 }
 
 // ========================================================================================
@@ -246,12 +268,12 @@ fn main() {
 /// Intelligently resolves the user-provided input path to a PLINK prefix.
 fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
-        return Err("Input path does not exist.".to_string());
+        return Err(format!("Input path '{}' does not exist.", path.display()));
     }
 
     if path.is_dir() {
         let bed_files: Vec<PathBuf> = fs::read_dir(path)
-            .map_err(|e| format!("Could not read directory: {}", e))?
+            .map_err(|e| format!("Could not read directory '{}': {}", path.display(), e))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|p| p.extension().map_or(false, |ext| ext == "bed"))
@@ -277,14 +299,9 @@ fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Writes the final calculated scores to a self-describing, tab-separated file.
-///
-/// The output format includes a header line with the Individual ID (IID) and all
-/// score names. This makes the file human-readable and easily machine-parsable.
-/// This function is optimized to minimize I/O overhead by formatting each line
-/// into a reusable buffer before performing a single write call per line.
 fn write_scores_to_file(
     path: &Path,
-    person_ids: &[String],
+    person_iids: &[String],
     score_names: &[String],
     scores: &[f32],
 ) -> io::Result<()> {
@@ -300,27 +317,24 @@ fn write_scores_to_file(
     writeln!(writer)?;
 
     // --- Write Data Rows ---
-    // A reusable buffer avoids repeated memory allocations in this hot loop.
-    let mut line_buffer = String::new();
+    let line_buffer_capacity = person_iids.get(0).map_or(128, |s| s.len() + num_scores * 12);
+    let mut line_buffer = String::with_capacity(line_buffer_capacity);
     let mut score_chunks = scores.chunks_exact(num_scores);
 
-    // Iterate through the person IDs, pulling the corresponding chunk of scores.
-    for iid in person_ids {
+    for iid in person_iids {
         let person_scores = score_chunks.next().ok_or_else(|| {
-            // This error indicates a catastrophic logic bug upstream.
-            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write.")
+            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write. This is a critical internal error.")
         })?;
 
         line_buffer.clear();
-        // The `unwrap` is safe because writing to a `String` via `fmt::Write` cannot fail.
         write!(&mut line_buffer, "{}", iid).unwrap();
 
-        for score in person_scores {
+        for &score in person_scores {
             write!(&mut line_buffer, "\t{}", score).unwrap();
         }
 
         writeln!(writer, "{}", line_buffer)?;
     }
 
-    Ok(())
+    writer.flush()
 }
