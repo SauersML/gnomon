@@ -38,18 +38,15 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 ///
 /// This is the sole public entry point into the synchronous compute engine. It adheres
 /// to the "return-then-merge" pattern to ensure contention-free parallelism.
-pub fn process_snp_chunk(
+pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
+    partial_scores_out: &mut [f32],
     kernel_data_pool: &KernelDataPool,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-) -> Result<Vec<f32>, Box<dyn Error + Send + Sync>> {
-    // 1. Allocate a local result buffer to prevent false sharing.
-    let mut partial_scores =
-        vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
-
-    // 2. Dispatch to the appropriate generic parallel iterator.
+) -> Result<(), Box<dyn Error + Send + Sync>>
+    // Dispatch to the appropriate generic parallel iterator.
     match &prep_result.person_subset {
         PersonSubset::All => {
             let iter = (0..prep_result.total_people_in_fam as u32)
@@ -79,7 +76,7 @@ pub fn process_snp_chunk(
         }
     };
 
-    // 3. Return ownership of the completed partial scores.
+    // Return ownership of the completed partial scores.
     Ok(partial_scores)
 }
 
