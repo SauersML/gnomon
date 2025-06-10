@@ -12,8 +12,8 @@
 
 use crate::kernel;
 use crate::types::{
-    BlockIndex, EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
-    PreparationResult, Reconciliation, SparseIndexPool,
+    EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
+    PreparationResult, Reconciliation,
 };
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
