@@ -7,7 +7,7 @@
 // This module contains the final, innermost loop of the compute engine. It is designed
 // for maximum throughput and is 100% allocation-free in the hot path.
 
-use std::simd::{f32x8, prelude::*};
+use std::simd::{f32x8, prelude::*, StdFloat};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
