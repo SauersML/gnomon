@@ -1,28 +1,22 @@
 name: Rust Test CI
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -30,7 +24,6 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-index-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-index
-
       - name: Cache Cargo registry cache
         uses: actions/cache@v4
         with:
@@ -38,7 +31,6 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-cache-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-cache
-
       - name: Cache Cargo git dependencies
         uses: actions/cache@v4
         with:
@@ -46,7 +38,6 @@ jobs:
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-git
-
       - name: Cache target directory
         uses: actions/cache@v4
         with:
@@ -55,7 +46,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}
             ${{ runner.os }}-target
-
       - name: Cache getdoc installation
         uses: actions/cache@v4
         with:
@@ -63,19 +53,22 @@ jobs:
           key: ${{ runner.os }}-getdoc-binary
           restore-keys: |
             ${{ runner.os }}-getdoc-binary
-
-      - name: Test
-        id: test_step
-        run: cargo +nightly test
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Generate failure report
-        if: steps.test_step.outcome == 'failure'
+      - name: Install getdoc
         run: |
           if [ ! -f ~/.cargo/bin/getdoc ]; then
             cargo +nightly install getdoc --locked
           fi
+      - name: Test
+        id: test_step
+        run: cargo +nightly test
+        continue-on-error: true
+        env:
+          RUST_BACKTRACE: 1
+      - name: Generate report
+        run: |
           ~/.cargo/bin/getdoc
-          echo "=== Test Failure Report ==="
+          echo "=== Test Report ==="
           cat report.md
+      - name: Fail job if tests failed
+        if: steps.test_step.outcome == 'failure'
+        run: exit 1
