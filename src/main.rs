@@ -13,7 +13,8 @@ use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
 use gnomon::io::SnpChunkReader;
-use gnomon::prepare;
+use gnomon::prepare::{self, PrepError};
+use gnomon::reformat;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -79,15 +80,72 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     fs::create_dir_all(output_dir)?;
 
     // --- Phase 2: The Preparation Phase ---
-    eprintln!(
-        "> Preparing data using score file: {}",
-        args.score.display()
-    );
-    let prep_result = Arc::new(prepare::prepare_for_computation(
-        &plink_prefix,
-        &args.score,
-        args.keep.as_deref(),
-    )?);
+    // This block attempts to prepare for computation. If it fails with a parsing
+    // error, it falls back to an automatic reformatting attempt for the PGS Catalog format.
+    let prep_result = {
+        // The path to the score file to be used, which may be updated by the
+        // fallback logic.
+        let mut score_path_to_use = args.score.clone();
+
+        eprintln!(
+            "> Preparing data using score file: {}",
+            score_path_to_use.display()
+        );
+
+        // --- First Attempt ---
+        // Try to process the user-provided score file directly.
+        match prepare::prepare_for_computation(
+            &plink_prefix,
+            &score_path_to_use,
+            args.keep.as_deref(),
+        ) {
+            // Success on the first try means the file was already in the correct format.
+            Ok(result) => Ok(result),
+
+            // A recoverable parsing error triggers the fallback logic.
+            Err(prep_error @ PrepError::Header(_)) | Err(prep_error @ PrepError::Parse(_)) => {
+                eprintln!(
+                    "\nWarning: Initial parsing failed. Checking for PGS Catalog format..."
+                );
+
+                // --- Reformat Attempt ---
+                // Call the specialist reformatting module.
+                match reformat::reformat_pgs_file(&score_path_to_use) {
+                    Ok(new_path) => {
+                        eprintln!(
+                            "Success! Created compatible score file at: '{}'",
+                            new_path.display()
+                        );
+                        eprintln!("Retrying computation with the new file...\n");
+
+                        // The path to use is now the newly created, valid file.
+                        score_path_to_use = new_path;
+
+                        // --- Second (and Final) Attempt ---
+                        // This result (Ok or Err) becomes the final result of the block.
+                        prepare::prepare_for_computation(
+                            &plink_prefix,
+                            &score_path_to_use,
+                            args.keep.as_deref(),
+                        )
+                    }
+                    Err(reformat_error) => {
+                        // The reformatting failed; the file is not a convertible format.
+                        eprintln!("\nError: Automatic conversion failed: {}", reformat_error);
+                        eprintln!("Please ensure the score file is in the gnomon-native format (snp_id, effect_allele, ...) or a valid PGS Catalog format.");
+                        // Return the original, more relevant error.
+                        Err(prep_error)
+                    }
+                }
+            }
+            // An unrecoverable error (e.g., I/O error) is passed through directly.
+            Err(other_error) => Err(other_error),
+        }
+    };
+
+    // The '?' operator propagates any final, unrecoverable error.
+    // On success, the result is wrapped for concurrent sharing.
+    let prep_result = Arc::new(prep_result?);
 
     eprintln!(
         "> Preparation complete. Found {} individuals to score and {} overlapping SNPs.",
