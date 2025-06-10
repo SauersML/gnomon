@@ -70,7 +70,10 @@ impl<'a> InterleavedWeights<'a> {
         // This is the single, minimal `unsafe` operation. Its correctness is
         // guaranteed by the disciplined logic of its sole caller.
         let offset = (snp_idx * self.num_scores) + (lane_idx * LANE_COUNT);
-        SimdVec::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT))
+        // SAFETY: The `unsafe fn` contract guarantees the offset is in-bounds.
+        // This inner `unsafe` block is required by modern Rust to make the
+        // exact location of the unsafe operation explicit.
+        unsafe { SimdVec::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
     }
 }
 
