@@ -20,6 +20,7 @@ memmap2 = "0.9.5"
 rayon = "1.10.0"
 thread_local = "1.1.8"
 crossbeam-queue = "0.3.12"
+sysinfo = "0.35.2"
 
 [profile.release]
 opt-level = 3
