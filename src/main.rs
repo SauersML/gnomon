@@ -11,7 +11,8 @@
 
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
-use gnomon::batch::{self, EffectAlleleDosage, SparseIndexPool};
+use gnomon::batch::{self, SparseIndexPool};
+use gnomon::types::EffectAlleleDosage;
 use gnomon::io::SnpChunkReader;
 use gnomon::prepare;
 use std::error::Error;
