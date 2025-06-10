@@ -16,15 +16,6 @@ use thread_local::ThreadLocal;
 pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LANE_COUNT;
 
-/// A thread-local pool for reusable accumulator buffers.
-///
-/// Under the Plan C architecture, the kernel's only responsibility is to perform
-/// the final SIMD-accelerated accumulation. It no longer manages sparse index buffers.
-///
-/// The calling code (in `batch.rs`) is responsible for ensuring that the `Vec<SimdVec>`
-/// for each thread is correctly sized on its first use. On subsequent uses, the buffer
-/// is reused with zero overhead.
-pub type KernelDataPool = ThreadLocal<RefCell<Vec<SimdVec>>>;
 
 // ========================================================================================
 //                            PUBLIC API & TYPE DEFINITIONS
@@ -113,12 +104,6 @@ pub fn accumulate_scores_for_person(
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
     let dosage_2_multiplier = SimdVec::splat(2.0);
-
-    // --- STEP 1: DELETED ---
-    // The redundant pre-scan for non-zero genotypes, which previously happened here,
-    // has been completely eliminated. This is the primary source of the system-wide
-    // performance gain from the Plan C architecture.
-
     // --- STEP 2: Reset the Reusable Accumulator Buffer ---
     // Zero-out the buffer provided by the caller. This is a fast, predictable
     // operation on a buffer that should be hot in the CPU cache.
