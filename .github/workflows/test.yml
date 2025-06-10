@@ -20,30 +20,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
 
-      - name: Cache Cargo dependencies
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: ~/.cargo/registry/index
+          key: ${{ runner.os }}-cargo-registry-index-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-index
+
+      - name: Cache Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: ${{ runner.os }}-cargo-registry-cache-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-cache
+
+      - name: Cache Cargo git dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('src/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}
+            ${{ runner.os }}-target
+
+      - name: Cache getdoc installation
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/getdoc
+          key: ${{ runner.os }}-getdoc-binary
+          restore-keys: |
+            ${{ runner.os }}-getdoc-binary
 
       - name: Test
         id: test_step
-        run: cargo test
+        run: cargo +nightly test
         env:
           RUST_BACKTRACE: 1
 
       - name: Generate failure report
         if: steps.test_step.outcome == 'failure'
         run: |
-          cargo install getdoc --locked
-          getdoc
+          if [ ! -f ~/.cargo/bin/getdoc ]; then
+            cargo +nightly install getdoc --locked
+          fi
+          ~/.cargo/bin/getdoc
           echo "=== Test Failure Report ==="
           cat report.md
