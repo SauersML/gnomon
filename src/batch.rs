@@ -32,10 +32,6 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 
 use thread_local::ThreadLocal;
 
-/// A type-safe wrapper for an index of a block of people.
-#[derive(Clone, Copy)]
-struct BlockIndex(usize);
-
 /// A thread-local pool for reusing the memory buffers required for storing
 /// sparse indices (`g1_indices`, `g2_indices`).
 #[derive(Default, Debug)]
