@@ -67,7 +67,7 @@ struct IoMessage {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let start_time = Instant::now();
 
     // --- Phase 1: Argument Parsing and Path Resolution ---
