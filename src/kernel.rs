@@ -3,17 +3,28 @@
 //                                     THE KERNEL
 //
 // ========================================================================================
+//
+// This module contains the final, innermost loop of the compute engine. It is designed
+// for maximum throughput and is 100% allocation-free in the hot path.
 
-use std::simd::{f32x8, Simd};
 use std::cell::RefCell;
+use std::simd::{f32x8, Simd};
 use thread_local::ThreadLocal;
 
 // --- Type Aliases for Readability ---
-// Public so the caller can correctly size the accumulator buffer.
+// These types are part of the public API of the kernel.
 pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LANE_COUNT;
-pub type KernelDataPool =
-    ThreadLocal<RefCell<(Vec<SimdVec>, Vec<usize>, Vec<usize>)>>;
+
+/// A thread-local pool for reusable accumulator buffers.
+///
+/// Under the Plan C architecture, the kernel's only responsibility is to perform
+/// the final SIMD-accelerated accumulation. It no longer manages sparse index buffers.
+///
+/// The calling code (in `batch.rs`) is responsible for ensuring that the `Vec<SimdVec>`
+/// for each thread is correctly sized on its first use. On subsequent uses, the buffer
+/// is reused with zero overhead.
+pub type KernelDataPool = ThreadLocal<RefCell<Vec<SimdVec>>>;
 
 // ========================================================================================
 //                            PUBLIC API & TYPE DEFINITIONS
@@ -21,9 +32,8 @@ pub type KernelDataPool =
 
 /// A validated, type-safe, zero-cost wrapper for the interleaved weights matrix.
 ///
-/// This struct is the gatekeeper for the weights data. Its constructor guarantees
-/// that an instance of `InterleavedWeights` can only be created if its dimensions
-//  are coherent, making an invalidly-dimensioned weights matrix an unrepresentable state.
+/// This struct's constructor guarantees that an instance can only be created if its
+/// dimensions are coherent, making an invalidly-dimensioned matrix an unrepresentable state.
 pub struct InterleavedWeights<'a> {
     slice: &'a [f32],
     num_snps: usize,
@@ -62,9 +72,8 @@ impl<'a> InterleavedWeights<'a> {
     /// # Safety
     /// The caller MUST guarantee that `snp_idx < self.num_snps` and
     /// `lane_idx < (self.num_scores + LANE_COUNT - 1) / LANE_COUNT`.
-    /// This contract is upheld by the `accumulate_scores_for_person` function,
-    /// whose "scan-and-gather" logic ensures all SNP indices are derived from
-    /// the valid genotype row, and the loop over lanes is correctly bounded.
+    /// This contract is upheld by `accumulate_scores_for_person`, whose loops
+    /// are correctly bounded.
     #[inline(always)]
     unsafe fn get_simd_lane_unchecked(&self, snp_idx: usize, lane_idx: usize) -> SimdVec {
         // This is the single, minimal `unsafe` operation. Its correctness is
@@ -78,45 +87,37 @@ impl<'a> InterleavedWeights<'a> {
 //                              THE KERNEL IMPLEMENTATION
 // ========================================================================================
 
-/// Calculates all K scores for a single person.
+/// Calculates all K scores for a single person using pre-computed sparse indices.
 ///
-/// This function is the heart of the compute engine. It is **100% allocation-free**,
-/// using reusable buffers provided by the caller for all temporary storage.
+/// This function is the heart of the compute engine. It is significantly faster
+/// than its predecessor because it no longer performs a redundant scan for non-zero
+/// genotypes; that work is now done once in `batch.rs`.
 ///
 /// # Safety
 ///
-/// This function is safe to call only if the caller upholds the following contracts,
-/// which are guaranteed by the `batch.rs` engine:
-/// - `genotype_row.len() == weights.num_snps`
-/// - `scores_out.len() == weights.num_scores()`
-/// - `accumulator_buffer.len()` is sufficient for the number of scores, i.e.,
+/// The caller must uphold the following contracts:
+/// - All indices in `g1_indices` and `g2_indices` must be `< weights.num_snps`.
+/// - `scores_out.len()` must be `== weights.num_scores()`.
+/// - `accumulator_buffer.len()` must be sufficient for the number of scores, i.e.,
 ///   at least `(weights.num_scores() + LANE_COUNT - 1) / LANE_COUNT`.
 #[inline]
 pub fn accumulate_scores_for_person(
-    genotype_row: &[u8],
     weights: &InterleavedWeights,
     scores_out: &mut [f32],
-    // --- Reusable, thread-local buffers ---
+    // --- Reusable, thread-local buffer ---
     accumulator_buffer: &mut [SimdVec],
-    idx_g1_buffer: &mut Vec<usize>,
-    idx_g2_buffer: &mut Vec<usize>,
+    // --- Pre-computed sparse indices from batch.rs ---
+    g1_indices: &[usize],
+    g2_indices: &[usize],
 ) {
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
     let dosage_2_multiplier = SimdVec::splat(2.0);
 
-    // --- STEP 1: Pre-scan & Indexing (The "Sparsity-Aware" part) ---
-    // Clear the buffers to reset their length to 0, but retain their capacity.
-    // This avoids heap allocation on every kernel invocation.
-    idx_g1_buffer.clear();
-    idx_g2_buffer.clear();
-    for (snp_idx, &dosage) in genotype_row.iter().enumerate() {
-        match dosage {
-            1 => idx_g1_buffer.push(snp_idx),
-            2 => idx_g2_buffer.push(snp_idx),
-            _ => (), // Dosage 0 is ignored, performing zero wasted work.
-        }
-    }
+    // --- STEP 1: DELETED ---
+    // The redundant pre-scan for non-zero genotypes, which previously happened here,
+    // has been completely eliminated. This is the primary source of the system-wide
+    // performance gain from the Plan C architecture.
 
     // --- STEP 2: Reset the Reusable Accumulator Buffer ---
     // Zero-out the buffer provided by the caller. This is a fast, predictable
@@ -127,9 +128,8 @@ pub fn accumulate_scores_for_person(
 
     // --- STEP 3: The Fused-Multiply-Add Update Loop ---
     // This is the performance-critical core. Every `snp_idx` is guaranteed to be
-    // in-bounds because it was just gathered from `genotype_row`. The accumulator
-    // is guaranteed to have the correct size by the function's safety contract.
-    for &snp_idx in &*idx_g1_buffer {
+    // in-bounds by the function's safety contract.
+    for &snp_idx in g1_indices {
         for i in 0..num_accumulator_lanes {
             // This is safe due to the function's contract.
             let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
@@ -137,7 +137,7 @@ pub fn accumulate_scores_for_person(
         }
     }
 
-    for &snp_idx in &*idx_g2_buffer {
+    for &snp_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
             // This is safe due to the function's contract.
             let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
