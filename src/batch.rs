@@ -130,7 +130,8 @@ pub fn run_chunk_computation(
 //                            PRIVATE IMPLEMENTATION
 // ========================================================================================
 
-/// A generic, zero-cost function containing the main parallel processing logic.
+/// Contains the main parallel processing logic, using a structure that is idiomatic
+/// for high-performance, in-place mutation with Rayon.
 fn process_people_iterator<'a, I>(
     iter: I,
     snp_major_data: &'a [u8],
@@ -144,20 +145,37 @@ fn process_people_iterator<'a, I>(
 {
     let num_scores = prep_result.score_names.len();
 
-    // The main parallel loop over blocks of people.
-    iter.chunks(PERSON_BLOCK_SIZE)
+    // Collect all person indices into a single vector. This allows us to map
+    // chunks of the output scores back to chunks of input people.
+    let all_person_indices: Vec<_> = iter.collect();
+
+    // The number of f32 scores corresponding to a full block of people.
+    let scores_per_block = PERSON_BLOCK_SIZE * num_scores;
+
+    // The main parallel loop. It iterates over the OUTPUT buffer in mutable,
+    // disjoint chunks. This is the idiomatic Rayon approach for in-place mutation.
+    partial_scores
+        .par_chunks_mut(scores_per_block)
         .enumerate()
-        .for_each(move |(block_idx_val, person_indices_chunk)| {
-            let block_idx = BlockIndex(block_idx_val);
-            let score_start_idx = block_idx.0 * PERSON_BLOCK_SIZE * num_scores;
-            let score_end_idx = score_start_idx + person_indices_chunk.len() * num_scores;
+        .for_each(|(block_idx, block_scores_out)| {
+            // From the block index, calculate the corresponding range of people
+            // from our collected input vector.
+            let person_start_idx = block_idx * PERSON_BLOCK_SIZE;
+            let person_end_idx =
+                (person_start_idx + PERSON_BLOCK_SIZE).min(all_person_indices.len());
 
-            // Each parallel task gets its own mutable slice of the partial scores buffer.
-            // This is safe because the chunks are disjoint.
-            let block_scores_out = &mut partial_scores[score_start_idx..score_end_idx];
+            let person_indices_in_block = &all_person_indices[person_start_idx..person_end_idx];
 
+            // If this block corresponds to no people (can happen on the final,
+            // smaller chunk), there is nothing to do.
+            if person_indices_in_block.is_empty() {
+                return;
+            }
+
+            // Now we have the input `person_indices_in_block` and the output
+            // `block_scores_out` for this parallel task. Dispatch to the processing logic.
             process_block(
-                &person_indices_chunk,
+                person_indices_in_block,
                 prep_result,
                 snp_major_data,
                 weights_for_chunk,
