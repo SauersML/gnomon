@@ -12,7 +12,7 @@
 
 use crate::kernel;
 use crate::types::{
-    BlockIndex, EffectAlleleDosage, KernelDataPool, OriginalPersonIndex, PersonSubset,
+    BlockIndex, EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
     PreparationResult, Reconciliation, SparseIndexPool,
 };
 use crossbeam_queue::ArrayQueue;
