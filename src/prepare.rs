@@ -13,7 +13,7 @@
 // and structured for the extreme performance requirements of the Staged
 // Block-Pivoting Engine.
 
-use crate::types::{PersonSubset, PreparationResult};
+use crate::types::{PersonSubset, PreparationResult, Reconciliation};
 use ahash::{AHashMap, AHashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -25,15 +25,6 @@ use std::path::{Path, PathBuf};
 // ========================================================================================
 //                                  PUBLIC API
 // ========================================================================================
-
-/// An instruction for the I/O engine on how to handle a SNP's dosage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reconciliation {
-    /// Use the dosage as-is (effect allele is Allele 2).
-    Identity,
-    /// Flip the dosage: `2 - dosage` (effect allele is Allele 1).
-    Flip,
-}
 
 /// A comprehensive, production-grade error type for the preparation phase.
 #[derive(Debug)]
