@@ -7,9 +7,7 @@
 // This module contains the final, innermost loop of the compute engine. It is designed
 // for maximum throughput and is 100% allocation-free in the hot path.
 
-use std::cell::RefCell;
-use std::simd::{f32x8, Simd};
-use thread_local::ThreadLocal;
+use std::simd::{f32x8, prelude::*};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
