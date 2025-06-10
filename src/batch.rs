@@ -19,8 +19,7 @@ use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::error::Error;
-use std::simd::num::SimdUint;
-use std::simd::prelude::*;
+use std::simd::{Simd, SimdPartialEq};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -141,7 +140,7 @@ fn process_people_iterator<'a, I>(
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
 ) where
-    I: ParallelIterator<Item = OriginalPersonIndex> + Send,
+    I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
     let num_scores = prep_result.score_names.len();
 
@@ -313,8 +312,11 @@ fn pivot_and_reconcile_tile(
                 0
             }
         }));
-        let person_byte_indices = person_indices / 4;
-        let bit_shifts = (person_indices % 4) * 2;
+        // PLINK .bed files pack 4 genotypes into a byte. Find the byte index and
+        // the 2-bit shift required for each person. These operations are performed
+        // in parallel on all 8 lanes of the SIMD vector.
+        let person_byte_indices = person_indices / U64xN::splat(4);
+        let bit_shifts = (person_indices % U64xN::splat(4)) * U64xN::splat(2);
 
         for snp_chunk_start in (0..snps_in_chunk).step_by(SIMD_LANES) {
             let remaining_snps = snps_in_chunk - snp_chunk_start;
@@ -336,15 +338,31 @@ fn pivot_and_reconcile_tile(
                 let packed_vals = snp_data_vectors[i];
                 let reconciliation = prep_result.reconciliation_instructions[snp_idx];
 
+                // --- SIMD Genotype Unpacking ---
+                // This logic unpacks the 2-bit PLINK genotypes into dosage values (0, 1, 2)
+                // or a missing sentinel (3). All operations are performed on 8-lane vectors.
                 let two_bit_genotypes = (packed_vals >> bit_shifts.cast()) & U8xN::splat(0b11);
-                let initial_dosages =
-                    ((two_bit_genotypes >> 1) & 1) * ((two_bit_genotypes & 1) + 1);
+
+                // The formula `((g >> 1) & 1) * ((g & 1) + 1)` correctly maps the 2-bit
+                // genotype `g` to a dosage, except for the missing value.
+                // 0b00 -> 0, 0b10 -> 1, 0b11 -> 2. The case 0b01 is handled next.
+                let one = U8xN::splat(1);
+                let term1 = (two_bit_genotypes >> 1) & one;
+                let term2 = (two_bit_genotypes & one) + one;
+                let initial_dosages = term1 * term2;
+
+                // Create a mask for missing genotypes (coded as 0b01) and use it to
+                // select between the calculated dosage and the missing sentinel value.
                 let missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1));
                 let mut dosages =
-                    U8xN::mask_select(missing_mask, missing_sentinel_splat, initial_dosages);
+                    missing_mask.select(missing_sentinel_splat, initial_dosages);
+
+                // --- SIMD Reconciliation ---
+                // If the effect allele is flipped, compute `2 - dosage` for all non-missing
+                // values. This is done with a masked selection.
                 if reconciliation == Reconciliation::Flip {
                     let not_missing_mask = dosages.simd_ne(missing_sentinel_splat);
-                    dosages = U8xN::mask_select(not_missing_mask, two_splat - dosages, dosages);
+                    dosages = not_missing_mask.select(two_splat - dosages, dosages);
                 }
                 dosage_vectors[i] = dosages;
             }
