@@ -186,6 +186,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
+        let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
 
         let weights_start = snps_processed_so_far * prep_clone.score_names.len();
         let weights_end = (snps_processed_so_far + snps_in_chunk) * prep_clone.score_names.len();
