@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 pub mod batch;
 pub mod io;
 pub mod kernel;
