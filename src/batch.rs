@@ -106,7 +106,6 @@ fn process_people_iterator<'a, I>(
     weights_for_chunk: &'a [f32],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f32],
-    kernel_data_pool: &'a KernelDataPool,
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
 ) where
@@ -132,7 +131,6 @@ fn process_people_iterator<'a, I>(
                 snp_major_data,
                 weights_for_chunk,
                 block_scores_out,
-                kernel_data_pool,
                 tile_pool,
                 sparse_index_pool,
             );
@@ -148,7 +146,6 @@ fn process_block(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
     block_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
 ) {
@@ -173,7 +170,6 @@ fn process_block(
         prep_result,
         weights_for_chunk,
         block_scores_out,
-        kernel_data_pool,
         sparse_index_pool,
     );
 
@@ -189,18 +185,17 @@ fn process_tile(
     prep_result: &PreparationResult,
     weights_for_chunk: &[f32],
     block_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
     sparse_index_pool: &SparseIndexPool,
 ) {
     let snps_in_chunk = prep_result.num_reconciled_snps;
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = tile.len() / snps_in_chunk;
 
-    // --- The System-Wide Win: Pre-computation of Sparse Indices ---
+    // --- Pre-computation of Sparse Indices ---
     let thread_indices = sparse_index_pool.get_or_default();
     let (g1_indices, g2_indices) = &mut *thread_indices.borrow_mut();
 
-    // Correct buffer management: clear inner vectors to reuse their capacity.
+    // Clear inner vectors to reuse their capacity.
     // Then, only allocate new inner vectors if the current block is larger than any seen before.
     g1_indices.iter_mut().for_each(Vec::clear);
     g2_indices.iter_mut().for_each(Vec::clear);
@@ -220,8 +215,11 @@ fn process_tile(
         for (snp_idx, &dosage) in genotype_row.iter().enumerate() {
             // The dosage is repr(transparent) over u8.
             match dosage.0 {
-                1 => g1_indices[person_idx].push(snp_idx),
-                2 => g2_indices[person_idx].push(snp_idx),
+                // SAFETY: `person_idx` is guaranteed to be in bounds because the `g1_indices`
+                // and `g2_indices` vectors were resized to `num_people_in_block` and the
+                // outer loop runs from `0..num_people_in_block`.
+                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx) },
+                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx) },
                 _ => (), // Dosage 0 or 3 (missing) are ignored.
             }
         }
@@ -236,13 +234,21 @@ fn process_tile(
         .chunks_exact_mut(num_scores)
         .enumerate()
         .for_each(|(person_idx, scores_out_slice)| {
-            let thread_data = kernel_data_pool.get_or_default();
-            let acc_buffer = &mut *thread_data.borrow_mut();
+            // PERFORMANCE: This accumulator is a stack-allocated array.
+            // With a maximum of 100 scores, the size is ceil(100 / 8) = 13 SIMD vectors,
+            // or 13 * 32 = 416 bytes. This is trivial for the stack and avoids all
+            // overhead from heap allocation, ThreadLocal lookups, and RefCell borrows.
+            const MAX_SCORES: usize = 100;
+            const MAX_ACC_LANES: usize = (MAX_SCORES + SIMD_LANES - 1) / SIMD_LANES;
+            let mut acc_buffer = [kernel::SimdVec::splat(0.0); MAX_ACC_LANES];
+
+            let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
+            let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
 
             kernel::accumulate_scores_for_person(
                 &weights,
                 scores_out_slice,
-                acc_buffer,
+                acc_buffer_slice,
                 &g1_indices[person_idx],
                 &g2_indices[person_idx],
             );
