@@ -12,8 +12,7 @@ use std::simd::{f32x8, prelude::*, StdFloat};
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
 pub type SimdVec = f32x8;
-pub const LANE_COUNT: usize = SimdVec::LANE_COUNT;
-
+pub const LANE_COUNT: usize = SimdVec::LEN;
 
 // ========================================================================================
 //                            PUBLIC API & TYPE DEFINITIONS
