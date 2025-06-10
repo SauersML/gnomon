@@ -45,7 +45,6 @@ pub fn run_chunk_computation(
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f32],
-    kernel_data_pool: &KernelDataPool,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -75,7 +74,6 @@ pub fn run_chunk_computation(
                 weights_for_chunk,
                 prep_result,
                 partial_scores_out,
-                kernel_data_pool,
                 tile_pool,
                 sparse_index_pool,
             );
@@ -88,7 +86,6 @@ pub fn run_chunk_computation(
                 weights_for_chunk,
                 prep_result,
                 partial_scores_out,
-                kernel_data_pool,
                 tile_pool,
                 sparse_index_pool,
             );
