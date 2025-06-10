@@ -151,6 +151,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Spawn the dedicated I/O Producer task.
     let io_handle = tokio::spawn(async move {
+        // The `SnpChunkReader` is stateful and must be explicitly passed into and
+        // returned from the blocking task on each iteration to update its cursor.
+        // We re-bind `reader` as mutable to allow this update cycle.
+        let mut reader = reader;
+
         // The I/O task owns the reader and the channels.
         while let Some(mut buffer) = empty_buffer_rx.recv().await {
             // The synchronous read_chunk call MUST be wrapped in spawn_blocking
@@ -158,14 +163,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let read_result = task::spawn_blocking(move || {
                 let bytes_read = reader.read_chunk(&mut buffer)?;
                 let snps_in_chunk = reader.snps_in_bytes(bytes_read);
-                Ok::<_, io::Error>((buffer, bytes_read, snps_in_chunk))
+                // Return ownership of the reader and buffer for the next iteration.
+                Ok::<_, io::Error>((reader, buffer, bytes_read, snps_in_chunk))
             })
             .await
             .unwrap(); // Panicking here is acceptable; a JoinError is unrecoverable.
 
             match read_result {
-                Ok((buffer, 0, _)) => break, // EOF
-                Ok((buffer, bytes_read, snps_in_chunk)) => {
+                // `reader` is destructured here to regain ownership.
+                // EOF is reached. The I/O task's job is complete. We break the loop,
+                // allowing the `reader` and `buffer` for this final iteration to be
+                // dropped, which is the correct behavior during shutdown.
+                Ok((_, _, 0, _)) => break,
+                Ok((new_reader, buffer, bytes_read, snps_in_chunk)) => {
+                    reader = new_reader;
                     if full_buffer_tx
                         .send(IoMessage {
                             buffer,
@@ -210,8 +221,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let weights_start = snps_processed_so_far * prep_clone.score_names.len();
         let weights_end = (snps_processed_so_far + snps_in_chunk) * prep_clone.score_names.len();
-        let weights_for_chunk = prep_clone.interleaved_weights.get(weights_start..weights_end)
-            .ok_or("Internal error: Failed to slice weights buffer.")?;
 
         // Acquire a reusable buffer for partial scores to avoid allocation.
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
@@ -219,6 +228,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // Dispatch compute task to the blocking pool.
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
+            let weights_for_chunk = prep_clone
+                .interleaved_weights
+                .get(weights_start..weights_end)
+                .ok_or("Internal error: Failed to slice weights buffer.")?;
+
             batch::run_chunk_computation(
                 buffer_slice,
                 weights_for_chunk,
@@ -232,7 +246,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
 
         // Await the results of the computation.
-        let (returned_io_buffer, returned_scores_buffer) = match compute_handle.await? {
+        let (returned_io_buffer, mut returned_scores_buffer) = match compute_handle.await? {
             Ok(buffers) => buffers,
             Err(e) => return Err(e),
         };
