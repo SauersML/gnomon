@@ -327,7 +327,11 @@ fn pivot_and_reconcile_tile(
                 let snp_idx = snp_chunk_start + i;
                 let snp_byte_offset =
                     prep_result.required_snp_indices[snp_idx] as u64 * bytes_per_snp;
-                let source_byte_indices = snp_byte_offset + person_byte_indices;
+                // To find the final memory address for each person's genotype data for this SNP,
+                // we must add the SNP's base offset (a scalar) to the vector of
+                // person-specific offsets. This requires "lifting" the scalar into a vector
+                // by splatting it across all lanes.
+                let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
                 snp_data_vectors[i] =
                     U8xN::gather_or_default(snp_major_data, source_byte_indices.cast());
             }
