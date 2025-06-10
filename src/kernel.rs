@@ -104,33 +104,44 @@ pub fn accumulate_scores_for_person(
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
     let dosage_2_multiplier = SimdVec::splat(2.0);
-    // --- STEP 2: Reset the Reusable Accumulator Buffer ---
+    // --- Reset the Reusable Accumulator Buffer ---
     // Zero-out the buffer provided by the caller. This is a fast, predictable
     // operation on a buffer that should be hot in the CPU cache.
     for acc in accumulator_buffer.iter_mut() {
         *acc = SimdVec::splat(0.0);
     }
 
-    // --- STEP 3: The Fused-Multiply-Add Update Loop ---
+    // --- The Fused-Multiply-Add Update Loop ---
     // This is the performance-critical core. Every `snp_idx` is guaranteed to be
     // in-bounds by the function's safety contract.
     for &snp_idx in g1_indices {
         for i in 0..num_accumulator_lanes {
-            // This is safe due to the function's contract.
             let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
-            accumulator_buffer[i] += weights_vec;
+            // SAFETY: The `accumulator_buffer` slice is guaranteed by the caller to have
+            // `num_accumulator_lanes` elements, and this loop runs from `0..num_accumulator_lanes`,
+            // so `i` is always in bounds. This allows `get_unchecked_mut` to be used to
+            // remove bounds-checking overhead in this hot loop.
+            unsafe {
+                *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
+            }
         }
     }
 
     for &snp_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
-            // This is safe due to the function's contract.
             let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
-            accumulator_buffer[i] = weights_vec.mul_add(dosage_2_multiplier, accumulator_buffer[i]);
+            // SAFETY: The `accumulator_buffer` slice is guaranteed by the caller to have
+            // `num_accumulator_lanes` elements, and this loop runs from `0..num_accumulator_lanes`,
+            // so `i` is always in bounds. This allows `get_unchecked_mut` to be used to
+            // remove bounds-checking overhead in this hot loop.
+            unsafe {
+                let acc = accumulator_buffer.get_unchecked_mut(i);
+                *acc = weights_vec.mul_add(dosage_2_multiplier, *acc);
+            }
         }
     }
 
-    // --- STEP 4: Final Horizontal Store ---
+    // --- Final Horizontal Store ---
     // The results, which have been accumulated vertically in SIMD registers, are
     // now written out to the final destination slice.
     for (i, &acc_vec) in accumulator_buffer.iter().enumerate() {
