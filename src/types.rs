@@ -16,7 +16,6 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::ParseFloatError;
 use std::path::PathBuf;
-use thread_local::ThreadLocal;
 use std::io;
 
 // ========================================================================================
