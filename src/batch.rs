@@ -348,23 +348,28 @@ fn pivot_and_reconcile_tile(
 fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
     let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix;
 
-    // Interleave 8-bit elements
-    let (t0, t1) = simd_swizzle!(m0, m1, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]);
-    let (t2, t3) = simd_swizzle!(m2, m3, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]);
-    let (t4, t5) = simd_swizzle!(m4, m5, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]);
-    let (t6, t7) = simd_swizzle!(m6, m7, [0, 8, 2, 10, 4, 12, 6, 14], [1, 9, 3, 11, 5, 13, 7, 15]);
+    // Stage 1: Interleave 8-bit elements from adjacent rows.
+    // This is equivalent to a vpunpckl/hbw sequence on x86, which is the
+    // first step in a standard matrix transposition butterfly network.
+    let (t0, t1) = m0.interleave(m1);
+    let (t2, t3) = m2.interleave(m3);
+    let (t4, t5) = m4.interleave(m5);
+    let (t6, t7) = m6.interleave(m7);
 
-    // Interleave 16-bit elements
-    let (s0, s1) = simd_swizzle!(t0.cast::<u16>(), t2.cast::<u16>(), [0, 4, 1, 5], [2, 6, 3, 7]);
-    let (s2, s3) = simd_swizzle!(t1.cast::<u16>(), t3.cast::<u16>(), [0, 4, 1, 5], [2, 6, 3, 7]);
-    let (s4, s5) = simd_swizzle!(t4.cast::<u16>(), t6.cast::<u16>(), [0, 4, 1, 5], [2, 6, 3, 7]);
-    let (s6, s7) = simd_swizzle!(t5.cast::<u16>(), t7.cast::<u16>(), [0, 4, 1, 5], [2, 6, 3, 7]);
+    // Stage 2: Interleave 16-bit elements from the results of stage 1.
+    // This is equivalent to a vpunpckl/hwd sequence. The cast changes the
+    // granularity of the interleave operation.
+    let (s0, s1) = t0.cast::<u16>().interleave(t2.cast::<u16>());
+    let (s2, s3) = t1.cast::<u16>().interleave(t3.cast::<u16>());
+    let (s4, s5) = t4.cast::<u16>().interleave(t6.cast::<u16>());
+    let (s6, s7) = t5.cast::<u16>().interleave(t7.cast::<u16>());
 
-    // Interleave 32-bit elements
-    let (r0, r1) = simd_swizzle!(s0.cast::<u32>(), s4.cast::<u32>(), [0, 2], [1, 3]);
-    let (r2, r3) = simd_swizzle!(s1.cast::<u32>(), s5.cast::<u32>(), [0, 2], [1, 3]);
-    let (r4, r5) = simd_swizzle!(s2.cast::<u32>(), s6.cast::<u32>(), [0, 2], [1, 3]);
-    let (r6, r7) = simd_swizzle!(s3.cast::<u32>(), s7.cast::<u32>(), [0, 2], [1, 3]);
+    // Stage 3: Interleave 32-bit elements from the results of stage 2.
+    // This is equivalent to a vpunpckl/hdq sequence.
+    let (r0, r1) = s0.cast::<u32>().interleave(s4.cast::<u32>());
+    let (r2, r3) = s1.cast::<u32>().interleave(s5.cast::<u32>());
+    let (r4, r5) = s2.cast::<u32>().interleave(s6.cast::<u32>());
+    let (r6, r7) = s3.cast::<u32>().interleave(s7.cast::<u32>());
 
     [
         r0.cast(),
