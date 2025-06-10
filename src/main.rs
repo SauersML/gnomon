@@ -93,6 +93,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tile_pool_capacity = num_cpus::get().max(1) * 2;
     let tile_pool = Arc::new(ArrayQueue::new(tile_pool_capacity));
 
+    // The pool for sparse genotype indices is created once and shared safely
+    // across all compute tasks using an Atomic Reference Counter.
+    let sparse_index_pool = Arc::new(SparseIndexPool::new());
+
     // Determine a safe and effective I/O chunk size.
     const MIN_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
     const MAX_CHUNK_SIZE: u64 = 1 * 1024 * 1024 * 1024;
