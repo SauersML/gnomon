@@ -55,6 +55,17 @@ struct Args {
 //                           THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
+/// A message passed from the I/O producer task to the compute dispatcher.
+///
+/// This struct bundles the raw byte buffer from the .bed file with metadata
+/// required for processing, such as the number of valid bytes and the number
+/// of SNPs contained within that chunk.
+struct IoMessage {
+    buffer: Vec<u8>,
+    bytes_read: usize,
+    snps_in_chunk: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let start_time = Instant::now();
@@ -114,8 +125,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .push(vec![0.0f32; partial_scores_size])
             .unwrap();
     }
-    let (full_buffer_tx, mut full_buffer_rx) =
-        mpsc::channel::<(Vec<u8>, usize)>(PIPELINE_DEPTH);
+    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<IoMessage>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
     eprintln!(
@@ -125,9 +135,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     // --- Phase 4: True Concurrent Pipeline Execution ---
-    // The message passed from the I/O task to the compute dispatcher.
-    type IoMessage = (Vec<u8>, usize, usize); // (buffer, bytes_read, snps_in_chunk)
-
     // Prime the pipeline by sending the empty I/O buffers to the I/O task.
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
@@ -159,7 +166,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match read_result {
                 Ok((buffer, 0, _)) => break, // EOF
                 Ok((buffer, bytes_read, snps_in_chunk)) => {
-                    if full_buffer_tx.send((buffer, bytes_read, snps_in_chunk)).await.is_err() {
+                    if full_buffer_tx
+                        .send(IoMessage {
+                            buffer,
+                            bytes_read,
+                            snps_in_chunk,
+                        })
+                        .await
+                        .is_err()
+                    {
                         break; // Consumer has disconnected.
                     }
                 }
@@ -174,7 +189,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // The main task becomes the Consumer and Compute Dispatcher.
     let mut snps_processed_so_far = 0;
-    while let Some((full_buffer, bytes_read, snps_in_chunk)) = full_buffer_rx.recv().await {
+    while let Some(IoMessage {
+        buffer: full_buffer,
+        bytes_read,
+        snps_in_chunk,
+    }) = full_buffer_rx.recv().await
+    {
         if snps_in_chunk == 0 {
             // If the chunk was empty, immediately recycle the buffer.
             if empty_buffer_tx.send(full_buffer).await.is_err() {
