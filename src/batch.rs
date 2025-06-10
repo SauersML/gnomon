@@ -19,6 +19,7 @@ use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::error::Error;
+use std::simd::num::SimdUint;
 use std::simd::prelude::*;
 
 // --- SIMD & Engine Tuning Parameters ---
