@@ -147,6 +147,6 @@ pub fn accumulate_scores_for_person(
     for (i, &acc_vec) in accumulator_buffer.iter().enumerate() {
         let start = i * LANE_COUNT;
         let end = (start + LANE_COUNT).min(num_scores);
-        acc_vec.write_to_slice(&mut scores_out[start..end]);
+        acc_vec.copy_to_slice(&mut scores_out[start..end]);
     }
 }
