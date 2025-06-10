@@ -12,7 +12,6 @@
 // a clean, one-way dependency graph where high-level modules can depend on these
 // core types, but not on each other's implementation details.
 
-use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::ParseFloatError;
