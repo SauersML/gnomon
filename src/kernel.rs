@@ -24,7 +24,10 @@ pub const LANE_COUNT: usize = SimdVec::LEN;
 /// dimensions are coherent, making an invalidly-dimensioned matrix an unrepresentable state.
 pub struct InterleavedWeights<'a> {
     slice: &'a [f32],
-    num_snps: usize,
+    // This field acts as a "proof token." Its value is used only for validation
+    // during construction, guaranteeing that any instance of this struct has
+    // coherent dimensions. It is intentionally not read afterwards.
+    _num_snps: usize,
     num_scores: usize,
 }
 
@@ -44,7 +47,7 @@ impl<'a> InterleavedWeights<'a> {
         }
         Ok(Self {
             slice,
-            num_snps,
+            _num_snps: num_snps,
             num_scores,
         })
     }
