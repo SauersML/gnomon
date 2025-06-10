@@ -30,6 +30,37 @@ type U8xN = Simd<u8, SIMD_LANES>;
 /// This value is tuned to ensure the tile fits comfortably within the L3 cache.
 const PERSON_BLOCK_SIZE: usize = 4096;
 
+use thread_local::ThreadLocal;
+
+/// A type-safe wrapper for an index of a block of people.
+#[derive(Clone, Copy)]
+struct BlockIndex(usize);
+
+/// A thread-local pool for reusing the memory buffers required for storing
+/// sparse indices (`g1_indices`, `g2_indices`).
+#[derive(Default, Debug)]
+pub struct SparseIndexPool {
+    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)>>,
+}
+
+impl SparseIndexPool {
+    /// Creates a new, empty pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Gets the thread-local buffer of sparse indices.
+    ///
+    /// If this is the first time the current thread is accessing the pool, a new,
+    /// empty buffer pair `(Vec::new(), Vec::new())` will be created and wrapped in
+    /// a `RefCell` for it. Subsequent calls from the same thread will return a
+    /// reference to the exact same `RefCell`-wrapped buffer, allowing for efficient reuse.
+    #[inline(always)]
+    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
+        self.pool.get_or_default()
+    }
+}
+
 // ========================================================================================
 //                                   PUBLIC API
 // ========================================================================================
