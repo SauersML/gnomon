@@ -232,7 +232,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
 
         // Await the results of the computation.
-        let (returned_io_buffer, returned_scores_buffer) = compute_handle.await??;
+        let (returned_io_buffer, returned_scores_buffer) = match compute_handle.await? {
+            Ok(buffers) => buffers,
+            Err(e) => return Err(e),
+        };
 
         // Recycle the I/O buffer by sending it back to the I/O task.
         if empty_buffer_tx.send(returned_io_buffer).await.is_err() {
