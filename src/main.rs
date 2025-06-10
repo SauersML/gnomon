@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &prep_clone,
                 &mut partial_scores_buffer, // Mutates the buffer in-place
                 &tile_pool_clone,
+                &sparse_index_pool_clone,
             )?;
             // Return ownership of both buffers for reuse.
             Ok::<_, Box<dyn Error + Send + Sync>>((full_buffer, partial_scores_buffer))
