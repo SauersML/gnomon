@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let bed_path = plink_prefix.with_extension("bed");
-    let mut reader = SnpChunkReader::new(
+    let reader = SnpChunkReader::new(
         &bed_path,
         prep_result.total_people_in_fam,
         prep_result.total_snps_in_bim,
