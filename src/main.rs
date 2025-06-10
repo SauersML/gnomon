@@ -89,7 +89,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
     let mut all_scores =
         vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
-    let kernel_data_pool = Arc::new(KernelDataPool::new());
     let tile_pool_capacity = num_cpus::get().max(1) * 2;
     let tile_pool = Arc::new(ArrayQueue::new(tile_pool_capacity));
 
@@ -180,7 +179,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let prep_clone = Arc::clone(&prep_result);
-        let pool_clone = Arc::clone(&kernel_data_pool);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
 
@@ -200,7 +198,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 weights_for_chunk,
                 &prep_clone,
                 &mut partial_scores_buffer, // Mutates the buffer in-place
-                &pool_clone,
                 &tile_pool_clone,
             )?;
             // Return ownership of both buffers for reuse.
