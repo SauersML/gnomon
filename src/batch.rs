@@ -364,7 +364,7 @@ fn pivot_and_reconcile_tile(
             bytes_per_snp
         );
         eprintln!(
-            "[DBG] pivot_and_reconcile_tile: num_people_in_block={} snps_in_chunk={} slice.len={} bytes_per_snp={}",
+            "[debug] pivot_and_reconcile_tile: num_people_in_block={} snps_in_chunk={} slice.len={} bytes_per_snp={}",
             num_people_in_block, snps_in_chunk, slice_len, bytes_per_snp
         );
     }
