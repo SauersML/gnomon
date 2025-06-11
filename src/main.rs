@@ -39,9 +39,6 @@ use std::fs::File;
     about = "A high-performance engine for polygenic score calculation."
 )]
 struct Args {
-    /// Path to the PLINK .bed file, or a directory containing a single .bed file.
-    input_path: PathBuf,
-
     /// Path to the score file.
     #[clap(long)]
     score: PathBuf,
@@ -50,6 +47,9 @@ struct Args {
     /// If not provided, all individuals in the .fam file will be scored.
     #[clap(long)]
     keep: Option<PathBuf>,
+
+    /// Path to the PLINK .bed file, or a directory containing a single .bed file.
+    input_path: PathBuf,
 }
 
 // ========================================================================================
