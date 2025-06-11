@@ -115,7 +115,7 @@ def monitor_memory(p: subprocess.Popen, results: dict):
 
 def run_and_measure(command: list, tool_name: str) -> dict:
     """Runs a command, measuring its wall-clock time and peak memory usage."""
-    print(f"--- 실행: {tool_name} ---")
+    print(f"--- {tool_name} ---")
     start_time = time.perf_counter()
     
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
