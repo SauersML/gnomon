@@ -27,6 +27,8 @@ use sysinfo::System;
 use tokio::sync::mpsc;
 use tokio::task;
 use std::fs::File;
+use std::cell::Cell;
+use tokio::sync::mpsc::{error::SendError, Sender};
 
 // ========================================================================================
 //                         COMMAND-LINE INTERFACE DEFINITION
@@ -65,6 +67,76 @@ struct IoMessage {
     buffer: Vec<u8>,
     bytes_read: usize,
     snps_in_chunk: usize,
+}
+
+/// A structure that bundles the I/O buffer and the partial scores buffer for a
+/// single computational chunk. This type enforces that the partial scores are
+/// merged before the I/O buffer can be recycled, preventing data loss.
+struct ChunkResult {
+    io_buffer: Vec<u8>,
+    partial_scores: Vec<f32>,
+    /// A debug-only flag to ensure the chunk is explicitly committed.
+    #[cfg(debug_assertions)]
+    committed: Cell<bool>,
+}
+
+impl ChunkResult {
+    /// Creates a new `ChunkResult` from its constituent buffers.
+    fn new(io_buffer: Vec<u8>, partial_scores: Vec<f32>) -> Self {
+        Self {
+            io_buffer,
+            partial_scores,
+            #[cfg(debug_assertions)]
+            committed: Cell::new(false),
+        }
+    }
+
+    /// Atomically merges partial scores, sends the I/O buffer back to the
+    /// producer, and returns the now-cleared partial scores buffer for reuse.
+    ///
+    /// This `async` method consumes the `ChunkResult`, enforcing a single-use
+    /// policy and guaranteeing correct operational order.
+    #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
+    async fn commit(
+        self,
+        all_scores: &mut [f32],
+        empty_tx: &Sender<Vec<u8>>,
+    ) -> (Vec<f32>, Result<(), SendError<Vec<u8>>>) {
+        // --- Core Logic: Merge partial scores into the master array ---
+        for (master_score, partial_score) in all_scores.iter_mut().zip(&self.partial_scores) {
+            *master_score += partial_score;
+        }
+
+        // --- Mark as committed for the Drop guard ---
+        #[cfg(debug_assertions)]
+        self.committed.set(true);
+
+        // --- Asynchronously recycle the I/O buffer ---
+        let send_result = empty_tx.send(self.io_buffer).await;
+
+        // --- Prepare the partial_scores buffer for reuse ---
+        let mut recycled_scores_buffer = self.partial_scores;
+        // Using `fill` is the idiomatic and most performant way to zero a slice.
+        recycled_scores_buffer.fill(0.0);
+
+        (recycled_scores_buffer, send_result)
+    }
+}
+
+/// A debug-only RAII guard that panics if a `ChunkResult` is dropped without
+/// being explicitly committed. This prevents silent data loss during development
+/// and refactoring if a code path accidentally discards a result.
+#[cfg(debug_assertions)]
+impl Drop for ChunkResult {
+    fn drop(&mut self) {
+        if !self.committed.get() {
+            // Check if there were any non-zero scores that were about to be lost.
+            let was_data_loss = self.partial_scores.iter().any(|&score| score != 0.0);
+            if was_data_loss {
+                panic!("CRITICAL BUG: A `ChunkResult` with non-zero scores was dropped without being committed. This indicates a silent data loss has occurred.");
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -301,12 +373,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // we can skip it entirely and immediately recycle its I/O buffer.
         if num_reconciled_in_chunk == 0 {
             if empty_buffer_tx.send(full_buffer).await.is_err() {
+                // Producer has shut down, which is fine. The pipeline is draining.
                 break;
             }
             bed_row_offset += snps_in_chunk;
             continue;
         }
 
+        // --- Prepare resources for the compute task ---
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
@@ -326,29 +400,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
-#[cfg(debug_assertions)]
-{
-    eprintln!(
-        "[debug] CHUNK ➤ offset={} bytes={} snps_in_chunk={} \
-         recon_range=[{}..{}) ({} snps) \
-         weights=[{}..{})({} floats) \
-         partial_scores_buf.len={} people_to_score={} scores_per_person={}",
-        bed_row_offset,
-        bytes_read,
-        snps_in_chunk,
-        reconciled_indices_start,
-        reconciled_indices_end,
-        num_reconciled_in_chunk,
-        weights_start,
-        weights_end,
-        weights_end - weights_start,
-        partial_scores_buffer.len(),
-        prep_clone.num_people_to_score,
-        prep_clone.score_names.len(),
-    );
-}
-        // Dispatch the computation. We pass the raw buffer slice as before, but now also
-        // include the specific sub-problem parameters for the compute engine.
+        // --- Dispatch the computation task ---
+        // The compute task is given ownership of the buffers and will return them
+        // bundled in a `ChunkResult`, which enforces correct handling.
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
             let weights_for_chunk = prep_clone
@@ -366,34 +420,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 reconciled_indices_start,
                 bed_row_offset,
             )?;
-            Ok::<_, Box<dyn Error + Send + Sync>>((full_buffer, partial_scores_buffer))
+            // On success, bundle the buffers into a `ChunkResult` for safe handling.
+            let result = ChunkResult::new(full_buffer, partial_scores_buffer);
+            Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
 
-        let (returned_io_buffer, mut returned_scores_buffer) = match compute_handle.await? {
-            Ok(buffers) => buffers,
+        // --- Await and Commit the Result ---
+        // This is the critical section. We await the result, and if successful,
+        // we call `.commit()`, which atomically merges scores and recycles buffers.
+        let chunk_result = match compute_handle.await? {
+            Ok(result) => result,
             Err(e) => {
-                eprintln!("Compute task panicked: {:?}", e);
+                // A true error in the compute task. Propagate it.
+                eprintln!("Compute task failed: {:?}", e);
                 return Err(e);
-            },
+            }
         };
 
-        #[cfg(debug_assertions)]
-        {
-            // Check if the empty-buffer channel is already closed before returning the buffer
-            let is_closed = empty_buffer_tx.is_closed();
-            eprintln!("[debug] empty_buffer_tx closed = {}", is_closed);
-        }
+        // The `commit` call handles the score merge, I/O buffer return, and
+        // gives back the partial scores buffer, already zeroed for reuse.
+        let (recycled_scores_buffer, send_result) = chunk_result
+            .commit(&mut all_scores, &empty_buffer_tx)
+            .await;
 
-        if empty_buffer_tx.send(returned_io_buffer).await.is_err() {
+        // Return the recycled buffer to the pool for the next iteration.
+        partial_scores_pool_clone.push(recycled_scores_buffer).unwrap();
+
+        // If sending the I/O buffer failed, the producer has terminated,
+        // so we should stop processing new chunks.
+        if send_result.is_err() {
+            #[cfg(debug_assertions)]
+            eprintln!("[debug] Consumer breaking: I/O task has terminated.");
             break;
         }
-
-        for (master_score, partial_score) in all_scores.iter_mut().zip(returned_scores_buffer.iter()) {
-            *master_score += partial_score;
-        }
-
-        returned_scores_buffer.iter_mut().for_each(|s| *s = 0.0);
-        partial_scores_pool_clone.push(returned_scores_buffer).unwrap();
 
         // Advance the raw file offset for the next chunk.
         bed_row_offset += snps_in_chunk;
