@@ -53,19 +53,28 @@ NUMERICAL_TOLERANCE = 1e-5
 #                             HELPER FUNCTIONS
 # ========================================================================================
 
+def print_header(title: str):
+    """Prints a formatted header."""
+    print("\n" + "=" * 80)
+    print(f"===== {title.upper()} =====")
+    print("=" * 80)
+
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads a file and extracts it if it is a .zip or .gz archive."""
-    # Strip URL query parameters (e.g., ?raw=true) to correctly identify the filename.
     base_url = url.split('?')[0]
     filename = Path(base_url.split("/")[-1])
     download_path = dest_dir / filename
     
     print(f"Downloading {filename}...")
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-    with open(download_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    try:
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        with open(download_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ FAILED to download {url}: {e}")
+        sys.exit(1)
 
     if str(filename).endswith(".zip"):
         print(f"Unzipping {filename}...")
@@ -82,6 +91,7 @@ def download_and_extract(url: str, dest_dir: Path):
 
 def setup_environment():
     """Prepares the CI workspace by downloading and setting up all required artifacts."""
+    print_header("Environment Setup")
     CI_WORKDIR.mkdir(exist_ok=True)
     
     # Download and set up tools
@@ -99,28 +109,60 @@ def setup_environment():
     for url in PGS_SCORES.values():
         download_and_extract(url, CI_WORKDIR)
 
-    print("--- Environment setup complete ---\n")
+    print("\n--- Environment setup complete ---\n")
 
 def monitor_memory(p: subprocess.Popen, results: dict):
     """Polls process memory usage in a separate thread."""
     peak_mem = 0
     results['peak_mem_mb'] = 0
-    proc = psutil.Process(p.pid)
-    while p.poll() is None:
-        try:
-            mem_info = proc.memory_info()
-            peak_mem = max(peak_mem, mem_info.rss)
-        except psutil.NoSuchProcess:
-            break
-        time.sleep(0.01) # Poll every 10ms
+    try:
+        proc = psutil.Process(p.pid)
+        while p.poll() is None:
+            try:
+                mem_info = proc.memory_info()
+                peak_mem = max(peak_mem, mem_info.rss)
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.01)
+    except psutil.NoSuchProcess:
+        pass # Process may have finished before the thread started
     results['peak_mem_mb'] = peak_mem / (1024 * 1024)
 
-def run_and_measure(command: list, tool_name: str) -> dict:
+def inspect_file_head(file_path: Path, num_lines: int = 5):
+    """Prints the first few lines of a file for debugging."""
+    print("-" * 30)
+    print(f"Inspecting file: {file_path.name}")
+    print(f"Full path: {file_path.resolve()}")
+    if not file_path.exists():
+        print(">>> FILE DOES NOT EXIST <<<")
+        print("-" * 30)
+        return
+        
+    print("-" * 30)
+    try:
+        with open(file_path, 'r') as f:
+            for i, line in enumerate(f):
+                if i >= num_lines:
+                    break
+                print(f"{i+1: >3}: {line.strip()}")
+        print("-" * 30)
+    except Exception as e:
+        print(f"Could not read file: {e}")
+        print("-" * 30)
+
+
+def run_and_measure(command: list, tool_name: str, files_to_inspect_on_error: list = None) -> dict:
     """Runs a command, measuring its wall-clock time and peak memory usage."""
-    print(f"--- {tool_name} ---")
+    print(f"\n--- Running: {tool_name} ---")
     start_time = time.perf_counter()
     
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(
+        command, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE, 
+        text=True, 
+        encoding='utf-8'
+    )
     
     monitor_results = {}
     mem_thread = threading.Thread(target=monitor_memory, args=(process, monitor_results))
@@ -132,13 +174,27 @@ def run_and_measure(command: list, tool_name: str) -> dict:
     end_time = time.perf_counter()
     
     if process.returncode != 0:
-        print(f"❌ ERROR running {tool_name}. Exit code: {process.returncode}")
-        print("--- STDOUT ---")
-        print(stdout)
-        print("--- STDERR ---")
-        print(stderr)
+        print_header(f"ERROR running {tool_name}")
+        print(f"Exit Code: {process.returncode}")
+        
+        print("\n--- COMMAND ---")
+        print(' '.join(map(str, command)))
+        
+        print("\n--- STDOUT ---")
+        print(stdout if stdout else "[EMPTY]")
+        
+        print("\n--- STDERR ---")
+        print(stderr if stderr else "[EMPTY]")
+        
+        if files_to_inspect_on_error:
+            print_header("INSPECTING RELEVANT FILES FOR DEBUGGING")
+            for file_path in files_to_inspect_on_error:
+                inspect_file_head(Path(file_path))
+        
+        print_header("TEST SUITE HALTED DUE TO ERROR")
         sys.exit(1)
         
+    print(f"--- Finished {tool_name} in {end_time - start_time:.2f}s ---")
     return {
         'tool': tool_name,
         'time_sec': end_time - start_time,
@@ -149,90 +205,114 @@ def find_reformatted_file(original_pgs_path: Path) -> Path:
     """Constructs the expected path of a gnomon-reformatted score file."""
     expected_name = f"{original_pgs_path.stem}.gnomon_format.tsv"
     expected_path = original_pgs_path.parent / expected_name
-    assert expected_path.exists(), f"Reformatted file not found at {expected_path}"
+    if not expected_path.exists():
+        print(f"❌ Could not find the expected reformatted file at: {expected_path}")
+        # This is a critical failure of the gnomon run, so we should exit.
+        sys.exit(1)
+    print(f"Found reformatted score file: {expected_path.name}")
     return expected_path
 
 def validate_outputs(gnomon_path: Path, plink2_path: Path, plink1_path: Path, pgs_id: str) -> bool:
     """Compares the output files from all tools for identity and correlation."""
-    print(f"--- 검증: Validating outputs for {pgs_id} ---")
+    print_header(f"Validating outputs for {pgs_id}")
     try:
         gnomon_df = pd.read_csv(gnomon_path, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
         plink2_df = pd.read_csv(plink2_path, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
         plink1_df = pd.read_csv(plink1_path, delim_whitespace=True).set_index("IID")
+        
+        print("Successfully loaded output files from all tools.")
 
-        # Get score column names
         score_name_gnomon = gnomon_df.columns[0]
         score_name_plink2 = f"{score_name_gnomon}_SUM"
         
-        # Merge for comparison
         merged = gnomon_df.join(plink2_df[[score_name_plink2]]).join(plink1_df[['SCORE']])
         
-        # 1. Numerical Identity Check
         is_close_p2 = np.isclose(merged[score_name_gnomon], merged[score_name_plink2], atol=NUMERICAL_TOLERANCE)
-        is_close_p1 = np.isclose(merged[score_name_gnomon], merged['SCORE'], atol=NUMERICAL_TOLERANCE)
-        
-        assert is_close_p2.all(), f"Numerical mismatch between Gnomon and PLINK2 for {pgs_id}"
+        mismatches_p2 = merged[~is_close_p2]
+        if not mismatches_p2.empty:
+            print(f"❌ Numerical mismatch between Gnomon and PLINK2 for {pgs_id}")
+            print("Sample of mismatched scores:")
+            print(mismatches_p2.head())
+            return False
         print(f"✅ Numerical Identity: Gnomon == PLINK2")
         
-        assert is_close_p1.all(), f"Numerical mismatch between Gnomon and PLINK1 for {pgs_id}"
+        is_close_p1 = np.isclose(merged[score_name_gnomon], merged['SCORE'], atol=NUMERICAL_TOLERANCE)
+        mismatches_p1 = merged[~is_close_p1]
+        if not mismatches_p1.empty:
+            print(f"❌ Numerical mismatch between Gnomon and PLINK1 for {pgs_id}")
+            print("Sample of mismatched scores:")
+            print(mismatches_p1.head())
+            return False
         print(f"✅ Numerical Identity: Gnomon == PLINK1")
         
-        # 2. Correlation Check (as a redundant sanity check)
         correlation = merged.corr().iloc[0, 1]
-        assert correlation > CORRELATION_THRESHOLD, f"Correlation below threshold ({correlation:.5f}) for {pgs_id}"
+        if not (correlation > CORRELATION_THRESHOLD):
+            print(f"❌ Correlation below threshold ({correlation:.5f}) for {pgs_id}")
+            return False
         print(f"✅ Correlation > {CORRELATION_THRESHOLD} (actual: {correlation:.6f})")
         
         return True
 
-    except Exception as e:
-        print(f"❌ VALIDATION FAILED for {pgs_id}: {e}")
+    except FileNotFoundError as e:
+        print(f"❌ VALIDATION FAILED for {pgs_id}: Output file not found: {e}")
         return False
-
+    except Exception as e:
+        print(f"❌ VALIDATION FAILED for {pgs_id} with an unexpected error: {e}")
+        return False
 
 # ========================================================================================
 #                             MAIN EXECUTION
 # ========================================================================================
 
 if __name__ == "__main__":
-    print("===== Running Gnomon CI Test & Benchmark Suite =====")
+    print_header("Running Gnomon CI Test & Benchmark Suite")
     setup_environment()
     
     all_perf_results = []
     any_test_failed = False
     
     for pgs_id, pgs_url in PGS_SCORES.items():
-        print(f"\n===== TESTING SCORE: {pgs_id} =====")
+        print_header(f"TESTING SCORE: {pgs_id}")
         original_score_file = CI_WORKDIR / Path(pgs_url.split("/")[-1]).stem
+        reformatted_file_path = original_score_file.parent / f"{original_score_file.stem}.gnomon_format.tsv"
 
         # --- Run Gnomon (triggers auto-reformatting) ---
         cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CI_WORKDIR)]
-        all_perf_results.append(run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}"))
+        # Define the key files to inspect if gnomon fails
+        gnomon_debug_files = [
+            PLINK_PREFIX.with_suffix(".bim"),
+            original_score_file,
+            reformatted_file_path  # This might not exist if failure is early
+        ]
+        all_perf_results.append(run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}", gnomon_debug_files))
         
         # --- Find reformatted file for PLINK ---
         reformatted_file = find_reformatted_file(original_score_file)
         
         # --- Run PLINK2 ---
+        plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         cmd_plink2 = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), 
                       "--score", str(reformatted_file), "header", "no-mean-imputation",
-                      "--score-col-nums", "3", "--out", str(CI_WORKDIR / f"plink2_{pgs_id}")]
+                      "--score-col-nums", "3", "--out", str(plink2_out_prefix)]
         all_perf_results.append(run_and_measure(cmd_plink2, f"plink2_{pgs_id}"))
 
         # --- Run PLINK1 ---
+        plink1_out_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         cmd_plink1 = [str(PLINK1_BINARY), "--bfile", str(PLINK_PREFIX), 
                       "--score", str(reformatted_file), "1", "2", "3", "header", "sum", "no-mean-imputation",
-                      "--out", str(CI_WORKDIR / f"plink1_{pgs_id}")]
+                      "--out", str(plink1_out_prefix)]
         all_perf_results.append(run_and_measure(cmd_plink1, f"plink1_{pgs_id}"))
         
         # --- Validate Outputs ---
         gnomon_out = original_score_file.parent / f"{original_score_file.name}.sscore"
-        plink2_out = CI_WORKDIR / f"plink2_{pgs_id}.sscore"
-        plink1_out = CI_WORKDIR / f"plink1_{pgs_id}.profile"
+        plink2_out = plink2_out_prefix.with_suffix(".sscore")
+        plink1_out = plink1_out_prefix.with_suffix(".profile")
         
         if not validate_outputs(gnomon_out, plink2_out, plink1_out, pgs_id):
             any_test_failed = True
 
     # --- Analyze and Report Performance ---
-    print("\n\n===== PERFORMANCE SUMMARY =====")
+    print_header("PERFORMANCE SUMMARY")
     results_df = pd.DataFrame(all_perf_results)
     results_df['pgs_id'] = results_df['tool'].apply(lambda x: x.split('_')[1])
     results_df['tool_base'] = results_df['tool'].apply(lambda x: x.split('_')[0])
@@ -246,20 +326,23 @@ if __name__ == "__main__":
 
     print(summary.to_markdown(index=False, floatfmt=".3f"))
     
-    gnomon_stats = summary[summary['tool_base'] == 'gnomon'].iloc[0]
-    plink2_stats = summary[summary['tool_base'] == 'plink2'].iloc[0]
-    
-    time_factor = plink2_stats['mean_time_sec'] / gnomon_stats['mean_time_sec']
-    mem_factor = gnomon_stats['mean_mem_mb'] / plink2_stats['mean_mem_mb']
-    
-    print("\n--- PERFORMANCE FACTORS (Gnomon vs PLINK2) ---")
-    print(f"Time:       Gnomon is {time_factor:.2f}x faster on average.")
-    print(f"Memory:     Gnomon uses {mem_factor:.2f}x the memory of PLINK2 on average.")
+    if 'gnomon' in summary['tool_base'].values and 'plink2' in summary['tool_base'].values:
+        gnomon_stats = summary[summary['tool_base'] == 'gnomon'].iloc[0]
+        plink2_stats = summary[summary['tool_base'] == 'plink2'].iloc[0]
+        
+        time_factor = plink2_stats['mean_time_sec'] / gnomon_stats['mean_time_sec']
+        mem_factor = gnomon_stats['mean_mem_mb'] / plink2_stats['mean_mem_mb']
+        
+        print("\n--- PERFORMANCE FACTORS (Gnomon vs PLINK2) ---")
+        print(f"Time:       Gnomon is {time_factor:.2f}x faster on average.")
+        print(f"Memory:     Gnomon uses {mem_factor:.2f}x the memory of PLINK2 on average.")
     
     # --- Final Exit ---
     if any_test_failed:
-        print("\n\n❌ CI CHECK FAILED: One or more correctness tests did not pass.")
+        print_header("CI CHECK FAILED")
+        print("❌ One or more correctness tests did not pass.")
         sys.exit(1)
     else:
-        print("\n\n🎉 CI CHECK PASSED: All correctness and performance tests completed successfully.")
+        print_header("CI CHECK PASSED")
+        print("🎉 All correctness and performance tests completed successfully.")
         sys.exit(0)
