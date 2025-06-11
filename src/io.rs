@@ -23,7 +23,7 @@ pub struct SnpChunkReader {
 
     /// The current read position (in bytes) within the memory map. It is initialized
     /// to 3 to skip the PLINK magic number.
-    cursor: u64,
+    pub cursor: u64,
 
     /// The total size of the file in bytes, cached at creation time.
     file_size: u64,
