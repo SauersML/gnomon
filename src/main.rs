@@ -257,18 +257,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     // The main task becomes the Consumer and Compute Dispatcher.
-    let mut snps_processed_so_far = 0;
+    // We must track two separate counters: one for the raw .bed file rows, and one
+    // for the index into our compacted, reconciled SNP data structures.
+    let mut bed_row_offset = 0;
+    let mut reconciled_snps_processed = 0;
+
     while let Some(IoMessage {
         buffer: full_buffer,
         bytes_read,
         snps_in_chunk,
     }) = full_buffer_rx.recv().await
     {
-        if snps_in_chunk == 0 {
-            // If the chunk was empty, immediately recycle the buffer.
+        // The current raw I/O chunk corresponds to a specific range of rows in the .bed file.
+        let bed_row_end = bed_row_offset + snps_in_chunk;
+
+        // Using the sorted `required_snp_indices` list from the preparation phase,
+        // we can efficiently find which (if any) of our reconciled SNPs fall
+        // within the current raw I/O chunk. `partition_point` performs a binary search.
+        let reconciled_indices_start = prep_result
+            .required_snp_indices
+            .partition_point(|&x| x < bed_row_offset);
+        let reconciled_indices_end = prep_result
+            .required_snp_indices
+            .partition_point(|&x| x < bed_row_end);
+
+        let num_reconciled_in_chunk = reconciled_indices_end - reconciled_indices_start;
+
+        // If this chunk of the .bed file contains no SNPs relevant to our calculation,
+        // we can skip it entirely and immediately recycle its I/O buffer.
+        if num_reconciled_in_chunk == 0 {
             if empty_buffer_tx.send(full_buffer).await.is_err() {
                 break;
             }
+            bed_row_offset += snps_in_chunk;
             continue;
         }
 
@@ -277,13 +298,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
 
-        let weights_start = snps_processed_so_far * prep_clone.score_names.len();
-        let weights_end = (snps_processed_so_far + snps_in_chunk) * prep_clone.score_names.len();
+        // Correctly slice the weights buffer. The indices are now derived from the
+        // number of *reconciled* SNPs processed so far, not the raw file offset.
+        let weights_start = reconciled_snps_processed * prep_clone.score_names.len();
+        let weights_end = (reconciled_snps_processed + num_reconciled_in_chunk) * prep_clone.score_names.len();
 
-        // Acquire a reusable buffer for partial scores to avoid allocation.
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
-        // Dispatch compute task to the blocking pool.
+        // Dispatch the computation. We pass the raw buffer slice as before, but now also
+        // include the specific sub-problem parameters for the compute engine.
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
             let weights_for_chunk = prep_clone
@@ -295,41 +318,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 buffer_slice,
                 weights_for_chunk,
                 &prep_clone,
-                &mut partial_scores_buffer, // Mutates the buffer in-place
+                &mut partial_scores_buffer,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
+                reconciled_indices_start,
+                bed_row_offset,
             )?;
-            // Return ownership of both buffers for reuse.
             Ok::<_, Box<dyn Error + Send + Sync>>((full_buffer, partial_scores_buffer))
         });
 
-        // Await the results of the computation.
         let (returned_io_buffer, mut returned_scores_buffer) = match compute_handle.await? {
             Ok(buffers) => buffers,
             Err(e) => return Err(e),
         };
 
-        // Recycle the I/O buffer by sending it back to the I/O task.
         if empty_buffer_tx.send(returned_io_buffer).await.is_err() {
-            // I/O task has shut down, we can't continue.
             break;
         }
 
-        // Perform the sequential, non-contentious merge step.
         for (master_score, partial_score) in all_scores.iter_mut().zip(returned_scores_buffer.iter()) {
             *master_score += partial_score;
         }
-        
-        // Before returning the scores buffer to the pool, it must be cleared.
+
         returned_scores_buffer.iter_mut().for_each(|s| *s = 0.0);
         partial_scores_pool_clone.push(returned_scores_buffer).unwrap();
 
-        snps_processed_so_far += snps_in_chunk;
+        // Update both counters before processing the next chunk.
+        bed_row_offset += snps_in_chunk;
+        reconciled_snps_processed += num_reconciled_in_chunk;
+
+        // The progress report is now accurate.
         eprintln!(
             "> Processed chunk: {}/{} SNPs ({:.1}%)",
-            snps_processed_so_far,
+            reconciled_snps_processed,
             prep_result.num_reconciled_snps,
-            (snps_processed_so_far as f32 / prep_result.num_reconciled_snps as f32) * 100.0
+            (reconciled_snps_processed as f32 / prep_result.num_reconciled_snps as f32) * 100.0
         );
     }
 
