@@ -1,6 +1,4 @@
-# .github/workflows/test.yml
-
-name: Gnomon Integration & Performance CI
+name: Rust Test CI
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,38 +15,145 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # This single job compiles the Rust binary and then uses a Python script
-  # to orchestrate an end-to-end test against PLINK for both correctness
-  # and performance.
-  test-and-benchmark:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly toolchain
+      - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Setup Python environment
+      - name: Cache Cargo home
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.toml') }}
+            ${{ runner.os }}-cargo-home
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}
+            ${{ runner.os }}-target
+
+      - name: Cache Rust toolchain components
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+            ~/.rustup/settings.toml
+          key: ${{ runner.os }}-rust-toolchain-nightly-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-toolchain-nightly
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt
+
+      - name: Cache getdoc installation
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/getdoc
+          key: ${{ runner.os }}-getdoc-binary-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-getdoc-binary
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/deps
+            target/debug/build
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-deps
+
+      # --- Stage 1: Initial Validation and Reporting ---
+
+      - name: Install getdoc
+        run: |
+          if [ ! -f ~/.cargo/bin/getdoc ]; then
+            echo "Installing getdoc..."
+            cargo +nightly install getdoc --locked
+          else
+            echo "getdoc already installed (cached)"
+          fi
+
+      - name: Cache test artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/incremental
+            target/.rustc_info.json
+          key: ${{ runner.os }}-test-artifacts-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-test-artifacts
+
+      - name: Run Rust unit tests
+        id: test_step
+        run: cargo +nightly test
+        continue-on-error: true
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Cache generated reports
+        uses: actions/cache@v4
+        with:
+          path: |
+            report.md
+            target/doc
+          key: ${{ runner.os }}-reports-${{ github.sha }}
+
+      - name: Generate custom report with getdoc
+        run: |
+          ~/.cargo/bin/getdoc
+          echo "=== Custom Report (getdoc) ==="
+          cat report.md
+
+      - name: Fail job if unit tests failed
+        if: steps.test_step.outcome == 'failure'
+        run: exit 1
+
+      # --- Stage 2: Integration Test, Correctness Validation, and Benchmark ---
+
+      - name: Build Gnomon release binary
+        run: cargo build --release
+
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      # The sccache action helps to speed up Rust compilations by caching
-      # compiled artifacts. It is more robust than manual cache steps.
-      - name: Setup sccache for Rust build caching
-        uses: mozilla-actions/sccache-action@v0.0.5
-
       - name: Install Python dependencies
+        run: pip install pandas numpy requests psutil
+
+      - name: Install PLINK Binaries
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy requests psutil
+          # PLINK 1.9
+          wget https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip -O plink1.zip
+          unzip plink1.zip
+          sudo mv plink /usr/local/bin/
 
-      - name: Compile Gnomon in release mode
-        env:
-          # Wire the Rust build process to use sccache.
-          RUSTC_WRAPPER: sccache
-        run: cargo build --release
+          # PLINK 2.0
+          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_x86_64_20240116.zip -O plink2.zip
+          unzip plink2.zip
+          sudo mv plink2 /usr/local/bin/
 
-      - name: Run Unified Test & Benchmark Script
-        run: python testing/test.py
+          echo "--- PLINK Versions ---"
+          plink --version
+          plink2 --version
+
+      - name: Run Unified End-to-End Test Suite
+        run: python test/test.py
