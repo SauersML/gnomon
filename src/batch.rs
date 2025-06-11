@@ -74,6 +74,8 @@ pub fn run_chunk_computation(
     partial_scores_out: &mut [f32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
+    reconciled_snp_start_idx: usize,
+    chunk_bed_row_offset: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // This is the "airlock" for the compute engine. We verify that the mutable
@@ -103,6 +105,8 @@ pub fn run_chunk_computation(
                 partial_scores_out,
                 tile_pool,
                 sparse_index_pool,
+                reconciled_snp_start_idx,
+                chunk_bed_row_offset,
             );
         }
         PersonSubset::Indices(indices) => {
@@ -115,6 +119,8 @@ pub fn run_chunk_computation(
                 partial_scores_out,
                 tile_pool,
                 sparse_index_pool,
+                reconciled_snp_start_idx,
+                chunk_bed_row_offset,
             );
         }
     };
@@ -136,6 +142,8 @@ fn process_people_iterator<'a, I>(
     partial_scores: &'a mut [f32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
+    reconciled_snp_start_idx: usize,
+    chunk_bed_row_offset: usize,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
