@@ -264,7 +264,7 @@ if __name__ == "__main__":
             failed_tests.append(f"{pgs_id} (gnomon_execution_failed)"); continue
 
         # --- Find and Verify Gnomon's output files IMMEDIATELY ---
-        gnomon_reformatted_file = original_score_file.parent / f"{original_score_file.name}.gnomon_format.tsv"
+        gnomon_reformatted_file = original_score_file.parent / f"{original_score_file.stem}.gnomon_format.tsv"
         gnomon_final_score_file = original_score_file.parent / f"{original_score_file.name}.sscore"
         
         if not gnomon_reformatted_file.exists() or not gnomon_final_score_file.exists():
