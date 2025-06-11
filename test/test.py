@@ -291,9 +291,8 @@ if __name__ == "__main__":
         
         # --- Run PLINK2 ---
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        # Col 1: snp_id, Col 2: effect_allele, Col 3: score
         cmd_plink2 = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), 
-                      "--score", str(reformatted_file), "1", "2", "3", "header", "sum", "no-mean-imputation",
+                      "--score", str(reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
                       "--out", str(plink2_out_prefix)]
         all_perf_results.append(run_and_measure(cmd_plink2, f"plink2_{pgs_id}"))
 
