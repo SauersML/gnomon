@@ -55,7 +55,9 @@ NUMERICAL_TOLERANCE = 1e-5
 
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads a file and extracts it if it is a .zip or .gz archive."""
-    filename = Path(url.split("/")[-1])
+    # Strip URL query parameters (e.g., ?raw=true) to correctly identify the filename.
+    base_url = url.split('?')[0]
+    filename = Path(base_url.split("/")[-1])
     download_path = dest_dir / filename
     
     print(f"Downloading {filename}...")
