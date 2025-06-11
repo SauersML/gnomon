@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::error::Error;
 use std::simd::{cmp::SimdPartialEq, num::SimdUint, Simd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -324,6 +325,29 @@ fn process_tile(
             let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
             let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
 
+// ================== PROBE #2 START ==================
+#[cfg(debug_assertions)]
+{
+    // This flag is also declared inside the debug block for zero release cost.
+    static HAS_PRINTED_SPARSE_SUMMARY: AtomicBool = AtomicBool::new(false);
+
+    // Use `compare_exchange` to print a summary for the very first person only.
+    if !HAS_PRINTED_SPARSE_SUMMARY.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        let g1_count = g1_indices[person_idx].len();
+        let g2_count = g2_indices[person_idx].len();
+
+        eprintln!("
+
+================ [debug] KERNEL INPUT SUMMARY (First Person) ===================");
+        eprintln!("  (Final data prepared for the computation kernel)");
+        eprintln!("  -----------------------------------------------------------------------------");
+        eprintln!("  Num SNPs with Dosage = 1 (g1_indices.len()): {}", g1_count);
+        eprintln!("  Num SNPs with Dosage = 2 (g2_indices.len()): {}", g2_count);
+        eprintln!("====================================================================================
+");
+    }
+}
+// =================== PROBE #2 END ===================
             kernel::accumulate_scores_for_person(
                 &weights,
                 scores_out_slice,
@@ -433,6 +457,39 @@ fn pivot_and_reconcile_tile(
                 let term1 = (two_bit_genotypes >> 1) & one;
                 let term2 = (two_bit_genotypes & one) + one;
                 let initial_dosages = term1 * term2;
+
+// ================== PROBE #1 START ==================
+#[cfg(debug_assertions)]
+{
+    // This flag is declared *inside* the debug-only block, ensuring
+    // it does not exist and has zero cost in release builds.
+    static HAS_PRINTED_UNPACK_TRACE: AtomicBool = AtomicBool::new(false);
+
+    // Use `compare_exchange` for thread-safe "print-once" logic.
+    if !HAS_PRINTED_UNPACK_TRACE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        // Extract lane 0 data for a clean, single-example trace.
+        let packed_val_0 = packed_vals.to_array()[0];
+        let bit_shift_0 = bit_shifts.to_array()[0];
+        let two_bit_geno_0 = two_bit_genotypes.to_array()[0];
+        let term1_0 = term1.to_array()[0];
+        let term2_0 = term2.to_array()[0];
+        let initial_dosage_0 = initial_dosages.to_array()[0];
+
+        eprintln!("
+
+================ [debug] GENOTYPE UNPACKING TRACE (First Person/SNP) ================");
+        eprintln!("  Input Packed Byte:  {:#010b} ({})", packed_val_0, packed_val_0);
+        eprintln!("  Input Bit Shift:    {}", bit_shift_0);
+        eprintln!("  -----------------------------------------------------------------------------");
+        eprintln!("  -> Isolated 2-bit:   {:#04b} ({})", two_bit_geno_0, two_bit_geno_0);
+        eprintln!("  -> term1 ((g>>1)&1): {}", term1_0);
+        eprintln!("  -> term2 ((g&1)+1):  {}", term2_0);
+        eprintln!("  => Initial Dosage:   {}", initial_dosage_0);
+        eprintln!("====================================================================================
+");
+    }
+}
+// =================== PROBE #1 END ===================
 
                 // Create a mask for missing genotypes (coded as 0b01) and use it to
                 // select between the calculated dosage and the missing sentinel value.
