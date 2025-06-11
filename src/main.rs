@@ -298,10 +298,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
 
-        // Correctly slice the weights buffer. The indices are now derived from the
-        // number of *reconciled* SNPs processed so far, not the raw file offset.
-        let weights_start = reconciled_snps_processed * prep_clone.score_names.len();
-        let weights_end = (reconciled_snps_processed + num_reconciled_in_chunk) * prep_clone.score_names.len();
+        // Calculate the stride to correctly slice the padded weights buffer.
+        // This logic must exactly match the padding logic in `prepare.rs`.
+        const LANE_COUNT: usize = 8;
+        let num_scores = prep_clone.score_names.len();
+        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+
+        // The indices are now based on the stride, not the original number of scores.
+        let weights_start = reconciled_snps_processed * stride;
+        let weights_end = (reconciled_snps_processed + num_reconciled_in_chunk) * stride;
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
