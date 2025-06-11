@@ -221,21 +221,34 @@ def setup_environment():
     for url in PGS_SCORES.values():
         download_and_extract(url, CI_WORKDIR)
 
-    print_header("STANDARDIZING VARIANT IDS")
-    print("Modifying .bim file to use 'chr:pos' as variant IDs for consistency across all tools.")
+    print_header("DATA PRE-PROCESSING: STANDARDIZE AND DE-DUPLICATE VARIANTS")
     bim_path = PLINK_PREFIX.with_suffix(".bim")
     try:
+        # Step 1: Load the .bim file
         bim_df = pd.read_csv(
             bim_path, sep='\\s+', header=None,
             names=['chr', 'id', 'cm', 'pos', 'a1', 'a2'],
             dtype={'chr': str, 'id': str}, engine='python'
         )
+        initial_count = len(bim_df)
+        print(f"Read {initial_count} variants from original .bim file.")
+
+        # Step 2: Standardize variant IDs to `chr:pos`
         bim_df['id'] = bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str)
+        print("Standardized variant IDs to 'chromosome:position' format.")
+        
+        # Step 3: Remove duplicates based on the new standardized ID, keeping the first entry
+        bim_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
+        final_count = len(bim_df)
+        print(f"De-duplicated variants, keeping the first occurrence of each position. Removed {initial_count - final_count} duplicates.")
+
+        # Step 4: Save the cleaned .bim file
         bim_df.to_csv(bim_path, sep='\t', header=False, index=False)
-        print(f"✅ Successfully updated variant IDs in {bim_path.name}")
-        inspect_file_head(bim_path, title="Verifying updated .bim file format")
+        print(f"✅ Successfully wrote {final_count} unique variants to {bim_path.name}")
+        inspect_file_head(bim_path, title="Verifying Cleaned and De-duplicated .bim File")
+
     except Exception as e:
-        print(f"❌ FAILED to modify .bim file: {e}")
+        print(f"❌ FAILED to pre-process .bim file: {e}")
         sys.exit(1)
 
 def find_reformatted_file(original_pgs_path: Path) -> Path:
