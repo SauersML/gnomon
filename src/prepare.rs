@@ -292,16 +292,24 @@ fn build_reconciliation_plan(
         let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
         let mut parts = line.split_whitespace();
 
-        let _chromosome = parts.next();
-        let snp_id = parts.next();
+        let chromosome = parts.next();
+        let snp_id_col2 = parts.next(); // The original ID from column 2, used for warnings.
         let _cm_pos = parts.next();
-        let _bp_pos = parts.next();
+        let bp_pos = parts.next();
         let allele1_str = parts.next();
         let allele2_str = parts.next();
 
-        if let (Some(id), Some(a1_str), Some(a2_str)) = (snp_id, allele1_str, allele2_str) {
-            if a1_str.len() == 1 && a2_str.len() == 1 {
-                if let Some((weights_start_index, effect_allele_u8)) = score_map.remove(id) {
+        if let (Some(chr), Some(id_col2), Some(pos), Some(a1_str), Some(a2_str)) =
+            (chromosome, snp_id_col2, bp_pos, allele1_str, allele2_str)
+        {
+            // The canonical key for lookup is always chr:pos.
+            let canonical_id = format!("{}:{}", chr, pos);
+
+            // Attempt to find the variant in the score map using the canonical chr:pos ID.
+            if let Some(&(weights_start_index, effect_allele_u8)) = score_map.get(&canonical_id) {
+                // This variant exists in the score file. Now check its allele structure.
+                if a1_str.len() == 1 && a2_str.len() == 1 {
+                    // It's a valid biallelic SNP. Proceed with reconciliation.
                     let bim_a1 = a1_str.as_bytes()[0];
                     let bim_a2 = a2_str.as_bytes()[0];
 
@@ -310,8 +318,10 @@ fn build_reconciliation_plan(
                     } else if effect_allele_u8 == bim_a1 {
                         Reconciliation::Flip
                     } else {
-                        eprintln!("Warning: Skipping SNP '{}' due to allele mismatch (effect: '{}', bim: '{}/{}').", id, effect_allele_u8 as char, bim_a1 as char, bim_a2 as char);
+                        // Alleles in score file don't match alleles in .bim file for this chr:pos.
+                        eprintln!("Warning: Skipping SNP '{}' (at {}:{}) due to allele mismatch (effect: '{}', bim: '{}/{}').", id_col2, chr, pos, effect_allele_u8 as char, bim_a1 as char, bim_a2 as char);
                         skipped_snp_count += 1;
+                        score_map.remove(&canonical_id); // Consume the SNP to prevent other warnings.
                         continue;
                     };
 
@@ -320,11 +330,18 @@ fn build_reconciliation_plan(
                         instruction,
                         weights_start_index,
                     });
+                    
+                    // The SNP has been successfully processed, remove it from the map.
+                    score_map.remove(&canonical_id);
+
+                } else {
+                    // The variant was found by chr:pos, but its alleles are not simple (e.g., an indel).
+                    eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}').", id_col2, a1_str, a2_str);
+                    skipped_snp_count += 1;
+                    score_map.remove(&canonical_id); // Consume the SNP.
                 }
-            } else {
-                // eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}').", id, a1_str, a2_str);
-                skipped_snp_count += 1;
             }
+            // If the canonical_id is not in the score_map, we silently ignore it, as it's not relevant.
         } else {
             return Err(PrepError::Parse(format!(
                 "Malformed line #{} in .bim file: {}",
