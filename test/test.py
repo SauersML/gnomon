@@ -19,7 +19,7 @@ import psutil
 
 # --- Artifacts & Paths ---
 CI_WORKDIR = Path("./ci_workdir")
-GNOMON_BINARY = Path("../target/release/gnomon")
+GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
 PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
