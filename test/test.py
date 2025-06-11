@@ -1,176 +1,266 @@
+# testing/test.py
+
 import subprocess
 import requests
 import zipfile
-import random
+import gzip
+import shutil
+import time
 import sys
+import threading
+import os
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import psutil
 
-# --- Configuration ---
-# Use a consistent seed for reproducibility
-random.seed(2025)
+# ========================================================================================
+#                             CONFIGURATION
+# ========================================================================================
 
-# Constants for file URLs and local paths
-DATA_URL_BASE = "https://github.com/SauersML/genomic_pca/blob/main/data/"
-FILES_TO_DOWNLOAD = {
+# --- Artifacts & Paths ---
+CI_WORKDIR = Path("./ci_workdir")
+GNOMON_BINARY = Path("../target/release/gnomon")
+PLINK1_BINARY = CI_WORKDIR / "plink"
+PLINK2_BINARY = CI_WORKDIR / "plink2"
+PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
+
+# --- Data Sources ---
+# Tools
+PLINK1_URL = "https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
+PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/plink2_linux_x86_64_20240116.zip"
+
+# Genotype Data
+GENOTYPE_URL_BASE = "https://github.com/SauersML/genomic_pca/blob/main/data/"
+GENOTYPE_FILES = {
     "chr22_subset50.bed.zip": "chr22_subset50.bed",
     "chr22_subset50.bim.zip": "chr22_subset50.bim",
     "chr22_subset50.fam.zip": "chr22_subset50.fam",
 }
-DATA_DIR = Path("./test_data")
-PLINK_PREFIX = DATA_DIR / "chr22_subset50"
-SCORE_FILE = DATA_DIR / "scores.tsv"
-GNOMON_BINARY = Path("../target/release/gnomon")
 
-# --- Helper Functions ---
+# Real-world PGS Catalog Score Files to test against
+PGS_SCORES = {
+    "PGS004696": "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS004696/ScoringFiles/Harmonized/PGS004696_hmPOS_GRCh38.txt.gz",
+    "PGS003725": "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS003725/ScoringFiles/Harmonized/PGS003725_hmPOS_GRCh38.txt.gz",
+    "PGS001780": "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS001780/ScoringFiles/Harmonized/PGS001780_hmPOS_GRCh38.txt.gz",
+}
+
+# --- Validation Thresholds ---
+CORRELATION_THRESHOLD = 0.9999
+NUMERICAL_TOLERANCE = 1e-5
+
+
+# ========================================================================================
+#                             HELPER FUNCTIONS
+# ========================================================================================
+
+def download_and_extract(url: str, dest_dir: Path):
+    """Downloads a file and extracts it if it is a .zip or .gz archive."""
+    filename = Path(url.split("/")[-1])
+    download_path = dest_dir / filename
+    
+    print(f"Downloading {filename}...")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with open(download_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    if str(filename).endswith(".zip"):
+        print(f"Unzipping {filename}...")
+        with zipfile.ZipFile(download_path, 'r') as zf:
+            zf.extractall(dest_dir)
+        download_path.unlink()
+    elif str(filename).endswith(".gz"):
+        print(f"Decompressing {filename}...")
+        unzipped_path = dest_dir / filename.stem
+        with gzip.open(download_path, 'rb') as f_in:
+            with open(unzipped_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        download_path.unlink()
 
 def setup_environment():
-    """Create data directory, download, and unzip files."""
-    print("--- 셋업: Setting up test environment ---")
-    DATA_DIR.mkdir(exist_ok=True)
-    for zip_name, final_name in FILES_TO_DOWNLOAD.items():
-        zip_path = DATA_DIR / zip_name
-        final_path = DATA_DIR / final_name
-        if not final_path.exists():
-            print(f"Downloading {zip_name}...")
-            url = f"{DATA_URL_BASE}{zip_name}?raw=true"
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            with open(zip_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"Unzipping {zip_name}...")
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(DATA_DIR)
-            zip_path.unlink() # Clean up zip file
-    print("Environment setup complete.")
-
-def generate_score_file():
-    """
-    Creates a synthetic score file from the .bim file to test multiple scores
-    and allele flipping.
-    """
-    print("--- 셋업: Generating synthetic score file ---")
-    if SCORE_FILE.exists():
-        print("Score file already exists. Skipping generation.")
-        return
-
-    bim_df = pd.read_csv(
-        PLINK_PREFIX.with_suffix(".bim"),
-        sep='\t',
-        header=None,
-        names=['chr', 'snp_id', 'cm', 'pos', 'a1', 'a2']
-    )
-
-    score_data = []
-    for _, row in bim_df.iterrows():
-        # Randomly choose A1 or A2 as the effect allele to test flipping
-        effect_allele = random.choice([row['a1'], row['a2']])
-        # Generate two random scores
-        score1 = random.uniform(-1.0, 1.0)
-        score2 = random.uniform(-0.5, 0.5)
-        score_data.append([row['snp_id'], effect_allele, score1, score2])
-
-    score_df = pd.DataFrame(score_data, columns=['snp_id', 'effect_allele', 'PRS1', 'PRS2'])
-    score_df.to_csv(SCORE_FILE, sep='\t', index=False)
-    print(f"Generated score file with {len(score_df)} variants.")
-
-def run_tool(command_list, log_prefix):
-    """Executes a command and fails script on error."""
-    print(f"--- 실행: Running {log_prefix} ---")
-    result = subprocess.run(
-        command_list,
-        check=True,
-        capture_output=True,
-        text=True
-    )
-    # Write logs for debugging if needed, but keep console clean on success
-    (DATA_DIR / f"{log_prefix}.stdout.log").write_text(result.stdout)
-    (DATA_DIR / f"{log_prefix}.stderr.log").write_text(result.stderr)
-    print(f"Completed {log_prefix}.")
-
-
-def compare_results():
-    """Loads and compares the output files from all tools."""
-    print("--- 비교: Comparing outputs for numerical identity ---")
+    """Prepares the CI workspace by downloading and setting up all required artifacts."""
+    print("--- 셋업: Setting up CI test environment ---")
+    CI_WORKDIR.mkdir(exist_ok=True)
     
-    # Load Gnomon results
-    gnomon_df = pd.read_csv(
-        DATA_DIR / "scores.tsv.sscore",
-        sep='\t'
-    ).rename(columns={"#IID": "IID"}).set_index("IID")
+    # Download and set up tools
+    download_and_extract(PLINK1_URL, CI_WORKDIR)
+    download_and_extract(PLINK2_URL, CI_WORKDIR)
+    PLINK1_BINARY.chmod(0o755)
+    PLINK2_BINARY.chmod(0o755)
+    
+    # Download genotype data
+    for zip_name in GENOTYPE_FILES:
+        url = f"{GENOTYPE_URL_BASE}{zip_name}?raw=true"
+        download_and_extract(url, CI_WORKDIR)
+        
+    # Download score files
+    for url in PGS_SCORES.values():
+        download_and_extract(url, CI_WORKDIR)
 
-    # Load PLINK 2 results
-    plink2_df = pd.read_csv(
-        DATA_DIR / "plink2_run.sscore",
-        sep='\t'
-    ).rename(columns={"#IID": "IID"}).set_index("IID")[['PRS1_SUM', 'PRS2_SUM']]
+    print("--- Environment setup complete ---\n")
 
-    # Load PLINK 1 results
-    plink1_df = pd.read_csv(
-        DATA_DIR / "plink1_run.profile",
-        delim_whitespace=True
-    ).set_index("IID")[['SCORE']]
-    # PLINK 1 doesn't support multi-score, so we only test the first score
-    # It also names the column 'SCORE' by default.
-    
-    # --- Comparison for Score 1 ---
-    print("Comparing PRS1...")
-    merged1 = gnomon_df[['PRS1']].join(plink2_df[['PRS1_SUM']]).join(plink1_df[['SCORE']])
-    
-    # Check Gnomon vs PLINK 2
-    is_close_p2 = np.isclose(merged1['PRS1'], merged1['PRS1_SUM'])
-    assert is_close_p2.all(), f"Mismatch between Gnomon and PLINK 2 on PRS1!\n{merged1[~is_close_p2]}"
-    print("✅ Gnomon == PLINK 2 (PRS1)")
+def monitor_memory(p: subprocess.Popen, results: dict):
+    """Polls process memory usage in a separate thread."""
+    peak_mem = 0
+    results['peak_mem_mb'] = 0
+    proc = psutil.Process(p.pid)
+    while p.poll() is None:
+        try:
+            mem_info = proc.memory_info()
+            peak_mem = max(peak_mem, mem_info.rss)
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.01) # Poll every 10ms
+    results['peak_mem_mb'] = peak_mem / (1024 * 1024)
 
-    # Check Gnomon vs PLINK 1
-    is_close_p1 = np.isclose(merged1['PRS1'], merged1['SCORE'])
-    assert is_close_p1.all(), f"Mismatch between Gnomon and PLINK 1 on PRS1!\n{merged1[~is_close_p1]}"
-    print("✅ Gnomon == PLINK 1 (PRS1)")
+def run_and_measure(command: list, tool_name: str) -> dict:
+    """Runs a command, measuring its wall-clock time and peak memory usage."""
+    print(f"--- 실행: {tool_name} ---")
+    start_time = time.perf_counter()
     
-    # --- Comparison for Score 2 (Gnomon vs PLINK 2 only) ---
-    print("\nComparing PRS2...")
-    merged2 = gnomon_df[['PRS2']].join(plink2_df[['PRS2_SUM']])
-    is_close_p2_s2 = np.isclose(merged2['PRS2'], merged2['PRS2_SUM'])
-    assert is_close_p2_s2.all(), f"Mismatch between Gnomon and PLINK 2 on PRS2!\n{merged2[~is_close_p2_s2]}"
-    print("✅ Gnomon == PLINK 2 (PRS2)")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
-# --- Main Execution Logic ---
+    monitor_results = {}
+    mem_thread = threading.Thread(target=monitor_memory, args=(process, monitor_results))
+    mem_thread.start()
+    
+    stdout, stderr = process.communicate()
+    mem_thread.join()
+    
+    end_time = time.perf_counter()
+    
+    if process.returncode != 0:
+        print(f"❌ ERROR running {tool_name}. Exit code: {process.returncode}")
+        print("--- STDOUT ---")
+        print(stdout)
+        print("--- STDERR ---")
+        print(stderr)
+        sys.exit(1)
+        
+    return {
+        'tool': tool_name,
+        'time_sec': end_time - start_time,
+        'peak_mem_mb': monitor_results.get('peak_mem_mb', 0)
+    }
+
+def find_reformatted_file(original_pgs_path: Path) -> Path:
+    """Constructs the expected path of a gnomon-reformatted score file."""
+    expected_name = f"{original_pgs_path.stem}.gnomon_format.tsv"
+    expected_path = original_pgs_path.parent / expected_name
+    assert expected_path.exists(), f"Reformatted file not found at {expected_path}"
+    return expected_path
+
+def validate_outputs(gnomon_path: Path, plink2_path: Path, plink1_path: Path, pgs_id: str) -> bool:
+    """Compares the output files from all tools for identity and correlation."""
+    print(f"--- 검증: Validating outputs for {pgs_id} ---")
+    try:
+        gnomon_df = pd.read_csv(gnomon_path, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
+        plink2_df = pd.read_csv(plink2_path, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
+        plink1_df = pd.read_csv(plink1_path, delim_whitespace=True).set_index("IID")
+
+        # Get score column names
+        score_name_gnomon = gnomon_df.columns[0]
+        score_name_plink2 = f"{score_name_gnomon}_SUM"
+        
+        # Merge for comparison
+        merged = gnomon_df.join(plink2_df[[score_name_plink2]]).join(plink1_df[['SCORE']])
+        
+        # 1. Numerical Identity Check
+        is_close_p2 = np.isclose(merged[score_name_gnomon], merged[score_name_plink2], atol=NUMERICAL_TOLERANCE)
+        is_close_p1 = np.isclose(merged[score_name_gnomon], merged['SCORE'], atol=NUMERICAL_TOLERANCE)
+        
+        assert is_close_p2.all(), f"Numerical mismatch between Gnomon and PLINK2 for {pgs_id}"
+        print(f"✅ Numerical Identity: Gnomon == PLINK2")
+        
+        assert is_close_p1.all(), f"Numerical mismatch between Gnomon and PLINK1 for {pgs_id}"
+        print(f"✅ Numerical Identity: Gnomon == PLINK1")
+        
+        # 2. Correlation Check (as a redundant sanity check)
+        correlation = merged.corr().iloc[0, 1]
+        assert correlation > CORRELATION_THRESHOLD, f"Correlation below threshold ({correlation:.5f}) for {pgs_id}"
+        print(f"✅ Correlation > {CORRELATION_THRESHOLD} (actual: {correlation:.6f})")
+        
+        return True
+
+    except Exception as e:
+        print(f"❌ VALIDATION FAILED for {pgs_id}: {e}")
+        return False
+
+
+# ========================================================================================
+#                             MAIN EXECUTION
+# ========================================================================================
+
 if __name__ == "__main__":
+    print("===== Running Gnomon CI Test & Benchmark Suite =====")
     setup_environment()
-    generate_score_file()
-
-    # Define the commands
-    cmd_gnomon = [
-        str(GNOMON_BINARY),
-        "--input-path", str(DATA_DIR),
-        "--score", str(SCORE_FILE)
-    ]
-    # NOTE: PLINK 2 needs --score-col-nums to read multiple scores properly
-    cmd_plink2 = [
-        "plink2",
-        "--bfile", str(PLINK_PREFIX),
-        "--score", str(SCORE_FILE), "header", "no-mean-imputation",
-        "--score-col-nums", "3-4", # Select columns 3 and 4 for scores
-        "--out", str(DATA_DIR / "plink2_run")
-    ]
-    # NOTE: PLINK 1 only calculates one score at a time from column 3
-    cmd_plink1 = [
-        "plink",
-        "--bfile", str(PLINK_PREFIX),
-        "--score", str(SCORE_FILE), "1", "2", "3", "header", "sum", "no-mean-imputation",
-        "--out", str(DATA_DIR / "plink1_run")
-    ]
     
-    # Run all tools
-    run_tool(cmd_gnomon, "gnomon")
-    run_tool(cmd_plink2, "plink2")
-    run_tool(cmd_plink1, "plink1")
+    all_perf_results = []
+    any_test_failed = False
     
-    # The final assertion
-    compare_results()
+    for pgs_id, pgs_url in PGS_SCORES.items():
+        print(f"\n===== TESTING SCORE: {pgs_id} =====")
+        original_score_file = CI_WORKDIR / Path(pgs_url.split("/")[-1]).stem
 
-    print("\n\n🎉 SUCCESS: All correctness tests passed. Outputs are numerically identical.")
-    sys.exit(0)
+        # --- Run Gnomon (triggers auto-reformatting) ---
+        cmd_gnomon = [str(GNOMON_BINARY), "--input-path", str(CI_WORKDIR), "--score", str(original_score_file)]
+        all_perf_results.append(run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}"))
+        
+        # --- Find reformatted file for PLINK ---
+        reformatted_file = find_reformatted_file(original_score_file)
+        
+        # --- Run PLINK2 ---
+        cmd_plink2 = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), 
+                      "--score", str(reformatted_file), "header", "no-mean-imputation",
+                      "--score-col-nums", "3", "--out", str(CI_WORKDIR / f"plink2_{pgs_id}")]
+        all_perf_results.append(run_and_measure(cmd_plink2, f"plink2_{pgs_id}"))
+
+        # --- Run PLINK1 ---
+        cmd_plink1 = [str(PLINK1_BINARY), "--bfile", str(PLINK_PREFIX), 
+                      "--score", str(reformatted_file), "1", "2", "3", "header", "sum", "no-mean-imputation",
+                      "--out", str(CI_WORKDIR / f"plink1_{pgs_id}")]
+        all_perf_results.append(run_and_measure(cmd_plink1, f"plink1_{pgs_id}"))
+        
+        # --- Validate Outputs ---
+        gnomon_out = original_score_file.parent / f"{original_score_file.name}.sscore"
+        plink2_out = CI_WORKDIR / f"plink2_{pgs_id}.sscore"
+        plink1_out = CI_WORKDIR / f"plink1_{pgs_id}.profile"
+        
+        if not validate_outputs(gnomon_out, plink2_out, plink1_out, pgs_id):
+            any_test_failed = True
+
+    # --- Analyze and Report Performance ---
+    print("\n\n===== PERFORMANCE SUMMARY =====")
+    results_df = pd.DataFrame(all_perf_results)
+    results_df['pgs_id'] = results_df['tool'].apply(lambda x: x.split('_')[1])
+    results_df['tool_base'] = results_df['tool'].apply(lambda x: x.split('_')[0])
+    
+    summary = results_df.groupby('tool_base').agg(
+        mean_time_sec=('time_sec', 'mean'),
+        std_time_sec=('time_sec', 'std'),
+        mean_mem_mb=('peak_mem_mb', 'mean'),
+        std_mem_mb=('peak_mem_mb', 'std')
+    ).reset_index()
+
+    print(summary.to_markdown(index=False, floatfmt=".3f"))
+    
+    gnomon_stats = summary[summary['tool_base'] == 'gnomon'].iloc[0]
+    plink2_stats = summary[summary['tool_base'] == 'plink2'].iloc[0]
+    
+    time_factor = plink2_stats['mean_time_sec'] / gnomon_stats['mean_time_sec']
+    mem_factor = gnomon_stats['mean_mem_mb'] / plink2_stats['mean_mem_mb']
+    
+    print("\n--- PERFORMANCE FACTORS (Gnomon vs PLINK2) ---")
+    print(f"Time:       Gnomon is {time_factor:.2f}x faster on average.")
+    print(f"Memory:     Gnomon uses {mem_factor:.2f}x the memory of PLINK2 on average.")
+    
+    # --- Final Exit ---
+    if any_test_failed:
+        print("\n\n❌ CI CHECK FAILED: One or more correctness tests did not pass.")
+        sys.exit(1)
+    else:
+        print("\n\n🎉 CI CHECK PASSED: All correctness and performance tests completed successfully.")
+        sys.exit(0)
