@@ -289,11 +289,27 @@ if __name__ == "__main__":
         # --- Find reformatted file for PLINK ---
         reformatted_file = find_reformatted_file(original_score_file)
         
-        # --- Run PLINK2 ---
+        # --- Run PLINK2 (Canonical Two-Step Workflow) ---
+        
+        # Convert the .bfile to the native .pfile format.
+        pfile_prefix = CI_WORKDIR / "chr22_subset50_pfile"
+        cmd_make_pgen = [
+            str(PLINK2_BINARY),
+            "--bfile", str(PLINK_PREFIX),
+            "--make-pgen",
+            "--out", str(pfile_prefix)
+        ]
+        print("\\n--- Running: plink2_make_pgen (one-time setup) ---")
+        subprocess.run(cmd_make_pgen, check=True, capture_output=True, text=True)
+        
+        # Run the --score command on the native .pfile.
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        cmd_plink2 = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), 
-                      "--score", str(reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
-                      "--out", str(plink2_out_prefix)]
+        cmd_plink2 = [
+            str(PLINK2_BINARY),
+            "--pfile", str(pfile_prefix), # Use --pfile instead of --bfile
+            "--score", str(reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
+            "--out", str(plink2_out_prefix)
+        ]
         all_perf_results.append(run_and_measure(cmd_plink2, f"plink2_{pgs_id}"))
 
         # --- Run PLINK1 ---
