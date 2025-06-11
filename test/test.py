@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-
-"""
-Gnomon CI Test & Benchmark Suite
-
-This script provides a comprehensive framework for testing the correctness and
-performance of the 'gnomon' polygenic score (PGS) calculator. It validates
-gnomon's output against two industry-standard tools: PLINK 1.9 and PLINK 2.
-
-The suite performs the following steps:
-1.  Sets up a clean working environment, downloading necessary tools (PLINKs)
-    and data (genotypes and real-world PGS Catalog score files).
-2.  Pre-processes the genotype data into two standardized formats to ensure
-    maximum compatibility across all tools.
-3.  For each PGS score file, it runs gnomon, PLINK 1.9, and PLINK 2.
-4.  It measures and records the execution time and peak memory usage for each run.
-5.  It intelligently parses the output files from all three tools, robustly
-    detecting the correct score columns even if their names vary by tool version
-    or scoring mode.
-6.  It performs two layers of validation:
-    a. Numerical Identity Check: Verifies that the scores produced by gnomon are
-       numerically identical (within a small tolerance) to those from PLINK.
-    b. Correlation Analysis: Computes and displays a full correlation matrix
-       to provide a quantitative measure of agreement between the tools.
-7.  Aggregates all results and failures, providing a clear, final summary of
-    performance and a definitive "CI CHECK PASSED" or "CI CHECK FAILED" status.
-"""
-
 import subprocess
 import requests
 import zipfile
