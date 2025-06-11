@@ -378,7 +378,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         {
             // Check if the empty-buffer channel is already closed before returning the buffer
             let is_closed = empty_buffer_tx.is_closed();
-            eprintln!("[DBG MAIN] empty_buffer_tx closed = {}", is_closed);
+            eprintln!("[debug] empty_buffer_tx closed = {}", is_closed);
         }
 
         if empty_buffer_tx.send(returned_io_buffer).await.is_err() {
