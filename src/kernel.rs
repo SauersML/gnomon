@@ -145,11 +145,17 @@ pub fn accumulate_scores_for_person(
     }
 
     // --- Final Horizontal Store ---
-    // The results, which have been accumulated vertically in SIMD registers, are
+    // The results, which have been accumulated vertically in SIMD vectors, are
     // now written out to the final destination slice.
     for (i, &acc_vec) in accumulator_buffer.iter().enumerate() {
         let start = i * LANE_COUNT;
         let end = (start + LANE_COUNT).min(num_scores);
-        acc_vec.copy_to_slice(&mut scores_out[start..end]);
+
+        // To handle the final, partially-filled SIMD vector, we first convert it
+        // to a stack array. This allows us to safely create a slice of the exact
+        // required length (`end - start`), preventing a panic when `num_scores` is
+        // not a multiple of the SIMD lane count (on copy_to_slice method).
+        let temp_array = acc_vec.to_array();
+        scores_out[start..end].copy_from_slice(&temp_array[..(end - start)]);
     }
 }
