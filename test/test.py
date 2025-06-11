@@ -311,12 +311,18 @@ if __name__ == "__main__":
                 plink2_df = pd.read_csv(plink2_out_file, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
                 plink1_df = pd.read_csv(plink1_out_file, delim_whitespace=True).set_index("IID")
                 
-                score_name_gnomon = gnomon_df.columns[0]
-                score_name_plink2 = f"{score_name_gnomon}_SUM"
-
-                merged = gnomon_df.join(plink2_df[[score_name_plink2]]).join(plink1_df[['SCORE']])
-                merged.columns = ['gnomon', 'plink2', 'plink1']
+                # Select the score columns from each tool using their known, fixed names.
+                # Gnomon uses the score name from the file header.
+                # PLINK2 uses 'NAMED_ALLELE_DOSAGE_SUM' for the sum.
+                # PLINK1 uses 'SCORE' for the sum.
+                gnomon_col = gnomon_df.columns[0]
                 
+                # Create a new, clean DataFrame for comparison.
+                merged = pd.DataFrame(index=gnomon_df.index)
+                merged['gnomon'] = gnomon_df[gnomon_col]
+                merged['plink2'] = plink2_df['NAMED_ALLELE_DOSAGE_SUM']
+                merged['plink1'] = plink1_df['SCORE']
+
                 print(merged.head(15).to_string())
                 
                 is_close_p2 = np.isclose(merged['gnomon'], merged['plink2'], atol=NUMERICAL_TOLERANCE, rtol=NUMERICAL_TOLERANCE)
