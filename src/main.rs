@@ -326,6 +326,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
+#[cfg(debug_assertions)]
+{
+    eprintln!(
+        "[debug] CHUNK ➤ offset={} bytes={} snps_in_chunk={} \
+         recon_range=[{}..{}) ({} snps) \
+         weights=[{}..{})({} floats) \
+         partial_scores_buf.len={} people_to_score={} scores_per_person={}",
+        bed_row_offset,
+        bytes_read,
+        snps_in_chunk,
+        reconciled_indices_start,
+        reconciled_indices_end,
+        num_reconciled_in_chunk,
+        weights_start,
+        weights_end,
+        weights_end - weights_start,
+        partial_scores_buffer.len(),
+        prep_clone.num_people_to_score,
+        prep_clone.score_names.len(),
+    );
+}
         // Dispatch the computation. We pass the raw buffer slice as before, but now also
         // include the specific sub-problem parameters for the compute engine.
         let compute_handle = task::spawn_blocking(move || {
