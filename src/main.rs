@@ -27,6 +27,7 @@ use sysinfo::System;
 use tokio::sync::mpsc;
 use tokio::task;
 use std::fs::File;
+#[cfg(debug_assertions)]
 use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
 
