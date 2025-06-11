@@ -1,5 +1,3 @@
-# testing/test.py
-
 import subprocess
 import requests
 import zipfile
@@ -82,7 +80,6 @@ def download_and_extract(url: str, dest_dir: Path):
 
 def setup_environment():
     """Prepares the CI workspace by downloading and setting up all required artifacts."""
-    print("--- 셋업: Setting up CI test environment ---")
     CI_WORKDIR.mkdir(exist_ok=True)
     
     # Download and set up tools
