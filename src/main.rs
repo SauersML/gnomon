@@ -95,28 +95,41 @@ impl ChunkResult {
     /// producer, and returns the now-cleared partial scores buffer for reuse.
     ///
     /// This `async` method consumes the `ChunkResult`, enforcing a single-use
-    /// policy and guaranteeing correct operational order.
+    /// policy and guaranteeing correct operational order. It uses `ManuallyDrop`
+    /// to safely move fields out of a type with a `Drop` implementation, which
+    /// is a zero-cost, high-performance pattern.
     #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
     async fn commit(
         self,
         all_scores: &mut [f32],
         empty_tx: &Sender<Vec<u8>>,
     ) -> (Vec<f32>, Result<(), SendError<Vec<u8>>>) {
+        // Wrap `self` in `ManuallyDrop` to prevent its `Drop` impl from running,
+        // which allows us to safely move its fields out.
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: Because `this` is a `ManuallyDrop`, the compiler allows us to
+        // move the fields out. We are taking direct responsibility for these
+        // values. The `Drop` guard on the original `self` is correctly
+        // bypassed because we are explicitly handling this `ChunkResult`.
+        let io_buffer = unsafe { std::ptr::read(&this.io_buffer) };
+        let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
+
         // --- Core Logic: Merge partial scores into the master array ---
-        for (master_score, partial_score) in all_scores.iter_mut().zip(&self.partial_scores) {
+        for (master_score, partial_score) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
             *master_score += partial_score;
         }
 
         // --- Mark as committed for the Drop guard ---
+        // This is the contract that prevents the Drop guard from panicking if it
+        // were ever to run on a similar object.
         #[cfg(debug_assertions)]
-        self.committed.set(true);
+        this.committed.set(true);
 
         // --- Asynchronously recycle the I/O buffer ---
-        let send_result = empty_tx.send(self.io_buffer).await;
+        let send_result = empty_tx.send(io_buffer).await;
 
         // --- Prepare the partial_scores buffer for reuse ---
-        let mut recycled_scores_buffer = self.partial_scores;
-        // Using `fill` is the idiomatic and most performant way to zero a slice.
         recycled_scores_buffer.fill(0.0);
 
         (recycled_scores_buffer, send_result)
