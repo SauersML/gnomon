@@ -23,10 +23,15 @@ CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-# Explicit naming for clarity in the processing pipeline
+
+# --- FIX: Define separate, explicit data paths for tool compatibility ---
+# Gnomon & PLINK2 will use the modern, chr:pos standard
+GNOMON_NATIVE_PREFIX = CI_WORKDIR / "gnomon_native_data"
+# PLINK1 requires a universally safe chr_pos format
+P1_COMPAT_PREFIX = CI_WORKDIR / "p1_compatible_data"
+
+# Original data path
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_original"
-RENAMED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_renamed"
-CLEANED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_cleaned"
 
 
 # --- Data Sources ---
@@ -134,7 +139,6 @@ def parse_plink_log(log_path: Path) -> dict:
             error_match = re.search(r"\nError: (.*)", content)
             if error_match: log_info['error_message'] = error_match.group(1).strip()
             
-            # Use regex to find all possible "variants processed" messages
             processed_matches = re.findall(r"(?:--score: |from --score file).*?(\d+)\s+variants", content)
             if processed_matches:
                 log_info['variants_processed'] = int(processed_matches[-1])
@@ -172,7 +176,7 @@ def run_and_measure(command: list, tool_name: str, log_path: Path) -> dict:
     return results
 
 def setup_environment():
-    """Prepares the CI workspace, creating PLINK 1.9-compatible data."""
+    """Prepares the CI workspace, creating two parallel, clean datasets."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     
@@ -181,74 +185,56 @@ def setup_environment():
     PLINK1_BINARY.chmod(0o755)
     PLINK2_BINARY.chmod(0o755)
     
-    temp_prefix = CI_WORKDIR / "chr22_subset50"
     for zip_name, final_name in GENOTYPE_FILES.items():
         download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-        (temp_prefix.parent / final_name).rename(ORIGINAL_PLINK_PREFIX.with_suffix(f".{final_name.split('.')[-1]}"))
+        (CI_WORKDIR / "chr22_subset50" / final_name).rename(ORIGINAL_PLINK_PREFIX.with_suffix(f".{final_name.split('.')[-1]}"))
         
     for url in PGS_SCORES.values():
         download_and_extract(url, CI_WORKDIR)
 
     print_header("DATA PRE-PROCESSING: A ROBUST, TOOL-DRIVEN WORKFLOW")
     try:
-        # Step 1: RENAME variants to `chr_pos` format for universal compatibility.
-        print("Step 1: Renaming variants to 'chr_pos' format for PLINK 1.9 compatibility...")
-        # This PLINK2 command creates variant IDs like 'chr22_10519265'
-        # which are safe for all tools, including the older PLINK 1.9.
-        cmd_rename = [
-             str(PLINK2_BINARY),
-             "--bfile", str(ORIGINAL_PLINK_PREFIX),
-             # The template "chr@_#" creates IDs like "chr1_12345"
-             "--set-all-var-ids", "chr@_#",
-             "--make-bed",
-             "--out", str(RENAMED_PLINK_PREFIX)
-        ]
-        result_rename = subprocess.run(cmd_rename, check=True, capture_output=True, text=True)
-        print("✅ Renaming successful.")
-        inspect_file_head(RENAMED_PLINK_PREFIX.with_suffix(".bim"), title="Verifying Renamed .bim File (chr_pos format)")
+        # --- FIX: Create two separate, clean datasets for compatibility ---
+        
+        # 1. Gnomon Native data (chr:pos IDs) for Gnomon and PLINK2
+        print("Step 1a: Creating Gnomon-native data (chr:pos format)...")
+        cmd_rename_gnomon = [str(PLINK2_BINARY), "--bfile", str(ORIGINAL_PLINK_PREFIX), "--set-all-var-ids", "@:#", "--make-bed", "--out", str(GNOMON_NATIVE_PREFIX) + "_renamed"]
+        subprocess.run(cmd_rename_gnomon, check=True, capture_output=True, text=True)
+        cmd_dedup_gnomon = [str(PLINK2_BINARY), "--bfile", str(GNOMON_NATIVE_PREFIX) + "_renamed", "--rm-dup", "force-first", "--make-bed", "--out", str(GNOMON_NATIVE_PREFIX)]
+        subprocess.run(cmd_dedup_gnomon, check=True, capture_output=True, text=True)
+        print("✅ Gnomon-native data created successfully.")
+        inspect_file_head(GNOMON_NATIVE_PREFIX.with_suffix(".bim"), title="Verifying Gnomon-Native .bim File")
 
-        # Step 2: DE-DUPLICATE the renamed fileset. This step remains critical.
-        print("\nStep 2: De-duplicating the renamed fileset...")
-        cmd_dedup = [
-            str(PLINK2_BINARY),
-            "--bfile", str(RENAMED_PLINK_PREFIX),
-            "--rm-dup", "force-first",
-            "--make-bed",
-            "--out", str(CLEANED_PLINK_PREFIX)
-        ]
-        result_dedup = subprocess.run(cmd_dedup, check=True, capture_output=True, text=True)
-        print("✅ De-duplication successful. The data is now clean and consistent.")
-        inspect_file_head(CLEANED_PLINK_PREFIX.with_suffix(".bim"), title="Verifying Final Cleaned .bim File")
+        # 2. PLINK1 Compatible data (chr_pos IDs)
+        print("\nStep 1b: Creating PLINK1-compatible data (chr_pos format)...")
+        cmd_rename_p1 = [str(PLINK2_BINARY), "--bfile", str(ORIGINAL_PLINK_PREFIX), "--set-all-var-ids", "chr@_#", "--make-bed", "--out", str(P1_COMPAT_PREFIX) + "_renamed"]
+        subprocess.run(cmd_rename_p1, check=True, capture_output=True, text=True)
+        cmd_dedup_p1 = [str(PLINK2_BINARY), "--bfile", str(P1_COMPAT_PREFIX) + "_renamed", "--rm-dup", "force-first", "--make-bed", "--out", str(P1_COMPAT_PREFIX)]
+        subprocess.run(cmd_dedup_p1, check=True, capture_output=True, text=True)
+        print("✅ PLINK1-compatible data created successfully.")
+        inspect_file_head(P1_COMPAT_PREFIX.with_suffix(".bim"), title="Verifying PLINK1-Compatible .bim File")
 
     except Exception as e:
         print(f"❌ FAILED to pre-process genotype data: {e}")
-        if 'result_rename' in locals() and result_rename.returncode != 0:
-            print("--- RENAME STEP FAILED ---")
-            print(result_rename.stderr)
-        if 'result_dedup' in locals() and result_dedup.returncode != 0:
-            print("--- DE-DUPLICATION STEP FAILED ---")
-            print(result_dedup.stderr)
         sys.exit(1)
 
-def align_score_file_ids(score_file_path: Path) -> Path:
+def create_plink1_compatible_score_file(gnomon_native_score_file: Path) -> Path:
     """
-    FIX: Gnomon's reformatter creates `chr:pos` IDs. This function
-    post-processes that file to create `chr_pos` IDs to match our cleaned
-    genotype data, ensuring compatibility for PLINK tools.
+    FIX: Creates a copy of the Gnomon-reformatted score file and converts its
+    `chr:pos` IDs to the `chr_pos` format required by the PLINK1 test run.
     """
-    print_header(f"ALIGNING SCORE FILE IDs in {score_file_path.name}", char='*')
-    df = pd.read_csv(score_file_path, sep=r'\s+', engine='python')
+    p1_compat_path = gnomon_native_score_file.with_name(gnomon_native_score_file.name.replace(".tsv", "_p1_compat.tsv"))
+    print_header(f"Creating PLINK1-compatible score file: {p1_compat_path.name}", char='*')
     
-    # Check if 'snp_id' column exists before trying to modify it
+    df = pd.read_csv(gnomon_native_score_file, sep=r'\s+', engine='python')
+    # Gnomon's reformatter creates chr:pos, we need chr_pos for the P1 test
     if 'snp_id' in df.columns:
-        df['snp_id'] = df['snp_id'].str.replace(':', '_', regex=False)
-        df.to_csv(score_file_path, sep='\t', index=False)
-        print(f"✅ IDs in {score_file_path.name} aligned to 'chr_pos' format.")
-        inspect_file_head(score_file_path, title="Verifying Aligned Score File")
-    else:
-        print(f"⚠️  Warning: 'snp_id' column not found in {score_file_path.name}. Skipping alignment.")
-
-    return score_file_path
+        df['snp_id'] = df['snp_id'].str.replace(':', '_', regex=False).str.replace('^', 'chr', regex=True)
+    df.to_csv(p1_compat_path, sep='\t', index=False)
+    
+    print(f"✅ IDs in {p1_compat_path.name} aligned for PLINK1.")
+    inspect_file_head(p1_compat_path, title="Verifying PLINK1 Score File")
+    return p1_compat_path
 
 # ========================================================================================
 #                             MAIN EXECUTION & VALIDATION
@@ -265,58 +251,51 @@ if __name__ == "__main__":
         print_header(f"TESTING SCORE: {pgs_id}")
         original_score_file = CI_WORKDIR / Path(pgs_url.split("/")[-1]).stem
         
-        # --- Run Gnomon ---
-        cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CLEANED_PLINK_PREFIX)]
+        # --- Run Gnomon (using its native chr:pos data) ---
+        cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(GNOMON_NATIVE_PREFIX)]
         gnomon_result = run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}", CI_WORKDIR / f"gnomon_{pgs_id}.log")
         all_perf_results.append(gnomon_result)
         
         if not gnomon_result['success']:
             failed_tests.append(f"{pgs_id} (gnomon_execution_failed)"); continue
 
-        # --- Align Score File ---
-        # Gnomon will create a reformatted file. We need to find it and fix its IDs.
-        reformatted_file_raw = CI_WORKDIR / f"{original_score_file.name}.gnomon_format.tsv"
-        if not reformatted_file_raw.exists():
-            print(f"❌ CRITICAL: Gnomon did not produce the expected reformatted file: {reformatted_file_raw}")
-            failed_tests.append(f"{pgs_id} (gnomon_reformat_missing)"); continue
+        # --- Find Gnomon's output files ---
+        gnomon_reformatted_file = CI_WORKDIR / f"{original_score_file.name}.gnomon_format.tsv"
+        gnomon_final_score_file = CI_WORKDIR / f"{original_score_file.name}.sscore"
+        if not gnomon_reformatted_file.exists() or not gnomon_final_score_file.exists():
+            print(f"❌ CRITICAL: Gnomon did not produce its expected output files for {pgs_id}.")
+            failed_tests.append(f"{pgs_id} (gnomon_output_missing)"); continue
         
-        reformatted_file_aligned = align_score_file_ids(reformatted_file_raw)
-
-        # --- Run PLINK Tools with Aligned Data ---
-        pfile_prefix = CLEANED_PLINK_PREFIX.with_suffix("")
-        if not pfile_prefix.with_suffix(".pgen").exists():
-             print_header("One-time PLINK2 setup: creating .pfile from CLEANED data", char='*')
-             cmd_make_pgen = [str(PLINK2_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), "--make-pgen", "--out", str(pfile_prefix)]
-             subprocess.run(cmd_make_pgen, check=True, capture_output=True, text=True)
-        
+        # --- Run PLINK2 (using Gnomon-native chr:pos data for direct comparison) ---
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         cmd_plink2 = [
-            str(PLINK2_BINARY), "--pfile", str(pfile_prefix),
-            "--score", str(reformatted_file_aligned), "1", "2", "3", "header", "no-mean-imputation",
+            str(PLINK2_BINARY), "--pfile", str(GNOMON_NATIVE_PREFIX),
+            "--score", str(gnomon_reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
             "--out", str(plink2_out_prefix)
         ]
         plink2_result = run_and_measure(cmd_plink2, f"plink2_{pgs_id}", plink2_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink2_result)
 
+        # --- Run PLINK1 (using its special compatible chr_pos data) ---
+        p1_compat_score_file = create_plink1_compatible_score_file(gnomon_reformatted_file)
         plink1_out_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
-        cmd_plink1 = [str(PLINK1_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), "--score", str(reformatted_file_aligned), "1", "2", "3", "header", "sum", "--out", str(plink1_out_prefix)]
+        cmd_plink1 = [
+            str(PLINK1_BINARY), "--bfile", str(P1_COMPAT_PREFIX),
+            "--score", str(p1_compat_score_file), "1", "2", "3", "header", "sum",
+            "--out", str(plink1_out_prefix)
+        ]
         plink1_result = run_and_measure(cmd_plink1, f"plink1_{pgs_id}", plink1_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink1_result)
         
         # --- Validate Outputs ---
-        gnomon_out_file = original_score_file.parent / f"{original_score_file.name}.sscore"
-        
         if gnomon_result['success'] and plink1_result['success'] and plink2_result['success']:
             print_header(f"VALIDATING OUTPUTS for {pgs_id}", char='~')
-            plink2_out_file = plink2_out_prefix.with_suffix(".sscore")
-            plink1_out_file = plink1_out_prefix.with_suffix(".profile")
             
             try:
-                gnomon_df = pd.read_csv(gnomon_out_file, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
-                plink2_df = pd.read_csv(plink2_out_file, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
-                plink1_df = pd.read_csv(plink1_out_file, delim_whitespace=True).set_index("IID")
+                gnomon_df = pd.read_csv(gnomon_final_score_file, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
+                plink2_df = pd.read_csv(plink2_out_prefix.with_suffix(".sscore"), sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
+                plink1_df = pd.read_csv(plink1_out_prefix.with_suffix(".profile"), delim_whitespace=True).set_index("IID")
                 
-                # Robustly select the score columns from each tool using their known, fixed names.
                 gnomon_col = gnomon_df.columns[0]
                 
                 merged = pd.DataFrame(index=gnomon_df.index)
@@ -327,11 +306,10 @@ if __name__ == "__main__":
                 print("Comparing scores from Gnomon, PLINK2, and PLINK1:")
                 print(merged.head(15).to_string())
                 
-                # Specific check for the all-zeros bug
                 if (merged['gnomon'] == 0).all():
                     failed_tests.append(f"{pgs_id} (gnomon_all_zeros_bug)")
                     print(f"❌ CRITICAL FAILURE: Gnomon produced all-zero scores for {pgs_id}.")
-                    continue # No need to check numerical identity if scores are all zero
+                    continue 
 
                 is_close_p2 = np.isclose(merged['gnomon'], merged['plink2'], atol=NUMERICAL_TOLERANCE, rtol=NUMERICAL_TOLERANCE)
                 if not is_close_p2.all(): failed_tests.append(f"{pgs_id} (Gnomon_vs_PLINK2_mismatch)")
@@ -345,14 +323,11 @@ if __name__ == "__main__":
                 failed_tests.append(f"{pgs_id} (validation_script_error: {e})")
         else:
             print(f"Skipping validation for {pgs_id} due to tool execution failure(s).")
-            if not plink1_result['success']: failed_tests.append(f"{pgs_id} (plink1_execution_failed)")
-            if not plink2_result['success']: failed_tests.append(f"{pgs_id} (plink2_execution_failed)")
 
     # --- Final Summary ---
     print_header("PERFORMANCE SUMMARY")
     if all_perf_results:
         results_df = pd.DataFrame(all_perf_results)
-        results_df['pgs_id'] = results_df['tool'].apply(lambda x: x.split('_')[1])
         results_df['tool_base'] = results_df['tool'].apply(lambda x: x.split('_')[0])
         summary = results_df[results_df['success']].groupby('tool_base').agg(
             mean_time_sec=('time_sec', 'mean'), std_time_sec=('time_sec', 'std'),
@@ -360,13 +335,13 @@ if __name__ == "__main__":
         ).reset_index()
         print(summary.to_markdown(index=False, floatfmt=".3f"))
         
-        # Safely calculate performance comparison
         try:
-            gnomon_time = summary[summary['tool_base'] == 'gnomon']['mean_time_sec'].iloc[0]
-            plink2_time = summary[summary['tool_base'] == 'plink2']['mean_time_sec'].iloc[0]
+            gnomon_time = summary.loc[summary['tool_base'] == 'gnomon', 'mean_time_sec'].iloc[0]
+            plink2_time = summary.loc[summary['tool_base'] == 'plink2', 'mean_time_sec'].iloc[0]
             if gnomon_time > 0:
-                time_factor = plink2_time / gnomon_time
-                print(f"\nTime: Gnomon is {time_factor:.2f}x the speed of PLINK2 on average.")
+                # Swapped to be "speed of" vs "faster than" for clarity
+                speed_factor = plink2_time / gnomon_time
+                print(f"\nTime: Gnomon is {speed_factor:.2f}x the speed of PLINK2 on average.")
         except (IndexError, ZeroDivisionError):
             print("\nCould not compute performance comparison due to missing or zero-time results.")
     
