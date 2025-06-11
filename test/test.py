@@ -128,7 +128,7 @@ def monitor_memory(p: subprocess.Popen, results: dict):
         pass # Process may have finished before the thread started
     results['peak_mem_mb'] = peak_mem / (1024 * 1024)
 
-def inspect_file_head(file_path: Path, num_lines: int = 5):
+def inspect_file_head(file_path: Path, num_lines: int = 50):
     """Prints the first few lines of a file for debugging."""
     print("-" * 30)
     print(f"Inspecting file: {file_path.name}")
