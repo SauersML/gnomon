@@ -327,10 +327,17 @@ fn pivot_and_reconcile_tile(
     person_indices_in_block: &[OriginalPersonIndex],
     tile: &mut [EffectAlleleDosage],
     prep_result: &PreparationResult,
+    reconciled_snp_start_idx: usize,
+    chunk_bed_row_offset: usize,
 ) {
-    let snps_in_chunk = prep_result.num_reconciled_snps;
-    let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
+    // The number of SNPs in this chunk is the length of the tile row.
     let num_people_in_block = person_indices_in_block.len();
+    let snps_in_chunk = if num_people_in_block > 0 {
+        tile.len() / num_people_in_block
+    } else {
+        0
+    };
+    let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
 
     let two_splat = U8xN::splat(2);
     let missing_sentinel_splat = U8xN::splat(3);
@@ -358,13 +365,20 @@ fn pivot_and_reconcile_tile(
 
             let mut snp_data_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
-                let snp_idx = snp_chunk_start + i;
-                let snp_byte_offset =
-                    prep_result.required_snp_indices[snp_idx] as u64 * bytes_per_snp;
-                // To find the final memory address for each person's genotype data for this SNP,
-                // we must add the SNP's base offset (a scalar) to the vector of
-                // person-specific offsets. This requires "lifting" the scalar into a vector
-                // by splatting it across all lanes.
+                // This is the index into this chunk's subset of reconciled SNPs.
+                let snp_idx_in_chunk = snp_chunk_start + i;
+                // This is the index into the *global* list of all reconciled SNPs.
+                let global_snp_idx = reconciled_snp_start_idx + snp_idx_in_chunk;
+
+                // This is the absolute row index in the original .bed file.
+                let absolute_bed_row = prep_result.required_snp_indices[global_snp_idx];
+                // This is the row index *relative to the start of the current I/O chunk*.
+                let relative_bed_row = absolute_bed_row - chunk_bed_row_offset;
+
+                let snp_byte_offset = relative_bed_row as u64 * bytes_per_snp;
+
+                // The gather operation now correctly uses a relative offset within the
+                // `snp_major_data` buffer provided for this chunk.
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
                 snp_data_vectors[i] =
                     U8xN::gather_or_default(snp_major_data, source_byte_indices.cast());
@@ -372,9 +386,10 @@ fn pivot_and_reconcile_tile(
 
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
-                let snp_idx = snp_chunk_start + i;
+                let snp_idx_in_chunk = snp_chunk_start + i;
+                let global_snp_idx = reconciled_snp_start_idx + snp_idx_in_chunk;
                 let packed_vals = snp_data_vectors[i];
-                let reconciliation = prep_result.reconciliation_instructions[snp_idx];
+                let reconciliation = prep_result.reconciliation_instructions[global_snp_idx];
 
                 // --- SIMD Genotype Unpacking ---
                 // This logic unpacks the 2-bit PLINK genotypes into dosage values (0, 1, 2)
