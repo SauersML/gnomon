@@ -305,8 +305,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
 
         // The indices are now based on the stride, not the original number of scores.
-        let weights_start = reconciled_snps_processed * stride;
-        let weights_end = (reconciled_snps_processed + num_reconciled_in_chunk) * stride;
+        let weights_start = reconciled_indices_start * stride;
+        let weights_end = (reconciled_indices_start + num_reconciled_in_chunk) * stride;
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
