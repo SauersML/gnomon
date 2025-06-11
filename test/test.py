@@ -286,7 +286,11 @@ if __name__ == "__main__":
              subprocess.run(cmd_make_pgen, check=True, capture_output=True, text=True)
         
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        cmd_plink2 = [str(PLINK2_BINARY), "--pfile", str(pfile_prefix), "--score", str(reformatted_file), "1", "2", "3", "header", "--out", str(plink2_out_prefix)]
+        cmd_plink2 = [
+            str(PLINK2_BINARY), "--pfile", str(pfile_prefix),
+            "--score", str(reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
+            "--out", str(plink2_out_prefix)
+        ]
         plink2_result = run_and_measure(cmd_plink2, f"plink2_{pgs_id}", plink2_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink2_result)
 
