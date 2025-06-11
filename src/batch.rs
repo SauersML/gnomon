@@ -206,10 +206,13 @@ fn process_block(
     reconciled_snp_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) {
-    // Deduce the number of SNPs in this specific chunk from the length of the weights slice provided
+    // Deduce the number of SNPs in this specific chunk from the length of the
+    // padded weights slice. This logic must exactly match the padding logic
+    // from the `prepare` phase to correctly interpret the data's dimensions.
     let num_scores = prep_result.score_names.len();
-    let snps_in_chunk = if num_scores > 0 {
-        weights_for_chunk.len() / num_scores
+    let stride = (num_scores + SIMD_LANES - 1) / SIMD_LANES * SIMD_LANES;
+    let snps_in_chunk = if stride > 0 {
+        weights_for_chunk.len() / stride
     } else {
         0
     };
