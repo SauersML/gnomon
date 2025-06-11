@@ -322,7 +322,7 @@ fn build_reconciliation_plan(
                     });
                 }
             } else {
-                #eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}').", id, a1_str, a2_str);
+                // eprintln!("Warning: Skipping SNP '{}' in .bim file due to invalid allele format (alleles: '{}'/'{}').", id, a1_str, a2_str);
                 skipped_snp_count += 1;
             }
         } else {
