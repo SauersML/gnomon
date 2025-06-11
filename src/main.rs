@@ -244,9 +244,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             "read_chunk: {} bytes_read is not a multiple of bytes_per_snp ({})",
                             bytes_read, bps
                         );
-                        // a bit more context, if you like:
+                        // a bit more context
                         eprintln!(
-                            "[DBG] chunk_offset={} bytes_read={} snps_in_chunk={} bytes_per_snp={}",
+                            "[debug] chunk_offset={} bytes_read={} snps_in_chunk={} bytes_per_snp={}",
                             reader.cursor - bytes_read as u64, bytes_read, snps_in_chunk, bps
                         );
                     }
