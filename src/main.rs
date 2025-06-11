@@ -235,6 +235,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Ok((_, _, 0, _)) => break,
                 Ok((new_reader, buffer, bytes_read, snps_in_chunk)) => {
                     reader = new_reader;
+                    #[cfg(debug_assertions)]
+                    {
+                        let bps = reader.bytes_per_snp() as usize;
+                        // if this ever trips in debug, you know you mis-aligned
+                        debug_assert!(
+                            bytes_read % bps == 0,
+                            "read_chunk: {} bytes_read is not a multiple of bytes_per_snp ({})",
+                            bytes_read, bps
+                        );
+                        // a bit more context, if you like:
+                        eprintln!(
+                            "[DBG] chunk_offset={} bytes_read={} snps_in_chunk={} bytes_per_snp={}",
+                            reader.cursor - bytes_read as u64, bytes_read, snps_in_chunk, bps
+                        );
+                    }
                     if full_buffer_tx
                         .send(IoMessage {
                             buffer,

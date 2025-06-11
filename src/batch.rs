@@ -344,6 +344,22 @@ fn pivot_and_reconcile_tile(
     reconciled_snp_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) {
+    #[cfg(debug_assertions)]
+    {
+        // compute the pointer and length once
+        let ptr = tile.as_ptr() as usize;
+        let slice_len = snp_major_data.len();
+        debug_assert!(
+            ptr % bytes_per_snp as usize == 0,
+            "pivot: slice ptr {:#x} not aligned to bytes_per_snp {}",
+            ptr,
+            bytes_per_snp
+        );
+        eprintln!(
+            "[DBG] pivot_and_reconcile_tile: num_people_in_block={} snps_in_chunk={} slice.len={} bytes_per_snp={}",
+            num_people_in_block, snps_in_chunk, slice_len, bytes_per_snp
+        );
+    }
     // The number of SNPs in this chunk is the length of the tile row.
     let num_people_in_block = person_indices_in_block.len();
     let snps_in_chunk = if num_people_in_block > 0 {
