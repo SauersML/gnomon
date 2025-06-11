@@ -236,6 +236,7 @@ fn process_block(
         weights_for_chunk,
         block_scores_out,
         sparse_index_pool,
+        snps_in_chunk,
     );
 
     // Return the tile to the pool for reuse.
