@@ -18,41 +18,48 @@ pub const LANE_COUNT: usize = SimdVec::LEN;
 //                            PUBLIC API & TYPE DEFINITIONS
 // ========================================================================================
 
-/// A validated, type-safe, zero-cost wrapper for the interleaved weights matrix.
+/// A validated, type-safe, zero-cost wrapper for a padded, interleaved weights matrix.
 ///
 /// This struct's constructor guarantees that an instance can only be created if its
-/// dimensions are coherent, making an invalidly-dimensioned matrix an unrepresentable state.
-pub struct InterleavedWeights<'a> {
+/// dimensions and padding are coherent, making an invalidly-dimensioned or non-padded
+/// matrix an unrepresentable state for the kernel.
+pub struct PaddedInterleavedWeights<'a> {
     slice: &'a [f32],
-    // This field acts as a "proof token." Its value is used only for validation
-    // during construction, guaranteeing that any instance of this struct has
-    // coherent dimensions. It is intentionally not read afterwards.
-    _num_snps: usize,
+    // The number of actual scores (K), not the padded width.
     num_scores: usize,
+    // The padded width of one SNP's data block. Always a multiple of `LANE_COUNT`.
+    stride: usize,
 }
 
-impl<'a> InterleavedWeights<'a> {
-    /// Creates a new, validated `InterleavedWeights` view over a slice.
+impl<'a> PaddedInterleavedWeights<'a> {
+    /// Creates a new, validated `PaddedInterleavedWeights` view over a slice.
     ///
     /// This is the sole entry point for creating this type. It performs a single,
-    /// upfront check to ensure the slice length matches the provided dimensions.
+    /// upfront check to ensure the slice length matches the provided dimensions
+    /// and the implied padding, making it impossible for the kernel to receive
+    /// data with an incorrect memory layout.
     #[inline]
     pub fn new(
         slice: &'a [f32],
         num_snps: usize,
         num_scores: usize,
     ) -> Result<Self, &'static str> {
-        if slice.len() != num_snps * num_scores {
-            return Err("Mismatched weights: slice.len() does not equal num_snps * num_scores");
+        // The stride is the width of a single SNP's data, rounded up to the
+        // nearest multiple of the SIMD vector width.
+        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+        if slice.len() != num_snps * stride {
+            return Err(
+                "Mismatched weights: slice.len() does not equal num_snps * calculated_stride",
+            );
         }
         Ok(Self {
             slice,
-            _num_snps: num_snps,
             num_scores,
+            stride,
         })
     }
 
-    /// Returns the number of scores (K) this matrix was created with.
+    /// Returns the original number of scores (K) this matrix was created with.
     #[inline(always)]
     pub fn num_scores(&self) -> usize {
         self.num_scores
@@ -62,17 +69,18 @@ impl<'a> InterleavedWeights<'a> {
     ///
     /// # Safety
     /// The caller MUST guarantee that `snp_idx < self.num_snps` and
-    /// `lane_idx < (self.num_scores + LANE_COUNT - 1) / LANE_COUNT`.
-    /// This contract is upheld by `accumulate_scores_for_person`, whose loops
-    /// are correctly bounded.
+    /// `lane_idx < self.stride / LANE_COUNT`. This contract is upheld by
+    /// `accumulate_scores_for_person`, whose loops are correctly bounded.
+    /// The `PaddedInterleavedWeights` constructor guarantees that this memory
+    /// access is always in-bounds.
     #[inline(always)]
     unsafe fn get_simd_lane_unchecked(&self, snp_idx: usize, lane_idx: usize) -> SimdVec {
-        // This is the single, minimal `unsafe` operation. Its correctness is
-        // guaranteed by the disciplined logic of its sole caller.
-        let offset = (snp_idx * self.num_scores) + (lane_idx * LANE_COUNT);
-        // SAFETY: The `unsafe fn` contract guarantees the offset is in-bounds.
-        // This inner `unsafe` block is required by modern Rust to make the
-        // exact location of the unsafe operation explicit.
+        // The offset calculation now uses the pre-computed `stride` to correctly
+        // jump between the start of each SNP's padded data block.
+        let offset = (snp_idx * self.stride) + (lane_idx * LANE_COUNT);
+        // SAFETY: The `unsafe fn` contract guarantees the offset is in-bounds. The
+        // struct's constructor guarantees the data is padded, so reading a full
+        // `LANE_COUNT` of floats is always safe.
         unsafe { SimdVec::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
     }
 }
