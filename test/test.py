@@ -27,7 +27,7 @@ PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
 # --- Data Sources ---
 # Tools
 PLINK1_URL = "https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
-PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/plink2_linux_x86_64_20240116.zip"
+PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 # Genotype Data
 GENOTYPE_URL_BASE = "https://github.com/SauersML/genomic_pca/blob/main/data/"
