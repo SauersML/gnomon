@@ -23,7 +23,10 @@ CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
+# We will start with the original prefix and create a new, cleaned one.
+ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_original"
+CLEANED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_cleaned"
+
 
 # --- Data Sources ---
 # Tools
@@ -215,16 +218,20 @@ def setup_environment():
     PLINK1_BINARY.chmod(0o755)
     PLINK2_BINARY.chmod(0o755)
     
-    for zip_name in GENOTYPE_FILES:
+    # Download to a temporary name first, so we can rename to the original prefix.
+    temp_prefix = CI_WORKDIR / "chr22_subset50"
+    for zip_name, final_name in GENOTYPE_FILES.items():
         download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
+        # Rename the unzipped file to have the `_original` suffix
+        (temp_prefix.parent / final_name).rename(ORIGINAL_PLINK_PREFIX.with_suffix(f".{final_name.split('.')[-1]}"))
         
     for url in PGS_SCORES.values():
         download_and_extract(url, CI_WORKDIR)
 
-    print_header("DATA PRE-PROCESSING: STANDARDIZE AND DE-DUPLICATE VARIANTS")
-    bim_path = PLINK_PREFIX.with_suffix(".bim")
+    print_header("DATA PRE-PROCESSING: CREATING A CLEAN, DE-DUPLICATED GENOTYPE FILESET")
+    bim_path = ORIGINAL_PLINK_PREFIX.with_suffix(".bim")
     try:
-        # Step 1: Load the .bim file
+        # Step 1: Load the original .bim file to find unique variants
         bim_df = pd.read_csv(
             bim_path, sep='\\s+', header=None,
             names=['chr', 'id', 'cm', 'pos', 'a1', 'a2'],
@@ -237,18 +244,36 @@ def setup_environment():
         bim_df['id'] = bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str)
         print("Standardized variant IDs to 'chromosome:position' format.")
         
-        # Step 3: Remove duplicates based on the new standardized ID, keeping the first entry
-        bim_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
-        final_count = len(bim_df)
-        print(f"De-duplicated variants, keeping the first occurrence of each position. Removed {initial_count - final_count} duplicates.")
+        # Step 3: Identify unique variants to keep
+        unique_variants_df = bim_df.drop_duplicates(subset=['id'], keep='first')
+        final_count = len(unique_variants_df)
+        print(f"Identified {final_count} unique variants to keep. Removing {initial_count - final_count} duplicates.")
+        
+        # Step 4: Save the list of unique IDs to a file for PLINK's --extract command
+        unique_ids_path = CI_WORKDIR / "unique_variant_ids.txt"
+        unique_variants_df['id'].to_csv(unique_ids_path, header=False, index=False)
+        print(f"Saved list of unique variant IDs to {unique_ids_path.name}")
 
-        # Step 4: Save the cleaned .bim file
-        bim_df.to_csv(bim_path, sep='\t', header=False, index=False)
-        print(f"✅ Successfully wrote {final_count} unique variants to {bim_path.name}")
-        inspect_file_head(bim_path, title="Verifying Cleaned and De-duplicated .bim File")
+        # Step 5: Use PLINK to create a new, consistent fileset
+        print("Running PLINK to generate a new, cleaned .bed/.bim/.fam fileset...")
+        cmd_filter = [
+            str(PLINK2_BINARY),
+            "--bfile", str(ORIGINAL_PLINK_PREFIX),
+            "--extract", str(unique_ids_path),
+            "--make-bed",
+            "--out", str(CLEANED_PLINK_PREFIX)
+        ]
+        result = subprocess.run(cmd_filter, check=True, capture_output=True, text=True)
+        print("PLINK filtering process completed successfully.")
+        
+        # Verify the new files
+        inspect_file_head(CLEANED_PLINK_PREFIX.with_suffix(".bim"), title=f"Verifying new cleaned .bim file ({CLEANED_PLINK_PREFIX.name})")
 
     except Exception as e:
-        print(f"❌ FAILED to pre-process .bim file: {e}")
+        print(f"❌ FAILED to pre-process genotype data: {e}")
+        if 'result' in locals() and result.returncode != 0:
+            print("--- PLINK ERROR ---")
+            print(result.stderr)
         sys.exit(1)
 
 def find_reformatted_file(original_pgs_path: Path) -> Path:
@@ -279,7 +304,8 @@ if __name__ == "__main__":
         
         # --- Run Gnomon (triggers auto-reformatting) ---
         gnomon_log = CI_WORKDIR / f"gnomon_{pgs_id}.log" 
-        cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CI_WORKDIR)]
+        # Gnomon now runs on the CLEANED prefix
+        cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CLEANED_PLINK_PREFIX)]
         gnomon_result = run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}", gnomon_log)
         all_perf_results.append(gnomon_result)
         
@@ -292,11 +318,11 @@ if __name__ == "__main__":
             failed_tests.append(f"{pgs_id} (gnomon_reformat)")
             continue
 
-        # --- Convert .bfile to PLINK2's .pfile format (one-time setup) ---
-        pfile_prefix = CI_WORKDIR / "chr22_subset50_pfile"
+        # --- Convert CLEANED .bfile to PLINK2's .pfile format (one-time setup) ---
+        pfile_prefix = CLEANED_PLINK_PREFIX.with_suffix(".pfile") # A dummy name for checking existence
         if not pfile_prefix.with_suffix(".pgen").exists():
-             print_header("One-time PLINK2 setup: creating .pfile", char='*')
-             cmd_make_pgen = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), "--make-pgen", "--out", str(pfile_prefix)]
+             print_header("One-time PLINK2 setup: creating .pfile from CLEANED data", char='*')
+             cmd_make_pgen = [str(PLINK2_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), "--make-pgen", "--out", str(pfile_prefix)]
              subprocess.run(cmd_make_pgen, check=True, capture_output=True, text=True)
         
         # --- Run PLINK2 ---
@@ -314,7 +340,7 @@ if __name__ == "__main__":
         plink1_out_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         plink1_log = plink1_out_prefix.with_suffix(".log")
         cmd_plink1 = [
-            str(PLINK1_BINARY), "--bfile", str(PLINK_PREFIX), 
+            str(PLINK1_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), 
             "--score", str(reformatted_file), "1", "2", "3", "header", "sum",
             "--out", str(plink1_out_prefix)
         ]
@@ -322,7 +348,7 @@ if __name__ == "__main__":
         all_perf_results.append(plink1_result)
         
         # --- Validate Outputs ---
-        gnomon_out_file = original_score_file.parent / f"{original_score_file.name}.sscore"
+        gnomon_out_file = CLEANED_PLINK_PREFIX.parent / f"{original_score_file.name}.sscore"
         
         if gnomon_result['success'] and plink1_result['success'] and plink2_result['success']:
             print_header(f"VALIDATING OUTPUTS for {pgs_id}", char='~')
