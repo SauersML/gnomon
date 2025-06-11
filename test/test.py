@@ -203,7 +203,7 @@ if __name__ == "__main__":
         original_score_file = CI_WORKDIR / Path(pgs_url.split("/")[-1]).stem
 
         # --- Run Gnomon (triggers auto-reformatting) ---
-        cmd_gnomon = [str(GNOMON_BINARY), "--input-path", str(CI_WORKDIR), "--score", str(original_score_file)]
+        cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CI_WORKDIR)]
         all_perf_results.append(run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}"))
         
         # --- Find reformatted file for PLINK ---
