@@ -44,8 +44,10 @@ pub enum PersonSubset {
 /// can therefore operate with correct configuration.
 #[derive(Debug)]
 pub struct PreparationResult {
-    /// The flattened, interleaved weight matrix, structured for extreme performance.
-    /// Layout: `[S1_w1, S1_w2, ..., S2_w1, S2_w2, ...]`.
+    /// The flattened, padded, and interleaved weight matrix, structured for extreme
+    /// performance. For each SNP, the number of weights is rounded up to the
+    /// nearest multiple of the SIMD vector width (8), with the extra slots
+    /// padded with zeros. This guarantees safe, branch-free memory access in the kernel.
     pub interleaved_weights: Vec<f32>,
     /// The 0-based indices of the SNPs from the original .bim file that are
     /// required for the calculation, sorted in file order for sequential access.
