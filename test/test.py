@@ -152,14 +152,15 @@ def inspect_file_head(file_path: Path, num_lines: int = 50):
 
 
 def run_and_measure(command: list, tool_name: str, files_to_inspect_on_error: list = None) -> dict:
-    """Runs a command, measuring its wall-clock time and peak memory usage."""
     print(f"\n--- Running: {tool_name} ---")
     start_time = time.perf_counter()
     
+    # We now stream stderr directly to the console (sys.stderr) so that
+    # log messages from gnomon are visible in real-time.
     process = subprocess.Popen(
         command, 
         stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE, 
+        stderr=sys.stderr,  # Stream stderr directly
         text=True, 
         encoding='utf-8'
     )
@@ -168,7 +169,7 @@ def run_and_measure(command: list, tool_name: str, files_to_inspect_on_error: li
     mem_thread = threading.Thread(target=monitor_memory, args=(process, monitor_results))
     mem_thread.start()
     
-    stdout, stderr = process.communicate()
+    stdout, _ = process.communicate()
     mem_thread.join()
     
     end_time = time.perf_counter()
@@ -180,11 +181,10 @@ def run_and_measure(command: list, tool_name: str, files_to_inspect_on_error: li
         print("\n--- COMMAND ---")
         print(' '.join(map(str, command)))
         
-        print("\n--- STDOUT ---")
+        print("\n--- STDOUT (Captured) ---")
         print(stdout if stdout else "[EMPTY]")
         
-        print("\n--- STDERR ---")
-        print(stderr if stderr else "[EMPTY]")
+        # Stderr is already printed, so no need to print it again here.
         
         if files_to_inspect_on_error:
             print_header("INSPECTING RELEVANT FILES FOR DEBUGGING")
