@@ -104,7 +104,7 @@ impl<'a> PaddedInterleavedWeights<'a> {
 ///   at least `(weights.num_scores() + LANE_COUNT - 1) / LANE_COUNT`.
 #[inline]
 pub fn accumulate_scores_for_person(
-    weights: &InterleavedWeights,
+    weights: &PaddedInterleavedWeights,
     scores_out: &mut [f32],
     // --- Reusable, thread-local buffer ---
     accumulator_buffer: &mut [SimdVec],
