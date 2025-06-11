@@ -369,6 +369,23 @@ fn pivot_and_reconcile_tile(
     };
     let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
 
+    #[cfg(debug_assertions)]
+    {
+        // compute the pointer and length once
+        let ptr = tile.as_ptr() as usize;
+        let slice_len = snp_major_data.len();
+        debug_assert!(
+            ptr % bytes_per_snp as usize == 0,
+            "pivot: slice ptr {:#x} not aligned to bytes_per_snp {}",
+            ptr,
+            bytes_per_snp
+        );
+        eprintln!(
+            "[DBG] pivot_and_reconcile_tile: num_people_in_block={} snps_in_chunk={} slice.len={} bytes_per_snp={}",
+            num_people_in_block, snps_in_chunk, slice_len, bytes_per_snp
+        );
+    }
+
     let two_splat = U8xN::splat(2);
     let missing_sentinel_splat = U8xN::splat(3);
 
