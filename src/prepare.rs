@@ -353,26 +353,41 @@ fn build_reconciliation_plan(
     Ok((tasks, total_bim_snps, skipped_snp_count))
 }
 
-/// This function's internal logic is preserved as it was already correct.
+/// Creates the final, engine-ready data structures from the sorted reconciliation plan.
 fn finalize_from_sorted_plan(
     tasks: Vec<ReconciliationTask>,
     flat_weights: &[f32],
     num_scores: usize,
 ) -> (Vec<f32>, Vec<usize>, Vec<Reconciliation>) {
     let num_reconciled_snps = tasks.len();
-    let mut interleaved_weights = vec![0.0f32; num_reconciled_snps * num_scores];
     let mut required_snp_indices = Vec::with_capacity(num_reconciled_snps);
     let mut reconciliation_instructions = Vec::with_capacity(num_reconciled_snps);
+
+    // --- PADDING LOGIC ---
+    // The stride is the width of a single SNP's data, rounded up to the
+    // nearest multiple of the SIMD vector width (LANE_COUNT).
+    // This means that all memory accesses in the kernel will be safe and aligned.
+    const LANE_COUNT: usize = 8; // Must match the kernel's SIMD width.
+    let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let mut interleaved_weights = vec![0.0f32; num_reconciled_snps * stride];
 
     for (snp_i, task) in tasks.into_iter().enumerate() {
         required_snp_indices.push(task.bed_row_index);
         reconciliation_instructions.push(task.instruction);
+
+        // This is the slice of weights for the current SNP from the original, flat list.
         let source_slice =
             &flat_weights[task.weights_start_index..task.weights_start_index + num_scores];
-        let dest_start = snp_i * num_scores;
+
+        // This is the start of the padded block for this SNP in the destination vector.
+        let dest_start = snp_i * stride;
+
+        // This is the slice within the padded block where the actual weights will be copied.
+        // The rest of the block (the padding) remains zero, as initialized by vec!.
         let dest_slice = &mut interleaved_weights[dest_start..dest_start + num_scores];
         dest_slice.copy_from_slice(source_slice);
     }
+
     (
         interleaved_weights,
         required_snp_indices,
