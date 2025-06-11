@@ -293,8 +293,7 @@ if __name__ == "__main__":
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         cmd_plink2 = [str(PLINK2_BINARY), "--bfile", str(PLINK_PREFIX), 
                       "--score", str(reformatted_file), "header", "no-mean-imputation",
-                      "--score-col-nums", "3", "--out", str(plink2_out_prefix),
-                      "--variant-id", "@:#"]
+                      "--score-col-nums", "3", "--out", str(plink2_out_prefix)]
         all_perf_results.append(run_and_measure(cmd_plink2, f"plink2_{pgs_id}"))
 
         # --- Run PLINK1 ---
