@@ -30,7 +30,7 @@ GNOMON_NATIVE_PREFIX = CI_WORKDIR / "gnomon_native_data"
 # PLINK1 requires a universally safe chr_pos format
 P1_COMPAT_PREFIX = CI_WORKDIR / "p1_compatible_data"
 
-# Original data path
+# Original data path (used as source)
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_original"
 
 
@@ -187,7 +187,6 @@ def setup_environment():
     
     for zip_name, final_name in GENOTYPE_FILES.items():
         download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-        # --- FIX: The extracted file is in CI_WORKDIR directly, not a subdirectory. ---
         source_path = CI_WORKDIR / final_name
         dest_path = ORIGINAL_PLINK_PREFIX.with_suffix(f".{final_name.split('.')[-1]}")
         source_path.rename(dest_path)
@@ -197,7 +196,7 @@ def setup_environment():
 
     print_header("DATA PRE-PROCESSING: A ROBUST, TOOL-DRIVEN WORKFLOW")
     try:
-        # Create two separate, clean datasets for compatibility
+        # Create two separate, clean datasets for maximum compatibility
         
         # 1. Gnomon Native data (chr:pos IDs) for Gnomon and PLINK2
         print("Step 1a: Creating Gnomon-native data (chr:pos format)...")
@@ -231,9 +230,8 @@ def create_plink1_compatible_score_file(gnomon_native_score_file: Path) -> Path:
     
     df = pd.read_csv(gnomon_native_score_file, sep=r'\s+', engine='python')
     # Gnomon's reformatter creates chr:pos, we need chr_pos for the P1 test
+    # The PLINK1 data was created with a "chr" prefix, so we add it here.
     if 'snp_id' in df.columns:
-        # The logic is chr:pos -> chr_pos, e.g., 22:12345 -> chr22_12345
-        # The PLINK1 data was created with a "chr" prefix, so we add it here.
         df['snp_id'] = 'chr' + df['snp_id'].str.replace(':', '_', regex=False)
     
     df.to_csv(p1_compat_path, sep='\t', index=False)
@@ -265,15 +263,22 @@ if __name__ == "__main__":
         if not gnomon_result['success']:
             failed_tests.append(f"{pgs_id} (gnomon_execution_failed)"); continue
 
-        # --- Find Gnomon's output files ---
-        gnomon_reformatted_file = CI_WORKDIR / f"{original_score_file.name}.gnomon_format.tsv"
-        gnomon_final_score_file = CI_WORKDIR / f"{original_score_file.name}.sscore"
+        # --- Find and Verify Gnomon's output files IMMEDIATELY ---
+        gnomon_reformatted_file = original_score_file.parent / f"{original_score_file.name}.gnomon_format.tsv"
+        gnomon_final_score_file = original_score_file.parent / f"{original_score_file.name}.sscore"
+        
         if not gnomon_reformatted_file.exists() or not gnomon_final_score_file.exists():
             print(f"❌ CRITICAL: Gnomon did not produce its expected output files for {pgs_id}.")
+            if not gnomon_reformatted_file.exists(): inspect_file_head(gnomon_reformatted_file)
+            if not gnomon_final_score_file.exists(): inspect_file_head(gnomon_final_score_file)
             failed_tests.append(f"{pgs_id} (gnomon_output_missing)"); continue
-        
+        else:
+            print("✅ Gnomon produced all expected output files.")
+            inspect_file_head(gnomon_reformatted_file, title="Verifying Gnomon-Reformatted Score File")
+
         # --- Run PLINK2 (using Gnomon-native chr:pos data for direct comparison) ---
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
+        # Use Gnomon's reformatted file as input for a true apples-to-apples comparison
         cmd_plink2 = [
             str(PLINK2_BINARY), "--pfile", str(GNOMON_NATIVE_PREFIX),
             "--score", str(gnomon_reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
@@ -287,7 +292,7 @@ if __name__ == "__main__":
         plink1_out_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         cmd_plink1 = [
             str(PLINK1_BINARY), "--bfile", str(P1_COMPAT_PREFIX),
-            "--score", str(p1_compat_score_file), "1", "2", "3", "header", "sum",
+            "--score", str(p1_compat_score_file), "1", "2", "3", "header", "sum", "no-mean-imputation",
             "--out", str(plink1_out_prefix)
         ]
         plink1_result = run_and_measure(cmd_plink1, f"plink1_{pgs_id}", plink1_out_prefix.with_suffix(".log"))
@@ -344,9 +349,11 @@ if __name__ == "__main__":
         try:
             gnomon_time = summary.loc[summary['tool_base'] == 'gnomon', 'mean_time_sec'].iloc[0]
             plink2_time = summary.loc[summary['tool_base'] == 'plink2', 'mean_time_sec'].iloc[0]
-            if gnomon_time > 0:
+            if gnomon_time > 0 and plink2_time > 0:
                 speed_factor = plink2_time / gnomon_time
                 print(f"\nTime: Gnomon is {speed_factor:.2f}x the speed of PLINK2 on average.")
+            else:
+                print("\nCould not compute performance comparison due to missing or zero-time results.")
         except (IndexError, ZeroDivisionError):
             print("\nCould not compute performance comparison due to missing or zero-time results.")
     
