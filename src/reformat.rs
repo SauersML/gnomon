@@ -153,52 +153,43 @@ fn parse_metadata_and_header(
     Ok((final_score_name, column_map))
 }
 
-/// Determines the best variant identifier based on a defined priority.
+/// Determines the canonical variant identifier based on chromosome and position.
 ///
-/// Priority: hm_rsID > rsID > hm_chr:hm_pos > chr_name:chr_position
+/// This function enforces the use of positional identifiers, which is the only
+/// format supported by the downstream reconciliation engine. It uses a defined
+/// priority to ensure the most reliable data is used.
+///
+/// Priority: `hm_chr:hm_pos` (harmonized) > `chr_name:chr_position` (author-reported).
+///
+/// All other identifier types (e.g., rsIDs) are ignored.
 fn determine_snp_id(fields: &[&str], column_map: &HashMap<String, usize>) -> Option<String> {
-    // 1. Harmonized rsID (hm_rsID)
-    if let Some(&idx) = column_map.get("hm_rsID") {
-        if let Some(val) = fields.get(idx) {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
-
-    // 2. Author-reported rsID
-    if let Some(&idx) = column_map.get("rsID") {
-        if let Some(val) = fields.get(idx) {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
-
-    // 3. Harmonized Position (hm_chr:hm_pos)
+    // 1. Prioritize Harmonized Position (hm_chr:hm_pos)
+    // This is the most reliable positional data from the PGS Catalog harmonization pipeline.
     if let (Some(&chr_idx), Some(&pos_idx)) = (column_map.get("hm_chr"), column_map.get("hm_pos")) {
         if let (Some(chr), Some(pos)) = (fields.get(chr_idx), fields.get(pos_idx)) {
             if !chr.is_empty() && !pos.is_empty() {
-                // Do not prepend "chr". The canonical ID is based on the raw chromosome and position.
+                // The canonical ID format is "chromosome:position".
                 return Some(format!("{}:{}", chr, pos));
             }
         }
     }
 
-    // 4. Author-reported Position (chr_name:chr_position)
+    // 2. Fallback to Author-reported Position (chr_name:chr_position)
+    // This is used if harmonized data is not available for a given variant.
     if let (Some(&chr_idx), Some(&pos_idx)) = (
         column_map.get("chr_name"),
         column_map.get("chr_position"),
     ) {
         if let (Some(chr), Some(pos)) = (fields.get(chr_idx), fields.get(pos_idx)) {
             if !chr.is_empty() && !pos.is_empty() {
-                // Do not prepend "chr". The canonical ID is based on the raw chromosome and position.
+                // The canonical ID format is "chromosome:position".
                 return Some(format!("{}:{}", chr, pos));
             }
         }
     }
 
-    None // No valid identifier could be constructed.
+    // If no valid positional identifier can be constructed, the variant cannot be used.
+    None
 }
 
 /// Generates a descriptive output path for the reformatted file.
