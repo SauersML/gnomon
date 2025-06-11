@@ -186,6 +186,8 @@ fn process_people_iterator<'a, I>(
                 block_scores_out,
                 tile_pool,
                 sparse_index_pool,
+                reconciled_snp_start_idx,
+                chunk_bed_row_offset,
             );
         });
 }
@@ -201,8 +203,16 @@ fn process_block(
     block_scores_out: &mut [f32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
+    reconciled_snp_start_idx: usize,
+    chunk_bed_row_offset: usize,
 ) {
-    let snps_in_chunk = prep_result.num_reconciled_snps;
+    // Deduce the number of SNPs in this specific chunk from the length of the weights slice provided
+    let num_scores = prep_result.score_names.len();
+    let snps_in_chunk = if num_scores > 0 {
+        weights_for_chunk.len() / num_scores
+    } else {
+        0
+    };
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
 
     // Acquire a tile buffer from the pool.
@@ -216,6 +226,8 @@ fn process_block(
         person_indices_in_block,
         &mut tile,
         prep_result,
+        reconciled_snp_start_idx,
+        chunk_bed_row_offset,
     );
 
     process_tile(
