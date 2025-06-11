@@ -301,8 +301,9 @@ fn process_tile(
     }
     // --- End of Pre-computation ---
 
-    let weights = kernel::InterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
-        .expect("CRITICAL: Weights matrix validation failed. This is an unrecoverable internal error.");
+    let weights =
+        kernel::PaddedInterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
+            .expect("CRITICAL: Weights matrix validation failed. This is an unrecoverable internal error.");
 
     // This is now a sequential iterator over a block owned by a single rayon thread.
     block_scores_out
