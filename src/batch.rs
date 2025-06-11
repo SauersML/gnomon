@@ -251,10 +251,19 @@ fn process_tile(
     weights_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     sparse_index_pool: &SparseIndexPool,
+    // The number of SNPs in this specific chunk must be passed in explicitly, as
+    // it can vary from the total number of SNPs in the job.
+    snps_in_chunk: usize,
 ) {
-    let snps_in_chunk = prep_result.num_reconciled_snps;
     let num_scores = prep_result.score_names.len();
-    let num_people_in_block = tile.len() / snps_in_chunk;
+    // The number of people is determined by the tile's total length divided by
+    // the number of SNPs known to be in this specific chunk. This prevents a
+    // division-by-zero if a chunk contains no relevant SNPs.
+    let num_people_in_block = if snps_in_chunk > 0 {
+        tile.len() / snps_in_chunk
+    } else {
+        0
+    };
 
     // --- Pre-computation of Sparse Indices ---
     let thread_indices = sparse_index_pool.get_or_default();
