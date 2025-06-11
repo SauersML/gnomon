@@ -131,21 +131,5 @@ jobs:
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil
 
-      - name: Install PLINK Binaries
-        run: |
-          # PLINK 1.9
-          wget https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip -O plink1.zip
-          unzip plink1.zip
-          sudo mv plink /usr/local/bin/
-
-          # PLINK 2.0
-          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_x86_64_20240116.zip -O plink2.zip
-          unzip plink2.zip
-          sudo mv plink2 /usr/local/bin/
-
-          echo "--- PLINK Versions ---"
-          plink --version
-          plink2 --version
-
       - name: Run Unified End-to-End Test Suite
         run: python test/test.py
