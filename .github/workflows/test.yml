@@ -79,9 +79,7 @@ jobs:
           key: ${{ runner.os }}-deps-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-deps
-
-      # --- Stage 1: Initial Validation and Reporting ---
-
+  
       - name: Install getdoc
         run: |
           if [ ! -f ~/.cargo/bin/getdoc ]; then
@@ -118,8 +116,6 @@ jobs:
         if: steps.test_step.outcome == 'failure'
         run: exit 1
 
-      # --- Stage 2: Integration Test, Correctness Validation, and Benchmark ---
-
       - name: Build Gnomon release binary
         run: cargo build --release
 
@@ -131,5 +127,5 @@ jobs:
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil
 
-      - name: Run Unified End-to-End Test Suite
+      - name: Run Tests
         run: python test/test.py
