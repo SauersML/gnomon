@@ -23,7 +23,7 @@ CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-# We now use a more explicit naming scheme for clarity
+# Explicit naming for clarity in the processing pipeline
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_original"
 RENAMED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_renamed"
 CLEANED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_cleaned"
@@ -133,10 +133,12 @@ def parse_plink_log(log_path: Path) -> dict:
             content = f.read()
             error_match = re.search(r"\nError: (.*)", content)
             if error_match: log_info['error_message'] = error_match.group(1).strip()
-            processed_match = re.search(r"--score: (\d+) variants processed", content)
-            if processed_match: log_info['variants_processed'] = int(processed_match.group(1))
-            processed_match_p1 = re.search(r"(\d+) variants loaded from --score file", content)
-            if processed_match_p1: log_info['variants_processed'] = int(processed_match_p1.group(1))
+            
+            # Use regex to find all possible "variants processed" messages
+            processed_matches = re.findall(r"(?:--score: |from --score file).*?(\d+)\s+variants", content)
+            if processed_matches:
+                log_info['variants_processed'] = int(processed_matches[-1])
+
     except Exception as e:
         return {"log_status": f"Error reading log: {e}"}
     return log_info
@@ -170,7 +172,7 @@ def run_and_measure(command: list, tool_name: str, log_path: Path) -> dict:
     return results
 
 def setup_environment():
-    """Prepares the CI workspace by downloading and setting up all required artifacts."""
+    """Prepares the CI workspace, creating PLINK 1.9-compatible data."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     
@@ -189,42 +191,27 @@ def setup_environment():
 
     print_header("DATA PRE-PROCESSING: A ROBUST, TOOL-DRIVEN WORKFLOW")
     try:
-        # Step 1: RENAME variants to chr:pos format using PLINK. This creates a new, synchronized fileset.
-        print("Step 1: Renaming variants to 'chr:pos' format using PLINK...")
+        # Step 1: RENAME variants to `chr_pos` format for universal compatibility.
+        print("Step 1: Renaming variants to 'chr_pos' format for PLINK 1.9 compatibility...")
+        # This PLINK2 command creates variant IDs like 'chr22_10519265'
+        # which are safe for all tools, including the older PLINK 1.9.
         cmd_rename = [
-            str(PLINK1_BINARY), # Using PLINK1 for --set-missing-var-ids
-            "--bfile", str(ORIGINAL_PLINK_PREFIX),
-            # The template '@:#' means 'chromosome:position'
-            "--set-missing-var-ids", "@:#",
-            "--make-bed",
-            "--out", str(RENAMED_PLINK_PREFIX)
-        ]
-        # We need to run this on the original data, which has '.' as missing IDs
-        # To make it robust, we create a temporary bim file with all IDs set to '.'
-        original_bim = pd.read_csv(ORIGINAL_PLINK_PREFIX.with_suffix('.bim'), sep='\\s+', header=None)
-        original_bim[1] = '.'
-        temp_bim_path = CI_WORKDIR / "temp_for_rename.bim"
-        original_bim.to_csv(temp_bim_path, sep='\t', header=False, index=False)
-        
-        cmd_rename_p2 = [
              str(PLINK2_BINARY),
-             "--bed", str(ORIGINAL_PLINK_PREFIX.with_suffix('.bed')),
-             "--bim", str(temp_bim_path), # Use the temp bim with '.' for IDs
-             "--fam", str(ORIGINAL_PLINK_PREFIX.with_suffix('.fam')),
-             "--set-all-var-ids", "@:#",
+             "--bfile", str(ORIGINAL_PLINK_PREFIX),
+             # The template "chr@_#" creates IDs like "chr1_12345"
+             "--set-all-var-ids", "chr@_#",
              "--make-bed",
              "--out", str(RENAMED_PLINK_PREFIX)
         ]
-        result_rename = subprocess.run(cmd_rename_p2, check=True, capture_output=True, text=True)
+        result_rename = subprocess.run(cmd_rename, check=True, capture_output=True, text=True)
         print("✅ Renaming successful.")
-        inspect_file_head(RENAMED_PLINK_PREFIX.with_suffix(".bim"), title="Verifying Renamed .bim File")
+        inspect_file_head(RENAMED_PLINK_PREFIX.with_suffix(".bim"), title="Verifying Renamed .bim File (chr_pos format)")
 
-        # Step 2: DE-DUPLICATE the renamed fileset using PLINK's dedicated command.
+        # Step 2: DE-DUPLICATE the renamed fileset. This step remains critical.
         print("\nStep 2: De-duplicating the renamed fileset...")
         cmd_dedup = [
             str(PLINK2_BINARY),
             "--bfile", str(RENAMED_PLINK_PREFIX),
-            # This mode finds variants with the same ID and keeps only the first one.
             "--rm-dup", "force-first",
             "--make-bed",
             "--out", str(CLEANED_PLINK_PREFIX)
@@ -243,15 +230,25 @@ def setup_environment():
             print(result_dedup.stderr)
         sys.exit(1)
 
-def find_reformatted_file(original_pgs_path: Path) -> Path:
-    expected_name = f"{original_pgs_path.stem}.gnomon_format.tsv"
-    expected_path = original_pgs_path.parent / expected_name
-    if not expected_path.exists():
-        print(f"❌ CRITICAL: Could not find the expected reformatted file at: {expected_path}")
-        return None
-    print(f"Found Gnomon's reformatted score file: {expected_path.name}")
-    inspect_file_head(expected_path, title="Verifying reformatted score file")
-    return expected_path
+def align_score_file_ids(score_file_path: Path) -> Path:
+    """
+    FIX: Gnomon's reformatter creates `chr:pos` IDs. This function
+    post-processes that file to create `chr_pos` IDs to match our cleaned
+    genotype data, ensuring compatibility for PLINK tools.
+    """
+    print_header(f"ALIGNING SCORE FILE IDs in {score_file_path.name}", char='*')
+    df = pd.read_csv(score_file_path, sep=r'\s+', engine='python')
+    
+    # Check if 'snp_id' column exists before trying to modify it
+    if 'snp_id' in df.columns:
+        df['snp_id'] = df['snp_id'].str.replace(':', '_', regex=False)
+        df.to_csv(score_file_path, sep='\t', index=False)
+        print(f"✅ IDs in {score_file_path.name} aligned to 'chr_pos' format.")
+        inspect_file_head(score_file_path, title="Verifying Aligned Score File")
+    else:
+        print(f"⚠️  Warning: 'snp_id' column not found in {score_file_path.name}. Skipping alignment.")
+
+    return score_file_path
 
 # ========================================================================================
 #                             MAIN EXECUTION & VALIDATION
@@ -268,17 +265,24 @@ if __name__ == "__main__":
         print_header(f"TESTING SCORE: {pgs_id}")
         original_score_file = CI_WORKDIR / Path(pgs_url.split("/")[-1]).stem
         
+        # --- Run Gnomon ---
         cmd_gnomon = [str(GNOMON_BINARY), "--score", str(original_score_file), str(CLEANED_PLINK_PREFIX)]
         gnomon_result = run_and_measure(cmd_gnomon, f"gnomon_{pgs_id}", CI_WORKDIR / f"gnomon_{pgs_id}.log")
         all_perf_results.append(gnomon_result)
         
         if not gnomon_result['success']:
-            failed_tests.append(f"{pgs_id} (gnomon)"); continue
+            failed_tests.append(f"{pgs_id} (gnomon_execution_failed)"); continue
 
-        reformatted_file = find_reformatted_file(original_score_file)
-        if reformatted_file is None:
-            failed_tests.append(f"{pgs_id} (gnomon_reformat)"); continue
+        # --- Align Score File ---
+        # Gnomon will create a reformatted file. We need to find it and fix its IDs.
+        reformatted_file_raw = CI_WORKDIR / f"{original_score_file.name}.gnomon_format.tsv"
+        if not reformatted_file_raw.exists():
+            print(f"❌ CRITICAL: Gnomon did not produce the expected reformatted file: {reformatted_file_raw}")
+            failed_tests.append(f"{pgs_id} (gnomon_reformat_missing)"); continue
+        
+        reformatted_file_aligned = align_score_file_ids(reformatted_file_raw)
 
+        # --- Run PLINK Tools with Aligned Data ---
         pfile_prefix = CLEANED_PLINK_PREFIX.with_suffix("")
         if not pfile_prefix.with_suffix(".pgen").exists():
              print_header("One-time PLINK2 setup: creating .pfile from CLEANED data", char='*')
@@ -288,17 +292,18 @@ if __name__ == "__main__":
         plink2_out_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         cmd_plink2 = [
             str(PLINK2_BINARY), "--pfile", str(pfile_prefix),
-            "--score", str(reformatted_file), "1", "2", "3", "header", "no-mean-imputation",
+            "--score", str(reformatted_file_aligned), "1", "2", "3", "header", "no-mean-imputation",
             "--out", str(plink2_out_prefix)
         ]
         plink2_result = run_and_measure(cmd_plink2, f"plink2_{pgs_id}", plink2_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink2_result)
 
         plink1_out_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
-        cmd_plink1 = [str(PLINK1_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), "--score", str(reformatted_file), "1", "2", "3", "header", "sum", "--out", str(plink1_out_prefix)]
+        cmd_plink1 = [str(PLINK1_BINARY), "--bfile", str(CLEANED_PLINK_PREFIX), "--score", str(reformatted_file_aligned), "1", "2", "3", "header", "sum", "--out", str(plink1_out_prefix)]
         plink1_result = run_and_measure(cmd_plink1, f"plink1_{pgs_id}", plink1_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink1_result)
         
+        # --- Validate Outputs ---
         gnomon_out_file = original_score_file.parent / f"{original_score_file.name}.sscore"
         
         if gnomon_result['success'] and plink1_result['success'] and plink2_result['success']:
@@ -311,34 +316,39 @@ if __name__ == "__main__":
                 plink2_df = pd.read_csv(plink2_out_file, sep='\t').rename(columns={"#IID": "IID"}).set_index("IID")
                 plink1_df = pd.read_csv(plink1_out_file, delim_whitespace=True).set_index("IID")
                 
-                # Select the score columns from each tool using their known, fixed names.
-                # Gnomon uses the score name from the file header.
-                # PLINK2 uses 'NAMED_ALLELE_DOSAGE_SUM' for the sum.
-                # PLINK1 uses 'SCORE' for the sum.
+                # Robustly select the score columns from each tool using their known, fixed names.
                 gnomon_col = gnomon_df.columns[0]
                 
-                # Create a new, clean DataFrame for comparison.
                 merged = pd.DataFrame(index=gnomon_df.index)
                 merged['gnomon'] = gnomon_df[gnomon_col]
                 merged['plink2'] = plink2_df['NAMED_ALLELE_DOSAGE_SUM']
                 merged['plink1'] = plink1_df['SCORE']
 
+                print("Comparing scores from Gnomon, PLINK2, and PLINK1:")
                 print(merged.head(15).to_string())
                 
+                # Specific check for the all-zeros bug
+                if (merged['gnomon'] == 0).all():
+                    failed_tests.append(f"{pgs_id} (gnomon_all_zeros_bug)")
+                    print(f"❌ CRITICAL FAILURE: Gnomon produced all-zero scores for {pgs_id}.")
+                    continue # No need to check numerical identity if scores are all zero
+
                 is_close_p2 = np.isclose(merged['gnomon'], merged['plink2'], atol=NUMERICAL_TOLERANCE, rtol=NUMERICAL_TOLERANCE)
-                if not is_close_p2.all(): failed_tests.append(f"{pgs_id} (Gnomon!=PLINK2)")
+                if not is_close_p2.all(): failed_tests.append(f"{pgs_id} (Gnomon_vs_PLINK2_mismatch)")
                 else: print(f"✅ NUMERICAL IDENTITY: Gnomon == PLINK2")
 
                 is_close_p1 = np.isclose(merged['gnomon'], merged['plink1'], atol=NUMERICAL_TOLERANCE, rtol=NUMERICAL_TOLERANCE)
-                if not is_close_p1.all(): failed_tests.append(f"{pgs_id} (Gnomon!=PLINK1)")
+                if not is_close_p1.all(): failed_tests.append(f"{pgs_id} (Gnomon_vs_PLINK1_mismatch)")
                 else: print(f"✅ NUMERICAL IDENTITY: Gnomon == PLINK1")
-            except Exception as e:
-                failed_tests.append(f"{pgs_id} (validation_error: {e})")
-        else:
-            print(f"Skipping validation for {pgs_id} due to tool failure(s).")
-            if not plink1_result['success']: failed_tests.append(f"{pgs_id} (plink1)")
-            if not plink2_result['success']: failed_tests.append(f"{pgs_id} (plink2)")
 
+            except Exception as e:
+                failed_tests.append(f"{pgs_id} (validation_script_error: {e})")
+        else:
+            print(f"Skipping validation for {pgs_id} due to tool execution failure(s).")
+            if not plink1_result['success']: failed_tests.append(f"{pgs_id} (plink1_execution_failed)")
+            if not plink2_result['success']: failed_tests.append(f"{pgs_id} (plink2_execution_failed)")
+
+    # --- Final Summary ---
     print_header("PERFORMANCE SUMMARY")
     if all_perf_results:
         results_df = pd.DataFrame(all_perf_results)
@@ -349,11 +359,16 @@ if __name__ == "__main__":
             mean_mem_mb=('peak_mem_mb', 'mean'), std_mem_mb=('peak_mem_mb', 'std')
         ).reset_index()
         print(summary.to_markdown(index=False, floatfmt=".3f"))
-        gnomon_stats = summary[summary['tool_base'] == 'gnomon']
-        plink2_stats = summary[summary['tool_base'] == 'plink2']
-        if not gnomon_stats.empty and not plink2_stats.empty:
-            time_factor = plink2_stats['mean_time_sec'].iloc[0] / gnomon_stats['mean_time_sec'].iloc[0]
-            print(f"\nTime: Gnomon is {time_factor:.2f}x faster than PLINK2 on average.")
+        
+        # Safely calculate performance comparison
+        try:
+            gnomon_time = summary[summary['tool_base'] == 'gnomon']['mean_time_sec'].iloc[0]
+            plink2_time = summary[summary['tool_base'] == 'plink2']['mean_time_sec'].iloc[0]
+            if gnomon_time > 0:
+                time_factor = plink2_time / gnomon_time
+                print(f"\nTime: Gnomon is {time_factor:.2f}x the speed of PLINK2 on average.")
+        except (IndexError, ZeroDivisionError):
+            print("\nCould not compute performance comparison due to missing or zero-time results.")
     
     if failed_tests:
         print_header("CI CHECK FAILED")
