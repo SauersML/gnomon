@@ -399,11 +399,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 // ========================================================================================
 
 /// Intelligently resolves the user-provided input path to a PLINK prefix.
+///
+/// This function is designed to be flexible and supports three common ways of
+/// specifying a PLINK fileset:
+/// 1. By providing a path to the directory containing a single `.bed` file.
+/// 2. By providing a direct path to the `.bed` file itself.
+/// 3. By providing the fileset's prefix (e.g., `data/my_plink_files`), which
+///    does not exist as a file or directory itself.
 fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
-    if !path.exists() {
-        return Err(format!("Input path '{}' does not exist.", path.display()));
-    }
-
+    // Case 1: The path is a directory. Search for a unique .bed file inside.
     if path.is_dir() {
         let bed_files: Vec<PathBuf> = fs::read_dir(path)
             .map_err(|e| format!("Could not read directory '{}': {}", path.display(), e))?
@@ -413,21 +417,41 @@ fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
             .collect();
 
         match bed_files.len() {
-            0 => Err("No .bed file found in the specified directory.".to_string()),
+            0 => Err(format!("No .bed file found in the directory '{}'.", path.display())),
             1 => Ok(bed_files[0].with_extension("")),
             _ => Err(format!(
-                "Ambiguous input: multiple .bed files found in directory: {:?}",
+                "Ambiguous input: multiple .bed files found in directory '{}': {:?}",
+                path.display(),
                 bed_files
             )),
         }
-    } else if path.is_file() {
+    }
+    // Case 2: The path is a direct file path. Check if it's a .bed file.
+    else if path.is_file() {
         if path.extension().map_or(false, |ext| ext == "bed") {
             Ok(path.with_extension(""))
         } else {
-            Err("Input file must have a .bed extension.".to_string())
+            // If it's a file but not a .bed, this is an explicit error, as the user
+            // pointed to a specific, but incorrect, file type.
+            Err(format!(
+                "Input file '{}' must have a .bed extension.",
+                path.display()
+            ))
         }
-    } else {
-        Err("Input path is not a file or directory.".to_string())
+    }
+    // Case 3: The path does not exist as a file or directory. Treat it as a prefix string.
+    // We construct the expected .bed file path and check for its existence.
+    else {
+        let bed_path_from_prefix = path.with_extension("bed");
+        if bed_path_from_prefix.is_file() {
+            Ok(path.to_path_buf())
+        } else {
+            // If all attempts fail, return a comprehensive error message.
+            Err(format!(
+                "Input '{}' is not a valid directory, .bed file, or PLINK prefix.",
+                path.display()
+            ))
+        }
     }
 }
 
