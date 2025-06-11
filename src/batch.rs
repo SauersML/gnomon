@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::error::Error;
 use std::simd::{cmp::SimdPartialEq, num::SimdUint, Simd};
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- SIMD & Engine Tuning Parameters ---
