@@ -1,131 +1,54 @@
-name: Rust Test CI
+# .github/workflows/test.yml
+
+name: Gnomon Integration & Performance CI
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
+
 env:
   CARGO_TERM_COLOR: always
+
 jobs:
-  test:
+  # This single job compiles the Rust binary and then uses a Python script
+  # to orchestrate an end-to-end test against PLINK for both correctness
+  # and performance.
+  test-and-benchmark:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust nightly
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
-      
-      # Cache the entire .cargo directory (includes bin, registry, git)
-      - name: Cache Cargo home
-        uses: actions/cache@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
         with:
-          path: ~/.cargo
-          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.toml') }}
-            ${{ runner.os }}-cargo-home
-      
-      # Cache target directory with more granular keys
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
-          restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}
-            ${{ runner.os }}-target
-      
-      # Cache Rust toolchain components
-      - name: Cache Rust toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.rustup/update-hashes
-            ~/.rustup/settings.toml
-          key: ${{ runner.os }}-rust-toolchain-nightly-${{ hashFiles('rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-toolchain-nightly
-      
-      # Cache system dependencies that might be downloaded
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt
-      
-      # Cache getdoc installation with version awareness
-      - name: Cache getdoc installation
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/getdoc
-          key: ${{ runner.os }}-getdoc-binary-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-getdoc-binary
-      
-      # Cache compiled dependencies separately from target
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            target/debug/deps
-            target/debug/build
-          key: ${{ runner.os }}-deps-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-deps
-      
-      # Install getdoc only if not cached
-      - name: Install getdoc
+          python-version: '3.10'
+
+      # The sccache action helps to speed up Rust compilations by caching
+      # compiled artifacts. It is more robust than manual cache steps.
+      - name: Setup sccache for Rust build caching
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      - name: Install Python dependencies
         run: |
-          if [ ! -f ~/.cargo/bin/getdoc ]; then
-            echo "Installing getdoc..."
-            cargo +nightly install getdoc --locked
-          else
-            echo "getdoc already installed (cached)"
-          fi
-      
-      # Cache test artifacts
-      - name: Cache test artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            target/debug/incremental
-            target/.rustc_info.json
-          key: ${{ runner.os }}-test-artifacts-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
-          restore-keys: |
-            ${{ runner.os }}-test-artifacts
-      
-      - name: Test
-        id: test_step
-        run: cargo +nightly test
-        continue-on-error: true
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests psutil
+
+      - name: Compile Gnomon in release mode
         env:
-          RUST_BACKTRACE: 1
-      
-      # Cache generated reports
-      - name: Cache reports
-        uses: actions/cache@v4
-        with:
-          path: |
-            report.md
-            target/doc
-          key: ${{ runner.os }}-reports-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-reports
-      
-      - name: Generate report
-        run: |
-          ~/.cargo/bin/getdoc
-          echo "=== Test Report ==="
-          cat report.md
-      
-      - name: Fail job if tests failed
-        if: steps.test_step.outcome == 'failure'
-        run: exit 1
+          # Wire the Rust build process to use sccache.
+          RUSTC_WRAPPER: sccache
+        run: cargo build --release
+
+      - name: Run Unified Test & Benchmark Script
+        run: python testing/test.py
