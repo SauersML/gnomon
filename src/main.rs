@@ -257,10 +257,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     // The main task becomes the Consumer and Compute Dispatcher.
-    // We must track two separate counters: one for the raw .bed file rows, and one
-    // for the index into our compacted, reconciled SNP data structures.
-    let mut bed_row_offset = 0;
-    let mut reconciled_snps_processed = 0;
+    // We track the offset into the raw .bed file and use it to find the corresponding
+    // range of reconciled SNPs for each chunk.
+    let mut bed_row_offset: usize = 0;
 
     while let Some(IoMessage {
         buffer: full_buffer,
@@ -304,9 +303,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let num_scores = prep_clone.score_names.len();
         let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
 
-        // The indices are now based on the stride, not the original number of scores.
+        // The `interleaved_weights` and `required_snp_indices` vectors are co-sorted.
+        // We use the start and end indices from the binary search on `required_snp_indices`
+        // to derive the correct slice from the weights buffer, for perfect sync.
         let weights_start = reconciled_indices_start * stride;
-        let weights_end = (reconciled_indices_start + num_reconciled_in_chunk) * stride;
+        let weights_end = reconciled_indices_end * stride;
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
@@ -348,16 +349,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         returned_scores_buffer.iter_mut().for_each(|s| *s = 0.0);
         partial_scores_pool_clone.push(returned_scores_buffer).unwrap();
 
-        // Update both counters before processing the next chunk.
+        // Advance the raw file offset for the next chunk.
         bed_row_offset += snps_in_chunk;
-        reconciled_snps_processed += num_reconciled_in_chunk;
 
-        // The progress report is now accurate.
         eprintln!(
             "> Processed chunk: {}/{} SNPs ({:.1}%)",
-            reconciled_snps_processed,
+            reconciled_indices_end,
             prep_result.num_reconciled_snps,
-            (reconciled_snps_processed as f32 / prep_result.num_reconciled_snps as f32) * 100.0
+            (reconciled_indices_end as f32 / prep_result.num_reconciled_snps as f32) * 100.0
         );
     }
 
