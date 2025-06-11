@@ -299,7 +299,7 @@ if __name__ == "__main__":
         plink1_result = run_and_measure(cmd_plink1, f"plink1_{pgs_id}", plink1_out_prefix.with_suffix(".log"))
         all_perf_results.append(plink1_result)
         
-        gnomon_out_file = CLEANED_PLINK_PREFIX.with_suffix(".sscore")
+        gnomon_out_file = original_score_file.parent / f"{original_score_file.name}.sscore"
         
         if gnomon_result['success'] and plink1_result['success'] and plink2_result['success']:
             print_header(f"VALIDATING OUTPUTS for {pgs_id}", char='~')
