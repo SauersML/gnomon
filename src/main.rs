@@ -371,7 +371,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let (returned_io_buffer, mut returned_scores_buffer) = match compute_handle.await? {
             Ok(buffers) => buffers,
-            Err(e) => return Err(e),
+            Err(e) => {
+                eprintln!("Compute task panicked: {:?}", e);
+                return Err(e);
+            },
         };
 
         #[cfg(debug_assertions)]
