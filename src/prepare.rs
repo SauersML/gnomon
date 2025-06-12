@@ -403,7 +403,7 @@ fn discover_required_bim_indices(
                     }
                 }
             }
-            Ok(set_for_snp)
+            Ok::<_, PrepError>(set_for_snp)
         })
         .collect();
 
