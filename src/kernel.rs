@@ -104,7 +104,8 @@ impl<'a> PaddedInterleavedWeights<'a> {
 ///   at least `(weights.num_scores() + LANE_COUNT - 1) / LANE_COUNT`.
 #[inline]
 pub fn accumulate_scores_for_person(
-    weights: &PaddedInterleavedWeights,
+    aligned_weights: &PaddedInterleavedWeights,
+    correction_constants: &PaddedInterleavedWeights, // ADDED
     scores_out: &mut [f32],
     // --- Reusable, thread-local buffer ---
     accumulator_buffer: &mut [SimdVec],
@@ -112,7 +113,7 @@ pub fn accumulate_scores_for_person(
     g1_indices: &[usize],
     g2_indices: &[usize],
 ) {
-    let num_scores = weights.num_scores();
+    let num_scores = aligned_weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
     let dosage_2_multiplier = SimdVec::splat(2.0);
     // --- Reset the Reusable Accumulator Buffer ---
@@ -127,7 +128,7 @@ pub fn accumulate_scores_for_person(
     // in-bounds by the function's safety contract.
     for &snp_idx in g1_indices {
         for i in 0..num_accumulator_lanes {
-            let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
+            let weights_vec = unsafe { aligned_weights.get_simd_lane_unchecked(snp_idx, i) };
             // SAFETY: The `accumulator_buffer` slice is guaranteed by the caller to have
             // `num_accumulator_lanes` elements, and this loop runs from `0..num_accumulator_lanes`,
             // so `i` is always in bounds. This allows `get_unchecked_mut` to be used to
@@ -140,7 +141,7 @@ pub fn accumulate_scores_for_person(
 
     for &snp_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
-            let weights_vec = unsafe { weights.get_simd_lane_unchecked(snp_idx, i) };
+            let weights_vec = unsafe { aligned_weights.get_simd_lane_unchecked(snp_idx, i) };
             // SAFETY: The `accumulator_buffer` slice is guaranteed by the caller to have
             // `num_accumulator_lanes` elements, and this loop runs from `0..num_accumulator_lanes`,
             // so `i` is always in bounds. This allows `get_unchecked_mut` to be used to
@@ -148,6 +149,16 @@ pub fn accumulate_scores_for_person(
             unsafe {
                 let acc = accumulator_buffer.get_unchecked_mut(i);
                 *acc = weights_vec.mul_add(dosage_2_multiplier, *acc);
+            }
+        }
+    }
+
+    // --- ADD THIS ENTIRE LOOP (Loop 3: Correction Constants) ---
+    for &matrix_row in g1_indices.iter().chain(g2_indices.iter()) {
+        for i in 0..num_accumulator_lanes {
+            unsafe {
+                let correction_vec = correction_constants.get_simd_lane_unchecked(matrix_row, i);
+                *accumulator_buffer.get_unchecked_mut(i) += correction_vec;
             }
         }
     }
