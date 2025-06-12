@@ -218,7 +218,6 @@ fn process_block(
         block_scores_out,
         sparse_index_pool,
         snps_in_chunk,
-        matrix_row_start_idx,
     );
 
     // Return the tile to the pool for reuse.
@@ -236,7 +235,6 @@ fn process_tile(
     block_scores_out: &mut [f32],
     sparse_index_pool: &SparseIndexPool,
     snps_in_chunk: usize,
-    matrix_row_start_idx: usize,
 ) {
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
