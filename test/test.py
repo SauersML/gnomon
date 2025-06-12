@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import subprocess
 import requests
 import zipfile
@@ -20,17 +19,18 @@ CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_original"
+# Use the raw, unzipped PLINK files directly
+ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
 
 PLINK1_URL = "https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 GENOTYPE_URL_BASE = "https://github.com/SauersML/genomic_pca/blob/main/data/"
-GENOTYPE_FILES = {
-    "chr22_subset50.bed.zip": "chr22_subset50.bed",
-    "chr22_subset50.bim.zip": "chr22_subset50.bim",
-    "chr22_subset50.fam.zip": "chr22_subset50.fam",
-}
+GENOTYPE_FILES = [
+    "chr22_subset50.bed.zip",
+    "chr22_subset50.bim.zip",
+    "chr22_subset50.fam.zip",
+]
 
 PGS_SCORES = {
     "PGS004696": "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS004696/ScoringFiles/Harmonized/PGS004696_hmPOS_GRCh38.txt.gz",
@@ -114,30 +114,19 @@ def setup_environment():
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
 
-    # Download and set permissions on PLINK executables
-    download_and_extract(PLINK1_URL, CI_WORKDIR)
-    download_and_extract(PLINK2_URL, CI_WORKDIR)
-    if PLINK1_BINARY.exists():
-        PLINK1_BINARY.chmod(0o755)
-    else:
+    # Download PLINK1 and PLINK2, extract, and set executable
+    for url, binary in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
+        download_and_extract(url, CI_WORKDIR)
+        # find extracted file and rename
         for p in CI_WORKDIR.iterdir():
-            if p.is_file() and p.name.startswith('plink') and 'linux' not in p.name:
-                p.rename(PLINK1_BINARY)
-                PLINK1_BINARY.chmod(0o755)
-                break
-    if PLINK2_BINARY.exists():
-        PLINK2_BINARY.chmod(0o755)
-    else:
-        for p in CI_WORKDIR.iterdir():
-            if p.is_file() and p.name.startswith('plink2'):
-                p.rename(PLINK2_BINARY)
-                PLINK2_BINARY.chmod(0o755)
+            if p.is_file() and p.name.startswith(binary.name.split('_')[0]):
+                p.rename(binary)
+                binary.chmod(0o755)
                 break
 
-    # Download raw genotype files (no reformat)
-    for zip_name, final in GENOTYPE_FILES.items():
+    # Download raw genotype .bed/.bim/.fam without modification
+    for zip_name in GENOTYPE_FILES:
         download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-        (CI_WORKDIR / final).rename(ORIGINAL_PLINK_PREFIX.with_suffix(f".{final.split('.')[-1]}"))
 
     # Download PGS score files
     for url in PGS_SCORES.values():
@@ -159,14 +148,13 @@ def find_score_column(df: pd.DataFrame, candidates: list) -> str:
 def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
-    all_results = []
-    failures = []
+    all_results, failures = [], []
 
     for pgs_id, url in PGS_SCORES.items():
         print_header(f"TESTING SCORE: {pgs_id}")
         score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
 
-        # 1) Run Gnomon on raw unzipped data
+        # 1) Run Gnomon
         cmd_g = [str(GNOMON_BINARY), "--score", str(score_file), str(ORIGINAL_PLINK_PREFIX)]
         res_g = run_and_measure(cmd_g, f"gnomon_{pgs_id}")
         all_results.append(res_g)
@@ -180,7 +168,7 @@ def main():
             failures.append(f"{pgs_id} (gnomon_output_missing)")
             continue
 
-        # 2) Run PLINK2 on raw unzipped data
+        # 2) Run PLINK2
         out2 = CI_WORKDIR / f"plink2_{pgs_id}"
         cmd_p2 = [
             str(PLINK2_BINARY), "--bfile", str(ORIGINAL_PLINK_PREFIX),
@@ -190,7 +178,7 @@ def main():
         res_p2 = run_and_measure(cmd_p2, f"plink2_{pgs_id}")
         all_results.append(res_p2)
 
-        # 3) Run PLINK1 on raw unzipped data
+        # 3) Run PLINK1
         df = pd.read_csv(fmt_file, sep='\t')
         df['snp_id'] = 'chr' + df['snp_id'].str.replace(':', '_', regex=False)
         compat = CI_WORKDIR / f"{pgs_id}_p1_compat.tsv"
@@ -204,7 +192,7 @@ def main():
         res_p1 = run_and_measure(cmd_p1, f"plink1_{pgs_id}")
         all_results.append(res_p1)
 
-        # 4) Validate outputs
+        # 4) Validate
         if not (res_p2['success'] and res_p1['success']):
             if not res_p1['success']:
                 failures.append(f"{pgs_id} (plink1_execution_failed)")
@@ -254,7 +242,7 @@ def main():
     if all_results:
         df = pd.DataFrame(all_results)
         df['tool_base'] = df['tool'].str.split('_').str[0]
-        summary = df[df['success']].groupby('tool_base').agg(
+        summary = df[df'r킱success'].groupby('tool_base').agg(
             mean_time_sec=('time_sec','mean'),
             mean_mem_mb=('peak_mem_mb','mean')
         ).reset_index()
