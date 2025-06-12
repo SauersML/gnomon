@@ -40,7 +40,7 @@ impl SnpChunkReader {
     /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
     /// file exists, is a valid PLINK .bed file, and has a size consistent with the
     /// metadata from the `prepare` phase, using overflow-safe arithmetic.
-    pub fn new(bed_path: &Path, num_people: usize, num_snps: usize) -> io::Result<Self> {
+    pub fn new(bed_path: &Path, bytes_per_snp_arg: u64, num_snps: usize) -> io::Result<Self> {
         let bed_file = File::open(bed_path)?;
         let metadata = bed_file.metadata()?;
         let file_size = metadata.len();
@@ -58,8 +58,8 @@ impl SnpChunkReader {
         }
 
         // --- Validation Step 2: File Size (with checked arithmetic) ---
-        let bytes_per_snp = (num_people as u64 + 3) / 4;
-        let total_snp_bytes = (num_snps as u64).checked_mul(bytes_per_snp)
+        // bytes_per_snp is now passed as an argument
+        let total_snp_bytes = (num_snps as u64).checked_mul(bytes_per_snp_arg)
             .ok_or_else(|| {
                 io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
             })?;
@@ -83,8 +83,8 @@ impl SnpChunkReader {
             mmap,
             cursor: 3, // Start reading after the 3-byte magic number.
             file_size,
-            // Store the calculated value, encapsulating this logic.
-            bytes_per_snp,
+            // Store the passed-in value.
+            bytes_per_snp: bytes_per_snp_arg,
         })
     }
 

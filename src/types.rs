@@ -12,12 +12,6 @@
 // a clean, one-way dependency graph where high-level modules can depend on these
 // core types, but not on each other's implementation details.
 
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
-use std::num::ParseFloatError;
-use std::path::PathBuf;
-use std::io;
-
 // ========================================================================================
 //                            High-Level Data Contracts
 // ========================================================================================
@@ -35,100 +29,61 @@ pub enum PersonSubset {
     Indices(Vec<u32>),
 }
 
-/// A "proof token" containing the complete, validated, and reconciled blueprint
-/// for a polygenic score calculation.
+/// A "proof token" containing the complete, validated, and "compiled" blueprint for a
+/// polygenic score calculation.
 ///
-/// The successful creation of this struct guarantees that all input files were
-/// valid, consistent, and that there is a scientifically valid set of overlapping
-/// markers to be processed. The engine takes this as an immutable reference and
-/// can therefore operate with correct configuration.
+/// The successful creation of this struct is a guarantee that all input files were
+/// valid and consistent. It contains the hyper-optimized data matrices that the
+/// compute kernel (the "Virtual Machine") will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    /// The flattened, padded, and interleaved weight matrix, structured for extreme
-    /// performance. For each SNP, the number of weights is rounded up to the
-    /// nearest multiple of the SIMD vector width (8), with the extra slots
-    /// padded with zeros. This guarantees safe, branch-free memory access in the kernel.
-    pub interleaved_weights: Vec<f32>,
-    /// The 0-based indices of the SNPs from the original .bim file that are
-    /// required for the calculation, sorted in file order for sequential access.
-    pub required_snp_indices: Vec<usize>,
-    /// The corresponding set of reconciliation instructions for each required SNP.
-    pub reconciliation_instructions: Vec<Reconciliation>,
-    /// The names of the scores being calculated.
+    // --- COMPILED DATA MATRICES for the VM ---
+    /// A flat, padded matrix of aligned weights (W'). Rows correspond to variants,
+    /// and columns correspond to scores. This matrix is the result of resolving all
+    /// allele differences into a single, canonical representation.
+    pub aligned_weights_matrix: Vec<f32>,
+    /// A flat, padded matrix of correction constants (C). It has the exact same
+    /// dimensions as `aligned_weights_matrix`. These values are pre-calculated
+    /// constants that account for allele flips, ensuring the final score is
+    /// mathematically identical to a naive calculation without impacting kernel
+    /// performance.
+    pub correction_constants_matrix: Vec<f32>,
+    /// The padded width of one row in the matrices. This is always a multiple of
+    /// the SIMD lane count and is essential for correct, safe memory access.
+    pub stride: usize,
+    /// A fast, O(1) lookup map to connect a sparse, original `.bim` file row
+    /// index to its dense row index in our compiled matrices. This is a critical
+    /// performance component for the batching module.
+    pub bim_row_to_matrix_row: Vec<Option<usize>>,
+    /// The sorted list of original `.bim` row indices that are required for this
+    /// calculation. This is used by the orchestrator to identify relevant chunks
+    /// of the `.bed` file.
+    pub required_bim_indices: Vec<usize>,
+
+    // --- PRESERVED METADATA ---
+    /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
-    /// The total number of SNPs that were successfully reconciled.
-    pub num_reconciled_snps: usize,
-    /// The total number of SNPs found in the original .bim file.
-    pub total_snps_in_bim: usize,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
-    /// The total number of individuals found in the original .fam file.
-    pub total_people_in_fam: usize,
+    /// The list of Individual IDs (IIDs) for the individuals being scored, in the
+    /// final output order.
+    pub final_person_iids: Vec<String>,
     /// The number of individuals that will actually be scored in this run.
     pub num_people_to_score: usize,
-    /// The list of Individual IDs (IIDs) for the individuals being scored,
-    /// in the final output order.
-    pub final_person_iids: Vec<String>,
-}
-
-/// An instruction for how to handle a SNP's dosage based on its effect allele.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reconciliation {
-    /// Use the dosage as-is (effect allele is Allele 2).
-    Identity,
-    /// Flip the dosage: `2 - dosage` (effect allele is Allele 1).
-    Flip,
+    /// The total number of individuals found in the original .fam file.
+    pub total_people_in_fam: usize,
+    /// The total number of variants found in the original .bim file.
+    pub total_snps_in_bim: usize,
+    /// The number of variants successfully reconciled and included in the matrices.
+    /// This corresponds to the number of rows in the compiled matrices.
+    pub num_reconciled_variants: usize,
+    /// The number of bytes per SNP in the .bed file, calculated as CEIL(total_people_in_fam / 4).
+    pub bytes_per_snp: u64,
 }
 
 // ========================================================================================
-//                             Error and Type Definitions
+//                            Primitive Type Definitions
 // ========================================================================================
-
-/// A comprehensive, production-grade error type for the preparation phase.
-#[derive(Debug)]
-pub enum PrepError {
-    /// An error occurred during file I/O, with the associated file path.
-    Io(io::Error, PathBuf),
-    /// An error occurred parsing a text file (e.g., malformed lines).
-    Parse(String),
-    /// The header of a file was invalid or missing required columns.
-    Header(String),
-    /// The number of scores for a SNP did not match the header.
-    InconsistentScores(String),
-    /// An error occurred parsing a floating-point number.
-    ParseFloat(ParseFloatError),
-    /// One or more individual IDs from the keep file were not found in the .fam file.
-    InconsistentKeepId(String),
-}
-
-impl Display for PrepError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            PrepError::Io(e, path) => write!(f, "I/O Error for file '{}': {}", path.display(), e),
-            PrepError::Parse(s) => write!(f, "Parse Error: {}", s),
-            PrepError::Header(s) => write!(f, "Invalid Header: {}", s),
-            PrepError::InconsistentScores(s) => write!(f, "Inconsistent Data: {}", s),
-            PrepError::ParseFloat(e) => write!(f, "Numeric Parse Error: {}", e),
-            PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {}", s),
-        }
-    }
-}
-
-impl Error for PrepError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            PrepError::Io(e, _) => Some(e),
-            PrepError::ParseFloat(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<ParseFloatError> for PrepError {
-    fn from(err: ParseFloatError) -> Self {
-        PrepError::ParseFloat(err)
-    }
-}
 
 /// An index into the original, full .fam file (e.g., one of 150,000).
 ///
@@ -137,10 +92,10 @@ impl From<ParseFloatError> for PrepError {
 #[repr(transparent)]
 pub struct OriginalPersonIndex(pub u32);
 
-/// A `#[repr(transparent)]` wrapper for a dosage value, guaranteeing it is <= 2.
+/// A `#[repr(transparent)]` wrapper for a dosage value.
 ///
-/// This type can only be constructed via its smart constructor, which ensures that
-/// an invalid dosage value is an unrepresentable state within the engine.
+/// This type is used in the pivoted tile buffer. Its `u8` representation is
+/// compact and efficient for the pivoting process.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EffectAlleleDosage(pub u8);
@@ -149,7 +104,7 @@ impl EffectAlleleDosage {
     /// Creates a new dosage, asserting the value is valid in debug builds.
     #[inline(always)]
     pub fn new(value: u8) -> Self {
-        debug_assert!(value <= 2, "Invalid dosage value created: {}", value);
+        debug_assert!(value <= 3, "Invalid dosage value created: {}", value);
         Self(value)
     }
 }
