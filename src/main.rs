@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Phase 2: The Preparation Phase ---
     // This logic now supports providing a directory to the --score argument.
-    let score_files = if args.score.is_dir() {
+    let mut score_files = if args.score.is_dir() {
         eprintln!("> Found directory for --score, locating all score files...");
         fs::read_dir(&args.score)?
             .filter_map(Result::ok)
@@ -155,46 +155,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     eprintln!("> Preparing data using {} score file(s)...", score_files.len());
 
-    // Call the preparation compiler, handling potential parsing errors by offering to reformat.
-    let prep_result = match prepare::prepare_for_computation(
-        &plink_prefix,
-        &score_files, // Pass the entire slice of paths, fixing the E0308 error.
-        args.keep.as_deref(),
-    ) {
-        Ok(result) => Ok(result),
-        // If preparation fails on a single file, offer to reformat it.
-        Err(prep_error @ PrepError::Header(_)) | Err(prep_error @ PrepError::Parse(_)) if score_files.len() == 1 => {
-            let score_path_to_check = &score_files[0];
-            eprintln!("\nWarning: Initial parsing of '{}' failed. Checking for PGS Catalog format...", score_path_to_check.display());
-            match reformat::reformat_pgs_file(score_path_to_check) {
-                Ok(new_path) => {
-                    // HONEST UX: Do not auto-retry. Inform the user and exit successfully.
-                    eprintln!("\nSuccess! A gnomon-compatible version of your score file has been created at:");
-                    eprintln!("  {}", new_path.display());
-                    eprintln!("\nPlease re-run your command using this new file path (or a directory containing it).");
-                    return Ok(()); // Successful exit, no error code.
-                }
-                Err(reformat_error) => {
-                    eprintln!("\nError: Automatic conversion failed: {}", reformat_error);
-                    eprintln!("Please ensure the score file is in the gnomon-native format (snp_id, effect_allele, other_allele, ...) or a valid PGS Catalog format.");
-                    Err(prep_error) // Propagate the original, more specific error.
+    // Attempt one auto-reformat on parse/header error, then retry once.
+    let mut attempted_reformat = false;
+    let prep = loop {
+        match prepare::prepare_for_computation(&plink_prefix, &score_files, args.keep.as_deref()) {
+            Ok(result) => break result,
+            Err(prep_error @ (PrepError::Header(_) | PrepError::Parse(_)))
+                if !attempted_reformat && score_files.len() == 1 =>
+            {
+                let orig = &score_files[0];
+                eprintln!("\nWarning: parsing '{}' failed. Auto-converting...", orig.display());
+                match reformat::reformat_pgs_file(orig) {
+                    Ok(new_path) => {
+                        eprintln!("Success! Converted to '{}'. Retrying...", new_path.display());
+                        score_files = vec![new_path];
+                        attempted_reformat = true;
+                        // loop and retry
+                    }
+                    Err(err) => {
+                        return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
+                    }
                 }
             }
+            Err(e) => {
+                return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+            }
         }
-        // For any other error, or for errors with multiple files, just fail.
-        Err(other_error) => Err(other_error),
     };
-
-    let prep_result = Arc::new(prep_result?);
+    let prep_result = Arc::new(prep);
 
     eprintln!(
         "> Preparation complete. Found {} individuals to score and {} overlapping variants across {} score(s).",
-        prep_result.num_people_to_score, prep_result.num_reconciled_variants, prep_result.score_names.len()
+        prep_result.num_people_to_score,
+        prep_result.num_reconciled_variants,
+        prep_result.score_names.len()
     );
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
-    let mut all_scores =
-        vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
+    let mut all_scores = vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
@@ -246,7 +244,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Ok((_, _, 0, _)) => break,
                 Ok((new_reader, buffer, bytes_read, snps_in_chunk)) => {
                     reader = new_reader;
-                    if full_buffer_tx.send(IoMessage { buffer, bytes_read, snps_in_chunk }).await.is_err() {
+                    if full_buffer_tx
+                        .send(IoMessage { buffer, bytes_read, snps_in_chunk })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
