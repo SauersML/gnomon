@@ -5,7 +5,7 @@ import gzip
 import shutil
 import time
 import sys
-import re
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -20,8 +20,6 @@ GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
-
-# This new prefix will point to genotype files with updated, position-based variant IDs
 UPDATED_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50_pos_ids"
 
 PLINK1_URL = "https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
@@ -29,9 +27,7 @@ PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20
 
 GENOTYPE_URL_BASE = "https://github.com/SauersML/genomic_pca/blob/main/data/"
 GENOTYPE_FILES = [
-    "chr22_subset50.bed.zip",
-    "chr22_subset50.bim.zip",
-    "chr22_subset50.fam.zip",
+    "chr22_subset50.bed.zip", "chr22_subset50.bim.zip", "chr22_subset50.fam.zip"
 ]
 
 PGS_SCORES = {
@@ -50,6 +46,12 @@ def print_header(title: str, char: str = "="):
     print("\n" + char * width)
     print(f"{char*4} {title} {char*(width - len(title) - 6)}")
     print(char * width)
+
+def print_debug_header(title: str):
+    """Prints a smaller header for debug sections."""
+    print("\n" + "." * 80)
+    print(f".... DEBUG: {title} ....")
+    print("." * 80)
 
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads and extracts a file, handling .zip and .gz."""
@@ -79,7 +81,7 @@ def download_and_extract(url: str, dest_dir: Path):
         print(f"Extracted GZ: {filename} -> {dest.name}")
         outpath.unlink()
 
-def run_and_measure(cmd: list, name: str):
+def run_and_measure(cmd: list, name: str, out_prefix: Path):
     """Executes a command, measures its performance, and captures output."""
     print_header(f"RUNNING: {name}", char='-')
     print("Command:")
@@ -90,30 +92,25 @@ def run_and_measure(cmd: list, name: str):
     try:
         p = psutil.Process(proc.pid)
         while proc.poll() is None:
-            try:
-                peak_mem = max(peak_mem, p.memory_info().rss)
-            except psutil.NoSuchProcess:
-                break
+            try: peak_mem = max(peak_mem, p.memory_info().rss)
+            except psutil.NoSuchProcess: break
             time.sleep(0.01)
-    except psutil.NoSuchProcess:
-        pass
+    except psutil.NoSuchProcess: pass
     
     stdout, stderr = proc.communicate()
     duration = time.perf_counter() - start
     
-    result = {
-        'tool': name,
-        'time_sec': duration,
-        'peak_mem_mb': peak_mem / (1024*1024),
-        'returncode': proc.returncode,
-        'success': proc.returncode == 0
-    }
+    result = {'tool': name, 'time_sec': duration, 'peak_mem_mb': peak_mem / (1024*1024), 'returncode': proc.returncode, 'success': proc.returncode == 0}
 
     if result['success']:
         print(f"✅ {name} finished in {duration:.2f}s.")
+        print(f"  > Log file: {out_prefix}.log")
+        if (out_prefix.with_suffix('.sscore')).exists(): print(f"  > PLINK2 output: {out_prefix}.sscore")
+        if (out_prefix.with_suffix('.profile')).exists(): print(f"  > PLINK1 output: {out_prefix}.profile")
+
     else:
         print(f"❌ {name} FAILED (Exit Code: {proc.returncode})")
-        print_header("STDERR", char='.')
+        print_debug_header("STDERR")
         print(stderr.strip() or "[EMPTY]")
         
     return result
@@ -123,114 +120,88 @@ def setup_environment():
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     
-    # Download PLINK binaries
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
-                    p.rename(binary_path)
-                    binary_path.chmod(0o755)
-                    print(f"Renamed and chmod: {binary_path}")
-                    break
+                    p.rename(binary_path); p.chmod(0o755); print(f"Renamed and chmod: {binary_path}"); break
+
+    for zip_name in GENOTYPE_FILES: download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
+    for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
     
-    # Download genotype subset
-    for zip_name in GENOTYPE_FILES:
-        download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-        
-    # Download PGS scores
-    for url in PGS_SCORES.values():
-        download_and_extract(url, CI_WORKDIR)
-    
-    print_header("WORKDIR CONTENTS AFTER DOWNLOADS", char='.')
-    for p in sorted(CI_WORKDIR.iterdir()):
-        print(f" - {p.name}")
+    print_debug_header("WORKDIR CONTENTS AFTER DOWNLOADS")
+    for root, _, files in os.walk(CI_WORKDIR):
+        for name in files: print(f" - {Path(root).relative_to(CI_WORKDIR) / name}")
 
 def create_positional_bim(original_prefix: Path, new_prefix: Path):
-    """
-    Creates a new .bim file with variant IDs in 'chr:pos' format to ensure
-    matching with harmonized PGS files. Also copies corresponding .bed/.fam files.
-    """
+    """Creates a new .bim file with 'chr:pos' variant IDs and copies related files."""
     print_header("SYNCHRONIZING GENOTYPE VARIANT IDs", char='.')
-    original_bim = original_prefix.with_suffix('.bim')
-    new_bim = new_prefix.with_suffix('.bim')
-
-    bim_df = pd.read_csv(
-        original_bim,
-        sep='\t',
-        header=None,
-        names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'],
-        dtype=str
-    )
+    original_bim, new_bim = original_prefix.with_suffix('.bim'), new_prefix.with_suffix('.bim')
     
-    # Create the new canonical ID: chr:pos
+    bim_df = pd.read_csv(original_bim, sep='\t', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
+    
+    print_debug_header(f"Original {original_bim.name} (first 5 rows)")
+    print(bim_df.head().to_string())
+
     bim_df['rsid'] = bim_df['chrom'] + ':' + bim_df['pos']
-    
     bim_df.to_csv(new_bim, sep='\t', header=False, index=False)
-    print(f"Created new BIM file with positional IDs: {new_bim}")
+    
+    print_debug_header(f"New {new_bim.name} with positional IDs (first 5 rows)")
+    print(bim_df.head().to_string())
+    print(f"\nCreated new BIM file: {new_bim}")
 
-    # Copy the .bed and .fam files to complete the new fileset
     shutil.copy(original_prefix.with_suffix('.bed'), new_prefix.with_suffix('.bed'))
     shutil.copy(original_prefix.with_suffix('.fam'), new_prefix.with_suffix('.fam'))
     print(f"Copied .bed and .fam to new prefix: {new_prefix}")
 
 def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
-    """
-    Reads a raw PGS harmonized file and creates a clean, PLINK-compatible score file.
-    - Uses harmonized positions (hm_chr:hm_pos) for robust variant matching.
-    - Ensures all effect weights are numeric, dropping rows with invalid data.
-    """
+    """Reads a raw PGS file and creates a clean, de-duplicated, PLINK-compatible score file."""
     print_header(f"PREPARING PLINK FORMAT FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', dtype=str)
+    print(f"  Loaded {len(df)} raw entries from {score_file.name}")
+    print_debug_header("Raw PGS file sample (first 5 rows)")
+    print(df.head().to_string())
 
-    # --- Use harmonized positions for robust variant matching ---
-    if 'hm_chr' not in df.columns or 'hm_pos' not in df.columns:
-        raise KeyError("Harmonized columns 'hm_chr' or 'hm_pos' not found.")
-    
+    if 'hm_chr' not in df.columns or 'hm_pos' not in df.columns: raise KeyError("'hm_chr' or 'hm_pos' not found.")
     df.dropna(subset=['hm_chr', 'hm_pos'], inplace=True)
-    variant_id_col = "variant_id"
-    df[variant_id_col] = df['hm_chr'] + ':' + df['hm_pos']
-    print("  Using 'hm_chr':'hm_pos' as the canonical variant ID.")
+    df["variant_id"] = df['hm_chr'] + ':' + df['hm_pos']
+    print("\n  Step 1: Created 'chr:pos' canonical variant IDs.")
 
-    # --- Identify and CLEAN effect weight column ---
-    effect_col = 'effect_allele'
-    other_allele_col = 'other_allele'
     weight_col = 'effect_weight'
-    if effect_col not in df.columns or weight_col not in df.columns:
-        raise KeyError(f"Required columns '{effect_col}' or '{weight_col}' not found.")
+    if weight_col not in df.columns: raise KeyError(f"Weight column '{weight_col}' not found.")
     
-    original_rows = len(df)
+    rows_before_cleaning = len(df)
     df[weight_col] = pd.to_numeric(df[weight_col], errors='coerce')
     df.dropna(subset=[weight_col], inplace=True)
-    cleaned_rows = len(df)
-    if original_rows > cleaned_rows:
-        print(f"  Dropped {original_rows - cleaned_rows} rows with non-numeric effect weights.")
+    rows_after_cleaning = len(df)
+    print(f"  Step 2: Cleaned weights. Removed {rows_before_cleaning - rows_after_cleaning} rows with non-numeric weights.")
 
-    print(f"  Using effect-allele column: {effect_col}")
-    print(f"  Using weight column: {weight_col}")
-    
-    # --- Subset and write the PLINK-compatible file ---
-    plink_df = df[[variant_id_col, effect_col, other_allele_col, weight_col]].copy()
-    plink_df.columns = ['ID', 'EFFECT_ALLELE', 'OTHER_ALLELE', 'WEIGHT']
-    
+    rows_before_dedup = len(df)
+    df.drop_duplicates(subset=['variant_id'], keep='first', inplace=True)
+    rows_after_dedup = len(df)
+    print(f"  Step 3: De-duplicated variants. Removed {rows_before_dedup - rows_after_dedup} duplicate variant IDs.")
+
     out_path = CI_WORKDIR / f"{pgs_id}_plink_format.tsv"
+    plink_df = df[['variant_id', 'effect_allele', 'other_allele', weight_col]].copy()
+    plink_df.columns = ['ID', 'EFFECT_ALLELE', 'OTHER_ALLELE', 'WEIGHT']
     plink_df.to_csv(out_path, sep='\t', index=False, na_rep='NA')
-    print(f"\n  Written PLINK-compatible score file: {out_path}")
 
-    # --- Debug: Check for matches against the updated BIM file ---
+    print_debug_header("Final clean score data for PLINK (first 5 rows)")
+    print(plink_df.head().to_string())
+    print(f"\nWritten clean PLINK-compatible file: {out_path} ({len(plink_df)} variants)")
+
     bim_path = UPDATED_PLINK_PREFIX.with_suffix('.bim')
     bim_ids = pd.read_csv(bim_path, sep='\t', header=None, usecols=[1], dtype=str)[1].to_numpy()
     matches = plink_df['ID'].isin(bim_ids).sum()
-    print(f"  Variants in score file matching updated BIM file: {matches} / {len(plink_df)}")
-    if matches == 0:
-        print("  ⚠️ WARNING: No matching variants found. PLINK will likely fail.")
+    print(f"  > Variants matching updated genotype file: {matches} / {len(plink_df)}")
+    if matches == 0: print("  > ⚠️ WARNING: No matching variants found. PLINK will fail.")
 
     return out_path
 
 def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
-    
     create_positional_bim(ORIGINAL_PLINK_PREFIX, UPDATED_PLINK_PREFIX)
 
     all_results, failures = [], []
@@ -239,71 +210,37 @@ def main():
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         print(f"Raw PGS file: {raw_score_file}")
 
-        # 1) Gnomon (assumed to work with the raw PGS file and original genotypes)
-        res_g = run_and_measure([
-            str(GNOMON_BINARY), "--score", str(raw_score_file), str(ORIGINAL_PLINK_PREFIX)
-        ], f"gnomon_{pgs_id}")
+        res_g = run_and_measure([str(GNOMON_BINARY), "--score", str(raw_score_file), str(ORIGINAL_PLINK_PREFIX)], f"gnomon_{pgs_id}", CI_WORKDIR / f"gnomon_{pgs_id}")
         all_results.append(res_g)
-        if not res_g['success']:
-            failures.append(f"{pgs_id} (gnomon_failed)")
-            continue
+        if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)"); continue
 
-        # 2) Prepare a unified, clean PLINK-compatible score file
         try:
             plink_fmt_file = create_plink_formatted_scorefile(raw_score_file, pgs_id)
         except Exception as e:
-            print(f"❌ Error preparing PLINK format for {pgs_id}: {e}")
-            failures.append(f"{pgs_id} (format_error)")
-            continue
+            print(f"❌ Error preparing PLINK format for {pgs_id}: {e}"); failures.append(f"{pgs_id} (format_error)"); continue
 
-        # 3) PLINK2
-        out2 = CI_WORKDIR / f"plink2_{pgs_id}"
-        res_p2 = run_and_measure([
-            str(PLINK2_BINARY),
-            "--bfile", str(UPDATED_PLINK_PREFIX),
-            "--score", str(plink_fmt_file), "header", "no-mean-imputation",
-            "cols=maybesid,dosagesum,scoreavgs",
-            "--out", str(out2)
-        ], f"plink2_{pgs_id}")
+        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
+        res_p2 = run_and_measure([str(PLINK2_BINARY), "--bfile", str(UPDATED_PLINK_PREFIX), "--score", str(plink_fmt_file), "header", "no-mean-imputation", "cols=maybesid,dosagesum,scoreavgs", "--out", str(out2_prefix)], f"plink2_{pgs_id}", out2_prefix)
         all_results.append(res_p2)
-        if not res_p2['success']:
-            failures.append(f"{pgs_id} (plink2_failed)")
+        if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
         
-        # 4) PLINK1
-        out1 = CI_WORKDIR / f"plink1_{pgs_id}"
-        # PLINK1 will default to calculating an average score over non-missing variants.
-        res_p1 = run_and_measure([
-            str(PLINK1_BINARY),
-            "--bfile", str(UPDATED_PLINK_PREFIX),
-            # Use columns 1 (ID), 2 (EFFECT_ALLELE), and 4 (WEIGHT)
-            "--score", str(plink_fmt_file), "1", "2", "4", "header", "no-mean-imputation",
-            "--out", str(out1)
-        ], f"plink1_{pgs_id}")
+        out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
+        res_p1 = run_and_measure([str(PLINK1_BINARY), "--bfile", str(UPDATED_PLINK_PREFIX), "--score", str(plink_fmt_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)], f"plink1_{pgs_id}", out1_prefix)
         all_results.append(res_p1)
-        if not res_p1['success']:
-            failures.append(f"{pgs_id} (plink1_failed)")
+        if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
 
-    # Final summary
     print_header('PERFORMANCE SUMMARY')
     if all_results:
         df = pd.DataFrame(all_results)
         df['tool_base'] = df['tool'].str.split('_').str[0]
-        summary = df[df['success']].groupby('tool_base').agg(
-            mean_time_sec=('time_sec','mean'),
-            mean_mem_mb=('peak_mem_mb','mean')
-        ).reset_index()
-        if not summary.empty:
-            print(summary.to_markdown(index=False, floatfmt='.3f'))
+        summary = df[df['success']].groupby('tool_base').agg(mean_time_sec=('time_sec','mean'), mean_mem_mb=('peak_mem_mb','mean')).reset_index()
+        if not summary.empty: print(summary.to_markdown(index=False, floatfmt='.3f'))
 
     print_header(f"CI CHECK {'FAILED' if failures else 'PASSED'}")
     if failures:
-        print('❌ Tests failed:')
-        for f in sorted(list(set(failures))):
-            print(f'  - {f}')
-        sys.exit(1)
+        print('❌ Tests failed:'); [print(f'  - {f}') for f in sorted(list(set(failures)))]; sys.exit(1)
     else:
-        print('🎉 All tests passed.')
-        sys.exit(0)
+        print('🎉 All tests passed.'); sys.exit(0)
 
 if __name__ == '__main__':
     main()
