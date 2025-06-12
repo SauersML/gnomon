@@ -76,7 +76,7 @@ def download_and_extract(url: str, dest_dir: Path):
         print(f"Extracted GZ: {filename} -> {dest.name}")
         outpath.unlink()
 
-def run_and_measure(cmd: list, name: str, score_file: Path = None):
+def run_and_measure(cmd: list, name: str):
     print_header(f"RUNNING: {name}", char='-')
     print("Command:")
     print(f"  {' '.join(map(str, cmd))}\n")
@@ -95,20 +95,12 @@ def run_and_measure(cmd: list, name: str, score_file: Path = None):
         pass
     out, err = proc.communicate()
     dur = time.perf_counter() - start
-    result = {
-        'tool': name,
-        'time_sec': dur,
-        'peak_mem_mb': peak / (1024*1024),
-        'returncode': proc.returncode,
-        'success': proc.returncode == 0
-    }
-    if result['success']:
-        print(f"✅ {name} finished in {dur:.2f}s.")
-    else:
-        print(f"❌ {name} FAILED (Exit Code: {proc.returncode})")
+    print(out.strip())
+    if err.strip():
         print_header("STDERR", char='.')
-        print(err.strip() or "[EMPTY]")
-    return result
+        print(err.strip())
+    print(f"Time: {dur:.3f}s, Peak RSS: {peak/(1024*1024):.1f} MB")
+    return proc.returncode == 0
 
 def setup_environment():
     print_header("ENVIRONMENT SETUP")
@@ -130,16 +122,31 @@ def setup_environment():
         download_and_extract(url, CI_WORKDIR)
 
 def make_gnomon_format(score_file: Path) -> Path:
-    df = pd.read_csv(score_file, sep='\t', comment='#')
-    # The last column is the weight column; keep only the first three plus it.
+    print_header(f"REFORMATTING {score_file.name} to GNOMON FORMAT", char='.')
+    # 1) Locate the first non-comment line (the true header)
+    with open(score_file, 'r') as f:
+        lines = f.readlines()
+    header_idx = next(i for i, line in enumerate(lines) if not line.startswith('#'))
+    header = lines[header_idx].rstrip('\n')
+    print(f"Header line #{header_idx+1}: {header}")
+    # 2) Read with that header
+    df = pd.read_csv(score_file, sep='\t', header=header_idx, dtype=str)
+    print(f"Columns detected: {df.columns.tolist()}")
+    # 3) Build snp_id from chr_name/chr_position
+    if 'chr_name' in df.columns and 'chr_position' in df.columns:
+        df['snp_id'] = df['chr_name'].astype(str) + ':' + df['chr_position'].astype(str)
+    else:
+        raise KeyError("Chromosome or position columns missing")
+    # 4) Pick the last column as the weight column
     weight_col = df.columns[-1]
+    print(f"Using weight column: {weight_col}")
+    out_df = df[['snp_id', 'effect_allele', 'other_allele', weight_col]].copy()
+    out_df.rename(columns={weight_col: 'weight'}, inplace=True)
     fmt_file = score_file.with_suffix('.gnomon_format.tsv')
-    out = df[['snp_id', 'effect_allele', 'other_allele', weight_col]].copy()
-    out.rename(columns={weight_col: 'weight'}, inplace=True)
-    out.to_csv(fmt_file, sep='\t', index=False)
-    print_header(f"GNOMON-FORMAT for {score_file.name}", char='.')
-    print(out.head(5).to_markdown(index=False))
-    print(f"Total variants formatted: {len(out)}")
+    out_df.to_csv(fmt_file, sep='\t', index=False)
+    print(f"Written {fmt_file} with {len(out_df)} variants")
+    print("Sample of reformatted file:")
+    print(out_df.head(5).to_markdown(index=False))
     return fmt_file
 
 # ========================================================================================
@@ -148,7 +155,7 @@ def make_gnomon_format(score_file: Path) -> Path:
 def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
-    all_results, failures = [], []
+    failures = []
 
     for pgs_id, url in PGS_SCORES.items():
         print_header(f"TESTING SCORE: {pgs_id}")
@@ -156,109 +163,88 @@ def main():
         print(f"Score file path: {score_file}")
 
         # 1) Gnomon
-        res_g = run_and_measure(
-            [str(GNOMON_BINARY), "--score", str(score_file), str(ORIGINAL_PLINK_PREFIX)],
-            f"gnomon_{pgs_id}"
-        )
-        all_results.append(res_g)
-        if not res_g['success']:
+        ok = run_and_measure([str(GNOMON_BINARY), "--score", str(score_file), str(ORIGINAL_PLINK_PREFIX)], f"gnomon_{pgs_id}")
+        if not ok:
             failures.append(f"{pgs_id} (gnomon_execution_failed)")
             continue
 
-        # prepare for PLINK2
+        # 2) Reformat for PLINK
         fmt_file = make_gnomon_format(score_file)
 
-        # 2) PLINK2
+        # 3) PLINK2
         out2 = CI_WORKDIR / f"plink2_{pgs_id}"
-        res_p2 = run_and_measure([
+        ok2 = run_and_measure([
             str(PLINK2_BINARY),
             "--bfile", str(ORIGINAL_PLINK_PREFIX),
             "--score", str(fmt_file), "1", "2", "3", "header", "no-mean-imputation",
             "--out", str(out2)
         ], f"plink2_{pgs_id}")
-        all_results.append(res_p2)
+        if not ok2:
+            failures.append(f"{pgs_id} (plink2_execution_failed)")
+            continue
 
-        # 3) PLINK1
-        df1 = pd.read_csv(fmt_file, sep='\t')
+        # 4) PLINK1
+        df1 = pd.read_csv(fmt_file, sep='\t', dtype=str)
         df1['snp_id'] = 'chr' + df1['snp_id'].str.replace(':', '_', regex=False)
         compat = CI_WORKDIR / f"{pgs_id}_p1_compat.tsv"
         df1.to_csv(compat, sep='\t', index=False)
-        print(f"Wrote PLINK1-compatible: {compat}")
+        print(f"Wrote PLINK1-compatible file: {compat}")
         out1 = CI_WORKDIR / f"plink1_{pgs_id}"
-        res_p1 = run_and_measure([
+        ok1 = run_and_measure([
             str(PLINK1_BINARY),
             "--bfile", str(ORIGINAL_PLINK_PREFIX),
             "--score", str(compat), "1", "2", "3", "header", "sum",
             "--out", str(out1)
         ], f"plink1_{pgs_id}")
-        all_results.append(res_p1)
-
-        # 4) Validate
-        if not (res_p2['success'] and res_p1['success']):
-            if not res_p1['success']:
-                failures.append(f"{pgs_id} (plink1_execution_failed)")
-            if not res_p2['success']:
-                failures.append(f"{pgs_id} (plink2_execution_failed)")
+        if not ok1:
+            failures.append(f"{pgs_id} (plink1_execution_failed)")
             continue
 
+        # 5) Validation
         print_header(f"VALIDATING OUTPUTS for {pgs_id}", char='~')
-        try:
-            gdf = pd.read_csv(str(ORIGINAL_PLINK_PREFIX.with_suffix(".sscore")), sep='\t')\
-                    .rename(columns={'#IID':'IID'}).set_index('IID')
-            p2df = pd.read_csv(f'{out2}.sscore', sep='\t')\
-                    .rename(columns={'#IID':'IID'}).set_index('IID')
-            p1df = pd.read_csv(f'{out1}.profile', delim_whitespace=True).set_index('IID')
-            print(f"Loaded: gnomon={len(gdf)}, plink2={len(p2df)}, plink1={len(p1df)}")
+        gdf = pd.read_csv(str(ORIGINAL_PLINK_PREFIX.with_suffix(".sscore")), sep='\t').rename(columns={'#IID':'IID'}).set_index('IID')
+        p2df = pd.read_csv(f'{out2}.sscore', sep='\t').rename(columns={'#IID':'IID'}).set_index('IID')
+        p1df = pd.read_csv(f'{out1}.profile', delim_whitespace=True).set_index('IID')
+        print(f"Loaded IID counts — gnomon: {len(gdf)}, plink2: {len(p2df)}, plink1: {len(p1df)}")
 
-            col1 = [c for c in p1df.columns if c.upper().startswith("SCORE")][0]
-            col2 = [c for c in p2df.columns if c.upper().startswith("SCORE1")][0]
-            nv = p2df['ALLELE_CT'] / 2
-            p2df['SCORE_SUM'] = p2df[col2] * nv
-            colg = pgs_id
+        # choose score columns
+        col1 = [c for c in p1df.columns if c.upper().startswith("SCORE")][0]
+        col2 = [c for c in p2df.columns if c.upper().startswith("SCORE1")][0]
+        nv = p2df['ALLELE_CT'].astype(float) / 2.0
+        p2df['SCORE_SUM'] = p2df[col2].astype(float) * nv
+        colg = pgs_id
 
-            merged = pd.DataFrame({
-                'gnomon': gdf[colg],
-                'plink1_sum': p1df[col1],
-                'plink2_sum': p2df['SCORE_SUM']
-            })
-            print("Merged head:")
-            print(merged.head().to_markdown())
-            print("Correlations:")
-            corr = merged.corr()
-            print(corr.to_markdown(floatfmt='.8f'))
+        merged = pd.DataFrame({
+            'gnomon': gdf[colg].astype(float),
+            'plink1_sum': p1df[col1].astype(float),
+            'plink2_sum': p2df['SCORE_SUM']
+        })
+        print("Merged head:")
+        print(merged.head().to_markdown(floatfmt='.6g'))
+        print("Correlation matrix:")
+        corr = merged.corr()
+        print(corr.to_markdown(floatfmt='.8f'))
 
-            if (merged['gnomon'] == 0).all():
-                failures.append(f"{pgs_id} (gnomon_all_zeros_bug)")
-            if not np.allclose(merged['gnomon'], merged['plink1_sum'], atol=NUMERICAL_TOLERANCE):
-                failures.append(f"{pgs_id} (Gnomon_vs_PLINK1_mismatch)")
-            if not np.allclose(merged['gnomon'], merged['plink2_sum'], atol=NUMERICAL_TOLERANCE):
-                failures.append(f"{pgs_id} (Gnomon_vs_PLINK2_mismatch)")
-            if corr.loc['plink1_sum','plink2_sum'] < CORR_THRESHOLD:
-                failures.append(f"{pgs_id} (plink1_vs_plink2_low_correlation)")
+        if (merged['gnomon'] == 0).all():
+            failures.append(f"{pgs_id} (gnomon_all_zeros_bug)")
+        if not np.allclose(merged['gnomon'], merged['plink1_sum'], atol=NUMERICAL_TOLERANCE):
+            failures.append(f"{pgs_id} (Gnomon_vs_PLINK1_mismatch)")
+        if not np.allclose(merged['gnomon'], merged['plink2_sum'], atol=NUMERICAL_TOLERANCE):
+            failures.append(f"{pgs_id} (Gnomon_vs_PLINK2_mismatch)")
+        if corr.loc['plink1_sum','plink2_sum'] < CORR_THRESHOLD:
+            failures.append(f"{pgs_id} (plink1_vs_plink2_low_correlation)")
 
-        except Exception as e:
-            failures.append(f"{pgs_id} (validation_script_error: {e})")
-            print(f"❌ Error during validation: {e}")
-
-    # Summary
+    # Final summary
     print_header("PERFORMANCE SUMMARY")
-    if all_results:
-        df_res = pd.DataFrame(all_results)
-        df_res['tool_base'] = df_res['tool'].str.split('_').str[0]
-        summary = df_res[df_res['success']].groupby('tool_base').agg(
-            mean_time_sec=('time_sec','mean'),
-            mean_mem_mb=('peak_mem_mb','mean')
-        ).reset_index()
-        print(summary.to_markdown(index=False, floatfmt='.3f'))
-
-    print_header(f"CI CHECK {'PASSED' if not failures else 'FAILED'}")
+    print(f"Failures: {failures}")
     if failures:
         print("❌ Tests failed:")
         for f in failures:
             print(f"  - {f}")
         sys.exit(1)
-    print("🎉 All tests passed.")
-    sys.exit(0)
+    else:
+        print("🎉 All tests passed.")
+        sys.exit(0)
 
 if __name__ == '__main__':
     main()
