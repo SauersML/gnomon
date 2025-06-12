@@ -4,7 +4,6 @@
 //
 // ========================================================================================
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -15,33 +14,32 @@ use std::path::{Path, PathBuf};
 //                                   PUBLIC API
 // ========================================================================================
 
-/// An error type for PGS-to-gnomon reformatting.
+/// Errors that can occur during PGS-to-gnomon reformatting.
 #[derive(Debug)]
 pub enum ReformatError {
-    /// I/O problem reading or writing files.
+    /// File I/O error.
     Io(io::Error),
-    /// File does not contain the PGS-Catalog signature.
+    /// Input does not contain the PGS Catalog signature.
     NotPgsFormat,
-    /// Missing one or more required columns.
+    /// Header is missing required columns.
     MissingColumns(&'static str),
 }
 
 impl Display for ReformatError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            ReformatError::Io(e) => write!(f, "I/O error during reformatting: {}", e),
-            ReformatError::NotPgsFormat => write!(f, "File is not in PGS Catalog format."),
-            ReformatError::MissingColumns(s) => write!(f, "Missing required column(s): {}", s),
+            ReformatError::Io(e) => write!(f, "I/O error: {}", e),
+            ReformatError::NotPgsFormat => write!(f, "Not a PGS Catalog scoring file."),
+            ReformatError::MissingColumns(s) => write!(f, "Missing column(s): {}", s),
         }
     }
 }
 
 impl Error for ReformatError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        if let ReformatError::Io(e) = self {
-            Some(e)
-        } else {
-            None
+        match self {
+            ReformatError::Io(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -52,171 +50,159 @@ impl From<io::Error> for ReformatError {
     }
 }
 
-/// Reads a PGS Catalog scoring file (possibly harmonized) and writes a gnomon-native TSV.
-/// Returns the path to the new file on success.
+/// Reformat a PGS Catalog scoring file into gnomon-native TSV (chr:pos, effect_allele, other_allele, weight).
+/// Returns the new file path on success.
 pub fn reformat_pgs_file(input_path: &Path) -> Result<PathBuf, ReformatError> {
-    let file = File::open(input_path).map_err(ReformatError::Io)?;
-    let mut reader = BufReader::new(file);
+    let file = File::open(input_path)?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut line = String::new();
-    let mut saw_pgs_signature = false;
+    let mut saw_signature = false;
     let mut score_name: Option<String> = None;
 
-    // --- Phase 1: Parse metadata comments and locate header ---
-    while reader.read_line(&mut line).map_err(ReformatError::Io)? > 0 {
+    // Phase 1: Scan metadata comments until header line
+    while reader.read_line(&mut line)? > 0 {
         if line.starts_with("###PGS CATALOG SCORING FILE") {
-            saw_pgs_signature = true;
+            saw_signature = true;
         }
         if let Some(id) = line.strip_prefix("#pgs_id=") {
-            score_name = Some(id.trim().to_owned());
+            score_name = Some(id.trim().to_string());
         }
         if !line.starts_with('#') {
-            break; // this is the header line
+            break; // header reached
         }
         line.clear();
     }
-    if !saw_pgs_signature {
+    if !saw_signature {
         return Err(ReformatError::NotPgsFormat);
     }
     let header_line = line.trim_end();
 
-    // Split header into column names
-    let raw_cols: Vec<&str> = header_line.split('\t').collect();
-    let mapping = HeaderMapping::from_columns(&raw_cols)?;
+    // Phase 2: Build column mapping
+    let cols: Vec<&str> = header_line.split('\t').collect();
+    let mapping = HeaderMapping::from_columns(&cols)?;
+    let score_label = score_name.unwrap_or_else(|| "PGS_SCORE".into());
+    let output_path = input_path.with_file_name(
+        format!("{}.gnomon_format.tsv", input_path.file_stem().unwrap().to_string_lossy())
+    );
 
-    let score_name = score_name.unwrap_or_else(|| "PGS_SCORE".into());
-    let output_path = generate_output_path(input_path);
+    // Phase 3: Open writer and emit native header
+    let out_file = File::create(&output_path)?;
+    let mut writer = BufWriter::with_capacity(1 << 20, out_file);
+    writeln!(writer, "snp_id\teffect_allele\tother_allele\t{}", score_label)?;
 
-    // --- Phase 2: Open writer and emit native header ---
-    let out_file = File::create(&output_path).map_err(ReformatError::Io)?;
-    let mut writer = BufWriter::new(out_file);
-    write!(writer, "snp_id\teffect_allele\tother_allele\t{}", score_name)
-        .map_err(ReformatError::Io)?;
-    writeln!(writer).map_err(ReformatError::Io)?;
+    // Phase 4: Process first data line (header_line is not data)
+    // Skip header_line itself
 
-    // --- Phase 3: Process the first (already-read) data line ---
-    if !header_line.is_empty() {
-        write_data_line(header_line, &mapping, &mut writer)?;
-    }
-
-    // --- Phase 4: Process the rest of the file ---
-    for result in reader.lines() {
-        let row = result.map_err(ReformatError::Io)?;
-        if !row.trim().is_empty() {
-            write_data_line(&row, &mapping, &mut writer)?;
+    // Phase 5: Process subsequent lines in-place without reallocating strings
+    let mut buf = String::new();
+    while reader.read_line(&mut buf)? > 0 {
+        if !buf.is_empty() && !buf.starts_with('#') {
+            mapping.write_row(buf.trim_end(), &mut writer)?;
         }
+        buf.clear();
     }
 
-    writer.flush().map_err(ReformatError::Io)?;
+    writer.flush()?;
     Ok(output_path)
 }
 
 // ========================================================================================
-//                           PRIVATE IMPLEMENTATION TYPES & HELPERS
+//                        PRIVATE TYPES AND HELPERS
 // ========================================================================================
 
-/// A typed mapping from column names to indices for fast lookup.
-#[derive(Debug)]
+/// Defines which chromosome/position columns to use.
+#[derive(Debug, Copy, Clone)]
+enum PosColumns {
+    Harmonized { chr: usize, pos: usize },
+    Author    { chr: usize, pos: usize },
+}
+
+/// Holds zero-cost indices into each record's tab-separated fields.
+#[derive(Debug, Copy, Clone)]
 struct HeaderMapping {
-    snp_id: usize,
     effect_allele: usize,
     other_allele: usize,
     effect_weight: usize,
-    hm_chr: Option<usize>,
-    hm_pos: Option<usize>,
-    chr_name: Option<usize>,
-    chr_position: Option<usize>,
+    pos_cols: PosColumns,
 }
 
 impl HeaderMapping {
-    /// Builds a HeaderMapping from a slice of column names, validating required columns.
+    /// Build the mapping from header row, ensuring required columns exist.
     fn from_columns(cols: &[&str]) -> Result<Self, ReformatError> {
-        let mut map = HeaderMapping {
-            snp_id: usize::MAX,
-            effect_allele: usize::MAX,
-            other_allele: usize::MAX,
-            effect_weight: usize::MAX,
-            hm_chr: None,
-            hm_pos: None,
-            chr_name: None,
-            chr_position: None,
-        };
+        let mut ea = None;
+        let mut oa = None;
+        let mut ew = None;
+        let mut hm_chr = None;
+        let mut hm_pos = None;
+        let mut cn = None;
+        let mut cp = None;
 
         for (i, &name) in cols.iter().enumerate() {
             match name {
-                "snp_id" => map.snp_id = i,
-                "effect_allele" => map.effect_allele = i,
-                "other_allele" => {
-                    if map.other_allele == usize::MAX {
-                        map.other_allele = i;
-                    }
-                }
-                "hm_inferOtherAllele" => map.other_allele = i,
-                "effect_weight" => map.effect_weight = i,
-                "hm_chr" => map.hm_chr = Some(i),
-                "hm_pos" => map.hm_pos = Some(i),
-                "chr_name" => map.chr_name = Some(i),
-                "chr_position" => map.chr_position = Some(i),
+                "effect_allele"       => ea = Some(i),
+                "hm_inferOtherAllele"  if oa.is_none() => oa = Some(i),
+                "other_allele"         if oa.is_none() => oa = Some(i),
+                "effect_weight"        => ew = Some(i),
+                "hm_chr"               => hm_chr = Some(i),
+                "hm_pos"               => hm_pos = Some(i),
+                "chr_name"             => cn = Some(i),
+                "chr_position"         => cp = Some(i),
                 _ => {}
             }
         }
 
-        let mut missing = Vec::new();
-        if map.snp_id == usize::MAX { missing.push("snp_id"); }
-        if map.effect_allele == usize::MAX { missing.push("effect_allele"); }
-        if map.other_allele == usize::MAX { missing.push("other_allele or hm_inferOtherAllele"); }
-        if map.effect_weight == usize::MAX { missing.push("effect_weight"); }
-        let have_pos = map.hm_chr.is_some() && map.hm_pos.is_some();
-        let have_auth = map.chr_name.is_some() && map.chr_position.is_some();
-        if !have_pos && !have_auth {
-            missing.push("(chr_name & chr_position) or (hm_chr & hm_pos)");
-        }
-        if !missing.is_empty() {
-            return Err(ReformatError::MissingColumns(Box::leak(missing.join(", ").into_boxed_str())));
-        }
-        Ok(map)
-    }
-}
+        let effect_allele   = ea.ok_or(ReformatError::MissingColumns("effect_allele"))?;
+        let other_allele    = oa.ok_or(ReformatError::MissingColumns("other_allele or hm_inferOtherAllele"))?;
+        let effect_weight   = ew.ok_or(ReformatError::MissingColumns("effect_weight"))?;
 
-/// Given a data row and a HeaderMapping, write the normalized line to the writer.
-fn write_data_line(
-    line: &str,
-    m: &HeaderMapping,
-    w: &mut BufWriter<File>,
-) -> Result<(), ReformatError> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    // Quick length check
-    if fields.len() <= m.effect_weight || fields.len() <= m.other_allele {
-        return Ok(());
+        // choose pos strategy
+        let pos_cols = if let (Some(chr), Some(pos)) = (hm_chr, hm_pos) {
+            PosColumns::Harmonized { chr, pos }
+        } else if let (Some(chr), Some(pos)) = (cn, cp) {
+            PosColumns::Author { chr, pos }
+        } else {
+            return Err(ReformatError::MissingColumns("(chr_name & chr_position) or (hm_chr & hm_pos)"));
+        };
+
+        Ok(HeaderMapping { effect_allele, other_allele, effect_weight, pos_cols })
     }
 
-    // Determine SNP ID by priority
-    let snp_id = if let (Some(c), Some(p)) = (m.hm_chr, m.hm_pos) {
-        let chr = fields[c]; let pos = fields[p];
-        if !chr.is_empty() && !pos.is_empty() {
-            Some(format!("{}:{}", chr, pos))
-        } else { None }
-    } else if let (Some(c), Some(p)) = (m.chr_name, m.chr_position) {
-        let chr = fields[c]; let pos = fields[p];
-        if !chr.is_empty() && !pos.is_empty() {
-            Some(format!("{}:{}", chr, pos))
-        } else { None }
-    } else {
-        None
-    };
+    /// Parse a data row and write the gnomon-native line if valid.
+    #[inline]
+    fn write_row(&self, row: &str, w: &mut BufWriter<File>) -> Result<(), ReformatError> {
+        let mut iter = row.split('\t');
+        let mut chr = None;
+        let mut pos = None;
+        let mut ea  = None;
+        let mut oa  = None;
+        let mut ew  = None;
 
-    if let Some(id) = snp_id {
-        let ea = fields[m.effect_allele];
-        let oa = fields[m.other_allele];
-        let wv = fields[m.effect_weight];
-        if !ea.is_empty() && !oa.is_empty() && !wv.is_empty() {
-            writeln!(w, "{}\t{}\t{}\t{}", id, ea, oa, wv).map_err(ReformatError::Io)?;
+        for (i, field) in iter.enumerate() {
+            match self.pos_cols {
+                PosColumns::Harmonized { chr: ci, pos: pi } => {
+                    if i == ci { chr = Some(field) }
+                    else if i == pi { pos = Some(field) }
+                }
+                PosColumns::Author { chr: ci, pos: pi } => {
+                    if i == ci { chr = Some(field) }
+                    else if i == pi { pos = Some(field) }
+                }
+            }
+            if i == self.effect_allele   { ea = Some(field) }
+            if i == self.other_allele    { oa = Some(field) }
+            if i == self.effect_weight   { ew = Some(field) }
+
+            if chr.is_some() && pos.is_some() && ea.is_some() && oa.is_some() && ew.is_some() {
+                break;
+            }
         }
-    }
-    Ok(())
-}
 
-/// Generates an output path by appending `.gnomon_format.tsv` to the input stem.
-fn generate_output_path(input: &Path) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    input.with_file_name(format!("{}.gnomon_format.tsv", stem))
+        if let (Some(chr), Some(pos), Some(ea), Some(oa), Some(ew)) = (chr, pos, ea, oa, ew) {
+            if !chr.is_empty() && !pos.is_empty() && !ea.is_empty() && !oa.is_empty() && !ew.is_empty() {
+                // write with a single syscall
+                writeln!(w, "{}:{}\t{}\t{}\t{}", chr, pos, ea, oa, ew)?;
+            }
+        }
+        Ok(())
+    }
 }
