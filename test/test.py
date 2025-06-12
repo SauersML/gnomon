@@ -331,29 +331,29 @@ def main():
             print(f"❌ Error preparing PLINK format for {pgs_id}: {e}", flush=True); failures.append(f"{pgs_id} (format_error)"); continue
 
         # 3. PLINK2 uses the synchronized genotype files
-        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        # Use the 'list-variants' modifier to generate a file listing all variants that were successfully used for scoring.
-        plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(PLINK_COMPAT_PREFIX), "--score", str(plink_fmt_file), "header", "no-mean-imputation", "list-variants", "--out", str(out2_prefix)]
-        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
-        all_results.append(res_p2); pgs_results.append(res_p2)
-        if not res_p2['success']:
-            failures.append(f"{pgs_id} (plink2_failed)")
-        else:
-            # If plink2 was successful, view the first 50 variants from the list of used variants.
-            # The 'list-variants' modifier creates a file with the '.sscore.vars' suffix.
-            variant_list_file = out2_prefix.with_suffix('.sscore.vars')
-            if variant_list_file.exists():
-                print_debug_header(f"First 50 variants used in PLINK2 score for {pgs_id}")
-                try:
-                    with open(variant_list_file, 'r') as f:
-                        for i, line in enumerate(f):
-                            if i >= 50:
-                                break
-                            print(f"  [{i+1:2d}] {line.strip()}", flush=True)
-                except Exception as e:
-                    print(f"  > ERROR: Could not read variant list file {variant_list_file}: {e}", flush=True)
-            else:
-                print(f"  > WARNING: Variant list file {variant_list_file} not found.", flush=True)
+        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
+        # Use the 'list-variants' modifier to generate a file listing all variants that were successfully used for scoring.
+        plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(PLINK_COMPAT_PREFIX), "--score", str(plink_fmt_file), "header", "no-mean-imputation", "list-variants", "--out", str(out2_prefix)]
+        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
+        all_results.append(res_p2); pgs_results.append(res_p2)
+        if not res_p2['success']:
+            failures.append(f"{pgs_id} (plink2_failed)")
+        else:
+            # If plink2 was successful, view the first 50 variants from the list of used variants.
+            # The 'list-variants' modifier creates a file with the '.sscore.vars' suffix.
+            variant_list_file = out2_prefix.with_suffix('.sscore.vars')
+            if variant_list_file.exists():
+                print_debug_header(f"First 50 variants used in PLINK2 score for {pgs_id}")
+                try:
+                    with open(variant_list_file, 'r') as f:
+                        for i, line in enumerate(f):
+                            if i >= 50:
+                                break
+                            print(f"  [{i+1:2d}] {line.strip()}", flush=True)
+                except Exception as e:
+                    print(f"  > ERROR: Could not read variant list file {variant_list_file}: {e}", flush=True)
+            else:
+                print(f"  > WARNING: Variant list file {variant_list_file} not found.", flush=True)
         
         # 4. PLINK1 also uses the synchronized genotype files
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
