@@ -92,12 +92,16 @@ pub fn prepare_for_computation(
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
 
+    // --- FIX: Get raw pointers BEFORE the closure ---
+    let weights_ptr = aligned_weights_matrix.as_mut_ptr();
+    let corrections_ptr = correction_constants_matrix.as_mut_ptr();
+
     // Parallel population pass: Iterate over the sorted `required_bim_indices`.
     // This gives both the dense `matrix_row` (from enumerate) and the sparse `bim_row_index`.
     required_bim_indices
         .par_iter()
         .enumerate()
-        .for_each(|(matrix_row, &bim_row_index)| {
+        .for_each(move |(matrix_row, &bim_row_index)| { // Add `move` here
             // The task is now retrieved via a direct lookup using the bim_row_index.
             // It's expected that every bim_row_index in required_bim_indices has a task in reconciliation_map.
             let task = &reconciliation_map[&bim_row_index];
@@ -119,9 +123,11 @@ pub fn prepare_for_computation(
                 // `aligned_weights_matrix` and `correction_constants_matrix` are sized
                 // num_reconciled_variants * stride, matrix_row < num_reconciled_variants,
                 // col_idx < score_names.len() <= stride. So, matrix_offset is in bounds.
+                // --- FIX: Use pointer arithmetic for the write ---
                 unsafe {
-                    *aligned_weights_matrix.get_unchecked_mut(matrix_offset) = aligned_weight;
-                    *correction_constants_matrix.get_unchecked_mut(matrix_offset) = correction_constant;
+                    // This is now safe because each thread writes to a disjoint memory region.
+                    *weights_ptr.add(matrix_offset) = aligned_weight;
+                    *corrections_ptr.add(matrix_offset) = correction_constant;
                 }
             }
         });
@@ -279,10 +285,13 @@ fn reconcile_scores_and_genotypes(
             if let Some((bim_record, bim_row_index)) = matching_bim {
                 required_bim_indices_set.insert(*bim_row_index);
 
-                let sign = if effect_allele == &bim_record.allele1 { // Case-sensitive due to normalization
-                    1.0
+                // --- FIX: Invert the sign logic to match reality ---
+                // The pivot_tile function unpacks the dosage of `allele2`.
+                // Therefore, the math must be aligned to that reality.
+                let sign = if effect_allele == &bim_record.allele2 {
+                    1.0 // Correct: Effect allele IS allele2, use dosage as-is.
                 } else {
-                    -1.0
+                    -1.0 // Correct: Effect allele is allele1, so we must flip the A2 dosage.
                 };
 
                 reconciliation_map.insert(*bim_row_index, ReconciliationTask {
