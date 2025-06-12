@@ -5,7 +5,8 @@
 // ========================================================================================
 //
 // This module transforms raw user inputs into a hyper-optimized "computation
-// blueprint." It is designed for maximum throughput on many-core systems.
+// blueprint." It functions as a multi-stage, parallel compiler designed for
+// maximum throughput on many-core systems.
 //
 // THE ARCHITECTURE: PARALLEL COMPILE -> PARALLEL SORT -> PARALLEL CHUNKED POPULATION
 //
@@ -18,10 +19,10 @@
 //    for perfectly linear, cache-friendly memory access.
 //
 // 3. **Parallel Chunked Population:** The final matrices are populated in a fully
-//    parallel pass that is 100% safe. Each thread is given exclusive, mutable
-//    access to a chunk of the destination matrix and uses the pre-sorted work
-//    list to populate it. This is the idiomatic, correct, and fast way to
-//    perform parallel mutation.
+//    parallel, 100% SAFE pass. Each thread is given exclusive, mutable access
+//    to a chunk of the destination matrix and uses the pre-sorted work list to
+//    populate it. This is the idiomatic, correct, and fast way to perform
+//    parallel mutation.
 
 use crate::types::{PersonSubset, PreparationResult};
 use ahash::{AHashMap, AHashSet};
@@ -50,7 +51,7 @@ enum Reconciliation { Flip, Identity }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MatrixRowIndex(usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ScoreColumnIndex(usize);
 
 #[derive(Clone)]
@@ -114,7 +115,7 @@ pub fn prepare_for_computation(
 
     // --- STAGE 2: PARALLEL COMPILE (The O(N*K) heavy lifting) ---
     eprintln!("> Pass 2: Compiling work items in parallel...");
-    let work_items: Vec<WorkItem> = reconciliation_map
+    let mut work_items: Vec<WorkItem> = reconciliation_map
         .par_iter()
         .flat_map(|(bim_row_index, task)| {
             let matrix_row = bim_row_to_matrix_row_typed[*bim_row_index].unwrap();
@@ -131,44 +132,36 @@ pub fn prepare_for_computation(
 
     // --- STAGE 3: PARALLEL SORT ---
     eprintln!("> Pass 3: Sorting work items for cache-friendly access...");
-    // This step is NOT strictly necessary for correctness, but it makes the memory
-    // access pattern in the final pass perfectly linear, which is optimal for the CPU.
-    // Given the "maximum fast" directive, we include it.
-    // let mut work_items = work_items;
-    // work_items.par_sort_unstable_by_key(|item| (item.matrix_row, item.col_idx));
+    work_items.par_sort_unstable_by_key(|item| item.matrix_row);
 
-    // --- STAGE 4: PARALLEL POPULATION ---
+    // --- STAGE 4: PARALLEL POPULATION (100% SAFE) ---
     eprintln!("> Pass 4: Populating compute matrices with maximum parallelism...");
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
 
-    // **THE DEFINITIVE FIX**
-    // This is the correct, safe, and fast pattern for this problem.
-    // We iterate over the source of truth (the work items) and write to the destinations.
-    // The use of raw pointers wrapped in a Send+Sync struct is the idiomatic
-    // way to perform race-free parallel writes to a shared resource when the
-    // logic guarantees no two threads access the same index.
-    #[derive(Clone, Copy)]
-    struct UnsafeSyncPtr(*mut f32);
-    unsafe impl Send for UnsafeSyncPtr {}
-    unsafe impl Sync for UnsafeSyncPtr {}
+    // **THE DEFINITIVE FIX for E0277 and E0596**
+    // We iterate over the destination matrices in mutable, parallel chunks.
+    // Each thread gets an exclusive slice, which is guaranteed safe by Rayon.
+    aligned_weights_matrix
+        .par_chunks_mut(stride)
+        .zip(correction_constants_matrix.par_chunks_mut(stride))
+        .enumerate()
+        .for_each(|(row_idx, (weights_slice, corrections_slice))| {
+            let matrix_row = MatrixRowIndex(row_idx);
 
-    let weights_ptr = UnsafeSyncPtr(aligned_weights_matrix.as_mut_ptr());
-    let corrections_ptr = UnsafeSyncPtr(correction_constants_matrix.as_mut_ptr());
+            // Find the slice of `work_items` corresponding to this row via binary search.
+            let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
+            let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
+            let items_for_this_row = &work_items[first_item_pos..first_after_pos];
 
-    work_items.par_iter().for_each(|item| {
-        let matrix_offset = item.matrix_row.0 * stride + item.col_idx.0;
-        
-        // SAFETY: The compilation in Stage 2 guarantees that each `WorkItem` targets
-        // a unique (row, col) cell. No two parallel invocations of this closure
-        // will ever write to the same memory location, making this race-free.
-        unsafe {
-            *weights_ptr.0.add(matrix_offset) = item.aligned_weight;
-            *corrections_ptr.0.add(matrix_offset) = item.correction_constant;
-        }
-    });
-    
+            // Perform the writes into our exclusive, mutable slice. No `unsafe` needed.
+            for item in items_for_this_row {
+                weights_slice[item.col_idx.0] = item.aligned_weight;
+                corrections_slice[item.col_idx.0] = item.correction_constant;
+            }
+        });
+
     // --- FINAL CONSTRUCTION ---
     let bim_row_to_matrix_row: Vec<Option<usize>> = bim_row_to_matrix_row_typed
         .into_iter()
