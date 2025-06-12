@@ -12,9 +12,6 @@ import pandas as pd
 import numpy as np
 import psutil
 
-# ========================================================================================
-#                                   CONFIGURATION
-# ========================================================================================
 CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
