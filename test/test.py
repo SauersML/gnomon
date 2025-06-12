@@ -176,13 +176,14 @@ def create_positional_bim(original_prefix: Path, new_prefix: Path):
 
 def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     """
-    Reads a raw PGS harmonized file and creates a PLINK-compatible score file.
-    It uses harmonized positions (hm_chr:hm_pos) for robust variant matching.
+    Reads a raw PGS harmonized file and creates a clean, PLINK-compatible score file.
+    - Uses harmonized positions (hm_chr:hm_pos) for robust variant matching.
+    - Ensures all effect weights are numeric, dropping rows with invalid data.
     """
     print_header(f"PREPARING PLINK FORMAT FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', dtype=str)
 
-    # Use harmonized positions (hm_chr:hm_pos) for robust variant matching.
+    # --- Use harmonized positions for robust variant matching ---
     if 'hm_chr' not in df.columns or 'hm_pos' not in df.columns:
         raise KeyError("Harmonized columns 'hm_chr' or 'hm_pos' not found.")
     
@@ -191,17 +192,24 @@ def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     df[variant_id_col] = df['hm_chr'] + ':' + df['hm_pos']
     print("  Using 'hm_chr':'hm_pos' as the canonical variant ID.")
 
-    # Identify effect allele and effect weight columns.
+    # --- Identify and CLEAN effect weight column ---
     effect_col = 'effect_allele'
     other_allele_col = 'other_allele'
     weight_col = 'effect_weight'
     if effect_col not in df.columns or weight_col not in df.columns:
         raise KeyError(f"Required columns '{effect_col}' or '{weight_col}' not found.")
+    
+    original_rows = len(df)
+    df[weight_col] = pd.to_numeric(df[weight_col], errors='coerce')
+    df.dropna(subset=[weight_col], inplace=True)
+    cleaned_rows = len(df)
+    if original_rows > cleaned_rows:
+        print(f"  Dropped {original_rows - cleaned_rows} rows with non-numeric effect weights.")
+
     print(f"  Using effect-allele column: {effect_col}")
     print(f"  Using weight column: {weight_col}")
     
-    # Subset and write the PLINK-compatible file.
-    # A 4-column file is robust for both PLINK1 and PLINK2.
+    # --- Subset and write the PLINK-compatible file ---
     plink_df = df[[variant_id_col, effect_col, other_allele_col, weight_col]].copy()
     plink_df.columns = ['ID', 'EFFECT_ALLELE', 'OTHER_ALLELE', 'WEIGHT']
     
@@ -209,7 +217,7 @@ def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     plink_df.to_csv(out_path, sep='\t', index=False, na_rep='NA')
     print(f"\n  Written PLINK-compatible score file: {out_path}")
 
-    # Debug: Check for matches against the updated BIM file.
+    # --- Debug: Check for matches against the updated BIM file ---
     bim_path = UPDATED_PLINK_PREFIX.with_suffix('.bim')
     bim_ids = pd.read_csv(bim_path, sep='\t', header=None, usecols=[1], dtype=str)[1].to_numpy()
     matches = plink_df['ID'].isin(bim_ids).sum()
@@ -240,7 +248,7 @@ def main():
             failures.append(f"{pgs_id} (gnomon_failed)")
             continue
 
-        # 2) Prepare a unified PLINK-compatible score file
+        # 2) Prepare a unified, clean PLINK-compatible score file
         try:
             plink_fmt_file = create_plink_formatted_scorefile(raw_score_file, pgs_id)
         except Exception as e:
@@ -260,15 +268,15 @@ def main():
         all_results.append(res_p2)
         if not res_p2['success']:
             failures.append(f"{pgs_id} (plink2_failed)")
-            # Do not continue; allow PLINK1 to be tested even if PLINK2 fails
         
         # 4) PLINK1
         out1 = CI_WORKDIR / f"plink1_{pgs_id}"
+        # PLINK1 will default to calculating an average score over non-missing variants.
         res_p1 = run_and_measure([
             str(PLINK1_BINARY),
             "--bfile", str(UPDATED_PLINK_PREFIX),
             # Use columns 1 (ID), 2 (EFFECT_ALLELE), and 4 (WEIGHT)
-            "--score", str(plink_fmt_file), "1", "2", "4", "header", "sum", "no-mean-imputation",
+            "--score", str(plink_fmt_file), "1", "2", "4", "header", "no-mean-imputation",
             "--out", str(out1)
         ], f"plink1_{pgs_id}")
         all_results.append(res_p1)
