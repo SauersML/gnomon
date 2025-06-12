@@ -209,41 +209,86 @@ fn index_bim_file(bim_path: &Path) -> Result<(AHashMap<String, Vec<(BimRecord, u
     Ok((bim_index, total_lines))
 }
 
-fn parse_and_group_score_file(score_path: &Path) -> Result<(AHashMap<String, (String, String, AHashMap<String, f32>)>, Vec<String>), PrepError> {
+/// A robust, format-aware parser for score files.
+/// It uses a "Hierarchy of Trust" to identify variants and handles complex alleles.
+fn parse_and_group_score_file(score_path: &Path) -> Result<(AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>>, Vec<String>), PrepError> {
     let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
-    reader.read_line(&mut header_line).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
 
-    let header_fields: Vec<_> = header_line.trim().split_whitespace().collect();
-    let snp_id_idx = find_column_index(&header_fields, "snp_id")?;
-    let effect_allele_idx = find_column_index(&header_fields, "effect_allele")?;
-    let other_allele_idx = find_column_index(&header_fields, "other_allele")?;
+    // Skip metadata lines starting with '#'
+    loop {
+        header_line.clear();
+        if reader.read_line(&mut header_line).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))? == 0 {
+            return Err(PrepError::Header("Score file is empty or contains only metadata.".to_string()));
+        }
+        if !header_line.starts_with('#') {
+            break;
+        }
+    }
 
-    let score_name_cols: Vec<(usize, &str)> = header_fields.iter().enumerate()
-        .filter(|(i, _)| *i != snp_id_idx && *i != effect_allele_idx && *i != other_allele_idx)
-        .map(|(idx, name)| (idx, *name)).collect();
+    // --- Header Parsing with Column Name Mapping ---
+    // This is a robust by-name parser, not a fragile by-index parser.
+    let header_fields: AHashMap<&str, usize> = header_line.trim().split('\t')
+        .enumerate().map(|(i, name)| (name, i)).collect();
 
-    let score_names: Vec<String> = score_name_cols.iter().map(|(_, name)| name.to_string()).collect();
-    if score_names.is_empty() { return Err(PrepError::Header("No score columns found.".to_string())); }
+    let get_col = |name: &str| header_fields.get(name).copied();
+    
+    // Determine which columns to use for variant identification using the hierarchy.
+    let (chr_col, pos_col) = match (get_col("hm_chr"), get_col("hm_pos")) {
+        (Some(chr), Some(pos)) => (chr, pos), // Harmonized is best.
+        _ => (
+            get_col("chr_name").ok_or_else(|| PrepError::Header("Missing required column: 'chr_name' (or 'hm_chr').".to_string()))?,
+            get_col("chr_position").ok_or_else(|| PrepError::Header("Missing required column: 'chr_position' (or 'hm_pos').".to_string()))?
+        )
+    };
+
+    let effect_allele_col = get_col("effect_allele").ok_or_else(|| PrepError::Header("Missing required column: 'effect_allele'.".to_string()))?;
+    // The `other_allele` column is now required for unambiguous biallelic matching.
+    let other_allele_col = get_col("other_allele").ok_or_else(|| PrepError::Header("Missing required column: 'other_allele' for unambiguous matching.".to_string()))?;
+
+    // Find all remaining columns to treat as score weights.
+    let score_name_cols: Vec<(String, usize)> = header_line.trim().split('\t').enumerate()
+        .filter(|(i, _)| *i != chr_col && *i != pos_col && *i != effect_allele_col && *i != other_allele_col && get_col("rsID") != Some(*i))
+        .map(|(i, name)| (name.to_string(), i)).collect();
+
+    let score_names: Vec<String> = score_name_cols.iter().map(|(name, _)| name.clone()).collect();
+    if score_names.is_empty() { return Err(PrepError::Header("No score weight columns found.".to_string())); }
 
     let mut score_map = AHashMap::new();
+
+    // --- Data Row Parsing ---
     for line_result in reader.lines() {
         let line = line_result.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
         if line.trim().is_empty() { continue; }
-        let fields: Vec<_> = line.split_whitespace().collect();
+        // The PGS Catalog format is explicitly tab-delimited.
+        let fields: Vec<_> = line.split('\t').collect();
 
-        let snp_id = fields.get(snp_id_idx).ok_or_else(|| PrepError::Parse("Missing snp_id.".to_string()))?.to_string();
-        let effect_allele = fields.get(effect_allele_idx).ok_or_else(|| PrepError::Parse("Missing effect_allele.".to_string()))?.to_uppercase();
-        let other_allele = fields.get(other_allele_idx).ok_or_else(|| PrepError::Parse("Missing other_allele.".to_string()))?.to_uppercase();
+        let chr = fields.get(chr_col).ok_or_else(|| PrepError::Parse("Missing chromosome value.".to_string()))?;
+        let pos = fields.get(pos_col).ok_or_else(|| PrepError::Parse("Missing position value.".to_string()))?;
+        let snp_id = format!("{}:{}", chr, pos);
+
+        // Alleles are now handled as case-sensitive Strings to support indels and complex types.
+        let effect_allele = fields.get(effect_allele_col).ok_or_else(|| PrepError::Parse("Missing effect_allele.".to_string()))?.to_string();
+        let other_allele = fields.get(other_allele_col).ok_or_else(|| PrepError::Parse("Missing other_allele.".to_string()))?.to_string();
+        
+        // This enforces the "no ambiguity" doctrine at the parse stage.
+        if other_allele.contains(',') || other_allele.contains(';') {
+            return Err(PrepError::Parse(format!(
+                "Fatal Ambiguity: Variant {} lists multiple 'other_alleles' ('{}') in a single row. Please decompose this into multiple score lines, each with one 'other_allele'.",
+                snp_id, other_allele
+            )));
+        }
 
         let mut weights = AHashMap::with_capacity(score_names.len());
-        for (col_idx, name) in &score_name_cols {
+        for (name, col_idx) in &score_name_cols {
             let val_str = fields.get(*col_idx).ok_or_else(|| PrepError::Parse(format!("Missing value for '{}'", name)))?;
             let weight: f32 = val_str.parse().map_err(|e| PrepError::Parse(format!("Invalid number for '{}': {}", name, e)))?;
-            weights.insert(name.to_string(), weight);
+            weights.insert(name.clone(), weight);
         }
-        score_map.insert(snp_id, (effect_allele, other_allele, weights));
+        
+        // The map now stores a Vec, allowing multiple biallelic contexts at the same position.
+        score_map.entry(snp_id).or_insert_with(Vec::new).push((effect_allele, other_allele, weights));
     }
     Ok((score_map, score_names))
 }
