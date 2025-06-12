@@ -40,9 +40,6 @@ PGS_SCORES = {
     "PGS001780": "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS001780/ScoringFiles/Harmonized/PGS001780_hmPOS_GRCh38.txt.gz",
 }
 
-NUMERICAL_TOLERANCE = 1e-4
-CORR_THRESHOLD = 0.9999
-
 # ========================================================================================
 #                                   HELPER FUNCTIONS
 # ========================================================================================
@@ -130,7 +127,6 @@ def setup_environment():
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
-            # The zip files contain binaries with generic names, find and rename them
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
                     p.rename(binary_path)
@@ -164,7 +160,7 @@ def create_positional_bim(original_prefix: Path, new_prefix: Path):
         sep='\t',
         header=None,
         names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'],
-        dtype={'chrom': str, 'rsid': str, 'cm': str, 'pos': str, 'a1': str, 'a2': str}
+        dtype=str
     )
     
     # Create the new canonical ID: chr:pos
@@ -180,39 +176,40 @@ def create_positional_bim(original_prefix: Path, new_prefix: Path):
 
 def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     """
-    Reads a raw PGS harmonized file and creates a PLINK2-compatible score file.
+    Reads a raw PGS harmonized file and creates a PLINK-compatible score file.
     It uses harmonized positions (hm_chr:hm_pos) for robust variant matching.
     """
     print_header(f"PREPARING PLINK FORMAT FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', dtype=str)
 
-    # --- Use harmonized positions for robust variant matching ---
-    # The schema guarantees hm_chr and hm_pos in harmonized files.
+    # Use harmonized positions (hm_chr:hm_pos) for robust variant matching.
     if 'hm_chr' not in df.columns or 'hm_pos' not in df.columns:
         raise KeyError("Harmonized columns 'hm_chr' or 'hm_pos' not found.")
     
     df.dropna(subset=['hm_chr', 'hm_pos'], inplace=True)
-    variant_id_col = "snp_id"
+    variant_id_col = "variant_id"
     df[variant_id_col] = df['hm_chr'] + ':' + df['hm_pos']
     print("  Using 'hm_chr':'hm_pos' as the canonical variant ID.")
 
-    # --- Identify effect allele and effect weight columns ---
+    # Identify effect allele and effect weight columns.
     effect_col = 'effect_allele'
+    other_allele_col = 'other_allele'
     weight_col = 'effect_weight'
     if effect_col not in df.columns or weight_col not in df.columns:
         raise KeyError(f"Required columns '{effect_col}' or '{weight_col}' not found.")
     print(f"  Using effect-allele column: {effect_col}")
     print(f"  Using weight column: {weight_col}")
     
-    # --- Subset and write the PLINK-compatible file ---
-    plink_df = df[[variant_id_col, effect_col, weight_col]].copy()
-    plink_df.columns = ['ID', 'A1', 'WEIGHT'] # Use standard column names for clarity
+    # Subset and write the PLINK-compatible file.
+    # A 4-column file is robust for both PLINK1 and PLINK2.
+    plink_df = df[[variant_id_col, effect_col, other_allele_col, weight_col]].copy()
+    plink_df.columns = ['ID', 'EFFECT_ALLELE', 'OTHER_ALLELE', 'WEIGHT']
     
     out_path = CI_WORKDIR / f"{pgs_id}_plink_format.tsv"
     plink_df.to_csv(out_path, sep='\t', index=False, na_rep='NA')
-    print(f"\n  Written PLINK2-compatible score file: {out_path}")
+    print(f"\n  Written PLINK-compatible score file: {out_path}")
 
-    # --- Debug: Check for matches against the updated BIM file ---
+    # Debug: Check for matches against the updated BIM file.
     bim_path = UPDATED_PLINK_PREFIX.with_suffix('.bim')
     bim_ids = pd.read_csv(bim_path, sep='\t', header=None, usecols=[1], dtype=str)[1].to_numpy()
     matches = plink_df['ID'].isin(bim_ids).sum()
@@ -226,7 +223,6 @@ def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
     
-    # Create a single, positionally-keyed genotype fileset to be used by PLINK.
     create_positional_bim(ORIGINAL_PLINK_PREFIX, UPDATED_PLINK_PREFIX)
 
     all_results, failures = [], []
@@ -235,37 +231,49 @@ def main():
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         print(f"Raw PGS file: {raw_score_file}")
 
-        # 1) Gnomon (assumed to work with the raw PGS file format and original genotypes)
+        # 1) Gnomon (assumed to work with the raw PGS file and original genotypes)
         res_g = run_and_measure([
             str(GNOMON_BINARY), "--score", str(raw_score_file), str(ORIGINAL_PLINK_PREFIX)
         ], f"gnomon_{pgs_id}")
         all_results.append(res_g)
         if not res_g['success']:
             failures.append(f"{pgs_id} (gnomon_failed)")
-            # Continue to the next score if gnomon fails
             continue
 
-        # 2) Prepare PLINK2-compatible score file
+        # 2) Prepare a unified PLINK-compatible score file
         try:
             plink_fmt_file = create_plink_formatted_scorefile(raw_score_file, pgs_id)
         except Exception as e:
-            print(f"❌ Error preparing PLINK2 format for {pgs_id}: {e}")
+            print(f"❌ Error preparing PLINK format for {pgs_id}: {e}")
             failures.append(f"{pgs_id} (format_error)")
             continue
 
         # 3) PLINK2
         out2 = CI_WORKDIR / f"plink2_{pgs_id}"
-        # Use the genotype files with updated positional IDs for matching
         res_p2 = run_and_measure([
             str(PLINK2_BINARY),
             "--bfile", str(UPDATED_PLINK_PREFIX),
-            "--score", str(plink_fmt_file), "header", "cols=maybesid,dosagesum,scoreavgs",
+            "--score", str(plink_fmt_file), "header", "no-mean-imputation",
+            "cols=maybesid,dosagesum,scoreavgs",
             "--out", str(out2)
         ], f"plink2_{pgs_id}")
         all_results.append(res_p2)
         if not res_p2['success']:
             failures.append(f"{pgs_id} (plink2_failed)")
-            continue
+            # Do not continue; allow PLINK1 to be tested even if PLINK2 fails
+        
+        # 4) PLINK1
+        out1 = CI_WORKDIR / f"plink1_{pgs_id}"
+        res_p1 = run_and_measure([
+            str(PLINK1_BINARY),
+            "--bfile", str(UPDATED_PLINK_PREFIX),
+            # Use columns 1 (ID), 2 (EFFECT_ALLELE), and 4 (WEIGHT)
+            "--score", str(plink_fmt_file), "1", "2", "4", "header", "sum", "no-mean-imputation",
+            "--out", str(out1)
+        ], f"plink1_{pgs_id}")
+        all_results.append(res_p1)
+        if not res_p1['success']:
+            failures.append(f"{pgs_id} (plink1_failed)")
 
     # Final summary
     print_header('PERFORMANCE SUMMARY')
@@ -282,7 +290,7 @@ def main():
     print_header(f"CI CHECK {'FAILED' if failures else 'PASSED'}")
     if failures:
         print('❌ Tests failed:')
-        for f in sorted(set(failures)):
+        for f in sorted(list(set(failures))):
             print(f'  - {f}')
         sys.exit(1)
     else:
