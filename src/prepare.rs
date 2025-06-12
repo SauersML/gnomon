@@ -225,16 +225,16 @@ pub fn prepare_for_computation(
         .zip(correction_constants_matrix.par_chunks_mut(stride))
         .enumerate()
         .for_each(|(row_idx, (weights_slice, corrections_slice))| {
-            let matrix_row = MatrixRowIndex(row_idx);
-            let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
-            let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
-            let items_for_this_row = &work_items[first_item_pos..first_after_pos];
+            let matrix_row = MatrixRowIndex(row_idx);
+            let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
+            let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
+            let items_for_this_row = &work_items[first_item_pos..first_after_pos];
 
-            for item in items_for_this_row {
-                weights_slice[item.col_idx.0] = item.aligned_weight;
-                corrections_slice[item.col_idx.0] = item.correction_constant;
-            }
-        });
+            for item in items_for_this_row {
+                weights_slice[item.col_idx.0] += item.aligned_weight;
+                corrections_slice[item.col_idx.0] += item.correction_constant;
+            }
+        });
 
     // --- FINAL CONSTRUCTION ---
     let bim_row_to_matrix_row: Vec<Option<usize>> = bim_row_to_matrix_row_typed
