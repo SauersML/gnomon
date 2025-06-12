@@ -72,43 +72,68 @@ struct IoMessage {
 struct ChunkResult {
     io_buffer: Vec<u8>,
     partial_scores: Vec<f32>,
+    partial_missing_counts: Vec<u32>,
     #[cfg(debug_assertions)]
     committed: Cell<bool>,
 }
 
 impl ChunkResult {
     /// Creates a new `ChunkResult` from its constituent buffers.
-    fn new(io_buffer: Vec<u8>, partial_scores: Vec<f32>) -> Self {
+    fn new(
+        io_buffer: Vec<u8>,
+        partial_scores: Vec<f32>,
+        partial_missing_counts: Vec<u32>,
+    ) -> Self {
         Self {
             io_buffer,
             partial_scores,
+            partial_missing_counts,
             #[cfg(debug_assertions)]
             committed: Cell::new(false),
         }
     }
 
-    /// Atomically merges partial scores, sends the I/O buffer back to the
-    /// producer, and returns the now-cleared partial scores buffer for reuse.
+    /// Atomically merges partial scores and missing counts, sends the I/O buffer
+    /// back to the producer, and returns the now-cleared partial result buffers for reuse.
     #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
     async fn commit(
         self,
         all_scores: &mut [f32],
+        all_missing_counts: &mut [u32],
         empty_tx: &Sender<Vec<u8>>,
-    ) -> (Vec<f32>, Result<(), SendError<Vec<u8>>>) {
+    ) -> (
+        (Vec<f32>, Vec<u32>),
+        Result<(), SendError<Vec<u8>>>,
+    ) {
         let this = std::mem::ManuallyDrop::new(self);
         let io_buffer = unsafe { std::ptr::read(&this.io_buffer) };
         let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
+        let mut recycled_missing_counts_buffer =
+            unsafe { std::ptr::read(&this.partial_missing_counts) };
 
+        // Aggregate both scores and missing counts.
         for (master_score, partial_score) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
             *master_score += partial_score;
+        }
+        for (master_count, partial_count) in
+            all_missing_counts.iter_mut().zip(&recycled_missing_counts_buffer)
+        {
+            *master_count += partial_count;
         }
 
         #[cfg(debug_assertions)]
         this.committed.set(true);
 
         let send_result = empty_tx.send(io_buffer).await;
+
+        // Clear buffers for reuse.
         recycled_scores_buffer.fill(0.0);
-        (recycled_scores_buffer, send_result)
+        recycled_missing_counts_buffer.fill(0);
+
+        (
+            (recycled_scores_buffer, recycled_missing_counts_buffer),
+            send_result,
+        )
     }
 }
 
@@ -192,7 +217,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
-    let mut all_scores = vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
+    let num_scores = prep_result.score_names.len();
+    let result_buffer_size = prep_result.num_people_to_score * num_scores;
+    let mut all_scores = vec![0.0f32; result_buffer_size];
+    let mut all_missing_counts = vec![0u32; result_buffer_size];
+
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
@@ -204,10 +233,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let chunk_size_bytes = (available_mem / 4).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as usize;
 
     const PIPELINE_DEPTH: usize = 2;
-    let partial_scores_size = prep_result.num_people_to_score * prep_result.score_names.len();
-    let partial_scores_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
+    let partial_result_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
     for _ in 0..(PIPELINE_DEPTH + 1) {
-        partial_scores_pool.push(vec![0.0f32; partial_scores_size]).unwrap();
+        partial_result_pool
+            .push((
+                vec![0.0f32; result_buffer_size],
+                vec![0u32; result_buffer_size],
+            ))
+            .unwrap();
     }
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<IoMessage>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
@@ -276,25 +309,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
-        let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
+        let partial_result_pool_clone = Arc::clone(&partial_result_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
         let stride = prep_clone.stride;
         let matrix_slice_start = matrix_row_start * stride;
         let matrix_slice_end = matrix_row_end * stride;
-        let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
+        let (mut partial_scores_buffer, mut partial_missing_counts_buffer) =
+            partial_result_pool_clone.pop().unwrap();
 
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
-            
+
             let weights_for_chunk = prep_clone
                 .aligned_weights_matrix
                 .get(matrix_slice_start..matrix_slice_end)
-                .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Internal error: Failed to slice aligned weights matrix."))?;
-                
+                .ok_or_else(|| {
+                    Box::<dyn Error + Send + Sync>::from(
+                        "Internal error: Failed to slice aligned weights matrix.",
+                    )
+                })?;
+
             let corrections_for_chunk = prep_clone
                 .correction_constants_matrix
                 .get(matrix_slice_start..matrix_slice_end)
-                .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Internal error: Failed to slice correction constants matrix."))?;
+                .ok_or_else(|| {
+                    Box::<dyn Error + Send + Sync>::from(
+                        "Internal error: Failed to slice correction constants matrix.",
+                    )
+                })?;
 
             batch::run_chunk_computation(
                 buffer_slice,
@@ -302,13 +344,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 corrections_for_chunk,
                 &prep_clone,
                 &mut partial_scores_buffer,
+                &mut partial_missing_counts_buffer,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
                 matrix_row_start,
                 bed_row_offset,
             )?;
 
-            let result = ChunkResult::new(full_buffer, partial_scores_buffer);
+            let result = ChunkResult::new(
+                full_buffer,
+                partial_scores_buffer,
+                partial_missing_counts_buffer,
+            );
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
 
@@ -317,8 +364,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Err(e) => return Err(e),
         };
 
-        let (recycled_scores_buffer, send_result) = chunk_result.commit(&mut all_scores, &empty_buffer_tx).await;
-        partial_scores_pool_clone.push(recycled_scores_buffer).unwrap();
+        let (recycled_buffers, send_result) = chunk_result
+            .commit(&mut all_scores, &mut all_missing_counts, &empty_buffer_tx)
+            .await;
+        partial_result_pool_clone.push(recycled_buffers).unwrap();
 
         if send_result.is_err() {
             break;
@@ -358,7 +407,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &out_path,
         &prep_result.final_person_iids,
         &prep_result.score_names,
+        &prep_result.score_variant_counts,
         &all_scores,
+        &all_missing_counts,
     )?;
 
     eprintln!("\nSuccess! Total execution time: {:.2?}", start_time.elapsed());
@@ -400,33 +451,68 @@ fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + S
 }
 
 /// Writes the final calculated scores to a self-describing, tab-separated file.
+/// This function now calculates the final per-variant average and missing percentage.
 fn write_scores_to_file(
     path: &Path,
     person_iids: &[String],
     score_names: &[String],
-    scores: &[f32],
+    score_variant_counts: &[u32],
+    sum_scores: &[f32],
+    missing_counts: &[u32],
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     let num_scores = score_names.len();
 
+    // Write the new, more descriptive header.
     write!(writer, "#IID")?;
     for name in score_names {
-        write!(writer, "\t{}", name)?;
+        write!(writer, "	{}_AVG	{}_MISSING_PCT", name, name)?;
     }
     writeln!(writer)?;
 
-    let mut line_buffer = String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 12));
-    let mut score_chunks = scores.chunks_exact(num_scores);
+    let mut line_buffer =
+        String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 24));
+    let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
+    let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
 
     for iid in person_iids {
-        let person_scores = score_chunks.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write.")
+        let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mismatched number of persons and score rows during final write.",
+            )
         })?;
+        let person_missing_counts = missing_count_chunks.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mismatched number of persons and missing count rows during final write.",
+            )
+        })?;
+
         line_buffer.clear();
         write!(&mut line_buffer, "{}", iid).unwrap();
-        for &score in person_scores {
-            write!(&mut line_buffer, "\t{:.6}", score).unwrap();
+
+        for i in 0..num_scores {
+            let sum_score = person_sum_scores[i];
+            let missing_count = person_missing_counts[i];
+            let total_variants_for_score = score_variant_counts[i];
+
+            let variants_used = total_variants_for_score.saturating_sub(missing_count);
+
+            let avg_score = if variants_used > 0 {
+                sum_score / (variants_used as f32)
+            } else {
+                0.0 // Or f32::NAN if preferred for 100% missing. 0.0 is simpler.
+            };
+
+            let missing_pct = if total_variants_for_score > 0 {
+                (missing_count as f32 / total_variants_for_score as f32) * 100.0
+            } else {
+                0.0 // Or f32::NAN if a score has no variants.
+            };
+
+            write!(&mut line_buffer, "	{:.6}	{:.4}", avg_score, missing_pct).unwrap();
         }
         writeln!(writer, "{}", line_buffer)?;
     }

@@ -60,9 +60,16 @@ pub struct PreparationResult {
     /// of the `.bed` file.
     pub required_bim_indices: Vec<usize>,
 
-    // --- PRESERVED METADATA ---
+    // --- PRESERVED METADATA & FINAL CALCULATION DATA ---
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
+    /// A vector containing the total number of variants that contribute to each score.
+    /// This is used as the denominator for per-variant-average and missing % calculations.
+    /// The order matches `score_names`.
+    pub score_variant_counts: Vec<u32>,
+    /// A "missingness blueprint" mapping each dense matrix row (variant) to the
+    /// score column indices it affects. This enables efficient missingness tracking.
+    pub variant_to_scores_map: Vec<Vec<u16>>,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
     /// The list of Individual IDs (IIDs) for the individuals being scored, in the
