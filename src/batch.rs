@@ -590,6 +590,3 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
         r7.cast(),
     ]
 }
-```
-
-**Note:** The `bytes_per_snp` change is included in this provided code. The `prep_result.bytes_per_snp` implies that this field will be added to `PreparationResult` in `types.rs` and calculated in `prepare.rs`. I will handle those dependent changes for `types.rs` and `prepare.rs` in subsequent steps after this `batch.rs` update.
