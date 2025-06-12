@@ -101,7 +101,7 @@ pub fn prepare_for_computation(
     required_bim_indices
         .par_iter()
         .enumerate()
-        .for_each(|(matrix_row, &bim_row_index)| {
+        .for_each(move |(matrix_row, &bim_row_index)| { // Add `move` here
             // The task is now retrieved via a direct lookup using the bim_row_index.
             // It's expected that every bim_row_index in required_bim_indices has a task in reconciliation_map.
             let task = &reconciliation_map[&bim_row_index];
