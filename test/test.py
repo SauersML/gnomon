@@ -196,10 +196,9 @@ def main():
             failures.append(f"{pgs_id} (gnomon_execution_failed)")
             continue
 
-        fmt_file = score_file.with_suffix('.gnomon_format.tsv')
-        out_file = score_file.with_suffix('.txt.sscore')
-        print(f"Expected reformatted: {fmt_file}, output: {out_file}")
-        if not fmt_file.exists() or not out_file.exists():
+        fmt_file = score_file
+        out_file = ORIGINAL_PLINK_PREFIX.with_suffix('.sscore')
+        if not out_file.exists():
             failures.append(f"{pgs_id} (gnomon_output_missing)")
             continue
 
