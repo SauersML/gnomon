@@ -19,6 +19,10 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// A flag to ensure we only print the allele-reconciliation warning once per run.
+static AMBIGUITY_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
 
 // The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
 const LANE_COUNT: usize = 8;
@@ -366,38 +370,37 @@ fn discover_required_bim_indices(
             let mut set_for_snp = BTreeSet::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, other_allele, _weights) in score_lines {
-                    let score_alleles: AHashSet<&str> =
-                        [effect_allele.as_str(), other_allele.as_str()]
-                            .iter()
-                            .copied()
-                            .collect();
+                    // Find the first BIM record for this chr:pos that contains the score's effect allele.
+                    // This implements the permissive matching logic.
+                    let usable_match = bim_records.iter().find(|(bim_record, _)| {
+                        effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                    });
 
-                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
-                        let bim_alleles: AHashSet<&str> =
+                    if let Some((bim_record, bim_row_index)) = usable_match {
+                        // The variant is usable. Add its bim row index to the set of required indices.
+                        set_for_snp.insert(*bim_row_index);
+
+                        let bim_alleles_set: AHashSet<&str> =
                             [bim_record.allele1.as_str(), bim_record.allele2.as_str()]
                                 .iter()
                                 .copied()
                                 .collect();
-                        score_alleles == bim_alleles
-                    });
-
-                    if let Some((_, bim_row_index)) = perfect_match {
-                        set_for_snp.insert(*bim_row_index);
-                    } else {
-                        // FATAL AMBIGUITY CHECK
-                        let effect_allele_exists = bim_records.iter().any(|(br, _)| {
-                            effect_allele == &br.allele1 || effect_allele == &br.allele2
-                        });
-                        if effect_allele_exists {
-                            let available = bim_records
+                        let score_alleles_set: AHashSet<&str> =
+                            [effect_allele.as_str(), other_allele.as_str()]
                                 .iter()
-                                .map(|(r, _)| format!("{{{}, {}}}", r.allele1, r.allele2))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            return Err(PrepError::Parse(format!(
-                                "FATAL AMBIGUITY for variant '{}': Score file expects pair {{{}, {}}} but genotype data only provides pairs [{}]. Gnomon cannot proceed.",
-                                snp_id, effect_allele, other_allele, available
-                            )));
+                                .copied()
+                                .collect();
+
+                        // If the allele sets are non-identical, this is an "imperfect" match.
+                        // We print a single, global warning to inform the user that this automatic
+                        // reconciliation is happening.
+                        if bim_alleles_set != score_alleles_set {
+                            if !AMBIGUITY_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "Warning: At least one variant was automatically reconciled due to mismatched allele sets (e.g., variant '{}'). Gnomon is proceeding by matching on the effect allele.",
+                                    snp_id
+                                );
+                            }
                         }
                     }
                 }
