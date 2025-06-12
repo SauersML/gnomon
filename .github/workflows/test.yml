@@ -128,4 +128,6 @@ jobs:
         run: pip install pandas numpy requests psutil tabulate
 
       - name: Run Tests
-        run: python test/test.py
+        # The '-u' flag runs Python in unbuffered mode, which ensures that
+        # print statements from the script are streamed to the log in real-time.
+        run: python -u test/test.py
