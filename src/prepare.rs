@@ -4,7 +4,7 @@
 //
 // ========================================================================================
 //
-// This module transforms raw user inputs into a hyper-optimized "computation
+// This module transforms raw user inputs into an optimized "computation
 // blueprint." It functions as a multi-stage, parallel compiler designed for
 // maximum throughput on many-core systems. It correctly handles and merges
 // multiple score files.
