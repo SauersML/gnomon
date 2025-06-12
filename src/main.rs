@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let prep = loop {
         match prepare::prepare_for_computation(&plink_prefix, &score_files, args.keep.as_deref()) {
             Ok(result) => break result,
-            Err(prep_error @ (PrepError::Header(_) | PrepError::Parse(_)))
+            Err(PrepError::Header(_) | PrepError::Parse(_))
                 if !attempted_reformat && score_files.len() == 1 =>
             {
                 let orig = &score_files[0];
