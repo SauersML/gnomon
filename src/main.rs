@@ -42,7 +42,7 @@ use tokio::sync::mpsc::{error::SendError, Sender};
     about = "A high-performance engine for polygenic score calculation."
 )]
 struct Args {
-    /// Path to the score file.
+    /// Path to a single score file or a directory containing multiple score files.
     #[clap(long)]
     score: PathBuf,
 
@@ -137,47 +137,59 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     fs::create_dir_all(output_dir)?;
 
     // --- Phase 2: The Preparation Phase ---
-    let prep_result = {
-        let mut score_path_to_use = args.score.clone();
-        eprintln!(
-            "> Preparing data using score file: {}",
-            score_path_to_use.display()
-        );
-        match prepare::prepare_for_computation(
-            &plink_prefix,
-            &score_path_to_use,
-            args.keep.as_deref(),
-        ) {
-            Ok(result) => Ok(result),
-            Err(prep_error @ PrepError::Header(_)) | Err(prep_error @ PrepError::Parse(_)) => {
-                eprintln!("\nWarning: Initial parsing failed. Checking for PGS Catalog format...");
-                match reformat::reformat_pgs_file(&score_path_to_use) {
-                    Ok(new_path) => {
-                        eprintln!("Success! Created compatible score file at: '{}'", new_path.display());
-                        eprintln!("Retrying computation with the new file...\n");
-                        score_path_to_use = new_path;
-                        prepare::prepare_for_computation(
-                            &plink_prefix,
-                            &score_path_to_use,
-                            args.keep.as_deref(),
-                        )
-                    }
-                    Err(reformat_error) => {
-                        eprintln!("\nError: Automatic conversion failed: {}", reformat_error);
-                        eprintln!("Please ensure the score file is in the gnomon-native format (snp_id, effect_allele, ...) or a valid PGS Catalog format.");
-                        Err(prep_error)
-                    }
+    // This logic now supports providing a directory to the --score argument.
+    let score_files = if args.score.is_dir() {
+        eprintln!("> Found directory for --score, locating all score files...");
+        fs::read_dir(&args.score)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|p| p.is_file())
+            .collect()
+    } else {
+        vec![args.score.clone()]
+    };
+
+    if score_files.is_empty() {
+        return Err("No score files found in the specified path.".into());
+    }
+
+    eprintln!("> Preparing data using {} score file(s)...", score_files.len());
+
+    // Call the preparation compiler, handling potential parsing errors by offering to reformat.
+    let prep_result = match prepare::prepare_for_computation(
+        &plink_prefix,
+        &score_files, // Pass the entire slice of paths, fixing the E0308 error.
+        args.keep.as_deref(),
+    ) {
+        Ok(result) => Ok(result),
+        // If preparation fails on a single file, offer to reformat it.
+        Err(prep_error @ PrepError::Header(_)) | Err(prep_error @ PrepError::Parse(_)) if score_files.len() == 1 => {
+            let score_path_to_check = &score_files[0];
+            eprintln!("\nWarning: Initial parsing of '{}' failed. Checking for PGS Catalog format...", score_path_to_check.display());
+            match reformat::reformat_pgs_file(score_path_to_check) {
+                Ok(new_path) => {
+                    // HONEST UX: Do not auto-retry. Inform the user and exit successfully.
+                    eprintln!("\nSuccess! A gnomon-compatible version of your score file has been created at:");
+                    eprintln!("  {}", new_path.display());
+                    eprintln!("\nPlease re-run your command using this new file path (or a directory containing it).");
+                    return Ok(()); // Successful exit, no error code.
+                }
+                Err(reformat_error) => {
+                    eprintln!("\nError: Automatic conversion failed: {}", reformat_error);
+                    eprintln!("Please ensure the score file is in the gnomon-native format (snp_id, effect_allele, other_allele, ...) or a valid PGS Catalog format.");
+                    Err(prep_error) // Propagate the original, more specific error.
                 }
             }
-            Err(other_error) => Err(other_error),
         }
+        // For any other error, or for errors with multiple files, just fail.
+        Err(other_error) => Err(other_error),
     };
 
     let prep_result = Arc::new(prep_result?);
 
     eprintln!(
-        "> Preparation complete. Found {} individuals to score and {} overlapping variants.",
-        prep_result.num_people_to_score, prep_result.num_reconciled_variants
+        "> Preparation complete. Found {} individuals to score and {} overlapping variants across {} score(s).",
+        prep_result.num_people_to_score, prep_result.num_reconciled_variants, prep_result.score_names.len()
     );
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
@@ -272,7 +284,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
             
-            // This is the primary change: slicing both matrices using the new contract.
             let weights_for_chunk = prep_clone
                 .aligned_weights_matrix
                 .get(matrix_slice_start..matrix_slice_end)
@@ -283,7 +294,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .get(matrix_slice_start..matrix_slice_end)
                 .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Internal error: Failed to slice correction constants matrix."))?;
 
-            // Dispatch to the updated `run_chunk_computation` with both matrices.
             batch::run_chunk_computation(
                 buffer_slice,
                 weights_for_chunk,
@@ -326,17 +336,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!("> Computation finished.");
 
     // --- Phase 5: Finalization and Output ---
-    let out_filename = match args.score.file_name() {
-        Some(name) => {
-            let mut s = OsString::from(name);
-            s.push(".sscore");
-            Ok(s)
-        }
-        None => Err(Box::<dyn Error + Send + Sync>::from(format!(
-            "Could not determine a base name from score file path '{}'.",
-            args.score.display()
-        ))),
-    }?;
+    // The output filename is now robustly based on the PLINK prefix, not the score file path.
+    let out_filename = {
+        let mut s = plink_prefix.file_name().map_or_else(
+            || OsString::from("gnomon_results"),
+            OsString::from,
+        );
+        s.push(".sscore");
+        s
+    };
     let out_path = output_dir.join(&out_filename);
     eprintln!(
         "> Writing {} scores per person to {}",
