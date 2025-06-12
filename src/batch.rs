@@ -69,6 +69,7 @@ pub fn run_chunk_computation(
     corrections_for_chunk: &[f32],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f32],
+    partial_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: usize,
@@ -99,6 +100,7 @@ pub fn run_chunk_computation(
                 corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
+            partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
@@ -114,6 +116,7 @@ pub fn run_chunk_computation(
                 corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
+            partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
@@ -138,6 +141,7 @@ fn process_people_iterator<'a, I>(
     corrections_for_chunk: &'a [f32],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f32],
+    partial_missing_counts: &'a mut [u32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
     matrix_row_start_idx: usize,
@@ -147,13 +151,14 @@ fn process_people_iterator<'a, I>(
 {
     let num_scores = prep_result.score_names.len();
     let all_person_indices: Vec<_> = iter.collect();
-    let scores_per_block = PERSON_BLOCK_SIZE * num_scores;
+    let items_per_block = PERSON_BLOCK_SIZE * num_scores;
 
-    // The main parallel loop iterates over the OUTPUT buffer in disjoint chunks.
+    // The main parallel loop iterates over the OUTPUT buffers in disjoint chunks.
     partial_scores
-        .par_chunks_mut(scores_per_block)
+        .par_chunks_mut(items_per_block)
+        .zip(partial_missing_counts.par_chunks_mut(items_per_block))
         .enumerate()
-        .for_each(|(block_idx, block_scores_out)| {
+        .for_each(|(block_idx, (block_scores_out, block_missing_counts_out))| {
             let person_start_idx = block_idx * PERSON_BLOCK_SIZE;
             let person_end_idx =
                 (person_start_idx + PERSON_BLOCK_SIZE).min(all_person_indices.len());
@@ -170,6 +175,7 @@ fn process_people_iterator<'a, I>(
                 weights_for_chunk,
                 corrections_for_chunk,
                 block_scores_out,
+                block_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
@@ -187,6 +193,7 @@ fn process_block(
     weights_for_chunk: &[f32],
     corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
+    block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: usize,
@@ -216,8 +223,10 @@ fn process_block(
         weights_for_chunk,
         corrections_for_chunk,
         block_scores_out,
+        block_missing_counts_out,
         sparse_index_pool,
         snps_in_chunk,
+        matrix_row_start_idx,
     );
 
     // Return the tile to the pool for reuse.
@@ -233,8 +242,10 @@ fn process_tile(
     weights_for_chunk: &[f32],
     corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
+    block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
     snps_in_chunk: usize,
+    matrix_row_start_idx: usize,
 ) {
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
@@ -258,17 +269,33 @@ fn process_tile(
         let genotype_row_end = genotype_row_start + snps_in_chunk;
         let genotype_row = &tile[genotype_row_start..genotype_row_end];
 
+        let person_missing_counts_start = person_idx * num_scores;
+        let person_missing_counts_slice =
+            &mut block_missing_counts_out[person_missing_counts_start..];
+
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
             // The kernel operates in the local coordinate space of the current chunk.
             // We pass the local `snp_idx_in_chunk` directly, which is a valid
             // index into the `weights_for_chunk` and `corrections_for_chunk` slices
-            // that the kernel receives. The global offset is handled by the orchestrator
-            // in main.rs when it creates the slices for this chunk.
+            // that the kernel receives.
             match dosage.0 {
                 // SAFETY: `person_idx` is guaranteed to be in bounds by the outer loop.
                 1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
-                _ => (), // Dosage 0 or 3 (missing) are ignored.
+                3 => {
+                    // This is the missing genotype sentinel.
+                    // Use the pre-compiled missingness blueprint to find which scores
+                    // this variant belongs to and increment their missing counts.
+                    let global_matrix_row_idx = matrix_row_start_idx + snp_idx_in_chunk;
+                    let scores_for_this_variant =
+                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                    for &score_idx in scores_for_this_variant {
+                        unsafe {
+                            *person_missing_counts_slice.get_unchecked_mut(score_idx as usize) += 1;
+                        }
+                    }
+                }
+                _ => (), // Dosage 0 is ignored.
             }
         }
     }

@@ -184,12 +184,38 @@ pub fn prepare_for_computation(
         })
         .collect();
 
-    // --- STAGE 4: PARALLEL SORT ---
-    eprintln!("> Pass 4: Sorting work items for cache-friendly access...");
+    // --- STAGE 4: COMPILE FINAL DATA STRUCTURES FROM WORK ITEMS ---
+    eprintln!("> Pass 4: Compiling final data structures for kernel...");
+
+    // To correctly count variants per score and build the missingness map, we need
+    // a unique set of (variant, score) pairings.
+    let mut unique_pairs: Vec<(MatrixRowIndex, ScoreColumnIndex)> = work_items
+        .par_iter()
+        .map(|item| (item.matrix_row, item.col_idx))
+        .collect();
+    unique_pairs.par_sort_unstable();
+    unique_pairs.dedup();
+
+    // --- Calculate total variants per score ---
+    let mut score_variant_counts = vec![0u32; score_names.len()];
+    for &(_, score_col) in &unique_pairs {
+        score_variant_counts[score_col.0] += 1;
+    }
+
+    // --- Build the variant_to_scores_map (missingness blueprint) ---
+    let mut variant_to_scores_map: Vec<Vec<u16>> = vec![Vec::new(); num_reconciled_variants];
+    // This is a sequential grouping operation on the sorted `unique_pairs`, which is fast.
+    for &(variant_row, score_col) in &unique_pairs {
+        // `variant_row.0` is guaranteed to be a valid index by construction.
+        variant_to_scores_map[variant_row.0].push(score_col.0 as u16);
+    }
+
+    // --- STAGE 5: PARALLEL SORT ---
+    eprintln!("> Pass 5: Sorting work items for cache-friendly access...");
     work_items.par_sort_unstable_by_key(|item| item.matrix_row);
 
-    // --- STAGE 5: PARALLEL POPULATION (100% SAFE) ---
-    eprintln!("> Pass 5: Populating compute matrices with maximum parallelism...");
+    // --- STAGE 6: PARALLEL POPULATION (100% SAFE) ---
+    eprintln!("> Pass 6: Populating compute matrices with maximum parallelism...");
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
@@ -223,6 +249,8 @@ pub fn prepare_for_computation(
         bim_row_to_matrix_row,
         required_bim_indices,
         score_names,
+        score_variant_counts,
+        variant_to_scores_map,
         person_subset,
         final_person_iids,
         num_people_to_score,
