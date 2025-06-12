@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               THE PREPARATION "COMPILER": MAXIMUM SPEED EDITION
+//               THE PREPARATION "COMPILER"
 //
 // ========================================================================================
 //
@@ -52,15 +52,15 @@ const LANE_COUNT: usize = 8;
 #[derive(Debug, Clone, Copy)]
 enum Reconciliation {
     /// The score's effect allele matches the BIM's primary allele (A1).
+    /// The dosage from the PLINK file's A2 is correct for a FLIP.
+    Flip,
+    /// The score's effect allele matches the BIM's secondary allele (A2).
     /// The dosage from the PLINK file can be used directly.
     Identity,
-    /// The score's effect allele matches the BIM's secondary allele (A2).
-    /// The dosage must be flipped (2 - dosage).
-    Flip,
 }
 
 /// A zero-cost newtype for a row index into the final compute matrices.
-/// Prevents accidental confusion with a `BimRowIndex`.
+/// Prevents accidental confusion with a raw .bim file index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MatrixRowIndex(usize);
 
@@ -136,35 +136,40 @@ pub fn prepare_for_computation(
     required_bim_indices.sort_unstable(); // For sequential .bed access
     let num_reconciled_variants = required_bim_indices.len();
 
-    let bim_row_to_matrix_row = build_bim_to_matrix_map(&required_bim_indices, total_snps_in_bim);
+    let bim_row_to_matrix_row_typed = build_bim_to_matrix_map(&required_bim_indices, total_snps_in_bim);
     let score_name_to_col_index: AHashMap<_, ScoreColumnIndex> =
         score_names.iter().enumerate().map(|(i, s)| (s.as_str(), ScoreColumnIndex(i))).collect();
 
     // --- STAGE 2: PARALLEL FLATTEN AND COMPILE (The O(N*K) heavy lifting) ---
     eprintln!("> Pass 2: Compiling work items in parallel...");
-    let mut work_items: Vec<WorkItem> = reconciliation_map
+    let work_items: Vec<WorkItem> = reconciliation_map
         .par_iter()
         .flat_map(|(bim_row_index, task)| {
-            let matrix_row = bim_row_to_matrix_row[*bim_row_index].unwrap();
+            // **ERROR FIX**: The closure must return a collection that implements `IntoParallelIterator`.
+            // We do the inner, sequential mapping and `collect` into a `Vec`.
+            // Rayon's `flat_map` can then take this `Vec` and flatten its contents
+            // into the main parallel stream.
+            let matrix_row = bim_row_to_matrix_row_typed[*bim_row_index].unwrap();
             
             task.weights.iter().map(move |(score_name, weight)| {
                 let col_idx = score_name_to_col_index[score_name.as_str()];
                 
-                // The compiler FORCES correct logic via the match statement.
-                // The `correction_term` bug is now impossible to write.
                 let (aligned_weight, correction_constant) = match task.reconciliation {
                     Reconciliation::Identity => (*weight, 0.0),
                     Reconciliation::Flip => (-(*weight), 2.0 * *weight),
                 };
 
                 WorkItem { matrix_row, col_idx, aligned_weight, correction_constant }
-            })
+            }).collect::<Vec<_>>() // <-- THIS IS THE FIX.
         })
-        .collect();
+        .collect(); // This `.collect()` is on the `ParallelIterator`.
 
     // --- STAGE 3: PARALLEL SORT ---
-    eprintln!("> Pass 3: Sorting work items for cache-friendly access...");
-    work_items.par_sort_unstable_by_key(|item| item.matrix_row);
+    // NOTE: This stage can be merged with Stage 2 by using `collect_unstable_sorted_by_key`
+    // if Rayon is updated, but this is the most compatible and robust approach.
+    // For now, sorting separately is correct and still massively parallel.
+    // work_items.par_sort_unstable_by_key(|item| item.matrix_row);
+    // (A separate sort is actually not needed for the final population strategy)
 
     // --- STAGE 4: PARALLEL POPULATION (Stable Rust Implementation) ---
     eprintln!("> Pass 4: Populating compute matrices with maximum parallelism...");
@@ -172,35 +177,30 @@ pub fn prepare_for_computation(
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
 
-    // This is the stable-Rust replacement for `par_group_by_key`.
-    (0..num_reconciled_variants).into_par_iter().for_each(|row_idx| {
-        let matrix_row = MatrixRowIndex(row_idx);
+    // This is a fully parallel write pass. It iterates over the compiled work items.
+    work_items.par_iter().for_each(|item| {
+        // Each thread processes a disjoint set of `WorkItem`s.
+        let matrix_row = item.matrix_row.0;
+        let col_idx = item.col_idx.0;
+        let matrix_offset = matrix_row * stride + col_idx;
 
-        // Find the slice of `work_items` corresponding to this row via binary search.
-        let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
-        let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
-        let items_for_this_row = &work_items[first_item_pos..first_after_pos];
-
-        if items_for_this_row.is_empty() { return; }
-
-        // SAFETY: The `for_each` on `0..num_reconciled_variants` guarantees each
-        // thread is given a unique `row_idx`. Therefore, the mutable slices
-        // created here will never overlap, preventing data races.
-        let row_start_offset = matrix_row.0 * stride;
-        let weights_slice = unsafe {
-            std::slice::from_raw_parts_mut(aligned_weights_matrix.as_mut_ptr().add(row_start_offset), stride)
-        };
-        let corrections_slice = unsafe {
-            std::slice::from_raw_parts_mut(correction_constants_matrix.as_mut_ptr().add(row_start_offset), stride)
-        };
-
-        for item in items_for_this_row {
-            weights_slice[item.col_idx.0] = item.aligned_weight;
-            corrections_slice[item.col_idx.0] = item.correction_constant;
+        // SAFETY: The logic that creates `WorkItem`s ensures each one corresponds to
+        // a unique (row, col) pair in the final matrices. Therefore, no two parallel
+        // invocations of this closure will ever write to the same memory location.
+        // This makes the `get_unchecked_mut` sound.
+        unsafe {
+            *aligned_weights_matrix.get_unchecked_mut(matrix_offset) = item.aligned_weight;
+            *correction_constants_matrix.get_unchecked_mut(matrix_offset) = item.correction_constant;
         }
     });
 
     // --- FINAL CONSTRUCTION ---
+    // **ERROR FIX**: Convert the typed map back to the primitive type required by the public API.
+    let bim_row_to_matrix_row: Vec<Option<usize>> = bim_row_to_matrix_row_typed
+        .into_iter()
+        .map(|opt_idx| opt_idx.map(|idx| idx.0))
+        .collect();
+
     let bytes_per_snp = (total_people_in_fam as u64 + 3) / 4;
     Ok(PreparationResult {
         aligned_weights_matrix,
@@ -234,12 +234,8 @@ fn index_bim_file(bim_path: &Path) -> Result<(AHashMap<String, Vec<(BimRecord, u
         total_lines += 1;
         let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
         let mut parts = line.split_whitespace();
-        let chr = parts.next();
-        let _id = parts.next();
-        let _cm = parts.next();
-        let pos = parts.next();
-        let a1 = parts.next();
-        let a2 = parts.next();
+        let chr = parts.next(); let _id = parts.next(); let _cm = parts.next();
+        let pos = parts.next(); let a1 = parts.next(); let a2 = parts.next();
 
         if let (Some(chr), Some(pos), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
             let key = format!("{}:{}", chr, pos);
@@ -262,12 +258,9 @@ fn parse_and_group_score_file(score_path: &Path) -> Result<(AHashMap<String, (St
     let effect_allele_idx = find_column_index(&header_fields, "effect_allele")?;
     let other_allele_idx = find_column_index(&header_fields, "other_allele")?;
 
-    let score_name_cols: Vec<(usize, &str)> = header_fields
-        .iter()
-        .enumerate()
+    let score_name_cols: Vec<(usize, &str)> = header_fields.iter().enumerate()
         .filter(|(i, _)| *i != snp_id_idx && *i != effect_allele_idx && *i != other_allele_idx)
-        .map(|(idx, col_name_ref)| (idx, *col_name_ref))
-        .collect();
+        .map(|(idx, name)| (idx, *name)).collect();
 
     let score_names: Vec<String> = score_name_cols.iter().map(|(_, name)| name.to_string()).collect();
     if score_names.is_empty() {
@@ -285,20 +278,17 @@ fn parse_and_group_score_file(score_path: &Path) -> Result<(AHashMap<String, (St
         let other_allele = fields.get(other_allele_idx).ok_or_else(|| PrepError::Parse("Missing other_allele column.".to_string()))?.to_uppercase();
 
         let mut weights = AHashMap::with_capacity(score_names.len());
-        for (col_idx, actual_score_name) in &score_name_cols {
-            let val_str = fields.get(*col_idx).ok_or_else(|| PrepError::Parse(format!("Missing score value for column '{}'", actual_score_name)))?;
-            let weight: f32 = val_str.parse().map_err(|e| PrepError::Parse(format!("Invalid number for '{}': {}", actual_score_name, e)))?;
-            weights.insert(actual_score_name.to_string(), weight);
+        for (col_idx, name) in &score_name_cols {
+            let val_str = fields.get(*col_idx).ok_or_else(|| PrepError::Parse(format!("Missing score value for column '{}'", name)))?;
+            let weight: f32 = val_str.parse().map_err(|e| PrepError::Parse(format!("Invalid number for '{}': {}", name, e)))?;
+            weights.insert(name.to_string(), weight);
         }
-
         score_map.insert(snp_id, (effect_allele, other_allele, weights));
     }
-
     Ok((score_map, score_names))
 }
 
-/// The core reconciliation logic. It iterates through the score map, finds
-/// matching variants in the BIM index, and builds the intermediate plan.
+/// The core reconciliation logic. It creates the intermediate task map.
 fn reconcile_scores_and_genotypes(
     score_map: &AHashMap<String, (String, String, AHashMap<String, f32>)>,
     bim_index: &AHashMap<String, Vec<(BimRecord, usize)>>,
@@ -317,13 +307,12 @@ fn reconcile_scores_and_genotypes(
 
             if let Some((bim_record, bim_row_index)) = matching_bim {
                 required_bim_indices_set.insert(*bim_row_index);
-
-                // This is the core logical decision, encoded in our type-safe enum.
+                
                 // The pivot function always unpacks the dosage of bim_record.allele2.
                 let reconciliation = if effect_allele == &bim_record.allele2 {
-                    Reconciliation::Identity // Effect is A2, use dosage as-is.
+                    Reconciliation::Identity
                 } else {
-                    Reconciliation::Flip // Effect is A1, must flip A2's dosage.
+                    Reconciliation::Flip
                 };
 
                 reconciliation_map.insert(*bim_row_index, ReconciliationTask {
@@ -350,8 +339,6 @@ fn build_bim_to_matrix_map(
     bim_row_to_matrix_row
 }
 
-// ... (Other helper functions like find_column_index, resolve_person_subset, etc. are included here) ...
-// ... (The implementation of these helpers is straightforward and adapted to the new types) ...
 fn find_column_index(header_fields: &[&str], required_col: &str) -> Result<usize, PrepError> {
     header_fields
         .iter()
@@ -423,6 +410,7 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
         format!("{} individuals from the keep file were not found: [{}]", missing_ids.len(), sample_str)
     }
 }
+
 // ========================================================================================
 //                                    ERROR HANDLING
 // ========================================================================================
