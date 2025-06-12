@@ -229,18 +229,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     };
 
-    // The '?' operator propagates any final, unrecoverable error.
-    // On success, the result is wrapped for concurrent sharing.
+    // The '?' operator propagates any final, unrecoverable error from the prep phase.
+    // This now correctly handles the `NoOverlappingVariants` case.
     let prep_result = Arc::new(prep_result?);
 
     eprintln!(
-        "> Preparation complete. Found {} individuals to score and {} overlapping SNPs.",
-        prep_result.num_people_to_score, prep_result.num_reconciled_snps
+        "> Preparation complete. Found {} individuals to score and {} overlapping variants.",
+        prep_result.num_people_to_score, prep_result.num_reconciled_variants
     );
-
-    if prep_result.num_reconciled_snps == 0 {
-        return Err("No overlapping SNPs found. Cannot proceed.".into());
-    }
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
     let mut all_scores =
@@ -289,7 +285,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let bed_path = plink_prefix.with_extension("bed");
     let reader = SnpChunkReader::new(
         &bed_path,
-        prep_result.total_people_in_fam,
+        prep_result.bytes_per_snp, // Pass the pre-calculated value
         prep_result.total_snps_in_bim,
     )?;
 
@@ -371,17 +367,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // The current raw I/O chunk corresponds to a specific range of rows in the .bed file.
         let bed_row_end = bed_row_offset + snps_in_chunk;
 
-        // Using the sorted `required_snp_indices` list from the preparation phase,
-        // we can efficiently find which (if any) of our reconciled SNPs fall
+        // Using the sorted `required_bim_indices` list from the preparation phase,
+        // we can efficiently find which (if any) of our reconciled variants fall
         // within the current raw I/O chunk. `partition_point` performs a binary search.
-        let reconciled_indices_start = prep_result
-            .required_snp_indices
+        let matrix_row_start = prep_result
+            .required_bim_indices
             .partition_point(|&x| x < bed_row_offset);
-        let reconciled_indices_end = prep_result
-            .required_snp_indices
+        let matrix_row_end = prep_result
+            .required_bim_indices
             .partition_point(|&x| x < bed_row_end);
 
-        let num_reconciled_in_chunk = reconciled_indices_end - reconciled_indices_start;
+        let num_reconciled_in_chunk = matrix_row_end - matrix_row_start;
 
         // If this chunk of the .bed file contains no SNPs relevant to our calculation,
         // we can skip it entirely and immediately recycle its I/O buffer.
@@ -400,17 +396,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
 
-        // Calculate the stride to correctly slice the padded weights buffer.
-        // This logic must exactly match the padding logic in `prepare.rs`.
-        const LANE_COUNT: usize = 8;
-        let num_scores = prep_clone.score_names.len();
-        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+        // The stride is pre-calculated and stored in the PreparationResult.
+        let stride = prep_clone.stride;
 
-        // The `interleaved_weights` and `required_snp_indices` vectors are co-sorted.
-        // We use the start and end indices from the binary search on `required_snp_indices`
-        // to derive the correct slice from the weights buffer, for perfect sync.
-        let weights_start = reconciled_indices_start * stride;
-        let weights_end = reconciled_indices_end * stride;
+        // The data matrices and `required_bim_indices` are co-sorted.
+        // We use the start and end indices from the binary search to derive the correct
+        // slice from the matrices, ensuring perfect synchronization.
+        let matrix_slice_start = matrix_row_start * stride;
+        let matrix_slice_end = matrix_row_end * stride;
 
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
@@ -420,18 +413,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
             let weights_for_chunk = prep_clone
-                .interleaved_weights
-                .get(weights_start..weights_end)
-                .ok_or("Internal error: Failed to slice weights buffer.")?;
+                .aligned_weights_matrix
+                .get(matrix_slice_start..matrix_slice_end)
+                .ok_or("Internal error: Failed to slice aligned weights matrix.")?;
+            let corrections_for_chunk = prep_clone
+                .correction_constants_matrix
+                .get(matrix_slice_start..matrix_slice_end)
+                .ok_or("Internal error: Failed to slice correction constants matrix.")?;
 
             batch::run_chunk_computation(
                 buffer_slice,
                 weights_for_chunk,
+                corrections_for_chunk,
                 &prep_clone,
                 &mut partial_scores_buffer,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
-                reconciled_indices_start,
+                matrix_row_start,
                 bed_row_offset,
             )?;
             // On success, bundle the buffers into a `ChunkResult` for safe handling.
@@ -472,10 +470,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         bed_row_offset += snps_in_chunk;
 
         eprintln!(
-            "> Processed chunk: {}/{} SNPs ({:.1}%)",
-            reconciled_indices_end,
-            prep_result.num_reconciled_snps,
-            (reconciled_indices_end as f32 / prep_result.num_reconciled_snps as f32) * 100.0
+            "> Processed chunk: {}/{} variants ({:.1}%)",
+            matrix_row_end,
+            prep_result.num_reconciled_variants,
+            (matrix_row_end as f32 / prep_result.num_reconciled_variants as f32) * 100.0
         );
     }
 

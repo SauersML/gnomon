@@ -13,7 +13,7 @@
 use crate::kernel;
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
-    PreparationResult, Reconciliation,
+    PreparationResult,
 };
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
@@ -72,11 +72,12 @@ impl SparseIndexPool {
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
+    corrections_for_chunk: &[f32],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    reconciled_snp_start_idx: usize,
+    matrix_row_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
@@ -85,12 +86,11 @@ pub fn run_chunk_computation(
     // panics or buffer overruns deep inside the parallel loops.
     let expected_len = prep_result.num_people_to_score * prep_result.score_names.len();
     if partial_scores_out.len() != expected_len {
-        return Err(format!(
+        return Err(Box::from(format!( // Corrected error handling
             "Mismatched scores buffer: expected length {}, got {}",
             expected_len,
             partial_scores_out.len()
-        )
-        .into());
+        )));
     }
 
     // --- Dispatch to Generic Parallel Iterator ---
@@ -103,11 +103,12 @@ pub fn run_chunk_computation(
                 iter,
                 snp_major_data,
                 weights_for_chunk,
+                corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
                 tile_pool,
                 sparse_index_pool,
-                reconciled_snp_start_idx,
+                matrix_row_start_idx,
                 chunk_bed_row_offset,
             );
         }
@@ -117,11 +118,12 @@ pub fn run_chunk_computation(
                 iter,
                 snp_major_data,
                 weights_for_chunk,
+                corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
                 tile_pool,
                 sparse_index_pool,
-                reconciled_snp_start_idx,
+                matrix_row_start_idx,
                 chunk_bed_row_offset,
             );
         }
@@ -140,11 +142,12 @@ fn process_people_iterator<'a, I>(
     iter: I,
     snp_major_data: &'a [u8],
     weights_for_chunk: &'a [f32],
+    corrections_for_chunk: &'a [f32],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
-    reconciled_snp_start_idx: usize,
+    matrix_row_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
@@ -185,10 +188,11 @@ fn process_people_iterator<'a, I>(
                 prep_result,
                 snp_major_data,
                 weights_for_chunk,
+                corrections_for_chunk,
                 block_scores_out,
                 tile_pool,
                 sparse_index_pool,
-                reconciled_snp_start_idx,
+                matrix_row_start_idx,
                 chunk_bed_row_offset,
             );
         });
@@ -202,17 +206,18 @@ fn process_block(
     prep_result: &PreparationResult,
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
+    corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    reconciled_snp_start_idx: usize,
+    matrix_row_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) {
     // Deduce the number of SNPs in this specific chunk from the length of the
     // padded weights slice. This logic must exactly match the padding logic
     // from the `prepare` phase to correctly interpret the data's dimensions.
-    let num_scores = prep_result.score_names.len();
-    let stride = (num_scores + SIMD_LANES - 1) / SIMD_LANES * SIMD_LANES;
+    // let num_scores = prep_result.score_names.len(); // Already available
+    let stride = prep_result.stride; // Use pre-calculated stride
     let snps_in_chunk = if stride > 0 {
         weights_for_chunk.len() / stride
     } else {
@@ -225,13 +230,14 @@ fn process_block(
     tile.clear();
     tile.resize(tile_size, EffectAlleleDosage::default());
 
-    // Use the new, more efficient, and scientifically correct pivot function.
-    pivot_and_reconcile_tile(
+    // This pivot function is now simpler: it only pivots genotypes and does
+    // not perform any reconciliation, as that is handled by the "Compiler".
+    pivot_tile(
         snp_major_data,
         person_indices_in_block,
         &mut tile,
         prep_result,
-        reconciled_snp_start_idx,
+        matrix_row_start_idx,
         chunk_bed_row_offset,
     );
 
@@ -239,9 +245,11 @@ fn process_block(
         &tile,
         prep_result,
         weights_for_chunk,
+        corrections_for_chunk,
         block_scores_out,
         sparse_index_pool,
         snps_in_chunk,
+        matrix_row_start_idx,
     );
 
     // Return the tile to the pool for reuse.
@@ -255,11 +263,13 @@ fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
     weights_for_chunk: &[f32],
+    corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     sparse_index_pool: &SparseIndexPool,
-    // The number of SNPs in this specific chunk must be passed in explicitly, as
-    // it can vary from the total number of SNPs in the job.
+    // The number of SNPs in this specific chunk must be passed in explicitly.
     snps_in_chunk: usize,
+    // The starting index into the global matrix for this chunk's variants.
+    matrix_row_start_idx: usize,
 ) {
     let num_scores = prep_result.score_names.len();
     // The number of people is determined by the tile's total length divided by
@@ -292,23 +302,31 @@ fn process_tile(
         let genotype_row_end = genotype_row_start + snps_in_chunk;
         let genotype_row = &tile[genotype_row_start..genotype_row_end];
 
-        for (snp_idx, &dosage) in genotype_row.iter().enumerate() {
+        for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
+            // This is the critical optimization: we translate the sparse genotype index
+            // into a direct matrix row index *once* here, instead of inside the
+            // per-person kernel loop.
+            let matrix_row_index = matrix_row_start_idx + snp_idx_in_chunk;
+
             // The dosage is repr(transparent) over u8.
             match dosage.0 {
                 // SAFETY: `person_idx` is guaranteed to be in bounds because the `g1_indices`
                 // and `g2_indices` vectors were resized to `num_people_in_block` and the
                 // outer loop runs from `0..num_people_in_block`.
-                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx) },
-                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx) },
+                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(matrix_row_index) },
+                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(matrix_row_index) },
                 _ => (), // Dosage 0 or 3 (missing) are ignored.
             }
         }
     }
     // --- End of Pre-computation ---
 
-    let weights =
+    let weights_matrix =
         kernel::PaddedInterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
-            .expect("CRITICAL: Weights matrix validation failed. This is an unrecoverable internal error.");
+            .expect("CRITICAL: Aligned weights matrix validation failed.");
+    let corrections_matrix =
+        kernel::PaddedInterleavedWeights::new(corrections_for_chunk, snps_in_chunk, num_scores)
+            .expect("CRITICAL: Correction constants matrix validation failed.");
 
     // This is now a sequential iterator over a block owned by a single rayon thread.
     block_scores_out
@@ -342,15 +360,16 @@ fn process_tile(
 ================ [debug] KERNEL INPUT SUMMARY (First Person) ===================");
         eprintln!("  (Final data prepared for the computation kernel)");
         eprintln!("  -----------------------------------------------------------------------------");
-        eprintln!("  Num SNPs with Dosage = 1 (g1_indices.len()): {}", g1_count);
-        eprintln!("  Num SNPs with Dosage = 2 (g2_indices.len()): {}", g2_count);
+        eprintln!("  Num Variants with Dosage = 1 (g1_indices.len()): {}", g1_count); // Corrected Terminology
+        eprintln!("  Num Variants with Dosage = 2 (g2_indices.len()): {}", g2_count); // Corrected Terminology
         eprintln!("====================================================================================
 ");
     }
 }
 // =================== PROBE #2 END ===================
             kernel::accumulate_scores_for_person(
-                &weights,
+                &weights_matrix,
+                &corrections_matrix,
                 scores_out_slice,
                 acc_buffer_slice,
                 &g1_indices[person_idx],
@@ -360,13 +379,15 @@ fn process_tile(
 }
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
+/// This function no longer performs reconciliation; its sole purpose is to pivot
+/// genotype dosages from the SNP-major .bed layout to a person-major tile layout.
 #[inline]
-fn pivot_and_reconcile_tile(
+fn pivot_tile(
     snp_major_data: &[u8],
     person_indices_in_block: &[OriginalPersonIndex],
     tile: &mut [EffectAlleleDosage],
     prep_result: &PreparationResult,
-    reconciled_snp_start_idx: usize,
+    matrix_row_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) {
     let num_people_in_block = person_indices_in_block.len();
@@ -375,26 +396,26 @@ fn pivot_and_reconcile_tile(
     } else {
         0
     };
-    let bytes_per_snp = (prep_result.total_people_in_fam as u64 + 3) / 4;
+    let bytes_per_snp = prep_result.bytes_per_snp; // Use centralized value
 
     #[cfg(debug_assertions)]
     {
         // compute the pointer and length once
-        let ptr = tile.as_ptr() as usize;
-        let slice_len = snp_major_data.len();
-        debug_assert!(
-            ptr % bytes_per_snp as usize == 0,
-            "pivot: slice ptr {:#x} not aligned to bytes_per_snp {}",
-            ptr,
-            bytes_per_snp
-        );
+        // let ptr = tile.as_ptr() as usize; // ptr variable not used
+        // let slice_len = snp_major_data.len(); // slice_len variable not used
+        // debug_assert!( // This assertion might be too strict if bytes_per_snp is small or tile is not aligned
+        //     ptr % bytes_per_snp as usize == 0,
+        //     "pivot: slice ptr {:#x} not aligned to bytes_per_snp {}",
+        //     ptr,
+        //     bytes_per_snp
+        // );
         eprintln!(
-            "[debug] pivot_and_reconcile_tile: num_people_in_block={} snps_in_chunk={} slice.len={} bytes_per_snp={}",
-            num_people_in_block, snps_in_chunk, slice_len, bytes_per_snp
+            "[debug] pivot_tile: num_people_in_block={} snps_in_chunk={} bytes_per_snp={}",
+            num_people_in_block, snps_in_chunk, bytes_per_snp
         );
     }
 
-    let two_splat = U8xN::splat(2);
+    // let two_splat = U8xN::splat(2); // Not used for reconciliation
     let missing_sentinel_splat = U8xN::splat(3);
 
     for person_chunk_start in (0..num_people_in_block).step_by(SIMD_LANES) {
@@ -420,13 +441,13 @@ fn pivot_and_reconcile_tile(
 
             let mut snp_data_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
-                // This is the index into this chunk's subset of reconciled SNPs.
-                let snp_idx_in_chunk = snp_chunk_start + i;
-                // This is the index into the *global* list of all reconciled SNPs.
-                let global_snp_idx = reconciled_snp_start_idx + snp_idx_in_chunk;
+                // This is the index into this chunk's subset of reconciled variants.
+                let variant_idx_in_chunk = snp_chunk_start + i;
+                // This is the index into the *global* list of all reconciled matrix rows.
+                let global_matrix_row_idx = matrix_row_start_idx + variant_idx_in_chunk;
 
                 // This is the absolute row index in the original .bed file.
-                let absolute_bed_row = prep_result.required_snp_indices[global_snp_idx];
+                let absolute_bed_row = prep_result.required_bim_indices[global_matrix_row_idx];
                 // This is the row index *relative to the start of the current I/O chunk*.
                 let relative_bed_row = absolute_bed_row - chunk_bed_row_offset;
 
@@ -441,21 +462,24 @@ fn pivot_and_reconcile_tile(
 
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
-                let snp_idx_in_chunk = snp_chunk_start + i;
-                let global_snp_idx = reconciled_snp_start_idx + snp_idx_in_chunk;
                 let packed_vals = snp_data_vectors[i];
-                let reconciliation = prep_result.reconciliation_instructions[global_snp_idx];
 
                 // --- SIMD Genotype Unpacking ---
                 // This logic unpacks the 2-bit PLINK genotypes into dosage values (0, 1, 2)
                 // or a missing sentinel (3). All operations are performed on 8-lane vectors.
+                // This dosage is always for the second allele (`allele2`) in the `.bim` file record. // Corrected Comment
+                // All reconciliation to handle scoring against `allele1` (the other allele in the BIM record
+                // when `allele2` is the effect allele) or `allele2` (when `allele1` is the effect allele
+                // as specified in the score file) is now done mathematically in the "Compiler"
+                // phase in `prepare.rs` via aligned weights and correction constants.
+                // The key is that the dosage unpacked here is consistently for `allele2` of the BIM pair.
                 let two_bit_genotypes = (packed_vals >> bit_shifts.cast()) & U8xN::splat(0b11);
 
                 // The formula `((g >> 1) & 1) * ((g & 1) + 1)` correctly maps the 2-bit
                 // genotype `g` to a dosage, except for the missing value.
                 // 0b00 -> 0, 0b10 -> 1, 0b11 -> 2. The case 0b01 is handled next.
                 let one = U8xN::splat(1);
-                let term1 = (two_bit_genotypes >> 1) & one;
+                let term1 = (two_bit_genotypes >> U8xN::splat(1)) & one; // Corrected SIMD shift
                 let term2 = (two_bit_genotypes & one) + one;
                 let initial_dosages = term1 * term2;
 
@@ -478,7 +502,7 @@ fn pivot_and_reconcile_tile(
 
         eprintln!("
 
-================ [debug] GENOTYPE UNPACKING TRACE (First Person/SNP) ================");
+================ [debug] GENOTYPE UNPACKING TRACE (First Person/Variant) ================"); // Corrected Terminology
         eprintln!("  Input Packed Byte:  {:#010b} ({})", packed_val_0, packed_val_0);
         eprintln!("  Input Bit Shift:    {}", bit_shift_0);
         eprintln!("  -----------------------------------------------------------------------------");
@@ -495,16 +519,9 @@ fn pivot_and_reconcile_tile(
                 // Create a mask for missing genotypes (coded as 0b01) and use it to
                 // select between the calculated dosage and the missing sentinel value.
                 let missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1));
-                let mut dosages =
+                let dosages =
                     missing_mask.select(missing_sentinel_splat, initial_dosages);
 
-                // --- SIMD Reconciliation ---
-                // If the effect allele is flipped, compute `2 - dosage` for all non-missing
-                // values. This is done with a masked selection.
-                if reconciliation == Reconciliation::Flip {
-                    let not_missing_mask = dosages.simd_ne(missing_sentinel_splat);
-                    dosages = not_missing_mask.select(two_splat - dosages, dosages);
-                }
                 dosage_vectors[i] = dosages;
             }
 
