@@ -464,10 +464,10 @@ fn write_scores_to_file(
     let mut writer = BufWriter::new(file);
     let num_scores = score_names.len();
 
-    // Write the new, more descriptive header.
+    // Write the new, more descriptive, and correctly tab-separated header.
     write!(writer, "#IID")?;
     for name in score_names {
-        write!(writer, "	{}_AVG	{}_MISSING_PCT", name, name)?;
+        write!(writer, "\t{}_AVG\t{}_MISSING_PCT", name, name)?;
     }
     writeln!(writer)?;
 
@@ -503,16 +503,17 @@ fn write_scores_to_file(
             let avg_score = if variants_used > 0 {
                 sum_score / (variants_used as f32)
             } else {
-                0.0 // Or f32::NAN if preferred for 100% missing. 0.0 is simpler.
+                0.0
             };
 
             let missing_pct = if total_variants_for_score > 0 {
                 (missing_count as f32 / total_variants_for_score as f32) * 100.0
             } else {
-                0.0 // Or f32::NAN if a score has no variants.
+                0.0
             };
 
-            write!(&mut line_buffer, "	{:.6}	{:.4}", avg_score, missing_pct).unwrap();
+            // Write the correctly tab-separated data columns.
+            write!(&mut line_buffer, "\t{:.6}\t{:.4}", avg_score, missing_pct).unwrap();
         }
         writeln!(writer, "{}", line_buffer)?;
     }
