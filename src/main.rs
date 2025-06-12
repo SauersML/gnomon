@@ -60,10 +60,6 @@ struct Args {
 // ========================================================================================
 
 /// A message passed from the I/O producer task to the compute dispatcher.
-///
-/// This struct bundles the raw byte buffer from the .bed file with metadata
-/// required for processing, such as the number of valid bytes and the number
-/// of SNPs contained within that chunk.
 struct IoMessage {
     buffer: Vec<u8>,
     bytes_read: usize,
@@ -76,7 +72,6 @@ struct IoMessage {
 struct ChunkResult {
     io_buffer: Vec<u8>,
     partial_scores: Vec<f32>,
-    /// A debug-only flag to ensure the chunk is explicitly committed.
     #[cfg(debug_assertions)]
     committed: Cell<bool>,
 }
@@ -94,59 +89,36 @@ impl ChunkResult {
 
     /// Atomically merges partial scores, sends the I/O buffer back to the
     /// producer, and returns the now-cleared partial scores buffer for reuse.
-    ///
-    /// This `async` method consumes the `ChunkResult`, enforcing a single-use
-    /// policy and guaranteeing correct operational order. It uses `ManuallyDrop`
-    /// to safely move fields out of a type with a `Drop` implementation, which
-    /// is a zero-cost, high-performance pattern.
     #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
     async fn commit(
         self,
         all_scores: &mut [f32],
         empty_tx: &Sender<Vec<u8>>,
     ) -> (Vec<f32>, Result<(), SendError<Vec<u8>>>) {
-        // Wrap `self` in `ManuallyDrop` to prevent its `Drop` impl from running,
-        // which allows us to safely move its fields out.
         let this = std::mem::ManuallyDrop::new(self);
-
-        // SAFETY: Because `this` is a `ManuallyDrop`, the compiler allows us to
-        // move the fields out. We are taking direct responsibility for these
-        // values. The `Drop` guard on the original `self` is correctly
-        // bypassed because we are explicitly handling this `ChunkResult`.
         let io_buffer = unsafe { std::ptr::read(&this.io_buffer) };
         let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
 
-        // --- Core Logic: Merge partial scores into the master array ---
         for (master_score, partial_score) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
             *master_score += partial_score;
         }
 
-        // --- Mark as committed for the Drop guard ---
-        // This is the contract that prevents the Drop guard from panicking if it
-        // were ever to run on a similar object.
         #[cfg(debug_assertions)]
         this.committed.set(true);
 
-        // --- Asynchronously recycle the I/O buffer ---
         let send_result = empty_tx.send(io_buffer).await;
-
-        // --- Prepare the partial_scores buffer for reuse ---
         recycled_scores_buffer.fill(0.0);
-
         (recycled_scores_buffer, send_result)
     }
 }
 
 /// A debug-only RAII guard that panics if a `ChunkResult` is dropped without
-/// being explicitly committed. This prevents silent data loss during development
-/// and refactoring if a code path accidentally discards a result.
+/// being explicitly committed.
 #[cfg(debug_assertions)]
 impl Drop for ChunkResult {
     fn drop(&mut self) {
         if !self.committed.get() {
-            // Check if there were any non-zero scores that were about to be lost.
-            let was_data_loss = self.partial_scores.iter().any(|&score| score != 0.0);
-            if was_data_loss {
+            if self.partial_scores.iter().any(|&score| score != 0.0) {
                 panic!("CRITICAL BUG: A `ChunkResult` with non-zero scores was dropped without being committed. This indicates a silent data loss has occurred.");
             }
         }
@@ -161,54 +133,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
     let plink_prefix = resolve_plink_prefix(&args.input_path)?;
     eprintln!("> Using PLINK prefix: {}", plink_prefix.display());
-
     let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
 
     // --- Phase 2: The Preparation Phase ---
-    // This block attempts to prepare for computation. If it fails with a parsing
-    // error, it falls back to an automatic reformatting attempt for the PGS Catalog format.
     let prep_result = {
-        // The path to the score file to be used, which may be updated by the
-        // fallback logic.
         let mut score_path_to_use = args.score.clone();
-
         eprintln!(
             "> Preparing data using score file: {}",
             score_path_to_use.display()
         );
-
-        // --- First Attempt ---
-        // Try to process the user-provided score file directly.
         match prepare::prepare_for_computation(
             &plink_prefix,
             &score_path_to_use,
             args.keep.as_deref(),
         ) {
-            // Success on the first try means the file was already in the correct format.
             Ok(result) => Ok(result),
-
-            // A recoverable parsing error triggers the fallback logic.
             Err(prep_error @ PrepError::Header(_)) | Err(prep_error @ PrepError::Parse(_)) => {
-                eprintln!(
-                    "\nWarning: Initial parsing failed. Checking for PGS Catalog format..."
-                );
-
-                // --- Reformat Attempt ---
-                // Call the specialist reformatting module.
+                eprintln!("\nWarning: Initial parsing failed. Checking for PGS Catalog format...");
                 match reformat::reformat_pgs_file(&score_path_to_use) {
                     Ok(new_path) => {
-                        eprintln!(
-                            "Success! Created compatible score file at: '{}'",
-                            new_path.display()
-                        );
+                        eprintln!("Success! Created compatible score file at: '{}'", new_path.display());
                         eprintln!("Retrying computation with the new file...\n");
-
-                        // The path to use is now the newly created, valid file.
                         score_path_to_use = new_path;
-
-                        // --- Second (and Final) Attempt ---
-                        // This result (Ok or Err) becomes the final result of the block.
                         prepare::prepare_for_computation(
                             &plink_prefix,
                             &score_path_to_use,
@@ -216,21 +163,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         )
                     }
                     Err(reformat_error) => {
-                        // The reformatting failed; the file is not a convertible format.
                         eprintln!("\nError: Automatic conversion failed: {}", reformat_error);
                         eprintln!("Please ensure the score file is in the gnomon-native format (snp_id, effect_allele, ...) or a valid PGS Catalog format.");
-                        // Return the original, more relevant error.
                         Err(prep_error)
                     }
                 }
             }
-            // An unrecoverable error (e.g., I/O error) is passed through directly.
             Err(other_error) => Err(other_error),
         }
     };
 
-    // The '?' operator propagates any final, unrecoverable error from the prep phase.
-    // This now correctly handles the `NoOverlappingVariants` case.
     let prep_result = Arc::new(prep_result?);
 
     eprintln!(
@@ -241,14 +183,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
     let mut all_scores =
         vec![0.0f32; prep_result.num_people_to_score * prep_result.score_names.len()];
-    let tile_pool_capacity = num_cpus::get().max(1) * 2;
-    let tile_pool = Arc::new(ArrayQueue::new(tile_pool_capacity));
-
-    // The pool for sparse genotype indices is created once and shared safely
-    // across all compute tasks using an Atomic Reference Counter.
+    let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
-    // Determine a safe and effective I/O chunk size.
     const MIN_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
     const MAX_CHUNK_SIZE: u64 = 1 * 1024 * 1024 * 1024;
     let mut sys = System::new_all();
@@ -256,14 +193,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let available_mem = sys.available_memory();
     let chunk_size_bytes = (available_mem / 4).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as usize;
 
-    // --- Pipeline Resource Allocation ---
-    const PIPELINE_DEPTH: usize = 2; // Classic double-buffering
+    const PIPELINE_DEPTH: usize = 2;
     let partial_scores_size = prep_result.num_people_to_score * prep_result.score_names.len();
     let partial_scores_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
     for _ in 0..(PIPELINE_DEPTH + 1) {
-        partial_scores_pool
-            .push(vec![0.0f32; partial_scores_size])
-            .unwrap();
+        partial_scores_pool.push(vec![0.0f32; partial_scores_size]).unwrap();
     }
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<IoMessage>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
@@ -275,73 +209,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     // --- Phase 4: True Concurrent Pipeline Execution ---
-    // Prime the pipeline by sending the empty I/O buffers to the I/O task.
     for _ in 0..PIPELINE_DEPTH {
-        empty_buffer_tx
-            .send(vec![0u8; chunk_size_bytes])
-            .await?;
+        empty_buffer_tx.send(vec![0u8; chunk_size_bytes]).await?;
     }
 
     let bed_path = plink_prefix.with_extension("bed");
     let reader = SnpChunkReader::new(
         &bed_path,
-        prep_result.bytes_per_snp, // Pass the pre-calculated value
+        prep_result.bytes_per_snp,
         prep_result.total_snps_in_bim,
     )?;
 
-    // Spawn the dedicated I/O Producer task.
     let io_handle = tokio::spawn(async move {
-        // The `SnpChunkReader` is stateful and must be explicitly passed into and
-        // returned from the blocking task on each iteration to update its cursor.
-        // We re-bind `reader` as mutable to allow this update cycle.
         let mut reader = reader;
-
-        // The I/O task owns the reader and the channels.
         while let Some(mut buffer) = empty_buffer_rx.recv().await {
-            // The synchronous read_chunk call MUST be wrapped in spawn_blocking
-            // to prevent it from blocking the async I/O task on a page fault.
             let read_result = task::spawn_blocking(move || {
                 let bytes_read = reader.read_chunk(&mut buffer)?;
                 let snps_in_chunk = reader.snps_in_bytes(bytes_read);
-                // Return ownership of the reader and buffer for the next iteration.
                 Ok::<_, io::Error>((reader, buffer, bytes_read, snps_in_chunk))
             })
-            .await
-            .unwrap(); // Panicking here is acceptable; a JoinError is unrecoverable.
+            .await.unwrap();
 
             match read_result {
-                // `reader` is destructured here to regain ownership.
-                // EOF is reached. The I/O task's job is complete. We break the loop,
-                // allowing the `reader` and `buffer` for this final iteration to be
-                // dropped, which is the correct behavior during shutdown.
                 Ok((_, _, 0, _)) => break,
                 Ok((new_reader, buffer, bytes_read, snps_in_chunk)) => {
                     reader = new_reader;
-                    #[cfg(debug_assertions)]
-                    {
-                        let bps = reader.bytes_per_snp() as usize;
-                        // if this ever trips in debug, you know you mis-aligned
-                        debug_assert!(
-                            bytes_read % bps == 0,
-                            "read_chunk: {} bytes_read is not a multiple of bytes_per_snp ({})",
-                            bytes_read, bps
-                        );
-                        // a bit more context
-                        eprintln!(
-                            "[debug] chunk_offset={} bytes_read={} snps_in_chunk={} bytes_per_snp={}",
-                            reader.cursor - bytes_read as u64, bytes_read, snps_in_chunk, bps
-                        );
-                    }
-                    if full_buffer_tx
-                        .send(IoMessage {
-                            buffer,
-                            bytes_read,
-                            snps_in_chunk,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break; // Consumer has disconnected.
+                    if full_buffer_tx.send(IoMessage { buffer, bytes_read, snps_in_chunk }).await.is_err() {
+                        break;
                     }
                 }
                 Err(e) => {
@@ -350,77 +244,46 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
             }
         }
-        // The reader is dropped here when the task finishes.
     });
 
-    // The main task becomes the Consumer and Compute Dispatcher.
-    // We track the offset into the raw .bed file and use it to find the corresponding
-    // range of reconciled SNPs for each chunk.
     let mut bed_row_offset: usize = 0;
 
-    while let Some(IoMessage {
-        buffer: full_buffer,
-        bytes_read,
-        snps_in_chunk,
-    }) = full_buffer_rx.recv().await
-    {
-        // The current raw I/O chunk corresponds to a specific range of rows in the .bed file.
+    while let Some(IoMessage { buffer: full_buffer, bytes_read, snps_in_chunk }) = full_buffer_rx.recv().await {
         let bed_row_end = bed_row_offset + snps_in_chunk;
 
-        // Using the sorted `required_bim_indices` list from the preparation phase,
-        // we can efficiently find which (if any) of our reconciled variants fall
-        // within the current raw I/O chunk. `partition_point` performs a binary search.
-        let matrix_row_start = prep_result
-            .required_bim_indices
-            .partition_point(|&x| x < bed_row_offset);
-        let matrix_row_end = prep_result
-            .required_bim_indices
-            .partition_point(|&x| x < bed_row_end);
+        let matrix_row_start = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_offset);
+        let matrix_row_end = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_end);
 
-        let num_reconciled_in_chunk = matrix_row_end - matrix_row_start;
-
-        // If this chunk of the .bed file contains no SNPs relevant to our calculation,
-        // we can skip it entirely and immediately recycle its I/O buffer.
-        if num_reconciled_in_chunk == 0 {
-            if empty_buffer_tx.send(full_buffer).await.is_err() {
-                // Producer has shut down, which is fine. The pipeline is draining.
-                break;
-            }
+        if matrix_row_end == matrix_row_start {
+            if empty_buffer_tx.send(full_buffer).await.is_err() { break; }
             bed_row_offset += snps_in_chunk;
             continue;
         }
 
-        // --- Prepare resources for the compute task ---
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_scores_pool_clone = Arc::clone(&partial_scores_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-
-        // The stride is pre-calculated and stored in the PreparationResult.
         let stride = prep_clone.stride;
-
-        // The data matrices and `required_bim_indices` are co-sorted.
-        // We use the start and end indices from the binary search to derive the correct
-        // slice from the matrices, ensuring perfect synchronization.
         let matrix_slice_start = matrix_row_start * stride;
         let matrix_slice_end = matrix_row_end * stride;
-
         let mut partial_scores_buffer = partial_scores_pool_clone.pop().unwrap();
 
-        // --- Dispatch the computation task ---
-        // The compute task is given ownership of the buffers and will return them
-        // bundled in a `ChunkResult`, which enforces correct handling.
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
+            
+            // This is the primary change: slicing both matrices using the new contract.
             let weights_for_chunk = prep_clone
                 .aligned_weights_matrix
                 .get(matrix_slice_start..matrix_slice_end)
-                .ok_or("Internal error: Failed to slice aligned weights matrix.")?;
+                .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Internal error: Failed to slice aligned weights matrix."))?;
+                
             let corrections_for_chunk = prep_clone
                 .correction_constants_matrix
                 .get(matrix_slice_start..matrix_slice_end)
-                .ok_or("Internal error: Failed to slice correction constants matrix.")?;
+                .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("Internal error: Failed to slice correction constants matrix."))?;
 
+            // Dispatch to the updated `run_chunk_computation` with both matrices.
             batch::run_chunk_computation(
                 buffer_slice,
                 weights_for_chunk,
@@ -432,41 +295,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 matrix_row_start,
                 bed_row_offset,
             )?;
-            // On success, bundle the buffers into a `ChunkResult` for safe handling.
+
             let result = ChunkResult::new(full_buffer, partial_scores_buffer);
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
 
-        // --- Await and Commit the Result ---
-        // This is the critical section. We await the result, and if successful,
-        // we call `.commit()`, which atomically merges scores and recycles buffers.
         let chunk_result = match compute_handle.await? {
             Ok(result) => result,
-            Err(e) => {
-                // A true error in the compute task. Propagate it.
-                eprintln!("Compute task failed: {:?}", e);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
-        // The `commit` call handles the score merge, I/O buffer return, and
-        // gives back the partial scores buffer, already zeroed for reuse.
-        let (recycled_scores_buffer, send_result) = chunk_result
-            .commit(&mut all_scores, &empty_buffer_tx)
-            .await;
-
-        // Return the recycled buffer to the pool for the next iteration.
+        let (recycled_scores_buffer, send_result) = chunk_result.commit(&mut all_scores, &empty_buffer_tx).await;
         partial_scores_pool_clone.push(recycled_scores_buffer).unwrap();
 
-        // If sending the I/O buffer failed, the producer has terminated,
-        // so we should stop processing new chunks.
         if send_result.is_err() {
-            #[cfg(debug_assertions)]
-            eprintln!("[debug] Consumer breaking: I/O task has terminated.");
             break;
         }
 
-        // Advance the raw file offset for the next chunk.
         bed_row_offset += snps_in_chunk;
 
         eprintln!(
@@ -477,7 +322,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         );
     }
 
-    // Await the I/O task to make sure it has finished.
     io_handle.await?;
     eprintln!("> Computation finished.");
 
@@ -488,10 +332,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             s.push(".sscore");
             Ok(s)
         }
-        None => Err(format!(
+        None => Err(Box::<dyn Error + Send + Sync>::from(format!(
             "Could not determine a base name from score file path '{}'.",
             args.score.display()
-        )),
+        ))),
     }?;
     let out_path = output_dir.join(&out_filename);
     eprintln!(
@@ -507,10 +351,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &all_scores,
     )?;
 
-    eprintln!(
-        "\nSuccess! Total execution time: {:.2?}",
-        start_time.elapsed()
-    );
+    eprintln!("\nSuccess! Total execution time: {:.2?}", start_time.elapsed());
 
     Ok(())
 }
@@ -520,58 +361,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 // ========================================================================================
 
 /// Intelligently resolves the user-provided input path to a PLINK prefix.
-///
-/// This function is designed to be flexible and supports three common ways of
-/// specifying a PLINK fileset:
-/// 1. By providing a path to the directory containing a single `.bed` file.
-/// 2. By providing a direct path to the `.bed` file itself.
-/// 3. By providing the fileset's prefix (e.g., `data/my_plink_files`), which
-///    does not exist as a file or directory itself.
-fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, String> {
-    // Case 1: The path is a directory. Search for a unique .bed file inside.
+fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     if path.is_dir() {
-        let bed_files: Vec<PathBuf> = fs::read_dir(path)
-            .map_err(|e| format!("Could not read directory '{}': {}", path.display(), e))?
+        let bed_files: Vec<PathBuf> = fs::read_dir(path)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|p| p.extension().map_or(false, |ext| ext == "bed"))
             .collect();
-
         match bed_files.len() {
-            0 => Err(format!("No .bed file found in the directory '{}'.", path.display())),
+            0 => Err(format!("No .bed file found in the directory '{}'.", path.display()).into()),
             1 => Ok(bed_files[0].with_extension("")),
-            _ => Err(format!(
-                "Ambiguous input: multiple .bed files found in directory '{}': {:?}",
-                path.display(),
-                bed_files
-            )),
+            _ => Err(format!("Ambiguous input: multiple .bed files found in directory '{}'.", path.display()).into()),
         }
-    }
-    // Case 2: The path is a direct file path. Check if it's a .bed file.
-    else if path.is_file() {
+    } else if path.is_file() {
         if path.extension().map_or(false, |ext| ext == "bed") {
             Ok(path.with_extension(""))
         } else {
-            // If it's a file but not a .bed, this is an explicit error, as the user
-            // pointed to a specific, but incorrect, file type.
-            Err(format!(
-                "Input file '{}' must have a .bed extension.",
-                path.display()
-            ))
+            Err(format!("Input file '{}' must have a .bed extension.", path.display()).into())
         }
-    }
-    // Case 3: The path does not exist as a file or directory. Treat it as a prefix string.
-    // We construct the expected .bed file path and check for its existence.
-    else {
+    } else {
         let bed_path_from_prefix = path.with_extension("bed");
         if bed_path_from_prefix.is_file() {
             Ok(path.to_path_buf())
         } else {
-            // If all attempts fail, return a comprehensive error message.
-            Err(format!(
-                "Input '{}' is not a valid directory, .bed file, or PLINK prefix.",
-                path.display()
-            ))
+            Err(format!("Input '{}' is not a valid directory, .bed file, or PLINK prefix.", path.display()).into())
         }
     }
 }
@@ -587,30 +400,24 @@ fn write_scores_to_file(
     let mut writer = BufWriter::new(file);
     let num_scores = score_names.len();
 
-    // --- Write Header ---
     write!(writer, "#IID")?;
     for name in score_names {
         write!(writer, "\t{}", name)?;
     }
     writeln!(writer)?;
 
-    // --- Write Data Rows ---
-    let line_buffer_capacity = person_iids.get(0).map_or(128, |s| s.len() + num_scores * 12);
-    let mut line_buffer = String::with_capacity(line_buffer_capacity);
+    let mut line_buffer = String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 12));
     let mut score_chunks = scores.chunks_exact(num_scores);
 
     for iid in person_iids {
         let person_scores = score_chunks.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write. This is a critical internal error.")
+            io::Error::new(io::ErrorKind::InvalidData, "Mismatched number of persons and score rows during final write.")
         })?;
-
         line_buffer.clear();
         write!(&mut line_buffer, "{}", iid).unwrap();
-
         for &score in person_scores {
-            write!(&mut line_buffer, "\t{}", score).unwrap();
+            write!(&mut line_buffer, "\t{:.6}", score).unwrap();
         }
-
         writeln!(writer, "{}", line_buffer)?;
     }
 
