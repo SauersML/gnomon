@@ -293,30 +293,60 @@ fn parse_and_group_score_file(score_path: &Path) -> Result<(AHashMap<String, Vec
     Ok((score_map, score_names))
 }
 
+/// The core reconciliation engine.
 fn reconcile_scores_and_genotypes(
-    score_map: &AHashMap<String, (String, String, AHashMap<String, f32>)>,
+    score_map: &AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>>,
     bim_index: &AHashMap<String, Vec<(BimRecord, usize)>>,
 ) -> Result<(AHashMap<usize, ReconciliationTask>, BTreeSet<usize>), PrepError> {
     let mut reconciliation_map = AHashMap::new();
     let mut required_bim_indices_set = BTreeSet::new();
 
-    for (snp_id, (effect_allele, other_allele, weights)) in score_map {
+    for (snp_id, score_lines) in score_map {
+        // This outer loop now iterates over chromosomal positions.
         if let Some(bim_records) = bim_index.get(snp_id) {
-            let score_alleles: AHashSet<&str> = [effect_allele.as_str(), other_allele.as_str()].iter().copied().collect();
-            let matching_bim = bim_records.iter().find(|(bim_record, _)| {
-                let bim_alleles: AHashSet<&str> = [bim_record.allele1.as_str(), bim_record.allele2.as_str()].iter().copied().collect();
-                score_alleles == bim_alleles
-            });
+            // This inner loop iterates over each scoring rule defined at this position.
+            for (effect_allele, other_allele, weights) in score_lines {
+                let score_alleles: AHashSet<&str> = [effect_allele.as_str(), other_allele.as_str()].iter().copied().collect();
 
-            if let Some((bim_record, bim_row_index)) = matching_bim {
-                required_bim_indices_set.insert(*bim_row_index);
-                
-                let reconciliation = if effect_allele == &bim_record.allele2 {
-                    Reconciliation::Identity
+                // --- STAGE 1: Attempt a perfect match (the fast path) ---
+                let perfect_match = bim_records.iter().find(|(bim_record, _)| {
+                    let bim_alleles: AHashSet<&str> = [bim_record.allele1.as_str(), bim_record.allele2.as_str()].iter().copied().collect();
+                    score_alleles == bim_alleles
+                });
+
+                if let Some((bim_record, bim_row_index)) = perfect_match {
+                    required_bim_indices_set.insert(*bim_row_index);
+                    
+                    let reconciliation = if effect_allele == &bim_record.allele2 {
+                        Reconciliation::Identity
+                    } else {
+                        Reconciliation::Flip
+                    };
+                    
+                    // MASSIVE ERROR: If multiple score lines map to the same bim_row, this will overwrite.
+                    reconciliation_map.insert(*bim_row_index, ReconciliationTask { reconciliation, weights: weights.clone() });
                 } else {
-                    Reconciliation::Flip
-                };
-                reconciliation_map.insert(*bim_row_index, ReconciliationTask { reconciliation, weights: weights.clone() });
+                    // --- STAGE 2: Diagnose Ambiguity (the error path) ---
+                    // A perfect match failed. We must diagnose why.
+                    // Check if the effect allele exists in any BIM record for this position.
+                    let effect_allele_exists = bim_records.iter().any(|(bim_record, _)| {
+                        effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                    });
+                    
+                    if effect_allele_exists {
+                        // This is the specific, fatal ambiguity we must catch.
+                        let available_pairs: String = bim_records.iter()
+                            .map(|(r, _)| format!("{{{}, {}}}", r.allele1, r.allele2))
+                            .collect::<Vec<_>>().join(", ");
+                            
+                        return Err(PrepError::Parse(format!(
+                            "FATAL AMBIGUITY for variant '{}': The score file specifies a scoring context for alleles {{{}, {}}} with effect allele '{}'. However, the genotype data (.bim file) does not contain a record for this exact pair. Instead, it contains records for: [{}]. Gnomon cannot proceed because it is scientifically ambiguous which baseline allele should be used. Please ensure your score file's other_allele matches a pair in the BIM file.",
+                            snp_id, effect_allele, other_allele, effect_allele, available_pairs
+                        )));
+                    }
+                    // If the effect allele doesn't exist at all, we silently skip,
+                    // as this is a simple non-overlapping variant.
+                }
             }
         }
     }
