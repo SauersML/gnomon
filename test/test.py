@@ -216,94 +216,94 @@ def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
 
 
 def validate_results(pgs_id: str, results: list):
-    """Loads successful tool outputs, merges them, and calculates correlation and differences."""
-    print_header(f"VALIDATION & COMPARISON FOR {pgs_id}", char='-')
+    """Loads successful tool outputs, merges them, and calculates correlation and differences."""
+    print_header(f"VALIDATION & COMPARISON FOR {pgs_id}", char='-')
 
-    # Define the expected output paths for each tool.
-    # This dictionary maps the tool name to its actual output file path.
-    all_tool_paths = {
-        # Gnomon's output path is derived from the input PLINK prefix, not the PGS ID.
-        'gnomon': ORIGINAL_PLINK_PREFIX.with_suffix('.sscore'),
-        'plink1': CI_WORKDIR / f"plink1_{pgs_id}.profile",
-        'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
-    }
+    # Define the expected output paths for each tool.
+    # This dictionary maps the tool name to its actual output file path.
+    all_tool_paths = {
+        # Gnomon's output path is derived from the input PLINK prefix, not the PGS ID.
+        'gnomon': ORIGINAL_PLINK_PREFIX.with_suffix('.sscore'),
+        'plink1': CI_WORKDIR / f"plink1_{pgs_id}.profile",
+        'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
+    }
 
-    successful_tools = {}
-    for res in results:
-        if res['success']:
-            tool_name = res['tool'].split('_')[0]
-            if tool_name in all_tool_paths:
-                successful_tools[tool_name] = all_tool_paths[tool_name]
+    successful_tools = {}
+    for res in results:
+        if res['success']:
+            tool_name = res['tool'].split('_')[0]
+            if tool_name in all_tool_paths:
+                successful_tools[tool_name] = all_tool_paths[tool_name]
 
-    if len(successful_tools) < 2:
-        print("Fewer than two tools succeeded, cannot perform comparison.", flush=True)
-        return
+    if len(successful_tools) < 2:
+        print("Fewer than two tools succeeded, cannot perform comparison.", flush=True)
+        return
 
-    print("Comparing scores from successful tools:", list(successful_tools.keys()), flush=True)
-    
-    data_frames = []
-    for tool, path in successful_tools.items():
-        if not path.exists():
-            print(f"  > WARNING: Output file for {tool} not found at {path}", flush=True)
-            continue
-        
-        try:
-            df = None
-            if tool == 'gnomon':
-                # Gnomon produces a tab-separated file with an _AVG score column.
-                # The score name in the column is derived from the pgs_id.
-                df_raw = pd.read_csv(path, sep='\t')
-                score_name_from_pgs = pgs_id.split('_')[0]
-                score_col = f"{score_name_from_pgs}_AVG"
-                if score_col not in df_raw.columns:
-                    score_col_from_header = next((c for c in df_raw.columns if c.endswith('_AVG')), None)
-                    if not score_col_from_header:
-                        raise KeyError(f"Expected score column ending in '_AVG' not found.")
-                    score_col = score_col_from_header
-                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
+    print("Comparing scores from successful tools:", list(successful_tools.keys()), flush=True)
+    
+    data_frames = []
+    for tool, path in successful_tools.items():
+        if not path.exists():
+            print(f"  > WARNING: Output file for {tool} not found at {path}", flush=True)
+            continue
+        
+        try:
+            df = None
+            if tool == 'gnomon':
+                # Gnomon produces a tab-separated file with an _AVG score column.
+                # The score name in the column is derived from the pgs_id.
+                df_raw = pd.read_csv(path, sep='\t')
+                score_name_from_pgs = pgs_id.split('_')[0]
+                score_col = f"{score_name_from_pgs}_AVG"
+                if score_col not in df_raw.columns:
+                    score_col_from_header = next((c for c in df_raw.columns if c.endswith('_AVG')), None)
+                    if not score_col_from_header:
+                        raise KeyError(f"Expected score column ending in '_AVG' not found.")
+                    score_col = score_col_from_header
+                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
 
-            elif tool == 'plink1':
-                # Plink1 produces a whitespace-separated .profile file.
-                df_raw = pd.read_csv(path, sep='\s+')
-                df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool}'})
+            elif tool == 'plink1':
+                # Plink1 produces a whitespace-separated .profile file.
+                df_raw = pd.read_csv(path, sep='\s+')
+                df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool}'})
 
-            elif tool == 'plink2':
-                # Plink2 produces a whitespace-separated .sscore file.
-                # The score column name can vary but contains "SCORE".
-                df_raw = pd.read_csv(path, sep='\s+')
-                score_col = next((col for col in df_raw.columns if 'SCORE' in col), None)
-                if not score_col:
-                    raise KeyError("Could not find a score column in plink2 output.")
-                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
+            elif tool == 'plink2':
+                # Plink2 produces a whitespace-separated .sscore file.
+                # The score column name can vary but contains "SCORE".
+                df_raw = pd.read_csv(path, sep='\s+')
+                score_col = next((col for col in df_raw.columns if 'SCORE' in col), None)
+                if not score_col:
+                    raise KeyError("Could not find a score column in plink2 output.")
+                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
 
-            if df is not None:
-                data_frames.append(df)
+            if df is not None:
+                data_frames.append(df)
 
-        except Exception as e:
-            print(f"  > ERROR: Failed to parse output for {tool} from {path}: {e}", flush=True)
+        except Exception as e:
+            print(f"  > ERROR: Failed to parse output for {tool} from {path}: {e}", flush=True)
 
-    if len(data_frames) < 2:
-        print("Could not load enough valid dataframes for comparison.", flush=True)
-        return
+    if len(data_frames) < 2:
+        print("Could not load enough valid dataframes for comparison.", flush=True)
+        return
 
-    # Merge all successfully loaded dataframes at once for robustness.
-    merged_df = data_frames[0]
-    for df_to_merge in data_frames[1:]:
-        merged_df = pd.merge(merged_df, df_to_merge, on='IID')
-    
-    if merged_df.empty or merged_df.shape[1] < 3:
-        print("Could not merge results for comparison.", flush=True)
-        return
-        
-    score_cols = [col for col in merged_df.columns if 'SCORE' in col]
-    print_debug_header("Score Correlation Matrix")
-    print(merged_df[score_cols].corr(), flush=True)
+    # Merge all successfully loaded dataframes at once for robustness.
+    merged_df = data_frames[0]
+    for df_to_merge in data_frames[1:]:
+        merged_df = pd.merge(merged_df, df_to_merge, on='IID')
+    
+    if merged_df.empty or merged_df.shape[1] < 3:
+        print("Could not merge results for comparison.", flush=True)
+        return
+        
+    score_cols = [col for col in merged_df.columns if 'SCORE' in col]
+    print_debug_header("Score Correlation Matrix")
+    print(merged_df[score_cols].corr(), flush=True)
 
-    print_debug_header("Mean Absolute Difference")
-    from itertools import combinations
-    for col1, col2 in combinations(score_cols, 2):
-        abs_diff = (merged_df[col1] - merged_df[col2]).abs().mean()
-        print(f"  > {col1} vs {col2}: {abs_diff:.6f}", flush=True)
+    print_debug_header("Mean Absolute Difference")
+    from itertools import combinations
+    for col1, col2 in combinations(score_cols, 2):
+        abs_diff = (merged_df[col1] - merged_df[col2]).abs().mean()
+        print(f"  > {col1} vs {col2}: {abs_diff:.6f}", flush=True)
 
 
 def main():
