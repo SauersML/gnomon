@@ -170,7 +170,7 @@ impl HeaderMapping {
     /// Parse a data row and write the gnomon-native line if valid.
     #[inline]
     fn write_row(&self, row: &str, w: &mut BufWriter<File>) -> Result<(), ReformatError> {
-        let mut iter = row.split('\t');
+        let iter = row.split('\t');
         let mut chr = None;
         let mut pos = None;
         let mut ea  = None;
