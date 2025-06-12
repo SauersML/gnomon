@@ -134,56 +134,54 @@ pub fn prepare_for_computation(
     let mut work_items: Vec<WorkItem> = final_score_map
         .par_iter()
         .flat_map(|(snp_id, score_lines)| {
-            let mut work_for_position = Vec::new();
-            if let Some(bim_records) = bim_index.get(snp_id) {
-                for (effect_allele, other_allele, weights) in score_lines {
-                    let score_alleles: AHashSet<&str> =
-                        [effect_allele.as_str(), other_allele.as_str()]
-                            .iter()
-                            .copied()
-                            .collect();
+            let mut work_for_position = Vec::new();
+            if let Some(bim_records) = bim_index.get(snp_id) {
+                for (effect_allele, _other_allele, weights) in score_lines {
+                    // Find the first BIM record for this chr:pos that contains the score's effect allele.
+                    let usable_match = bim_records.iter().find(|(bim_record, _)| {
+                        effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                    });
 
-                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
-                        let bim_alleles: AHashSet<&str> =
-                            [bim_record.allele1.as_str(), bim_record.allele2.as_str()]
-                                .iter()
-                                .copied()
-                                .collect();
-                        score_alleles == bim_alleles
-                    });
+                    if let Some((bim_record, bim_row_index)) = usable_match {
+                        // The `bim_row_to_matrix_row_typed` lookup should always succeed here,
+                        // because the `discover_required_bim_indices` pass has already
+                        // identified this `bim_row_index` as being required.
+                        if let Some(matrix_row) = bim_row_to_matrix_row_typed[*bim_row_index] {
+                            // The dosage extracted by the kernel is always for `allele2` in the BIM file.
+                            // Therefore, if the score's effect allele is `allele2`, the weight is used as-is.
+                            // If the score's effect allele is `allele1`, we must flip the sign of the weight
+                            // and add a correction constant.
+                            let reconciliation = if effect_allele == &bim_record.allele2 {
+                                Reconciliation::Identity
+                            } else {
+                                Reconciliation::Flip
+                            };
 
-                    if let Some((bim_record, bim_row_index)) = perfect_match {
-                        let matrix_row = bim_row_to_matrix_row_typed[*bim_row_index]
-                            .expect("BIM to matrix map should contain all required indices");
-
-                        let reconciliation = if effect_allele == &bim_record.allele2 {
-                            Reconciliation::Identity
-                        } else {
-                            Reconciliation::Flip
-                        };
-
-                        // THIS IS THE CORE BUG FIX:
-                        // Iterate over the weights for *this specific score line* and generate
-                        // a WorkItem for each. No data is ever overwritten.
-                        for (score_name, weight) in weights {
-                            let col_idx = score_name_to_col_index[score_name.as_str()];
-                            let (aligned_weight, correction_constant) =
-                                match reconciliation {
-                                    Reconciliation::Identity => (*weight, 0.0),
-                                    Reconciliation::Flip => (-(*weight), 2.0 * *weight),
-                                };
-                            work_for_position.push(WorkItem {
-                                matrix_row,
-                                col_idx,
-                                aligned_weight,
-                                correction_constant,
-                            });
-                        }
-                    }
-                }
-            }
-            work_for_position
-        })
+                            // Iterate over the weights for *this specific score line* and generate
+                            // a WorkItem for each. No data is ever overwritten.
+                            for (score_name, weight) in weights {
+                                if let Some(&col_idx) =
+                                    score_name_to_col_index.get(score_name.as_str())
+                                {
+                                    let (aligned_weight, correction_constant) =
+                                        match reconciliation {
+                                            Reconciliation::Identity => (*weight, 0.0),
+                                            Reconciliation::Flip => (-(*weight), 2.0 * *weight),
+                                        };
+                                    work_for_position.push(WorkItem {
+                                        matrix_row,
+                                        col_idx,
+                                        aligned_weight,
+                                        correction_constant,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            work_for_position
+        })
         .collect();
 
     // --- STAGE 4: PARALLEL SORT ---
