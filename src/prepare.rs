@@ -190,6 +190,7 @@ pub fn prepare_for_computation(
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
 
+/// A robust parser for `.bim` files.
 fn index_bim_file(bim_path: &Path) -> Result<(AHashMap<String, Vec<(BimRecord, usize)>>, usize), PrepError> {
     let file = File::open(bim_path).map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
     let reader = BufReader::new(file);
@@ -198,11 +199,19 @@ fn index_bim_file(bim_path: &Path) -> Result<(AHashMap<String, Vec<(BimRecord, u
     for (i, line_result) in reader.lines().enumerate() {
         total_lines += 1;
         let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
+        // BIM files are whitespace-delimited, which is different from score files.
         let mut parts = line.split_whitespace();
-        let (chr, pos, a1, a2) = (parts.next(), parts.nth(2), parts.next(), parts.next());
+        let chr = parts.next();
+        let _id = parts.next();
+        let _cm = parts.next();
+        let pos = parts.next();
+        let a1 = parts.next();
+        let a2 = parts.next();
+
         if let (Some(chr), Some(pos), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
             let key = format!("{}:{}", chr, pos);
-            let record = BimRecord { allele1: a1.to_uppercase(), allele2: a2.to_uppercase() };
+            // Alleles are now stored as case-sensitive Strings.
+            let record = BimRecord { allele1: a1.to_string(), allele2: a2.to_string() };
             bim_index.entry(key).or_insert_with(Vec::new).push((record, i));
         }
     }
