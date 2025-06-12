@@ -315,7 +315,8 @@ fn parse_and_group_score_file(
     }
 
     let score_names: Vec<String> = header_parts[3..].iter().map(|s| s.to_string()).collect();
-    let mut score_map = AHashMap::new();
+    let mut score_map: AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>> =
+        AHashMap::new();
 
     for line_result in reader.lines() {
         let line = line_result.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
