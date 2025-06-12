@@ -261,15 +261,15 @@ fn process_tile(
         let genotype_row = &tile[genotype_row_start..genotype_row_end];
 
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
-            // This is the critical coordinate transformation. It translates the local
-            // index within the chunk to a global index into the master matrices.
-            // This logic is essential for correctness. DO NOT CHANGE.
-            let matrix_row_index = matrix_row_start_idx + snp_idx_in_chunk;
-
+            // The kernel operates in the local coordinate space of the current chunk.
+            // We pass the local `snp_idx_in_chunk` directly, which is a valid
+            // index into the `weights_for_chunk` and `corrections_for_chunk` slices
+            // that the kernel receives. The global offset is handled by the orchestrator
+            // in main.rs when it creates the slices for this chunk.
             match dosage.0 {
                 // SAFETY: `person_idx` is guaranteed to be in bounds by the outer loop.
-                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(matrix_row_index) },
-                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(matrix_row_index) },
+                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
+                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 _ => (), // Dosage 0 or 3 (missing) are ignored.
             }
         }
