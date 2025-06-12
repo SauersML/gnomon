@@ -36,6 +36,9 @@ const LANE_COUNT: usize = 8;
 // ========================================================================================
 //                     TYPE-DRIVEN DOMAIN MODEL
 // ========================================================================================
+// These types encode the logic of our domain into the compiler, making invalid
+// states unrepresentable and preventing entire classes of bugs. They have zero
+// runtime cost.
 
 /// Represents the logical outcome of matching the score file's effect allele
 /// against the .bim file's allele orientation. This is pure logic, not math.
@@ -133,10 +136,7 @@ pub fn prepare_for_computation(
         .flat_map(|(bim_row_index, task)| {
             let matrix_row = bim_row_to_matrix_row_typed[*bim_row_index].unwrap();
             
-            // This closure returns a Vec, which implements IntoParallelIterator.
-            // This fixes the E0277/E0507 errors.
             task.weights.iter().map(|(score_name, weight)| {
-                // We capture `score_name_to_col_index` by reference, avoiding the move.
                 let col_idx = score_name_to_col_index[score_name.as_str()];
                 
                 let (aligned_weight, correction_constant) = match task.reconciliation {
@@ -155,8 +155,18 @@ pub fn prepare_for_computation(
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
 
-    // This is a fully parallel write pass. It iterates over the pre-compiled work items.
-    // This fixes the E0596 mutable borrow error by design.
+    // **ERROR FIX**: To solve the E0596 borrow error, we must use raw pointers
+    // that are captured by the closure. To solve the original Send/Sync error,
+    // we wrap these pointers in a simple struct and implement `Send` and `Sync`
+    // for it, explicitly telling the compiler our logic is sound.
+    #[derive(Clone, Copy)]
+    struct SafePtr(*mut f32);
+    unsafe impl Send for SafePtr {}
+    unsafe impl Sync for SafePtr {}
+
+    let weights_ptr = SafePtr(aligned_weights_matrix.as_mut_ptr());
+    let corrections_ptr = SafePtr(correction_constants_matrix.as_mut_ptr());
+
     work_items.par_iter().for_each(|item| {
         let matrix_offset = item.matrix_row.0 * stride + item.col_idx.0;
         
@@ -164,8 +174,8 @@ pub fn prepare_for_computation(
         // a unique (row, col) cell. No two parallel invocations of this closure
         // will ever write to the same memory location, making this race-free.
         unsafe {
-            *aligned_weights_matrix.get_unchecked_mut(matrix_offset) = item.aligned_weight;
-            *correction_constants_matrix.get_unchecked_mut(matrix_offset) = item.correction_constant;
+            *weights_ptr.0.add(matrix_offset) = item.aligned_weight;
+            *corrections_ptr.0.add(matrix_offset) = item.correction_constant;
         }
     });
 
@@ -273,7 +283,6 @@ fn reconcile_scores_and_genotypes(
             if let Some((bim_record, bim_row_index)) = matching_bim {
                 required_bim_indices_set.insert(*bim_row_index);
                 
-                // The pivot function always unpacks the dosage of bim_record.allele2.
                 let reconciliation = if effect_allele == &bim_record.allele2 {
                     Reconciliation::Identity
                 } else {
