@@ -31,6 +31,7 @@ use std::fs::File;
 use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
 use cache_size;
+use sysinfo::{MemoryRefreshKind, RefreshKind};
 
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
@@ -226,7 +227,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
-    // --- Start: Dynamic Chunk Size Calculation ---
+    // GOAL: Find the largest I/O Chunk Size that produces a compute `tile` that
+    //       fits within the L3 cache, thus co-optimizing I/O and compute.
+    //
+    // VARIABLES:
+    // S_io_chunk_opt: Optimal I/O Chunk Size (bytes) - The value we want to find.
+    // C_L3:           L3 Cache Size (bytes)
+    // S_person_block: The `PERSON_BLOCK_SIZE` constant (4096)
+    // N_people:       Total number of individuals in the study
+    // N_total_snps:   Total number of SNPs in the genome file
+    // N_score_snps:   Number of relevant SNPs used in the analysis
+    // B_snp:          Bytes per SNP in the .bed file = CEIL(N_people / 4)
+    // D_score:        Density of relevant SNPs = N_score_snps / N_total_snps
+    //
+    // DERIVATION:
+    // 1. The L3 cache constraint: Size(tile) <= C_L3
+    // 2. Tile size definition: Size(tile) = S_person_block * N_chunk_snps_max
+    // 3. From (1) and (2), max SNPs per tile: N_chunk_snps_max = C_L3 / S_person_block
+    // 4. Link tile to I/O chunk: N_chunk_snps_max = (S_io_chunk_opt / B_snp) * D_score
+    // 5. Solving for S_io_chunk_opt: S_io_chunk_opt = (C_L3 * B_snp) / (S_person_block * D_score)
+    //
+    // FINAL FORMULA:
+    // S_io_chunk_opt = (C_L3 * N_total_snps * CEIL(N_people / 4)) / (S_person_block * N_score_snps)
+    //
     const PERSON_BLOCK_SIZE: u64 = 4096; // Must match the value in `batch.rs`
 
     // 1. Determine L3 Cache Size, with a safe fallback.
@@ -262,8 +285,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     // 4. Apply practical guardrails to the optimal value.
-    use sysinfo::{MemoryRefreshKind, RefreshKind};
-    let mut sys = System::new_with_specifics(RefreshKind::new().with_memory(MemoryRefreshKind::new()));
+    let sys = System::new_with_specifics(
+        RefreshKind::new()
+            .with_memory(MemoryRefreshKind::everything()),
+    );
     let available_mem = sys.available_memory();
     
     const DYNAMIC_MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB floor for I/O efficiency.
