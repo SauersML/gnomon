@@ -187,6 +187,12 @@ pub fn prepare_for_computation(
                                 &mut work_for_position,
                             );
                         }
+
+
+                    // Imagine:
+                    // a `chr:pos` that has multiple definitions in the .bim file (e.g., a merged
+                    // dataset containing both an 'A/C' and an 'A/G' definition for 1:5000).
+                    // Could this create issues here?
                     } else if !is_ambiguous {
                         // Priority 2: Use the single, unambiguous permissive match.
                         if let Some((bim_record, bim_row_index)) = permissive_candidate {
