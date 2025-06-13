@@ -262,15 +262,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     // 4. Apply practical guardrails to the optimal value.
-    let sys = System::new();
+    use sysinfo::{MemoryRefreshKind, RefreshKind};
+    let mut sys = System::new_with_specifics(RefreshKind::new().with_memory(MemoryRefreshKind::new()));
     let available_mem = sys.available_memory();
-
+    
     const DYNAMIC_MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB floor for I/O efficiency.
-    let ram_based_max_chunk_size = available_mem / 2; // Cap at 50% of available RAM.
-
+    let ram_based_max_chunk_size = available_mem / 2; // Cap at 50% of available RAM to be safe.
+    
     let chunk_size_bytes = optimal_chunk_size
         .clamp(DYNAMIC_MIN_CHUNK_SIZE, ram_based_max_chunk_size) as usize;
-    // --- End: Dynamic Chunk Size Calculation ---
 
     const PIPELINE_DEPTH: usize = 2;
     let partial_result_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
