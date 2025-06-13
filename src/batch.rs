@@ -15,7 +15,7 @@
 // It will panic / overflow if we try.
 
 use crate::kernel;
-use crate::types::{CleanCounts, CleanCorrections, CleanScores};
+use crate::types::{CleanCounts, CleanScores, MatrixRowIndex};
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
     PreparationResult,
@@ -41,7 +41,7 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// optimization that avoids heap allocations in the hot compute path.
 #[derive(Default, Debug)]
 pub struct SparseIndexPool {
-    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)>>,
+    pool: ThreadLocal<RefCell<(Vec<Vec<MatrixRowIndex>>, Vec<Vec<MatrixRowIndex>>)>>,
 }
 
 impl SparseIndexPool {
@@ -51,7 +51,7 @@ impl SparseIndexPool {
 
     /// Gets the thread-local buffer of sparse indices, creating it if it doesn't exist.
     #[inline(always)]
-    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
+    fn get_or_default(&self) -> &RefCell<(Vec<Vec<MatrixRowIndex>>, Vec<Vec<MatrixRowIndex>>)> {
         self.pool.get_or_default()
     }
 }
@@ -64,14 +64,13 @@ impl SparseIndexPool {
 /// This is the sole public entry point into the synchronous compute engine.
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
-    weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
     partial_missing_counts_out: &mut CleanCounts,
-    partial_correction_sums_out: &mut CleanCorrections,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    matrix_row_start_idx: usize,
+    matrix_row_start_idx: MatrixRowIndex,
+    snps_in_chunk: usize,
     chunk_bed_row_offset: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
@@ -97,14 +96,13 @@ pub fn run_chunk_computation(
             process_people_iterator(
                 iter,
                 snp_major_data,
-                weights_for_chunk,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
-                partial_correction_sums_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
+                snps_in_chunk,
                 chunk_bed_row_offset,
             );
         }
@@ -113,14 +111,13 @@ pub fn run_chunk_computation(
             process_people_iterator(
                 iter,
                 snp_major_data,
-                weights_for_chunk,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
-                partial_correction_sums_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
+                snps_in_chunk,
                 chunk_bed_row_offset,
             );
         }
@@ -138,14 +135,13 @@ pub fn run_chunk_computation(
 fn process_people_iterator<'a, I>(
     iter: I,
     snp_major_data: &'a [u8],
-    weights_for_chunk: &'a [f32],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f32],
     partial_missing_counts: &'a mut [u32],
-    partial_correction_sums: &'a mut [f32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
-    matrix_row_start_idx: usize,
+    matrix_row_start_idx: MatrixRowIndex,
+    snps_in_chunk: usize,
     chunk_bed_row_offset: usize,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
@@ -158,9 +154,8 @@ fn process_people_iterator<'a, I>(
     partial_scores
         .par_chunks_mut(items_per_block)
         .zip(partial_missing_counts.par_chunks_mut(items_per_block))
-        .zip(partial_correction_sums.par_chunks_mut(items_per_block))
         .enumerate()
-        .for_each(|(block_idx, ((block_scores_out, block_missing_counts_out), block_correction_sums_out))| {
+        .for_each(|(block_idx, (block_scores_out, block_missing_counts_out))| {
             let person_start_idx = block_idx * PERSON_BLOCK_SIZE;
             let person_end_idx =
                 (person_start_idx + PERSON_BLOCK_SIZE).min(all_person_indices.len());
@@ -174,13 +169,12 @@ fn process_people_iterator<'a, I>(
                 person_indices_in_block,
                 prep_result,
                 snp_major_data,
-                weights_for_chunk,
                 block_scores_out,
                 block_missing_counts_out,
-                block_correction_sums_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
+                snps_in_chunk,
                 chunk_bed_row_offset,
             );
         });
@@ -192,17 +186,14 @@ fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
     prep_result: &PreparationResult,
     snp_major_data: &[u8],
-    weights_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     block_missing_counts_out: &mut [u32],
-    block_correction_sums_out: &mut [f32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    matrix_row_start_idx: usize,
+    matrix_row_start_idx: MatrixRowIndex,
+    snps_in_chunk: usize,
     chunk_bed_row_offset: usize,
 ) {
-    let stride = prep_result.stride;
-    let snps_in_chunk = if stride > 0 { weights_for_chunk.len() / stride } else { 0 };
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
 
     let mut tile = tile_pool.pop().unwrap_or_default();
@@ -216,16 +207,15 @@ fn process_block(
         &mut tile,
         prep_result,
         matrix_row_start_idx,
+        snps_in_chunk,
         chunk_bed_row_offset,
     );
 
     process_tile(
         &tile,
         prep_result,
-        weights_for_chunk,
         block_scores_out,
         block_missing_counts_out,
-        block_correction_sums_out,
         sparse_index_pool,
         snps_in_chunk,
         matrix_row_start_idx,
@@ -241,13 +231,11 @@ fn process_block(
 fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
-    weights_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     block_missing_counts_out: &mut [u32],
-    block_correction_sums_out: &mut [f32],
     sparse_index_pool: &SparseIndexPool,
     snps_in_chunk: usize,
-    matrix_row_start_idx: usize,
+    matrix_row_start_idx: MatrixRowIndex,
 ) {
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
@@ -274,39 +262,20 @@ fn process_tile(
         let person_data_start = person_idx * num_scores;
         let person_missing_counts_slice =
             &mut block_missing_counts_out[person_data_start..person_data_start + num_scores];
-        let person_correction_sums_slice =
-            &mut block_correction_sums_out[person_data_start..person_data_start + num_scores];
 
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
-            // The kernel operates in the local coordinate space of the current chunk.
-            // We pass the local `snp_idx_in_chunk` directly, which is a valid
-            // index into the `weights_for_chunk` slice that the kernel receives.
+            let matrix_row = MatrixRowIndex(matrix_row_start_idx.0 + snp_idx_in_chunk);
             match dosage.0 {
                 // SAFETY: `person_idx` is guaranteed to be in bounds by the outer loop.
-                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
-                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
+                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(matrix_row) },
+                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(matrix_row) },
                 3 => {
                     // This is the missing genotype sentinel.
-                    let global_matrix_row_idx = matrix_row_start_idx + snp_idx_in_chunk;
-
-                    // 1. Increment the missing count for ALL scores this variant belongs to. This is
-                    //    required even for variants with no correction constant.
                     let scores_for_this_variant =
-                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                        &prep_result.variant_to_scores_map[matrix_row.0];
                     for &score_idx in scores_for_this_variant {
                         unsafe {
-                            *person_missing_counts_slice.get_unchecked_mut(score_idx as usize) += 1;
-                        }
-                    }
-
-                    // 2. Accumulate the correction constant using the FAST sparse map. This loop
-                    //    only runs for variants that were allele-flipped.
-                    let corrections_for_this_variant =
-                        &prep_result.variant_to_corrections_map[global_matrix_row_idx];
-                    for &(score_idx, correction_value) in corrections_for_this_variant {
-                        unsafe {
-                            *person_correction_sums_slice.get_unchecked_mut(score_idx as usize) +=
-                                correction_value;
+                            *person_missing_counts_slice.get_unchecked_mut(score_idx.0) += 1;
                         }
                     }
                 }
@@ -316,9 +285,20 @@ fn process_tile(
     }
     // --- End of Pre-computation ---
 
-    let weights_matrix =
-        kernel::PaddedInterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
-            .expect("CRITICAL: Aligned weights matrix validation failed.");
+    let stride = prep_result.stride();
+    let matrix_slice_start = matrix_row_start_idx.0 * stride;
+    let matrix_slice_end = (matrix_row_start_idx.0 + snps_in_chunk) * stride;
+
+    let weights_chunk = &prep_result.weights_matrix()[matrix_slice_start..matrix_slice_end];
+    let flip_flags_chunk = &prep_result.flip_mask_matrix()[matrix_slice_start..matrix_slice_end];
+
+    let weights =
+        kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
+            .expect("CRITICAL: Weights matrix validation failed.");
+    let flip_flags =
+        kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
+            .expect("CRITICAL: Flip flags matrix validation failed.");
+
     // This is now a sequential iterator over a block owned by a single Rayon thread.
     block_scores_out
         .chunks_exact_mut(num_scores)
@@ -330,9 +310,10 @@ fn process_tile(
             let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
             let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
 
-            // Dispatch to the simplified, "two-loop" SIMD kernel.
+            // Dispatch to the numerically stable, flip-aware SIMD kernel.
             kernel::accumulate_scores_for_person(
-                &weights_matrix,
+                &weights,
+                &flip_flags,
                 scores_out_slice,
                 acc_buffer_slice,
                 &g1_indices[person_idx],
@@ -350,11 +331,11 @@ fn pivot_tile(
     person_indices_in_block: &[OriginalPersonIndex],
     tile: &mut [EffectAlleleDosage],
     prep_result: &PreparationResult,
-    matrix_row_start_idx: usize,
+    matrix_row_start_idx: MatrixRowIndex,
+    snps_in_chunk: usize,
     chunk_bed_row_offset: usize,
 ) {
     let num_people_in_block = person_indices_in_block.len();
-    let snps_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
     let bytes_per_snp = prep_result.bytes_per_snp;
 
     // Maps a desired sequential SNP index (0-7) to its physical source location within
@@ -382,9 +363,9 @@ fn pivot_tile(
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
                 let variant_idx_in_chunk = snp_chunk_start + i;
-                let global_matrix_row_idx = matrix_row_start_idx + variant_idx_in_chunk;
+                    let global_matrix_row_idx = matrix_row_start_idx.0 + variant_idx_in_chunk;
                 let absolute_bed_row = prep_result.required_bim_indices[global_matrix_row_idx];
-                let relative_bed_row = absolute_bed_row - chunk_bed_row_offset;
+                    let relative_bed_row = absolute_bed_row.0 - chunk_bed_row_offset;
                 let snp_byte_offset = relative_bed_row as u64 * bytes_per_snp;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
 

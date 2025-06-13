@@ -9,7 +9,8 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{f32x8, StdFloat};
+use crate::types::MatrixRowIndex;
+use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -89,56 +90,120 @@ impl<'a> PaddedInterleavedWeights<'a> {
 //                              THE KERNEL IMPLEMENTATION
 // ========================================================================================
 
-/// Calculates the dosage-dependent component of all K scores for a single person
-/// using a "two-loop" strategy on the aligned weights matrix and sparse indices.
+/// A validated, type-safe, zero-cost view over a slice representing a padded,
+/// interleaved matrix of `u8` flags.
+pub struct PaddedInterleavedFlags<'a> {
+    slice: &'a [u8],
+    stride: usize,
+}
+
+impl<'a> PaddedInterleavedFlags<'a> {
+    /// Creates a new, validated `PaddedInterleavedFlags` view over a slice.
+    #[inline]
+    pub fn new(
+        slice: &'a [u8],
+        num_rows: usize,
+        num_scores: usize,
+    ) -> Result<Self, &'static str> {
+        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+        if slice.len() != num_rows * stride {
+            return Err(
+                "Mismatched flag matrix data: slice.len() does not equal num_rows * calculated_stride",
+            );
+        }
+        Ok(Self { slice, stride })
+    }
+
+    /// Fetches the i-th SIMD vector of flags for a given matrix row.
+    ///
+    /// # Safety
+    /// The caller MUST guarantee that `row_idx` is a valid row index and `lane_idx` is valid.
+    #[inline(always)]
+    unsafe fn get_simd_lane_unchecked(&self, row_idx: usize, lane_idx: usize) -> Simd<u8, 8> {
+        let offset = (row_idx * self.stride) + (lane_idx * LANE_COUNT);
+        unsafe { Simd::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
+    }
+}
+
+
+// ========================================================================================
+//                              THE KERNEL IMPLEMENTATION
+// ========================================================================================
+
+/// Calculates the score contributions for a single person using a numerically stable,
+/// branchless, SIMD-accelerated algorithm.
 ///
-/// This function is the heart of the compute engine. It is branch-free and
-/// performs a minimal number of predictable memory accesses, maximizing throughput.
-/// It calculates only the score delta from genotypes; any constant base score
-/// must be initialized in the output buffer beforehand.
+/// This function is the heart of the compute engine. It executes a pre-compiled
+/// plan (`weights`, `flip_flags`, `g1_indices`, `g2_indices`) to maximize throughput.
 ///
 /// # Safety
-///
 /// The caller must uphold the following contracts:
 /// - All indices in `g1_indices` and `g2_indices` must be valid row indices
-///   for the `aligned_weights` matrix.
-/// - `scores_out.len()` must be `== aligned_weights.num_scores()`.
+///   for the `weights` and `flip_flags` matrices.
+/// - `scores_out.len()` must be `== weights.num_scores()`.
 /// - `accumulator_buffer.len()` must be sufficient for the number of scores.
 #[inline]
 pub fn accumulate_scores_for_person(
-    aligned_weights: &PaddedInterleavedWeights,
+    weights: &PaddedInterleavedWeights,
+    flip_flags: &PaddedInterleavedFlags,
     scores_out: &mut [f32],
     accumulator_buffer: &mut [SimdVec],
-    g1_indices: &[usize],
-    g2_indices: &[usize],
+    g1_indices: &[MatrixRowIndex],
+    g2_indices: &[MatrixRowIndex],
 ) {
-    let num_scores = aligned_weights.num_scores();
+    let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
-    let dosage_2_multiplier = SimdVec::splat(2.0);
+    let two = SimdVec::splat(2.0);
 
     // --- Reset the Reusable Accumulator Buffer ---
-    accumulator_buffer.iter_mut().for_each(|acc| *acc = SimdVec::splat(0.0));
+    accumulator_buffer
+        .iter_mut()
+        .for_each(|acc| *acc = SimdVec::splat(0.0));
 
-    // --- Loop 1: Accumulate Aligned Weights (W') for Dosage=1 Variants ---
+    // --- Loop 1: Accumulate contributions for Dosage=1 variants ---
+    let dosage1 = SimdVec::splat(1.0);
     for &matrix_row in g1_indices {
         for i in 0..num_accumulator_lanes {
             // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
             // Using get_unchecked here is a critical performance optimization.
             unsafe {
-                let weights_vec = aligned_weights.get_simd_lane_unchecked(matrix_row, i);
-                *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
+                let weights_vec = weights.get_simd_lane_unchecked(matrix_row.0, i);
+                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row.0, i);
+
+                // Create a SIMD boolean mask from the u8 flags.
+                let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
+
+                // Calculate BOTH potential outcomes in parallel across all 8 lanes.
+                let contrib_regular = dosage1 * weights_vec;
+                let contrib_flipped = (two - dosage1) * weights_vec;
+
+                // Use a single, branchless instruction (e.g., blendvps) to select
+                // the correct contribution for each of the 8 lanes.
+                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
+
+                *accumulator_buffer.get_unchecked_mut(i) += contribution;
             }
         }
     }
 
-    // --- Loop 2: Accumulate Aligned Weights (W') for Dosage=2 Variants ---
+    // --- Loop 2: Accumulate contributions for Dosage=2 variants ---
+    let dosage2 = SimdVec::splat(2.0);
     for &matrix_row in g2_indices {
         for i in 0..num_accumulator_lanes {
             // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
             unsafe {
-                let weights_vec = aligned_weights.get_simd_lane_unchecked(matrix_row, i);
-                let acc = accumulator_buffer.get_unchecked_mut(i);
-                *acc = weights_vec.mul_add(dosage_2_multiplier, *acc);
+                let weights_vec = weights.get_simd_lane_unchecked(matrix_row.0, i);
+                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row.0, i);
+
+                let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
+
+                let contrib_regular = dosage2 * weights_vec;
+                // For dosage=2, the flipped contribution is (2-2)*w = 0.
+                let contrib_flipped = SimdVec::splat(0.0);
+
+                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
+
+                *accumulator_buffer.get_unchecked_mut(i) += contribution;
             }
         }
     }
