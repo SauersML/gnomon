@@ -32,6 +32,9 @@ use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
 use cache_size;
 use std::ops::{Deref, DerefMut};
+use gnomon::types::{
+    CleanCounts, CleanCorrections, CleanScores, DirtyCounts, DirtyCorrections, DirtyScores,
+};
 
 // ========================================================================================
 //                             ZERO-COST BUFFER STATE TYPES
