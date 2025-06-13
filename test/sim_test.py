@@ -292,7 +292,7 @@ def run_and_validate_tools():
     # --- Configuration ---
     PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
     PLINK2_BINARY_PATH = Path("./plink2")
-    GNOMON_BINARY_PATH = "gnomon" # Assumes gnomon is in the system's PATH
+    GNOMON_BINARY_PATH = Path("./target/release/gnomon")
     COMPAT_PREFIX = "simulated_data_plink_compat"
     
     # --- Helper Functions (nested to keep them self-contained) ---
