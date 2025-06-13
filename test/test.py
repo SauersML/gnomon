@@ -190,20 +190,22 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
                 if match and num_variants == 0: num_variants = int(match.group(1))
 
             elif tool_name == 'plink1':
-                # Without 'sum', the 'SCORE' column is the average score.
                 df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+valid\s+predictors', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
 
             elif tool_name == 'plink2':
-                # With 'no-mean-imputation', plink2 provides an _AVG column.
                 score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
                 if not score_col: raise KeyError("PLINK2 _AVG score column not found")
                 df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
             
-            if 'df' in locals() and df is not None: data_frames.append(df)
+            # Defensively convert the score column to a numeric type.
+            if 'df' in locals() and df is not None:
+                df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
+                data_frames.append(df)
+
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
@@ -213,8 +215,11 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     for df_to_merge in data_frames[1:]:
         merged_df = pd.merge(merged_df, df_to_merge, on='IID', how='inner')
     
+    # Drop rows where any score is NaN after the numeric conversion
     score_cols = sorted([c for c in merged_df.columns if c.startswith('SCORE_')])
-    if len(score_cols) < 2: return summary
+    merged_df.dropna(subset=score_cols, inplace=True)
+    
+    if len(score_cols) < 2 or merged_df.empty: return summary
 
     summary['n_variants_used'] = num_variants
     summary['sample_scores'] = merged_df[['IID'] + score_cols].head(5)
@@ -225,7 +230,7 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         key = f"{col1.replace('SCORE_', '')}_vs_{col2.replace('SCORE_', '')}"
         mad_results[key] = (merged_df[col1] - merged_df[col2]).abs().mean()
         denominator = (merged_df[col1].abs() + merged_df[col2].abs()) / 2.0
-        valid_rows = denominator > 1e-12 # Use a small epsilon for floating point safety
+        valid_rows = denominator > 1e-12
         mrd = ((merged_df.loc[valid_rows, col1] - merged_df.loc[valid_rows, col2]).abs() / denominator[valid_rows]).mean()
         mrd_results[key] = mrd if not np.isnan(mrd) else 0.0
 
@@ -294,8 +299,6 @@ def main():
         all_results.append(res_g); pgs_run_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
-        # NOTE: Both plink commands now use 'no-mean-imputation' and do NOT use 'sum'
-        # This makes them calculate the average score, matching gnomon's primary output.
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
         res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}")
