@@ -21,22 +21,27 @@ use std::ops::{Deref, DerefMut};
 // These wrapper types encode a buffer's state (Clean or Dirty) into the type system,
 // allowing the compiler to enforce correct usage at zero runtime cost. The `#[repr(transparent)]`
 // attribute ensures they are identical to a `Vec` in memory layout.
-
 /// A buffer that is guaranteed by the type system to have been zeroed.
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct CleanScores(Vec<f32>);
+pub struct CleanScores(pub Vec<f32>);
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct CleanCounts(Vec<u32>);
+pub struct CleanCounts(pub Vec<u32>);
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct CleanCorrections(Vec<f32>);
+pub struct CleanCorrections(pub Vec<f32>);
 
 /// A buffer that may contain non-zero data from a previous computation.
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct DirtyScores(Vec<f32>);
+pub struct DirtyScores(pub Vec<f32>);
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct DirtyCounts(Vec<u32>);
+pub struct DirtyCounts(pub Vec<u32>);
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct DirtyCorrections(Vec<f32>);
+pub struct DirtyCorrections(pub Vec<f32>);
 
 // --- State Transition & Ergonomics ---
 
