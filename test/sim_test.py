@@ -330,14 +330,15 @@ def run_and_validate_tools():
             sys.exit(1)
 
     def setup_tools():
+        """Ensures gnomon and PLINK2 are available."""
         _print_header("Step A: Setting up tools")
         
-        # 1. Check for gnomon
-        if not shutil.which(GNOMON_BINARY_PATH):
-            print(f"  > ❌ ERROR: '{GNOMON_BINARY_PATH}' not found in PATH.")
-            print("  > Please install gnomon (e.g., via 'cargo install gnomon') and ensure it's in your PATH.")
+        # 1. Check for gnomon at its build location
+        if not GNOMON_BINARY_PATH.exists():
+            print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'.")
+            print("  > Please ensure the script is run after 'cargo build --release' has completed.")
             sys.exit(1)
-        print("  > Found 'gnomon' executable.")
+        print(f"  > Found 'gnomon' executable at: {GNOMON_BINARY_PATH}")
 
         # 2. Download and extract PLINK2 if it doesn't exist
         if PLINK2_BINARY_PATH.exists():
