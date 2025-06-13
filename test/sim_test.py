@@ -307,10 +307,18 @@ def run_and_validate_tools():
         print("--- OUTPUT ---")
         
         try:
-            # Use Popen for real-time output
+        # Create a new environment for the subprocess, inheriting from the current one
+        proc_env = os.environ.copy()
+        # If we're running gnomon, force a backtrace on panic/crash
+        if "gnomon" in str(cmd_str[0]):
+            proc_env["RUST_BACKTRACE"] = "1"
+
+        try:
+            # Use Popen for real-time output, passing the modified environment
             process = subprocess.Popen(
                 cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', cwd=cwd
+                text=True, encoding='utf-8', errors='replace', cwd=cwd,
+                env=proc_env
             )
             
             # Print output in real-time
