@@ -306,7 +306,6 @@ def run_and_validate_tools():
         print(f"  > CWD: {cwd}")
         print("--- OUTPUT ---")
         
-        try:
         # Create a new environment for the subprocess, inheriting from the current one
         proc_env = os.environ.copy()
         # If we're running gnomon, force a backtrace on panic/crash
