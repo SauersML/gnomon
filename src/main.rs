@@ -16,6 +16,7 @@ use gnomon::io::SnpChunkReader;
 use gnomon::io::SnpChunk;
 use gnomon::prepare;
 use gnomon::reformat;
+use gnomon::types::{DirtyCounts, DirtyCorrections, DirtyScores};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -27,8 +28,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task;
 use std::fs::File;
-#[cfg(debug_assertions)]
-use std::cell::Cell;
 use cache_size;
 
 // ========================================================================================
@@ -270,7 +269,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let t6 = Instant::now();
 
     const PIPELINE_DEPTH: usize = 2;
-    let partial_result_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
+    let partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts, DirtyCorrections)>> =
+        Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
     for _ in 0..(PIPELINE_DEPTH + 1) {
         partial_result_pool
             .push((
