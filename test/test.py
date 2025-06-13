@@ -12,6 +12,9 @@ import pandas as pd
 import numpy as np
 import psutil
 
+# ========================================================================================
+#                                     CONFIGURATION
+# ========================================================================================
 CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
@@ -37,7 +40,7 @@ PGS_SCORES = {
 }
 
 # ========================================================================================
-#                                   HELPER FUNCTIONS
+#                                     HELPER FUNCTIONS
 # ========================================================================================
 
 def print_header(title: str, char: str = "="):
@@ -148,9 +151,10 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     print(f"[SCRIPT] Reading original bim file: {original_bim}", flush=True)
     bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
     
-    print("[SCRIPT] Creating canonical allele-aware IDs (chr:pos:sorted_a1:sorted_a2)...", flush=True)
+    # Create canonical IDs using underscores for PLINK 1.9 compatibility.
+    print("[SCRIPT] Creating canonical allele-aware IDs (chr_pos_sorted_a1_sorted_a2)...", flush=True)
     alleles = bim_df[['a1', 'a2']].apply(lambda x: sorted(x), axis=1, result_type='expand')
-    bim_df['canonical_id'] = bim_df['chrom'] + ':' + bim_df['pos'] + ':' + alleles[0] + ':' + alleles[1]
+    bim_df['canonical_id'] = bim_df['chrom'] + '_' + bim_df['pos'] + '_' + alleles[0] + '_' + alleles[1]
     
     bim_df_to_save = bim_df[['chrom', 'canonical_id', 'cm', 'pos', 'a1', 'a2']]
     bim_df_to_save.to_csv(temp_bim, sep='\t', header=False, index=False)
@@ -195,7 +199,8 @@ def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     print(f"  > Step 2: Kept {len(df)} rows after removing non-numeric weights.", flush=True)
 
     alleles = df[['effect_allele', 'other_allele']].apply(lambda x: sorted(x), axis=1, result_type='expand')
-    df['canonical_id'] = df['hm_chr'] + ':' + df['hm_pos'] + ':' + alleles[0] + ':' + alleles[1]
+    # Create canonical IDs using underscores for PLINK 1.9 compatibility.
+    df['canonical_id'] = df['hm_chr'] + '_' + df['hm_pos'] + '_' + alleles[0] + '_' + alleles[1]
     print(f"  > Step 3: Created canonical allele-aware IDs.", flush=True)
     
     df.drop_duplicates(subset=['canonical_id'], keep='first', inplace=True, ignore_index=True)
@@ -247,31 +252,28 @@ def validate_results(pgs_id: str, results: list):
         try:
             df = None
             if tool == 'gnomon':
-                # Gnomon produces a tab-separated file with an _AVG score column.
-                # The score name in the column is derived from the pgs_id.
                 df_raw = pd.read_csv(path, sep='\t')
-                score_name_from_pgs = pgs_id.split('_')[0]
-                score_col = f"{score_name_from_pgs}_AVG"
-                if score_col not in df_raw.columns:
-                    score_col_from_header = next((c for c in df_raw.columns if c.endswith('_AVG')), None)
-                    if not score_col_from_header:
-                        raise KeyError(f"Expected score column ending in '_AVG' not found.")
-                    score_col = score_col_from_header
-                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
+                # Flexibly find IID column
+                id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
+                if id_col not in df_raw.columns: raise KeyError("Could not find IID column.")
+                # Flexibly find score column
+                score_col = next((c for c in df_raw.columns if c.endswith('_AVG')), None)
+                if not score_col: raise KeyError("Expected score column ending in '_AVG' not found.")
+                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool}'})
 
             elif tool == 'plink1':
-                # Plink1 produces a whitespace-separated .profile file.
                 df_raw = pd.read_csv(path, sep='\s+')
                 df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool}'})
 
             elif tool == 'plink2':
-                # Plink2 produces a whitespace-separated .sscore file.
-                # The score column name can vary but contains "SCORE".
                 df_raw = pd.read_csv(path, sep='\s+')
+                # Flexibly find IID column
+                id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
+                if id_col not in df_raw.columns: raise KeyError("Could not find IID column.")
+                # Flexibly find score column
                 score_col = next((col for col in df_raw.columns if 'SCORE' in col), None)
-                if not score_col:
-                    raise KeyError("Could not find a score column in plink2 output.")
-                df = df_raw[['#IID', score_col]].rename(columns={'#IID': 'IID', score_col: f'SCORE_{tool}'})
+                if not score_col: raise KeyError("Could not find a score column in plink2 output.")
+                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool}'})
 
             if df is not None:
                 data_frames.append(df)
@@ -294,6 +296,8 @@ def validate_results(pgs_id: str, results: list):
         
     score_cols = [col for col in merged_df.columns if 'SCORE' in col]
     print_debug_header("Score Correlation Matrix")
+    # A moderate correlation can still be misleading if a large number of predictors were dropped.
+    # With the fixes, this should be very close to 1.0.
     print(merged_df[score_cols].corr(), flush=True)
 
     print_debug_header("Mean Absolute Difference")
