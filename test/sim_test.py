@@ -410,7 +410,7 @@ def run_and_validate_tools():
             truth_df = truth_df[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
 
             # 2. Load Gnomon's results
-            gnomon_df = pd.read_csv("gnomon_results.sscore", sep='\t', comment='#')
+            gnomon_df = pd.read_csv(f"{OUTPUT_PREFIX}.sscore", sep='\t', comment='#')
             gnomon_df = gnomon_df[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_GNOMON'})
 
             # 3. Load PLINK2's results (score column is SCORE1_AVG)
@@ -456,7 +456,7 @@ def run_and_validate_tools():
     # --- Step C: Run Scoring Tools ---
     # Gnomon uses original files (it's more flexible)
     run_command(
-        [GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX}.score", OUTPUT_PREFIX, "--out", "gnomon_results"],
+        [str(GNOMON_BINARY_PATH), "--score", f"{OUTPUT_PREFIX}.score", OUTPUT_PREFIX],
         "Gnomon"
     )
 
