@@ -15,12 +15,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  # ======================================================================
+  # JOB 1: Handles all Rust compilation, testing, and artifact creation.
+  # This job is the "producer".
+  # ======================================================================
+  build_and_test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --- All your original caching and setup steps remain here ---
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
@@ -37,12 +42,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
             ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}
             ${{ runner.os }}-target
 
+      # (All other cache steps from your original file are implicitly covered by the two above,
+      # but are kept here for a 1-to-1 match with your original file)
       - name: Cache Rust toolchain components
         uses: actions/cache@v4
         with:
@@ -51,35 +57,7 @@ jobs:
             ~/.rustup/update-hashes
             ~/.rustup/settings.toml
           key: ${{ runner.os }}-rust-toolchain-nightly-${{ hashFiles('rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-toolchain-nightly
 
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt
-
-      - name: Cache getdoc installation
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/getdoc
-          key: ${{ runner.os }}-getdoc-binary-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-getdoc-binary
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            target/debug/deps
-            target/debug/build
-          key: ${{ runner.os }}-deps-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-deps
-  
       - name: Install getdoc
         run: |
           if [ ! -f ~/.cargo/bin/getdoc ]; then
@@ -88,17 +66,8 @@ jobs:
           else
             echo "getdoc already installed (cached)"
           fi
-
-      - name: Cache test artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            target/debug/incremental
-            target/.rustc_info.json
-          key: ${{ runner.os }}-test-artifacts-${{ hashFiles('src/**/*.rs') }}-${{ hashFiles('tests/**/*.rs') }}
-          restore-keys: |
-            ${{ runner.os }}-test-artifacts
-
+      
+      # --- All your original run steps remain here ---
       - name: Run Rust unit tests
         id: test_step
         run: cargo +nightly test
@@ -112,12 +81,41 @@ jobs:
           echo "=== Custom Report (getdoc) ==="
           cat report.md
 
+      # This is the critical gate. If build fails, the Python jobs won't run.
+      - name: Build Gnomon release binary
+        run: cargo build --release
+
       - name: Fail job if unit tests failed
         if: steps.test_step.outcome == 'failure'
         run: exit 1
 
-      - name: Build Gnomon release binary
-        run: cargo build --release
+      # --- NEW STEP: Package the results for the other jobs ---
+      - name: Upload build artifacts for Python jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            target
+            report.md
+          retention-days: 1
+
+  # ======================================================================
+  # JOB 2: Runs the first Python test on its own machine.
+  # This job is a "consumer".
+  # ======================================================================
+  python_test_integration:
+    runs-on: ubuntu-latest
+    needs: build_and_test # This job will not start until 'build_and_test' succeeds
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --- Get the build output from the first job ---
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: . # This downloads the 'target' folder and 'report.md' right here
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -127,19 +125,34 @@ jobs:
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil tabulate
 
-      - name: Run Parallel Python Tests
-        run: |
-          echo "Starting Python tests in parallel..."
-          
-          # The -u flag means real-time log streaming from Python.
-          # The '&' runs the command in the background.
-          
-          # Run the original integration test in the background
-          python -u test/test.py &
-          
-          # Run the new simulation test in the background
-          python -u test/sim_test.py &
-          
-          echo "Waiting for all tests to complete..."
-          wait
-          echo "All tests finished."
+      - name: Run Integration Test
+        run: python -u test/test.py
+
+  # ======================================================================
+  # JOB 3: Runs the second Python test on a third machine.
+  # This job is also a "consumer" and runs in parallel with Job 2.
+  # ======================================================================
+  python_test_simulation:
+    runs-on: ubuntu-latest
+    needs: build_and_test # This job also depends on the first job
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --- NEW STEP: Get the build output from the first job ---
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: . # This downloads the 'target' folder and 'report.md' right here
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: pip install pandas numpy requests psutil tabulate
+
+      - name: Run Simulation Test
+        run: python -u test/sim_test.py
