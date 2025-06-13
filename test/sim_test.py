@@ -298,37 +298,37 @@ def run_and_validate_tools():
         width = 70
         print(f"\n{char*4} {title} {'-'*(width - len(title) - 5)}")
 
-def run_command(cmd: list, step_name: str, cwd: Path):
-    _print_header(f"Executing: {step_name}")
-    # Convert all command parts to strings for subprocess
-    cmd_str = [str(c) for c in cmd]
-    print(f"  > Command: {' '.join(cmd_str)}")
-    print(f"  > CWD: {cwd}")
-    print("--- OUTPUT ---")
-    
-    try:
-        # Use Popen for real-time output
-        process = subprocess.Popen(
-            cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', errors='replace', cwd=cwd
-        )
+    def run_command(cmd: list, step_name: str, cwd: Path):
+        _print_header(f"Executing: {step_name}")
+        # Convert all command parts to strings for subprocess
+        cmd_str = [str(c) for c in cmd]
+        print(f"  > Command: {' '.join(cmd_str)}")
+        print(f"  > CWD: {cwd}")
+        print("--- OUTPUT ---")
         
-        # Print output in real-time
-        for line in process.stdout:
-            print(line, end='')  # end='' because line already has newline
+        try:
+            # Use Popen for real-time output
+            process = subprocess.Popen(
+                cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace', cwd=cwd
+            )
             
-        # Wait for process to complete
-        return_code = process.wait()
-        
-        if return_code == 0:
-            print(f"\n  > Success.")
-        else:
-            print(f"\n  > ❌ ERROR: {step_name} failed with exit code {return_code}.")
+            # Print output in real-time
+            for line in process.stdout:
+                print(line, end='')  # end='' because line already has newline
+                
+            # Wait for process to complete
+            return_code = process.wait()
+            
+            if return_code == 0:
+                print(f"\n  > Success.")
+            else:
+                print(f"\n  > ❌ ERROR: {step_name} failed with exit code {return_code}.")
+                sys.exit(1)
+                
+        except FileNotFoundError:
+            print(f"  > ❌ ERROR: Command '{cmd[0]}' not found.")
             sys.exit(1)
-            
-    except FileNotFoundError:
-        print(f"  > ❌ ERROR: Command '{cmd[0]}' not found.")
-        sys.exit(1)
 
     def setup_tools():
         _print_header("Step A: Setting up tools")
