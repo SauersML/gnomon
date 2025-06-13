@@ -47,6 +47,8 @@ def generate_variants_and_weights():
     effect_alleles = np.where(is_alt_effect, alt_alleles, ref_alleles)
 
     # 4. Generate effect weights from a normal distribution
+    # Effect weights are drawn from a normal distribution.
+    # loc=0, scale=0.05 chosen as a reasonable default for effect size magnitudes.
     effect_weights = np.random.normal(loc=0, scale=0.05, size=N_VARIANTS)
 
     # 5. Assemble into a DataFrame for easy management
@@ -73,7 +75,9 @@ def generate_genotypes(variants_df):
     
     n_vars = len(variants_df)
 
-    # Generate a random allele frequency 'p' for the reference allele for each variant
+    # For each variant, simulate a reference allele frequency 'p'.
+    # Drawing 'p' from U(0.01, 0.99) ensures variability in allele frequencies across loci,
+    # preventing fixed alleles and providing a range for HWE calculations.
     p = np.random.uniform(0.01, 0.99, size=n_vars)
     q = 1 - p
 
@@ -115,6 +119,7 @@ def simulate_annotations():
     print(f"...Generated {len(annotations)} annotations.")
     print(f"First 10 annotation positions: {annotations[:10]}")
     # This data is not used further, as per the prompt's structure.
+    return annotations
 
 def introduce_missingness(genotypes):
     """
@@ -131,6 +136,9 @@ def introduce_missingness(genotypes):
     # Apply the mask. Convert to float to hold a marker, then back to int.
     genotypes_with_missing = genotypes.astype(float)
     genotypes_with_missing[missing_mask] = -1 # Use -1 as the missing marker
+    # Using -1 as a numerical marker for missingness is specific to this script's
+    # genotype processing and BED file conversion logic (via code_map).
+    # In other contexts or with different tools, pandas.NA or np.nan might be preferred.
     
     print("...Missingness introduced.")
     return genotypes_with_missing.astype(int)
@@ -203,10 +211,14 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix)
 
     # --- a. Write PRS Results File (.sscore format) ---
     sscore_filename = f"{prefix}.sscore"
-    header = ['#FID', 'IID', 'SID', 'PHENO1', 'ALLELE_CT', 'DENOM', 'NAMED_ALLELE_DOSAGE_SUM', 'PRS_AVG', 'PRS_SUM']
-    # Reorder columns to match the standard PLINK output
+    # Define column order for the .sscore file
     prs_cols_ordered = ['FID', 'IID', 'SID', 'PHENO1', 'ALLELE_CT', 'DENOM', 'NAMED_ALLELE_DOSAGE_SUM', 'PRS_AVG', 'PRS_SUM']
-    prs_results[prs_cols_ordered].to_csv(sscore_filename, sep='\t', header=header, index=False, na_rep='NA')
+
+    with open(sscore_filename, 'w') as f:
+        # Manually write the header line starting with #
+        f.write('#' + '\t'.join(prs_cols_ordered) + '\n')
+        # Write the DataFrame content without pandas header
+        prs_results[prs_cols_ordered].to_csv(f, sep='\t', header=False, index=False, na_rep='NA')
     print(f"...PRS results written to {sscore_filename}")
     
     # --- b. Write Scorefile ---
@@ -266,6 +278,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix)
 
 def main():
     """Main function to run the entire simulation and file generation pipeline."""
+    np.random.seed(42) # Set seed for reproducibility
     print("--- Starting Full Simulation and File Writing Pipeline ---")
     
     # Step 1: Simulate variants, weights, and effect alleles
@@ -275,19 +288,30 @@ def main():
     genotypes_pristine = generate_genotypes(variants_df)
 
     # Step 3: Simulate annotations (as a standalone demonstration)
-    simulate_annotations()
+    annotation_positions = simulate_annotations()
+
+    # Step 3b: Writing annotation positions to file
+    annotations_filename = f"{OUTPUT_PREFIX}.annotations.txt"
+    print(f"Step 3b: Writing annotation positions to {annotations_filename}...")
+    with open(annotations_filename, 'w') as f:
+        for pos in annotation_positions:
+            f.write(f"{pos}\n")
+    print(f"...Annotation positions written to {annotations_filename}.")
 
     # Step 4: Introduce missingness into the genotype matrix
     genotypes_with_missing = introduce_missingness(genotypes_pristine)
 
     # Step 5: Calculate ground truth Polygenic Scores
     prs_results_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
+
+    print("\n--- Ground Truth Polygenic Scores (per individual) ---")
+    print(prs_results_df.to_string())
     
     # Step 6: Write all specified output files to disk
     write_output_files(prs_results_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
 
     print("\n--- Pipeline Finished Successfully ---")
-    print(f"Generated filesets: '{OUTPUT_PREFIX}.bed/.bim/.fam', '{OUTPUT_PREFIX}.sscore', '{OUTPUT_PREFIX}.score'")
+    print(f"Generated filesets: '{OUTPUT_PREFIX}.bed/.bim/.fam', '{OUTPUT_PREFIX}.sscore', '{OUTPUT_PREFIX}.score', '{OUTPUT_PREFIX}.annotations.txt'")
 
 if __name__ == "__main__":
     main()
