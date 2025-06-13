@@ -192,6 +192,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     
     print(f"...PLINK files written: {prefix}.bed/.bim/.fam")
 
+# Simple Dosage Test
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
     """
     Runs a minimal, hardcoded test case with 1 variant and 3 individuals
@@ -211,6 +212,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     
     # --- 2. Write Input Files and Print Contents ---
     print("\n--- Writing Input Files ---")
+    variant_id = "1:1000" # Use CHR:POS as the canonical identifier
 
     # .fam file
     fam_content = "id_hom_ref id_hom_ref 0 0 0 -9\nid_het id_het 0 0 0 -9\nid_hom_alt id_hom_alt 0 0 0 -9\n"
@@ -218,14 +220,14 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         f.write(fam_content)
     print(f"\nContents of {prefix.with_suffix('.fam')}:\n---\n{fam_content.strip()}\n---")
     
-    # .bim file
-    bim_content = "1\trs123\t0\t1000\tA\tG\n"
+    # .bim file - Use CHR:POS in the second column (variant ID)
+    bim_content = f"1\t{variant_id}\t0\t1000\tA\tG\n"
     with open(prefix.with_suffix(".bim"), "w") as f:
         f.write(bim_content)
     print(f"\nContents of {prefix.with_suffix('.bim')}:\n---\n{bim_content.strip()}\n---")
     
-    # score file
-    score_content = "snp_id\teffect_allele\tother_allele\tsimple_score\nrs123\tG\tA\t0.5\n"
+    # score file - Use CHR:POS in the snp_id column
+    score_content = f"snp_id\teffect_allele\tother_allele\tsimple_score\n{variant_id}\tG\tA\t0.5\n"
     with open(prefix.with_suffix(".score"), "w") as f:
         f.write(score_content)
     print(f"\nContents of {prefix.with_suffix('.score')}:\n---\n{score_content.strip()}\n---")
