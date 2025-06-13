@@ -110,6 +110,16 @@ pub fn prepare_for_computation(
     eprintln!("> Pass 2: Indexing genotype data...");
     let bim_path = plink_prefix.with_extension("bim");
     let (bim_index, total_snps_in_bim) = index_bim_file(&bim_path)?;
+    // Create a reverse map from the original bim file row index to its snp_id string.
+    // This is used for fast, user-friendly error reporting if duplicates are found.
+    let bim_row_to_snp_id: AHashMap<usize, &str> = bim_index
+        .iter()
+        .flat_map(|(snp_id, records)| {
+            records
+                .iter()
+                .map(move |(_, bim_row)| (*bim_row, snp_id.as_str()))
+        })
+        .collect();
 
     // We need to know which BIM rows are used to build the dense matrix map.
     let required_bim_indices_set = discover_required_bim_indices(&final_score_map, &bim_index)?;
@@ -210,9 +220,33 @@ pub fn prepare_for_computation(
         variant_to_scores_map[variant_row.0].push(score_col.0 as u16);
     }
 
-    // --- STAGE 5: PARALLEL SORT ---
-    eprintln!("> Pass 5: Sorting work items for cache-friendly access...");
-    work_items.par_sort_unstable_by_key(|item| item.matrix_row);
+// --- STAGE 5: PARALLEL SORT & VALIDATION ---
+    eprintln!("> Pass 5: Sorting and validating work items...");
+    // Sort by matrix row and then column index. This groups any potential duplicate
+    // definitions for the same (variant, score) cell right next to each other,
+    // which allows for a fast linear scan to detect them.
+    work_items.par_sort_unstable_by_key(|item| (item.matrix_row, item.col_idx));
+
+    // After sorting, a single pass over adjacent items can efficiently detect duplicates.
+    // This check ensures that every variant is defined only once per score.
+    if let Some(w) = work_items.windows(2).find(|w| {
+        w[0].matrix_row == w[1].matrix_row && w[0].col_idx == w[1].col_idx
+    }) {
+        let bad_item = &w[0];
+        let score_name = &score_names[bad_item.col_idx.0];
+        // To find the human-readable snp_id, we map from our internal dense matrix row
+        // index back to the original .bim file row index, and then use the reverse
+        // map to find the snp_id string.
+        let bim_row = required_bim_indices[bad_item.matrix_row.0];
+        let snp_id = bim_row_to_snp_id
+            .get(&bim_row)
+            .unwrap_or(&"unknown variant");
+
+        return Err(PrepError::Parse(format!(
+            "Ambiguous input: The score '{}' is defined more than once for variant '{}'. Each variant must have exactly one definition per score.",
+            score_name, snp_id
+        )));
+    }
 
     // --- STAGE 6: PARALLEL POPULATION (100% SAFE) ---
     eprintln!("> Pass 6: Populating compute matrices with maximum parallelism...");
