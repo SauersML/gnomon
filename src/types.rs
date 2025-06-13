@@ -53,9 +53,20 @@ impl DirtyScores {
         CleanScores(self.0)
     }
 }
+
 impl Deref for DirtyScores {
     type Target = [f32];
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<'a> IntoIterator for &'a DirtyScores {
+    type Item = &'a f32;
+    type IntoIter = std::slice::Iter<'a, f32>;
+
+    /// Enables direct iteration over the wrapped data.
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 impl DirtyCounts {
@@ -65,9 +76,20 @@ impl DirtyCounts {
         CleanCounts(self.0)
     }
 }
+
 impl Deref for DirtyCounts {
     type Target = [u32];
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<'a> IntoIterator for &'a DirtyCounts {
+    type Item = &'a u32;
+    type IntoIter = std::slice::Iter<'a, u32>;
+
+    /// Enables direct iteration over the wrapped data.
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 impl DirtyCorrections {
@@ -77,9 +99,20 @@ impl DirtyCorrections {
         CleanCorrections(self.0)
     }
 }
+
 impl Deref for DirtyCorrections {
     type Target = [f32];
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<'a> IntoIterator for &'a DirtyCorrections {
+    type Item = &'a f32;
+    type IntoIter = std::slice::Iter<'a, f32>;
+
+    /// Enables direct iteration over the wrapped data.
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 impl CleanScores {
