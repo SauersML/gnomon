@@ -278,23 +278,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // 1. Determine L3 Cache Size, with a robust fallback.
     const FALLBACK_L3_CACHE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
-    
-    // Chain .and_then() to treat a size of 0 as a detection failure.
-    // This correctly handles both None and Some(0) as cases for the fallback.
+    const MINIMUM_PLAUSIBLE_L3_CACHE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+
+    // Attempt to detect the L3 cache size. If the detected size is too small to be a
+    // plausible L3 cache (common in virtualized environments), treat it as a
+    // detection failure and use the safe fallback value.
     let l3_cache_bytes = cache_size::l3_cache_size()
-        .and_then(|size| if size > 0 { Some(size) } else { None })
+        .and_then(|size| {
+            if size >= MINIMUM_PLAUSIBLE_L3_CACHE_BYTES {
+                Some(size)
+            } else {
+                // A detected size that is non-zero but smaller than the minimum plausible
+                // size is logged as a warning before reverting to the fallback.
+                eprintln!(
+                    "> Warning: Detected cache size ({} KiB) is implausibly small for L3. Reverting to fallback.",
+                    size / 1024
+                );
+                None
+            }
+        })
         .unwrap_or_else(|| {
             eprintln!(
-                "> L3 cache size not detected or is 0. Using safe fallback: {} MiB.",
+                "> L3 cache size not detected or is implausible. Using safe fallback: {} MiB.",
                 FALLBACK_L3_CACHE_BYTES / 1024 / 1024
             );
             FALLBACK_L3_CACHE_BYTES
         });
-    
-    // This prints the cache size *actually being used* for the calculation.
+
+    // This prints the cache size actually being used for the calculation, using
+    // floating-point division for accuracy and including the raw byte count for clarity.
     eprintln!(
-        "> Using L3 cache size for optimization: {} MiB",
-        l3_cache_bytes / 1024 / 1024
+        "> Using L3 cache size for optimization: {:.2} MiB ({} bytes)",
+        l3_cache_bytes as f64 / (1024.0 * 1024.0),
+        l3_cache_bytes
     );
 
     // 2. Get data parameters from the `prep_result`.
