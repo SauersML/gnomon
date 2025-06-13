@@ -26,9 +26,6 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::simd::{cmp::SimdPartialEq, num::SimdUint, Simd};
 use thread_local::ThreadLocal;
-#[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicBool, Ordering};
-
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
