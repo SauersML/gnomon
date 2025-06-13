@@ -266,18 +266,34 @@ def run_and_validate_tools():
 
     def analyze_and_compare_results():
         _print_header("Step D: Analyzing and Comparing Results")
+        
+        def _debug_print_df(df: pd.DataFrame, name: str):
+            """Helper to print dataframe info for debugging."""
+            print(f"\n--- DEBUG: Loaded '{name}' ---")
+            print("Columns:", df.columns.tolist())
+            print("Shape:", df.shape)
+            print(df.head(3).to_markdown(index=False, floatfmt=".6f"))
+            print("-" * 30)
+
         try:
-            truth_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t', comment='#')
-            truth_df = truth_df[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
+            truth_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')
+            _debug_print_df(truth_df_raw, "truth_df (raw)")
+            # --- FIX: Clean up the '#FID' column name that results from the above read ---
+            if '#FID' in truth_df_raw.columns:
+                truth_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            truth_df = truth_df_raw[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
+
+            gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t', comment='#')
+            _debug_print_df(gnomon_df_raw, "gnomon_df (raw)")
+            gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
+
+            plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\t', comment='#')
+            _debug_print_df(plink2_df_raw, "plink2_df (raw)")
+            plink2_df = plink2_df_raw[['IID', 'SCORE1_AVG']].rename(columns={'SCORE1_AVG': 'SCORE_PLINK2'})
             
-            gnomon_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t', comment='#')
-            gnomon_df = gnomon_df[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
-            
-            plink2_df = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\t', comment='#')
-            plink2_df = plink2_df[['IID', 'SCORE1_AVG']].rename(columns={'SCORE1_AVG': 'SCORE_PLINK2'})
-        except FileNotFoundError as e:
-            print(f"  > ❌ ERROR: Could not find a result file: {e.filename}. Aborting comparison.")
-            return
+        except (FileNotFoundError, KeyError) as e:
+            print(f"  > ❌ ERROR: Failed to load or parse a result file. Error: {e}. Aborting comparison.")
+            sys.exit(1)
 
         merged_df = pd.merge(truth_df, gnomon_df, on='IID').merge(plink2_df, on='IID')
         score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2']
@@ -299,6 +315,8 @@ def run_and_validate_tools():
             print("\n✅ Validation Successful: All tools produced scores identical to the ground truth.")
         else:
             print("\n⚠️ Validation Warning: Significant differences detected.")
+            # Fail the job if differences are detected
+            sys.exit(1)
 
     # --- Main execution flow for this function ---
     setup_tools()
