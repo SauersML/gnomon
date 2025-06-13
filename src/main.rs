@@ -342,7 +342,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         break 'producer;
                     }
                 }
-                Ok((new_reader, unused_buffer, None)) => {
+                Ok((_new_reader, unused_buffer, None)) => {
                     // EOF. The reader is now exhausted.
                     // The buffer we received was not used by the factory. We drop it.
                     // The producer loop can now terminate.
