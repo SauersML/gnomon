@@ -43,17 +43,20 @@ PGS_SCORES = {
 #                                     HELPER FUNCTIONS
 # ========================================================================================
 def print_header(title: str, char: str = "="):
+    """Prints a formatted header to the console."""
     width = 80
     print("\n" + char * width, flush=True)
     print(f"{char*4} {title} {char*(width - len(title) - 6)}", flush=True)
     print(char * width, flush=True)
 
 def print_debug_header(title: str):
+    """Prints a smaller header for debug sections."""
     print("\n" + "." * 80, flush=True)
     print(f".... {title} ....", flush=True)
     print("." * 80, flush=True)
 
 def download_and_extract(url: str, dest_dir: Path):
+    """Downloads and extracts a file, handling .zip and .gz, and cleans up archives."""
     base = url.split('?')[0]
     filename = Path(base.split('/')[-1])
     outpath = dest_dir / filename
@@ -64,6 +67,7 @@ def download_and_extract(url: str, dest_dir: Path):
             with open(outpath, 'wb') as f: shutil.copyfileobj(r.raw, f)
     except Exception as e:
         print(f"❌ FAILED to download {url}: {e}", flush=True); sys.exit(1)
+    
     if outpath.suffix == '.zip':
         with zipfile.ZipFile(outpath, 'r') as z: z.extractall(dest_dir)
         print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True); outpath.unlink()
@@ -73,6 +77,7 @@ def download_and_extract(url: str, dest_dir: Path):
         print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
 def run_and_measure(cmd: list, name: str):
+    """Executes a command, streaming its output in real-time, and measures performance."""
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
@@ -94,22 +99,32 @@ def run_and_measure(cmd: list, name: str):
     return result
 
 def setup_environment():
+    """Downloads, extracts, renames, and sets permissions for all required binaries."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
+    
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
-                    p.rename(binary_path); p.chmod(0o755); print(f"[SCRIPT] Renamed and chmod: {binary_path}", flush=True); break
+                    if p != binary_path:
+                        p.rename(binary_path)
+                    binary_path.chmod(0o755)
+                    print(f"[SCRIPT] Configured and chmod: {binary_path}", flush=True)
+                    break
+    
     for zip_name in GENOTYPE_FILES: download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
     for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
+    """Creates a new, de-duplicated PLINK fileset where variant IDs are 'chr:pos'."""
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
     original_bim = original_prefix.with_suffix('.bim')
     bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
+    
     bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
+    
     duplicate_pos = bim_df[bim_df.duplicated(subset=['chr_pos_id'], keep=False)]
     variants_to_exclude = set(duplicate_pos['rsid'])
     variants_to_rename = bim_df[~bim_df['rsid'].isin(variants_to_exclude)]
@@ -132,6 +147,7 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     print(f"[SCRIPT] Successfully created synchronized fileset at: {final_prefix}", flush=True)
 
 def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
+    """Creates a unified scorefile where the variant ID is 'chr:pos'."""
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
     df.dropna(inplace=True)
@@ -155,7 +171,6 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
     }
     
-    # 1. Load data from successful runs
     data_frames = []
     num_variants = 0
     for res in pgs_run_results:
@@ -165,46 +180,47 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         if not path or not path.exists(): continue
         
         try:
-            df = None
+            df_raw = pd.read_csv(path, sep='\s+')
+            # Robustly find the ID column
+            id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
+            
             if tool_name == 'gnomon':
-                df_raw = pd.read_csv(path, sep='\t')
                 avg_col = next((c for c in df_raw.columns if '_AVG' in c), None)
                 miss_pct_col = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
-                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns not found")
+                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns _AVG or _MISSING_PCT not found")
                 
-                match = re.search(r'\((\d+)v\)', avg_col)
-                if not match: raise ValueError("Could not parse total variants from gnomon header")
+                # Robustly get variant count from stdout
+                match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
+                if not match: raise ValueError("Could not parse variant count from gnomon stdout")
                 total_vars_in_score = float(match.group(1))
                 if num_variants == 0: num_variants = int(total_vars_in_score)
                 
                 df_raw[f'SCORE_{tool_name}'] = df_raw[avg_col] * (total_vars_in_score * (1 - df_raw[miss_pct_col] / 100.0))
-                df = df_raw[['#IID', f'SCORE_{tool_name}']].rename(columns={'#IID': 'IID'})
+                df = df_raw[[id_col, f'SCORE_{tool_name}']].rename(columns={id_col: 'IID'})
             
             elif tool_name == 'plink1':
-                df = pd.read_csv(path, sep='\s+')[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
-                match = re.search(r'(\d+) valid predictors loaded', res['stdout'])
+                df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
+                match = re.search(r'(\d+)\s+valid\s+predictors', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
 
             elif tool_name == 'plink2':
-                df_raw = pd.read_csv(path, sep='\s+')
                 score_sum_col = next((c for c in df_raw.columns if '_SUM' in c), None)
                 if not score_sum_col: raise KeyError("PLINK2 SCORE_SUM column not found")
-                df = df_raw[['#IID', score_sum_col]].rename(columns={'#IID': 'IID', score_sum_col: f'SCORE_{tool_name}'})
-                match = re.search(r'(\d+) variants processed', res['stdout'])
+                df = df_raw[[id_col, score_sum_col]].rename(columns={id_col: 'IID', score_sum_col: f'SCORE_{tool_name}'})
+                match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
             
-            if df is not None: data_frames.append(df)
+            if 'df' in locals() and df is not None: data_frames.append(df)
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
     if len(data_frames) < 2: return summary
     
-    # 2. Merge and calculate metrics
     merged_df = data_frames[0]
     for df_to_merge in data_frames[1:]:
         merged_df = pd.merge(merged_df, df_to_merge, on='IID', how='inner')
     
-    score_cols = [c for c in merged_df.columns if c.startswith('SCORE_')]
+    score_cols = sorted([c for c in merged_df.columns if c.startswith('SCORE_')])
     if len(score_cols) < 2: return summary
 
     summary['n_variants_used'] = num_variants
@@ -214,11 +230,8 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     mad_results, mrd_results = {}, {}
     for col1, col2 in combinations(score_cols, 2):
         key = f"{col1.replace('SCORE_', '')}_vs_{col2.replace('SCORE_', '')}"
-        # Mean Absolute Difference
         mad_results[key] = (merged_df[col1] - merged_df[col2]).abs().mean()
-        # Mean Relative Difference
         denominator = (merged_df[col1].abs() + merged_df[col2].abs())
-        # Avoid division by zero where both scores are zero
         valid_rows = denominator > 1e-9
         mrd = (2 * (merged_df.loc[valid_rows, col1] - merged_df.loc[valid_rows, col2]).abs() / denominator[valid_rows]).mean()
         mrd_results[key] = mrd if not np.isnan(mrd) else 0.0
@@ -232,16 +245,15 @@ def print_final_summary(summary_data: list, performance_results: list):
     """Prints a single, comprehensive summary report at the end of the run."""
     print_header("FINAL TEST & BENCHMARKING REPORT", "*")
 
-    # --- Part 1: Per-PGS Score Analysis ---
     for pgs_summary in summary_data:
         pgs_id = pgs_summary['pgs_id']
         print_header(f"Analysis for {pgs_id}", "=")
         
-        if not pgs_summary['success']:
+        if not pgs_summary.get('success', False):
             print(f"❌ Analysis for {pgs_id} could not be completed due to failed runs or parsing errors.")
             continue
 
-        print(f"✅ Concordance established using {pgs_summary['n_variants_used']:,} variants.")
+        print(f"✅ Concordance established using {pgs_summary.get('n_variants_used', 'N/A'):,} variants.")
 
         print_debug_header("Sample of Computed SUM Scores")
         print(pgs_summary['sample_scores'].to_markdown(index=False, floatfmt=".6f"))
@@ -258,7 +270,6 @@ def print_final_summary(summary_data: list, performance_results: list):
         mrd_df['Difference (%)'] *= 100
         print(mrd_df.to_markdown(floatfmt=".6f"))
 
-    # --- Part 2: Performance Summary ---
     print_header("Performance Summary", "=")
     if performance_results:
         df = pd.DataFrame([r for r in performance_results if r['success']])
@@ -272,8 +283,6 @@ def print_final_summary(summary_data: list, performance_results: list):
             print(summary.to_markdown(index=False, floatfmt='.3f'))
         else:
             print("No successful tool runs to summarize performance.")
-    else:
-        print("No results to summarize.")
 
 def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
@@ -285,7 +294,6 @@ def main():
         print_header(f"TESTING SCORE: {pgs_id}", "~")
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         pgs_run_results = []
-
         unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
         
         gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(SHARED_GENOTYPE_PREFIX)]
@@ -305,11 +313,9 @@ def main():
         all_results.append(res_p1); pgs_run_results.append(res_p1)
         if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
 
-        # Analyze and collect summary data for this PGS run
         pgs_summary = analyze_pgs_results(pgs_id, pgs_run_results)
         final_summary_data.append(pgs_summary)
 
-    # --- Print the final consolidated report ---
     print_final_summary(final_summary_data, all_results)
 
     print_header(f"CI CHECK {'FAILED' if failures else 'PASSED'}", "*")
