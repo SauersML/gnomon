@@ -12,6 +12,7 @@
 // chunk of genotype data, pivot it into a person-major tile, generate a sparse
 // index of non-zero work, and dispatch it to the kernel. It performs ZERO
 // scientific logic or reconciliation. We don't support over 100 scores yet.
+// It will panic / overflow if we try.
 
 use crate::kernel;
 use crate::types::{CleanCounts, CleanCorrections, CleanScores};
