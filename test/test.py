@@ -54,21 +54,25 @@ def print_debug_header(title: str):
     print("." * 80, flush=True)
 
 def download_and_extract(url: str, dest_dir: Path):
+    """Downloads and extracts a file, handling .zip and .gz, and cleans up archives."""
     base = url.split('?')[0]
     filename = Path(base.split('/')[-1])
     outpath = dest_dir / filename
+    print(f"[SCRIPT] Downloading {filename}...", flush=True)
     try:
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(outpath, 'wb') as f: shutil.copyfileobj(r.raw, f)
     except Exception as e:
         print(f"❌ FAILED to download {url}: {e}", flush=True); sys.exit(1)
+    
     if outpath.suffix == '.zip':
         with zipfile.ZipFile(outpath, 'r') as z: z.extractall(dest_dir)
+        print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True); outpath.unlink()
     elif outpath.suffix == '.gz':
         dest = dest_dir / filename.stem
         with gzip.open(outpath, 'rb') as f_in, open(dest, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-        outpath.unlink()
+        print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
 def run_and_measure(cmd: list, name: str):
     print_header(f"RUNNING: {name}", char='-')
@@ -92,15 +96,26 @@ def run_and_measure(cmd: list, name: str):
     return result
 
 def setup_environment():
+    """Downloads, extracts, renames, and sets permissions for all required binaries."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
+    
+    # This logic is now restored and corrected
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
-        if not binary_path.exists(): print(f"[SCRIPT] Downloading {binary_path.name}..."); download_and_extract(url, CI_WORKDIR)
-        for p in CI_WORKDIR.iterdir():
-            if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
-                p.rename(binary_path); p.chmod(0o755); print(f"[SCRIPT] Renamed and chmod: {binary_path}", flush=True); break
-    for zip_name in GENOTYPE_FILES: print(f"[SCRIPT] Downloading {zip_name}..."); download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-    for url in PGS_SCORES.values(): print(f"[SCRIPT] Downloading {Path(url).name}..."); download_and_extract(url, CI_WORKDIR)
+        if not binary_path.exists():
+            download_and_extract(url, CI_WORKDIR)
+            # Find the extracted binary and give it the correct name and permissions
+            for p in CI_WORKDIR.iterdir():
+                # Match based on the start of the binary name (e.g., 'plink' or 'plink2')
+                if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
+                    if p != binary_path:
+                        p.rename(binary_path)
+                    binary_path.chmod(0o755) # Correctly chmod the DESTINATION path
+                    print(f"[SCRIPT] Configured and chmod: {binary_path}", flush=True)
+                    break
+    
+    for zip_name in GENOTYPE_FILES: download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
+    for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
@@ -144,7 +159,6 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     return out_path
 
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
-    """Analyzes results for a single PGS, calculating all comparison metrics."""
     summary = {'pgs_id': pgs_id, 'success': False}
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
@@ -169,7 +183,6 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
                 miss_pct_col = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
                 if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns not found")
                 
-                # Robustly get variant count from stdout
                 match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
                 if not match: raise ValueError("Could not parse variant count from gnomon stdout")
                 total_vars_in_score = float(match.group(1))
@@ -222,7 +235,6 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     return summary
 
 def print_final_summary(summary_data: list, performance_results: list):
-    """Prints a single, comprehensive summary report at the end of the run."""
     print_header("FINAL TEST & BENCHMARKING REPORT", "*")
 
     for pgs_summary in summary_data:
