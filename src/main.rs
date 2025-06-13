@@ -452,20 +452,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
 
         // --- Lean Aggregation Step ---
-        // The loops are simplified using Deref coercion. The compiler automatically
-        // converts `&partial_scores` (a `&DirtyScores`) into a slice reference
-        // (`&[f32]`) for the `.zip()` method, making the explicit `&*` unnecessary.
-        // This is a zero-cost abstraction that improves readability with no
-        // performance penalty.
-
+        // The `Dirty*` wrapper types implement `IntoIterator`, which allows them to
+        // be used directly in functions like `.zip()` that expect an iterator.
         for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) {
             *master += partial;
         }
-
         for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
             *master += partial;
         }
-
         for (master, &partial) in all_correction_sums.iter_mut().zip(&partial_correction_sums) {
             *master += partial;
         }
