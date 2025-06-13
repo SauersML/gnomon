@@ -14,6 +14,35 @@ use std::path::{Path, PathBuf};
 //                                   PUBLIC API
 // ========================================================================================
 
+/// Checks if a file appears to be in the gnomon-native format by inspecting its header.
+/// This is a fast, best-effort check to avoid unnecessary reformatting.
+pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    // Scan past any comment lines at the beginning of the file.
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            // File is empty or only contains comments, not a valid native file.
+            return Ok(false);
+        }
+        if !line.starts_with('#') {
+            // Found the first non-comment line, which should be the header.
+            break;
+        }
+    }
+
+    // Check if the header matches the expected native format.
+    let header = line.trim();
+    if header.starts_with("snp_id	effect_allele	other_allele	") {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Errors that can occur during PGS-to-gnomon reformatting.
 #[derive(Debug)]
 pub enum ReformatError {
