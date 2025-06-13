@@ -236,11 +236,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
     let resource_alloc_start = Instant::now();
+
+    // This block of code adds detailed timing points for the resource allocation phase.
+    let t0 = Instant::now();
+
     let num_scores = prep_result.score_names.len();
     let result_buffer_size = prep_result.num_people_to_score * num_scores;
     let mut all_scores = vec![0.0f32; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
     let mut all_correction_sums = vec![0.0f32; result_buffer_size];
+
+    let t1 = Instant::now();
 
     // Initialize the final scores buffer with the dosage-independent base scores.
     // The kernel will then compute the dosage-dependent deltas which are aggregated.
@@ -248,8 +254,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         person_scores_slice.copy_from_slice(&prep_result.base_scores);
     }
 
+    let t2 = Instant::now();
+
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
+
+    #[cfg(debug_assertions)]
+    let t3 = Instant::now();
 
     // GOAL: Find the largest I/O Chunk Size that produces a compute `tile` that
     //       fits within the L3 cache, thus co-optimizing I/O and compute.
@@ -305,6 +316,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             FALLBACK_L3_CACHE_BYTES
         });
 
+    let t4 = Instant::now();
+
     // This prints the cache size actually being used for the calculation, using
     // floating-point division for accuracy and including the raw byte count for clarity.
     eprintln!(
@@ -335,18 +348,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
-    // 4. Apply practical guardrails to the optimal value.
-    let sys = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_memory(MemoryRefreshKind::everything()),
-    );
-    let available_mem = sys.available_memory();
-    
+    let t5 = Instant::now();
+
+    // 4. Apply practical guardrails to the optimal value. We assume sufficient RAM
+    // and apply a fixed upper and lower bound for stability and I/O efficiency.
     const DYNAMIC_MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB floor for I/O efficiency.
-    let ram_based_max_chunk_size = available_mem / 2; // Cap at 50% of available RAM to be safe.
-    
+    const ABSOLUTE_MAX_CHUNK_SIZE: u64 = 512 * 1024 * 1024; // 512 MB fixed safety cap.
+
     let chunk_size_bytes = optimal_chunk_size
-        .clamp(DYNAMIC_MIN_CHUNK_SIZE, ram_based_max_chunk_size) as usize;
+        .clamp(DYNAMIC_MIN_CHUNK_SIZE, ABSOLUTE_MAX_CHUNK_SIZE) as usize;
+
+    let t6 = Instant::now();
 
     const PIPELINE_DEPTH: usize = 2;
     let partial_result_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
@@ -359,8 +371,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             ))
             .unwrap();
     }
+
+    let t7 = Instant::now();
+
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<IoMessage>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
+
+    let t8 = Instant::now();
+
+    {
+        eprintln!("[Allocation Benchmark]");
+        eprintln!("  - Main result buffer alloc:      {:.2?}", t1 - t0);
+        eprintln!("  - Main result buffer init:       {:.2?}", t2 - t1);
+        eprintln!("  - Basic worker pools alloc:      {:.2?}", t3 - t2);
+        eprintln!("  - L3 cache detection:            {:.2?}", t4 - t3);
+        eprintln!("  - Chunk size formula calc:       {:.2?}", t5 - t4);
+        eprintln!("  - Chunk size clamping:           {:.2?}", t6 - t5);
+        eprintln!("  - Partial result pool alloc:     {:.2?}", t7 - t6);
+        eprintln!("  - Pipeline channels setup:       {:.2?}", t8 - t7);
+    }
 
     eprintln!(
         "> Resource allocation complete in {:.2?}. Determined I/O chunk size to {} MB and pipeline depth to {}",
