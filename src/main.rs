@@ -14,7 +14,7 @@ use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
 use gnomon::io::SnpChunkReader;
 use gnomon::io::SnpChunk;
-use gnomon::prepare::{self, PrepError};
+use gnomon::prepare;
 use gnomon::reformat;
 use std::error::Error;
 use std::ffi::OsString;
@@ -474,7 +474,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let matrix_row_end = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_end);
 
         if matrix_row_end == matrix_row_start {
-            if empty_buffer_tx.send(full_buffer).await.is_err() { break; }
+            // This chunk contains no variants relevant to the calculation.
+            // Skip computation and immediately recycle the buffer by sending it back.
+            if empty_buffer_tx.send(chunk.buffer).await.is_err() {
+                break;
+            }
             bed_row_offset += snps_in_chunk;
             continue;
         }
