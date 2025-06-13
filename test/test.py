@@ -8,9 +8,8 @@ import sys
 import os
 from pathlib import Path
 from itertools import combinations
-
 import pandas as pd
-import numpy asnp
+import numpy as np
 import psutil
 
 # ========================================================================================
