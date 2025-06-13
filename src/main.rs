@@ -563,15 +563,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
 
         // --- Lean Aggregation Step ---
-        // Deref coercion allows us to treat the wrapper types as slices for iteration.
-        for (master, partial) in all_scores.iter_mut().zip(&partial_scores) {
-            *master += *partial;
+        // By explicitly dereferencing the wrapper types into slices, we can iterate over them.
+        for (master, &partial) in all_scores.iter_mut().zip(&*partial_scores) {
+            *master += partial;
         }
-        for (master, partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
-            *master += *partial;
+        for (master, &partial) in all_missing_counts.iter_mut().zip(&*partial_missing_counts) {
+            *master += partial;
         }
-        for (master, partial) in all_correction_sums.iter_mut().zip(&partial_correction_sums) {
-            *master += *partial;
+        for (master, &partial) in all_correction_sums.iter_mut().zip(&*partial_correction_sums) {
+            *master += partial;
         }
         
         // Recycle the I/O buffer to the producer.
