@@ -14,8 +14,18 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
+/// A self-contained, validated chunk of SNP-major data.
+///
+/// The existence of this struct is a guarantee that `buffer.len()` is a
+/// multiple of `bytes_per_snp` and that `num_snps` is correct. This makes
+/// inconsistent states unrepresentable in the rest of the application.
+pub struct SnpChunk {
+    pub buffer: Vec<u8>,
+    pub num_snps: usize,
+}
+
 /// A high-performance reader for moving raw, sequential chunks of data from a
-/// memory-mapped .bed file.
+/// memory-mapped .bed file. It acts as a factory for producing valid `SnpChunk`s.
 pub struct SnpChunkReader {
     /// A memory map of the entire .bed file. This provides a zero-cost "view" of
     /// the file on disk, not data loaded into RAM.
@@ -88,52 +98,64 @@ impl SnpChunkReader {
         })
     }
 
-    /// Reads the next chunk of raw SNP data into the provided buffer.
+    /// Reads the next chunk of SNP data, producing a validated `SnpChunk`.
     ///
-    /// This method is allocation-free and synchronous. The caller owns and provides the buffer,
-    /// and this function simply fills it with bytes from the memory map via `memcpy`.
+    /// This is a "smart factory" method. It takes a mutable buffer to use for I/O,
+    /// fills it with a non-partial amount of SNP data, and returns a type-safe
+    /// struct that guarantees correctness.
     ///
     /// # Arguments
-    /// * `buf`: A mutable slice representing the destination buffer.
+    /// * `buf`: A mutable `Vec` which will be used for the read. Its capacity
+    ///          is respected. The method takes ownership of the buffer's memory
+    ///          via `std::mem::take`, leaving an empty `Vec` in its place.
     ///
     /// # Returns
-    /// A `Result` containing the number of bytes read. A value of `Ok(0)`
-    /// indicates that the end of the file has been reached (EOF).
-    pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    /// * `Ok(Some(SnpChunk))`: On a successful read.
+    /// * `Ok(None)`: If the end of the file is reached.
+    /// * `Err(e)`: On an I/O error.
+    pub fn read_next_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<SnpChunk>> {
         if self.cursor >= self.file_size {
-            return Ok(0);
+            return Ok(None); // Graceful EOF
         }
 
         let bytes_remaining = self.file_size - self.cursor;
-        let bytes_to_copy = (buf.len() as u64).min(bytes_remaining) as usize;
+        let max_bytes_to_read = (buf.capacity() as u64).min(bytes_remaining) as usize;
 
-        let src_end = self.cursor as usize + bytes_to_copy;
-        let src_slice = &self.mmap[self.cursor as usize..src_end];
-        let dest_slice = &mut buf[..bytes_to_copy];
-
-        dest_slice.copy_from_slice(src_slice);
-
-        self.cursor += bytes_to_copy as u64;
-
-        Ok(bytes_to_copy)
-    }
-
-    /// Calculates the number of SNPs contained within a given number of bytes.
-    ///
-    /// This method is the public face of the file format's layout logic. By
-    /// providing this, we prevent the orchestrator in `main.rs` from needing to
-    /// know these low-level details.
-    #[inline]
-    pub fn snps_in_bytes(&self, num_bytes: usize) -> usize {
-        if self.bytes_per_snp == 0 {
-            return 0;
+        if max_bytes_to_read == 0 {
+            return Ok(None);
         }
-        num_bytes / self.bytes_per_snp as usize
-    }
 
-    /// Returns the number of bytes per SNP for this specific .bed file.
-    #[inline]
-    pub fn bytes_per_snp(&self) -> u64 {
-        self.bytes_per_snp
+        // Round down to the nearest whole SNP. This is the core of the correctness guarantee.
+        let num_snps = if self.bytes_per_snp > 0 {
+            max_bytes_to_read / self.bytes_per_snp as usize
+        } else {
+            0
+        };
+
+        if num_snps == 0 {
+            // Not enough space in the remaining file for even one full SNP.
+            return Ok(None);
+        }
+
+        let final_bytes_to_copy = num_snps * self.bytes_per_snp as usize;
+
+        // Take ownership of the buffer's allocation, leaving an empty vector behind.
+        let mut owned_buf = std::mem::take(buf);
+        // Use unsafe set_len because we are about to fill it. This is faster than resize.
+        unsafe {
+            owned_buf.set_len(final_bytes_to_copy);
+        }
+
+        let src_end = self.cursor as usize + final_bytes_to_copy;
+        let src_slice = &self.mmap[self.cursor as usize..src_end];
+
+        owned_buf.copy_from_slice(src_slice);
+
+        self.cursor += final_bytes_to_copy as u64;
+
+        Ok(Some(SnpChunk {
+            buffer: owned_buf,
+            num_snps,
+        }))
     }
 }
