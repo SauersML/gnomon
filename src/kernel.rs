@@ -10,7 +10,7 @@
 // zero scientific logic, branches, or decisions.
 
 use crate::types::MatrixRowIndex;
-use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd, StdFloat};
+use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -121,7 +121,7 @@ impl<'a> PaddedInterleavedFlags<'a> {
     #[inline(always)]
     unsafe fn get_simd_lane_unchecked(&self, row_idx: usize, lane_idx: usize) -> Simd<u8, 8> {
         let offset = (row_idx * self.stride) + (lane_idx * LANE_COUNT);
-        Simd::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT))
+        unsafe { Simd::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
     }
 }
 
@@ -179,7 +179,7 @@ pub fn accumulate_scores_for_person(
 
                 // Use a single, branchless instruction (e.g., blendvps) to select
                 // the correct contribution for each of the 8 lanes.
-                let contribution = flip_mask.select(contrib_flipped, contrib_regular);
+                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
 
                 *accumulator_buffer.get_unchecked_mut(i) += contribution;
             }
@@ -201,7 +201,7 @@ pub fn accumulate_scores_for_person(
                 // For dosage=2, the flipped contribution is (2-2)*w = 0.
                 let contrib_flipped = SimdVec::splat(0.0);
 
-                let contribution = flip_mask.select(contrib_flipped, contrib_regular);
+                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
 
                 *accumulator_buffer.get_unchecked_mut(i) += contribution;
             }
