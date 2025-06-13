@@ -226,12 +226,35 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix)
         prs_results[prs_cols_ordered].to_csv(f, sep='\t', header=False, index=False, na_rep='NA')
     print(f"...PRS results written to {sscore_filename}")
     
-    # --- b. Write Scorefile ---
+    # --- b. Write Scorefile (for PLINK2 compatibility) ---
     scorefile_filename = f"{prefix}.score"
     score_df = variants_df[['chr', 'pos', 'effect_allele', 'effect_weight']].copy()
     score_df.rename(columns={'chr': 'chr_name', 'pos': 'chr_position'}, inplace=True)
     score_df.to_csv(scorefile_filename, sep='\t', index=False)
-    print(f"...Scorefile written to {scorefile_filename}")
+    print(f"...Scorefile for PLINK written to {scorefile_filename}")
+
+    # --- b2. Write Gnomon-native Scorefile ---
+    gnomon_scorefile_filename = f"{prefix}.gnomon.score"
+    gnomon_df = variants_df[['chr', 'pos', 'ref', 'alt', 'effect_allele', 'effect_weight']].copy()
+    
+    # 1. Create the 'snp_id' column in chr:pos format.
+    gnomon_df['snp_id'] = gnomon_df['chr'].astype(str) + ':' + gnomon_df['pos'].astype(str)
+    
+    # 2. Determine the 'other_allele'.
+    gnomon_df['other_allele'] = np.where(
+        gnomon_df['effect_allele'] == gnomon_df['ref'],
+        gnomon_df['alt'],
+        gnomon_df['ref']
+    )
+    
+    # 3. Rename the weight column to a score name.
+    gnomon_df.rename(columns={'effect_weight': 'simulated_score'}, inplace=True)
+    
+    # 4. Select and order columns for the final native format.
+    final_gnomon_df = gnomon_df[['snp_id', 'effect_allele', 'other_allele', 'simulated_score']]
+    
+    final_gnomon_df.to_csv(gnomon_scorefile_filename, sep='\t', index=False)
+    print(f"...Gnomon-native scorefile written to {gnomon_scorefile_filename}")
 
     # --- c. Write PLINK BED/BIM/FAM files ---
     # --- .fam file ---
@@ -454,9 +477,9 @@ def run_and_validate_tools():
     prepare_plink_compatible_files()
 
     # --- Step C: Run Scoring Tools ---
-    # Gnomon uses original files (it's more flexible)
+    # Gnomon uses the new, native-format score file we just created.
     run_command(
-        [str(GNOMON_BINARY_PATH), "--score", f"{OUTPUT_PREFIX}.score", OUTPUT_PREFIX],
+        [str(GNOMON_BINARY_PATH), "--score", f"{OUTPUT_PREFIX}.gnomon.score", OUTPUT_PREFIX],
         "Gnomon"
     )
 
