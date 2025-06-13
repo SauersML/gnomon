@@ -9,7 +9,9 @@
 // maximum throughput on many-core systems. It correctly handles and merges
 // multiple score files.
 
-use crate::types::{PersonSubset, PreparationResult};
+use crate::types::{
+    BimRowIndex, MatrixRowIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
+};
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -37,23 +39,19 @@ enum Reconciliation {
     Identity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct MatrixRowIndex(usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct ScoreColumnIndex(usize);
-
 #[derive(Clone)]
 struct BimRecord {
     allele1: String,
     allele2: String,
 }
 
+/// A temporary, internal representation of a single score definition for a
+/// variant, created during the reconciliation process.
 struct WorkItem {
     matrix_row: MatrixRowIndex,
     col_idx: ScoreColumnIndex,
-    aligned_weight: f32,
-    correction_constant: f32,
+    weight: f32,
+    is_flipped: bool,
 }
 
 // ========================================================================================
@@ -112,7 +110,7 @@ pub fn prepare_for_computation(
     let (bim_index, total_snps_in_bim) = index_bim_file(&bim_path)?;
     // Create a reverse map from the original bim file row index to its snp_id string.
     // This is used for fast, user-friendly error reporting if duplicates are found.
-    let bim_row_to_snp_id: AHashMap<usize, &str> = bim_index
+    let bim_row_to_snp_id: AHashMap<BimRowIndex, &str> = bim_index
         .iter()
         .flat_map(|(snp_id, records)| {
             records
@@ -127,11 +125,11 @@ pub fn prepare_for_computation(
         return Err(PrepError::NoOverlappingVariants);
     }
 
-    let mut required_bim_indices: Vec<usize> = required_bim_indices_set.into_iter().collect();
+    let mut required_bim_indices: Vec<BimRowIndex> = required_bim_indices_set.into_iter().collect();
     required_bim_indices.sort_unstable();
     let num_reconciled_variants = required_bim_indices.len();
 
-    let bim_row_to_matrix_row_typed =
+    let bim_row_to_matrix_row_map =
         build_bim_to_matrix_map(&required_bim_indices, total_snps_in_bim);
     let score_name_to_col_index: AHashMap<&str, ScoreColumnIndex> = score_names
         .iter()
@@ -150,7 +148,7 @@ pub fn prepare_for_computation(
                     // This is a single-pass state machine to find all valid matches for a score line.
 
                     let mut perfect_matches = Vec::new();
-                    let mut permissive_candidate: Option<&(BimRecord, usize)> = None;
+                    let mut permissive_candidate: Option<&(BimRecord, BimRowIndex)> = None;
                     let mut is_ambiguous = false;
 
                     // --- Single Pass ---
@@ -182,26 +180,20 @@ pub fn prepare_for_computation(
                                 *bim_row_index,
                                 effect_allele,
                                 weights,
-                                &bim_row_to_matrix_row_typed,
+                                &bim_row_to_matrix_row_map,
                                 &score_name_to_col_index,
                                 &mut work_for_position,
                             );
                         }
-
-
-                    // Imagine:
-                    // a `chr:pos` that has multiple definitions in the .bim file (e.g., a merged
-                    // dataset containing both an 'A/C' and an 'A/G' definition for 1:5000).
-                    // Could this create issues here?
                     } else if !is_ambiguous {
                         // Priority 2: Use the single, unambiguous permissive match.
                         if let Some((bim_record, bim_row_index)) = permissive_candidate {
-                             process_match(
+                            process_match(
                                 bim_record,
                                 *bim_row_index,
                                 effect_allele,
                                 weights,
-                                &bim_row_to_matrix_row_typed,
+                                &bim_row_to_matrix_row_map,
                                 &score_name_to_col_index,
                                 &mut work_for_position,
                             );
@@ -233,28 +225,15 @@ pub fn prepare_for_computation(
     }
 
     // --- Build the variant_to_scores_map (missingness blueprint) ---
-    let mut variant_to_scores_map: Vec<Vec<u16>> = vec![Vec::new(); num_reconciled_variants];
+    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
+        vec![Vec::new(); num_reconciled_variants];
     // This is a sequential grouping operation on the sorted `unique_pairs`, which is fast.
     for &(variant_row, score_col) in &unique_pairs {
         // `variant_row.0` is guaranteed to be a valid index by construction.
-        variant_to_scores_map[variant_row.0].push(score_col.0 as u16);
+        variant_to_scores_map[variant_row.0].push(score_col);
     }
 
-    // --- Build the sparse variant_to_corrections_map ---
-    // This map is critical for efficiently correcting scores when a flipped variant is missing.
-    let mut variant_to_corrections_map: Vec<Vec<(u16, f32)>> = vec![vec![]; num_reconciled_variants];
-    // We iterate over the sorted `work_items` to build the map efficiently.
-    work_items
-        .iter()
-        // We only care about items that have a non-zero correction constant.
-        .filter(|item| item.correction_constant != 0.0)
-        .for_each(|item| {
-            // `item.matrix_row.0` is guaranteed to be a valid index.
-            variant_to_corrections_map[item.matrix_row.0]
-                .push((item.col_idx.0 as u16, item.correction_constant));
-        });
-
-// --- STAGE 5: PARALLEL SORT & VALIDATION ---
+    // --- STAGE 5: PARALLEL SORT & VALIDATION ---
     eprintln!("> Pass 5: Sorting and validating work items...");
     // Sort by matrix row and then column index. This groups any potential duplicate
     // definitions for the same (variant, score) cell right next to each other,
@@ -285,48 +264,46 @@ pub fn prepare_for_computation(
     // --- STAGE 6: POPULATE COMPUTE STRUCTURES ---
     eprintln!("> Pass 6: Populating compute structures with maximum parallelism...");
 
-    // First, calculate the dosage-independent base scores by summing all correction
-    // constants from the entire set of work items. This is a fast, sequential pass.
-    let mut base_scores = vec![0.0f32; score_names.len()];
-    for item in &work_items {
-        base_scores[item.col_idx.0] += item.correction_constant;
-    }
-
-    // Second, populate the aligned weights matrix in parallel. This matrix only
-    // contains the dosage-dependent component of the score calculation.
+    // The stride is the padded row width of the matrices, ensuring each row
+    // begins on a SIMD-friendly memory boundary.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
-    let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
+    let matrix_size = num_reconciled_variants * stride;
 
-    aligned_weights_matrix
+    let mut weights_matrix = vec![0.0f32; matrix_size];
+    let mut flip_mask_matrix = vec![0u8; matrix_size];
+
+    // Populate both the weights and flip mask matrices in parallel.
+    // This is the O(N*K) workhorse of the preparation phase.
+    weights_matrix
         .par_chunks_mut(stride)
+        .zip(flip_mask_matrix.par_chunks_mut(stride))
         .enumerate()
-        .for_each(|(row_idx, weights_slice)| {
+        .for_each(|(row_idx, (weights_slice, flip_slice))| {
             let matrix_row = MatrixRowIndex(row_idx);
             let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
             let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
             let items_for_this_row = &work_items[first_item_pos..first_after_pos];
 
             for item in items_for_this_row {
-                weights_slice[item.col_idx.0] += item.aligned_weight;
+                let col = item.col_idx.0;
+                weights_slice[col] = item.weight;
+                if item.is_flipped {
+                    flip_slice[col] = 1;
+                }
             }
         });
 
     // --- FINAL CONSTRUCTION ---
-    let bim_row_to_matrix_row: Vec<Option<usize>> = bim_row_to_matrix_row_typed
-        .into_iter()
-        .map(|opt_idx| opt_idx.map(|idx| idx.0))
-        .collect();
     let bytes_per_snp = (total_people_in_fam as u64 + 3) / 4;
-    Ok(PreparationResult {
-        aligned_weights_matrix,
-        base_scores,
+    Ok(PreparationResult::new(
+        weights_matrix,
+        flip_mask_matrix,
         stride,
-        bim_row_to_matrix_row,
+        bim_row_to_matrix_row_map,
         required_bim_indices,
         score_names,
         score_variant_counts,
         variant_to_scores_map,
-        variant_to_corrections_map,
         person_subset,
         final_person_iids,
         num_people_to_score,
@@ -334,7 +311,7 @@ pub fn prepare_for_computation(
         total_snps_in_bim,
         num_reconciled_variants,
         bytes_per_snp,
-    })
+    ))
 }
 
 // ========================================================================================
@@ -346,14 +323,14 @@ pub fn prepare_for_computation(
 #[inline(always)]
 fn process_match(
     bim_record: &BimRecord,
-    bim_row_index: usize,
+    bim_row_index: BimRowIndex,
     effect_allele: &str,
     weights: &AHashMap<String, f32>,
-    bim_row_to_matrix_row_typed: &[Option<MatrixRowIndex>],
+    bim_row_to_matrix_row_map: &[Option<MatrixRowIndex>],
     score_name_to_col_index: &AHashMap<&str, ScoreColumnIndex>,
     work_for_position: &mut Vec<WorkItem>,
 ) {
-    if let Some(matrix_row) = bim_row_to_matrix_row_typed[bim_row_index] {
+    if let Some(matrix_row) = bim_row_to_matrix_row_map[bim_row_index.0] {
         let reconciliation = if effect_allele == &bim_record.allele2 {
             Reconciliation::Identity
         } else {
@@ -362,15 +339,12 @@ fn process_match(
 
         for (score_name, weight) in weights {
             if let Some(&col_idx) = score_name_to_col_index.get(score_name.as_str()) {
-                let (aligned_weight, correction_constant) = match reconciliation {
-                    Reconciliation::Identity => (*weight, 0.0),
-                    Reconciliation::Flip => (-(*weight), 2.0 * *weight),
-                };
+                let is_flipped = matches!(reconciliation, Reconciliation::Flip);
                 work_for_position.push(WorkItem {
                     matrix_row,
                     col_idx,
-                    aligned_weight,
-                    correction_constant,
+                    weight: *weight,
+                    is_flipped,
                 });
             }
         }
@@ -379,7 +353,7 @@ fn process_match(
 
 fn index_bim_file(
     bim_path: &Path,
-) -> Result<(AHashMap<String, Vec<(BimRecord, usize)>>, usize), PrepError> {
+) -> Result<(AHashMap<String, Vec<(BimRecord, BimRowIndex)>>, usize), PrepError> {
     let file = File::open(bim_path).map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
     let reader = BufReader::new(file);
     let mut bim_index = AHashMap::new();
@@ -404,7 +378,7 @@ fn index_bim_file(
             bim_index
                 .entry(key)
                 .or_insert_with(Vec::new)
-                .push((record, i));
+                .push((record, BimRowIndex(i)));
         }
     }
     Ok((bim_index, total_lines))
@@ -500,8 +474,8 @@ fn parse_and_group_score_file(
 /// Scans the inputs to find which variants are needed, also performing ambiguity checks.
 fn discover_required_bim_indices(
     score_map: &AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>>,
-    bim_index: &AHashMap<String, Vec<(BimRecord, usize)>>,
-) -> Result<BTreeSet<usize>, PrepError> {
+    bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
+) -> Result<BTreeSet<BimRowIndex>, PrepError> {
     let required_indices_results: Vec<_> = score_map
         .par_iter()
         .map(|(snp_id, score_lines)| {
@@ -565,13 +539,13 @@ fn discover_required_bim_indices(
 }
 
 fn build_bim_to_matrix_map(
-    required_bim_indices: &[usize],
+    required_bim_indices: &[BimRowIndex],
     total_bim_snps: usize,
 ) -> Vec<Option<MatrixRowIndex>> {
     let mut bim_row_to_matrix_row = vec![None; total_bim_snps];
     for (matrix_row_idx, &bim_row) in required_bim_indices.iter().enumerate() {
-        if bim_row < total_bim_snps {
-            bim_row_to_matrix_row[bim_row] = Some(MatrixRowIndex(matrix_row_idx));
+        if bim_row.0 < total_bim_snps {
+            bim_row_to_matrix_row[bim_row.0] = Some(MatrixRowIndex(matrix_row_idx));
         }
     }
     bim_row_to_matrix_row
