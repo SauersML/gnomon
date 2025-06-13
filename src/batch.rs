@@ -360,9 +360,10 @@ fn pivot_tile(
     let snps_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
     let bytes_per_snp = prep_result.bytes_per_snp;
 
-    // This maps a logical SNP index (0-7) to its physical byte position in a transposed person-vector.
-    // The shuffle pattern is an artifact of the 8x8 butterfly network transpose algorithm.
-    const SHUFFLE: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+    // Maps a desired sequential SNP index (0-7) to its physical source location within
+    // the shuffled vector produced by the `transpose_8x8_u8` function. This is used
+    // to "un-shuffle" the data into the correct sequential order in the tile.
+    const UNSHUFFLE_MAP: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
     for person_chunk_start in (0..num_people_in_block).step_by(SIMD_LANES) {
         let remaining_people = num_people_in_block - person_chunk_start;
@@ -412,24 +413,15 @@ fn pivot_tile(
                 let dest_offset = person_idx_in_block * snps_in_chunk + snp_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
 
-                if current_snps == SIMD_LANES {
-                    // FAST PATH: For full chunks, a direct memcpy is fastest.
-                    let dest_slice = &mut tile[dest_offset..dest_offset + SIMD_LANES];
-                    // SAFETY: The `EffectAlleleDosage` is repr(transparent) u8.
-                    let dest_u8: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            dest_slice.as_mut_ptr() as *mut u8,
-                            SIMD_LANES,
-                        )
-                    };
-                    dest_u8.copy_from_slice(&shuffled_person_row);
-                } else {
-                    // CORRECTNESS PATH: For partial chunks, un-shuffle the data byte by byte.
-                    // The compiler will unroll this tiny loop, making it extremely fast.
-                    for j in 0..current_snps {
-                        let correct_dosage = shuffled_person_row[SHUFFLE[j]];
-                        tile[dest_offset + j] = EffectAlleleDosage(correct_dosage);
-                    }
+                // UNIFIED PATH: Always un-shuffle the transposed vector to write sequential data.
+                // This loop is correct for both full and partial chunks. For `current_snps=8`,
+                // the compiler unrolls this into optimal, branch-free code
+                for j in 0..current_snps {
+                    let dosage_from_shuffled_pos = shuffled_person_row[UNSHUFFLE_MAP[j]];
+                    // SAFETY: `dest_offset + j` is guaranteed to be in-bounds by the loop condition
+                    // and the tile allocation size.
+                    *unsafe { tile.get_unchecked_mut(dest_offset + j) } =
+                        EffectAlleleDosage(dosage_from_shuffled_pos);
                 }
             }
         }
@@ -473,8 +465,8 @@ mod tests {
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
         // This map from a logical SNP index (0-7) to its physical byte position
-        // in a transposed person-vector is the hypothesis we are testing.
-        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        // in the transposed person-vector
+        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
         // 1. SETUP: Create a known 8x8 matrix of SNP-major data.
         // We use unique, traceable values: `(person_idx+1)*10 + (snp_idx+1)`.
