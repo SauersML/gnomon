@@ -205,7 +205,7 @@ def run_and_validate_tools():
     PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
     PLINK2_BINARY_PATH = WORKDIR / "plink2"
     # The gnomon binary is expected to be in the repo root relative to this script's execution
-    GNOMON_BINARY_PATH = Path("../target/release/gnomon").resolve()
+    GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
 
     def _print_header(title: str, char: str = "-"):
         width = 70
