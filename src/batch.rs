@@ -18,7 +18,7 @@ use crate::kernel;
 use crate::types::{CleanCounts, CleanScores, MatrixRowIndex};
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
-    PreparationResult, ScoreColumnIndex,
+    PreparationResult,
 };
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
