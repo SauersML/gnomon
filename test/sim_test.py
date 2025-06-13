@@ -276,15 +276,19 @@ def run_and_validate_tools():
             print("-" * 30)
 
         try:
+            # --- Load truth_df without `comment='#'` to read the header ---
             truth_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')
             _debug_print_df(truth_df_raw, "truth_df (raw)")
-            # --- FIX: Clean up the '#FID' column name that results from the above read ---
             if '#FID' in truth_df_raw.columns:
-                truth_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+                truth_df_raw.rename(columns={'#FID': 'IID'}, inplace=True)
             truth_df = truth_df_raw[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
 
-            gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t', comment='#')
+            # --- Load gnomon_df without `comment='#'` to read the header ---
+            gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t')
             _debug_print_df(gnomon_df_raw, "gnomon_df (raw)")
+            # --- Clean up the '#IID' column name if it exists ---
+            if '#IID' in gnomon_df_raw.columns:
+                gnomon_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
 
             plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\t', comment='#')
