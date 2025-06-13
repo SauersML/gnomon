@@ -23,7 +23,7 @@ crossbeam-queue = "0.3.12"
 sysinfo = "0.35.2"
 tokio = { version = "1.45.1", features = ["sync", "rt-multi-thread", "macros"] }
 num_cpus = "1.17.0"
-cache_size = "0.7.0"
+cache-size = "0.7.0"
 
 [profile.release]
 opt-level = 3
