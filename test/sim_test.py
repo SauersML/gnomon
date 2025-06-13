@@ -276,23 +276,28 @@ def run_and_validate_tools():
             print("-" * 30)
 
         try:
-            # --- Load truth_df without `comment='#'` to read the header ---
+            # --- Load truth_df ---
             truth_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')
             _debug_print_df(truth_df_raw, "truth_df (raw)")
             if '#FID' in truth_df_raw.columns:
-                truth_df_raw.rename(columns={'#FID': 'IID'}, inplace=True)
+                truth_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
             truth_df = truth_df_raw[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
 
-            # --- Load gnomon_df without `comment='#'` to read the header ---
+            # --- Load gnomon_df ---
             gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t')
             _debug_print_df(gnomon_df_raw, "gnomon_df (raw)")
-            # --- Clean up the '#IID' column name if it exists ---
             if '#IID' in gnomon_df_raw.columns:
                 gnomon_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
 
-            plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\t', comment='#')
+            # --- Load plink2_df with flexible separator and without ignoring the header ---
+            plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\s+')
             _debug_print_df(plink2_df_raw, "plink2_df (raw)")
+            # --- Clean up the '#IID' or '#FID' column name from PLINK2 output ---
+            if '#IID' in plink2_df_raw.columns:
+                plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
+            elif '#FID' in plink2_df_raw.columns:
+                plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
             plink2_df = plink2_df_raw[['IID', 'SCORE1_AVG']].rename(columns={'SCORE1_AVG': 'SCORE_PLINK2'})
             
         except (FileNotFoundError, KeyError) as e:
