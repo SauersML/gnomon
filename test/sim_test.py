@@ -195,47 +195,55 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 # Simple Dosage Test
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
     """
-    Runs a minimal, hardcoded test case with 1 variant and 3 individuals
-    (0/0, 0/1, 1/1) to verify basic dosage calculation.
+    Runs a minimal, hardcoded test case with 2 variants and 3 individuals.
+    This test verifies basic dosage calculation AND correct handling of a missing genotype.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
-    print("= Running Simple Dosage Test Case")
+    print("= Running Simple Dosage Test Case (with missingness)")
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
     # --- 1. Define Ground Truth and File Contents ---
+    # Manually calculated ground truth:
+    # Scores are averaged over non-missing variants for each person.
+    # Person 1 (hom_ref): (0*0.5 + 0*-0.2) / 2 = 0.0
+    # Person 2 (het):     (1*0.5) / 1 = 0.5  (variant 2 is missing)
+    # Person 3 (hom_alt): (2*0.5 + 2*-0.2) / 2 = (1.0 - 0.4) / 2 = 0.3
     truth_df = pd.DataFrame({
         'IID': ['id_hom_ref', 'id_het', 'id_hom_alt'],
-        'SCORE_TRUTH': [0.0, 0.5, 1.0] # (0*0.5)/1, (1*0.5)/1, (2*0.5)/1
+        'SCORE_TRUTH': [0.0, 0.5, 0.3]
     })
-    
+
     # --- 2. Write Input Files and Print Contents ---
     print("\n--- Writing Input Files ---")
-    variant_id = "1:1000" # Use CHR:POS as the canonical identifier
+    variant1_id = "1:1000"
+    variant2_id = "1:2000"
 
     # .fam file
     fam_content = "id_hom_ref id_hom_ref 0 0 0 -9\nid_het id_het 0 0 0 -9\nid_hom_alt id_hom_alt 0 0 0 -9\n"
     with open(prefix.with_suffix(".fam"), "w") as f:
         f.write(fam_content)
     print(f"\nContents of {prefix.with_suffix('.fam')}:\n---\n{fam_content.strip()}\n---")
-    
-    # .bim file - Use CHR:POS in the second column (variant ID)
-    bim_content = f"1\t{variant_id}\t0\t1000\tA\tG\n"
+
+    # .bim file - two variants
+    bim_content = f"1\t{variant1_id}\t0\t1000\tA\tG\n1\t{variant2_id}\t0\t2000\tC\tT\n"
     with open(prefix.with_suffix(".bim"), "w") as f:
         f.write(bim_content)
     print(f"\nContents of {prefix.with_suffix('.bim')}:\n---\n{bim_content.strip()}\n---")
-    
-    # score file - Use CHR:POS in the snp_id column
-    score_content = f"snp_id\teffect_allele\tother_allele\tsimple_score\n{variant_id}\tG\tA\t0.5\n"
+
+    # score file - two variants
+    score_content = (f"snp_id\teffect_allele\tother_allele\tsimple_score\n"
+                     f"{variant1_id}\tG\tA\t0.5\n"
+                     f"{variant2_id}\tT\tC\t-0.2\n")
     with open(prefix.with_suffix(".score"), "w") as f:
         f.write(score_content)
     print(f"\nContents of {prefix.with_suffix('.score')}:\n---\n{score_content.strip()}\n---")
 
-    # .bed file (magic bytes + 1 variant for 3 people)
-    # Genos: 0/0 (0b00), 0/1 (0b10), 1/1 (0b11).
-    # Byte is (padding)(ind3)(ind2)(ind1) -> 00111000 -> 0x38
-    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x38])
+    # .bed file (magic bytes + 2 variants for 3 people)
+    # Variant 1 Genos: 0/0 (0b00), 0/1 (0b10), 1/1 (0b11). Byte is 00111000 -> 0x38
+    # Variant 2 Genos: 0/0 (0b00), missing (0b01), 1/1 (0b11). Byte is 00110100 -> 0x34
+    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x38, 0x34])
     with open(prefix.with_suffix(".bed"), "wb") as f:
         f.write(bed_bytes)
     print(f"\nContents of {prefix.with_suffix('.bed')} (in hex):\n---\n{bed_bytes.hex()}\n---")
@@ -245,6 +253,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         [gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
         "Simple Gnomon Test", cwd=workdir
     )
+    # The 'no-mean-imputation' flag is critical here. It tells PLINK to treat missing
+    # genotypes as having zero contribution and to correctly adjust the denominator.
     run_cmd_func(
         [f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
         "Simple PLINK2 Test", cwd=workdir
@@ -260,11 +270,11 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     merged_df = pd.merge(truth_df, gnomon_results, on='IID').merge(plink_results, on='IID')
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
-    
+
     # --- 5. Final Validation ---
     is_gnomon_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
     is_plink_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_PLINK2'])
-    
+
     if is_gnomon_ok and is_plink_ok:
         print("\n✅ Simple Dosage Test Successful: All tools produced the correct scores.")
     else:
