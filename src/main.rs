@@ -224,6 +224,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut all_scores = vec![0.0f32; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
 
+    // Initialize the final scores buffer with the dosage-independent base scores.
+    // The kernel will then compute the dosage-dependent deltas which are aggregated.
+    for person_scores_slice in all_scores.chunks_mut(num_scores) {
+        person_scores_slice.copy_from_slice(&prep_result.base_scores);
+    }
+
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
@@ -394,19 +400,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     )
                 })?;
 
-            let corrections_for_chunk = prep_clone
-                .correction_constants_matrix
-                .get(matrix_slice_start..matrix_slice_end)
-                .ok_or_else(|| {
-                    Box::<dyn Error + Send + Sync>::from(
-                        "Internal error: Failed to slice correction constants matrix.",
-                    )
-                })?;
-
             batch::run_chunk_computation(
                 buffer_slice,
                 weights_for_chunk,
-                corrections_for_chunk,
                 &prep_clone,
                 &mut partial_scores_buffer,
                 &mut partial_missing_counts_buffer,

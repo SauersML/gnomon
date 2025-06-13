@@ -89,24 +89,24 @@ impl<'a> PaddedInterleavedWeights<'a> {
 //                              THE KERNEL IMPLEMENTATION
 // ========================================================================================
 
-/// Calculates all K scores for a single person using the "three-loop" strategy
-/// on pre-compiled data matrices and pre-computed sparse indices.
+/// Calculates the dosage-dependent component of all K scores for a single person
+/// using a "two-loop" strategy on the aligned weights matrix and sparse indices.
 ///
 /// This function is the heart of the compute engine. It is branch-free and
 /// performs a minimal number of predictable memory accesses, maximizing throughput.
+/// It calculates only the score delta from genotypes; any constant base score
+/// must be initialized in the output buffer beforehand.
 ///
 /// # Safety
 ///
 /// The caller must uphold the following contracts:
 /// - All indices in `g1_indices` and `g2_indices` must be valid row indices
-///   for the `aligned_weights` and `correction_constants` matrices.
-/// - The dimensions of both matrices must match.
+///   for the `aligned_weights` matrix.
 /// - `scores_out.len()` must be `== aligned_weights.num_scores()`.
 /// - `accumulator_buffer.len()` must be sufficient for the number of scores.
 #[inline]
 pub fn accumulate_scores_for_person(
     aligned_weights: &PaddedInterleavedWeights,
-    correction_constants: &PaddedInterleavedWeights,
     scores_out: &mut [f32],
     accumulator_buffer: &mut [SimdVec],
     g1_indices: &[usize],
@@ -139,19 +139,6 @@ pub fn accumulate_scores_for_person(
                 let weights_vec = aligned_weights.get_simd_lane_unchecked(matrix_row, i);
                 let acc = accumulator_buffer.get_unchecked_mut(i);
                 *acc = weights_vec.mul_add(dosage_2_multiplier, *acc);
-            }
-        }
-    }
-
-    // --- Loop 3: Add Correction Constants (C) for All Non-Zero Dosage Variants ---
-    // This loop adds the pre-computed `C` term from the formula `G*W' + C`.
-    // It runs over all variants that contributed to the score, ensuring correctness.
-    for &matrix_row in g1_indices.iter().chain(g2_indices.iter()) {
-        for i in 0..num_accumulator_lanes {
-            // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
-            unsafe {
-                let correction_vec = correction_constants.get_simd_lane_unchecked(matrix_row, i);
-                *accumulator_buffer.get_unchecked_mut(i) += correction_vec;
             }
         }
     }
