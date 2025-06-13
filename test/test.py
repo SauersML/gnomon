@@ -54,6 +54,22 @@ def print_debug_header(title: str):
     print("\n" + "." * 80, flush=True)
     print(f".... {title} ....", flush=True)
     print("." * 80, flush=True)
+    
+def print_file_head(file_path: Path):
+    """Prints the header and first 10 lines of a given file for verification."""
+    if not file_path.exists():
+        print(f"File not found: {file_path}", flush=True)
+        return
+    print_debug_header(f"HEAD OF: {file_path.name}")
+    try:
+        with open(file_path, 'r', errors='replace') as f:
+            for i, line in enumerate(f):
+                if i >= 10:
+                    break
+                print(f"  {line.strip()}", flush=True)
+    except Exception as e:
+        print(f"  Could not read file: {e}", flush=True)
+
 
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads and extracts a file, handling .zip and .gz, and cleans up archives."""
@@ -76,8 +92,8 @@ def download_and_extract(url: str, dest_dir: Path):
         with gzip.open(outpath, 'rb') as f_in, open(dest, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
         print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
-def run_and_measure(cmd: list, name: str):
-    """Executes a command, streaming its output in real-time, and measures performance."""
+def run_and_measure(cmd: list, name: str, out_prefix: Path):
+    """Executes a command, streams its output, and prints the head of all generated files."""
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
@@ -93,6 +109,10 @@ def run_and_measure(cmd: list, name: str):
     
     returncode = proc.wait()
     duration = time.perf_counter() - start
+    
+    for p in sorted(out_prefix.parent.glob(f"{out_prefix.name}.*")):
+        print_file_head(p)
+    
     result = {'tool': name, 'time_sec': duration, 'returncode': returncode, 'success': returncode == 0, 'stdout': "\n".join(output_lines)}
     if result['success']: print(f"✅ {name} finished in {duration:.2f}s.", flush=True)
     else: print(f"❌ {name} FAILED (Exit Code: {returncode})", flush=True)
@@ -159,6 +179,7 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     out_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
     print(f"[SCRIPT] Writing {len(final_df)} variants to unified score file: {out_path.name}", flush=True)
     final_df.to_csv(out_path, sep='\t', index=False)
+    print_file_head(out_path)
     return out_path
 
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
@@ -201,7 +222,6 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
                 match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
             
-            # Defensively convert the score column to a numeric type.
             if 'df' in locals() and df is not None:
                 df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
                 data_frames.append(df)
@@ -215,7 +235,6 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     for df_to_merge in data_frames[1:]:
         merged_df = pd.merge(merged_df, df_to_merge, on='IID', how='inner')
     
-    # Drop rows where any score is NaN after the numeric conversion
     score_cols = sorted([c for c in merged_df.columns if c.startswith('SCORE_')])
     merged_df.dropna(subset=score_cols, inplace=True)
     
@@ -286,6 +305,8 @@ def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
     create_synchronized_genotype_files(ORIGINAL_PLINK_PREFIX, SHARED_GENOTYPE_PREFIX)
+    print_file_head(SHARED_GENOTYPE_PREFIX.with_suffix('.bim'))
+    print_file_head(SHARED_GENOTYPE_PREFIX.with_suffix('.fam'))
 
     all_results, failures, final_summary_data = [], [], []
     for pgs_id, url in PGS_SCORES.items():
@@ -294,20 +315,21 @@ def main():
         pgs_run_results = []
         unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
         
-        gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(SHARED_GENOTYPE_PREFIX)]
-        res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}")
+        out_g_prefix = SHARED_GENOTYPE_PREFIX
+        gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(out_g_prefix)]
+        res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}", out_g_prefix)
         all_results.append(res_g); pgs_run_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
-        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}")
+        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
         all_results.append(res_p2); pgs_run_results.append(res_p2)
         if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
         
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         plink1_cmd = [str(PLINK1_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)]
-        res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}")
+        res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}", out1_prefix)
         all_results.append(res_p1); pgs_run_results.append(res_p1)
         if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
 
