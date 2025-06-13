@@ -108,8 +108,7 @@ def setup_environment():
             download_and_extract(url, CI_WORKDIR)
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
-                    if p != binary_path:
-                        p.rename(binary_path)
+                    if p != binary_path: p.rename(binary_path)
                     binary_path.chmod(0o755)
                     print(f"[SCRIPT] Configured and chmod: {binary_path}", flush=True)
                     break
@@ -163,7 +162,7 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     return out_path
 
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
-    """Analyzes results for a single PGS, calculating all comparison metrics."""
+    """Analyzes results for a single PGS, focusing on AVERAGE scores."""
     summary = {'pgs_id': pgs_id, 'success': False}
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
@@ -181,32 +180,26 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         
         try:
             df_raw = pd.read_csv(path, sep='\s+')
-            # Robustly find the ID column
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
             
             if tool_name == 'gnomon':
-                avg_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-                miss_pct_col = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
-                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns _AVG or _MISSING_PCT not found")
-                
-                # Robustly get variant count from stdout
+                score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
+                if not score_col: raise KeyError("Gnomon _AVG score column not found")
+                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
-                if not match: raise ValueError("Could not parse variant count from gnomon stdout")
-                total_vars_in_score = float(match.group(1))
-                if num_variants == 0: num_variants = int(total_vars_in_score)
-                
-                df_raw[f'SCORE_{tool_name}'] = df_raw[avg_col] * (total_vars_in_score * (1 - df_raw[miss_pct_col] / 100.0))
-                df = df_raw[[id_col, f'SCORE_{tool_name}']].rename(columns={id_col: 'IID'})
-            
+                if match and num_variants == 0: num_variants = int(match.group(1))
+
             elif tool_name == 'plink1':
+                # Without 'sum', the 'SCORE' column is the average score.
                 df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+valid\s+predictors', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
 
             elif tool_name == 'plink2':
-                score_sum_col = next((c for c in df_raw.columns if '_SUM' in c), None)
-                if not score_sum_col: raise KeyError("PLINK2 SCORE_SUM column not found")
-                df = df_raw[[id_col, score_sum_col]].rename(columns={id_col: 'IID', score_sum_col: f'SCORE_{tool_name}'})
+                # With 'no-mean-imputation', plink2 provides an _AVG column.
+                score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
+                if not score_col: raise KeyError("PLINK2 _AVG score column not found")
+                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
             
@@ -231,9 +224,9 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     for col1, col2 in combinations(score_cols, 2):
         key = f"{col1.replace('SCORE_', '')}_vs_{col2.replace('SCORE_', '')}"
         mad_results[key] = (merged_df[col1] - merged_df[col2]).abs().mean()
-        denominator = (merged_df[col1].abs() + merged_df[col2].abs())
-        valid_rows = denominator > 1e-9
-        mrd = (2 * (merged_df.loc[valid_rows, col1] - merged_df.loc[valid_rows, col2]).abs() / denominator[valid_rows]).mean()
+        denominator = (merged_df[col1].abs() + merged_df[col2].abs()) / 2.0
+        valid_rows = denominator > 1e-12 # Use a small epsilon for floating point safety
+        mrd = ((merged_df.loc[valid_rows, col1] - merged_df.loc[valid_rows, col2]).abs() / denominator[valid_rows]).mean()
         mrd_results[key] = mrd if not np.isnan(mrd) else 0.0
 
     summary['mad'] = mad_results
@@ -255,8 +248,8 @@ def print_final_summary(summary_data: list, performance_results: list):
 
         print(f"✅ Concordance established using {pgs_summary.get('n_variants_used', 'N/A'):,} variants.")
 
-        print_debug_header("Sample of Computed SUM Scores")
-        print(pgs_summary['sample_scores'].to_markdown(index=False, floatfmt=".6f"))
+        print_debug_header("Sample of Computed AVERAGE Scores")
+        print(pgs_summary['sample_scores'].to_markdown(index=False, floatfmt=".8f"))
         
         print_debug_header("Score Correlation Matrix")
         print(pgs_summary['correlation_matrix'].to_markdown(floatfmt=".8f"))
@@ -301,6 +294,8 @@ def main():
         all_results.append(res_g); pgs_run_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
+        # NOTE: Both plink commands now use 'no-mean-imputation' and do NOT use 'sum'
+        # This makes them calculate the average score, matching gnomon's primary output.
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
         res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}")
