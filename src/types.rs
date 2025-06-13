@@ -28,9 +28,6 @@ pub struct CleanScores(pub Vec<f32>);
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct CleanCounts(pub Vec<u32>);
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct CleanCorrections(pub Vec<f32>);
 
 /// A buffer that may contain non-zero data from a previous computation.
 #[derive(Debug)]
@@ -39,9 +36,6 @@ pub struct DirtyScores(pub Vec<f32>);
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct DirtyCounts(pub Vec<u32>);
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct DirtyCorrections(pub Vec<f32>);
 
 // --- State Transition & Ergonomics ---
 
@@ -92,29 +86,6 @@ impl<'a> IntoIterator for &'a DirtyCounts {
     }
 }
 
-impl DirtyCorrections {
-    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
-    pub fn into_clean(mut self) -> CleanCorrections {
-        self.0.fill(0.0);
-        CleanCorrections(self.0)
-    }
-}
-
-impl Deref for DirtyCorrections {
-    type Target = [f32];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl<'a> IntoIterator for &'a DirtyCorrections {
-    type Item = &'a f32;
-    type IntoIter = std::slice::Iter<'a, f32>;
-
-    /// Enables direct iteration over the wrapped data.
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
 impl CleanScores {
     /// Consumes a clean buffer, acknowledging it is now dirty after use.
     /// This is a zero-cost type change.
@@ -144,20 +115,6 @@ impl DerefMut for CleanCounts {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
 }
 
-impl CleanCorrections {
-    /// Consumes a clean buffer, acknowledging it is now dirty after use.
-    pub fn into_dirty(self) -> DirtyCorrections {
-        DirtyCorrections(self.0)
-    }
-}
-impl Deref for CleanCorrections {
-    type Target = [f32];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-impl DerefMut for CleanCorrections {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
-}
-
 // ========================================================================================
 //                            High-Level Data Contracts
 // ========================================================================================
@@ -183,28 +140,30 @@ pub enum PersonSubset {
 /// compute kernel (the "Virtual Machine") will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    // --- COMPILED DATA MATRICES for the VM ---
-    /// A flat, padded matrix of aligned weights (W'). Rows correspond to variants,
-    /// and columns correspond to scores. This matrix is the result of resolving all
-    /// allele differences into a single, canonical representation.
-    pub aligned_weights_matrix: Vec<f32>,
-    /// A vector where each element is the sum of all dosage-independent correction
-    /// constants for the corresponding score. This value is used to initialize
-    /// each person's score before the dosage-dependent calculations begin.
-    pub base_scores: Vec<f32>,
+    // --- PRIVATE, COMPILED DATA MATRICES for the VM ---
+    // These fields are private to guarantee their invariants. They are created once
+    // by the `prepare` module and can only be read by downstream modules. This
+    // "Airlock" pattern makes invalid states unrepresentable.
+
+    /// A flat, padded matrix of original effect weights. Rows correspond to variants,
+    /// and columns correspond to scores.
+    weights_matrix: Vec<f32>,
+    /// A flat, padded matrix of flags indicating if a variant was flipped during
+    /// reconciliation (1 for flipped, 0 for not flipped). It is dimensionally
+    /// identical to `weights_matrix`.
+    flip_mask_matrix: Vec<u8>,
     /// The padded width of one row in the matrices. This is always a multiple of
     /// the SIMD lane count and is essential for correct, safe memory access.
-    pub stride: usize,
+    stride: usize,
     /// A fast, O(1) lookup map to connect a sparse, original `.bim` file row
-    /// index to its dense row index in our compiled matrices. This is a critical
-    /// performance component for the batching module.
-    pub bim_row_to_matrix_row: Vec<Option<usize>>,
+    /// index to its dense row index in our compiled matrices.
+    bim_row_to_matrix_row: Vec<Option<MatrixRowIndex>>,
     /// The sorted list of original `.bim` row indices that are required for this
     /// calculation. This is used by the orchestrator to identify relevant chunks
     /// of the `.bed` file.
-    pub required_bim_indices: Vec<usize>,
+    pub required_bim_indices: Vec<BimRowIndex>,
 
-    // --- PRESERVED METADATA & FINAL CALCULATION DATA ---
+    // --- PUBLIC METADATA & FINAL CALCULATION DATA ---
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
     /// A vector containing the total number of variants that contribute to each score.
@@ -212,13 +171,8 @@ pub struct PreparationResult {
     /// The order matches `score_names`.
     pub score_variant_counts: Vec<u32>,
     /// A "missingness blueprint" mapping each dense matrix row (variant) to the
-    /// score column indices it affects. This enables efficient missingness tracking for all variants.
-    pub variant_to_scores_map: Vec<Vec<u16>>,
-    /// A sparse "correction blueprint" mapping each dense matrix row (variant) to the
-    /// specific score columns it affects AND the constant value to be subtracted from
-    /// a person's score if that variant is missing. This map only contains entries for
-    /// variants with non-zero correction constants (i.e., those that were allele-flipped).
-    pub variant_to_corrections_map: Vec<Vec<(u16, f32)>>,
+    /// score column indices it affects. This enables efficient missingness tracking.
+    pub variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
     /// The list of Individual IDs (IIDs) for the individuals being scored, in the
@@ -237,16 +191,95 @@ pub struct PreparationResult {
     pub bytes_per_snp: u64,
 }
 
+impl PreparationResult {
+    /// The constructor is crate-private, enforcing the "Airlock" pattern.
+    /// Only the `prepare` module can construct this "proof token".
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        weights_matrix: Vec<f32>,
+        flip_mask_matrix: Vec<u8>,
+        stride: usize,
+        bim_row_to_matrix_row: Vec<Option<MatrixRowIndex>>,
+        required_bim_indices: Vec<BimRowIndex>,
+        score_names: Vec<String>,
+        score_variant_counts: Vec<u32>,
+        variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
+        person_subset: PersonSubset,
+        final_person_iids: Vec<String>,
+        num_people_to_score: usize,
+        total_people_in_fam: usize,
+        total_snps_in_bim: usize,
+        num_reconciled_variants: usize,
+        bytes_per_snp: u64,
+    ) -> Self {
+        Self {
+            weights_matrix,
+            flip_mask_matrix,
+            stride,
+            bim_row_to_matrix_row,
+            required_bim_indices,
+            score_names,
+            score_variant_counts,
+            variant_to_scores_map,
+            person_subset,
+            final_person_iids,
+            num_people_to_score,
+            total_people_in_fam,
+            total_snps_in_bim,
+            num_reconciled_variants,
+            bytes_per_snp,
+        }
+    }
+
+    // --- Public Getters for Private Data ---
+
+    #[inline(always)]
+    pub fn weights_matrix(&self) -> &[f32] {
+        &self.weights_matrix
+    }
+
+    #[inline(always)]
+    pub fn flip_mask_matrix(&self) -> &[u8] {
+        &self.flip_mask_matrix
+    }
+
+    #[inline(always)]
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    #[inline(always)]
+    pub fn bim_row_to_matrix_row(&self) -> &[Option<MatrixRowIndex>] {
+        &self.bim_row_to_matrix_row
+    }
+}
+
 // ========================================================================================
 //                            Primitive Type Definitions
 // ========================================================================================
 
 /// An index into the original, full .fam file (e.g., one of 150,000).
 ///
-/// This prevents confusion between different index spaces at compile time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This newtype prevents confusion between different index spaces at compile time.
+/// The `#[repr(transparent)]` attribute guarantees this is a zero-cost abstraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct OriginalPersonIndex(pub u32);
+
+/// An index into the original, full .bim file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct BimRowIndex(pub usize);
+
+/// An index into the dense, reconciled matrices (`weights_matrix`, `flip_mask_matrix`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct MatrixRowIndex(pub usize);
+
+/// An index corresponding to a specific score (a column in the conceptual matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ScoreColumnIndex(pub usize);
 
 /// A `#[repr(transparent)]` wrapper for a dosage value.
 ///

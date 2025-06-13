@@ -16,7 +16,7 @@ use gnomon::io::SnpChunkReader;
 use gnomon::io::SnpChunk;
 use gnomon::prepare;
 use gnomon::reformat;
-use gnomon::types::{DirtyCounts, DirtyCorrections, DirtyScores};
+use gnomon::types::{DirtyCounts, DirtyScores, MatrixRowIndex};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -153,16 +153,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let result_buffer_size = prep_result.num_people_to_score * num_scores;
     let mut all_scores = vec![0.0f32; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
-    let mut all_correction_sums = vec![0.0f32; result_buffer_size];
 
     let t1 = Instant::now();
-
-    // Initialize the final scores buffer with the dosage-independent base scores.
-    // The kernel will then compute the dosage-dependent deltas which are aggregated.
-    for person_scores_slice in all_scores.chunks_mut(num_scores) {
-        person_scores_slice.copy_from_slice(&prep_result.base_scores);
-    }
-
     let t2 = Instant::now();
 
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
@@ -269,14 +261,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let t6 = Instant::now();
 
     const PIPELINE_DEPTH: usize = 2;
-    let partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts, DirtyCorrections)>> =
+    let partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>> =
         Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
     for _ in 0..(PIPELINE_DEPTH + 1) {
         partial_result_pool
             .push((
                 DirtyScores(vec![0.0f32; result_buffer_size]),
                 DirtyCounts(vec![0u32; result_buffer_size]),
-                DirtyCorrections(vec![0.0f32; result_buffer_size]),
             ))
             .unwrap();
     }
@@ -364,19 +355,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let computation_start = Instant::now();
     while let Some(chunk) = full_buffer_rx.recv().await {
-        let snps_in_chunk = chunk.num_snps;
-        let bed_row_end = bed_row_offset + snps_in_chunk;
+        let snps_in_bed_chunk = chunk.num_snps;
+        let bed_row_end = bed_row_offset + snps_in_bed_chunk;
 
-        let matrix_row_start = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_offset);
-        let matrix_row_end = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_end);
+        let matrix_row_start = prep_result
+            .required_bim_indices
+            .partition_point(|&x| x.0 < bed_row_offset);
+        let matrix_row_end = prep_result
+            .required_bim_indices
+            .partition_point(|&x| x.0 < bed_row_end);
 
-        if matrix_row_end == matrix_row_start {
+        let snps_in_matrix_chunk = matrix_row_end - matrix_row_start;
+
+        if snps_in_matrix_chunk == 0 {
             // This chunk contains no variants relevant to the calculation.
             // Skip computation and immediately recycle the buffer by sending it back.
             if empty_buffer_tx.send(chunk.buffer).await.is_err() {
                 break;
             }
-            bed_row_offset += snps_in_chunk;
+            bed_row_offset += snps_in_bed_chunk;
             continue;
         }
 
@@ -386,11 +383,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
         
         // Pop the set of "dirty" buffers from the reusable pool.
-        let (
-            dirty_scores_buffer,
-            dirty_missing_counts_buffer,
-            dirty_correction_sums_buffer,
-        ) = partial_result_pool_clone.pop().unwrap();
+        let (dirty_scores_buffer, dirty_missing_counts_buffer) =
+            partial_result_pool_clone.pop().unwrap();
 
         let compute_handle = task::spawn_blocking(move || {
             // This is the state transition: the dirty buffers are consumed and zeroed,
@@ -398,55 +392,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             // This work now happens in parallel on a blocking-safe thread.
             let mut clean_scores = dirty_scores_buffer.into_clean();
             let mut clean_counts = dirty_missing_counts_buffer.into_clean();
-            let mut clean_corrections = dirty_correction_sums_buffer.into_clean();
-
-            let stride = prep_clone.stride;
-            let matrix_slice_start = matrix_row_start * stride;
-            let matrix_slice_end = matrix_row_end * stride;
-
-            let weights_for_chunk = prep_clone
-                .aligned_weights_matrix
-                .get(matrix_slice_start..matrix_slice_end)
-                .ok_or_else(|| {
-                    Box::<dyn Error + Send + Sync>::from(
-                        "Internal error: Failed to slice aligned weights matrix.",
-                    )
-                })?;
 
             // The signature of `run_chunk_computation` now demands clean buffers,
             // which is enforced by the compiler.
             batch::run_chunk_computation(
                 &chunk.buffer,
-                weights_for_chunk,
                 &prep_clone,
                 &mut clean_scores,
                 &mut clean_counts,
-                &mut clean_corrections,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
-                matrix_row_start,
+                MatrixRowIndex(matrix_row_start),
+                snps_in_matrix_chunk,
                 bed_row_offset,
             )?;
-            
+
             // The compute task has filled the buffers, so they are now dirty.
             // We transition their types back before returning them.
             let result = (
                 chunk.buffer,
                 clean_scores.into_dirty(),
                 clean_counts.into_dirty(),
-                clean_corrections.into_dirty(),
             );
 
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
 
         // The main thread awaits the result from the compute task.
-        let (
-            io_buffer,
-            partial_scores,
-            partial_missing_counts,
-            partial_correction_sums
-        ) = match compute_handle.await? {
+        let (io_buffer, partial_scores, partial_missing_counts) = match compute_handle.await? {
             Ok(result) => result,
             Err(e) => return Err(e),
         };
@@ -460,25 +433,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
             *master += partial;
         }
-        for (master, &partial) in all_correction_sums.iter_mut().zip(&partial_correction_sums) {
-            *master += partial;
-        }
-        
+
         // Recycle the I/O buffer to the producer.
         let send_result = empty_buffer_tx.send(io_buffer).await;
 
         // Return the still-"dirty" partial result buffers to the pool for the next iteration.
-        partial_result_pool_clone.push((
-            partial_scores,
-            partial_missing_counts,
-            partial_correction_sums,
-        )).unwrap();
+        partial_result_pool_clone
+            .push((partial_scores, partial_missing_counts))
+            .unwrap();
 
         if send_result.is_err() {
             break;
         }
 
-        bed_row_offset += snps_in_chunk;
+        bed_row_offset += snps_in_bed_chunk;
 
         eprintln!(
             "> Processed chunk: {}/{} variants ({:.1}%)",
@@ -516,7 +484,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &prep_result.score_variant_counts,
         &all_scores,
         &all_missing_counts,
-        &all_correction_sums,
     )?;
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
 
@@ -567,7 +534,6 @@ fn write_scores_to_file(
     score_variant_counts: &[u32],
     sum_scores: &[f32],
     missing_counts: &[u32],
-    correction_sums: &[f32],
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -584,7 +550,6 @@ fn write_scores_to_file(
         String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 24));
     let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
     let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
-    let mut correction_sum_chunks = correction_sums.chunks_exact(num_scores);
 
     for iid in person_iids {
         let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
@@ -599,26 +564,17 @@ fn write_scores_to_file(
                 "Mismatched number of persons and missing count rows during final write.",
             )
         })?;
-        let person_correction_sums = correction_sum_chunks.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Mismatched number of persons and correction sum rows during final write.",
-            )
-        })?;
 
         line_buffer.clear();
         write!(&mut line_buffer, "{}", iid).unwrap();
 
         for i in 0..num_scores {
-            let provisional_sum_score = person_sum_scores[i];
+            let final_sum_score = person_sum_scores[i];
             let missing_count = person_missing_counts[i];
-            let correction_for_missing = person_correction_sums[i];
             let total_variants_for_score = score_variant_counts[i];
 
-            // This is the mathematically correct final sum after subtracting the
-            // pre-added constants for variants that turned out to be missing.
-            let final_sum_score = provisional_sum_score - correction_for_missing;
-
+            // The score is calculated based on the number of non-missing variants.
+            // This behavior matches standard tools when mean-imputation is disabled.
             let variants_used = total_variants_for_score.saturating_sub(missing_count);
 
             let avg_score = if variants_used > 0 {
