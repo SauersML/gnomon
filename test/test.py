@@ -17,14 +17,12 @@ import psutil
 #                                     CONFIGURATION
 # ========================================================================================
 CI_WORKDIR = Path("./ci_workdir")
-# --- All tools will now use the same, cleaned genotype files for a fair comparison ---
-# This is the single source of truth for genotype data.
-SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_plink_compat"
-
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
 
+# --- ALL TOOLS will now use the same, cleaned genotype files for a fair comparison ---
+SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_plink_compat"
 # We still need the original files to create the cleaned version.
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
 
@@ -43,7 +41,7 @@ PGS_SCORES = {
 }
 
 # ========================================================================================
-#                                     HELPER FUNCTIONS
+#                                     HELPER FUNCTIONS (UNCHANGED)
 # ========================================================================================
 
 def print_header(title: str, char: str = "="):
@@ -107,7 +105,6 @@ def run_and_measure(cmd: list, name: str, out_prefix: Path):
     duration = time.perf_counter() - start
 
     peak_mem = 0
-    # Note: peak memory measurement is not very reliable with Popen/wait
     try:
         p = psutil.Process(proc.pid)
         peak_mem = p.memory_info().rss
@@ -145,7 +142,7 @@ def setup_environment():
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
     """Creates a new, de-duplicated PLINK fileset with unique, allele-aware variant IDs."""
-    print_header("SYNCHRONIZING GENOTYPE VARIANT IDs FOR PLINK", char='.')
+    print_header("SYNCHRONIZING GENOTYPE VARIANT IDs", char='.')
 
     temp_prefix = CI_WORKDIR / "temp_bim_for_dedup"
     original_bim = original_prefix.with_suffix('.bim')
@@ -180,7 +177,7 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
 
 def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
     """Reads a raw PGS file and creates a clean, de-duplicated, PLINK-compatible score file."""
-    print_header(f"PREPARING PLINK FORMAT FOR {pgs_id}", char='.')
+    print_header(f"PREPARING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
 
     cols_to_use = ['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight']
     print(f"[SCRIPT] Loading raw data from {score_file.name}...", flush=True)
@@ -189,26 +186,22 @@ def create_plink_formatted_scorefile(score_file: Path, pgs_id: str) -> Path:
 
     print("[SCRIPT] Starting data cleaning pipeline...", flush=True)
     df.dropna(subset=cols_to_use, inplace=True, ignore_index=True)
-    print(f"  > Step 1: Kept {len(df)} rows with all required columns.", flush=True)
-
     df['effect_weight'] = pd.to_numeric(df['effect_weight'], errors='coerce')
     df.dropna(subset=['effect_weight'], inplace=True, ignore_index=True)
-    print(f"  > Step 2: Kept {len(df)} rows after removing non-numeric weights.", flush=True)
 
     alleles = df[['effect_allele', 'other_allele']].apply(lambda x: sorted(x), axis=1, result_type='expand')
     df['canonical_id'] = df['hm_chr'] + '_' + df['hm_pos'] + '_' + alleles[0] + '_' + alleles[1]
-    print(f"  > Step 3: Created canonical allele-aware IDs.", flush=True)
-
+    
     df.drop_duplicates(subset=['canonical_id'], keep='first', inplace=True, ignore_index=True)
-    print(f"  > Step 4: Kept {len(df)} rows after de-duplicating by canonical ID.", flush=True)
+    print(f"  > Kept {len(df)} unique, clean variants after de-duplication.", flush=True)
 
-    out_path = CI_WORKDIR / f"{pgs_id}_plink_format.tsv"
+    out_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
+    # Create the 3-column format that PLINK and Gnomon (in simple mode) can use.
     final_df = df[['canonical_id', 'effect_allele', 'effect_weight']].copy()
     final_df.columns = ['ID', 'EFFECT_ALLELE', 'WEIGHT']
 
-    print(f"[SCRIPT] Writing clean score file to {out_path}...", flush=True)
+    print(f"[SCRIPT] Writing unified score file to {out_path}...", flush=True)
     final_df.to_csv(out_path, sep='\t', index=False, na_rep='NA')
-    print(f"  > Done. Final file has {len(final_df)} unique, clean variants.", flush=True)
     return out_path
 
 
@@ -216,9 +209,6 @@ def validate_results(pgs_id: str, results: list):
     """Loads successful tool outputs, merges them, and calculates correlation and differences."""
     print_header(f"VALIDATION & COMPARISON FOR {pgs_id}", char='-')
 
-    ### CHANGE ###
-    # This dictionary maps the tool name to its *actual* output file path.
-    # We now use the unique output prefixes for each run.
     all_tool_paths = {
         'gnomon': CI_WORKDIR / f"gnomon_{pgs_id}.sscore",
         'plink1': CI_WORKDIR / f"plink1_{pgs_id}.profile",
@@ -243,14 +233,12 @@ def validate_results(pgs_id: str, results: list):
         if not path.exists():
             print(f"  > WARNING: Output file for {tool} not found at {path}", flush=True)
             continue
-
         try:
             df = None
-            ### CHANGE ### More robust parsing of output files.
             if tool == 'gnomon':
                 df_raw = pd.read_csv(path, sep='\t')
                 id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
-                score_col = next((c for c in df_raw.columns if c.endswith('_AVG')), None)
+                score_col = next((c for c in df_raw.columns if c.endswith('_SUM')), None) # gnomon simple output is _SUM
                 if not score_col: raise KeyError("Gnomon score column not found.")
                 df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool}'})
             elif tool == 'plink1':
@@ -275,12 +263,15 @@ def validate_results(pgs_id: str, results: list):
     for df_to_merge in data_frames[1:]:
         merged_df = pd.merge(merged_df, df_to_merge, on='IID')
 
-    if merged_df.empty or merged_df.shape[1] < 3:
+    if merged_df.empty or merged_df.shape[1] < 2:
         print("Could not merge results for comparison.", flush=True)
         return
 
     score_cols = [col for col in merged_df.columns if 'SCORE' in col]
-
+    if len(score_cols) < 2:
+        print("Not enough score columns to compare after merge.", flush=True)
+        return
+        
     print_debug_header("Sample of Computed Scores per Individual")
     print(merged_df.head(10).to_markdown(index=False, floatfmt='.6f'), flush=True)
 
@@ -290,7 +281,7 @@ def validate_results(pgs_id: str, results: list):
     print_debug_header("Mean Absolute Difference")
     for col1, col2 in combinations(score_cols, 2):
         abs_diff = (merged_df[col1] - merged_df[col2]).abs().mean()
-        print(f"  > {col1} vs {col2}: {abs_diff:.6f}", flush=True)
+        print(f"  > {col1} vs {col2}: {abs_diff:.8f}", flush=True)
 
 
 def main():
@@ -305,75 +296,53 @@ def main():
         print_header(f"TESTING SCORE: {pgs_id}")
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         pgs_results = []
-        common_variants_file = None
 
-        # --- STEP 1: Prepare a clean scoring file for all tools ---
+        # --- STEP 1: Create a single, unified, pre-harmonized scoring file ---
         try:
-            plink_fmt_file = create_plink_formatted_scorefile(raw_score_file, pgs_id)
+            # This file contains canonical IDs and is used by ALL tools.
+            unified_score_file = create_plink_formatted_scorefile(raw_score_file, pgs_id)
         except Exception as e:
-            print(f"❌ Error preparing PLINK format for {pgs_id}: {e}", flush=True)
+            print(f"❌ Error preparing unified score file for {pgs_id}: {e}", flush=True)
             failures.append(f"{pgs_id} (format_error)")
             continue
 
-        ### CHANGE ### Test logic is reordered to establish the "source of truth" first.
-
-        # --- STEP 2: Run PLINK2 to define the exact set of variants to be used by everyone ---
-        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        plink2_cmd = [
-            str(PLINK2_BINARY),
-            "--bfile", str(SHARED_GENOTYPE_PREFIX),
-            "--score", str(plink_fmt_file), "header", "no-mean-imputation", "list-variants",
-            "--out", str(out2_prefix)
-        ]
-        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
-        all_results.append(res_p2); pgs_results.append(res_p2)
-
-        if not res_p2['success']:
-            failures.append(f"{pgs_id} (plink2_failed)")
-            # If plink2 fails, we can't define the common variant set, so we can't continue this test.
-            validate_results(pgs_id, pgs_results)
-            continue
-        else:
-            # The list of variants that PLINK2 actually used is our source of truth.
-            common_variants_file = out2_prefix.with_suffix('.sscore.vars')
-            if not common_variants_file.exists():
-                print(f"❌ CRITICAL: PLINK2 succeeded but did not produce the variant list at {common_variants_file}", flush=True)
-                failures.append(f"{pgs_id} (plink2_no_vars_file)")
-                continue
-
-            print_debug_header(f"Common Variant List Established by PLINK2 for {pgs_id}")
-            variant_count = sum(1 for line in open(common_variants_file))
-            print(f"  > Found {variant_count} common variants to be used for all tools.", flush=True)
-            print(f"  > File location: {common_variants_file}", flush=True)
-
-        # --- STEP 3: Run Gnomon on the same genotype data, restricted to the common variants ---
+        # --- STEP 2: Run Gnomon using the pre-harmonized inputs ---
+        # We give it the unified score file and the synchronized genotype data.
+        # This bypasses its smart-matching and forces a direct 1-to-1 calculation.
         out_g_prefix = CI_WORKDIR / f"gnomon_{pgs_id}"
-        # We now use the raw score file (Gnomon is robust) but crucially filter using the plink2-generated list.
         gnomon_cmd = [
             str(GNOMON_BINARY),
-            "--score", str(raw_score_file),
-            "--bfile", str(SHARED_GENOTYPE_PREFIX), # Use the same clean genotype data
-            "--extract", str(common_variants_file), # Force use of the same variants
+            "--score", str(unified_score_file),
+            "--bfile", str(SHARED_GENOTYPE_PREFIX),
             "--out", str(out_g_prefix)
         ]
         res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}", out_g_prefix)
         all_results.append(res_g); pgs_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
+        # --- STEP 3: Run PLINK2 using the exact same pre-harmonized inputs ---
+        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
+        plink2_cmd = [
+            str(PLINK2_BINARY),
+            "--bfile", str(SHARED_GENOTYPE_PREFIX),
+            "--score", str(unified_score_file), "header", "no-mean-imputation",
+            "--out", str(out2_prefix)
+        ]
+        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
+        all_results.append(res_p2); pgs_results.append(res_p2)
+        if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
 
-        # --- STEP 4: Run PLINK1 on the same data, restricted to the common variants ---
+        # --- STEP 4: Run PLINK1 using the exact same pre-harmonized inputs ---
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         plink1_cmd = [
             str(PLINK1_BINARY),
-            "--bfile", str(SHARED_GENOTYPE_PREFIX), # Use the same clean genotype data
-            "--score", str(plink_fmt_file), "1", "2", "3", "header", "no-mean-imputation",
-            "--extract", str(common_variants_file), # Force use of the same variants
+            "--bfile", str(SHARED_GENOTYPE_PREFIX),
+            "--score", str(unified_score_file), "1", "2", "3", "header", "no-mean-imputation",
             "--out", str(out1_prefix)
         ]
         res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}", out1_prefix)
         all_results.append(res_p1); pgs_results.append(res_p1)
         if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
-
 
         # --- STEP 5: Validate and compare results for this PGS ID ---
         validate_results(pgs_id, pgs_results)
