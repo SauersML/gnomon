@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//                      THE STRATEGIC ORCHESTRATOR: GNOMON
+//                               THE STRATEGIC ORCHESTRATOR: GNOMON
 //
 // ========================================================================================
 //
@@ -30,9 +30,10 @@ use std::fs::File;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
+use cache_size;
 
 // ========================================================================================
-//                         COMMAND-LINE INTERFACE DEFINITION
+//                              COMMAND-LINE INTERFACE DEFINITION
 // ========================================================================================
 
 #[derive(Parser, Debug)]
@@ -56,7 +57,7 @@ struct Args {
 }
 
 // ========================================================================================
-//                           THE MAIN ORCHESTRATION LOGIC
+//                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
 /// A message passed from the I/O producer task to the compute dispatcher.
@@ -225,12 +226,51 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
-    const MIN_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
-    const MAX_CHUNK_SIZE: u64 = 1 * 1024 * 1024 * 1024;
-    let mut sys = System::new_all();
-    sys.refresh_memory();
+    // --- Start: Dynamic Chunk Size Calculation ---
+    const PERSON_BLOCK_SIZE: u64 = 4096; // Must match the value in `batch.rs`
+
+    // 1. Determine L3 Cache Size, with a safe fallback.
+    let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or_else(|| {
+        eprintln!("> L3 cache size not detected, using safe fallback of 32 MiB.");
+        32 * 1024 * 1024 // 32 MiB fallback
+    });
+
+    if let Some(size) = cache_size::l3_cache_size() {
+        eprintln!("> Detected L3 cache size: {} MiB", size / 1024 / 1024);
+    }
+
+    // 2. Get data parameters from the `prep_result`.
+    let n_people = prep_result.total_people_in_fam as u64;
+    let n_total_snps = prep_result.total_snps_in_bim as u64;
+    let n_score_snps = prep_result.num_reconciled_variants as u64;
+
+    // 3. Calculate the theoretically optimal chunk size using our formula.
+    let mut optimal_chunk_size: u64 = 64 * 1024 * 1024; // Default to 64MB.
+
+    if n_score_snps > 0 {
+        let bytes_per_snp = (n_people + 3) / 4;
+
+        // Use u128 for the intermediate multiplication to prevent overflow.
+        let numerator = (l3_cache_bytes as u128)
+            * (n_total_snps as u128)
+            * (bytes_per_snp as u128);
+        let denominator = (PERSON_BLOCK_SIZE as u128) * (n_score_snps as u128);
+
+        if denominator > 0 {
+            optimal_chunk_size = (numerator / denominator) as u64;
+        }
+    }
+
+    // 4. Apply practical guardrails to the optimal value.
+    let sys = System::new();
     let available_mem = sys.available_memory();
-    let chunk_size_bytes = (available_mem / 4).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as usize;
+
+    const DYNAMIC_MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB floor for I/O efficiency.
+    let ram_based_max_chunk_size = available_mem / 2; // Cap at 50% of available RAM.
+
+    let chunk_size_bytes = optimal_chunk_size
+        .clamp(DYNAMIC_MIN_CHUNK_SIZE, ram_based_max_chunk_size) as usize;
+    // --- End: Dynamic Chunk Size Calculation ---
 
     const PIPELINE_DEPTH: usize = 2;
     let partial_result_pool = Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
@@ -246,7 +286,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
     eprintln!(
-        "> Dynamically configured I/O chunk size to {} MB and pipeline depth to {}",
+        "> Dynamically determined I/O chunk size to {} MB and pipeline depth to {}",
         chunk_size_bytes / 1024 / 1024,
         PIPELINE_DEPTH
     );
