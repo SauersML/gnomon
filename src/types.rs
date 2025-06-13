@@ -42,12 +42,10 @@ pub struct PreparationResult {
     /// and columns correspond to scores. This matrix is the result of resolving all
     /// allele differences into a single, canonical representation.
     pub aligned_weights_matrix: Vec<f32>,
-    /// A flat, padded matrix of correction constants (C). It has the exact same
-    /// dimensions as `aligned_weights_matrix`. These values are pre-calculated
-    /// constants that account for allele flips, ensuring the final score is
-    /// mathematically identical to a naive calculation without impacting kernel
-    /// performance.
-    pub correction_constants_matrix: Vec<f32>,
+    /// A vector where each element is the sum of all dosage-independent correction
+    /// constants for the corresponding score. This value is used to initialize
+    /// each person's score before the dosage-dependent calculations begin.
+    pub base_scores: Vec<f32>,
     /// The padded width of one row in the matrices. This is always a multiple of
     /// the SIMD lane count and is essential for correct, safe memory access.
     pub stride: usize,

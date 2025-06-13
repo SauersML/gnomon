@@ -248,17 +248,25 @@ pub fn prepare_for_computation(
         )));
     }
 
-    // --- STAGE 6: PARALLEL POPULATION (100% SAFE) ---
-    eprintln!("> Pass 6: Populating compute matrices with maximum parallelism...");
+    // --- STAGE 6: POPULATE COMPUTE STRUCTURES ---
+    eprintln!("> Pass 6: Populating compute structures with maximum parallelism...");
+
+    // First, calculate the dosage-independent base scores by summing all correction
+    // constants from the entire set of work items. This is a fast, sequential pass.
+    let mut base_scores = vec![0.0f32; score_names.len()];
+    for item in &work_items {
+        base_scores[item.col_idx.0] += item.correction_constant;
+    }
+
+    // Second, populate the aligned weights matrix in parallel. This matrix only
+    // contains the dosage-dependent component of the score calculation.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut aligned_weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
-    let mut correction_constants_matrix = vec![0.0f32; num_reconciled_variants * stride];
 
     aligned_weights_matrix
         .par_chunks_mut(stride)
-        .zip(correction_constants_matrix.par_chunks_mut(stride))
         .enumerate()
-        .for_each(|(row_idx, (weights_slice, corrections_slice))| {
+        .for_each(|(row_idx, weights_slice)| {
             let matrix_row = MatrixRowIndex(row_idx);
             let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
             let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
@@ -266,7 +274,6 @@ pub fn prepare_for_computation(
 
             for item in items_for_this_row {
                 weights_slice[item.col_idx.0] += item.aligned_weight;
-                corrections_slice[item.col_idx.0] += item.correction_constant;
             }
         });
 
@@ -278,7 +285,7 @@ pub fn prepare_for_computation(
     let bytes_per_snp = (total_people_in_fam as u64 + 3) / 4;
     Ok(PreparationResult {
         aligned_weights_matrix,
-        correction_constants_matrix,
+        base_scores,
         stride,
         bim_row_to_matrix_row,
         required_bim_indices,

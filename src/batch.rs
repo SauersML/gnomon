@@ -66,7 +66,6 @@ impl SparseIndexPool {
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
-    corrections_for_chunk: &[f32],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f32],
     partial_missing_counts_out: &mut [u32],
@@ -97,10 +96,9 @@ pub fn run_chunk_computation(
                 iter,
                 snp_major_data,
                 weights_for_chunk,
-                corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
-            partial_missing_counts_out,
+                partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
                 matrix_row_start_idx,
@@ -113,7 +111,6 @@ pub fn run_chunk_computation(
                 iter,
                 snp_major_data,
                 weights_for_chunk,
-                corrections_for_chunk,
                 prep_result,
                 partial_scores_out,
             partial_missing_counts_out,
@@ -138,7 +135,6 @@ fn process_people_iterator<'a, I>(
     iter: I,
     snp_major_data: &'a [u8],
     weights_for_chunk: &'a [f32],
-    corrections_for_chunk: &'a [f32],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f32],
     partial_missing_counts: &'a mut [u32],
@@ -173,7 +169,6 @@ fn process_people_iterator<'a, I>(
                 prep_result,
                 snp_major_data,
                 weights_for_chunk,
-                corrections_for_chunk,
                 block_scores_out,
                 block_missing_counts_out,
                 tile_pool,
@@ -191,7 +186,6 @@ fn process_block(
     prep_result: &PreparationResult,
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
-    corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
@@ -221,7 +215,6 @@ fn process_block(
         &tile,
         prep_result,
         weights_for_chunk,
-        corrections_for_chunk,
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
@@ -240,7 +233,6 @@ fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
     weights_for_chunk: &[f32],
-    corrections_for_chunk: &[f32],
     block_scores_out: &mut [f32],
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
@@ -304,10 +296,6 @@ fn process_tile(
     let weights_matrix =
         kernel::PaddedInterleavedWeights::new(weights_for_chunk, snps_in_chunk, num_scores)
             .expect("CRITICAL: Aligned weights matrix validation failed.");
-    let corrections_matrix =
-        kernel::PaddedInterleavedWeights::new(corrections_for_chunk, snps_in_chunk, num_scores)
-            .expect("CRITICAL: Correction constants matrix validation failed.");
-
     // This is now a sequential iterator over a block owned by a single Rayon thread.
     block_scores_out
         .chunks_exact_mut(num_scores)
@@ -319,10 +307,9 @@ fn process_tile(
             let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
             let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
 
-            // Dispatch to the "three-loop" SIMD kernel.
+            // Dispatch to the simplified, "two-loop" SIMD kernel.
             kernel::accumulate_scores_for_person(
                 &weights_matrix,
-                &corrections_matrix,
                 scores_out_slice,
                 acc_buffer_slice,
                 &g1_indices[person_idx],
