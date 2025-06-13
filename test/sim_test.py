@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 import sys
 import os
+import subprocess
+import requests
+import zipfile
+import shutil
+from pathlib import Path
 
 # --- Configuration Parameters ---
 N_VARIANTS = 500_000
@@ -275,6 +280,197 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix)
     
     print(f"...PLINK files written: {fam_filename}, {bim_filename}, {bed_filename}")
 
+def run_and_validate_tools():
+    """
+    ownloads PLINK2, runs it and gnomon on the simulated data,
+    and compares their outputs against each other and the ground truth.
+    """
+    print("\n" + "="*80)
+    print("= Running Tool Validation and Comparison Pipeline")
+    print("="*80)
+
+    # --- Configuration ---
+    PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
+    PLINK2_BINARY_PATH = Path("./plink2")
+    GNOMON_BINARY_PATH = "gnomon" # Assumes gnomon is in the system's PATH
+    COMPAT_PREFIX = "simulated_data_plink_compat"
+    
+    # --- Helper Functions (nested to keep them self-contained) ---
+
+    def _print_header(title: str, char: str = "-"):
+        width = 70
+        print(f"\n{char*4} {title} {'-'*(width - len(title) - 5)}")
+
+    def run_command(cmd: list, step_name: str):
+        """Executes a command, printing its output and checking for errors."""
+        _print_header(f"Executing: {step_name}")
+        print(f"  > Command: {' '.join(map(str, cmd))}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,  # This will raise an exception on non-zero exit codes
+                encoding='utf-8',
+                errors='replace'
+            )
+            print(f"  > Success. Output logs can be found in files like '{cmd[-1]}.log'")
+            # print(result.stdout) # Uncomment for verbose debugging
+            return True
+        except FileNotFoundError:
+            print(f"  > ❌ ERROR: Command '{cmd[0]}' not found.")
+            print(f"  > Please ensure '{cmd[0]}' is installed and in your system's PATH.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"  > ❌ ERROR: {step_name} failed with exit code {e.returncode}.")
+            print("--- STDERR ---")
+            print(e.stderr)
+            print("--- STDOUT ---")
+            print(e.stdout)
+            sys.exit(1)
+
+    def setup_tools():
+        _print_header("Step A: Setting up tools")
+        
+        # 1. Check for gnomon
+        if not shutil.which(GNOMON_BINARY_PATH):
+            print(f"  > ❌ ERROR: '{GNOMON_BINARY_PATH}' not found in PATH.")
+            print("  > Please install gnomon (e.g., via 'cargo install gnomon') and ensure it's in your PATH.")
+            sys.exit(1)
+        print("  > Found 'gnomon' executable.")
+
+        # 2. Download and extract PLINK2 if it doesn't exist
+        if PLINK2_BINARY_PATH.exists():
+            print("  > 'plink2' executable already exists. Skipping download.")
+            return
+
+        print(f"  > Downloading PLINK2 from {PLINK2_URL}...")
+        zip_path = Path("plink.zip")
+        try:
+            with requests.get(PLINK2_URL, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(zip_path, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+            
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(".")
+            
+            zip_path.unlink()
+            PLINK2_BINARY_PATH.chmod(0o755) # Make it executable
+            print("  > PLINK2 downloaded and extracted successfully.")
+
+        except Exception as e:
+            print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
+            sys.exit(1)
+
+    def prepare_plink_compatible_files():
+        """Creates a new fileset with variant IDs synchronized for PLINK."""
+        _print_header("Step B: Preparing PLINK-compatible files")
+
+        # 1. Read the original .bim file to get allele information
+        bim_df = pd.read_csv(f"{OUTPUT_PREFIX}.bim", sep='\t', header=None, names=['chr', 'id', 'cm', 'pos', 'a1', 'a2'])
+        
+        # 2. Create canonical IDs (chr_pos_sortedA1_sortedA2) for robust matching
+        alleles = bim_df[['a1', 'a2']].apply(sorted, axis=1, result_type='expand')
+        bim_df['canonical_id'] = bim_df['chr'].astype(str) + '_' + bim_df['pos'].astype(str) + '_' + alleles[0] + '_' + alleles[1]
+        
+        # 3. Write new .bim file
+        new_bim_df = bim_df[['chr', 'canonical_id', 'cm', 'pos', 'a1', 'a2']]
+        new_bim_df.to_csv(f"{COMPAT_PREFIX}.bim", sep='\t', header=False, index=False)
+        print(f"  > Created synchronized BIM file: {COMPAT_PREFIX}.bim")
+
+        # 4. Copy .bed and .fam files
+        shutil.copy(f"{OUTPUT_PREFIX}.bed", f"{COMPAT_PREFIX}.bed")
+        shutil.copy(f"{OUTPUT_PREFIX}.fam", f"{COMPAT_PREFIX}.fam")
+
+        # 5. Create a new score file with the same canonical IDs
+        score_df = pd.read_csv(f"{OUTPUT_PREFIX}.score", sep='\t')
+        # We need the other allele to create the same canonical ID
+        # Join with original bim 'ref' and 'alt' to get both alleles for each variant
+        bim_alleles = bim_df[['pos', 'a1', 'a2']].set_index('pos')
+        score_df = score_df.join(bim_alleles, on='chr_position')
+        
+        alleles = score_df[['a1', 'a2']].apply(sorted, axis=1, result_type='expand')
+        score_df['canonical_id'] = score_df['chr_name'].astype(str) + '_' + score_df['chr_position'].astype(str) + '_' + alleles[0] + '_' + alleles[1]
+
+        # 6. Write new score file in the format PLINK expects (ID, EFFECT_ALLELE, WEIGHT)
+        plink_score_df = score_df[['canonical_id', 'effect_allele', 'effect_weight']]
+        plink_score_df.to_csv(f"{COMPAT_PREFIX}.score", sep='\t', index=False)
+        print(f"  > Created synchronized score file: {COMPAT_PREFIX}.score")
+
+
+    def analyze_and_compare_results():
+        """Loads all results and prints a detailed comparison."""
+        _print_header("Step D: Analyzing and Comparing Results")
+
+        try:
+            # 1. Load the ground truth calculated by this script
+            truth_df = pd.read_csv(f"{OUTPUT_PREFIX}.sscore", sep='\t', comment='#')
+            truth_df = truth_df[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
+
+            # 2. Load Gnomon's results
+            gnomon_df = pd.read_csv("gnomon_results.sscore", sep='\t', comment='#')
+            gnomon_df = gnomon_df[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_GNOMON'})
+
+            # 3. Load PLINK2's results (score column is SCORE1_AVG)
+            plink2_df = pd.read_csv("plink2_results.sscore", sep='\t', comment='#')
+            plink2_df = plink2_df[['IID', 'SCORE1_AVG']].rename(columns={'SCORE1_AVG': 'SCORE_PLINK2'})
+            
+        except FileNotFoundError as e:
+            print(f"  > ❌ ERROR: Could not find a result file: {e.filename}")
+            print("  > Aborting comparison.")
+            return
+
+        # 4. Merge all results into a single DataFrame
+        merged_df = pd.merge(truth_df, gnomon_df, on='IID')
+        merged_df = pd.merge(merged_df, plink2_df, on='IID')
+        
+        score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2']
+        merged_df[score_cols] = merged_df[score_cols].astype(float)
+
+        print("\n--- Sample of Computed Scores (first 10 individuals) ---")
+        print(merged_df.head(10).to_markdown(index=False, floatfmt=".8f"))
+
+        print("\n--- Score Correlation Matrix ---")
+        correlation_matrix = merged_df[score_cols].corr()
+        print(correlation_matrix.to_markdown(floatfmt=".8f"))
+
+        print("\n--- Mean Absolute Difference (MAD) ---")
+        mad_g_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_GNOMON']).abs().mean()
+        mad_p_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PLINK2']).abs().mean()
+        mad_g_vs_p = (merged_df['SCORE_GNOMON'] - merged_df['SCORE_PLINK2']).abs().mean()
+        print(f"Gnomon vs. Truth: {mad_g_vs_t:.10f}")
+        print(f"PLINK2 vs. Truth: {mad_p_vs_t:.10f}")
+        print(f"Gnomon vs. PLINK2: {mad_g_vs_p:.10f}")
+
+        if mad_g_vs_t < 1e-9 and mad_p_vs_t < 1e-9:
+            print("\n✅ Validation Successful: All tools produced scores identical to the ground truth.")
+        else:
+            print("\n⚠️ Validation Warning: Significant differences detected between tool outputs and ground truth.")
+
+    # --- Main execution flow for this function ---
+    setup_tools()
+    prepare_plink_compatible_files()
+
+    # --- Step C: Run Scoring Tools ---
+    # Gnomon uses original files (it's more flexible)
+    run_command(
+        [GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX}.score", OUTPUT_PREFIX, "--out", "gnomon_results"],
+        "Gnomon"
+    )
+
+    # PLINK2 uses the new, compatible files
+    run_command(
+        [
+            str(PLINK2_BINARY_PATH),
+            "--bfile", COMPAT_PREFIX,
+            "--score", f"{COMPAT_PREFIX}.score", "1", "2", "3", "header", "no-mean-imputation",
+            "--out", "plink2_results"
+        ],
+        "PLINK2"
+    )
+
+    analyze_and_compare_results()
 
 def main():
     """Main function to run the entire simulation and file generation pipeline."""
@@ -309,6 +505,11 @@ def main():
     
     # Step 6: Write all specified output files to disk
     write_output_files(prs_results_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
+
+    print("\n--- Simulation and File Writing Finished Successfully ---")
+    print(f"Generated filesets: '{OUTPUT_PREFIX}.bed/.bim/.fam', '{OUTPUT_PREFIX}.sscore', '{OUTPUT_PREFIX}.score', '{OUTPUT_PREFIX}.annotations.txt'")
+
+    run_and_validate_tools()
 
     print("\n--- Pipeline Finished Successfully ---")
     print(f"Generated filesets: '{OUTPUT_PREFIX}.bed/.bim/.fam', '{OUTPUT_PREFIX}.sscore', '{OUTPUT_PREFIX}.score', '{OUTPUT_PREFIX}.annotations.txt'")
