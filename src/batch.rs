@@ -503,7 +503,7 @@ mod tests {
             eprintln!("  SNP {:?}: {:?}", snp_idx, snp_major_matrix[snp_idx]);
         }
         eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
-        eprintln!("Each row represents data for one Person, across all 8 SNPs.");
+        eprintln!("Each row represents data for one Person, across all 8 SNPs...");
 
         let mut all_tests_passed = true;
         for person_idx in 0..8 {
