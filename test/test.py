@@ -66,7 +66,6 @@ def download_and_extract(url: str, dest_dir: Path):
             with open(outpath, 'wb') as f: shutil.copyfileobj(r.raw, f)
     except Exception as e:
         print(f"❌ FAILED to download {url}: {e}", flush=True); sys.exit(1)
-
     if outpath.suffix == '.zip':
         with zipfile.ZipFile(outpath, 'r') as z: z.extractall(dest_dir)
         print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True); outpath.unlink()
@@ -80,20 +79,15 @@ def run_and_measure(cmd: list, name: str):
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-    
     print_debug_header(f"{name} Real-time Output")
     with proc.stdout:
         for line in iter(proc.stdout.readline, ''):
             print(f"  [{name}] {line.strip()}", flush=True)
-    
     returncode = proc.wait()
     duration = time.perf_counter() - start
     result = {'tool': name, 'time_sec': duration, 'returncode': returncode, 'success': returncode == 0}
-
-    if result['success']:
-        print(f"✅ {name} finished in {duration:.2f}s.", flush=True)
-    else:
-        print(f"❌ {name} FAILED (Exit Code: {returncode})", flush=True)
+    if result['success']: print(f"✅ {name} finished in {duration:.2f}s.", flush=True)
+    else: print(f"❌ {name} FAILED (Exit Code: {returncode})", flush=True)
     return result
 
 def setup_environment():
@@ -114,32 +108,48 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     original_bim = original_prefix.with_suffix('.bim')
     bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
     
-    # Set the variant ID (col 2) to be 'chr:pos'. This is the key insight.
     bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
     
-    # We must first remove variants with duplicate chr:pos, as these cannot be used as unique IDs.
-    bim_df.drop_duplicates(subset=['chr_pos_id'], keep=False, inplace=True)
-    print(f"[SCRIPT] Kept {len(bim_df)} variants with unique chr:pos identifiers.", flush=True)
-
-    bim_df_to_save = bim_df[['chrom', 'chr_pos_id', 'cm', 'pos', 'a1', 'a2']]
-    bim_df_to_save.to_csv(final_prefix.with_suffix('.bim'), sep='\t', header=False, index=False)
+    # Identify variants at duplicate positions, as these cannot be used as unique IDs.
+    duplicate_pos = bim_df[bim_df.duplicated(subset=['chr_pos_id'], keep=False)]
     
-    # Now, filter the .bed file to keep only these non-duplicate variants.
-    variants_to_keep_file = CI_WORKDIR / "variants_to_keep.txt"
-    bim_df['chr_pos_id'].to_csv(variants_to_keep_file, index=False, header=False)
-
-    print("[SCRIPT] Filtering original BED file to match unique chr:pos variants...", flush=True)
-    filter_cmd = [str(PLINK2_BINARY), "--bfile", str(original_prefix), "--extract", str(variants_to_keep_file), "--make-bed", "--out", str(final_prefix)]
-    filter_proc = subprocess.run(filter_cmd, capture_output=True, text=True)
-    if filter_proc.returncode != 0:
-        print("❌ FAILED to filter original genotype data.", flush=True); print(filter_proc.stderr, flush=True); sys.exit(1)
+    # Get the rsIDs of the variants we need to exclude and the ones we will rename.
+    variants_to_exclude = set(duplicate_pos['rsid'])
+    variants_to_rename = bim_df[~bim_df['rsid'].isin(variants_to_exclude)]
     
-    print(f"[SCRIPT] Successfully created de-duplicated, synchronized fileset at: {final_prefix}", flush=True)
+    exclude_file = CI_WORKDIR / "variants_to_exclude.txt"
+    pd.Series(list(variants_to_exclude)).to_csv(exclude_file, index=False, header=False)
+    print(f"[SCRIPT] Identified {len(variants_to_exclude)} variants at duplicate positions to exclude.", flush=True)
+
+    # Create the mapping file for --update-name: old_id (rsid) -> new_id (chr:pos)
+    id_map_file = CI_WORKDIR / "id_update_map.txt"
+    variants_to_rename[['rsid', 'chr_pos_id']].to_csv(id_map_file, sep=' ', index=False, header=False)
+    print(f"[SCRIPT] Created ID mapping file for {len(variants_to_rename)} variants.", flush=True)
+
+    # Use PLINK to perform the exclusion and renaming in one atomic operation.
+    # We use plink1 here because its --update-name is simple and robust.
+    cmd = [
+        str(PLINK1_BINARY),
+        "--bfile", str(original_prefix),
+        "--exclude", str(exclude_file),
+        "--update-name", str(id_map_file), "2", "1",
+        "--make-bed",
+        "--out", str(final_prefix)
+    ]
+    
+    print("[SCRIPT] Creating synchronized fileset using PLINK...", flush=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print("❌ FAILED to create synchronized genotype fileset.", flush=True)
+        print(proc.stdout)
+        print(proc.stderr)
+        sys.exit(1)
+    
+    print(f"[SCRIPT] Successfully created synchronized fileset at: {final_prefix}", flush=True)
 
 def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     """Creates a unified scorefile where the variant ID is 'chr:pos'."""
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
-    
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
     df.dropna(inplace=True)
     df['effect_weight'] = pd.to_numeric(df['effect_weight'], errors='coerce')
@@ -148,6 +158,7 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
     df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
 
+    # Create the specific 4-column format that all tools can parse
     final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
     final_df.columns = ['snp_id', 'effect_allele', 'other_allele', pgs_id]
     
@@ -168,35 +179,34 @@ def validate_results(pgs_id: str, results: list):
 
     for tool_name in successful_tools:
         path = tool_paths.get(tool_name)
-        if not path or not path.exists():
-            print(f"  > WARNING: Output file for {tool_name} not found at {path}", flush=True); continue
+        if not path or not path.exists(): continue
         
         try:
             df = None
             if tool_name == 'gnomon':
                 df_raw = pd.read_csv(path, sep='\t')
-                avg_col = next(c for c in df_raw.columns if '_AVG' in c)
-                # Gnomon SUM = AVG * num_variants_used. num_variants_used = total - missing
-                # We extract total from the header string, e.g. "PGS004696(18722v)_AVG"
+                avg_col = next((c for c in df_raw.columns if '_AVG' in c), None)
+                miss_pct_col = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
+                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns not found")
                 total_vars_in_score = float(avg_col.split('(')[1].split('v)')[0])
-                miss_pct_col = next(c for c in df_raw.columns if '_MISSING_PCT' in c)
                 df_raw[f'SCORE_{tool_name}'] = df_raw[avg_col] * (total_vars_in_score * (1 - df_raw[miss_pct_col] / 100.0))
                 df = df_raw[['#IID', f'SCORE_{tool_name}']].rename(columns={'#IID': 'IID'})
             elif tool_name == 'plink1':
                 df = pd.read_csv(path, sep='\s+')[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
             elif tool_name == 'plink2':
-                df = pd.read_csv(path, sep='\s+')[['#IID', 'SCORE1_SUM']].rename(columns={'#IID': 'IID', 'SCORE1_SUM': f'SCORE_{tool_name}'})
+                df_raw = pd.read_csv(path, sep='\s+')
+                # Find the score sum column dynamically
+                score_sum_col = next((c for c in df_raw.columns if '_SUM' in c), None)
+                if not score_sum_col: raise KeyError("PLINK2 SCORE_SUM column not found")
+                df = df_raw[['#IID', score_sum_col]].rename(columns={'#IID': 'IID', score_sum_col: f'SCORE_{tool_name}'})
             
             if df is not None: dfs.append(df)
         except Exception as e:
             print(f"  > ERROR parsing {tool_name} output from {path}: {e}", flush=True)
 
-    if len(dfs) < 2:
-        print("Could not load enough results for comparison.", flush=True); return
-
+    if len(dfs) < 2: print("Could not load enough results for comparison.", flush=True); return
     merged_df = dfs[0]
     for df_to_merge in dfs[1:]: merged_df = pd.merge(merged_df, df_to_merge, on='IID')
-    
     score_cols = [c for c in merged_df.columns if c.startswith('SCORE_')]
     if len(score_cols) < 2: print("Not enough comparable scores after merging.", flush=True); return
 
@@ -209,7 +219,6 @@ def validate_results(pgs_id: str, results: list):
         diff = (merged_df[col1] - merged_df[col2]).abs().mean()
         print(f"  > {col1} vs {col2}: {diff:.8f}", flush=True)
 
-
 def main():
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
@@ -220,27 +229,22 @@ def main():
         print_header(f"TESTING SCORE: {pgs_id}")
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         pgs_results = []
-
         unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
         
         # --- Gnomon Run ---
-        # It reads the chr:pos from the unified file and matches the chr:pos index it builds from the bim file.
         gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(SHARED_GENOTYPE_PREFIX)]
         res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}")
         all_results.append(res_g); pgs_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
         # --- PLINK2 Run ---
-        # It reads the chr:pos ID from the bim file and matches it against the chr:pos ID in the unified file.
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        # Use column numbers: 1=snp_id, 2=effect_allele, 4=score
         plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
         res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}")
         all_results.append(res_p2); pgs_results.append(res_p2)
         if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
         
         # --- PLINK1 Run ---
-        # It also reads the chr:pos ID from the bim and matches against the score file.
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         plink1_cmd = [str(PLINK1_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)]
         res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}")
