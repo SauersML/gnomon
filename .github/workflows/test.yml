@@ -127,7 +127,19 @@ jobs:
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil tabulate
 
-      - name: Run Tests
-        # The '-u' flag runs Python in unbuffered mode, which ensures that
-        # print statements from the script are streamed to the log in real-time.
-        run: python -u test/test.py
+      - name: Run Parallel Python Tests
+        run: |
+          echo "Starting Python tests in parallel..."
+          
+          # The -u flag means real-time log streaming from Python.
+          # The '&' runs the command in the background.
+          
+          # Run the original integration test in the background
+          python -u test/test.py &
+          
+          # Run the new simulation test in the background
+          python -u sim_test.py &
+          
+          echo "Waiting for all tests to complete..."
+          wait
+          echo "All tests finished."
