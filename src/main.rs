@@ -286,7 +286,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // 4. Apply practical guardrails to the optimal value.
     let sys = System::new_with_specifics(
-        RefreshKind::new()
+        RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::everything()),
     );
     let available_mem = sys.available_memory();
