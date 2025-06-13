@@ -311,7 +311,7 @@ def run_and_validate_tools():
 
     # Run PLINK2
     run_command(
-        [PLINK2_BINARY_PATH.name, "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "3", "header", "no-mean-imputation", "--out", "plink2_results"],
+        [f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "3", "header", "no-mean-imputation", "--out", "plink2_results"],
         "PLINK2", cwd=WORKDIR
     )
 
