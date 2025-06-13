@@ -43,12 +43,14 @@ PGS_SCORES = {
 #                                     HELPER FUNCTIONS
 # ========================================================================================
 def print_header(title: str, char: str = "="):
+    """Prints a formatted header to the console."""
     width = 80
     print("\n" + char * width, flush=True)
     print(f"{char*4} {title} {char*(width - len(title) - 6)}", flush=True)
     print(char * width, flush=True)
 
 def print_debug_header(title: str):
+    """Prints a smaller header for debug sections."""
     print("\n" + "." * 80, flush=True)
     print(f".... {title} ....", flush=True)
     print("." * 80, flush=True)
@@ -75,6 +77,7 @@ def download_and_extract(url: str, dest_dir: Path):
         print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
 def run_and_measure(cmd: list, name: str):
+    """Executes a command, streaming its output in real-time, and measures performance."""
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
@@ -100,17 +103,14 @@ def setup_environment():
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     
-    # This logic is now restored and corrected
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
-            # Find the extracted binary and give it the correct name and permissions
             for p in CI_WORKDIR.iterdir():
-                # Match based on the start of the binary name (e.g., 'plink' or 'plink2')
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
                     if p != binary_path:
                         p.rename(binary_path)
-                    binary_path.chmod(0o755) # Correctly chmod the DESTINATION path
+                    binary_path.chmod(0o755)
                     print(f"[SCRIPT] Configured and chmod: {binary_path}", flush=True)
                     break
     
@@ -118,10 +118,13 @@ def setup_environment():
     for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
+    """Creates a new, de-duplicated PLINK fileset where variant IDs are 'chr:pos'."""
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
     original_bim = original_prefix.with_suffix('.bim')
     bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
+    
     bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
+    
     duplicate_pos = bim_df[bim_df.duplicated(subset=['chr_pos_id'], keep=False)]
     variants_to_exclude = set(duplicate_pos['rsid'])
     variants_to_rename = bim_df[~bim_df['rsid'].isin(variants_to_exclude)]
@@ -144,6 +147,7 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     print(f"[SCRIPT] Successfully created synchronized fileset at: {final_prefix}", flush=True)
 
 def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
+    """Creates a unified scorefile where the variant ID is 'chr:pos'."""
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
     df.dropna(inplace=True)
@@ -159,6 +163,7 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     return out_path
 
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
+    """Analyzes results for a single PGS, calculating all comparison metrics."""
     summary = {'pgs_id': pgs_id, 'success': False}
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
@@ -176,13 +181,15 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         
         try:
             df_raw = pd.read_csv(path, sep='\s+')
+            # Robustly find the ID column
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
             
             if tool_name == 'gnomon':
                 avg_col = next((c for c in df_raw.columns if '_AVG' in c), None)
                 miss_pct_col = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
-                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns not found")
+                if not avg_col or not miss_pct_col: raise KeyError("Gnomon output columns _AVG or _MISSING_PCT not found")
                 
+                # Robustly get variant count from stdout
                 match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
                 if not match: raise ValueError("Could not parse variant count from gnomon stdout")
                 total_vars_in_score = float(match.group(1))
@@ -203,7 +210,7 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
                 match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
                 if match and num_variants == 0: num_variants = int(match.group(1))
             
-            if df is not None: data_frames.append(df)
+            if 'df' in locals() and df is not None: data_frames.append(df)
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
@@ -235,6 +242,7 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     return summary
 
 def print_final_summary(summary_data: list, performance_results: list):
+    """Prints a single, comprehensive summary report at the end of the run."""
     print_header("FINAL TEST & BENCHMARKING REPORT", "*")
 
     for pgs_summary in summary_data:
