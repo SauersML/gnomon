@@ -68,13 +68,14 @@ struct IoMessage {
     snps_in_chunk: usize,
 }
 
-/// A structure that bundles the I/O buffer and the partial scores buffer for a
-/// single computational chunk. This type enforces that the partial scores are
+/// A structure that bundles the I/O buffer and the partial result buffers for a
+/// single computational chunk. This type enforces that the partial results are
 /// merged before the I/O buffer can be recycled, preventing data loss.
 struct ChunkResult {
     io_buffer: Vec<u8>,
     partial_scores: Vec<f32>,
     partial_missing_counts: Vec<u32>,
+    partial_correction_sums: Vec<f32>,
     #[cfg(debug_assertions)]
     committed: Cell<bool>,
 }
@@ -85,26 +86,29 @@ impl ChunkResult {
         io_buffer: Vec<u8>,
         partial_scores: Vec<f32>,
         partial_missing_counts: Vec<u32>,
+        partial_correction_sums: Vec<f32>,
     ) -> Self {
         Self {
             io_buffer,
             partial_scores,
             partial_missing_counts,
+            partial_correction_sums,
             #[cfg(debug_assertions)]
             committed: Cell::new(false),
         }
     }
 
-    /// Atomically merges partial scores and missing counts, sends the I/O buffer
-    /// back to the producer, and returns the now-cleared partial result buffers for reuse.
+    /// Atomically merges all partial results, sends the I/O buffer back to the
+    /// producer, and returns the now-cleared partial result buffers for reuse.
     #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
     async fn commit(
         self,
         all_scores: &mut [f32],
         all_missing_counts: &mut [u32],
+        all_correction_sums: &mut [f32],
         empty_tx: &Sender<Vec<u8>>,
     ) -> (
-        (Vec<f32>, Vec<u32>),
+        (Vec<f32>, Vec<u32>, Vec<f32>),
         Result<(), SendError<Vec<u8>>>,
     ) {
         let this = std::mem::ManuallyDrop::new(self);
@@ -112,15 +116,20 @@ impl ChunkResult {
         let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
         let mut recycled_missing_counts_buffer =
             unsafe { std::ptr::read(&this.partial_missing_counts) };
+        let mut recycled_correction_sums_buffer =
+            unsafe { std::ptr::read(&this.partial_correction_sums) };
 
-        // Aggregate both scores and missing counts.
-        for (master_score, partial_score) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
-            *master_score += partial_score;
+        // Aggregate all partial result buffers into their master counterparts.
+        for (master, partial) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
+            *master += partial;
         }
-        for (master_count, partial_count) in
-            all_missing_counts.iter_mut().zip(&recycled_missing_counts_buffer)
+        for (master, partial) in all_missing_counts.iter_mut().zip(&recycled_missing_counts_buffer)
         {
-            *master_count += partial_count;
+            *master += partial;
+        }
+        for (master, partial) in all_correction_sums.iter_mut().zip(&recycled_correction_sums_buffer)
+        {
+            *master += partial;
         }
 
         #[cfg(debug_assertions)]
@@ -131,9 +140,14 @@ impl ChunkResult {
         // Clear buffers for reuse.
         recycled_scores_buffer.fill(0.0);
         recycled_missing_counts_buffer.fill(0);
+        recycled_correction_sums_buffer.fill(0.0);
 
         (
-            (recycled_scores_buffer, recycled_missing_counts_buffer),
+            (
+                recycled_scores_buffer,
+                recycled_missing_counts_buffer,
+                recycled_correction_sums_buffer,
+            ),
             send_result,
         )
     }
@@ -154,7 +168,7 @@ impl Drop for ChunkResult {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let start_time = Instant::now();
+    let overall_start_time = Instant::now();
 
     // --- Phase 1: Argument Parsing and Path Resolution ---
     let args = Args::parse();
@@ -181,6 +195,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     eprintln!("> Preparing data using {} score file(s)...", score_files.len());
+    let prep_phase_start = Instant::now();
 
     // Attempt one auto-reformat on parse/header error, then retry once.
     let mut attempted_reformat = false;
@@ -212,17 +227,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let prep_result = Arc::new(prep);
 
     eprintln!(
-        "> Preparation complete. Found {} individuals to score and {} overlapping variants across {} score(s).",
+        "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",
+        prep_phase_start.elapsed(),
         prep_result.num_people_to_score,
         prep_result.num_reconciled_variants,
         prep_result.score_names.len()
     );
 
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
+    let resource_alloc_start = Instant::now();
     let num_scores = prep_result.score_names.len();
     let result_buffer_size = prep_result.num_people_to_score * num_scores;
     let mut all_scores = vec![0.0f32; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
+    let mut all_correction_sums = vec![0.0f32; result_buffer_size];
 
     // Initialize the final scores buffer with the dosage-independent base scores.
     // The kernel will then compute the dosage-dependent deltas which are aggregated.
@@ -321,6 +339,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .push((
                 vec![0.0f32; result_buffer_size],
                 vec![0u32; result_buffer_size],
+                vec![0.0f32; result_buffer_size],
             ))
             .unwrap();
     }
@@ -328,7 +347,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
     eprintln!(
-        "> Dynamically determined I/O chunk size to {} MB and pipeline depth to {}",
+        "> Resource allocation complete in {:.2?}. Determined I/O chunk size to {} MB and pipeline depth to {}",
+        resource_alloc_start.elapsed(),
         chunk_size_bytes / 1024 / 1024,
         PIPELINE_DEPTH
     );
@@ -377,6 +397,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut bed_row_offset: usize = 0;
 
+    let computation_start = Instant::now();
     while let Some(IoMessage { buffer: full_buffer, bytes_read, snps_in_chunk }) = full_buffer_rx.recv().await {
         let bed_row_end = bed_row_offset + snps_in_chunk;
 
@@ -396,8 +417,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let stride = prep_clone.stride;
         let matrix_slice_start = matrix_row_start * stride;
         let matrix_slice_end = matrix_row_end * stride;
-        let (mut partial_scores_buffer, mut partial_missing_counts_buffer) =
-            partial_result_pool_clone.pop().unwrap();
+        let (
+            mut partial_scores_buffer,
+            mut partial_missing_counts_buffer,
+            mut partial_correction_sums_buffer,
+        ) = partial_result_pool_clone.pop().unwrap();
 
         let compute_handle = task::spawn_blocking(move || {
             let buffer_slice = &full_buffer[..bytes_read];
@@ -417,6 +441,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 &prep_clone,
                 &mut partial_scores_buffer,
                 &mut partial_missing_counts_buffer,
+                &mut partial_correction_sums_buffer,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
                 matrix_row_start,
@@ -427,6 +452,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 full_buffer,
                 partial_scores_buffer,
                 partial_missing_counts_buffer,
+                partial_correction_sums_buffer,
             );
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
@@ -437,7 +463,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
 
         let (recycled_buffers, send_result) = chunk_result
-            .commit(&mut all_scores, &mut all_missing_counts, &empty_buffer_tx)
+            .commit(
+                &mut all_scores,
+                &mut all_missing_counts,
+                &mut all_correction_sums,
+                &empty_buffer_tx,
+            )
             .await;
         partial_result_pool_clone.push(recycled_buffers).unwrap();
 
@@ -456,7 +487,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     io_handle.await?;
-    eprintln!("> Computation finished.");
+    eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
 
     // --- Phase 5: Finalization and Output ---
     // The output filename is now robustly based on the PLINK prefix, not the score file path.
@@ -475,6 +506,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         out_path.display()
     );
 
+    let output_start = Instant::now();
     write_scores_to_file(
         &out_path,
         &prep_result.final_person_iids,
@@ -482,9 +514,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &prep_result.score_variant_counts,
         &all_scores,
         &all_missing_counts,
+        &all_correction_sums,
     )?;
+    eprintln!("> Final output written in {:.2?}", output_start.elapsed());
 
-    eprintln!("\nSuccess! Total execution time: {:.2?}", start_time.elapsed());
+    eprintln!("\nSuccess! Total execution time: {:.2?}", overall_start_time.elapsed());
 
     Ok(())
 }
@@ -531,6 +565,7 @@ fn write_scores_to_file(
     score_variant_counts: &[u32],
     sum_scores: &[f32],
     missing_counts: &[u32],
+    correction_sums: &[f32],
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -547,6 +582,7 @@ fn write_scores_to_file(
         String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 24));
     let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
     let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
+    let mut correction_sum_chunks = correction_sums.chunks_exact(num_scores);
 
     for iid in person_iids {
         let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
@@ -561,19 +597,30 @@ fn write_scores_to_file(
                 "Mismatched number of persons and missing count rows during final write.",
             )
         })?;
+        let person_correction_sums = correction_sum_chunks.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mismatched number of persons and correction sum rows during final write.",
+            )
+        })?;
 
         line_buffer.clear();
         write!(&mut line_buffer, "{}", iid).unwrap();
 
         for i in 0..num_scores {
-            let sum_score = person_sum_scores[i];
+            let provisional_sum_score = person_sum_scores[i];
             let missing_count = person_missing_counts[i];
+            let correction_for_missing = person_correction_sums[i];
             let total_variants_for_score = score_variant_counts[i];
+
+            // This is the mathematically correct final sum after subtracting the
+            // pre-added constants for variants that turned out to be missing.
+            let final_sum_score = provisional_sum_score - correction_for_missing;
 
             let variants_used = total_variants_for_score.saturating_sub(missing_count);
 
             let avg_score = if variants_used > 0 {
-                sum_score / (variants_used as f32)
+                final_sum_score / (variants_used as f32)
             } else {
                 0.0
             };

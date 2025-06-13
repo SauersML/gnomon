@@ -66,8 +66,13 @@ pub struct PreparationResult {
     /// The order matches `score_names`.
     pub score_variant_counts: Vec<u32>,
     /// A "missingness blueprint" mapping each dense matrix row (variant) to the
-    /// score column indices it affects. This enables efficient missingness tracking.
+    /// score column indices it affects. This enables efficient missingness tracking for all variants.
     pub variant_to_scores_map: Vec<Vec<u16>>,
+    /// A sparse "correction blueprint" mapping each dense matrix row (variant) to the
+    /// specific score columns it affects AND the constant value to be subtracted from
+    /// a person's score if that variant is missing. This map only contains entries for
+    /// variants with non-zero correction constants (i.e., those that were allele-flipped).
+    pub variant_to_corrections_map: Vec<Vec<(u16, f32)>>,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
     /// The list of Individual IDs (IIDs) for the individuals being scored, in the

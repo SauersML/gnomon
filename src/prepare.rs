@@ -147,9 +147,21 @@ pub fn prepare_for_computation(
             let mut work_for_position = Vec::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, _other_allele, weights) in score_lines {
-                    // Find the first BIM record for this chr:pos that contains the score's effect allele.
-                    let usable_match = bim_records.iter().find(|(bim_record, _)| {
-                        effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                    // This two-pass logic ensures that we prioritize a perfect allele match before
+                    // falling back to a more permissive match on only the effect allele. This
+                    // resolves ambiguity when multiple variants exist at the same position.
+                    // Pass 1: Look for a perfect match on both alleles.
+                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
+                        (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
+                        (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
+                    });
+
+                    // Use the perfect match if it exists. Otherwise, fall back to the old permissive logic.
+                    let usable_match = perfect_match.or_else(|| {
+                        // Pass 2: Permissive match (only if no perfect match was found).
+                        bim_records.iter().find(|(bim_record, _)| {
+                            effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                        })
                     });
 
                     if let Some((bim_record, bim_row_index)) = usable_match {
@@ -219,6 +231,20 @@ pub fn prepare_for_computation(
         // `variant_row.0` is guaranteed to be a valid index by construction.
         variant_to_scores_map[variant_row.0].push(score_col.0 as u16);
     }
+
+    // --- Build the sparse variant_to_corrections_map ---
+    // This map is critical for efficiently correcting scores when a flipped variant is missing.
+    let mut variant_to_corrections_map: Vec<Vec<(u16, f32)>> = vec![vec![]; num_reconciled_variants];
+    // We iterate over the sorted `work_items` to build the map efficiently.
+    work_items
+        .iter()
+        // We only care about items that have a non-zero correction constant.
+        .filter(|item| item.correction_constant != 0.0)
+        .for_each(|item| {
+            // `item.matrix_row.0` is guaranteed to be a valid index.
+            variant_to_corrections_map[item.matrix_row.0]
+                .push((item.col_idx.0 as u16, item.correction_constant));
+        });
 
 // --- STAGE 5: PARALLEL SORT & VALIDATION ---
     eprintln!("> Pass 5: Sorting and validating work items...");
@@ -292,6 +318,7 @@ pub fn prepare_for_computation(
         score_names,
         score_variant_counts,
         variant_to_scores_map,
+        variant_to_corrections_map,
         person_subset,
         final_person_iids,
         num_people_to_score,
@@ -437,10 +464,20 @@ fn discover_required_bim_indices(
             let mut set_for_snp = BTreeSet::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, other_allele, _weights) in score_lines {
-                    // Find the first BIM record for this chr:pos that contains the score's effect allele.
-                    // This implements the permissive matching logic.
-                    let usable_match = bim_records.iter().find(|(bim_record, _)| {
-                        effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                    // This intelligent two-pass search ensures we only mark a variant as "required"
+                    // if it is the best possible match, resolving ambiguity correctly from the start.
+                    // Pass 1: Look for a perfect match on both alleles.
+                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
+                        (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
+                        (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
+                    });
+
+                    // Use the perfect match if it exists. Otherwise, fall back to permissive logic.
+                    let usable_match = perfect_match.or_else(|| {
+                        // Pass 2: Permissive match (only if no perfect match was found).
+                        bim_records.iter().find(|(bim_record, _)| {
+                            effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
+                        })
                     });
 
                     if let Some((bim_record, bim_row_index)) = usable_match {
