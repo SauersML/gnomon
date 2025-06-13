@@ -29,12 +29,7 @@ use tokio::task;
 use std::fs::File;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use tokio::sync::mpsc::{error::SendError, Sender};
 use cache_size;
-use std::ops::{Deref, DerefMut};
-use gnomon::types::{
-    CleanCounts, CleanCorrections, CleanScores, DirtyCounts, DirtyCorrections, DirtyScores,
-};
 
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
@@ -77,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Phase 2: The Preparation Phase ---
     // This logic now supports providing a directory to the --score argument.
-    let mut score_files = if args.score.is_dir() {
+    let score_files = if args.score.is_dir() {
         eprintln!("> Found directory for --score, locating all score files...");
         fs::read_dir(&args.score)?
             .filter_map(Result::ok)
