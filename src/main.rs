@@ -192,36 +192,53 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("No score files found in the specified path.".into());
     }
 
-    eprintln!("> Preparing data using {} score file(s)...", score_files.len());
+    eprintln!("> Normalizing and preparing {} score file(s)...", score_files.len());
     let prep_phase_start = Instant::now();
 
-    // Attempt one auto-reformat on parse/header error, then retry once.
-    let mut attempted_reformat = false;
-    let prep = loop {
-        match prepare::prepare_for_computation(&plink_prefix, &score_files, args.keep.as_deref()) {
-            Ok(result) => break result,
-            Err(PrepError::Header(_) | PrepError::Parse(_))
-                if !attempted_reformat && score_files.len() == 1 =>
-            {
-                let orig = &score_files[0];
-                eprintln!("\nWarning: parsing '{}' failed. Auto-converting...", orig.display());
-                match reformat::reformat_pgs_file(orig) {
+    let mut native_score_files = Vec::with_capacity(score_files.len());
+    for score_file_path in &score_files {
+        // First, check if the file is already in the correct format.
+        match reformat::is_gnomon_native_format(score_file_path) {
+            Ok(true) => {
+                // It's already native, so we can use it directly.
+                native_score_files.push(score_file_path.clone());
+            }
+            Ok(false) => {
+                // It's not in native format, so try to reformat it.
+                eprintln!(
+                    "> Info: Score file '{}' is not in native format. Attempting conversion...",
+                    score_file_path.display()
+                );
+                match reformat::reformat_pgs_file(score_file_path) {
                     Ok(new_path) => {
-                        eprintln!("Success! Converted to '{}'. Retrying...", new_path.display());
-                        score_files = vec![new_path];
-                        attempted_reformat = true;
-                        // loop and retry
+                        eprintln!(
+                            "> Success: Converted to '{}'.",
+                            new_path.display()
+                        );
+                        native_score_files.push(new_path);
                     }
-                    Err(err) => {
-                        return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
+                    Err(e) => {
+                        // Reformatting failed. This is a fatal error.
+                        return Err(format!(
+                            "Failed to auto-reformat '{}': {}. Please ensure it is a valid PGS Catalog file or convert it to the gnomon-native format manually.",
+                            score_file_path.display(), e
+                        ).into());
                     }
                 }
             }
             Err(e) => {
-                return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+                // An I/O error occurred while trying to check the file.
+                return Err(format!(
+                    "Error reading score file '{}': {}",
+                    score_file_path.display(), e
+                ).into());
             }
         }
-    };
+    }
+
+    // Now, run the preparation phase on the fully normalized list of files.
+    let prep = prepare::prepare_for_computation(&plink_prefix, &native_score_files, args.keep.as_deref())
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     let prep_result = Arc::new(prep);
 
     eprintln!(
