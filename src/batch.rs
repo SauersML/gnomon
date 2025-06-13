@@ -14,6 +14,7 @@
 // scientific logic or reconciliation.
 
 use crate::kernel;
+use crate::main::{CleanCounts, CleanCorrections, CleanScores};
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
     PreparationResult,
@@ -67,17 +68,17 @@ pub fn run_chunk_computation(
     snp_major_data: &[u8],
     weights_for_chunk: &[f32],
     prep_result: &PreparationResult,
-    partial_scores_out: &mut [f32],
-    partial_missing_counts_out: &mut [u32],
-    partial_correction_sums_out: &mut [f32],
+    partial_scores_out: &mut CleanScores,
+    partial_missing_counts_out: &mut CleanCounts,
+    partial_correction_sums_out: &mut CleanCorrections,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: usize,
     chunk_bed_row_offset: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
-    // This is the "airlock" for the compute engine. We verify the output buffer
-    // size once to prevent panics deep inside the parallel loops.
+    // The type system has already guaranteed the buffers are zeroed.
+    // We only need to check the length, which is possible via Deref.
     let expected_len = prep_result.num_people_to_score * prep_result.score_names.len();
     if partial_scores_out.len() != expected_len {
         return Err(Box::from(format!(
@@ -88,6 +89,8 @@ pub fn run_chunk_computation(
     }
 
     // --- Dispatch to Generic Parallel Iterator ---
+    // DerefMut coercion allows the typed wrappers to be passed as mutable slices
+    // to the internal implementation, which requires no changes.
     match &prep_result.person_subset {
         PersonSubset::All => {
             let iter = (0..prep_result.total_people_in_fam as u32)
