@@ -298,7 +298,7 @@ def run_and_validate_tools():
                 plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             elif '#FID' in plink2_df_raw.columns:
                 plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
-            plink2_df = plink2_df_raw[['IID', 'SCORE1_AVG']].rename(columns={'SCORE1_AVG': 'SCORE_PLINK2'})
+            plink2_df = plink2_df_raw.assign(SCORE_PLINK2=plink2_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
             
         except (FileNotFoundError, KeyError) as e:
             print(f"  > ❌ ERROR: Failed to load or parse a result file. Error: {e}. Aborting comparison.")
