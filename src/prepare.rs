@@ -146,7 +146,7 @@ pub fn prepare_for_computation(
         .flat_map(|(snp_id, score_lines)| {
             let mut work_for_position = Vec::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
-                for (effect_allele, _other_allele, weights) in score_lines {
+                for (effect_allele, other_allele, weights) in score_lines {
                     // This two-pass logic ensures that we prioritize a perfect allele match before
                     // falling back to a more permissive match on only the effect allele. This
                     // resolves ambiguity when multiple variants exist at the same position.
