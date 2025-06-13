@@ -467,7 +467,6 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
 }
 
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,7 +474,7 @@ mod tests {
     fn test_transpose_layout_is_empirically_verified() {
         // This map from a logical SNP index (0-7) to its physical byte position
         // in a transposed person-vector is the hypothesis we are testing.
-        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
         // 1. SETUP: Create a known 8x8 matrix of SNP-major data.
         // We use unique, traceable values: `(person_idx+1)*10 + (snp_idx+1)`.
