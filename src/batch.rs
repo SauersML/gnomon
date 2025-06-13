@@ -14,7 +14,7 @@
 // scientific logic or reconciliation.
 
 use crate::kernel;
-use crate::main::{CleanCounts, CleanCorrections, CleanScores};
+use crate::types::{CleanCounts, CleanCorrections, CleanScores};
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
     PreparationResult,
