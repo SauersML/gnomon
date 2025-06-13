@@ -295,9 +295,12 @@ def validate_results(pgs_id: str, results: list):
         return
         
     score_cols = [col for col in merged_df.columns if 'SCORE' in col]
+
+    # Print a sample of the first 10 computed scores for comparison.
+    print_debug_header("Sample of Computed Scores per Individual")
+    print(merged_df.head(10).to_markdown(index=False, floatfmt='.6f'), flush=True)
+
     print_debug_header("Score Correlation Matrix")
-    # A moderate correlation can still be misleading if a large number of predictors were dropped.
-    # With the fixes, this should be very close to 1.0.
     print(merged_df[score_cols].corr(), flush=True)
 
     print_debug_header("Mean Absolute Difference")
