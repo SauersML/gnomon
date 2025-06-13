@@ -359,7 +359,10 @@ fn pivot_tile(
     let num_people_in_block = person_indices_in_block.len();
     let snps_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
     let bytes_per_snp = prep_result.bytes_per_snp;
-    let missing_sentinel_splat = U8xN::splat(3);
+
+    // This maps a logical SNP index (0-7) to its physical byte position in a transposed person-vector.
+    // The shuffle pattern is an artifact of the 8x8 butterfly network transpose algorithm.
+    const SHUFFLE: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 
     for person_chunk_start in (0..num_people_in_block).step_by(SIMD_LANES) {
         let remaining_people = num_people_in_block - person_chunk_start;
@@ -377,7 +380,8 @@ fn pivot_tile(
             let remaining_snps = snps_in_chunk - snp_chunk_start;
             let current_snps = remaining_snps.min(SIMD_LANES);
 
-            let mut snp_data_vectors = [U8xN::default(); SIMD_LANES];
+            // --- 1. Decode a block of up to 8 SNPs using SIMD ---
+            let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
                 let variant_idx_in_chunk = snp_chunk_start + i;
                 let global_matrix_row_idx = matrix_row_start_idx + variant_idx_in_chunk;
@@ -385,76 +389,48 @@ fn pivot_tile(
                 let relative_bed_row = absolute_bed_row - chunk_bed_row_offset;
                 let snp_byte_offset = relative_bed_row as u64 * bytes_per_snp;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
-                snp_data_vectors[i] =
-                    U8xN::gather_or_default(snp_major_data, source_byte_indices.cast());
-            }
 
-            let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
-            for i in 0..current_snps {
-                let packed_vals = snp_data_vectors[i];
-                // --- SIMD Genotype Unpacking ---
-                // This logic unpacks the 2-bit PLINK genotypes into dosage values.
-                // The dosage extracted here is ALWAYS for the SECOND allele (allele2)
-                // in the corresponding .bim file record. All flipping logic has been
-                // pre-calculated into the correction_constants_matrix by prepare.rs.
+                let packed_vals =
+                    U8xN::gather_or_default(snp_major_data, source_byte_indices.cast());
                 let two_bit_genotypes = (packed_vals >> bit_shifts.cast()) & U8xN::splat(0b11);
 
-                // This formula maps 0b00->0, 0b10->1, 0b11->2. Missing (0b01) is handled next.
                 let one = U8xN::splat(1);
                 let term1 = (two_bit_genotypes >> U8xN::splat(1)) & one;
                 let term2 = (two_bit_genotypes & one) + one;
                 let initial_dosages = term1 * term2;
-    
-                #[cfg(debug_assertions)]
-                {
-                    static HAS_PRINTED_UNPACK_TRACE: AtomicBool = AtomicBool::new(false);
-                
-                    // Use `compare_exchange` for thread-safe "print-once" logic.
-                    if !HAS_PRINTED_UNPACK_TRACE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                        // Extract lane 0 data for a clean, single-example trace.
-                        let packed_val_0 = packed_vals.to_array()[0];
-                        let bit_shift_0 = bit_shifts.to_array()[0];
-                        let two_bit_geno_0 = two_bit_genotypes.to_array()[0];
-                        let term1_0 = term1.to_array()[0];
-                        let term2_0 = term2.to_array()[0];
-                        let initial_dosage_0 = initial_dosages.to_array()[0];
-                
-                        eprintln!("
-                ================ [debug] GENOTYPE UNPACKING TRACE (First Person/Variant) ================");
-                        eprintln!("  Input Packed Byte:  {:#010b} ({})", packed_val_0, packed_val_0);
-                        eprintln!("  Input Bit Shift:    {}", bit_shift_0);
-                        eprintln!("  -----------------------------------------------------------------------------");
-                        eprintln!("  -> Isolated 2-bit:   {:#04b} ({})", two_bit_geno_0, two_bit_geno_0);
-                        eprintln!("  -> term1 ((g>>1)&1): {}", term1_0);
-                        eprintln!("  -> term2 ((g&1)+1):  {}", term2_0);
-                        eprintln!("  => Initial Dosage:   {}", initial_dosage_0);
-                        eprintln!("====================================================================================
-                ");
-                    }
-                }
 
-                // Create a mask for missing genotypes (coded as 0b01) and use it to
-                // select between the calculated dosage and the missing sentinel value.
                 let missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1));
-                let dosages =
-                    missing_mask.select(missing_sentinel_splat, initial_dosages);
-
-                dosage_vectors[i] = dosages;
+                dosage_vectors[i] = missing_mask.select(U8xN::splat(3), initial_dosages);
             }
 
-            // This highly optimized transpose is a core part of the engine. DO NOT CHANGE.
+            // --- 2. Transpose the 8x8 block ---
             let person_data_vectors = transpose_8x8_u8(dosage_vectors);
 
-            let tile_u8: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(tile.as_mut_ptr() as *mut u8, tile.len())
-            };
-
+            // --- 3. Write data to the tile, handling full and partial chunks correctly ---
             for i in 0..current_lanes {
                 let person_idx_in_block = person_chunk_start + i;
                 let dest_offset = person_idx_in_block * snps_in_chunk + snp_chunk_start;
-                let dest_slice = &mut tile_u8[dest_offset..dest_offset + current_snps];
-                let src_slice = &person_data_vectors[i].to_array()[..current_snps];
-                dest_slice.copy_from_slice(src_slice);
+                let shuffled_person_row = person_data_vectors[i].to_array();
+
+                if current_snps == SIMD_LANES {
+                    // FAST PATH: For full chunks, a direct memcpy is fastest.
+                    let dest_slice = &mut tile[dest_offset..dest_offset + SIMD_LANES];
+                    // SAFETY: The `EffectAlleleDosage` is repr(transparent) u8.
+                    let dest_u8: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            dest_slice.as_mut_ptr() as *mut u8,
+                            SIMD_LANES,
+                        )
+                    };
+                    dest_u8.copy_from_slice(&shuffled_person_row);
+                } else {
+                    // CORRECTNESS PATH: For partial chunks, un-shuffle the data byte by byte.
+                    // The compiler will unroll this tiny loop, making it extremely fast.
+                    for j in 0..current_snps {
+                        let correct_dosage = shuffled_person_row[SHUFFLE[j]];
+                        tile[dest_offset + j] = EffectAlleleDosage(correct_dosage);
+                    }
+                }
             }
         }
     }
