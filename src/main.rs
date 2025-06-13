@@ -258,15 +258,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     //
     const PERSON_BLOCK_SIZE: u64 = 4096; // Must match the value in `batch.rs`
 
-    // 1. Determine L3 Cache Size, with a safe fallback.
-    let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or_else(|| {
-        eprintln!("> L3 cache size not detected, using safe fallback of 32 MiB.");
-        32 * 1024 * 1024 // 32 MiB fallback
-    });
-
-    if let Some(size) = cache_size::l3_cache_size() {
-        eprintln!("> Detected L3 cache size: {} MiB", size / 1024 / 1024);
-    }
+    // 1. Determine L3 Cache Size, with a robust fallback.
+    const FALLBACK_L3_CACHE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+    
+    // Chain .and_then() to treat a size of 0 as a detection failure.
+    // This correctly handles both None and Some(0) as cases for the fallback.
+    let l3_cache_bytes = cache_size::l3_cache_size()
+        .and_then(|size| if size > 0 { Some(size) } else { None })
+        .unwrap_or_else(|| {
+            eprintln!(
+                "> L3 cache size not detected or is 0. Using safe fallback: {} MiB.",
+                FALLBACK_L3_CACHE_BYTES / 1024 / 1024
+            );
+            FALLBACK_L3_CACHE_BYTES
+        });
+    
+    // This prints the cache size *actually being used* for the calculation.
+    eprintln!(
+        "> Using L3 cache size for optimization: {} MiB",
+        l3_cache_bytes / 1024 / 1024
+    );
 
     // 2. Get data parameters from the `prep_result`.
     let n_people = prep_result.total_people_in_fam as u64;
