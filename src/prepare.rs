@@ -147,59 +147,61 @@ pub fn prepare_for_computation(
             let mut work_for_position = Vec::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, other_allele, weights) in score_lines {
-                    // This two-pass logic ensures that we prioritize a perfect allele match before
-                    // falling back to a more permissive match on only the effect allele. This
-                    // resolves ambiguity when multiple variants exist at the same position.
-                    // Pass 1: Look for a perfect match on both alleles.
-                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
-                        (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
-                        (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
-                    });
+                    // This is a single-pass state machine to find all valid matches for a score line.
 
-                    // Use the perfect match if it exists. Otherwise, fall back to the old permissive logic.
-                    let usable_match = perfect_match.or_else(|| {
-                        // Pass 2: Permissive match (only if no perfect match was found).
-                        bim_records.iter().find(|(bim_record, _)| {
-                            effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
-                        })
-                    });
+                    let mut perfect_matches = Vec::new();
+                    let mut permissive_candidate: Option<&(BimRecord, usize)> = None;
+                    let mut is_ambiguous = false;
 
-                    if let Some((bim_record, bim_row_index)) = usable_match {
-                        // The `bim_row_to_matrix_row_typed` lookup should always succeed here,
-                        // because the `discover_required_bim_indices` pass has already
-                        // identified this `bim_row_index` as being required.
-                        if let Some(matrix_row) = bim_row_to_matrix_row_typed[*bim_row_index] {
-                            // The dosage extracted by the kernel is always for `allele2` in the BIM file.
-                            // Therefore, if the score's effect allele is `allele2`, the weight is used as-is.
-                            // If the score's effect allele is `allele1`, we must flip the sign of the weight
-                            // and add a correction constant.
-                            let reconciliation = if effect_allele == &bim_record.allele2 {
-                                Reconciliation::Identity
-                            } else {
-                                Reconciliation::Flip
-                            };
+                    // --- Single Pass ---
+                    for bim_tuple in bim_records {
+                        let (bim_record, _) = bim_tuple;
 
-                            // Iterate over the weights for *this specific score line* and generate
-                            // a WorkItem for each. No data is ever overwritten.
-                            for (score_name, weight) in weights {
-                                if let Some(&col_idx) =
-                                    score_name_to_col_index.get(score_name.as_str())
-                                {
-                                    let (aligned_weight, correction_constant) =
-                                        match reconciliation {
-                                            Reconciliation::Identity => (*weight, 0.0),
-                                            Reconciliation::Flip => (-(*weight), 2.0 * *weight),
-                                        };
-                                    work_for_position.push(WorkItem {
-                                        matrix_row,
-                                        col_idx,
-                                        aligned_weight,
-                                        correction_constant,
-                                    });
-                                }
+                        // Check for perfect match.
+                        if (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
+                           (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
+                        {
+                            perfect_matches.push(bim_tuple);
+                        }
+
+                        // Separately, check for permissive match to detect ambiguity.
+                        if bim_record.allele1 == *effect_allele || bim_record.allele2 == *effect_allele {
+                            if permissive_candidate.is_some() {
+                                is_ambiguous = true;
                             }
+                            permissive_candidate = Some(bim_tuple);
                         }
                     }
+
+                    // --- Evaluate Final State ---
+                    if !perfect_matches.is_empty() {
+                        // Priority 1: Use all found perfect matches. This is non-greedy.
+                        for (bim_record, bim_row_index) in perfect_matches {
+                             process_match(
+                                bim_record,
+                                *bim_row_index,
+                                effect_allele,
+                                weights,
+                                &bim_row_to_matrix_row_typed,
+                                &score_name_to_col_index,
+                                &mut work_for_position,
+                            );
+                        }
+                    } else if !is_ambiguous {
+                        // Priority 2: Use the single, unambiguous permissive match.
+                        if let Some((bim_record, bim_row_index)) = permissive_candidate {
+                             process_match(
+                                bim_record,
+                                *bim_row_index,
+                                effect_allele,
+                                weights,
+                                &bim_row_to_matrix_row_typed,
+                                &score_name_to_col_index,
+                                &mut work_for_position,
+                            );
+                        }
+                    }
+                    // If ambiguous, do nothing, correctly discarding the variant.
                 }
             }
             work_for_position
@@ -332,6 +334,42 @@ pub fn prepare_for_computation(
 // ========================================================================================
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
+
+/// Processes a matched variant and generates all corresponding `WorkItem`s.
+/// This helper function centralizes the work generation logic to avoid duplication.
+#[inline(always)]
+fn process_match(
+    bim_record: &BimRecord,
+    bim_row_index: usize,
+    effect_allele: &str,
+    weights: &AHashMap<String, f32>,
+    bim_row_to_matrix_row_typed: &[Option<MatrixRowIndex>],
+    score_name_to_col_index: &AHashMap<&str, ScoreColumnIndex>,
+    work_for_position: &mut Vec<WorkItem>,
+) {
+    if let Some(matrix_row) = bim_row_to_matrix_row_typed[bim_row_index] {
+        let reconciliation = if effect_allele == &bim_record.allele2 {
+            Reconciliation::Identity
+        } else {
+            Reconciliation::Flip
+        };
+
+        for (score_name, weight) in weights {
+            if let Some(&col_idx) = score_name_to_col_index.get(score_name.as_str()) {
+                let (aligned_weight, correction_constant) = match reconciliation {
+                    Reconciliation::Identity => (*weight, 0.0),
+                    Reconciliation::Flip => (-(*weight), 2.0 * *weight),
+                };
+                work_for_position.push(WorkItem {
+                    matrix_row,
+                    col_idx,
+                    aligned_weight,
+                    correction_constant,
+                });
+            }
+        }
+    }
+}
 
 fn index_bim_file(
     bim_path: &Path,
