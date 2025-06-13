@@ -452,14 +452,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
 
         // --- Lean Aggregation Step ---
-        // By explicitly dereferencing the wrapper types into slices, we can iterate over them.
-        for (master, &partial) in all_scores.iter_mut().zip(&*partial_scores) {
+        // The loops are simplified using Deref coercion. The compiler automatically
+        // converts `&partial_scores` (a `&DirtyScores`) into a slice reference
+        // (`&[f32]`) for the `.zip()` method, making the explicit `&*` unnecessary.
+        // This is a zero-cost abstraction that improves readability with no
+        // performance penalty.
+
+        for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) {
             *master += partial;
         }
-        for (master, &partial) in all_missing_counts.iter_mut().zip(&*partial_missing_counts) {
+
+        for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
             *master += partial;
         }
-        for (master, &partial) in all_correction_sums.iter_mut().zip(&*partial_correction_sums) {
+
+        for (master, &partial) in all_correction_sums.iter_mut().zip(&partial_correction_sums) {
             *master += partial;
         }
         
