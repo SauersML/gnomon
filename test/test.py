@@ -8,6 +8,7 @@ import sys
 import os
 from pathlib import Path
 from itertools import combinations
+
 import pandas as pd
 import numpy as np
 import psutil
@@ -21,7 +22,8 @@ PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
 
 # --- ALL TOOLS will now use the same, cleaned genotype files for a fair comparison ---
-SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_plink_compat"
+# The variant ID in this fileset will be 'chr:pos'
+SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_compat"
 # We still need the original files to create the cleaned version.
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
 
@@ -43,14 +45,12 @@ PGS_SCORES = {
 #                                     HELPER FUNCTIONS
 # ========================================================================================
 def print_header(title: str, char: str = "="):
-    """Prints a formatted header to the console."""
     width = 80
     print("\n" + char * width, flush=True)
     print(f"{char*4} {title} {char*(width - len(title) - 6)}", flush=True)
     print(char * width, flush=True)
 
 def print_debug_header(title: str):
-    """Prints a smaller header for debug sections."""
     print("\n" + "." * 80, flush=True)
     print(f".... DEBUG: {title} ....", flush=True)
     print("." * 80, flush=True)
@@ -76,7 +76,6 @@ def download_and_extract(url: str, dest_dir: Path):
         print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
 def run_and_measure(cmd: list, name: str):
-    """Executes a command, streaming its output in real-time, and measures performance."""
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
@@ -98,7 +97,6 @@ def run_and_measure(cmd: list, name: str):
     return result
 
 def setup_environment():
-    """Downloads all required binaries and data files for the CI test."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
@@ -111,33 +109,35 @@ def setup_environment():
     for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
-    """Creates a new, de-duplicated PLINK fileset with unique, allele-aware variant IDs."""
+    """Creates a new, de-duplicated PLINK fileset where variant IDs are 'chr:pos'."""
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
-    temp_prefix = CI_WORKDIR / "temp_bim_for_dedup"
     original_bim = original_prefix.with_suffix('.bim')
     bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
     
-    alleles = bim_df[['a1', 'a2']].apply(lambda x: sorted(x), axis=1, result_type='expand')
-    bim_df['canonical_id'] = bim_df['chrom'] + '_' + bim_df['pos'] + '_' + alleles[0] + '_' + alleles[1]
+    # Set the variant ID (col 2) to be 'chr:pos'. This is the key insight.
+    bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
     
-    bim_df_to_save = bim_df[['chrom', 'canonical_id', 'cm', 'pos', 'a1', 'a2']]
-    bim_df_to_save.to_csv(temp_prefix.with_suffix('.bim'), sep='\t', header=False, index=False)
-    
-    shutil.copy(original_prefix.with_suffix('.bed'), temp_prefix.with_suffix('.bed'))
-    shutil.copy(original_prefix.with_suffix('.fam'), temp_prefix.with_suffix('.fam'))
+    # We must first remove variants with duplicate chr:pos, as these cannot be used as unique IDs.
+    bim_df.drop_duplicates(subset=['chr_pos_id'], keep=False, inplace=True)
+    print(f"[SCRIPT] Kept {len(bim_df)} variants with unique chr:pos identifiers.", flush=True)
 
-    dedup_cmd = [str(PLINK2_BINARY), "--bfile", str(temp_prefix), "--rm-dup", "force-first", "--make-bed", "--out", str(final_prefix)]
-    dedup_proc = subprocess.run(dedup_cmd, capture_output=True, text=True)
-    if dedup_proc.returncode != 0:
-        print("❌ FAILED to de-duplicate genotype data.", flush=True); print(dedup_proc.stderr, flush=True); sys.exit(1)
+    bim_df_to_save = bim_df[['chrom', 'chr_pos_id', 'cm', 'pos', 'a1', 'a2']]
+    bim_df_to_save.to_csv(final_prefix.with_suffix('.bim'), sep='\t', header=False, index=False)
+    
+    # Now, filter the .bed file to keep only these non-duplicate variants.
+    variants_to_keep_file = CI_WORKDIR / "variants_to_keep.txt"
+    bim_df['chr_pos_id'].to_csv(variants_to_keep_file, index=False, header=False)
+
+    print("[SCRIPT] Filtering original BED file to match unique chr:pos variants...", flush=True)
+    filter_cmd = [str(PLINK2_BINARY), "--bfile", str(original_prefix), "--extract", str(variants_to_keep_file), "--make-bed", "--out", str(final_prefix)]
+    filter_proc = subprocess.run(filter_cmd, capture_output=True, text=True)
+    if filter_proc.returncode != 0:
+        print("❌ FAILED to filter original genotype data.", flush=True); print(filter_proc.stderr, flush=True); sys.exit(1)
     
     print(f"[SCRIPT] Successfully created de-duplicated, synchronized fileset at: {final_prefix}", flush=True)
 
 def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
-    """
-    Creates a single, unified scorefile in the "gnomon-native" format
-    that can be used by all three tools for a true 1-to-1 comparison.
-    """
+    """Creates a unified scorefile where the variant ID is 'chr:pos'."""
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
     
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
@@ -145,15 +145,11 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     df['effect_weight'] = pd.to_numeric(df['effect_weight'], errors='coerce')
     df.dropna(inplace=True)
     
-    # Create the canonical ID that matches the synchronized .bim file
-    alleles = df[['effect_allele', 'other_allele']].apply(lambda x: sorted(x), axis=1, result_type='expand')
-    df['canonical_id'] = df['hm_chr'] + '_' + df['hm_pos'] + '_' + alleles[0] + '_' + alleles[1]
-    df.drop_duplicates(subset=['canonical_id'], keep='first', inplace=True)
+    df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
+    df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
 
-    # Prepare the DataFrame in the gnomon-native format
-    # Header: snp_id, effect_allele, other_allele, [score_name]
-    final_df = df[['canonical_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
-    final_df.columns = ['snp_id', 'effect_allele', 'other_allele', pgs_id] # Use the pgs_id as the score column name
+    final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
+    final_df.columns = ['snp_id', 'effect_allele', 'other_allele', pgs_id]
     
     out_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
     print(f"[SCRIPT] Writing {len(final_df)} variants to unified score file: {out_path.name}", flush=True)
@@ -161,7 +157,6 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     return out_path
 
 def validate_results(pgs_id: str, results: list):
-    """Loads and compares successful tool outputs, focusing on SUM scores for direct comparison."""
     print_header(f"VALIDATION & COMPARISON FOR {pgs_id}", char='-')
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
@@ -174,25 +169,23 @@ def validate_results(pgs_id: str, results: list):
     for tool_name in successful_tools:
         path = tool_paths.get(tool_name)
         if not path or not path.exists():
-            print(f"  > WARNING: Output file for {tool_name} not found at {path}", flush=True)
-            continue
+            print(f"  > WARNING: Output file for {tool_name} not found at {path}", flush=True); continue
+        
         try:
             df = None
             if tool_name == 'gnomon':
-                # Gnomon outputs AVG scores. To get the SUM, we must reverse the calculation.
-                # SUM = AVG * (total_variants - missing_variants)
                 df_raw = pd.read_csv(path, sep='\t')
-                total_variants = float(df_raw.columns[1].split('_')[0].split('(')[-1].replace('v)','')) # hacky but works
                 avg_col = next(c for c in df_raw.columns if '_AVG' in c)
-                miss_col = next(c for c in df_raw.columns if '_MISSING' in c)
-                df_raw[f'SCORE_{tool_name}'] = df_raw[avg_col] * (total_variants * (1 - df_raw[miss_col] / 100.0))
+                # Gnomon SUM = AVG * num_variants_used. num_variants_used = total - missing
+                # We extract total from the header string, e.g. "PGS004696(18722v)_AVG"
+                total_vars_in_score = float(avg_col.split('(')[1].split('v)')[0])
+                miss_pct_col = next(c for c in df_raw.columns if '_MISSING_PCT' in c)
+                df_raw[f'SCORE_{tool_name}'] = df_raw[avg_col] * (total_vars_in_score * (1 - df_raw[miss_pct_col] / 100.0))
                 df = df_raw[['#IID', f'SCORE_{tool_name}']].rename(columns={'#IID': 'IID'})
             elif tool_name == 'plink1':
-                # PLINK1 by default calculates a SUM score in the SCORE column
                 df = pd.read_csv(path, sep='\s+')[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
             elif tool_name == 'plink2':
-                # PLINK2 with default 'sum' modifier outputs SCORE_SUM
-                df = pd.read_csv(path, sep='\s+')[['#IID', 'SCORE_SUM']].rename(columns={'#IID': 'IID', 'SCORE_SUM': f'SCORE_{tool_name}'})
+                df = pd.read_csv(path, sep='\s+')[['#IID', 'SCORE1_SUM']].rename(columns={'#IID': 'IID', 'SCORE1_SUM': f'SCORE_{tool_name}'})
             
             if df is not None: dfs.append(df)
         except Exception as e:
@@ -202,12 +195,10 @@ def validate_results(pgs_id: str, results: list):
         print("Could not load enough results for comparison.", flush=True); return
 
     merged_df = dfs[0]
-    for df_to_merge in dfs[1:]:
-        merged_df = pd.merge(merged_df, df_to_merge, on='IID')
+    for df_to_merge in dfs[1:]: merged_df = pd.merge(merged_df, df_to_merge, on='IID')
     
     score_cols = [c for c in merged_df.columns if c.startswith('SCORE_')]
-    if len(score_cols) < 2:
-        print("Not enough comparable scores after merging.", flush=True); return
+    if len(score_cols) < 2: print("Not enough comparable scores after merging.", flush=True); return
 
     print_debug_header("Sample of Computed SUM Scores")
     print(merged_df.head(10).to_markdown(index=False, floatfmt='.6f'), flush=True)
@@ -218,8 +209,8 @@ def validate_results(pgs_id: str, results: list):
         diff = (merged_df[col1] - merged_df[col2]).abs().mean()
         print(f"  > {col1} vs {col2}: {diff:.8f}", flush=True)
 
+
 def main():
-    """Main function to run the CI test suite."""
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
     create_synchronized_genotype_files(ORIGINAL_PLINK_PREFIX, SHARED_GENOTYPE_PREFIX)
@@ -230,27 +221,26 @@ def main():
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
         pgs_results = []
 
-        # Step 1: Create a single, unified scoring file in gnomon-native format
         unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
-
+        
         # --- Gnomon Run ---
-        # Gnomon will now read the unified file, see the 'snp_id' header, and use its
-        # simple/native parser. The output file is based on the PLINK prefix.
+        # It reads the chr:pos from the unified file and matches the chr:pos index it builds from the bim file.
         gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(SHARED_GENOTYPE_PREFIX)]
         res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}")
         all_results.append(res_g); pgs_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
-        
+
         # --- PLINK2 Run ---
-        # We tell PLINK2 to use the named columns from our unified file.
+        # It reads the chr:pos ID from the bim file and matches it against the chr:pos ID in the unified file.
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "snp_id", "effect_allele", pgs_id, "header", "no-mean-imputation", "--out", str(out2_prefix)]
+        # Use column numbers: 1=snp_id, 2=effect_allele, 4=score
+        plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
         res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}")
         all_results.append(res_p2); pgs_results.append(res_p2)
         if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
         
         # --- PLINK1 Run ---
-        # We tell PLINK1 to use columns 1 (snp_id), 2 (effect_allele), and 4 (the score)
+        # It also reads the chr:pos ID from the bim and matches against the score file.
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
         plink1_cmd = [str(PLINK1_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)]
         res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}")
