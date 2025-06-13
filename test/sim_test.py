@@ -192,14 +192,89 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     
     print(f"...PLINK files written: {prefix}.bed/.bim/.fam")
 
+def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
+    """
+    Runs a minimal, hardcoded test case with 1 variant and 3 individuals
+    (0/0, 0/1, 1/1) to verify basic dosage calculation.
+    """
+    prefix = workdir / "simple_test"
+    print("\n" + "="*80)
+    print("= Running Simple Dosage Test Case")
+    print("="*80)
+    print(f"Test files will be prefixed: {prefix}")
+
+    # --- 1. Define Ground Truth and File Contents ---
+    truth_df = pd.DataFrame({
+        'IID': ['id_hom_ref', 'id_het', 'id_hom_alt'],
+        'SCORE_TRUTH': [0.0, 0.5, 1.0] # (0*0.5)/1, (1*0.5)/1, (2*0.5)/1
+    })
+    
+    # --- 2. Write Input Files and Print Contents ---
+    print("\n--- Writing Input Files ---")
+
+    # .fam file
+    fam_content = "id_hom_ref id_hom_ref 0 0 0 -9\nid_het id_het 0 0 0 -9\nid_hom_alt id_hom_alt 0 0 0 -9\n"
+    with open(prefix.with_suffix(".fam"), "w") as f:
+        f.write(fam_content)
+    print(f"\nContents of {prefix.with_suffix('.fam')}:\n---\n{fam_content.strip()}\n---")
+    
+    # .bim file
+    bim_content = "1\trs123\t0\t1000\tA\tG\n"
+    with open(prefix.with_suffix(".bim"), "w") as f:
+        f.write(bim_content)
+    print(f"\nContents of {prefix.with_suffix('.bim')}:\n---\n{bim_content.strip()}\n---")
+    
+    # score file
+    score_content = "snp_id\teffect_allele\tother_allele\tsimple_score\nrs123\tG\tA\t0.5\n"
+    with open(prefix.with_suffix(".score"), "w") as f:
+        f.write(score_content)
+    print(f"\nContents of {prefix.with_suffix('.score')}:\n---\n{score_content.strip()}\n---")
+
+    # .bed file (magic bytes + 1 variant for 3 people)
+    # Genos: 0/0 (0b00), 0/1 (0b10), 1/1 (0b11).
+    # Byte is (padding)(ind3)(ind2)(ind1) -> 00111000 -> 0x38
+    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x38])
+    with open(prefix.with_suffix(".bed"), "wb") as f:
+        f.write(bed_bytes)
+    print(f"\nContents of {prefix.with_suffix('.bed')} (in hex):\n---\n{bed_bytes.hex()}\n---")
+
+    # --- 3. Run Tools ---
+    run_cmd_func(
+        [gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
+        "Simple Gnomon Test", cwd=workdir
+    )
+    run_cmd_func(
+        [f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
+        "Simple PLINK2 Test", cwd=workdir
+    )
+
+    # --- 4. Compare Results ---
+    print("\n--- Analyzing Simple Test Results ---")
+    gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={'#IID': 'IID', 'simple_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
+    plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep='\s+').rename(columns={'#IID': 'IID'})
+    # PLINK's AVG is per-allele, not per-variant. We must multiply by 2 for comparison.
+    plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
+
+    merged_df = pd.merge(truth_df, gnomon_results, on='IID').merge(plink_results, on='IID')
+    print("\n--- Comparison of Scores ---")
+    print(merged_df.to_markdown(index=False, floatfmt=".6f"))
+    
+    # --- 5. Final Validation ---
+    is_gnomon_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
+    is_plink_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_PLINK2'])
+    
+    if is_gnomon_ok and is_plink_ok:
+        print("\n✅ Simple Dosage Test Successful: All tools produced the correct scores.")
+    else:
+        print("\n❌ Simple Dosage Test FAILED:")
+        if not is_gnomon_ok: print("  - Gnomon scores do not match ground truth.")
+        if not is_plink_ok: print("  - PLINK2 scores do not match ground truth.")
+        sys.exit(1)
+
 def run_and_validate_tools():
     """
     Downloads tools, runs them on the simulated data, and compares results.
     """
-    print("\n" + "="*80)
-    print("= Running Tool Validation and Comparison Pipeline")
-    print("="*80)
-
     # --- Configuration ---
     # URLs and paths are now relative to the isolated WORKDIR
     PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
@@ -264,8 +339,8 @@ def run_and_validate_tools():
             print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
             sys.exit(1)
 
-    def analyze_and_compare_results():
-        _print_header("Step D: Analyzing and Comparing Results")
+    def analyze_and_compare_large_scale_results():
+        _print_header("Step D: Analyzing and Comparing Large-Scale Simulation Results")
         
         def _debug_print_df(df: pd.DataFrame, name: str):
             """Helper to print dataframe info for debugging."""
@@ -290,14 +365,13 @@ def run_and_validate_tools():
                 gnomon_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
 
-            # --- Load plink2_df with flexible separator and without ignoring the header ---
+            # --- Load plink2_df ---
             plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\s+')
             _debug_print_df(plink2_df_raw, "plink2_df (raw)")
-            # --- Clean up the '#IID' or '#FID' column name from PLINK2 output ---
-            if '#IID' in plink2_df_raw.columns:
-                plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
-            elif '#FID' in plink2_df_raw.columns:
-                plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            # Clean up the '#IID' or '#FID' column name
+            if '#IID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
+            elif '#FID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            # PLINK's AVG is per-allele, we multiply by 2 to compare with per-variant scores
             plink2_df = plink2_df_raw.assign(SCORE_PLINK2=plink2_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
             
         except (FileNotFoundError, KeyError) as e:
@@ -308,41 +382,46 @@ def run_and_validate_tools():
         score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2']
         merged_df[score_cols] = merged_df[score_cols].astype(float)
 
-        print("\n--- Sample of Computed Scores ---")
+        print("\n--- Sample of Computed Scores (Large-Scale) ---")
         print(merged_df.head(10).to_markdown(index=False, floatfmt=".8f"))
 
-        print("\n--- Score Correlation Matrix ---")
+        print("\n--- Score Correlation Matrix (Large-Scale) ---")
         print(merged_df[score_cols].corr().to_markdown(floatfmt=".8f"))
 
-        print("\n--- Mean Absolute Difference (MAD) vs. Ground Truth ---")
+        print("\n--- Mean Absolute Difference (MAD) vs. Ground Truth (Large-Scale) ---")
         mad_g_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_GNOMON']).abs().mean()
         mad_p_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PLINK2']).abs().mean()
         print(f"Gnomon vs. Truth: {mad_g_vs_t:.10f}")
         print(f"PLINK2 vs. Truth: {mad_p_vs_t:.10f}")
         
         if mad_g_vs_t < 1e-9 and mad_p_vs_t < 1e-9:
-            print("\n✅ Validation Successful: All tools produced scores identical to the ground truth.")
+            print("\n✅ Large-Scale Validation Successful: All tools produced scores identical to the ground truth.")
         else:
-            print("\n⚠️ Validation Warning: Significant differences detected.")
-            # Fail the job if differences are detected
+            print("\n⚠️ Large-Scale Validation Warning: Significant differences detected.")
             sys.exit(1)
 
     # --- Main execution flow for this function ---
     setup_tools()
     
-    # Run Gnomon
+    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, run_command)
+    
+    print("\n" + "="*80)
+    print("= Running Large-Scale Simulation and Validation")
+    print("="*80)
+
+    # Run Gnomon on large-scale data
     run_command(
         [GNOMON_BINARY_PATH, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, OUTPUT_PREFIX.name],
-        "Gnomon", cwd=WORKDIR
+        "Large-Scale Gnomon", cwd=WORKDIR
     )
 
-    # Run PLINK2
+    # Run PLINK2 on large-scale data
     run_command(
         [f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "plink2_results"],
-        "PLINK2", cwd=WORKDIR
+        "Large-Scale PLINK2", cwd=WORKDIR
     )
 
-    analyze_and_compare_results()
+    analyze_and_compare_large_scale_results()
 
 def cleanup():
     """Removes the generated workspace directory."""
