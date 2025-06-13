@@ -13,6 +13,7 @@ use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
 use gnomon::io::SnpChunkReader;
+use gnomon::io::SnpChunk;
 use gnomon::prepare::{self, PrepError};
 use gnomon::reformat;
 use std::error::Error;
@@ -59,18 +60,11 @@ struct Args {
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
-/// A message passed from the I/O producer task to the compute dispatcher.
-struct IoMessage {
-    buffer: Vec<u8>,
-    bytes_read: usize,
-    snps_in_chunk: usize,
-}
-
 /// A structure that bundles the I/O buffer and the partial result buffers for a
 /// single computational chunk. This type enforces that the partial results are
 /// merged before the I/O buffer can be recycled, preventing data loss.
 struct ChunkResult {
-    io_buffer: Vec<u8>,
+    chunk: SnpChunk,
     partial_scores: Vec<f32>,
     partial_missing_counts: Vec<u32>,
     partial_correction_sums: Vec<f32>,
@@ -81,13 +75,13 @@ struct ChunkResult {
 impl ChunkResult {
     /// Creates a new `ChunkResult` from its constituent buffers.
     fn new(
-        io_buffer: Vec<u8>,
+        chunk: SnpChunk,
         partial_scores: Vec<f32>,
         partial_missing_counts: Vec<u32>,
         partial_correction_sums: Vec<f32>,
     ) -> Self {
         Self {
-            io_buffer,
+            chunk,
             partial_scores,
             partial_missing_counts,
             partial_correction_sums,
@@ -110,7 +104,10 @@ impl ChunkResult {
         Result<(), SendError<Vec<u8>>>,
     ) {
         let this = std::mem::ManuallyDrop::new(self);
-        let io_buffer = unsafe { std::ptr::read(&this.io_buffer) };
+        // Unpack the guaranteed-valid chunk to retrieve the underlying buffer for recycling.
+        let SnpChunk {
+            buffer: io_buffer, ..
+        } = unsafe { std::ptr::read(&this.chunk) };
         let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
         let mut recycled_missing_counts_buffer =
             unsafe { std::ptr::read(&this.partial_missing_counts) };
@@ -388,7 +385,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let t7 = Instant::now();
 
-    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<IoMessage>(PIPELINE_DEPTH);
+    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpChunk>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
     let t8 = Instant::now();
@@ -426,38 +423,51 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let io_handle = tokio::spawn(async move {
         let mut reader = reader;
-        while let Some(mut buffer) = empty_buffer_rx.recv().await {
+        // The producer loop is now free of logic. It just calls the reader factory
+        // and sends the resulting guaranteed-valid chunk to the consumer.
+        'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
             let read_result = task::spawn_blocking(move || {
-                let bytes_read = reader.read_chunk(&mut buffer)?;
-                let snps_in_chunk = reader.snps_in_bytes(bytes_read);
-                Ok::<_, io::Error>((reader, buffer, bytes_read, snps_in_chunk))
+                // The factory method returns a valid chunk or None at EOF.
+                let chunk_opt = reader.read_next_chunk(&mut buffer)?;
+                // The buffer is passed back, potentially empty if it was used.
+                Ok::<_, io::Error>((reader, buffer, chunk_opt))
             })
-            .await.unwrap();
+            .await
+            .unwrap();
 
             match read_result {
-                Ok((_, _, 0, _)) => break,
-                Ok((new_reader, buffer, bytes_read, snps_in_chunk)) => {
+                Ok((new_reader, _cleared_buffer, Some(chunk))) => {
                     reader = new_reader;
-                    if full_buffer_tx
-                        .send(IoMessage { buffer, bytes_read, snps_in_chunk })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    // Send the validated chunk to the consumer.
+                    if full_buffer_tx.send(chunk).await.is_err() {
+                        // Consumer has hung up, no point in continuing.
+                        break 'producer;
                     }
+                }
+                Ok((new_reader, unused_buffer, None)) => {
+                    // EOF. The reader is now exhausted.
+                    reader = new_reader;
+                    // The buffer we received was not used by the factory. We drop it.
+                    // The producer loop can now terminate.
+                    drop(unused_buffer);
+                    break 'producer;
                 }
                 Err(e) => {
                     eprintln!("[I/O Task Error]: {}", e);
-                    break;
+                    break 'producer;
                 }
             }
         }
+        // The producer loop has finished (due to EOF, error, or consumer hang-up).
+        // The `full_buffer_tx` is now dropped, which will cause the consumer
+        // loop to terminate gracefully after processing any in-flight chunks.
     });
 
     let mut bed_row_offset: usize = 0;
 
     let computation_start = Instant::now();
-    while let Some(IoMessage { buffer: full_buffer, bytes_read, snps_in_chunk }) = full_buffer_rx.recv().await {
+    while let Some(chunk) = full_buffer_rx.recv().await {
+        let snps_in_chunk = chunk.num_snps;
         let bed_row_end = bed_row_offset + snps_in_chunk;
 
         let matrix_row_start = prep_result.required_bim_indices.partition_point(|&x| x < bed_row_offset);
@@ -483,8 +493,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         ) = partial_result_pool_clone.pop().unwrap();
 
         let compute_handle = task::spawn_blocking(move || {
-            let buffer_slice = &full_buffer[..bytes_read];
-
             let weights_for_chunk = prep_clone
                 .aligned_weights_matrix
                 .get(matrix_slice_start..matrix_slice_end)
@@ -494,8 +502,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     )
                 })?;
 
+            // The buffer from the chunk is passed directly. No slicing is needed as its
+            // length is guaranteed to be correct.
             batch::run_chunk_computation(
-                buffer_slice,
+                &chunk.buffer,
                 weights_for_chunk,
                 &prep_clone,
                 &mut partial_scores_buffer,
@@ -508,7 +518,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             )?;
 
             let result = ChunkResult::new(
-                full_buffer,
+                chunk,
                 partial_scores_buffer,
                 partial_missing_counts_buffer,
                 partial_correction_sums_buffer,
