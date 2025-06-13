@@ -31,7 +31,113 @@ use std::fs::File;
 use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
 use cache_size;
+use std::ops::{Deref, DerefMut};
 
+// ========================================================================================
+//                             ZERO-COST BUFFER STATE TYPES
+// ========================================================================================
+
+// These wrapper types encode a buffer's state (Clean or Dirty) into the type system,
+// allowing the compiler to enforce correct usage at zero runtime cost. The `#[repr(transparent)]`
+// attribute ensures they are identical to a `Vec` in memory layout.
+
+/// A buffer that is guaranteed by the type system to have been zeroed.
+#[repr(transparent)]
+pub struct CleanScores(Vec<f32>);
+#[repr(transparent)]
+pub struct CleanCounts(Vec<u32>);
+#[repr(transparent)]
+pub struct CleanCorrections(Vec<f32>);
+
+/// A buffer that may contain non-zero data from a previous computation.
+#[repr(transparent)]
+pub struct DirtyScores(Vec<f32>);
+#[repr(transparent)]
+pub struct DirtyCounts(Vec<u32>);
+#[repr(transparent)]
+pub struct DirtyCorrections(Vec<f32>);
+
+// --- State Transition & Ergonomics ---
+
+impl DirtyScores {
+    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
+    /// This is the ONLY way to transition from a Dirty to a Clean state.
+    pub fn into_clean(mut self) -> CleanScores {
+        self.0.fill(0.0);
+        CleanScores(self.0)
+    }
+}
+impl Deref for DirtyScores {
+    type Target = [f32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl DirtyCounts {
+    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
+    pub fn into_clean(mut self) -> CleanCounts {
+        self.0.fill(0);
+        CleanCounts(self.0)
+    }
+}
+impl Deref for DirtyCounts {
+    type Target = [u32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl DirtyCorrections {
+    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
+    pub fn into_clean(mut self) -> CleanCorrections {
+        self.0.fill(0.0);
+        CleanCorrections(self.0)
+    }
+}
+impl Deref for DirtyCorrections {
+    type Target = [f32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl CleanScores {
+    /// Consumes a clean buffer, acknowledging it is now dirty after use.
+    /// This is a zero-cost type change.
+    pub fn into_dirty(self) -> DirtyScores {
+        DirtyScores(self.0)
+    }
+}
+impl Deref for CleanScores {
+    type Target = [f32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl DerefMut for CleanScores {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+impl CleanCounts {
+    /// Consumes a clean buffer, acknowledging it is now dirty after use.
+    pub fn into_dirty(self) -> DirtyCounts {
+        DirtyCounts(self.0)
+    }
+}
+impl Deref for CleanCounts {
+    type Target = [u32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl DerefMut for CleanCounts {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+impl CleanCorrections {
+    /// Consumes a clean buffer, acknowledging it is now dirty after use.
+    pub fn into_dirty(self) -> DirtyCorrections {
+        DirtyCorrections(self.0)
+    }
+}
+impl Deref for CleanCorrections {
+    type Target = [f32];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl DerefMut for CleanCorrections {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
 // ========================================================================================
@@ -59,107 +165,6 @@ struct Args {
 // ========================================================================================
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
-
-/// A structure that bundles the I/O buffer and the partial result buffers for a
-/// single computational chunk. This type enforces that the partial results are
-/// merged before the I/O buffer can be recycled, preventing data loss.
-struct ChunkResult {
-    chunk: SnpChunk,
-    partial_scores: Vec<f32>,
-    partial_missing_counts: Vec<u32>,
-    partial_correction_sums: Vec<f32>,
-    #[cfg(debug_assertions)]
-    committed: Cell<bool>,
-}
-
-impl ChunkResult {
-    /// Creates a new `ChunkResult` from its constituent buffers.
-    fn new(
-        chunk: SnpChunk,
-        partial_scores: Vec<f32>,
-        partial_missing_counts: Vec<u32>,
-        partial_correction_sums: Vec<f32>,
-    ) -> Self {
-        Self {
-            chunk,
-            partial_scores,
-            partial_missing_counts,
-            partial_correction_sums,
-            #[cfg(debug_assertions)]
-            committed: Cell::new(false),
-        }
-    }
-
-    /// Atomically merges all partial results, sends the I/O buffer back to the
-    /// producer, and returns the now-cleared partial result buffers for reuse.
-    #[must_use = "The result of the commit must be handled to recycle buffers and check for errors."]
-    async fn commit(
-        self,
-        all_scores: &mut [f32],
-        all_missing_counts: &mut [u32],
-        all_correction_sums: &mut [f32],
-        empty_tx: &Sender<Vec<u8>>,
-    ) -> (
-        (Vec<f32>, Vec<u32>, Vec<f32>),
-        Result<(), SendError<Vec<u8>>>,
-    ) {
-        let this = std::mem::ManuallyDrop::new(self);
-        // Unpack the guaranteed-valid chunk to retrieve the underlying buffer for recycling.
-        let SnpChunk {
-            buffer: io_buffer, ..
-        } = unsafe { std::ptr::read(&this.chunk) };
-        let mut recycled_scores_buffer = unsafe { std::ptr::read(&this.partial_scores) };
-        let mut recycled_missing_counts_buffer =
-            unsafe { std::ptr::read(&this.partial_missing_counts) };
-        let mut recycled_correction_sums_buffer =
-            unsafe { std::ptr::read(&this.partial_correction_sums) };
-
-        // Aggregate all partial result buffers into their master counterparts.
-        for (master, partial) in all_scores.iter_mut().zip(&recycled_scores_buffer) {
-            *master += partial;
-        }
-        for (master, partial) in all_missing_counts.iter_mut().zip(&recycled_missing_counts_buffer)
-        {
-            *master += partial;
-        }
-        for (master, partial) in all_correction_sums.iter_mut().zip(&recycled_correction_sums_buffer)
-        {
-            *master += partial;
-        }
-
-        #[cfg(debug_assertions)]
-        this.committed.set(true);
-
-        let send_result = empty_tx.send(io_buffer).await;
-
-        // Clear buffers for reuse.
-        recycled_scores_buffer.fill(0.0);
-        recycled_missing_counts_buffer.fill(0);
-        recycled_correction_sums_buffer.fill(0.0);
-
-        (
-            (
-                recycled_scores_buffer,
-                recycled_missing_counts_buffer,
-                recycled_correction_sums_buffer,
-            ),
-            send_result,
-        )
-    }
-}
-
-/// A debug-only RAII guard that panics if a `ChunkResult` is dropped without
-/// being explicitly committed.
-#[cfg(debug_assertions)]
-impl Drop for ChunkResult {
-    fn drop(&mut self) {
-        if !self.committed.get() {
-            if self.partial_scores.iter().any(|&score| score != 0.0) {
-                panic!("CRITICAL BUG: A `ChunkResult` with non-zero scores was dropped without being committed. This indicates a silent data loss has occurred.");
-            }
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -376,9 +381,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     for _ in 0..(PIPELINE_DEPTH + 1) {
         partial_result_pool
             .push((
-                vec![0.0f32; result_buffer_size],
-                vec![0u32; result_buffer_size],
-                vec![0.0f32; result_buffer_size],
+                DirtyScores(vec![0.0f32; result_buffer_size]),
+                DirtyCounts(vec![0u32; result_buffer_size]),
+                DirtyCorrections(vec![0.0f32; result_buffer_size]),
             ))
             .unwrap();
     }
@@ -487,16 +492,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_result_pool_clone = Arc::clone(&partial_result_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-        let stride = prep_clone.stride;
-        let matrix_slice_start = matrix_row_start * stride;
-        let matrix_slice_end = matrix_row_end * stride;
+        
+        // Pop the set of "dirty" buffers from the reusable pool.
         let (
-            mut partial_scores_buffer,
-            mut partial_missing_counts_buffer,
-            mut partial_correction_sums_buffer,
+            dirty_scores_buffer,
+            dirty_missing_counts_buffer,
+            dirty_correction_sums_buffer,
         ) = partial_result_pool_clone.pop().unwrap();
 
         let compute_handle = task::spawn_blocking(move || {
+            // This is the state transition: the dirty buffers are consumed and zeroed,
+            // producing clean buffers that are guaranteed to be ready for computation.
+            // This work now happens in parallel on a blocking-safe thread.
+            let mut clean_scores = dirty_scores_buffer.into_clean();
+            let mut clean_counts = dirty_missing_counts_buffer.into_clean();
+            let mut clean_corrections = dirty_correction_sums_buffer.into_clean();
+
+            let stride = prep_clone.stride;
+            let matrix_slice_start = matrix_row_start * stride;
+            let matrix_slice_end = matrix_row_end * stride;
+
             let weights_for_chunk = prep_clone
                 .aligned_weights_matrix
                 .get(matrix_slice_start..matrix_slice_end)
@@ -506,44 +521,65 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     )
                 })?;
 
-            // The buffer from the chunk is passed directly. No slicing is needed as its
-            // length is guaranteed to be correct.
+            // The signature of `run_chunk_computation` now demands clean buffers,
+            // which is enforced by the compiler.
             batch::run_chunk_computation(
                 &chunk.buffer,
                 weights_for_chunk,
                 &prep_clone,
-                &mut partial_scores_buffer,
-                &mut partial_missing_counts_buffer,
-                &mut partial_correction_sums_buffer,
+                &mut clean_scores,
+                &mut clean_counts,
+                &mut clean_corrections,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
                 matrix_row_start,
                 bed_row_offset,
             )?;
-
-            let result = ChunkResult::new(
-                chunk,
-                partial_scores_buffer,
-                partial_missing_counts_buffer,
-                partial_correction_sums_buffer,
+            
+            // The compute task has filled the buffers, so they are now dirty.
+            // We transition their types back before returning them.
+            let result = (
+                chunk.buffer,
+                clean_scores.into_dirty(),
+                clean_counts.into_dirty(),
+                clean_corrections.into_dirty(),
             );
+
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
 
-        let chunk_result = match compute_handle.await? {
+        // The main thread awaits the result from the compute task.
+        let (
+            io_buffer,
+            partial_scores,
+            partial_missing_counts,
+            partial_correction_sums
+        ) = match compute_handle.await? {
             Ok(result) => result,
             Err(e) => return Err(e),
         };
 
-        let (recycled_buffers, send_result) = chunk_result
-            .commit(
-                &mut all_scores,
-                &mut all_missing_counts,
-                &mut all_correction_sums,
-                &empty_buffer_tx,
-            )
-            .await;
-        partial_result_pool_clone.push(recycled_buffers).unwrap();
+        // --- Lean Aggregation Step ---
+        // Deref coercion allows us to treat the wrapper types as slices for iteration.
+        for (master, partial) in all_scores.iter_mut().zip(&partial_scores) {
+            *master += *partial;
+        }
+        for (master, partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
+            *master += *partial;
+        }
+        for (master, partial) in all_correction_sums.iter_mut().zip(&partial_correction_sums) {
+            *master += *partial;
+        }
+        
+        // Recycle the I/O buffer to the producer.
+        let send_result = empty_buffer_tx.send(io_buffer).await;
+
+        // Return the still-"dirty" partial result buffers to the pool for the next iteration.
+        partial_result_pool_clone.push((
+            partial_scores,
+            partial_missing_counts,
+            partial_correction_sums,
+        )).unwrap();
 
         if send_result.is_err() {
             break;
