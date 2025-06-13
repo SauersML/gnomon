@@ -138,7 +138,7 @@ jobs:
           python -u test/test.py &
           
           # Run the new simulation test in the background
-          python -u sim_test.py &
+          python -u test/sim_test.py &
           
           echo "Waiting for all tests to complete..."
           wait
