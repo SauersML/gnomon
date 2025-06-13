@@ -465,3 +465,81 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
         r4.cast(), r5.cast(), r6.cast(), r7.cast(),
     ]
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_transpose_layout_is_empirically_verified() {
+        // This map from a logical SNP index (0-7) to its physical byte position
+        // in a transposed person-vector is the hypothesis we are testing.
+        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+
+        // 1. SETUP: Create a known 8x8 matrix of SNP-major data.
+        // We use unique, traceable values: `(person_idx+1)*10 + (snp_idx+1)`.
+        let mut snp_major_matrix = [[0u8; 8]; 8];
+        for snp_idx in 0..8 {
+            for person_idx in 0..8 {
+                let val = ((person_idx + 1) * 10 + (snp_idx + 1)) as u8;
+                snp_major_matrix[snp_idx][person_idx] = val;
+            }
+        }
+
+        // Convert the scalar matrix into the SIMD vector format required by the function.
+        // `input_vectors[j]` will hold data for SNP `j` across all 8 people.
+        let input_vectors: [U8xN; 8] = core::array::from_fn(|j| {
+            U8xN::from_array(snp_major_matrix[j])
+        });
+
+        // 2. EXECUTION: Perform the transpose operation we want to probe.
+        let transposed_vectors = transpose_8x8_u8(input_vectors);
+
+        // 3. VERIFICATION & REPORTING: Print the ground truth and assert correctness.
+        eprintln!("\n\n=============== EMPIRICAL TRANSPOSE VERIFICATION ===============");
+        eprintln!("Input Matrix (SNP-Major): One row per SNP");
+        for snp_idx in 0..8 {
+            eprintln!("  SNP {:?}: {:?}", snp_idx, snp_major_matrix[snp_idx]);
+        }
+        eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
+        eprintln!("Each row represents data for one Person, across all 8 SNPs.");
+
+        let mut all_tests_passed = true;
+        for person_idx in 0..8 {
+            let person_row_actual = transposed_vectors[person_idx].to_array();
+            eprintln!("  Person {:?}: {:?}", person_idx, person_row_actual);
+
+            // Now, verify the contents of this person's row.
+            // This loop will FAIL if the SNP data is not shuffled as hypothesized.
+            for snp_idx in 0..8 {
+                let expected_val = ((person_idx + 1) * 10 + (snp_idx + 1)) as u8;
+                
+                // Get the actual value from the shuffled location.
+                let val_from_shuffled_pos = person_row_actual[SNP_TO_SHUFFLED_POS[snp_idx]];
+                
+                // Also get the value from the naive sequential position.
+                let val_from_naive_pos = person_row_actual[snp_idx];
+
+                if val_from_shuffled_pos != expected_val {
+                    all_tests_passed = false;
+                    eprintln!(
+                        "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
+                        person_idx, snp_idx, expected_val, SNP_TO_SHUFFLED_POS[snp_idx], val_from_shuffled_pos
+                    );
+                }
+                if val_from_naive_pos == expected_val && SNP_TO_SHUFFLED_POS[snp_idx] != snp_idx {
+                     all_tests_passed = false;
+                     eprintln!(
+                        "    -> FAIL: Naive position [{}] unexpectedly held the correct value for S{}!",
+                        snp_idx, snp_idx
+                    );
+                }
+            }
+        }
+        eprintln!("==============================================================\n");
+
+        assert!(all_tests_passed, "The transpose output layout does not match the expected shuffle pattern.");
+        eprintln!("✅ SUCCESS: The transpose function shuffles SNPs within each person-vector as hypothesized.");
+    }
+}
