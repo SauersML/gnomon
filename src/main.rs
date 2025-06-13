@@ -31,7 +31,6 @@ use std::fs::File;
 use std::cell::Cell;
 use tokio::sync::mpsc::{error::SendError, Sender};
 use cache_size;
-use sysinfo::{MemoryRefreshKind, RefreshKind};
 
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
@@ -259,7 +258,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
 
-    #[cfg(debug_assertions)]
     let t3 = Instant::now();
 
     // GOAL: Find the largest I/O Chunk Size that produces a compute `tile` that
