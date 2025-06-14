@@ -10,12 +10,12 @@ import time
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 100_000
+N_VARIANTS = 10_000_000
 N_INDIVIDUALS = 50
 CHR = '22'
 CHR_LENGTH = 40_000_000
-ALT_EFFECT_PROB = 0.8
-MISSING_RATE = 0.02
+ALT_EFFECT_PROB = 0.7
+MISSING_RATE = 0.10
 
 # --- CI/Validation Configuration ---
 WORKDIR = Path("./sim_workdir")
@@ -24,11 +24,6 @@ OUTPUT_PREFIX = WORKDIR / "simulated_data"
 CORR_THRESHOLD = 0.99999
 MAD_THRESHOLD = 0.00001
 
-# --- Annotation simulation parameters ---
-ANNOT_MEAN_DIST = 30
-ANNOT_STD_DEV = 10
-ANNOT_MIN_DIST = 2
-ANNOT_MAX_DIST = 500
 
 def generate_variants_and_weights():
     """
@@ -80,25 +75,10 @@ def generate_genotypes(variants_df):
     print("...Genotype simulation complete.")
     return genotypes.astype(int)
 
-def simulate_annotations():
-    """
-    THEN: Simulates annotation positions along the chromosome.
-    """
-    print("Step 3: Simulating annotation positions (for demonstration)...")
-    annotations = []
-    current_pos = 1
-    while current_pos <= CHR_LENGTH:
-        annotations.append(current_pos)
-        step = np.random.normal(ANNOT_MEAN_DIST, ANNOT_STD_DEV)
-        step = np.clip(step, ANNOT_MIN_DIST, ANNOT_MAX_DIST)
-        current_pos += int(round(step))
-    
-    print(f"...Generated {len(annotations)} annotations.")
-    return annotations
 
 def introduce_missingness(genotypes):
     """
-    Inserts 2% random missingness into the genotype matrix.
+    Inserts random missingness into the genotype matrix.
     """
     print(f"Step 4: Introducing {MISSING_RATE*100:.1f}% missingness...")
     n_variants, n_individuals = genotypes.shape
@@ -517,7 +497,6 @@ def main():
 
         variants_df = generate_variants_and_weights()
         genotypes_pristine = generate_genotypes(variants_df)
-        _ = simulate_annotations() # Annotations are generated but not used in this validation
         genotypes_with_missing = introduce_missingness(genotypes_pristine)
         prs_results_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
         write_output_files(prs_results_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
