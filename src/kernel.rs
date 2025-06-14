@@ -124,64 +124,64 @@ impl<'a> PaddedInterleavedFlags<'a> {
 // ========================================================================================
 //                              THE KERNEL IMPLEMENTATION
 // ========================================================================================
-/// Calculates the score *adjustments* relative to the dosage-0 baseline for a
-/// single person. This kernel is designed for maximum throughput by only
-/// processing sparse, non-zero dosage genotypes. The result is an adjustment
-/// value that must be ADDED to the pre-calculated baseline score.
+/// This constant defines the maximum number of score columns the kernel can handle.
+/// It is used to size the kernel's internal accumulator buffer on the stack.
+const MAX_KERNEL_ACCUMULATOR_LANES: usize = (100 + LANE_COUNT - 1) / LANE_COUNT;
+
+/// Calculates the score *adjustments* for a single person over a mini-batch of variants.
+/// This kernel is self-contained: it creates its own accumulators, performs the
+/// computation, and returns the result. This pure-function approach enhances safety.
+/// The internal loop structure is designed to maximize instruction-level parallelism
+/// by processing all score columns for a variant before moving to the next.
 ///
 /// # Safety
-/// The caller must uphold the following contracts:
-/// - All indices in `g1_indices` and `g2_indices` must be valid row indices
-///   for the `weights` and `flip_flags` matrices.
-/// - `accumulator_buffer.len()` must be sufficient for `weights.num_scores()`.
+/// The caller must uphold the contract that all indices in `g1_indices` and `g2_indices`
+/// are valid row indices for the `weights` and `flip_flags` matrices, which represent
+/// a view of a single mini-batch.
 #[inline]
 pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
     flip_flags: &PaddedInterleavedFlags,
-    accumulator_buffer: &mut [SimdVec],
     g1_indices: &[usize],
     g2_indices: &[usize],
-) {
+) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
 
-    // --- Reset the Reusable Accumulator Buffer ---
-    accumulator_buffer.iter_mut().for_each(|acc| *acc = SimdVec::splat(0.0));
+    // A stack-allocated buffer for this person's mini-batch score adjustments.
+    let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
 
     // --- Loop 1: Dosage=1 Adjustments ---
-    // Regular Adjustment: d*W - 0 = 1*W
-    // Flipped Adjustment: (2-d)*W - 2*W = -d*W = -1*W
+    let two = SimdVec::splat(2.0);
     for &matrix_row_idx in g1_indices {
+        // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
+                let flip_mask = flip_flags
+                    .get_simd_lane_unchecked(matrix_row_idx, i)
+                    .simd_eq(u8x8::splat(1));
 
-                let adj_regular = weights_vec;
-                let adj_flipped = -adj_regular;
-                let adjustment = flip_mask.cast().select(adj_flipped, adj_regular);
-                *accumulator_buffer.get_unchecked_mut(i) += adjustment;
+                let adj = flip_mask.cast().select(-weights_vec, weights_vec);
+                *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
     }
 
     // --- Loop 2: Dosage=2 Adjustments ---
-    // Regular Adjustment: d*W - 0 = 2*W
-    // Flipped Adjustment: (2-d)*W - 2*W = -d*W = -2*W
-    let two = SimdVec::splat(2.0);
     for &matrix_row_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
+                let flip_mask = flip_flags
+                    .get_simd_lane_unchecked(matrix_row_idx, i)
+                    .simd_eq(u8x8::splat(1));
 
-                let adj_regular = two * weights_vec;
-                let adj_flipped = -adj_regular;
-                let adjustment = flip_mask.cast().select(adj_flipped, adj_regular);
-                *accumulator_buffer.get_unchecked_mut(i) += adjustment;
+                let adj = flip_mask.cast().select(-two * weights_vec, two * weights_vec);
+                *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
     }
+
+    accumulator_buffer
 }
