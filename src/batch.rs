@@ -321,8 +321,9 @@ fn process_tile(
 
     // --- Part 3: Dispatch to the adjustment-based kernel ---
     let matrix_slice_start = matrix_row_start_idx.0 * stride;
-    let weights_chunk = &weights_matrix[matrix_slice_start..];
-    let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..];
+    let matrix_slice_end = matrix_slice_start + (snps_in_chunk * stride);
+    let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
+    let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..matrix_slice_end];
 
     let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
         .expect("CRITICAL: Weights matrix validation failed.");
