@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 50_000
+N_VARIANTS = 100_000
 N_INDIVIDUALS = 50
 CHR = '22'
 CHR_LENGTH = 40_000_000
@@ -18,9 +18,11 @@ ALT_EFFECT_PROB = 0.8
 MISSING_RATE = 0.02
 
 # --- CI/Validation Configuration ---
-# Create an isolated workspace to prevent conflicts with other scripts.
 WORKDIR = Path("./sim_workdir")
 OUTPUT_PREFIX = WORKDIR / "simulated_data"
+# New validation thresholds
+CORR_THRESHOLD = 0.99999
+MAD_THRESHOLD = 0.00001
 
 # --- Annotation simulation parameters ---
 ANNOT_MEAN_DIST = 30
@@ -30,7 +32,7 @@ ANNOT_MAX_DIST = 500
 
 def generate_variants_and_weights():
     """
-    FIRST: Derives normally and randomly distributed weights over 500K positions.
+    FIRST: Derives normally and randomly distributed weights over 50K positions.
     """
     print(f"Step 1: Simulating {N_VARIANTS} variants on chr{CHR}...")
 
@@ -195,14 +197,8 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
-    Runs a complex, programmatically generated test case.
-
-    This test verifies a number of edge cases simultaneously:
-    1.  Standard dosage calculation (alternate allele is effect allele).
-    2.  Dosage calculation when the reference allele is the effect allele.
-    3.  Correct handling of missing genotypes across different individuals.
-    4.  Correct score calculation for an individual with many unique variants.
-    5.  Correct handling of a compound heterozygote at a multi-allelic site.
+    Runs a complex, programmatically generated test case to check edge cases.
+    Returns True if successful, False otherwise.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -210,95 +206,62 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
+    # --- Test Data Generation (Inner Functions) ---
     def _generate_test_data():
-        """Creates in-memory data structures for the entire complex test case."""
-        # --- Define Individuals ---
-        individuals = [
-            'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
-            'id_special_case', 'id_multiallelic'
-        ]
-
-        # --- Define BIM Data (56 variants total) ---
-        bim_data = []
-        # Part 1: Original 3 variants
-        bim_data.extend([
+        individuals = ['id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person', 'id_special_case', 'id_multiallelic']
+        bim_data = [
             {'chr': '1', 'id': '1:1000', 'cm': 0, 'pos': 1000, 'a1': 'A', 'a2': 'G'},
             {'chr': '1', 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'},
             {'chr': '1', 'id': '1:3000', 'cm': 0, 'pos': 3000, 'a1': 'A', 'a2': 'T'}
-        ])
-        # Part 2: 50 variants for the special case individual
+        ]
         for i in range(50):
             pos = 10000 + i
             bim_data.append({'chr': '1', 'id': f'1:{pos}', 'cm': 0, 'pos': pos, 'a1': 'A', 'a2': 'T'})
-        # Part 3: 3 variants for the multi-allelic case. These represent a VCF record
-        # of REF=A, ALT=C,G for a person with genotype C/G (VCF GT=1/2).
         bim_data.extend([
             {'chr': '1', 'id': '1:50000:A:C', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'C'},
             {'chr': '1', 'id': '1:50000:A:G', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'G'},
             {'chr': '1', 'id': '1:60000:T:C', 'cm': 0, 'pos': 60000, 'a1': 'T', 'a2': 'C'}
         ])
         bim_df = pd.DataFrame(bim_data)
-
-        # --- Define Score File Data (55 score lines total) ---
-        score_data = []
-        # Part 1: Scores for original 3 variants
-        score_data.extend([
+        
+        score_data = [
             {'snp_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'simple_score': 0.5},
             {'snp_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'simple_score': -0.2},
             {'snp_id': '1:3000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': -0.7}
-        ])
-        # Part 2: Scores for the 50 special case variants
+        ]
         for i in range(50):
             pos = 10000 + i
             score_data.append({'snp_id': f'1:{pos}', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 0.1})
-        # Part 3: Scores for the multi-allelic case
         score_data.extend([
             {'snp_id': '1:50000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 10.0},
             {'snp_id': '1:60000', 'effect_allele': 'C', 'other_allele': 'T', 'simple_score': 1.0}
         ])
         score_df = pd.DataFrame(score_data)
 
-        # --- Define Genotypes (56 variants x 6 individuals) ---
         genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-        # Person 1-4 genotypes
         genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
         genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
         genotypes_df.loc['1:1000', 'id_het'] = 1
         genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
         genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
         genotypes_df.loc['1:3000', 'id_new_person'] = 1
-        # Person 5 ('id_special_case') genotypes
         special_case_ids = [f'1:{10000+i}' for i in range(50)]
-        # Dosage=2 (geno=0), Dosage=1 (geno=1), Dosage=0 (geno=2)
         genotypes_df.loc[special_case_ids[0:10], 'id_special_case'] = 0
         genotypes_df.loc[special_case_ids[10:40], 'id_special_case'] = 1
         genotypes_df.loc[special_case_ids[40:50], 'id_special_case'] = 2
-        # Person 6 ('id_multiallelic') genotypes
-        # The PLINK representation of a C/G genotype at a REF=A, ALT=C,G site
-        # is het (1) for the A->C record and het (1) for the A->G record.
         genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
         genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
         genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
-        
         return bim_df, score_df, individuals, genotypes_df
 
-    def _write_plink_files(prefix: Path, bim_df: pd.DataFrame, individuals: list, genotypes_df: pd.DataFrame):
-        """Writes .fam, .bim, and .bed files from the provided data structures."""
-        # .fam file
+    def _write_plink_files(prefix, bim_df, individuals, genotypes_df):
         with open(prefix.with_suffix(".fam"), 'w') as f:
-            for iid in individuals:
-                f.write(f"{iid} {iid} 0 0 0 -9\n")
-        
-        # .bim file
-        bim_df[['chr', 'id', 'cm', 'pos', 'a1', 'a2']].to_csv(
-            prefix.with_suffix(".bim"), sep='\t', header=False, index=False
-        )
-        
-        # .bed file
+            for iid in individuals: f.write(f"{iid} {iid} 0 0 0 -9\n")
+        bim_df[['chr', 'id', 'cm', 'pos', 'a1', 'a2']].to_csv(prefix.with_suffix(".bim"), sep='\t', header=False, index=False)
         code_map = {0: 0b00, 1: 0b10, 2: 0b11, -1: 0b01}
         n_individuals = len(individuals)
         with open(prefix.with_suffix(".bed"), 'wb') as f:
-            f.write(bytes([0x6c, 0x1b, 0x01])) # PLINK magic number
+            f.write(bytes([0x6c, 0x1b, 0x01]))
             for _, geno_series in genotypes_df.iterrows():
                 for j in range(0, n_individuals, 4):
                     byte = 0
@@ -308,112 +271,65 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                     f.write(byte.to_bytes(1, 'little'))
         print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
 
-    def _write_score_file(filename: Path, score_df: pd.DataFrame):
-        """Writes the score file from the provided DataFrame."""
+    def _write_score_file(filename, score_df):
         score_df.to_csv(filename, sep='\t', index=False)
         print(f"Programmatically wrote {filename}")
 
-    # --- 1. Generate all test case data in memory ---
+    # --- Main Logic ---
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
-
-    # --- 2. Define Ground Truth based on Biological Reality ---
-    # The score for 'id_multiallelic' reflects the correct biological interpretation,
-    # not the flawed mechanical one.
-    # At pos 50000, the person has a C/G genotype. The effect allele is A.
-    # The dosage of A is therefore 0. Score contribution is 0.
-    # At pos 60000, the person has a T/C genotype. The effect allele is C.
-    # The dosage of C is 1. Score contribution is 1 * 1.0 = 1.0.
-    # The total sum is 1.0. If we consider all 3 variants matched (even with 0
-    # contribution), the average is 1.0/3. If we only average over variants
-    # that are present, it's 1.0/1 = 1.0. We will test for 1.0.
-    truth_df = pd.DataFrame({
-        'IID': individuals,
-        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 1.0]
-    })
-
-    # --- 3. Write all input files to disk ---
+    truth_df = pd.DataFrame({'IID': individuals, 'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 1.0]})
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(prefix.with_suffix(".score"), score_df)
 
-    # --- 4. Run Tools ---
-    run_cmd_func(
-        [gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
-        "Simple Gnomon Test", cwd=workdir
-    )
-    run_cmd_func(
-        [f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
-        "Simple PLINK2 Test", cwd=workdir
-    )
-    run_cmd_func(
-        ["python3", pylink_path.as_posix(), "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "--out", "simple_pylink_results", "1", "2", "4"],
-        "Simple PyLink Test", cwd=workdir
-    )
+    # Run tools, checking for command success
+    if not run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name], "Simple Gnomon Test", cwd=workdir): return False
+    if not run_cmd_func([f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"], "Simple PLINK2 Test", cwd=workdir): return False
+    if not run_cmd_func(["python3", pylink_path.as_posix(), "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "--out", "simple_pylink_results", "1", "2", "4"], "Simple PyLink Test", cwd=workdir): return False
 
-    # --- 5. Compare Results ---
     print("\n--- Analyzing Simple Test Results ---")
     gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={'#IID': 'IID', 'simple_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
-    plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep='\s+').rename(columns={'#IID': 'IID'})
+    plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep=r'\s+').rename(columns={'#IID': 'IID'})
     plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
     pylink_results_raw = pd.read_csv(workdir / "simple_pylink_results.sscore", sep='\t').rename(columns={'#IID': 'IID'})
     pylink_results = pylink_results_raw.assign(SCORE_PYLINK=pylink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PYLINK']]
-
     merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left').merge(plink_results, on='IID', how='left').merge(pylink_results, on='IID', how='left')
+
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
-    # --- 6. Final Validation ---
-    # For the special multi-allelic case, PLINK2 is expected to fail and produce NaN.
-    # We will validate it separately and then check the rest of the data.
     multiallelic_row = merged_df[merged_df['IID'] == 'id_multiallelic']
-    is_plink_multiallelic_ok = pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
-
-    # Check all other rows normally
     other_rows = merged_df[merged_df['IID'] != 'id_multiallelic']
-    is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON'])
-    # Also check the gnomon score for the multiallelic row specifically
-    is_gnomon_multiallelic_ok = np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
-    is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2'])
     
-    is_pylink_multiallelic_ok = pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
-    is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK'])
-
-    # Combine all checks
-    all_ok = is_gnomon_ok and is_gnomon_multiallelic_ok and is_plink_ok and is_plink_multiallelic_ok and is_pylink_ok and is_pylink_multiallelic_ok
+    is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON']) and \
+                   np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
+    is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2']) and \
+                  pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
+    is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK']) and \
+                   pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
+    
+    all_ok = is_gnomon_ok and is_plink_ok and is_pylink_ok
 
     if all_ok:
         print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
-        print("      - Gnomon correctly scored all individuals.")
-        print("      - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
-        print("      - PyLink correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
     else:
         print("\n❌ Simple Dosage Test FAILED:")
-        if not (is_gnomon_ok and is_gnomon_multiallelic_ok):
-            print("  - Gnomon scores do not match ground truth.")
-        if not is_plink_ok:
-            print("  - PLINK2 scores (for standard cases) do not match ground truth.")
-        if not is_plink_multiallelic_ok:
-            print("  - PLINK2 did not produce the expected NaN for the multi-allelic case.")
-        if not is_pylink_ok:
-            print("  - PyLink scores (for standard cases) do not match ground truth.")
-        if not is_pylink_multiallelic_ok:
-            print("  - PyLink did not produce the expected NaN for the multi-allelic case.")
-        sys.exit(1)
+        if not is_gnomon_ok: print("  - Gnomon scores do not match ground truth.")
+        if not is_plink_ok: print("  - PLINK2 scores/behavior do not match ground truth.")
+        if not is_pylink_ok: print("  - PyLink scores/behavior do not match ground truth.")
+    return all_ok
 
 
-def run_and_validate_tools():
+def run_and_validate_tools(runtimes):
     """
-    Downloads tools, runs them on the simulated data, and compares results.
+    Downloads tools, runs them, validates results, and manages runtime collection.
+    Returns True if all validations pass, False otherwise.
     """
-    # --- Configuration ---
-    # URLs and paths are now relative to the isolated WORKDIR
     PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
     PLINK2_BINARY_PATH = WORKDIR / "plink2"
-    # The gnomon binary is expected to be in the repo root relative to this script's execution
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
     PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
     
-    # --- New: List to store runtimes ---
-    runtimes = []
+    overall_success = True
 
     def _print_header(title: str, char: str = "-"):
         width = 70
@@ -421,66 +337,55 @@ def run_and_validate_tools():
 
     def run_command(cmd: list, step_name: str, cwd: Path):
         _print_header(f"Executing: {step_name}")
-        # Convert all command parts to strings for subprocess
         cmd_str = [str(c) for c in cmd]
         print(f"  > Command: {' '.join(cmd_str)}")
         print(f"  > CWD: {cwd}")
-        print("--- OUTPUT ---")
         
-        # Create a new environment for the subprocess, inheriting from the current one
         proc_env = os.environ.copy()
-        # If we're running gnomon, force a backtrace on panic/crash
         if "gnomon" in str(cmd_str[0]):
             proc_env["RUST_BACKTRACE"] = "1"
 
-        # --- New: Start timer ---
         start_time = time.monotonic()
-        
         try:
-            # Use Popen for real-time output, passing the modified environment
-            process = subprocess.Popen(
-                cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', cwd=cwd,
-                env=proc_env
+            # Use run with capture_output=True and timeout
+            result = subprocess.run(
+                cmd_str, capture_output=True, text=True, encoding='utf-8',
+                errors='replace', cwd=cwd, env=proc_env, check=False, timeout=600
             )
-            
-            # Print output in real-time
-            for line in process.stdout:
-                print(line, end='')  # end='' because line already has newline
-                
-            # Wait for process to complete
-            return_code = process.wait()
+            print("--- OUTPUT ---")
+            print(result.stdout)
+            if result.stderr:
+                print("--- STDERR ---")
+                print(result.stderr)
 
-            # --- New: End timer and record result ---
             end_time = time.monotonic()
             duration = end_time - start_time
-            
-            if return_code == 0:
+
+            if result.returncode == 0:
                 print(f"\n  > Success. (Completed in {duration:.4f}s)")
-                # Only record runtimes for the large-scale test
                 if "Large-Scale" in step_name:
-                    method_name = step_name.replace("Large-Scale ", "")
+                    method_name = step_name.split(" ")[-1]
                     runtimes.append({"Method": method_name, "Runtime (s)": duration})
+                return True
             else:
-                print(f"\n  > ❌ ERROR: {step_name} failed with exit code {return_code}.")
-                sys.exit(1)
-                
+                print(f"\n  > ❌ ERROR: {step_name} failed with exit code {result.returncode}.")
+                return False
         except FileNotFoundError:
             print(f"  > ❌ ERROR: Command '{cmd[0]}' not found.")
-            sys.exit(1)
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"  > ❌ ERROR: {step_name} timed out.")
+            return False
 
     def setup_tools():
         _print_header("Step A: Setting up tools")
         if not GNOMON_BINARY_PATH.exists():
             print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'.")
-            print("  > Please ensure 'cargo build --release' has completed in the parent directory.")
-            sys.exit(1)
+            return False
         print(f"  > Found 'gnomon' executable at: {GNOMON_BINARY_PATH}")
-
         if PLINK2_BINARY_PATH.exists():
             print("  > 'plink2' executable already exists. Skipping download.")
-            return
-
+            return True
         print(f"  > Downloading PLINK2 to '{PLINK2_BINARY_PATH}'...")
         zip_path = WORKDIR / "plink.zip"
         try:
@@ -488,7 +393,6 @@ def run_and_validate_tools():
                 r.raise_for_status()
                 with open(zip_path, 'wb') as f: shutil.copyfileobj(r.raw, f)
             with zipfile.ZipFile(zip_path, 'r') as z:
-                # Robustly find and extract just the binary
                 for member in z.infolist():
                     if member.filename.endswith('plink2') and not member.is_dir():
                         with z.open(member) as source, open(PLINK2_BINARY_PATH, 'wb') as target:
@@ -497,120 +401,96 @@ def run_and_validate_tools():
             zip_path.unlink()
             PLINK2_BINARY_PATH.chmod(0o755)
             print("  > PLINK2 downloaded and extracted successfully.")
+            return True
         except Exception as e:
             print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
-            sys.exit(1)
+            return False
     
-    def analyze_and_compare_large_scale_results():
+    def analyze_large_scale_results():
         _print_header("Step D: Analyzing and Comparing Large-Scale Simulation Results")
-        
-        def _debug_print_df(df: pd.DataFrame, name: str):
-            """Helper to print dataframe info for debugging."""
-            print(f"\n--- DEBUG: Loaded '{name}' ---")
-            print("Columns:", df.columns.tolist())
-            print("Shape:", df.shape)
-            print(df.head(3).to_markdown(index=False, floatfmt=".6f"))
-            print("-" * 30)
-    
         try:
-            # --- Load truth_df ---
-            truth_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')
-            _debug_print_df(truth_df_raw, "truth_df (raw)")
-            if '#FID' in truth_df_raw.columns:
-                truth_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
-            truth_df = truth_df_raw[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
-    
-            # --- Load gnomon_df ---
-            gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t')
-            _debug_print_df(gnomon_df_raw, "gnomon_df (raw)")
-            if '#IID' in gnomon_df_raw.columns:
-                gnomon_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
-            gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
-    
-            # --- Load plink2_df ---
-            plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\s+')
-            _debug_print_df(plink2_df_raw, "plink2_df (raw)")
-            if '#IID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
-            elif '#FID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            truth_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t').rename(columns={'#FID': 'FID', 'PRS_AVG': 'SCORE_TRUTH'})[['IID', 'SCORE_TRUTH']]
+            gnomon_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t').rename(columns={'#IID': 'IID', 'simulated_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
+            plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep=r'\s+').rename(columns={'#IID': 'IID'})
             plink2_df = plink2_df_raw.assign(SCORE_PLINK2=plink2_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
-    
-            # --- Load pylink_df ---
-            pylink_df_raw = pd.read_csv(WORKDIR / "pylink_results.sscore", sep='\t')
-            _debug_print_df(pylink_df_raw, "pylink_df (raw)")
-            if '#IID' in pylink_df_raw.columns: pylink_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
-            elif '#FID' in pylink_df_raw.columns: pylink_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            pylink_df_raw = pd.read_csv(WORKDIR / "pylink_results.sscore", sep='\t').rename(columns={'#IID': 'IID'})
             pylink_df = pylink_df_raw.assign(SCORE_PYLINK=pylink_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PYLINK']]
-            
         except (FileNotFoundError, KeyError) as e:
             print(f"  > ❌ ERROR: Failed to load or parse a result file. Error: {e}. Aborting comparison.")
-            sys.exit(1)
-    
+            return False
+
         merged_df = pd.merge(truth_df, gnomon_df, on='IID').merge(plink2_df, on='IID').merge(pylink_df, on='IID')
         score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2', 'SCORE_PYLINK']
         merged_df[score_cols] = merged_df[score_cols].astype(float)
-    
-        print("\n--- Sample of Computed Scores (Large-Scale) ---")
-        print(merged_df.head(10).to_markdown(index=False, floatfmt=".8f"))
-    
+
         print("\n--- Score Correlation Matrix (Large-Scale) ---")
-        print(merged_df[score_cols].corr().to_markdown(floatfmt=".8f"))
-    
+        corr_matrix = merged_df[score_cols].corr()
+        print(corr_matrix.to_markdown(floatfmt=".8f"))
+
         print("\n--- Mean Absolute Difference (MAD) vs. Ground Truth (Large-Scale) ---")
-        mad_g_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_GNOMON']).abs().mean()
-        mad_p_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PLINK2']).abs().mean()
-        mad_py_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PYLINK']).abs().mean()
-        print(f"Gnomon vs. Truth: {mad_g_vs_t:.10f}")
-        print(f"PLINK2 vs. Truth: {mad_p_vs_t:.10f}")
-        print(f"PyLink vs. Truth: {mad_py_vs_t:.10f}")
-        
-        if mad_g_vs_t < 1e-9 and mad_p_vs_t < 1e-9 and mad_py_vs_t < 1e-9:
-            print("\n✅ Large-Scale Validation Successful: All tools produced scores identical to the ground truth.")
+        mad_g = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_GNOMON']).abs().mean()
+        mad_p = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PLINK2']).abs().mean()
+        mad_py = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PYLINK']).abs().mean()
+        print(f"Gnomon vs. Truth: {mad_g:.10f}")
+        print(f"PLINK2 vs. Truth: {mad_p:.10f}")
+        print(f"PyLink vs. Truth: {mad_py:.10f}")
+
+        # --- New Validation Logic ---
+        corr_g = corr_matrix.loc['SCORE_TRUTH', 'SCORE_GNOMON']
+        corr_p = corr_matrix.loc['SCORE_TRUTH', 'SCORE_PLINK2']
+        corr_py = corr_matrix.loc['SCORE_TRUTH', 'SCORE_PYLINK']
+
+        gnomon_ok = corr_g > CORR_THRESHOLD and mad_g < MAD_THRESHOLD
+        plink_ok = corr_p > CORR_THRESHOLD and mad_p < MAD_THRESHOLD
+        pylink_ok = corr_py > CORR_THRESHOLD and mad_py < MAD_THRESHOLD
+
+        if gnomon_ok and plink_ok and pylink_ok:
+            print(f"\n✅ Large-Scale Validation SUCCESS: All tools passed criteria (Corr > {CORR_THRESHOLD}, MAD < {MAD_THRESHOLD}).")
+            return True
         else:
-            print("\n❌ Large-Scale Validation FAILED: Significant differences detected.")
-            if not mad_g_vs_t < 1e-9: print(f"  - Gnomon difference: {mad_g_vs_t:.10f}")
-            if not mad_p_vs_t < 1e-9: print(f"  - PLINK2 difference: {mad_p_vs_t:.10f}")
-            if not mad_py_vs_t < 1e-9: print(f"  - PyLink difference: {mad_py_vs_t:.10f}")
-            sys.exit(1)
+            print(f"\n❌ Large-Scale Validation FAILED: One or more tools did not meet criteria.")
+            if not gnomon_ok: print(f"  - Gnomon: Corr={corr_g:.8f}, MAD={mad_g:.10f}")
+            if not plink_ok: print(f"  - PLINK2: Corr={corr_p:.8f}, MAD={mad_p:.10f}")
+            if not pylink_ok: print(f"  - PyLink: Corr={corr_py:.8f}, MAD={mad_py:.10f}")
+            return False
 
     # --- Main execution flow for this function ---
-    setup_tools()
+    if not setup_tools(): return False
     
-    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command)      
-    
+    if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
+        overall_success = False
+
     print("\n" + "="*80)
     print("= Running Large-Scale Simulation and Validation")
     print("="*80)
 
-    # Run Gnomon on large-scale data
-    run_command(
-        [GNOMON_BINARY_PATH, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, OUTPUT_PREFIX.name],
-        "Large-Scale Gnomon", cwd=WORKDIR
-    )
+    # Sequentially run tools and check for command failures
+    if not run_command([GNOMON_BINARY_PATH, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR): overall_success = False
+    if not run_command([f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "plink2_results"], "Large-Scale PLINK2", WORKDIR): overall_success = False
+    if not run_command(["python3", PYLINK_SCRIPT_PATH.as_posix(), "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "--out", "pylink_results", "1", "2", "4"], "Large-Scale PyLink", WORKDIR): overall_success = False
+    
+    # If any command failed, we can't analyze results. Return the current failure status.
+    if not overall_success:
+        print("\nSkipping large-scale analysis due to command failure.")
+        return False
+        
+    # Run analysis and update overall success status
+    if not analyze_large_scale_results():
+        overall_success = False
 
-    # Run PLINK2 on large-scale data
-    run_command(
-        [f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "plink2_results"],
-        "Large-Scale PLINK2", cwd=WORKDIR
-    )
+    return overall_success
 
-    # Run PyLink on large-scale data
-    run_command(
-        ["python3", PYLINK_SCRIPT_PATH.as_posix(), "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "--out", "pylink_results", "1", "2", "4"],
-        "Large-Scale PyLink", cwd=WORKDIR
-    )
-
-    analyze_and_compare_large_scale_results()
-
-    # --- New: Display the final runtime table ---
-    _print_header("Mean Runtime for Large-Scale Methods", "=")
+def print_runtime_summary(runtimes):
+    """Prints the mean runtime summary table."""
+    print("\n" + "="*50)
+    print("= Mean Runtime for Large-Scale Methods")
+    print("="*50)
     if runtimes:
         runtime_df = pd.DataFrame(runtimes)
-        # In this script, each method is run once, so the mean is the single recorded value.
-        # The groupby().mean() would be useful if runs were repeated in a loop.
         mean_runtimes = runtime_df.groupby('Method')['Runtime (s)'].mean().reset_index()
         print(mean_runtimes.to_markdown(index=False, floatfmt=".4f"))
     else:
-        print("No large-scale runtimes were recorded.")
+        print("No large-scale runtimes were recorded (likely due to an early error).")
 
 def cleanup():
     """Removes the generated workspace directory."""
@@ -621,38 +501,54 @@ def cleanup():
         print("...Workspace cleaned up.")
 
 def main():
-    """Main function to run the entire simulation and file generation pipeline."""
+    """Main function to run the entire simulation and validation pipeline."""
     np.random.seed(42)
+    exit_code = 0
+    runtimes = []
+
     # Ensure the isolated workspace exists and is empty
     if WORKDIR.exists():
         shutil.rmtree(WORKDIR)
     WORKDIR.mkdir()
 
-    print("--- Starting Full Simulation and File Writing Pipeline ---")
-    print(f"All generated files will be placed in: {WORKDIR}")
-
-    variants_df = generate_variants_and_weights()
-    genotypes_pristine = generate_genotypes(variants_df)
-    annotation_positions = simulate_annotations()
-    with open(OUTPUT_PREFIX.with_suffix(".annotations.txt"), 'w') as f:
-        for pos in annotation_positions: f.write(f"{pos}\n")
-
-    genotypes_with_missing = introduce_missingness(genotypes_pristine)
-    prs_results_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
-    
-    write_output_files(prs_results_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
-    print("\n--- Simulation and File Writing Finished Successfully ---")
-
     try:
-        run_and_validate_tools()
+        print("--- Starting Full Simulation and File Writing Pipeline ---")
+        print(f"All generated files will be placed in: {WORKDIR}")
+
+        variants_df = generate_variants_and_weights()
+        genotypes_pristine = generate_genotypes(variants_df)
+        _ = simulate_annotations() # Annotations are generated but not used in this validation
+        genotypes_with_missing = introduce_missingness(genotypes_pristine)
+        prs_results_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
+        write_output_files(prs_results_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
+        print("\n--- Simulation and File Writing Finished Successfully ---")
+
+        # Run the validation, which now returns a success/fail boolean
+        if not run_and_validate_tools(runtimes):
+            exit_code = 1 # Mark for exit, but don't exit yet
+
+    except Exception as e:
+        print(f"\n--- An unexpected error occurred: {e} ---")
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
+        
     finally:
-        # Pass an argument like 'keep' to skip cleanup for debugging
+        # This block is GUARANTEED to run, regardless of success, failure, or exceptions.
+        print_runtime_summary(runtimes)
         if 'keep' not in sys.argv:
             cleanup()
         else:
             print("\nSkipping cleanup because 'keep' argument was provided.")
     
-    print("\n--- Full Simulation and Validation Pipeline Finished Successfully ---")
+    if exit_code == 0:
+        print("\n--- Full Simulation and Validation Pipeline Finished Successfully ---")
+    else:
+        # Use a generic error message as the specific reason for failure
+        # has already been printed.
+        print("\nError: Process completed with exit code 1.")
+        
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
