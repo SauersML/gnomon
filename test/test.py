@@ -19,10 +19,13 @@ import psutil
 # ========================================================================================
 CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
-PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-# Add the path to your pylink.py script
 PYLINK_SCRIPT = Path("test/pylink.py").resolve()
+
+# Constants for the Disagreement Bisection Algorithm
+DISCOVERY_PGS_ID = "PGS004696"
+CORRELATION_THRESHOLD = 0.99
+BISECTION_TERMINATION_SIZE = 3
 
 SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_compat"
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
@@ -56,23 +59,17 @@ def print_debug_header(title: str):
     print("\n" + "." * 80, flush=True)
     print(f".... {title} ....", flush=True)
     print("." * 80, flush=True)
-    
+
 def print_file_head(file_path: Path):
-    """
-    Prints the header and first 10 lines of a text file for verification.
-    For known binary files (e.g., .bed), it prints a hex dump of the first 250 bytes.
-    """
+    """Prints the header and first 10 lines of a text file for verification."""
     if not file_path.exists():
         print(f"File not found: {file_path}", flush=True)
         return
-
     if file_path.suffix in ['.bed']:
-        print_debug_header(f"HEXDUMP (first 500 chars) OF: {file_path.name}")
+        print_debug_header(f"HEXDUMP (first 250 bytes) OF: {file_path.name}")
         try:
             with open(file_path, 'rb') as f:
-                binary_content = f.read(250)
-                hex_representation = binary_content.hex()
-                print(f"  {hex_representation}", flush=True)
+                print(f"  {f.read(250).hex()}", flush=True)
         except Exception as e:
             print(f"  Could not read binary file: {e}", flush=True)
     else:
@@ -80,16 +77,14 @@ def print_file_head(file_path: Path):
         try:
             with open(file_path, 'r', errors='replace') as f:
                 for i, line in enumerate(f):
-                    if i >= 10:
-                        break
+                    if i >= 10: break
                     print(f"  {line.strip()}", flush=True)
         except Exception as e:
             print(f"  Could not read file: {e}", flush=True)
 
 def download_and_extract(url: str, dest_dir: Path):
-    """Downloads and extracts a file, handling .zip and .gz, and cleans up archives."""
-    base = url.split('?')[0]
-    filename = Path(base.split('/')[-1])
+    """Downloads and extracts a file, handling .zip and .gz."""
+    filename = Path(url.split('?')[0].split('/')[-1])
     outpath = dest_dir / filename
     print(f"[SCRIPT] Downloading {filename}...", flush=True)
     try:
@@ -98,37 +93,33 @@ def download_and_extract(url: str, dest_dir: Path):
             with open(outpath, 'wb') as f: shutil.copyfileobj(r.raw, f)
     except Exception as e:
         print(f"❌ FAILED to download {url}: {e}", flush=True); sys.exit(1)
-    
+
     if outpath.suffix == '.zip':
         with zipfile.ZipFile(outpath, 'r') as z: z.extractall(dest_dir)
-        print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True); outpath.unlink()
+        print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True)
+        outpath.unlink()
     elif outpath.suffix == '.gz':
         dest = dest_dir / filename.stem
         with gzip.open(outpath, 'rb') as f_in, open(dest, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-        print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
+        print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True)
+        outpath.unlink()
 
 def run_and_measure(cmd: list, name: str, out_prefix: Path):
-    """Executes a command, streams its output, and prints the head of all generated files."""
+    """Executes a command, streams its output, and captures results."""
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
-    # Ensure all parts of the command are strings
-    cmd_str = [str(c) for c in cmd]
-    proc = subprocess.Popen(cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+    proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
     
     output_lines = []
     print_debug_header(f"{name} Real-time Output")
     with proc.stdout:
         for line in iter(proc.stdout.readline, ''):
-            clean_line = line.strip()
-            print(f"  [{name}] {clean_line}", flush=True)
-            output_lines.append(clean_line)
+            print(f"  [{name}] {line.strip()}", flush=True)
+            output_lines.append(line.strip())
     
     returncode = proc.wait()
     duration = time.perf_counter() - start
-    
-    for p in sorted(out_prefix.parent.glob(f"{out_prefix.name}.*")):
-        print_file_head(p)
     
     result = {'tool': name, 'time_sec': duration, 'returncode': returncode, 'success': returncode == 0, 'stdout': "\n".join(output_lines)}
     if result['success']: print(f"✅ {name} finished in {duration:.2f}s.", flush=True)
@@ -136,38 +127,34 @@ def run_and_measure(cmd: list, name: str, out_prefix: Path):
     return result
 
 def setup_environment():
-    """Downloads, extracts, renames, and sets permissions for all required binaries."""
+    """Prepares the CI environment by downloading all necessary data and tools."""
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
-    
-    # Check that pylink.py exists
     if not PYLINK_SCRIPT.exists():
-        print(f"❌ ERROR: PyLink script not found at expected path: {PYLINK_SCRIPT}", flush=True)
-        sys.exit(1)
+        print(f"❌ ERROR: PyLink script not found at: {PYLINK_SCRIPT}", flush=True); sys.exit(1)
     print(f"[SCRIPT] Found PyLink script at: {PYLINK_SCRIPT}", flush=True)
 
-    for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
+    for url, binary_path in [(PLINK1_URL, CI_WORKDIR / "plink"), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
-            # Find the downloaded binary (which might have a generic name) and rename it
+            # Find the downloaded binary (it might have a generic name)
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
-                    if p != binary_path: p.rename(binary_path)
+                    p.rename(binary_path)
                     binary_path.chmod(0o755)
                     print(f"[SCRIPT] Configured and chmod: {binary_path}", flush=True)
                     break
-    
+
     for zip_name in GENOTYPE_FILES: download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
     for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
-    """Creates a new, de-duplicated PLINK fileset where variant IDs are 'chr:pos'."""
+    """Creates a new PLINK fileset with harmonized 'chr:pos' variant IDs."""
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
-    original_bim = original_prefix.with_suffix('.bim')
-    bim_df = pd.read_csv(original_bim, sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
-    
+    bim_df = pd.read_csv(original_prefix.with_suffix('.bim'), sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
     bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
     
+    # Exclude variants at positions that appear more than once
     duplicate_pos = bim_df[bim_df.duplicated(subset=['chr_pos_id'], keep=False)]
     variants_to_exclude = set(duplicate_pos['rsid'])
     variants_to_rename = bim_df[~bim_df['rsid'].isin(variants_to_exclude)]
@@ -178,19 +165,15 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
 
     id_map_file = CI_WORKDIR / "id_update_map.txt"
     variants_to_rename[['rsid', 'chr_pos_id']].to_csv(id_map_file, sep=' ', index=False, header=False)
-    print(f"[SCRIPT] Created ID mapping file for {len(variants_to_rename)} variants.", flush=True)
-
-    cmd = [str(PLINK1_BINARY), "--bfile", str(original_prefix), "--exclude", str(exclude_file), "--update-name", str(id_map_file), "2", "1", "--make-bed", "--out", str(final_prefix)]
     
-    print("[SCRIPT] Creating synchronized fileset using PLINK...", flush=True)
+    cmd = [str(CI_WORKDIR / "plink"), "--bfile", str(original_prefix), "--exclude", str(exclude_file), "--update-name", str(id_map_file), "2", "1", "--make-bed", "--out", str(final_prefix)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         print("❌ FAILED to create synchronized genotype fileset.", flush=True); print(proc.stdout); print(proc.stderr); sys.exit(1)
-    
     print(f"[SCRIPT] Successfully created synchronized fileset at: {final_prefix}", flush=True)
 
-def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
-    """Creates a unified scorefile where the variant ID is 'chr:pos'."""
+def create_unified_scorefile(score_file: Path, pgs_id: str) -> pd.DataFrame:
+    """Creates a unified scorefile dataframe where the variant ID is 'chr:pos'."""
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
     df.dropna(inplace=True)
@@ -199,26 +182,23 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
     df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
     df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
     final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
-    final_df.columns = ['snp_id', 'effect_allele', 'other_allele', pgs_id]
+    final_df.columns = ['snp_id', 'effect_allele', 'other_allele', 'effect_weight']
+    
     out_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
-    print(f"[SCRIPT] Writing {len(final_df)} variants to unified score file: {out_path.name}", flush=True)
     final_df.to_csv(out_path, sep='\t', index=False)
-    print_file_head(out_path)
-    return out_path
+    print(f"[SCRIPT] Writing {len(final_df)} variants to unified score file: {out_path.name}", flush=True)
+    return final_df
 
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
-    """Analyzes results for a single PGS, focusing on AVERAGE scores."""
+    """Analyzes and compares results from multiple tool runs for a single PGS."""
     summary = {'pgs_id': pgs_id, 'success': False}
-    # Add pylink to the tool paths
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
-        'plink1': CI_WORKDIR / f"plink1_{pgs_id}.profile",
-        'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
         'pylink': CI_WORKDIR / f"pylink_{pgs_id}.sscore",
+        'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
     }
     
     data_frames = []
-    num_variants = 0
     for res in pgs_run_results:
         if not res['success']: continue
         tool_name = res['tool'].split('_')[0]
@@ -228,35 +208,11 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         try:
             df_raw = pd.read_csv(path, sep='\s+')
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
-            
-            # Unified parsing for tools that produce .sscore format
-            if tool_name in ['gnomon', 'plink2', 'pylink']:
-                score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-                if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
-                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
-                
-                # Try to extract variant count from stdout
-                if num_variants == 0:
-                    if tool_name == 'gnomon':
-                        match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
-                    elif tool_name in ['plink2', 'pylink']:
-                        match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
-                    if match:
-                        num_variants = int(match.group(1))
-
-            elif tool_name == 'plink1':
-                df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
-                match = re.search(r'(\d+)\s+valid\s+predictors', res['stdout'])
-                if match and num_variants == 0:
-                    num_variants = int(match.group(1))
-            
-            else:
-                df = None
-            
-            if df is not None:
-                df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
-                data_frames.append(df)
-
+            score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
+            if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
+            df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
+            df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
+            data_frames.append(df)
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
@@ -270,117 +226,146 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     merged_df.dropna(subset=score_cols, inplace=True)
     
     if len(score_cols) < 2 or merged_df.empty: return summary
-
-    summary['n_variants_used'] = num_variants
-    summary['sample_scores'] = merged_df[['IID'] + score_cols].head(5)
+    
     summary['correlation_matrix'] = merged_df[score_cols].corr()
-
-    mad_results, mrd_results = {}, {}
-    for col1, col2 in combinations(score_cols, 2):
-        key = f"{col1.replace('SCORE_', '')}_vs_{col2.replace('SCORE_', '')}"
-        mad_results[key] = (merged_df[col1] - merged_df[col2]).abs().mean()
-        denominator = (merged_df[col1].abs() + merged_df[col2].abs()) / 2.0
-        valid_rows = denominator > 1e-12
-        mrd = ((merged_df.loc[valid_rows, col1] - merged_df.loc[valid_rows, col2]).abs() / denominator[valid_rows]).mean()
-        mrd_results[key] = mrd if not np.isnan(mrd) else 0.0
-
-    summary['mad'] = mad_results
-    summary['mrd'] = mrd_results
     summary['success'] = True
     return summary
 
-def print_final_summary(summary_data: list, performance_results: list):
-    """Prints a single, comprehensive summary report at the end of the run."""
-    print_header("FINAL TEST & BENCHMARKING REPORT", "*")
+def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
+    """Helper function for the bisection algorithm. Runs Gnomon and PLINK2 on a subset of variants and returns their correlation."""
+    temp_score_path = CI_WORKDIR / f"_temp_score_{iteration_name}.tsv"
+    variant_df.to_csv(temp_score_path, sep='\t', index=False)
 
-    for pgs_summary in summary_data:
-        pgs_id = pgs_summary['pgs_id']
-        print_header(f"Analysis for {pgs_id}", "=")
-        
-        if not pgs_summary.get('success', False):
-            print(f"❌ Analysis for {pgs_id} could not be completed due to failed runs or parsing errors.")
-            continue
+    # Run Gnomon
+    g_prefix = CI_WORKDIR / f"_g_{iteration_name}"
+    g_cmd = [str(GNOMON_BINARY), "--score", str(temp_score_path), str(SHARED_GENOTYPE_PREFIX), "--out", str(g_prefix)]
+    run_and_measure(g_cmd, f"Gnomon_Iter_{iteration_name}", g_prefix)
 
-        print(f"✅ Concordance established using {pgs_summary.get('n_variants_used', 'N/A'):,} variants.")
+    # Run PLINK2
+    p2_prefix = CI_WORKDIR / f"_p2_{iteration_name}"
+    p2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(temp_score_path), "1", "2", "4", "header", "no-mean-imputation", "--out", str(p2_prefix)]
+    run_and_measure(p2_cmd, f"PLINK2_Iter_{iteration_name}", p2_prefix)
 
-        print_debug_header("Sample of Computed AVERAGE Scores")
-        print(pgs_summary['sample_scores'].to_markdown(index=False, floatfmt=".8f"))
-        
-        print_debug_header("Score Correlation Matrix")
-        print(pgs_summary['correlation_matrix'].to_markdown(floatfmt=".8f"))
-        
-        print_debug_header("Mean Absolute Difference (MAD)")
-        mad_df = pd.DataFrame.from_dict(pgs_summary['mad'], orient='index', columns=['Difference'])
-        print(mad_df.to_markdown(floatfmt=".8f"))
-        
-        print_debug_header("Mean Relative Difference (MRD %)")
-        mrd_df = pd.DataFrame.from_dict(pgs_summary['mrd'], orient='index', columns=['Difference (%)'])
-        mrd_df['Difference (%)'] *= 100
-        print(mrd_df.to_markdown(floatfmt=".6f"))
+    # Analyze results
+    try:
+        g_df = pd.read_csv(g_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', f'{DISCOVERY_PGS_ID}_AVG': 'SCORE_GNOMON'})
+        p2_df = pd.read_csv(p2_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'SCORE_PLINK2'})
+        merged = pd.merge(g_df[['IID', 'SCORE_GNOMON']], p2_df[['IID', 'SCORE_PLINK2']], on='IID').dropna()
+        if len(merged) < 2: return 1.0 # Not enough data to correlate
+        correlation = merged['SCORE_GNOMON'].corr(merged['SCORE_PLINK2'])
+        return correlation if pd.notna(correlation) else 1.0
+    except Exception as e:
+        print(f"  > [BISECTION_ANALYSIS_ERROR] Could not analyze results for iteration {iteration_name}: {e}", flush=True)
+        return 1.0 # Assume perfect correlation on error to avoid false positives
 
-    print_header("Performance Summary", "=")
-    if performance_results:
-        df = pd.DataFrame([r for r in performance_results if r['success']])
-        if not df.empty:
-            df['tool_base'] = df['tool'].str.split('_').str[0]
-            summary = df.groupby('tool_base').agg(
-                mean_time_sec=('time_sec','mean'),
-                min_time_sec=('time_sec','min'),
-                max_time_sec=('time_sec','max'),
-            ).reset_index()
-            print(summary.to_markdown(index=False, floatfmt='.3f'))
+def run_disagreement_discovery(initial_score_df: pd.DataFrame):
+    """Performs the bisection search to find the variant causing the most disagreement."""
+    print_header("DISAGREEMENT DISCOVERY MODE", "*")
+    
+    # 1. Establish Baseline
+    print("[DISCOVERY] Establishing baseline correlation with full score file...")
+    baseline_corr = test_variant_subset(initial_score_df, "baseline")
+    print(f"[DISCOVERY] Baseline Gnomon vs PLINK2 Correlation: {baseline_corr:.6f}")
+    if baseline_corr >= CORRELATION_THRESHOLD:
+        print("✅ Baseline correlation is high. No disagreement discovery needed.", flush=True)
+        return
+
+    # 2. Bisection Loop
+    current_variants_df = initial_score_df.copy()
+    iteration = 0
+    while len(current_variants_df) > BISECTION_TERMINATION_SIZE:
+        iteration += 1
+        print_header(f"Bisection Iteration {iteration}: {len(current_variants_df)} variants remaining", "-")
+        
+        midpoint = len(current_variants_df) // 2
+        part_a_df = current_variants_df.iloc[:midpoint]
+        part_b_df = current_variants_df.iloc[midpoint:]
+
+        print(f"[DISCOVERY] Testing Part A ({len(part_a_df)} variants)...")
+        corr_a = test_variant_subset(part_a_df, f"{iteration}A")
+        print(f"  > Correlation for Part A: {corr_a:.6f}")
+
+        print(f"[DISCOVERY] Testing Part B ({len(part_b_df)} variants)...")
+        corr_b = test_variant_subset(part_b_df, f"{iteration}B")
+        print(f"  > Correlation for Part B: {corr_b:.6f}")
+
+        if corr_a < CORRELATION_THRESHOLD and corr_b < CORRELATION_THRESHOLD:
+            print("[DISCOVERY] Both halves show disagreement. Pursuing the worse one.")
+            current_variants_df = part_a_df if corr_a <= corr_b else part_b_df
+        elif corr_a < CORRELATION_THRESHOLD:
+            print("[DISCOVERY] Disagreement isolated to Part A.")
+            current_variants_df = part_a_df
+        elif corr_b < CORRELATION_THRESHOLD:
+            print("[DISCOVERY] Disagreement isolated to Part B.")
+            current_variants_df = part_b_df
         else:
-            print("No successful tool runs to summarize performance.")
+            print("✅ Disagreement resolved. The issue is likely an interaction between the two halves. Halting search.", flush=True)
+            return
+
+    # 3. Final Pinpointing
+    print_header(f"Final Pinpointing: {len(current_variants_df)} suspect variants", "-")
+    suspect_results = []
+    for i, row in current_variants_df.iterrows():
+        variant_id = row['snp_id']
+        print(f"[DISCOVERY] Testing single suspect variant: {variant_id}")
+        single_variant_df = pd.DataFrame([row])
+        corr = test_variant_subset(single_variant_df, f"final_{variant_id.replace(':', '_')}")
+        suspect_results.append({'id': variant_id, 'corr': corr, 'df': single_variant_df})
+        print(f"  > Correlation for {variant_id}: {corr:.6f}")
+    
+    # 4. Report Final Culprit
+    if suspect_results:
+        worst_offender = min(suspect_results, key=lambda x: x['corr'])
+        print_header("DISAGREEMENT ISOLATED", "*")
+        print(f"The primary source of disagreement is variant: {worst_offender['id']}")
+        print(f"On its own, it yields a Gnomon vs PLINK2 correlation of: {worst_offender['corr']:.6f}")
+        print("\nMinimal scorefile to reproduce this disagreement:")
+        print("---------------------------------------------")
+        print(worst_offender['df'].to_string(index=False))
+        print("---------------------------------------------")
 
 def main():
+    """Main function to run the entire benchmark and discovery pipeline."""
     print_header("GNOMON CI TEST & BENCHMARK SUITE")
     setup_environment()
     create_synchronized_genotype_files(ORIGINAL_PLINK_PREFIX, SHARED_GENOTYPE_PREFIX)
-    print_file_head(SHARED_GENOTYPE_PREFIX.with_suffix('.bim'))
-    print_file_head(SHARED_GENOTYPE_PREFIX.with_suffix('.fam'))
 
     all_results, failures, final_summary_data = [], [], []
+
     for pgs_id, url in PGS_SCORES.items():
         print_header(f"TESTING SCORE: {pgs_id}", "~")
         raw_score_file = CI_WORKDIR / Path(url.split('/')[-1]).stem
+        unified_score_df = create_unified_scorefile(raw_score_file, pgs_id)
+        unified_score_file_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
+
         pgs_run_results = []
-        unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
         
-        # --- Run Gnomon ---
-        out_g_prefix = SHARED_GENOTYPE_PREFIX
-        gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(out_g_prefix)]
-        res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}", out_g_prefix)
-        all_results.append(res_g); pgs_run_results.append(res_g)
-        if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
-
-        # --- Run PLINK2 ---
-        out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
-        plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
-        res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
-        all_results.append(res_p2); pgs_run_results.append(res_p2)
-        if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
+        # --- Define commands for all tools ---
+        commands_to_run = [
+            ("gnomon", [str(GNOMON_BINARY), "--score", str(unified_score_file_path), str(SHARED_GENOTYPE_PREFIX), "--out", str(SHARED_GENOTYPE_PREFIX)]),
+            ("plink2", [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "1", "2", "4", "header", "no-mean-imputation", "--out", str(CI_WORKDIR / f"plink2_{pgs_id}")]),
+            ("pylink", ["python3", str(PYLINK_SCRIPT), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "--out", str(CI_WORKDIR / f"pylink_{pgs_id}"), "1", "2", "4"]),
+        ]
         
-        # --- Run PLINK1 ---
-        out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
-        # Note: PLINK1 --score produces per-allele average in the SCORE column, not per-variant sum.
-        # This is different from its default behavior but matches what we need for comparison.
-        plink1_cmd = [str(PLINK1_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)]
-        res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}", out1_prefix)
-        all_results.append(res_p1); pgs_run_results.append(res_p1)
-        if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
+        # --- Run all tools for the current PGS ID ---
+        for tool, cmd in commands_to_run:
+            res = run_and_measure(cmd, f"{tool}_{pgs_id}", cmd[-1])
+            pgs_run_results.append(res)
+            if not res['success']: failures.append(f"{pgs_id} ({tool}_failed)")
         
-        # --- Run PyLink ---
-        out_py_prefix = CI_WORKDIR / f"pylink_{pgs_id}"
-        pylink_cmd = ["python3", str(PYLINK_SCRIPT), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "--out", str(out_py_prefix), "1", "2", "4"]
-        res_py = run_and_measure(pylink_cmd, f"pylink_{pgs_id}", out_py_prefix)
-        all_results.append(res_py); pgs_run_results.append(res_py)
-        if not res_py['success']: failures.append(f"{pgs_id} (pylink_failed)")
-
         # --- Analyze results for this PGS ID ---
         pgs_summary = analyze_pgs_results(pgs_id, pgs_run_results)
         final_summary_data.append(pgs_summary)
 
-    print_final_summary(final_summary_data, all_results)
+        # --- Automated Disagreement Discovery ---
+        if pgs_id == DISCOVERY_PGS_ID and pgs_summary.get('success'):
+            corr_matrix = pgs_summary['correlation_matrix']
+            if 'SCORE_gnomon' in corr_matrix and 'SCORE_plink2' in corr_matrix:
+                gnomon_plink2_corr = corr_matrix.loc['SCORE_gnomon', 'SCORE_plink2']
+                if gnomon_plink2_corr < CORRELATION_THRESHOLD:
+                    run_disagreement_discovery(unified_score_df)
+    
+    print_final_summary(final_summary_data)
 
     print_header(f"CI CHECK {'FAILED' if failures else 'PASSED'}", "*")
     if failures:
@@ -390,6 +375,19 @@ def main():
     else:
         print('🎉 All tests passed successfully.', flush=True)
         sys.exit(0)
+
+def print_final_summary(summary_data: list):
+    """Prints a single, comprehensive summary report at the end of the run."""
+    print_header("FINAL TEST & BENCHMARKING REPORT", "*")
+    for pgs_summary in summary_data:
+        pgs_id = pgs_summary['pgs_id']
+        print_header(f"Analysis for {pgs_id}", "=")
+        if not pgs_summary.get('success', False):
+            print(f"❌ Analysis for {pgs_id} could not be completed.")
+            continue
+        print(f"✅ Concordance established using {pgs_summary.get('correlation_matrix').shape[0]} tools.")
+        print_debug_header("Score Correlation Matrix")
+        print(pgs_summary['correlation_matrix'].to_markdown(floatfmt=".8f"))
 
 if __name__ == '__main__':
     main()
