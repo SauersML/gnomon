@@ -277,11 +277,13 @@ fn process_tile(
 
             // Calculate adjustment (2*W), but only where the mask is true.
             // Otherwise, the adjustment is 0. This is a branchless `if`.
-            let adjustments_f32 = flip_mask.select(two_f32 * weights_vec, zeros_f32);
+            let adjustments_f32 = flip_mask.cast().select(two_f32 * weights_vec, zeros_f32);
 
             // Now, add the f32 adjustments to the f64 baseline using the same
             // efficient split-and-cast technique from the other loop.
-            let (adj_low, adj_high) = adjustments_f32.split::<4>();
+            let adj_array = adjustments_f32.to_array();
+            let adj_low = Simd::<f32, 4>::from_slice(&adj_array[0..4]);
+            let adj_high = Simd::<f32, 4>::from_slice(&adj_array[4..8]);
 
             let adj_low_f64 = adj_low.cast::<f64>();
             let adj_high_f64 = adj_high.cast::<f64>();
@@ -289,12 +291,12 @@ fn process_tile(
             let baseline_slice_low = &mut chunk_baseline[offset..offset + 4];
             let mut baseline_low = Simd::<f64, 4>::from_slice(baseline_slice_low);
             baseline_low += adj_low_f64;
-            baseline_low.write_to_slice(baseline_slice_low);
+            baseline_slice_low.copy_from_slice(&baseline_low.to_array());
 
             let baseline_slice_high = &mut chunk_baseline[offset + 4..offset + 8];
             let mut baseline_high = Simd::<f64, 4>::from_slice(baseline_slice_high);
             baseline_high += adj_high_f64;
-            baseline_high.write_to_slice(baseline_slice_high);
+            baseline_slice_high.copy_from_slice(&baseline_high.to_array());
         }
 
         // Scalar fallback for the remainder
@@ -400,7 +402,9 @@ fn process_tile(
                 // FAST PATH: This branch handles full 8-wide vectors. It's the common case.
                 if scores_offset + SIMD_LANES <= num_scores {
                     // Split the 8-lane f32 vector into two 4-lane f32 vectors.
-                    let (adj_low_f32x4, adj_high_f32x4) = adjustments_f32x8.split::<4>();
+                    let adj_array_person = adjustments_f32x8.to_array();
+                    let adj_low_f32x4 = Simd::<f32, 4>::from_slice(&adj_array_person[0..4]);
+                    let adj_high_f32x4 = Simd::<f32, 4>::from_slice(&adj_array_person[4..8]);
 
                     // Cast the 32-bit float vectors to 64-bit float vectors.
                     // This compiles to a single, efficient CPU instruction (vcvtps2pd).
@@ -411,12 +415,12 @@ fn process_tile(
                     let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                     let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                     current_scores_low += adj_low_f64x4;
-                    current_scores_low.write_to_slice(scores_slice_low);
+                    scores_slice_low.copy_from_slice(&current_scores_low.to_array());
 
                     let scores_slice_high = &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
                     let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
                     current_scores_high += adj_high_f64x4;
-                    current_scores_high.write_to_slice(scores_slice_high);
+                    scores_slice_high.copy_from_slice(&current_scores_high.to_array());
                 } else {
                     // SCALAR FALLBACK: For the final, partial chunk of scores if num_scores
                     // is not a multiple of SIMD_LANES.
