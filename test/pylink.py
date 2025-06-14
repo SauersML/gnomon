@@ -1,3 +1,12 @@
+""""
+Example:
+python3 pylink.py \
+    --bfile ./ci_workdir/chr22_subset50_compat \
+    --score ./ci_workdir/PGS003725_unified_format.tsv \
+    --out ./ci_workdir/plink2_PGS003725 \
+    1 2 4
+"""
+
 import sys
 import math
 import argparse
