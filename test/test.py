@@ -256,15 +256,31 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
 def run_disagreement_discovery(initial_score_df: pd.DataFrame):
     """Performs the bisection search to find the variant causing the most disagreement."""
     print_header("DISAGREEMENT DISCOVERY MODE", "*")
+
+    # Pre-filter the score file to only include variants that exist in the genotype data.
+    # This is the step to prevent testing partitions with zero overlapping variants
+    # Shouldn't affect anything but just speeds it up. Unnecessary to do
+    print("[DISCOVERY] Pre-filtering score file against genotype data...")
+    bim_df = pd.read_csv(SHARED_GENOTYPE_PREFIX.with_suffix('.bim'), sep='\s+', header=None, usecols=[1], names=['snp_id'], dtype=str)
+    valid_snp_ids = set(bim_df['snp_id'])
     
-    print("[DISCOVERY] Establishing baseline correlation with full score file...")
-    baseline_corr = test_variant_subset(initial_score_df, "baseline")
-    print(f"[DISCOVERY] Baseline Gnomon vs PLINK2 Correlation: {baseline_corr:.6f}")
+    # The list of variants to search is the intersection of the score file and the bim file.
+    searchable_variants_df = initial_score_df[initial_score_df['snp_id'].isin(valid_snp_ids)].copy()
+    
+    if searchable_variants_df.empty:
+        print("❌ Bisection failed: No overlapping variants found between score file and genotype data. Aborting discovery.", flush=True)
+        return
+        
+    print(f"[DISCOVERY] Found {len(searchable_variants_df)} overlapping variants to search.")
+
+    print("[DISCOVERY] Establishing baseline correlation with filtered score file...")
+    baseline_corr = test_variant_subset(searchable_variants_df, "baseline")
+    print(f"[DISCOVERY] Baseline Gnomon vs PLINK2 Correlation on overlapping variants: {baseline_corr:.6f}")
     if baseline_corr >= CORRELATION_THRESHOLD:
-        print("✅ Baseline correlation is high. No disagreement discovery needed.", flush=True)
+        print("✅ Baseline correlation on overlapping variants is high. No disagreement discovery needed.", flush=True)
         return
 
-    current_variants_df = initial_score_df.copy()
+    current_variants_df = searchable_variants_df.copy()
     iteration = 0
     while len(current_variants_df) > BISECTION_TERMINATION_SIZE:
         iteration += 1
@@ -283,25 +299,32 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
         print(f"  > Correlation for Part B: {corr_b:.6f}")
 
         if corr_a < 0 and corr_b < 0:
+            # Only abort if BOTH sub-tests fail completely.
             print("❌ Bisection failed: BOTH halves failed their sub-tests. Aborting discovery.", flush=True)
             return
         elif corr_a < 0:
+            # If only Part A fails, continue the search with Part B.
             print("[DISCOVERY] Part A failed its sub-test. Proceeding with Part B.")
             current_variants_df = part_b_df
         elif corr_b < 0:
+            # If only Part B fails, continue the search with Part A.
             print("[DISCOVERY] Part B failed its sub-test. Proceeding with Part A.")
             current_variants_df = part_a_df
         elif corr_a < CORRELATION_THRESHOLD and corr_b < CORRELATION_THRESHOLD:
+            # If both succeed but have low correlation, pursue the half with the worse correlation.
             print("[DISCOVERY] Both halves show disagreement. Pursuing the worse one.")
             current_variants_df = part_a_df if corr_a <= corr_b else part_b_df
         elif corr_a < CORRELATION_THRESHOLD:
+            # If only Part A has low correlation, it is the culprit.
             print("[DISCOVERY] Disagreement isolated to Part A.")
             current_variants_df = part_a_df
         elif corr_b < CORRELATION_THRESHOLD:
+            # If only Part B has low correlation, it is the culprit.
             print("[DISCOVERY] Disagreement isolated to Part B.")
             current_variants_df = part_b_df
         else:
-            print("✅ Disagreement resolved. Both halves have high correlation. The issue is likely a complex interaction. Halting search.", flush=True)
+            # If both succeed with high correlation, the problem is likely a complex interaction.
+            print("✅ Disagreement resolved. Both halves have high correlation. The issue is likely an interaction between the two halves. Halting search.", flush=True)
             return
 
     print_header(f"Final Pinpointing: {len(current_variants_df)} suspect variants", "-")
