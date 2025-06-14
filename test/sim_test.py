@@ -98,23 +98,21 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     print("Step 5: Calculating ground truth polygenic scores (high-precision)...")
     
     # --- 1. Vectorized Data Preparation ---
-    # Extract weights and effect allele info into NumPy arrays for performance
     effect_weights = variants_df['effect_weight'].values
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
     
-    # Create a boolean mask for valid (non-missing) genotypes
     valid_mask = (genotypes != -1)
     
-    # Create a dosage matrix. Start with a copy of genotypes as float.
-    # Where the effect allele is NOT the alt allele, dosage is 2 - genotype.
-    # This is applied to the whole matrix at once.
     dosages = genotypes.astype(float)
-    # The reshape is needed to broadcast the 1D boolean array across the 2D matrix
-    dosages[~is_alt_effect[:, np.newaxis]] = 2 - dosages[~is_alt_effect[:, np.newaxis]]
+    
+    # **FIXED LINE**: Select all rows where the ref allele is the effect allele
+    # and update all individuals for those rows.
+    rows_to_flip = ~is_alt_effect
+    dosages[rows_to_flip, :] = 2 - dosages[rows_to_flip, :]
     
     # --- 2. High-Precision Score Calculation ---
-    # Calculate the raw score components (dosage * weight) for all variants
-    # For missing genotypes, set the score component to 0 so it doesn't affect the sum
+    # Reshape weights for broadcasting and calculate score components
+    # Set component to 0 for missing genotypes so it doesn't affect the sum
     score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
 
     # Use math.fsum for a high-precision sum for each individual (column-wise)
@@ -126,7 +124,6 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     variant_counts = valid_mask.sum(axis=0)
 
     # Calculate the average score, handling the case of zero valid variants
-    # Using np.divide with a 'where' clause is a safe way to handle division by zero
     score_avg = np.divide(score_sums, variant_counts, 
                           out=np.zeros_like(score_sums, dtype=float), 
                           where=(variant_counts != 0))
