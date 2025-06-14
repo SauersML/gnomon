@@ -6,6 +6,7 @@ import subprocess
 import requests
 import zipfile
 import shutil
+import time
 from pathlib import Path
 
 # --- Configuration Parameters ---
@@ -381,9 +382,9 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     if all_ok:
         print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
-        print("     - Gnomon correctly scored all individuals.")
-        print("     - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
-        print("     - PyLink correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
+        print("      - Gnomon correctly scored all individuals.")
+        print("      - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
+        print("      - PyLink correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
     else:
         print("\n❌ Simple Dosage Test FAILED:")
         if not (is_gnomon_ok and is_gnomon_multiallelic_ok):
@@ -410,6 +411,9 @@ def run_and_validate_tools():
     # The gnomon binary is expected to be in the repo root relative to this script's execution
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
     PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
+    
+    # --- New: List to store runtimes ---
+    runtimes = []
 
     def _print_header(title: str, char: str = "-"):
         width = 70
@@ -429,6 +433,9 @@ def run_and_validate_tools():
         if "gnomon" in str(cmd_str[0]):
             proc_env["RUST_BACKTRACE"] = "1"
 
+        # --- New: Start timer ---
+        start_time = time.monotonic()
+        
         try:
             # Use Popen for real-time output, passing the modified environment
             process = subprocess.Popen(
@@ -443,9 +450,17 @@ def run_and_validate_tools():
                 
             # Wait for process to complete
             return_code = process.wait()
+
+            # --- New: End timer and record result ---
+            end_time = time.monotonic()
+            duration = end_time - start_time
             
             if return_code == 0:
-                print(f"\n  > Success.")
+                print(f"\n  > Success. (Completed in {duration:.4f}s)")
+                # Only record runtimes for the large-scale test
+                if "Large-Scale" in step_name:
+                    method_name = step_name.replace("Large-Scale ", "")
+                    runtimes.append({"Method": method_name, "Runtime (s)": duration})
             else:
                 print(f"\n  > ❌ ERROR: {step_name} failed with exit code {return_code}.")
                 sys.exit(1)
@@ -560,7 +575,7 @@ def run_and_validate_tools():
     # --- Main execution flow for this function ---
     setup_tools()
     
-    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command)    
+    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command)      
     
     print("\n" + "="*80)
     print("= Running Large-Scale Simulation and Validation")
@@ -585,6 +600,17 @@ def run_and_validate_tools():
     )
 
     analyze_and_compare_large_scale_results()
+
+    # --- New: Display the final runtime table ---
+    _print_header("Mean Runtime for Large-Scale Methods", "=")
+    if runtimes:
+        runtime_df = pd.DataFrame(runtimes)
+        # In this script, each method is run once, so the mean is the single recorded value.
+        # The groupby().mean() would be useful if runs were repeated in a loop.
+        mean_runtimes = runtime_df.groupby('Method')['Runtime (s)'].mean().reset_index()
+        print(mean_runtimes.to_markdown(index=False, floatfmt=".4f"))
+    else:
+        print("No large-scale runtimes were recorded.")
 
 def cleanup():
     """Removes the generated workspace directory."""
