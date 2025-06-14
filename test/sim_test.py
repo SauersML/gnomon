@@ -192,101 +192,157 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     
     print(f"...PLINK files written: {prefix}.bed/.bim/.fam")
 
-# Simple Dosage Test
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
     """
-    Runs an expanded, hardcoded test case with 3 variants and 4 individuals.
-    This test verifies:
-    1. Basic dosage calculation (alternate allele is effect allele).
-    2. Dosage calculation when the reference allele is the effect allele.
-    3. Correct handling of missing genotypes across different individuals.
+    Runs a complex, programmatically generated test case.
+
+    This test verifies a number of edge cases simultaneously:
+    1.  Standard dosage calculation (alternate allele is effect allele).
+    2.  Dosage calculation when the reference allele is the effect allele.
+    3.  Correct handling of missing genotypes across different individuals.
+    4.  Correct score calculation for an individual with many unique variants.
+    5.  Permissive matching of a score file entry to multiple variants at one locus.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
-    print("= Running Simple Dosage Test Case (with missingness and ref-allele effect)")
+    print("= Running Comprehensive Simple Test Case")
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
-    # --- 1. Define Ground Truth and File Contents ---
-    # Manually calculated ground truth:
-    # Scores are averaged over non-missing variants for each person.
-    # V1(A/G, eff=G, w=0.5), V2(C/T, eff=T, w=-0.2), V3(A/T, eff=A, w=-0.7)
-    # Person 1 (hom_ref): (V1_dosage*0.5 + V2_dosage*-0.2)/2 = (0*0.5 + 0*-0.2)/2 = 0.0
-    # Person 2 (het):     (V1_dosage*0.5)/1 = (1*0.5)/1 = 0.5 (V2, V3 missing)
-    # Person 3 (hom_alt): (V1_dosage*0.5 + V2_dosage*-0.2)/2 = (2*0.5 + 2*-0.2)/2 = 0.3
-    # Person 4 (new):     (V3_dosage*-0.7)/1 = ((2-1)*-0.7)/1 = -0.7 (V1, V2 missing, V3 effect is ref)
+    def _generate_test_data():
+        """Creates in-memory data structures for the entire complex test case."""
+        # --- Define Individuals ---
+        individuals = [
+            'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
+            'id_special_case', 'id_multiallelic'
+        ]
+
+        # --- Define BIM Data (56 variants total) ---
+        bim_data = []
+        # Part 1: Original 3 variants
+        bim_data.extend([
+            {'chr': '1', 'id': '1:1000', 'cm': 0, 'pos': 1000, 'a1': 'A', 'a2': 'G'},
+            {'chr': '1', 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'},
+            {'chr': '1', 'id': '1:3000', 'cm': 0, 'pos': 3000, 'a1': 'A', 'a2': 'T'}
+        ])
+        # Part 2: 50 variants for the special case individual
+        for i in range(50):
+            pos = 10000 + i
+            bim_data.append({'chr': '1', 'id': f'1:{pos}', 'cm': 0, 'pos': pos, 'a1': 'A', 'a2': 'T'})
+        # Part 3: 3 variants for the multi-allelic case
+        bim_data.extend([
+            {'chr': '1', 'id': '1:50000:A:C', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'C'},
+            {'chr': '1', 'id': '1:50000:A:G', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'G'},
+            {'chr': '1', 'id': '1:60000:T:C', 'cm': 0, 'pos': 60000, 'a1': 'T', 'a2': 'C'}
+        ])
+        bim_df = pd.DataFrame(bim_data)
+
+        # --- Define Score File Data (55 score lines total) ---
+        score_data = []
+        # Part 1: Scores for original 3 variants
+        score_data.extend([
+            {'snp_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'simple_score': 0.5},
+            {'snp_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'simple_score': -0.2},
+            {'snp_id': '1:3000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': -0.7}
+        ])
+        # Part 2: Scores for the 50 special case variants
+        for i in range(50):
+            pos = 10000 + i
+            score_data.append({'snp_id': f'1:{pos}', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 0.1})
+        # Part 3: Scores for the multi-allelic case (2 lines match 3 variants)
+        score_data.extend([
+            {'snp_id': '1:50000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 10.0},
+            {'snp_id': '1:60000', 'effect_allele': 'C', 'other_allele': 'T', 'simple_score': 1.0}
+        ])
+        score_df = pd.DataFrame(score_data)
+
+        # --- Define Genotypes (56 variants x 6 individuals) ---
+        genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
+        # Person 1-4 genotypes
+        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
+        genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
+        genotypes_df.loc['1:1000', 'id_het'] = 1
+        genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
+        genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
+        genotypes_df.loc['1:3000', 'id_new_person'] = 1
+        # Person 5 ('id_special_case') genotypes
+        special_case_ids = [f'1:{10000+i}' for i in range(50)]
+        # Dosage=2 (geno=0), Dosage=1 (geno=1), Dosage=0 (geno=2)
+        genotypes_df.loc[special_case_ids[0:10], 'id_special_case'] = 0
+        genotypes_df.loc[special_case_ids[10:40], 'id_special_case'] = 1
+        genotypes_df.loc[special_case_ids[40:50], 'id_special_case'] = 2
+        # Person 6 ('id_multiallelic') genotypes (all het)
+        genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
+        genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
+        genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
+        
+        return bim_df, score_df, individuals, genotypes_df
+
+    def _write_plink_files(prefix: Path, bim_df: pd.DataFrame, individuals: list, genotypes_df: pd.DataFrame):
+        """Writes .fam, .bim, and .bed files from the provided data structures."""
+        # .fam file
+        with open(prefix.with_suffix(".fam"), 'w') as f:
+            for iid in individuals:
+                f.write(f"{iid} {iid} 0 0 0 -9\n")
+        
+        # .bim file
+        bim_df[['chr', 'id', 'cm', 'pos', 'a1', 'a2']].to_csv(
+            prefix.with_suffix(".bim"), sep='\t', header=False, index=False
+        )
+        
+        # .bed file
+        code_map = {0: 0b00, 1: 0b10, 2: 0b11, -1: 0b01}
+        n_individuals = len(individuals)
+        with open(prefix.with_suffix(".bed"), 'wb') as f:
+            f.write(bytes([0x6c, 0x1b, 0x01])) # PLINK magic number
+            for _, geno_series in genotypes_df.iterrows():
+                for j in range(0, n_individuals, 4):
+                    byte = 0
+                    chunk = geno_series.iloc[j:j+4]
+                    for k, geno in enumerate(chunk):
+                        byte |= (code_map[int(geno)] << (k * 2))
+                    f.write(byte.to_bytes(1, 'little'))
+        print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
+
+    def _write_score_file(filename: Path, score_df: pd.DataFrame):
+        """Writes the score file from the provided DataFrame."""
+        score_df.to_csv(filename, sep='\t', index=False)
+        print(f"Programmatically wrote {filename}")
+
+    # --- 1. Generate all test case data in memory ---
+    bim_df, score_df, individuals, genotypes_df = _generate_test_data()
+
+    # --- 2. Define Ground Truth ---
     truth_df = pd.DataFrame({
-        'IID': ['id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person'],
-        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7]
+        'IID': individuals,
+        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 7.0]
     })
 
-    # --- 2. Write Input Files and Print Contents ---
-    print("\n--- Writing Input Files ---")
-    variant1_id = "1:1000"
-    variant2_id = "1:2000"
-    variant3_id = "1:3000"
+    # --- 3. Write all input files to disk ---
+    _write_plink_files(prefix, bim_df, individuals, genotypes_df)
+    _write_score_file(prefix.with_suffix(".score"), score_df)
 
-    # .fam file - now with 4 individuals
-    fam_content = ("id_hom_ref id_hom_ref 0 0 0 -9\n"
-                   "id_het id_het 0 0 0 -9\n"
-                   "id_hom_alt id_hom_alt 0 0 0 -9\n"
-                   "id_new_person id_new_person 0 0 0 -9\n")
-    with open(prefix.with_suffix(".fam"), "w") as f:
-        f.write(fam_content)
-    print(f"\nContents of {prefix.with_suffix('.fam')}:\n---\n{fam_content.strip()}\n---")
-
-    # .bim file - three variants
-    bim_content = (f"1\t{variant1_id}\t0\t1000\tA\tG\n"
-                   f"1\t{variant2_id}\t0\t2000\tC\tT\n"
-                   f"1\t{variant3_id}\t0\t3000\tA\tT\n")
-    with open(prefix.with_suffix(".bim"), "w") as f:
-        f.write(bim_content)
-    print(f"\nContents of {prefix.with_suffix('.bim')}:\n---\n{bim_content.strip()}\n---")
-
-    # score file - three variants, with V3 having a reference effect allele
-    score_content = (f"snp_id\teffect_allele\tother_allele\tsimple_score\n"
-                     f"{variant1_id}\tG\tA\t0.5\n"
-                     f"{variant2_id}\tT\tC\t-0.2\n"
-                     f"{variant3_id}\tA\tT\t-0.7\n")
-    with open(prefix.with_suffix(".score"), "w") as f:
-        f.write(score_content)
-    print(f"\nContents of {prefix.with_suffix('.score')}:\n---\n{score_content.strip()}\n---")
-
-    # .bed file (magic bytes + 3 variants for 4 people)
-    # Genotype codes: 0/0=0b00, het=0b10, 1/1=0b11, missing=0b01
-    # Byte order is P4 P3 P2 P1
-    # V1 Genos [0, 1, 2, -1] -> Codes [00,10,11,01] -> Byte [01 11 10 00] -> 0x78
-    # V2 Genos [0, -1, 2, -1] -> Codes [00,01,11,01] -> Byte [01 11 01 00] -> 0x74
-    # V3 Genos [-1, -1, -1, 1] -> Codes [01,01,01,10] -> Byte [10 01 01 01] -> 0x95
-    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x78, 0x74, 0x95])
-    with open(prefix.with_suffix(".bed"), "wb") as f:
-        f.write(bed_bytes)
-    print(f"\nContents of {prefix.with_suffix('.bed')} (in hex):\n---\n{bed_bytes.hex()}\n---")
-
-    # --- 3. Run Tools ---
+    # --- 4. Run Tools ---
     run_cmd_func(
         [gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
         "Simple Gnomon Test", cwd=workdir
     )
-    # The 'no-mean-imputation' flag is critical here. It tells PLINK to treat missing
-    # genotypes as having zero contribution and to correctly adjust the denominator.
     run_cmd_func(
         [f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
         "Simple PLINK2 Test", cwd=workdir
     )
 
-    # --- 4. Compare Results ---
+    # --- 5. Compare Results ---
     print("\n--- Analyzing Simple Test Results ---")
     gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={'#IID': 'IID', 'simple_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
     plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep='\s+').rename(columns={'#IID': 'IID'})
-    # PLINK's AVG is per-allele, not per-variant. We must multiply by 2 for comparison.
     plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
 
     merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left').merge(plink_results, on='IID', how='left')
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
-    # --- 5. Final Validation ---
+    # --- 6. Final Validation ---
     is_gnomon_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
     is_plink_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_PLINK2'])
 
