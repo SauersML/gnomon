@@ -195,55 +195,70 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 # Simple Dosage Test
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
     """
-    Runs a minimal, hardcoded test case with 2 variants and 3 individuals.
-    This test verifies basic dosage calculation AND correct handling of a missing genotype.
+    Runs an expanded, hardcoded test case with 3 variants and 4 individuals.
+    This test verifies:
+    1. Basic dosage calculation (alternate allele is effect allele).
+    2. Dosage calculation when the reference allele is the effect allele.
+    3. Correct handling of missing genotypes across different individuals.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
-    print("= Running Simple Dosage Test Case (with missingness)")
+    print("= Running Simple Dosage Test Case (with missingness and ref-allele effect)")
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
     # --- 1. Define Ground Truth and File Contents ---
     # Manually calculated ground truth:
     # Scores are averaged over non-missing variants for each person.
-    # Person 1 (hom_ref): (0*0.5 + 0*-0.2) / 2 = 0.0
-    # Person 2 (het):     (1*0.5) / 1 = 0.5  (variant 2 is missing)
-    # Person 3 (hom_alt): (2*0.5 + 2*-0.2) / 2 = (1.0 - 0.4) / 2 = 0.3
+    # V1(A/G, eff=G, w=0.5), V2(C/T, eff=T, w=-0.2), V3(A/T, eff=A, w=-0.7)
+    # Person 1 (hom_ref): (V1_dosage*0.5 + V2_dosage*-0.2)/2 = (0*0.5 + 0*-0.2)/2 = 0.0
+    # Person 2 (het):     (V1_dosage*0.5)/1 = (1*0.5)/1 = 0.5 (V2, V3 missing)
+    # Person 3 (hom_alt): (V1_dosage*0.5 + V2_dosage*-0.2)/2 = (2*0.5 + 2*-0.2)/2 = 0.3
+    # Person 4 (new):     (V3_dosage*-0.7)/1 = ((2-1)*-0.7)/1 = -0.7 (V1, V2 missing, V3 effect is ref)
     truth_df = pd.DataFrame({
-        'IID': ['id_hom_ref', 'id_het', 'id_hom_alt'],
-        'SCORE_TRUTH': [0.0, 0.5, 0.3]
+        'IID': ['id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person'],
+        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7]
     })
 
     # --- 2. Write Input Files and Print Contents ---
     print("\n--- Writing Input Files ---")
     variant1_id = "1:1000"
     variant2_id = "1:2000"
+    variant3_id = "1:3000"
 
-    # .fam file
-    fam_content = "id_hom_ref id_hom_ref 0 0 0 -9\nid_het id_het 0 0 0 -9\nid_hom_alt id_hom_alt 0 0 0 -9\n"
+    # .fam file - now with 4 individuals
+    fam_content = ("id_hom_ref id_hom_ref 0 0 0 -9\n"
+                   "id_het id_het 0 0 0 -9\n"
+                   "id_hom_alt id_hom_alt 0 0 0 -9\n"
+                   "id_new_person id_new_person 0 0 0 -9\n")
     with open(prefix.with_suffix(".fam"), "w") as f:
         f.write(fam_content)
     print(f"\nContents of {prefix.with_suffix('.fam')}:\n---\n{fam_content.strip()}\n---")
 
-    # .bim file - two variants
-    bim_content = f"1\t{variant1_id}\t0\t1000\tA\tG\n1\t{variant2_id}\t0\t2000\tC\tT\n"
+    # .bim file - three variants
+    bim_content = (f"1\t{variant1_id}\t0\t1000\tA\tG\n"
+                   f"1\t{variant2_id}\t0\t2000\tC\tT\n"
+                   f"1\t{variant3_id}\t0\t3000\tA\tT\n")
     with open(prefix.with_suffix(".bim"), "w") as f:
         f.write(bim_content)
     print(f"\nContents of {prefix.with_suffix('.bim')}:\n---\n{bim_content.strip()}\n---")
 
-    # score file - two variants
+    # score file - three variants, with V3 having a reference effect allele
     score_content = (f"snp_id\teffect_allele\tother_allele\tsimple_score\n"
                      f"{variant1_id}\tG\tA\t0.5\n"
-                     f"{variant2_id}\tT\tC\t-0.2\n")
+                     f"{variant2_id}\tT\tC\t-0.2\n"
+                     f"{variant3_id}\tA\tT\t-0.7\n")
     with open(prefix.with_suffix(".score"), "w") as f:
         f.write(score_content)
     print(f"\nContents of {prefix.with_suffix('.score')}:\n---\n{score_content.strip()}\n---")
 
-    # .bed file (magic bytes + 2 variants for 3 people)
-    # Variant 1 Genos: 0/0 (0b00), 0/1 (0b10), 1/1 (0b11). Byte is 00111000 -> 0x38
-    # Variant 2 Genos: 0/0 (0b00), missing (0b01), 1/1 (0b11). Byte is 00110100 -> 0x34
-    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x38, 0x34])
+    # .bed file (magic bytes + 3 variants for 4 people)
+    # Genotype codes: 0/0=0b00, het=0b10, 1/1=0b11, missing=0b01
+    # Byte order is P4 P3 P2 P1
+    # V1 Genos [0, 1, 2, -1] -> Codes [00,10,11,01] -> Byte [01 11 10 00] -> 0x78
+    # V2 Genos [0, -1, 2, -1] -> Codes [00,01,11,01] -> Byte [01 11 01 00] -> 0x74
+    # V3 Genos [-1, -1, -1, 1] -> Codes [01,01,01,10] -> Byte [10 01 01 01] -> 0x95
+    bed_bytes = bytes([0x6c, 0x1b, 0x01, 0x78, 0x74, 0x95])
     with open(prefix.with_suffix(".bed"), "wb") as f:
         f.write(bed_bytes)
     print(f"\nContents of {prefix.with_suffix('.bed')} (in hex):\n---\n{bed_bytes.hex()}\n---")
@@ -267,7 +282,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     # PLINK's AVG is per-allele, not per-variant. We must multiply by 2 for comparison.
     plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
 
-    merged_df = pd.merge(truth_df, gnomon_results, on='IID').merge(plink_results, on='IID')
+    merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left').merge(plink_results, on='IID', how='left')
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
@@ -282,6 +297,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         if not is_gnomon_ok: print("  - Gnomon scores do not match ground truth.")
         if not is_plink_ok: print("  - PLINK2 scores do not match ground truth.")
         sys.exit(1)
+
 
 def run_and_validate_tools():
     """
