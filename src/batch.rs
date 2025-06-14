@@ -35,6 +35,11 @@ type U8xN = Simd<u8, SIMD_LANES>;
 /// This value is tuned to ensure the tile fits comfortably within the L3 cache.
 const PERSON_BLOCK_SIZE: usize = 4096;
 
+/// The number of variants to process in a single call to the compute kernel. This value
+/// controls the frequency of flushing the `f32` accumulators to the `f64` master
+/// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
+const KERNEL_MINI_BATCH_SIZE: usize = 256;
+
 /// A thread-local pool for reusing the memory buffers required for storing
 /// sparse indices (`g1_indices`, `g2_indices`). This is a critical performance
 /// optimization that avoids heap allocations in the hot compute path.
@@ -313,126 +318,133 @@ fn process_tile(
         person_scores[..num_scores].copy_from_slice(&chunk_baseline[..num_scores]);
     }
 
-    // --- Part 2: Build sparse indices for d>0 AND adjust for missing genotypes ---
-    let thread_indices = sparse_index_pool.get_or_default();
-    let (g1_indices, g2_indices) = &mut *thread_indices.borrow_mut();
+// --- Part 2: Main Processing Loop (Mini-Batching) ---
+    // Iterate over the tile in small, accuracy-preserving chunks.
+    for snp_mini_batch_start in (0..snps_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
+        let mini_batch_size =
+            (snps_in_chunk - snp_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
+        if mini_batch_size == 0 {
+            continue;
+        }
 
-    g1_indices.iter_mut().for_each(Vec::clear);
-    g2_indices.iter_mut().for_each(Vec::clear);
-    g1_indices.resize_with(num_people_in_block, Vec::new);
-    g2_indices.resize_with(num_people_in_block, Vec::new);
+        // --- A. Build Sparse Indices and Handle Missingness for the Mini-Batch ---
+        let thread_indices = sparse_index_pool.get_or_default();
+        let (g1_indices, g2_indices) = &mut *thread_indices.borrow_mut();
+        g1_indices.iter_mut().for_each(Vec::clear);
+        g2_indices.iter_mut().for_each(Vec::clear);
+        g1_indices.resize_with(num_people_in_block, Vec::new);
+        g2_indices.resize_with(num_people_in_block, Vec::new);
 
-    for person_idx in 0..num_people_in_block {
-        let genotype_row = &tile[person_idx * snps_in_chunk..(person_idx + 1) * snps_in_chunk];
-        let person_scores_slice =
-            &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
-        let person_missing_counts_slice =
-            &mut block_missing_counts_out[person_idx * num_scores..(person_idx + 1) * num_scores];
+        for person_idx in 0..num_people_in_block {
+            let genotype_tile_row_offset = person_idx * snps_in_chunk;
+            let mini_batch_genotype_start = genotype_tile_row_offset + snp_mini_batch_start;
+            let genotype_row_for_mini_batch =
+                &tile[mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size];
 
-        for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
-            match dosage.0 {
-                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
-                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
-                3 => {
-                    let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
-                    let scores_for_this_variant =
-                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
-                    let weight_row_offset = global_matrix_row_idx * stride;
-                    let weight_row =
-                        &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
-                    let flip_row =
-                        &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+            for (snp_idx_in_mini_batch, &dosage) in
+                genotype_row_for_mini_batch.iter().enumerate()
+            {
+                match dosage.0 {
+                    1 => unsafe {
+                        g1_indices
+                            .get_unchecked_mut(person_idx)
+                            .push(snp_idx_in_mini_batch)
+                    },
+                    2 => unsafe {
+                        g2_indices
+                            .get_unchecked_mut(person_idx)
+                            .push(snp_idx_in_mini_batch)
+                    },
+                    3 => {
+                        let snp_idx_in_chunk = snp_mini_batch_start + snp_idx_in_mini_batch;
+                        let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
+                        let scores_for_this_variant =
+                            &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                        let weight_row_offset = global_matrix_row_idx * stride;
+                        let weight_row =
+                            &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+                        let flip_row =
+                            &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
 
-                    for &score_idx in scores_for_this_variant {
-                        let score_col = score_idx.0;
-                        unsafe {
-                            *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
-                        }
-                        // If a flipped variant is missing, we must subtract the 2*W
-                        // that was added in the global baseline.
-                        if flip_row[score_col] == 1 {
+                        let person_scores_slice = &mut block_scores_out
+                            [person_idx * num_scores..(person_idx + 1) * num_scores];
+                        let person_missing_counts_slice = &mut block_missing_counts_out
+                            [person_idx * num_scores..(person_idx + 1) * num_scores];
+
+                        for &score_idx in scores_for_this_variant {
+                            let score_col = score_idx.0;
                             unsafe {
-                                *person_scores_slice.get_unchecked_mut(score_col) -=
+                                *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
+                                if flip_row[score_col] == 1 {
+                                    *person_scores_slice.get_unchecked_mut(score_col) -=
                                         2.0 * (weight_row[score_col] as f64);
+                                }
                             }
                         }
                     }
+                    _ => (),
                 }
-                _ => (), // Dosage 0 is correctly handled by the baseline.
             }
         }
-    }
 
-    // --- Part 3: Dispatch to the adjustment-based kernel ---
-    let matrix_slice_start = matrix_row_start_idx.0 * stride;
-    let matrix_slice_end = matrix_slice_start + (snps_in_chunk * stride);
-    let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
-    let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..matrix_slice_end];
+        // --- B. Create Matrix Views for the Mini-Batch ---
+        let matrix_row_offset = matrix_row_start_idx.0 + snp_mini_batch_start;
+        let matrix_slice_start = matrix_row_offset * stride;
+        let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
+        let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
+        let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..matrix_slice_end];
 
-    let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
-        .expect("CRITICAL: Weights matrix validation failed.");
-    let flip_flags =
-        kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
-            .expect("CRITICAL: Flip flags matrix validation failed.");
+        let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
+            .expect("CRITICAL: Mini-batch weights matrix validation failed.");
+        let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
+            .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
 
-    block_scores_out
-        .chunks_exact_mut(num_scores)
-        .enumerate()
-        .for_each(|(person_idx, scores_out_slice)| {
-            const MAX_SCORES: usize = 100;
-            const MAX_ACC_LANES: usize = (MAX_SCORES + SIMD_LANES - 1) / SIMD_LANES;
-            let mut acc_buffer = [kernel::SimdVec::splat(0.0); MAX_ACC_LANES];
-            let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
+        // --- C. Dispatch to Kernel and Accumulate Results ---
+        block_scores_out
+            .chunks_exact_mut(num_scores)
+            .enumerate()
+            .for_each(|(person_idx, scores_out_slice)| {
+                let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
+                    &weights,
+                    &flip_flags,
+                    &g1_indices[person_idx],
+                    &g2_indices[person_idx],
+                );
 
-            kernel::accumulate_adjustments_for_person(
-                &weights,
-                &flip_flags,
-                acc_buffer_slice,
-                &g1_indices[person_idx],
-                &g2_indices[person_idx],
-            );
+                // Add the kernel's calculated adjustments to the baseline.
+                for i in 0..num_accumulator_lanes {
+                    let scores_offset = i * SIMD_LANES;
+                    let adjustments_f32x8 = kernel_result_buffer[i];
 
-            // Add the kernel's calculated adjustments to the baseline.
-            // This is a performance-critical step. We use SIMD to cast the f32
-            // adjustments and add them to the f64 accumulators to avoid a slow scalar loop.
-            for i in 0..num_accumulator_lanes {
-                let scores_offset = i * SIMD_LANES;
-                let adjustments_f32x8 = acc_buffer_slice[i];
+                    if scores_offset + SIMD_LANES <= num_scores {
+                        let adj_array = adjustments_f32x8.to_array();
+                        let adj_low_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[0..4]);
+                        let adj_high_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[4..8]);
 
-                // FAST PATH: This branch handles full 8-wide vectors. It's the common case.
-                if scores_offset + SIMD_LANES <= num_scores {
-                    // Split the 8-lane f32 vector into two 4-lane f32 vectors.
-                    let adj_array_person = adjustments_f32x8.to_array();
-                    let adj_low_f32x4 = Simd::<f32, 4>::from_slice(&adj_array_person[0..4]);
-                    let adj_high_f32x4 = Simd::<f32, 4>::from_slice(&adj_array_person[4..8]);
+                        let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
+                        let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-                    // Cast the 32-bit float vectors to 64-bit float vectors.
-                    // This compiles to a single, efficient CPU instruction (vcvtps2pd).
-                    let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
-                    let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
+                        let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
+                        let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
+                        current_scores_low += adj_low_f64x4;
+                        scores_slice_low.copy_from_slice(&current_scores_low.to_array());
 
-                    // Load the current scores, add the adjustments, and write back.
-                    let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
-                    let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
-                    current_scores_low += adj_low_f64x4;
-                    scores_slice_low.copy_from_slice(&current_scores_low.to_array());
-
-                    let scores_slice_high = &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
-                    let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
-                    current_scores_high += adj_high_f64x4;
-                    scores_slice_high.copy_from_slice(&current_scores_high.to_array());
-                } else {
-                    // SCALAR FALLBACK: For the final, partial chunk of scores if num_scores
-                    // is not a multiple of SIMD_LANES.
-                    let start = scores_offset;
-                    let end = num_scores;
-                    let temp_array = adjustments_f32x8.to_array();
-                    for j in 0..(end - start) {
-                        scores_out_slice[start + j] += temp_array[j] as f64;
+                        let scores_slice_high =
+                            &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
+                        let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
+                        current_scores_high += adj_high_f64x4;
+                        scores_slice_high.copy_from_slice(&current_scores_high.to_array());
+                    } else {
+                        let start = scores_offset;
+                        let end = num_scores;
+                        let temp_array = adjustments_f32x8.to_array();
+                        for j in 0..(end - start) {
+                            scores_out_slice[start + j] += temp_array[j] as f64;
+                        }
                     }
                 }
-            }
-        });
+            });
+    }
 }
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
