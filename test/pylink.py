@@ -12,18 +12,24 @@ def read_fam_file(filepath: str) -> pl.DataFrame:
     """
     print(f"Reading sample info file (.fam): {filepath}...")
     try:
-        # Read each line as a single string, then split. This robustly handles
-        # variable spaces or tabs between columns.
+        # Read each line as a single string, which is robust to delimiter issues.
         df = pl.read_csv(filepath, has_header=False, separator='\n', new_columns=["data"])
+
+        # Split the single 'data' column into a struct with 6 fields.
+        # This handles variable spaces correctly.
         df = df.with_columns(
-            pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("split_data")
-        ).unnest("split_data").select(
-            pl.col("field_0").alias("FID"),
-            pl.col("field_1").alias("IID"),
-            pl.col("field_2").alias("PAT"),
-            pl.col("field_3").alias("MAT"),
-            pl.col("field_4").alias("SEX"),
-            pl.col("field_5").alias("PHEN"),
+            pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
+        )
+
+        # Select the fields directly from the struct into new columns. This is the correct
+        # way to handle the output of split_exact.
+        df = df.select(
+            pl.col("struct_data").struct.field("field_0").alias("FID"),
+            pl.col("struct_data").struct.field("field_1").alias("IID"),
+            pl.col("struct_data").struct.field("field_2").alias("PAT"),
+            pl.col("struct_data").struct.field("field_3").alias("MAT"),
+            pl.col("struct_data").struct.field("field_4").alias("SEX"),
+            pl.col("struct_data").struct.field("field_5").alias("PHEN"),
         )
         print(f"  > Loaded info for {df.height} samples.")
         return df
@@ -34,31 +40,35 @@ def read_fam_file(filepath: str) -> pl.DataFrame:
 
 def read_bim_file(filepath: str) -> pl.DataFrame:
     """
-    Reads a .bim file using Polars, robustly handling any whitespace delimiter.
+    Reads a .bim file using Polars, robustly handling tab or space delimiters.
     """
     print(f"Reading variant info file (.bim): {filepath}...")
     try:
-        # Use a robust method that handles tabs or spaces.
         df = pl.read_csv(filepath, has_header=False, separator='\n', new_columns=["data"])
-        df = df.with_columns(
-            pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("split_data")
+        
+        # First, try to split by tab, creating a struct.
+        struct_df = df.with_columns(
+            pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("struct_data")
         )
-        # If splitting by tab failed (produced nulls), try splitting by space.
-        if df.select(pl.col("split_data").list.get(0).is_null()).to_series().any():
-             df = df.with_columns(
-                 pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("split_data")
-             )
 
-        df = df.unnest("split_data").select(
-            pl.col("field_0").cast(pl.Utf8).alias("CHR"),
-            pl.col("field_1").cast(pl.Utf8).alias("ID"),
-            pl.col("field_2").cast(pl.Utf8).alias("CM"),
-            pl.col("field_3").cast(pl.Int64).alias("POS"),
-            pl.col("field_4").cast(pl.Utf8).alias("A1"),
-            pl.col("field_5").cast(pl.Utf8).alias("A2"),
+        # If the tab split failed, the struct's fields will be all null.
+        # In that case, we try again with space as the delimiter.
+        if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).item():
+            struct_df = df.with_columns(
+                pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
+            )
+
+        # Now, select the fields from the successfully created struct.
+        df_final = struct_df.select(
+            pl.col("struct_data").struct.field("field_0").cast(pl.Utf8).alias("CHR"),
+            pl.col("struct_data").struct.field("field_1").cast(pl.Utf8).alias("ID"),
+            pl.col("struct_data").struct.field("field_2").cast(pl.Utf8).alias("CM"),
+            pl.col("struct_data").struct.field("field_3").cast(pl.Int64).alias("POS"),
+            pl.col("struct_data").struct.field("field_4").cast(pl.Utf8).alias("A1"),
+            pl.col("struct_data").struct.field("field_5").cast(pl.Utf8).alias("A2"),
         )
-        print(f"  > Loaded info for {df.height} variants.")
-        return df
+        print(f"  > Loaded info for {df_final.height} variants.")
+        return df_final
     except Exception as e:
         print(f"Error reading .bim file: {e}", file=sys.stderr)
         sys.exit(1)
@@ -70,26 +80,26 @@ def read_score_file(filepath: str, id_col: int, allele_col: int, score_col: int)
     """
     print(f"Reading score file: {filepath}...")
     try:
-        # Read the header to find the total number of columns
         with open(filepath, 'r') as f:
-            header = f.readline().strip()
-            # Skip comments
-            while header.startswith('#'):
-                header = f.readline().strip()
-            num_cols = len(header.split())
+            header_line = ""
+            for line in f:
+                if not line.startswith('#'):
+                    header_line = line
+                    break
+            num_cols = len(header_line.split())
 
-        # Read the file, splitting each line into the determined number of columns
         df = pl.read_csv(filepath, has_header=True, separator='\n', comment_prefix='#', new_columns=["data"])
-        df = df.with_columns(
-             pl.col("data").str.strip_chars().str.split_exact(" ", num_cols - 1).alias("split_data")
-        ).unnest("split_data")
+        
+        # This robustly splits rows with either tabs or spaces.
+        struct_df = df.with_columns(
+            pl.col("data").str.strip_chars().str.split(" ", n=num_cols).alias("struct_data")
+        )
+        
+        # Select columns by their integer index from the list of strings.
+        id_series = struct_df.select(pl.col("struct_data").list.get(id_col - 1).cast(pl.Utf8)).to_series()
+        allele_series = struct_df.select(pl.col("struct_data").list.get(allele_col - 1).cast(pl.Utf8)).to_series()
+        score_series = struct_df.select(pl.col("struct_data").list.get(score_col - 1).cast(pl.Float64)).to_series()
 
-        # Select columns by their integer index to match original logic
-        id_series = df.select(pl.col(f"field_{id_col - 1}").cast(pl.Utf8)).to_series()
-        allele_series = df.select(pl.col(f"field_{allele_col - 1}").cast(pl.Utf8)).to_series()
-        score_series = df.select(pl.col(f"field_{score_col - 1}").cast(pl.Float64)).to_series()
-
-        # Create the dictionary lookup using a fast zip comprehension
         score_data = {
             (vid, allele): score
             for vid, allele, score in zip(id_series, allele_series, score_series)
@@ -109,21 +119,15 @@ def find_ambiguous_samples(bed_filepath: str, num_samples: int, bim_df: pl.DataF
     """
     print("\n--- Pass 1: Identifying ambiguous samples ---")
     
-    # Find positions that have more than one variant mapped to them
     ambiguous_pos_df = bim_df.group_by(['CHR', 'POS']).count().filter(pl.col('count') > 1)
-    
     if ambiguous_pos_df.height == 0:
-        print("  > No variants at duplicated positions found. Skipping ambiguity check.")
+        print("  > No variants at duplicated positions found.")
         return set()
         
-    # Get the indices of all variants located at these ambiguous positions
-    variants_to_check_df = bim_df.with_row_index().join(
-        ambiguous_pos_df, on=['CHR', 'POS']
-    )
+    variants_to_check_df = bim_df.with_row_index().join(ambiguous_pos_df, on=['CHR', 'POS'])
     indices_to_check = set(variants_to_check_df['index'].to_list())
     
-    genotype_counts_at_pos = {} # {(chr, pos): np.array}
-    
+    genotype_counts_at_pos = {}
     bytes_per_variant = math.ceil(num_samples / 4)
     shifts = np.array([0, 2, 4, 6], dtype=np.uint8)
 
@@ -158,7 +162,6 @@ def find_ambiguous_samples(bed_filepath: str, num_samples: int, bim_df: pl.DataF
         print(f"  > Identified {len(nan_indices)} sample(s) with ambiguous genotypes at single positions.")
     else:
         print("  > No ambiguous samples found.")
-        
     return nan_indices
 
 
@@ -171,10 +174,8 @@ def calculate_scores(bed_filepath: str, num_samples: int, bim_df: pl.DataFrame, 
     denominator_ct = np.zeros(num_samples, dtype=np.int64)
     variants_processed_count = 0
     bytes_per_variant = math.ceil(num_samples / 4)
-
     shifts = np.array([0, 2, 4, 6], dtype=np.uint8)
     geno_to_a2_dosage = np.array([0, -1, 1, 2], dtype=np.int8)
-
     bim_iter = zip(bim_df['ID'], bim_df['A1'], bim_df['A2'])
 
     with open(bed_filepath, "rb") as f:
@@ -214,15 +215,13 @@ def main():
     Main execution function.
     """
     parser = argparse.ArgumentParser(
-        description="A high-performance Python script to replicate 'plink --score' with "
-                    "'no-mean-imputation', matching PLINK2's NaN behavior "
-                    "for ambiguous positions.",
+        description="A high-performance Python script to replicate 'plink --score'.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--bfile', required=True, help='Prefix for the input PLINK .bed, .bim, and .fam fileset.')
-    parser.add_argument('--score', required=True, help='Path to the scoring file. Must have a header.')
-    parser.add_argument('--out', required=True, help='Prefix for the output file (e.g., my_scores).')
-    parser.add_argument('columns', nargs=3, type=int, help="Three 1-based column numbers for: Variant_ID Effect_Allele Score")
+    parser.add_argument('--bfile', required=True, help='Prefix for PLINK .bed, .bim, and .fam fileset.')
+    parser.add_argument('--score', required=True, help='Path to the scoring file.')
+    parser.add_argument('--out', required=True, help='Prefix for the output file.')
+    parser.add_argument('columns', nargs=3, type=int, help="1-based columns for: Variant_ID Effect_Allele Score")
     args = parser.parse_args()
 
     fam_df = read_fam_file(f"{args.bfile}.fam")
@@ -236,7 +235,6 @@ def main():
     weighted_sum, denom_ct = calculate_scores(bed_filepath, num_samples, bim_df, score_data)
 
     print("\n--- Finalizing results ---")
-    
     final_scores_avg = np.divide(
         weighted_sum, denom_ct,
         out=np.full(num_samples, np.nan, dtype=float),
@@ -248,18 +246,13 @@ def main():
         print(f"  > Applied NaN to {len(nan_indices)} sample(s).")
     
     output_df_pl = pl.DataFrame({
-        '#FID': fam_df['FID'],
-        'IID': fam_df['IID'],
-        'NMISS_ALLELE_CT': denom_ct,
-        'SCORE1_AVG': final_scores_avg
+        '#FID': fam_df['FID'], 'IID': fam_df['IID'],
+        'NMISS_ALLELE_CT': denom_ct, 'SCORE1_AVG': final_scores_avg
     })
 
     output_filepath = f"{args.out}.sscore"
     try:
-        # CRITICAL: Convert to pandas to use its specific float formatting
-        # to ensure byte-for-byte identical output with the original script.
         output_df_pd = output_df_pl.to_pandas()
-        
         output_df_pd.to_csv(
             output_filepath, sep='\t', index=False,
             float_format='%.6g', na_rep='nan'
@@ -268,7 +261,6 @@ def main():
     except Exception as e:
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()
