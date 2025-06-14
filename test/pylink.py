@@ -8,22 +8,26 @@ import pandas as pd # Used exclusively for its unique CSV writing capabilities.
 
 def read_fam_file(filepath: str) -> pl.DataFrame:
     """
-    Reads a .fam file using Polars, robustly handling any whitespace delimiter.
+    Reads a .fam file using Polars, robustly handling space or tab delimiters.
     """
     print(f"Reading sample info file (.fam): {filepath}...")
     try:
-        # Read each line as a single string, which is robust to delimiter issues.
         df = pl.read_csv(filepath, has_header=False, separator='\n', new_columns=["data"])
-
-        # Split the single 'data' column into a struct with 6 fields.
-        # This handles variable spaces correctly.
-        df = df.with_columns(
+        
+        # .fam files are usually space-delimited, so try that first.
+        struct_df = df.with_columns(
             pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
         )
 
-        # Select the fields directly from the struct into new columns. This is the correct
-        # way to handle the output of split_exact.
-        df = df.select(
+        # Check if the split failed (i.e., the first field is null for all rows).
+        # .to_series().all() is the correct way to check this condition.
+        if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).to_series().all():
+            struct_df = df.with_columns(
+                pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("struct_data")
+            )
+
+        # Select fields from the struct, which now correctly holds the split data.
+        df_final = struct_df.select(
             pl.col("struct_data").struct.field("field_0").alias("FID"),
             pl.col("struct_data").struct.field("field_1").alias("IID"),
             pl.col("struct_data").struct.field("field_2").alias("PAT"),
@@ -31,8 +35,8 @@ def read_fam_file(filepath: str) -> pl.DataFrame:
             pl.col("struct_data").struct.field("field_4").alias("SEX"),
             pl.col("struct_data").struct.field("field_5").alias("PHEN"),
         )
-        print(f"  > Loaded info for {df.height} samples.")
-        return df
+        print(f"  > Loaded info for {df_final.height} samples.")
+        return df_final
     except Exception as e:
         print(f"Error reading .fam file: {e}", file=sys.stderr)
         sys.exit(1)
@@ -46,19 +50,17 @@ def read_bim_file(filepath: str) -> pl.DataFrame:
     try:
         df = pl.read_csv(filepath, has_header=False, separator='\n', new_columns=["data"])
         
-        # First, try to split by tab, creating a struct.
+        # .bim files are usually tab-delimited, so try that first.
         struct_df = df.with_columns(
             pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("struct_data")
         )
 
-        # If the tab split failed, the struct's fields will be all null.
-        # In that case, we try again with space as the delimiter.
-        if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).item():
+        # Corrected Check: If tab split failed for all rows, fallback to space.
+        if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).to_series().all():
             struct_df = df.with_columns(
                 pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
             )
-
-        # Now, select the fields from the successfully created struct.
+        
         df_final = struct_df.select(
             pl.col("struct_data").struct.field("field_0").cast(pl.Utf8).alias("CHR"),
             pl.col("struct_data").struct.field("field_1").cast(pl.Utf8).alias("ID"),
@@ -90,19 +92,20 @@ def read_score_file(filepath: str, id_col: int, allele_col: int, score_col: int)
 
         df = pl.read_csv(filepath, has_header=True, separator='\n', comment_prefix='#', new_columns=["data"])
         
-        # This robustly splits rows with either tabs or spaces.
-        struct_df = df.with_columns(
-            pl.col("data").str.strip_chars().str.split(" ", n=num_cols).alias("struct_data")
+        # For score files, .str.split() is more robust than split_exact as it handles
+        # any amount of whitespace. It returns a List column, which is handled correctly.
+        list_df = df.with_columns(
+            pl.col("data").str.strip_chars().str.split(by=" ", n=num_cols).alias("list_data")
         )
         
-        # Select columns by their integer index from the list of strings.
-        id_series = struct_df.select(pl.col("struct_data").list.get(id_col - 1).cast(pl.Utf8)).to_series()
-        allele_series = struct_df.select(pl.col("struct_data").list.get(allele_col - 1).cast(pl.Utf8)).to_series()
-        score_series = struct_df.select(pl.col("struct_data").list.get(score_col - 1).cast(pl.Float64)).to_series()
+        id_series = list_df.select(pl.col("list_data").list.get(id_col - 1).cast(pl.Utf8)).to_series()
+        allele_series = list_df.select(pl.col("list_data").list.get(allele_col - 1).cast(pl.Utf8)).to_series()
+        score_series = list_df.select(pl.col("list_data").list.get(score_col - 1).cast(pl.Float64)).to_series()
 
         score_data = {
             (vid, allele): score
             for vid, allele, score in zip(id_series, allele_series, score_series)
+            if vid is not None and allele is not None
         }
         
         print(f"  > Loaded {len(score_data)} variant scores.")
