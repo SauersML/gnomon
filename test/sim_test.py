@@ -7,6 +7,7 @@ import requests
 import zipfile
 import shutil
 import time
+import math
 from pathlib import Path
 
 # --- Configuration Parameters ---
@@ -91,41 +92,54 @@ def introduce_missingness(genotypes):
 
 def calculate_ground_truth_prs(genotypes, variants_df):
     """
-    THEN: Calculates the 'ground truth' polygenic score for each individual.
+    Calculates the 'ground truth' polygenic score for each individual using a
+    vectorized, high-precision method.
     """
-    print("Step 5: Calculating ground truth polygenic scores...")
-    n_variants, n_individuals = genotypes.shape
-    results = []
+    print("Step 5: Calculating ground truth polygenic scores (high-precision)...")
+    
+    # --- 1. Vectorized Data Preparation ---
+    # Extract weights and effect allele info into NumPy arrays for performance
+    effect_weights = variants_df['effect_weight'].values
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
+    
+    # Create a boolean mask for valid (non-missing) genotypes
+    valid_mask = (genotypes != -1)
+    
+    # Create a dosage matrix. Start with a copy of genotypes as float.
+    # Where the effect allele is NOT the alt allele, dosage is 2 - genotype.
+    # This is applied to the whole matrix at once.
+    dosages = genotypes.astype(float)
+    # The reshape is needed to broadcast the 1D boolean array across the 2D matrix
+    dosages[~is_alt_effect[:, np.newaxis]] = 2 - dosages[~is_alt_effect[:, np.newaxis]]
+    
+    # --- 2. High-Precision Score Calculation ---
+    # Calculate the raw score components (dosage * weight) for all variants
+    # For missing genotypes, set the score component to 0 so it doesn't affect the sum
+    score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
 
-    for i in range(n_individuals):
-        ind_genotypes = genotypes[:, i]
-        valid_mask = ind_genotypes != -1
-        valid_genotypes = ind_genotypes[valid_mask]
-        
-        if len(valid_genotypes) == 0:
-            results.append({'FID': f"sample_{i+1}", 'IID': f"sample_{i+1}", 'PRS_AVG': 0})
-            continue
+    # Use math.fsum for a high-precision sum for each individual (column-wise)
+    # This avoids the floating-point error accumulation of np.sum()
+    score_sums = np.array([math.fsum(col) for col in score_components.T])
 
-        valid_weights = variants_df['effect_weight'][valid_mask].values
-        dosages = np.zeros_like(valid_genotypes, dtype=float)
-        valid_is_alt_effect = is_alt_effect[valid_mask]
-        
-        dosages[valid_is_alt_effect] = valid_genotypes[valid_is_alt_effect]
-        dosages[~valid_is_alt_effect] = 2 - valid_genotypes[~valid_is_alt_effect]
+    # --- 3. Final Averaging ---
+    # Count the number of valid (non-missing) variants for each individual
+    variant_counts = valid_mask.sum(axis=0)
 
-        variant_count = len(valid_genotypes)
-        score_sum = np.sum(dosages * valid_weights)
-        score_avg = score_sum / variant_count if variant_count > 0 else 0
-        
-        results.append({
-            'FID': f"sample_{i+1}", 
-            'IID': f"sample_{i+1}", 
-            'PRS_AVG': score_avg
-        })
-        
+    # Calculate the average score, handling the case of zero valid variants
+    # Using np.divide with a 'where' clause is a safe way to handle division by zero
+    score_avg = np.divide(score_sums, variant_counts, 
+                          out=np.zeros_like(score_sums, dtype=float), 
+                          where=(variant_counts != 0))
+
+    # --- 4. Format Output ---
+    results_df = pd.DataFrame({
+        'FID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
+        'IID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
+        'PRS_AVG': score_avg
+    })
+    
     print("...PRS calculation complete.")
-    return pd.DataFrame(results)
+    return results_df
 
 def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix: Path):
     """
