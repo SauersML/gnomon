@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 5_000_000
+N_VARIANTS = 50_000
 N_INDIVIDUALS = 50
 CHR = '22'
 CHR_LENGTH = 40_000_000
