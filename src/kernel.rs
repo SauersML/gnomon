@@ -85,10 +85,6 @@ impl<'a> PaddedInterleavedWeights<'a> {
     }
 }
 
-// ========================================================================================
-//                              THE KERNEL IMPLEMENTATION
-// ========================================================================================
-
 /// A validated, type-safe, zero-cost view over a slice representing a padded,
 /// interleaved matrix of `u8` flags.
 pub struct PaddedInterleavedFlags<'a> {
