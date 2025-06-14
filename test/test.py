@@ -15,12 +15,14 @@ import numpy as np
 import psutil
 
 # ========================================================================================
-#                                     CONFIGURATION
+#                                   CONFIGURATION
 # ========================================================================================
 CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK1_BINARY = CI_WORKDIR / "plink"
 PLINK2_BINARY = CI_WORKDIR / "plink2"
+# Add the path to your pylink.py script
+PYLINK_SCRIPT = Path("test/pylink.py").resolve()
 
 SHARED_GENOTYPE_PREFIX = CI_WORKDIR / "chr22_subset50_compat"
 ORIGINAL_PLINK_PREFIX = CI_WORKDIR / "chr22_subset50"
@@ -40,7 +42,7 @@ PGS_SCORES = {
 }
 
 # ========================================================================================
-#                                     HELPER FUNCTIONS
+#                                   HELPER FUNCTIONS
 # ========================================================================================
 def print_header(title: str, char: str = "="):
     """Prints a formatted header to the console."""
@@ -64,20 +66,16 @@ def print_file_head(file_path: Path):
         print(f"File not found: {file_path}", flush=True)
         return
 
-    # Handle known binary files by showing a hex dump of the first 250 bytes,
-    # which corresponds to 500 hexadecimal characters.
     if file_path.suffix in ['.bed']:
         print_debug_header(f"HEXDUMP (first 500 chars) OF: {file_path.name}")
         try:
             with open(file_path, 'rb') as f:
-                # Read the first 250 bytes; bytes.hex() will convert this to 500 characters.
                 binary_content = f.read(250)
                 hex_representation = binary_content.hex()
                 print(f"  {hex_representation}", flush=True)
         except Exception as e:
             print(f"  Could not read binary file: {e}", flush=True)
     else:
-        # Default behavior for text-based files.
         print_debug_header(f"HEAD OF: {file_path.name}")
         try:
             with open(file_path, 'r', errors='replace') as f:
@@ -114,7 +112,9 @@ def run_and_measure(cmd: list, name: str, out_prefix: Path):
     print_header(f"RUNNING: {name}", char='-')
     print(f"Command:\n  {' '.join(map(str, cmd))}\n", flush=True)
     start = time.perf_counter()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+    # Ensure all parts of the command are strings
+    cmd_str = [str(c) for c in cmd]
+    proc = subprocess.Popen(cmd_str, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
     
     output_lines = []
     print_debug_header(f"{name} Real-time Output")
@@ -140,9 +140,16 @@ def setup_environment():
     print_header("ENVIRONMENT SETUP")
     CI_WORKDIR.mkdir(exist_ok=True)
     
+    # Check that pylink.py exists
+    if not PYLINK_SCRIPT.exists():
+        print(f"❌ ERROR: PyLink script not found at expected path: {PYLINK_SCRIPT}", flush=True)
+        sys.exit(1)
+    print(f"[SCRIPT] Found PyLink script at: {PYLINK_SCRIPT}", flush=True)
+
     for url, binary_path in [(PLINK1_URL, PLINK1_BINARY), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
             download_and_extract(url, CI_WORKDIR)
+            # Find the downloaded binary (which might have a generic name) and rename it
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
                     if p != binary_path: p.rename(binary_path)
@@ -202,10 +209,12 @@ def create_unified_scorefile(score_file: Path, pgs_id: str) -> Path:
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     """Analyzes results for a single PGS, focusing on AVERAGE scores."""
     summary = {'pgs_id': pgs_id, 'success': False}
+    # Add pylink to the tool paths
     tool_paths = {
         'gnomon': SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'),
         'plink1': CI_WORKDIR / f"plink1_{pgs_id}.profile",
         'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
+        'pylink': CI_WORKDIR / f"pylink_{pgs_id}.sscore",
     }
     
     data_frames = []
@@ -220,26 +229,31 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
             df_raw = pd.read_csv(path, sep='\s+')
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
             
-            if tool_name == 'gnomon':
+            # Unified parsing for tools that produce .sscore format
+            if tool_name in ['gnomon', 'plink2', 'pylink']:
                 score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-                if not score_col: raise KeyError("Gnomon _AVG score column not found")
+                if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
                 df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
-                match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
-                if match and num_variants == 0: num_variants = int(match.group(1))
+                
+                # Try to extract variant count from stdout
+                if num_variants == 0:
+                    if tool_name == 'gnomon':
+                        match = re.search(r'(\d+)\s+overlapping\s+variants', res['stdout'])
+                    elif tool_name in ['plink2', 'pylink']:
+                        match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
+                    if match:
+                        num_variants = int(match.group(1))
 
             elif tool_name == 'plink1':
                 df = df_raw[['IID', 'SCORE']].rename(columns={'SCORE': f'SCORE_{tool_name}'})
                 match = re.search(r'(\d+)\s+valid\s+predictors', res['stdout'])
-                if match and num_variants == 0: num_variants = int(match.group(1))
-
-            elif tool_name == 'plink2':
-                score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-                if not score_col: raise KeyError("PLINK2 _AVG score column not found")
-                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
-                match = re.search(r'(\d+)\s+variants\s+processed', res['stdout'])
-                if match and num_variants == 0: num_variants = int(match.group(1))
+                if match and num_variants == 0:
+                    num_variants = int(match.group(1))
             
-            if 'df' in locals() and df is not None:
+            else:
+                df = None
+            
+            if df is not None:
                 df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
                 data_frames.append(df)
 
@@ -332,24 +346,37 @@ def main():
         pgs_run_results = []
         unified_score_file = create_unified_scorefile(raw_score_file, pgs_id)
         
+        # --- Run Gnomon ---
         out_g_prefix = SHARED_GENOTYPE_PREFIX
         gnomon_cmd = [str(GNOMON_BINARY), "--score", str(unified_score_file), str(out_g_prefix)]
         res_g = run_and_measure(gnomon_cmd, f"gnomon_{pgs_id}", out_g_prefix)
         all_results.append(res_g); pgs_run_results.append(res_g)
         if not res_g['success']: failures.append(f"{pgs_id} (gnomon_failed)")
 
+        # --- Run PLINK2 ---
         out2_prefix = CI_WORKDIR / f"plink2_{pgs_id}"
         plink2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out2_prefix)]
         res_p2 = run_and_measure(plink2_cmd, f"plink2_{pgs_id}", out2_prefix)
         all_results.append(res_p2); pgs_run_results.append(res_p2)
         if not res_p2['success']: failures.append(f"{pgs_id} (plink2_failed)")
         
+        # --- Run PLINK1 ---
         out1_prefix = CI_WORKDIR / f"plink1_{pgs_id}"
+        # Note: PLINK1 --score produces per-allele average in the SCORE column, not per-variant sum.
+        # This is different from its default behavior but matches what we need for comparison.
         plink1_cmd = [str(PLINK1_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "1", "2", "4", "header", "no-mean-imputation", "--out", str(out1_prefix)]
         res_p1 = run_and_measure(plink1_cmd, f"plink1_{pgs_id}", out1_prefix)
         all_results.append(res_p1); pgs_run_results.append(res_p1)
         if not res_p1['success']: failures.append(f"{pgs_id} (plink1_failed)")
+        
+        # --- Run PyLink ---
+        out_py_prefix = CI_WORKDIR / f"pylink_{pgs_id}"
+        pylink_cmd = ["python3", str(PYLINK_SCRIPT), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file), "--out", str(out_py_prefix), "1", "2", "4"]
+        res_py = run_and_measure(pylink_cmd, f"pylink_{pgs_id}", out_py_prefix)
+        all_results.append(res_py); pgs_run_results.append(res_py)
+        if not res_py['success']: failures.append(f"{pgs_id} (pylink_failed)")
 
+        # --- Analyze results for this PGS ID ---
         pgs_summary = analyze_pgs_results(pgs_id, pgs_run_results)
         final_summary_data.append(pgs_summary)
 
