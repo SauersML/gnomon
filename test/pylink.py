@@ -3,7 +3,8 @@ import math
 import argparse
 import polars as pl
 import numpy as np
-import pandas as pd # Used exclusively for its unique CSV writing capabilities.
+import pandas as pd
+import pyarrow as pa # Explicitly import to ensure it's installed for polars.to_pandas()
 
 
 def read_fam_file(filepath: str) -> pl.DataFrame:
@@ -82,8 +83,7 @@ def read_score_file(filepath: str, id_col: int, allele_col: int, score_col: int)
     try:
         df = pl.read_csv(filepath, has_header=True, separator='\n', comment_prefix='#', new_columns=["data"])
         
-        # CORRECTED LOGIC: Use a regular expression to extract all sequences of non-whitespace
-        # characters. This is the most robust way to handle arbitrary whitespace delimiters.
+        # Use a regex to extract all sequences of non-whitespace characters.
         list_df = df.with_columns(
             pl.col("data").str.extract_all(r"\S+").alias("list_data")
         )
@@ -113,7 +113,8 @@ def find_ambiguous_samples(bed_filepath: str, num_samples: int, bim_df: pl.DataF
     """
     print("\n--- Pass 1: Identifying ambiguous samples ---")
     
-    ambiguous_pos_df = bim_df.group_by(['CHR', 'POS']).count().filter(pl.col('count') > 1)
+    # CORRECTED: Use .len() instead of the deprecated .count()
+    ambiguous_pos_df = bim_df.group_by(['CHR', 'POS']).len().filter(pl.col('len') > 1)
     if ambiguous_pos_df.height == 0:
         print("  > No variants at duplicated positions found.")
         return set()
