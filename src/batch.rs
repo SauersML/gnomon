@@ -23,7 +23,7 @@ use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::error::Error;
-use std::simd::{cmp::SimdPartialEq, num::SimdUint, Simd, f32x8, u8x8};
+use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, Simd, f32x8, u8x8};
 use thread_local::ThreadLocal;
 
 // --- SIMD & Engine Tuning Parameters ---
