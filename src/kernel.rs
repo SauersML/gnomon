@@ -9,7 +9,7 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd, StdFloat};
+use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
