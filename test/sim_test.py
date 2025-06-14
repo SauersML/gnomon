@@ -46,7 +46,7 @@ def generate_variants_and_weights():
 
     is_alt_effect = np.random.rand(N_VARIANTS) < ALT_EFFECT_PROB
     effect_alleles = np.where(is_alt_effect, alt_alleles, ref_alleles)
-    effect_weights = np.random.normal(loc=1, scale=0.05, size=N_VARIANTS)
+    effect_weights = np.random.normal(loc=0.5, scale=0.5, size=N_VARIANTS)
 
     variants_df = pd.DataFrame({
         'chr': CHR,
