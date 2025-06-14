@@ -239,68 +239,85 @@ fn process_tile(
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
 
-    // --- Pre-computation of Sparse Indices ---
+    let num_scores = prep_result.score_names.len();
+    let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
+    let stride = prep_result.stride();
+    let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
+
+    // --- Part 1: Pre-calculate the chunk-wide baseline for flipped variants ---
+    let mut chunk_baseline = vec![0.0f32; stride]; // Use stride for safe SIMD access
+    let weights_matrix = prep_result.weights_matrix();
+    let flip_mask_matrix = prep_result.flip_mask_matrix();
+
+    for snp_idx in 0..snps_in_chunk {
+        let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx;
+        let weight_row_offset = global_matrix_row_idx * stride;
+        let weight_row = &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+        let flip_row = &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+
+        for i in 0..num_scores {
+            if flip_row[i] == 1 {
+                chunk_baseline[i] += 2.0 * weight_row[i];
+            }
+        }
+    }
+
+    // Apply the baseline to all people in this block.
+    // The `block_scores_out` buffer is already zeroed at this point.
+    for person_scores in block_scores_out.chunks_exact_mut(num_scores) {
+        person_scores[..num_scores].copy_from_slice(&chunk_baseline[..num_scores]);
+    }
+
+    // --- Part 2: Build sparse indices for d>0 AND adjust for missing genotypes ---
     let thread_indices = sparse_index_pool.get_or_default();
     let (g1_indices, g2_indices) = &mut *thread_indices.borrow_mut();
 
     g1_indices.iter_mut().for_each(Vec::clear);
     g2_indices.iter_mut().for_each(Vec::clear);
-    if g1_indices.len() < num_people_in_block {
-        g1_indices.resize_with(num_people_in_block, Vec::new);
-    }
-    if g2_indices.len() < num_people_in_block {
-        g2_indices.resize_with(num_people_in_block, Vec::new);
-    }
+    g1_indices.resize_with(num_people_in_block, Vec::new);
+    g2_indices.resize_with(num_people_in_block, Vec::new);
 
-    // This scan of the cache-hot, person-major tile generates the kernel's "work plan".
     for person_idx in 0..num_people_in_block {
-        let genotype_row_start = person_idx * snps_in_chunk;
-        let genotype_row_end = genotype_row_start + snps_in_chunk;
-        let genotype_row = &tile[genotype_row_start..genotype_row_end];
-
-        let person_data_start = person_idx * num_scores;
-        let person_missing_counts_slice =
-            &mut block_missing_counts_out[person_data_start..person_data_start + num_scores];
+        let genotype_row = &tile[person_idx * snps_in_chunk .. (person_idx + 1) * snps_in_chunk];
+        let person_scores_slice = &mut block_scores_out[person_idx * num_scores .. (person_idx + 1) * num_scores];
+        let person_missing_counts_slice = &mut block_missing_counts_out[person_idx * num_scores .. (person_idx + 1) * num_scores];
 
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
             match dosage.0 {
-                // SAFETY: `person_idx` is guaranteed to be in bounds by the outer loop.
-                // We push the LOCAL index `snp_idx_in_chunk` for the kernel.
                 1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 3 => {
-                    // This is the missing genotype sentinel. We still need the GLOBAL
-                    // index here to look up the variant's metadata.
                     let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
-                    let scores_for_this_variant =
-                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                    let scores_for_this_variant = &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                    let weight_row_offset = global_matrix_row_idx * stride;
+                    let weight_row = &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+                    let flip_row = &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+
                     for &score_idx in scores_for_this_variant {
-                        unsafe {
-                            *person_missing_counts_slice.get_unchecked_mut(score_idx.0) += 1;
+                        let score_col = score_idx.0;
+                        unsafe { *person_missing_counts_slice.get_unchecked_mut(score_col) += 1; }
+                        // If a flipped variant is missing, we must subtract the 2*W
+                        // that was added in the global baseline.
+                        if flip_row[score_col] == 1 {
+                             unsafe { *person_scores_slice.get_unchecked_mut(score_col) -= 2.0 * weight_row[score_col]; }
                         }
                     }
                 }
-                _ => (), // Dosage 0 is ignored.
+                _ => (), // Dosage 0 is handled by the baseline.
             }
         }
     }
-    // --- End of Pre-computation ---
 
-    let stride = prep_result.stride();
+    // --- Part 3: Dispatch to the adjustment-based kernel ---
     let matrix_slice_start = matrix_row_start_idx.0 * stride;
-    let matrix_slice_end = (matrix_row_start_idx.0 + snps_in_chunk) * stride;
+    let weights_chunk = &weights_matrix[matrix_slice_start..];
+    let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..];
 
-    let weights_chunk = &prep_result.weights_matrix()[matrix_slice_start..matrix_slice_end];
-    let flip_flags_chunk = &prep_result.flip_mask_matrix()[matrix_slice_start..matrix_slice_end];
-
-    let weights =
-        kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
+    let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
             .expect("CRITICAL: Weights matrix validation failed.");
-    let flip_flags =
-        kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
+    let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
             .expect("CRITICAL: Flip flags matrix validation failed.");
 
-    // This is now a sequential iterator over a block owned by a single Rayon thread.
     block_scores_out
         .chunks_exact_mut(num_scores)
         .enumerate()
@@ -308,20 +325,26 @@ fn process_tile(
             const MAX_SCORES: usize = 100;
             const MAX_ACC_LANES: usize = (MAX_SCORES + SIMD_LANES - 1) / SIMD_LANES;
             let mut acc_buffer = [kernel::SimdVec::splat(0.0); MAX_ACC_LANES];
-            let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
             let acc_buffer_slice = &mut acc_buffer[..num_accumulator_lanes];
 
-            // Dispatch to the numerically stable, flip-aware SIMD kernel.
-            kernel::accumulate_scores_for_person(
+            kernel::accumulate_adjustments_for_person(
                 &weights,
                 &flip_flags,
-                scores_out_slice,
                 acc_buffer_slice,
                 &g1_indices[person_idx],
                 &g2_indices[person_idx],
             );
+
+            // Add the kernel's calculated adjustments to the baseline.
+            for i in 0..num_accumulator_lanes {
+                let start = i * SIMD_LANES;
+                let end = (start + SIMD_LANES).min(num_scores);
+                let temp_array = acc_buffer_slice[i].to_array();
+                for j in 0..(end-start) {
+                    scores_out_slice[start+j] += temp_array[j];
+                }
+            }
         });
-}
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
 /// This function's sole purpose is to pivot raw genotype dosages from the SNP-major
