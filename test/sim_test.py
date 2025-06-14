@@ -192,7 +192,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     
     print(f"...PLINK files written: {prefix}.bed/.bim/.fam")
 
-def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, run_cmd_func):
+def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
     Runs a complex, programmatically generated test case.
 
@@ -343,14 +343,20 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         [f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
         "Simple PLINK2 Test", cwd=workdir
     )
+    run_cmd_func(
+        ["python3", pylink_path.as_posix(), "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "--out", "simple_pylink_results", "1", "2", "4"],
+        "Simple PyLink Test", cwd=workdir
+    )
 
     # --- 5. Compare Results ---
     print("\n--- Analyzing Simple Test Results ---")
     gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={'#IID': 'IID', 'simple_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
     plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep='\s+').rename(columns={'#IID': 'IID'})
     plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
+    pylink_results_raw = pd.read_csv(workdir / "simple_pylink_results.sscore", sep='\t').rename(columns={'#IID': 'IID'})
+    pylink_results = pylink_results_raw.assign(SCORE_PYLINK=pylink_results_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PYLINK']]
 
-    merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left').merge(plink_results, on='IID', how='left')
+    merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left').merge(plink_results, on='IID', how='left').merge(pylink_results, on='IID', how='left')
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
@@ -367,13 +373,17 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     is_gnomon_multiallelic_ok = np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
     is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2'])
     
+    is_pylink_multiallelic_ok = pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
+    is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK'])
+
     # Combine all checks
-    all_ok = is_gnomon_ok and is_gnomon_multiallelic_ok and is_plink_ok and is_plink_multiallelic_ok
+    all_ok = is_gnomon_ok and is_gnomon_multiallelic_ok and is_plink_ok and is_plink_multiallelic_ok and is_pylink_ok and is_pylink_multiallelic_ok
 
     if all_ok:
         print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
-        print("   - Gnomon correctly scored all individuals.")
-        print("   - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
+        print("     - Gnomon correctly scored all individuals.")
+        print("     - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
+        print("     - PyLink correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
     else:
         print("\n❌ Simple Dosage Test FAILED:")
         if not (is_gnomon_ok and is_gnomon_multiallelic_ok):
@@ -382,6 +392,10 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
             print("  - PLINK2 scores (for standard cases) do not match ground truth.")
         if not is_plink_multiallelic_ok:
             print("  - PLINK2 did not produce the expected NaN for the multi-allelic case.")
+        if not is_pylink_ok:
+            print("  - PyLink scores (for standard cases) do not match ground truth.")
+        if not is_pylink_multiallelic_ok:
+            print("  - PyLink did not produce the expected NaN for the multi-allelic case.")
         sys.exit(1)
 
 
@@ -395,6 +409,7 @@ def run_and_validate_tools():
     PLINK2_BINARY_PATH = WORKDIR / "plink2"
     # The gnomon binary is expected to be in the repo root relative to this script's execution
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
+    PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
 
     def _print_header(title: str, char: str = "-"):
         width = 70
@@ -535,7 +550,7 @@ def run_and_validate_tools():
     # --- Main execution flow for this function ---
     setup_tools()
     
-    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, run_command)
+    run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command)    
     
     print("\n" + "="*80)
     print("= Running Large-Scale Simulation and Validation")
