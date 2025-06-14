@@ -19,14 +19,12 @@ def read_fam_file(filepath: str) -> pl.DataFrame:
             pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
         )
 
-        # Check if the split failed (i.e., the first field is null for all rows).
-        # .to_series().all() is the correct way to check this condition.
+        # If the split failed (e.g., file was tab-delimited), the struct's fields will be null.
         if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).to_series().all():
             struct_df = df.with_columns(
                 pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("struct_data")
             )
 
-        # Select fields from the struct, which now correctly holds the split data.
         df_final = struct_df.select(
             pl.col("struct_data").struct.field("field_0").alias("FID"),
             pl.col("struct_data").struct.field("field_1").alias("IID"),
@@ -55,7 +53,7 @@ def read_bim_file(filepath: str) -> pl.DataFrame:
             pl.col("data").str.strip_chars().str.split_exact("\t", 5).alias("struct_data")
         )
 
-        # Corrected Check: If tab split failed for all rows, fallback to space.
+        # If tab split failed for all rows, fallback to space.
         if struct_df.select(pl.col("struct_data").struct.field("field_0").is_null()).to_series().all():
             struct_df = df.with_columns(
                 pl.col("data").str.strip_chars().str.split_exact(" ", 5).alias("struct_data")
@@ -82,22 +80,15 @@ def read_score_file(filepath: str, id_col: int, allele_col: int, score_col: int)
     """
     print(f"Reading score file: {filepath}...")
     try:
-        with open(filepath, 'r') as f:
-            header_line = ""
-            for line in f:
-                if not line.startswith('#'):
-                    header_line = line
-                    break
-            num_cols = len(header_line.split())
-
         df = pl.read_csv(filepath, has_header=True, separator='\n', comment_prefix='#', new_columns=["data"])
         
-        # For score files, .str.split() is more robust than split_exact as it handles
-        # any amount of whitespace. It returns a List column, which is handled correctly.
+        # CORRECTED LOGIC: Use a regular expression to extract all sequences of non-whitespace
+        # characters. This is the most robust way to handle arbitrary whitespace delimiters.
         list_df = df.with_columns(
-            pl.col("data").str.strip_chars().str.split(by=" ", n=num_cols).alias("list_data")
+            pl.col("data").str.extract_all(r"\S+").alias("list_data")
         )
         
+        # Extract the required columns from the list based on user-provided indices.
         id_series = list_df.select(pl.col("list_data").list.get(id_col - 1).cast(pl.Utf8)).to_series()
         allele_series = list_df.select(pl.col("list_data").list.get(allele_col - 1).cast(pl.Utf8)).to_series()
         score_series = list_df.select(pl.col("list_data").list.get(score_col - 1).cast(pl.Float64)).to_series()
