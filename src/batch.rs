@@ -225,7 +225,7 @@ fn process_block(
 }
 
 /// Dispatches a single, pivoted, person-major tile to the compute kernel after
-/// performing the critical pre-computation of sparse indices.
+/// calculating a baseline score and pre-computing sparse indices.
 #[inline]
 fn process_tile(
     tile: &[EffectAlleleDosage],
@@ -238,13 +238,15 @@ fn process_tile(
 ) {
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
-
-    let num_scores = prep_result.score_names.len();
-    let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
+    if num_people_in_block == 0 {
+        return;
+    }
     let stride = prep_result.stride();
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
 
     // --- Part 1: Pre-calculate the chunk-wide baseline for flipped variants ---
+    // This baseline represents the score every person would get if they were
+    // homozygous-reference for all flipped variants in this chunk.
     let mut chunk_baseline = vec![0.0f32; stride]; // Use stride for safe SIMD access
     let weights_matrix = prep_result.weights_matrix();
     let flip_mask_matrix = prep_result.flip_mask_matrix();
@@ -262,8 +264,7 @@ fn process_tile(
         }
     }
 
-    // Apply the baseline to all people in this block.
-    // The `block_scores_out` buffer is already zeroed at this point.
+    // Apply the baseline by copying it directly into the zeroed output buffer.
     for person_scores in block_scores_out.chunks_exact_mut(num_scores) {
         person_scores[..num_scores].copy_from_slice(&chunk_baseline[..num_scores]);
     }
@@ -278,9 +279,11 @@ fn process_tile(
     g2_indices.resize_with(num_people_in_block, Vec::new);
 
     for person_idx in 0..num_people_in_block {
-        let genotype_row = &tile[person_idx * snps_in_chunk .. (person_idx + 1) * snps_in_chunk];
-        let person_scores_slice = &mut block_scores_out[person_idx * num_scores .. (person_idx + 1) * num_scores];
-        let person_missing_counts_slice = &mut block_missing_counts_out[person_idx * num_scores .. (person_idx + 1) * num_scores];
+        let genotype_row = &tile[person_idx * snps_in_chunk..(person_idx + 1) * snps_in_chunk];
+        let person_scores_slice =
+            &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
+        let person_missing_counts_slice =
+            &mut block_missing_counts_out[person_idx * num_scores..(person_idx + 1) * num_scores];
 
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
             match dosage.0 {
@@ -288,22 +291,30 @@ fn process_tile(
                 2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 3 => {
                     let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
-                    let scores_for_this_variant = &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                    let scores_for_this_variant =
+                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
                     let weight_row_offset = global_matrix_row_idx * stride;
-                    let weight_row = &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
-                    let flip_row = &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+                    let weight_row =
+                        &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+                    let flip_row =
+                        &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
 
                     for &score_idx in scores_for_this_variant {
                         let score_col = score_idx.0;
-                        unsafe { *person_missing_counts_slice.get_unchecked_mut(score_col) += 1; }
+                        unsafe {
+                            *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
+                        }
                         // If a flipped variant is missing, we must subtract the 2*W
                         // that was added in the global baseline.
                         if flip_row[score_col] == 1 {
-                             unsafe { *person_scores_slice.get_unchecked_mut(score_col) -= 2.0 * weight_row[score_col]; }
+                            unsafe {
+                                *person_scores_slice.get_unchecked_mut(score_col) -=
+                                    2.0 * weight_row[score_col];
+                            }
                         }
                     }
                 }
-                _ => (), // Dosage 0 is handled by the baseline.
+                _ => (), // Dosage 0 is correctly handled by the baseline.
             }
         }
     }
@@ -314,8 +325,9 @@ fn process_tile(
     let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..];
 
     let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, snps_in_chunk, num_scores)
-            .expect("CRITICAL: Weights matrix validation failed.");
-    let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
+        .expect("CRITICAL: Weights matrix validation failed.");
+    let flip_flags =
+        kernel::PaddedInterleavedFlags::new(flip_flags_chunk, snps_in_chunk, num_scores)
             .expect("CRITICAL: Flip flags matrix validation failed.");
 
     block_scores_out
@@ -340,11 +352,12 @@ fn process_tile(
                 let start = i * SIMD_LANES;
                 let end = (start + SIMD_LANES).min(num_scores);
                 let temp_array = acc_buffer_slice[i].to_array();
-                for j in 0..(end-start) {
-                    scores_out_slice[start+j] += temp_array[j];
+                for j in 0..(end - start) {
+                    scores_out_slice[start + j] += temp_array[j];
                 }
             }
         });
+}
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
 /// This function's sole purpose is to pivot raw genotype dosages from the SNP-major
