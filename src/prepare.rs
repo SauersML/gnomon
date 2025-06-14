@@ -145,61 +145,23 @@ pub fn prepare_for_computation(
             let mut work_for_position = Vec::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, other_allele, weights) in score_lines {
-                    // This is a single-pass state machine to find all valid matches for a score line.
+                    // Call the single authoritative resolver to get the definitive list of matches.
+                    let winning_matches =
+                        resolve_matches_for_score_line(effect_allele, other_allele, bim_records);
 
-                    let mut perfect_matches = Vec::new();
-                    let mut permissive_candidate: Option<&(BimRecord, BimRowIndex)> = None;
-                    let mut is_ambiguous = false;
-
-                    // --- Single Pass ---
-                    for bim_tuple in bim_records {
-                        let (bim_record, _) = bim_tuple;
-
-                        // Check for perfect match.
-                        if (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
-                           (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
-                        {
-                            perfect_matches.push(bim_tuple);
-                        }
-
-                        // Separately, check for permissive match to detect ambiguity.
-                        if bim_record.allele1 == *effect_allele || bim_record.allele2 == *effect_allele {
-                            if permissive_candidate.is_some() {
-                                is_ambiguous = true;
-                            }
-                            permissive_candidate = Some(bim_tuple);
-                        }
+                    // The `process_match` helper function is perfect for turning our definitive
+                    // matches into WorkItems. We just need to loop over the resolver's results.
+                    for (bim_record, bim_row_index) in winning_matches {
+                        process_match(
+                            bim_record,
+                            *bim_row_index,
+                            effect_allele,
+                            weights,
+                            &bim_row_to_matrix_row_map,
+                            &score_name_to_col_index,
+                            &mut work_for_position,
+                        );
                     }
-
-                    // --- Evaluate Final State ---
-                    if !perfect_matches.is_empty() {
-                        // Priority 1: Use all found perfect matches. This is non-greedy.
-                        for (bim_record, bim_row_index) in perfect_matches {
-                             process_match(
-                                bim_record,
-                                *bim_row_index,
-                                effect_allele,
-                                weights,
-                                &bim_row_to_matrix_row_map,
-                                &score_name_to_col_index,
-                                &mut work_for_position,
-                            );
-                        }
-                    } else if !is_ambiguous {
-                        // Priority 2: Use the single, unambiguous permissive match.
-                        if let Some((bim_record, bim_row_index)) = permissive_candidate {
-                            process_match(
-                                bim_record,
-                                *bim_row_index,
-                                effect_allele,
-                                weights,
-                                &bim_row_to_matrix_row_map,
-                                &score_name_to_col_index,
-                                &mut work_for_position,
-                            );
-                        }
-                    }
-                    // If ambiguous, do nothing, correctly discarding the variant.
                 }
             }
             work_for_position
@@ -482,26 +444,17 @@ fn discover_required_bim_indices(
             let mut set_for_snp = BTreeSet::new();
             if let Some(bim_records) = bim_index.get(snp_id) {
                 for (effect_allele, other_allele, _weights) in score_lines {
-                    // This intelligent two-pass search ensures we only mark a variant as "required"
-                    // if it is the best possible match, resolving ambiguity correctly from the start.
-                    // Pass 1: Look for a perfect match on both alleles.
-                    let perfect_match = bim_records.iter().find(|(bim_record, _)| {
-                        (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
-                        (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
-                    });
+                    // Call the single authoritative resolver to get the definitive list of matches.
+                    let winning_matches =
+                        resolve_matches_for_score_line(effect_allele, other_allele, bim_records);
 
-                    // Use the perfect match if it exists. Otherwise, fall back to permissive logic.
-                    let usable_match = perfect_match.or_else(|| {
-                        // Pass 2: Permissive match (only if no perfect match was found).
-                        bim_records.iter().find(|(bim_record, _)| {
-                            effect_allele == &bim_record.allele1 || effect_allele == &bim_record.allele2
-                        })
-                    });
-
-                    if let Some((bim_record, bim_row_index)) = usable_match {
-                        // The variant is usable. Add its bim row index to the set of required indices.
+                    // For each valid match returned by the resolver...
+                    for (bim_record, bim_row_index) in winning_matches {
+                        // Add its bim row index to the set of required indices.
                         set_for_snp.insert(*bim_row_index);
 
+                        // The existing ambiguity warning logic is still useful to inform the user
+                        // about permissive matching, but now it acts on a definitively chosen match.
                         let bim_alleles_set: AHashSet<&str> =
                             [bim_record.allele1.as_str(), bim_record.allele2.as_str()]
                                 .iter()
@@ -513,9 +466,6 @@ fn discover_required_bim_indices(
                                 .copied()
                                 .collect();
 
-                        // If the allele sets are non-identical, this is an "imperfect" match.
-                        // We print a single, global warning to inform the user that this automatic
-                        // reconciliation is happening.
                         if bim_alleles_set != score_alleles_set {
                             if !AMBIGUITY_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
                                 eprintln!(
@@ -635,6 +585,68 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
             sample_str
         )
     }
+}
+
+/// The single, authoritative resolver for matching a score line to BIM records.
+///
+/// This function implements the "smart" reconciliation logic:
+/// 1. Prioritizes perfect matches (both alleles match). It is non-greedy and returns all perfect matches.
+/// 2. If no perfect matches are found, it looks for a single, unambiguous permissive match (effect allele matches).
+/// 3. If multiple permissive matches are found (and no perfect matches exist), it's considered ambiguous and returns nothing.
+///
+/// # Arguments
+/// * `effect_allele` - The effect allele from the score file.
+/// * `other_allele` - The other allele from the score file.
+/// * `bim_records_for_position` - A slice of all BIM records found at this chromosomal position.
+///
+/// # Returns
+/// A `Vec` containing references to the winning `(BimRecord, BimRowIndex)` tuples. An empty
+/// vector signifies that the score line should be discarded for this position (either no match or ambiguous).
+fn resolve_matches_for_score_line<'a>(
+    effect_allele: &str,
+    other_allele: &str,
+    bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
+) -> Vec<&'a (BimRecord, BimRowIndex)> {
+    // --- Pass 1: Greedily find all perfect matches. ---
+    let perfect_matches: Vec<_> = bim_records_for_position
+        .iter()
+        .filter(|(bim_record, _)| {
+            (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
+            (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
+        })
+        .collect();
+
+    // If we have any perfect matches, they are the winners. Return them immediately.
+    if !perfect_matches.is_empty() {
+        return perfect_matches;
+    }
+
+    // --- Pass 2: No perfect matches found. Evaluate permissive matches for ambiguity. ---
+    let mut permissive_candidate: Option<&(BimRecord, BimRowIndex)> = None;
+    let mut is_ambiguous = false;
+
+    for bim_tuple in bim_records_for_position {
+        let (bim_record, _) = bim_tuple;
+        // A permissive match is when the effect allele is one of the two alleles in the BIM file.
+        if bim_record.allele1 == effect_allele || bim_record.allele2 == effect_allele {
+            if permissive_candidate.is_some() {
+                // We have already found one permissive candidate. Finding another means it's ambiguous.
+                is_ambiguous = true;
+                break; // No need to check further; the ambiguity is confirmed.
+            }
+            permissive_candidate = Some(bim_tuple);
+        }
+    }
+
+    // If it's not ambiguous and we found exactly one candidate, that's our winner.
+    if !is_ambiguous {
+        if let Some(candidate) = permissive_candidate {
+            return vec![candidate];
+        }
+    }
+
+    // Otherwise (ambiguous or no matches found), return an empty Vec to signify "discard".
+    Vec::new()
 }
 
 // ========================================================================================
