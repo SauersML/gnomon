@@ -485,7 +485,7 @@ def run_and_validate_tools():
         except Exception as e:
             print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
             sys.exit(1)
-
+    
     def analyze_and_compare_large_scale_results():
         _print_header("Step D: Analyzing and Comparing Large-Scale Simulation Results")
         
@@ -496,7 +496,7 @@ def run_and_validate_tools():
             print("Shape:", df.shape)
             print(df.head(3).to_markdown(index=False, floatfmt=".6f"))
             print("-" * 30)
-
+    
         try:
             # --- Load truth_df ---
             truth_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')
@@ -504,47 +504,57 @@ def run_and_validate_tools():
             if '#FID' in truth_df_raw.columns:
                 truth_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
             truth_df = truth_df_raw[['IID', 'PRS_AVG']].rename(columns={'PRS_AVG': 'SCORE_TRUTH'})
-
+    
             # --- Load gnomon_df ---
             gnomon_df_raw = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t')
             _debug_print_df(gnomon_df_raw, "gnomon_df (raw)")
             if '#IID' in gnomon_df_raw.columns:
                 gnomon_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             gnomon_df = gnomon_df_raw[['IID', 'simulated_score_AVG']].rename(columns={'simulated_score_AVG': 'SCORE_GNOMON'})
-
+    
             # --- Load plink2_df ---
             plink2_df_raw = pd.read_csv(WORKDIR / "plink2_results.sscore", sep='\s+')
             _debug_print_df(plink2_df_raw, "plink2_df (raw)")
-            # Clean up the '#IID' or '#FID' column name
             if '#IID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
             elif '#FID' in plink2_df_raw.columns: plink2_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
-            # PLINK's AVG is per-allele, we multiply by 2 to compare with per-variant scores
             plink2_df = plink2_df_raw.assign(SCORE_PLINK2=plink2_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PLINK2']]
+    
+            # --- Load pylink_df ---
+            pylink_df_raw = pd.read_csv(WORKDIR / "pylink_results.sscore", sep='\t')
+            _debug_print_df(pylink_df_raw, "pylink_df (raw)")
+            if '#IID' in pylink_df_raw.columns: pylink_df_raw.rename(columns={'#IID': 'IID'}, inplace=True)
+            elif '#FID' in pylink_df_raw.columns: pylink_df_raw.rename(columns={'#FID': 'FID'}, inplace=True)
+            pylink_df = pylink_df_raw.assign(SCORE_PYLINK=pylink_df_raw['SCORE1_AVG'] * 2.0)[['IID', 'SCORE_PYLINK']]
             
         except (FileNotFoundError, KeyError) as e:
             print(f"  > ❌ ERROR: Failed to load or parse a result file. Error: {e}. Aborting comparison.")
             sys.exit(1)
-
-        merged_df = pd.merge(truth_df, gnomon_df, on='IID').merge(plink2_df, on='IID')
-        score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2']
+    
+        merged_df = pd.merge(truth_df, gnomon_df, on='IID').merge(plink2_df, on='IID').merge(pylink_df, on='IID')
+        score_cols = ['SCORE_TRUTH', 'SCORE_GNOMON', 'SCORE_PLINK2', 'SCORE_PYLINK']
         merged_df[score_cols] = merged_df[score_cols].astype(float)
-
+    
         print("\n--- Sample of Computed Scores (Large-Scale) ---")
         print(merged_df.head(10).to_markdown(index=False, floatfmt=".8f"))
-
+    
         print("\n--- Score Correlation Matrix (Large-Scale) ---")
         print(merged_df[score_cols].corr().to_markdown(floatfmt=".8f"))
-
+    
         print("\n--- Mean Absolute Difference (MAD) vs. Ground Truth (Large-Scale) ---")
         mad_g_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_GNOMON']).abs().mean()
         mad_p_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PLINK2']).abs().mean()
+        mad_py_vs_t = (merged_df['SCORE_TRUTH'] - merged_df['SCORE_PYLINK']).abs().mean()
         print(f"Gnomon vs. Truth: {mad_g_vs_t:.10f}")
         print(f"PLINK2 vs. Truth: {mad_p_vs_t:.10f}")
+        print(f"PyLink vs. Truth: {mad_py_vs_t:.10f}")
         
-        if mad_g_vs_t < 1e-9 and mad_p_vs_t < 1e-9:
+        if mad_g_vs_t < 1e-9 and mad_p_vs_t < 1e-9 and mad_py_vs_t < 1e-9:
             print("\n✅ Large-Scale Validation Successful: All tools produced scores identical to the ground truth.")
         else:
-            print("\n⚠️ Large-Scale Validation Warning: Significant differences detected.")
+            print("\n❌ Large-Scale Validation FAILED: Significant differences detected.")
+            if not mad_g_vs_t < 1e-9: print(f"  - Gnomon difference: {mad_g_vs_t:.10f}")
+            if not mad_p_vs_t < 1e-9: print(f"  - PLINK2 difference: {mad_p_vs_t:.10f}")
+            if not mad_py_vs_t < 1e-9: print(f"  - PyLink difference: {mad_py_vs_t:.10f}")
             sys.exit(1)
 
     # --- Main execution flow for this function ---
@@ -566,6 +576,12 @@ def run_and_validate_tools():
     run_command(
         [f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "plink2_results"],
         "Large-Scale PLINK2", cwd=WORKDIR
+    )
+
+    # Run PyLink on large-scale data
+    run_command(
+        ["python3", PYLINK_SCRIPT_PATH.as_posix(), "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "--out", "pylink_results", "1", "2", "4"],
+        "Large-Scale PyLink", cwd=WORKDIR
     )
 
     analyze_and_compare_large_scale_results()
