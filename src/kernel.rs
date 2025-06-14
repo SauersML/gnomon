@@ -9,8 +9,7 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use crate::types::MatrixRowIndex;
-use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd};
+use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd, StdFloat};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -148,8 +147,8 @@ pub fn accumulate_scores_for_person(
     flip_flags: &PaddedInterleavedFlags,
     scores_out: &mut [f32],
     accumulator_buffer: &mut [SimdVec],
-    g1_indices: &[MatrixRowIndex],
-    g2_indices: &[MatrixRowIndex],
+    g1_indices: &[usize],
+    g2_indices: &[usize],
 ) {
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
@@ -162,13 +161,13 @@ pub fn accumulate_scores_for_person(
 
     // --- Loop 1: Accumulate contributions for Dosage=1 variants ---
     let dosage1 = SimdVec::splat(1.0);
-    for &matrix_row in g1_indices {
+    for &matrix_row_idx in g1_indices {
         for i in 0..num_accumulator_lanes {
             // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
             // Using get_unchecked here is a critical performance optimization.
             unsafe {
-                let weights_vec = weights.get_simd_lane_unchecked(matrix_row.0, i);
-                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row.0, i);
+                let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
+                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
 
                 // Create a SIMD boolean mask from the u8 flags.
                 let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
@@ -188,12 +187,12 @@ pub fn accumulate_scores_for_person(
 
     // --- Loop 2: Accumulate contributions for Dosage=2 variants ---
     let dosage2 = SimdVec::splat(2.0);
-    for &matrix_row in g2_indices {
+    for &matrix_row_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
             // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
             unsafe {
-                let weights_vec = weights.get_simd_lane_unchecked(matrix_row.0, i);
-                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row.0, i);
+                let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
+                let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
 
                 let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
 
