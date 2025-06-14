@@ -17,8 +17,7 @@
 use crate::kernel;
 use crate::types::{CleanCounts, CleanScores, MatrixRowIndex};
 use crate::types::{
-    EffectAlleleDosage, OriginalPersonIndex, PersonSubset,
-    PreparationResult,
+    EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
 };
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
@@ -41,7 +40,7 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// optimization that avoids heap allocations in the hot compute path.
 #[derive(Default, Debug)]
 pub struct SparseIndexPool {
-    pool: ThreadLocal<RefCell<(Vec<Vec<MatrixRowIndex>>, Vec<Vec<MatrixRowIndex>>)>>,
+    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)>>,
 }
 
 impl SparseIndexPool {
@@ -51,7 +50,7 @@ impl SparseIndexPool {
 
     /// Gets the thread-local buffer of sparse indices, creating it if it doesn't exist.
     #[inline(always)]
-    fn get_or_default(&self) -> &RefCell<(Vec<Vec<MatrixRowIndex>>, Vec<Vec<MatrixRowIndex>>)> {
+    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
         self.pool.get_or_default()
     }
 }
@@ -264,15 +263,17 @@ fn process_tile(
             &mut block_missing_counts_out[person_data_start..person_data_start + num_scores];
 
         for (snp_idx_in_chunk, &dosage) in genotype_row.iter().enumerate() {
-            let matrix_row = MatrixRowIndex(matrix_row_start_idx.0 + snp_idx_in_chunk);
             match dosage.0 {
                 // SAFETY: `person_idx` is guaranteed to be in bounds by the outer loop.
-                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(matrix_row) },
-                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(matrix_row) },
+                // We push the LOCAL index `snp_idx_in_chunk` for the kernel.
+                1 => unsafe { g1_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
+                2 => unsafe { g2_indices.get_unchecked_mut(person_idx).push(snp_idx_in_chunk) },
                 3 => {
-                    // This is the missing genotype sentinel.
+                    // This is the missing genotype sentinel. We still need the GLOBAL
+                    // index here to look up the variant's metadata.
+                    let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
                     let scores_for_this_variant =
-                        &prep_result.variant_to_scores_map[matrix_row.0];
+                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
                     for &score_idx in scores_for_this_variant {
                         unsafe {
                             *person_missing_counts_slice.get_unchecked_mut(score_idx.0) += 1;
