@@ -355,15 +355,33 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
     # --- 6. Final Validation ---
-    is_gnomon_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
-    is_plink_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_PLINK2'])
+    # For the special multi-allelic case, PLINK2 is expected to fail and produce NaN.
+    # We will validate it separately and then check the rest of the data.
+    multiallelic_row = merged_df[merged_df['IID'] == 'id_multiallelic']
+    is_plink_multiallelic_ok = pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
 
-    if is_gnomon_ok and is_plink_ok:
-        print("\n✅ Simple Dosage Test Successful: All tools produced the correct scores.")
+    # Check all other rows normally
+    other_rows = merged_df[merged_df['IID'] != 'id_multiallelic']
+    is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON'])
+    # Also check the gnomon score for the multiallelic row specifically
+    is_gnomon_multiallelic_ok = np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
+    is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2'])
+    
+    # Combine all checks
+    all_ok = is_gnomon_ok and is_gnomon_multiallelic_ok and is_plink_ok and is_plink_multiallelic_ok
+
+    if all_ok:
+        print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
+        print("   - Gnomon correctly scored all individuals.")
+        print("   - PLINK2 correctly scored standard individuals and produced NaN for the ambiguous multi-allelic case as expected.")
     else:
         print("\n❌ Simple Dosage Test FAILED:")
-        if not is_gnomon_ok: print("  - Gnomon scores do not match ground truth.")
-        if not is_plink_ok: print("  - PLINK2 scores do not match ground truth.")
+        if not (is_gnomon_ok and is_gnomon_multiallelic_ok):
+            print("  - Gnomon scores do not match ground truth.")
+        if not is_plink_ok:
+            print("  - PLINK2 scores (for standard cases) do not match ground truth.")
+        if not is_plink_multiallelic_ok:
+            print("  - PLINK2 did not produce the expected NaN for the multi-allelic case.")
         sys.exit(1)
 
 
