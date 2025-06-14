@@ -19,10 +19,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-      
+
       # Create a hash of source files for binary caching
       - name: Generate source hash
         id: source_hash
@@ -31,7 +31,7 @@ jobs:
           SOURCE_HASH=$(find . -name "Cargo.toml" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
           echo "Source hash: $SOURCE_HASH"
-      
+
       # Try to restore the release binary from cache
       - name: Cache release binary
         id: binary_cache
@@ -40,7 +40,7 @@ jobs:
           path: |
             target/release/gnomon
           key: ${{ runner.os }}-release-binary-${{ steps.source_hash.outputs.hash }}
-      
+
       # Cache Cargo directories (for dependencies and incremental builds)
       - name: Cache Cargo directories
         uses: actions/cache@v4
@@ -51,7 +51,7 @@ jobs:
           key: ${{ runner.os }}-cargo-nightly-${{ steps.source_hash.outputs.hash }}
           restore-keys: |
             ${{ runner.os }}-cargo-nightly-
-      
+
       - name: Install getdoc
         run: |
           if [ ! -f ~/.cargo/bin/getdoc ]; then
@@ -60,27 +60,27 @@ jobs:
           else
             echo "getdoc already installed (cached)"
           fi
-      
+
       - name: Run Rust unit tests
         id: test_step
         run: cargo +nightly test
         continue-on-error: true
         env:
           RUST_BACKTRACE: 1
-      
+
       - name: Generate custom report with getdoc
         run: |
           ~/.cargo/bin/getdoc
           echo "=== Custom Report (getdoc) ==="
           cat report.md
-      
+
       # Only build if binary cache miss
       - name: Build Gnomon release binary
         if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           echo "Binary cache miss - building release binary..."
           cargo build --release
-      
+
       # If cache hit, just verify the binary exists and is executable
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
@@ -89,11 +89,11 @@ jobs:
           ls -la target/release/gnomon
           chmod +x target/release/gnomon
           ./target/release/gnomon --version || echo "Binary verification complete"
-      
+
       - name: Fail job if unit tests failed
         if: steps.test_step.outcome == 'failure'
         run: exit 1
-      
+
       - name: Upload build artifacts for Python jobs
         uses: actions/upload-artifact@v4
         with:
@@ -152,4 +152,13 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/release/gnomon
       - name: Run Simulation Test
+        id: sim_test # ID to reference this step's outcome
         run: python -u test/sim_test.py
+
+      - name: Check for OOM Kill on Failure
+        if: failure() # This condition means the step only runs if the previous step failed
+        run: |
+          echo "The simulation test failed. Checking for Out-of-Memory (OOM) errors in kernel logs..."
+          # Dump kernel logs and search for OOM messages.
+          # The '|| true' part ensures this step doesn't fail if grep finds no matches.
+          sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found in dmesg. The failure was likely due to another reason."
