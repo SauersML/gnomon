@@ -56,20 +56,37 @@ def print_debug_header(title: str):
     print("." * 80, flush=True)
     
 def print_file_head(file_path: Path):
-    """Prints the header and first 10 lines of a given file for verification."""
+    """
+    Prints the header and first 10 lines of a text file for verification.
+    For known binary files (e.g., .bed), it prints a hex dump of the first 250 bytes.
+    """
     if not file_path.exists():
         print(f"File not found: {file_path}", flush=True)
         return
-    print_debug_header(f"HEAD OF: {file_path.name}")
-    try:
-        with open(file_path, 'r', errors='replace') as f:
-            for i, line in enumerate(f):
-                if i >= 10:
-                    break
-                print(f"  {line.strip()}", flush=True)
-    except Exception as e:
-        print(f"  Could not read file: {e}", flush=True)
 
+    # Handle known binary files by showing a hex dump of the first 250 bytes,
+    # which corresponds to 500 hexadecimal characters.
+    if file_path.suffix in ['.bed']:
+        print_debug_header(f"HEXDUMP (first 500 chars) OF: {file_path.name}")
+        try:
+            with open(file_path, 'rb') as f:
+                # Read the first 250 bytes; bytes.hex() will convert this to 500 characters.
+                binary_content = f.read(250)
+                hex_representation = binary_content.hex()
+                print(f"  {hex_representation}", flush=True)
+        except Exception as e:
+            print(f"  Could not read binary file: {e}", flush=True)
+    else:
+        # Default behavior for text-based files.
+        print_debug_header(f"HEAD OF: {file_path.name}")
+        try:
+            with open(file_path, 'r', errors='replace') as f:
+                for i, line in enumerate(f):
+                    if i >= 10:
+                        break
+                    print(f"  {line.strip()}", flush=True)
+        except Exception as e:
+            print(f"  Could not read file: {e}", flush=True)
 
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads and extracts a file, handling .zip and .gz, and cleans up archives."""
