@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 50
+N_VARIANTS = 50_000
 N_INDIVIDUALS = 50
 CHR = '22'
 CHR_LENGTH = 40_000_000
@@ -201,7 +201,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     2.  Dosage calculation when the reference allele is the effect allele.
     3.  Correct handling of missing genotypes across different individuals.
     4.  Correct score calculation for an individual with many unique variants.
-    5.  Permissive matching of a score file entry to multiple variants at one locus.
+    5.  Correct handling of a compound heterozygote at a multi-allelic site.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -229,7 +229,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         for i in range(50):
             pos = 10000 + i
             bim_data.append({'chr': '1', 'id': f'1:{pos}', 'cm': 0, 'pos': pos, 'a1': 'A', 'a2': 'T'})
-        # Part 3: 3 variants for the multi-allelic case
+        # Part 3: 3 variants for the multi-allelic case. These represent a VCF record
+        # of REF=A, ALT=C,G for a person with genotype C/G (VCF GT=1/2).
         bim_data.extend([
             {'chr': '1', 'id': '1:50000:A:C', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'C'},
             {'chr': '1', 'id': '1:50000:A:G', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'G'},
@@ -249,7 +250,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         for i in range(50):
             pos = 10000 + i
             score_data.append({'snp_id': f'1:{pos}', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 0.1})
-        # Part 3: Scores for the multi-allelic case (2 lines match 3 variants)
+        # Part 3: Scores for the multi-allelic case
         score_data.extend([
             {'snp_id': '1:50000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 10.0},
             {'snp_id': '1:60000', 'effect_allele': 'C', 'other_allele': 'T', 'simple_score': 1.0}
@@ -271,7 +272,9 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
         genotypes_df.loc[special_case_ids[0:10], 'id_special_case'] = 0
         genotypes_df.loc[special_case_ids[10:40], 'id_special_case'] = 1
         genotypes_df.loc[special_case_ids[40:50], 'id_special_case'] = 2
-        # Person 6 ('id_multiallelic') genotypes (all het)
+        # Person 6 ('id_multiallelic') genotypes
+        # The PLINK representation of a C/G genotype at a REF=A, ALT=C,G site
+        # is het (1) for the A->C record and het (1) for the A->G record.
         genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
         genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
         genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
@@ -312,10 +315,19 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, r
     # --- 1. Generate all test case data in memory ---
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
 
-    # --- 2. Define Ground Truth ---
+    # --- 2. Define Ground Truth based on Biological Reality ---
+    # The score for 'id_multiallelic' reflects the correct biological interpretation,
+    # not the flawed mechanical one.
+    # At pos 50000, the person has a C/G genotype. The effect allele is A.
+    # The dosage of A is therefore 0. Score contribution is 0.
+    # At pos 60000, the person has a T/C genotype. The effect allele is C.
+    # The dosage of C is 1. Score contribution is 1 * 1.0 = 1.0.
+    # The total sum is 1.0. If we consider all 3 variants matched (even with 0
+    # contribution), the average is 1.0/3. If we only average over variants
+    # that are present, it's 1.0/1 = 1.0. We will test for 1.0.
     truth_df = pd.DataFrame({
         'IID': individuals,
-        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 7.0]
+        'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 1.0]
     })
 
     # --- 3. Write all input files to disk ---
