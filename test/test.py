@@ -282,11 +282,16 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
         corr_b = test_variant_subset(part_b_df, f"{iteration}B")
         print(f"  > Correlation for Part B: {corr_b:.6f}")
 
-        if corr_a < 0 or corr_b < 0:
-            print("❌ Bisection failed due to an error in a sub-test. Aborting discovery.", flush=True)
+        if corr_a < 0 and corr_b < 0:
+            print("❌ Bisection failed: BOTH halves failed their sub-tests. Aborting discovery.", flush=True)
             return
-
-        if corr_a < CORRELATION_THRESHOLD and corr_b < CORRELATION_THRESHOLD:
+        elif corr_a < 0:
+            print("[DISCOVERY] Part A failed its sub-test. Proceeding with Part B.")
+            current_variants_df = part_b_df
+        elif corr_b < 0:
+            print("[DISCOVERY] Part B failed its sub-test. Proceeding with Part A.")
+            current_variants_df = part_a_df
+        elif corr_a < CORRELATION_THRESHOLD and corr_b < CORRELATION_THRESHOLD:
             print("[DISCOVERY] Both halves show disagreement. Pursuing the worse one.")
             current_variants_df = part_a_df if corr_a <= corr_b else part_b_df
         elif corr_a < CORRELATION_THRESHOLD:
@@ -296,7 +301,7 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
             print("[DISCOVERY] Disagreement isolated to Part B.")
             current_variants_df = part_b_df
         else:
-            print("✅ Disagreement resolved. The issue is likely a complex interaction between the two halves. Halting search.", flush=True)
+            print("✅ Disagreement resolved. Both halves have high correlation. The issue is likely a complex interaction. Halting search.", flush=True)
             return
 
     print_header(f"Final Pinpointing: {len(current_variants_df)} suspect variants", "-")
