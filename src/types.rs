@@ -24,7 +24,7 @@ use std::ops::{Deref, DerefMut};
 /// A buffer that is guaranteed by the type system to have been zeroed.
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct CleanScores(pub Vec<f32>);
+pub struct CleanScores(pub Vec<f64>);
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct CleanCounts(pub Vec<u32>);
@@ -32,7 +32,7 @@ pub struct CleanCounts(pub Vec<u32>);
 /// A buffer that may contain non-zero data from a previous computation.
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct DirtyScores(pub Vec<f32>);
+pub struct DirtyScores(pub Vec<f64>);
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct DirtyCounts(pub Vec<u32>);
@@ -49,13 +49,13 @@ impl DirtyScores {
 }
 
 impl Deref for DirtyScores {
-    type Target = [f32];
+    type Target = [f64];
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl<'a> IntoIterator for &'a DirtyScores {
-    type Item = &'a f32;
-    type IntoIter = std::slice::Iter<'a, f32>;
+    type Item = &'a f64;
+    type IntoIter = std::slice::Iter<'a, f64>;
 
     /// Enables direct iteration over the wrapped data.
     fn into_iter(self) -> Self::IntoIter {
@@ -94,7 +94,7 @@ impl CleanScores {
     }
 }
 impl Deref for CleanScores {
-    type Target = [f32];
+    type Target = [f64];
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 impl DerefMut for CleanScores {

@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let num_scores = prep_result.score_names.len();
     let result_buffer_size = prep_result.num_people_to_score * num_scores;
-    let mut all_scores = vec![0.0f32; result_buffer_size];
+    let mut all_scores = vec![0.0f64; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
 
     let t1 = Instant::now();
@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     for _ in 0..(PIPELINE_DEPTH + 1) {
         partial_result_pool
             .push((
-                DirtyScores(vec![0.0f32; result_buffer_size]),
+                DirtyScores(vec![0.0f64; result_buffer_size]),
                 DirtyCounts(vec![0u32; result_buffer_size]),
             ))
             .unwrap();
@@ -532,7 +532,7 @@ fn write_scores_to_file(
     person_iids: &[String],
     score_names: &[String],
     score_variant_counts: &[u32],
-    sum_scores: &[f32],
+        sum_scores: &[f64],
     missing_counts: &[u32],
 ) -> io::Result<()> {
     let file = File::create(path)?;
@@ -578,7 +578,7 @@ fn write_scores_to_file(
             let variants_used = total_variants_for_score.saturating_sub(missing_count);
 
             let avg_score = if variants_used > 0 {
-                final_sum_score / (variants_used as f32)
+                final_sum_score / (variants_used as f64)
             } else {
                 0.0
             };
