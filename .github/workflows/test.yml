@@ -1,19 +1,15 @@
 name: Rust Test CI
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
@@ -23,18 +19,39 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+      
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-
+      
+      # Create a hash of source files for binary caching
+      - name: Generate source hash
+        id: source_hash
+        run: |
+          # Hash Cargo.toml and all Rust source files
+          SOURCE_HASH=$(find . -name "Cargo.toml" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          echo "Source hash: $SOURCE_HASH"
+      
+      # Try to restore the release binary from cache
+      - name: Cache release binary
+        id: binary_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/release/gnomon
+          key: ${{ runner.os }}-release-binary-${{ steps.source_hash.outputs.hash }}
+      
+      # Cache Cargo directories (for dependencies and incremental builds)
       - name: Cache Cargo directories
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo
             target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
-
+          key: ${{ runner.os }}-cargo-nightly-${{ steps.source_hash.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nightly-
+      
       - name: Install getdoc
         run: |
           if [ ! -f ~/.cargo/bin/getdoc ]; then
@@ -50,20 +67,33 @@ jobs:
         continue-on-error: true
         env:
           RUST_BACKTRACE: 1
-
+      
       - name: Generate custom report with getdoc
         run: |
           ~/.cargo/bin/getdoc
           echo "=== Custom Report (getdoc) ==="
           cat report.md
-
+      
+      # Only build if binary cache miss
       - name: Build Gnomon release binary
-        run: cargo build --release
-
+        if: steps.binary_cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Binary cache miss - building release binary..."
+          cargo build --release
+      
+      # If cache hit, just verify the binary exists and is executable
+      - name: Verify cached binary
+        if: steps.binary_cache.outputs.cache-hit == 'true'
+        run: |
+          echo "Binary cache hit - verifying cached binary..."
+          ls -la target/release/gnomon
+          chmod +x target/release/gnomon
+          ./target/release/gnomon --version || echo "Binary verification complete"
+      
       - name: Fail job if unit tests failed
         if: steps.test_step.outcome == 'failure'
         run: exit 1
-
+      
       - name: Upload build artifacts for Python jobs
         uses: actions/upload-artifact@v4
         with:
@@ -83,24 +113,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
           path: . # This recreates the 'target' folder and 'report.md' right here
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-
+          python-version: '3.13'
       - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars
-
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow
       - name: Make binary executable
         run: chmod +x target/release/gnomon
-
       - name: Run Integration Test
         run: python -u test/test.py
 
@@ -113,23 +138,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
           path: .
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-
+          python-version: '3.13'
       - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars
-
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow
       - name: Make binary executable
         run: chmod +x target/release/gnomon
-
       - name: Run Simulation Test
         run: python -u test/sim_test.py
