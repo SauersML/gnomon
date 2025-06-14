@@ -367,7 +367,7 @@ def main():
         commands_to_run = [
             ("gnomon", [str(GNOMON_BINARY), "--score", str(unified_score_file_path), str(SHARED_GENOTYPE_PREFIX)], SHARED_GENOTYPE_PREFIX),
             ("plink2", [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "1", "2", "4", "header", "no-mean-imputation", "--out", str(CI_WORKDIR / f"plink2_{pgs_id}")], CI_WORKDIR / f"plink2_{pgs_id}"),
-            ("pylink", ["python3", str(PYLINK_SCRIPT), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "--out", str(CI_WORKDIR / f"pylink_{pgs_id}"), "1", "2", "4"], CI_WORKDIR / f"pylink_{pgs_id}"),
+            ("pylink", ["python3", str(PYLINK_SCRIPT), "--precise", "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "--out", str(CI_WORKDIR / f"pylink_{pgs_id}"), "1", "2", "4"], CI_WORKDIR / f"pylink_{pgs_id}"),
         ]
         
         for tool, cmd, out_prefix in commands_to_run:
