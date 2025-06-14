@@ -124,94 +124,64 @@ impl<'a> PaddedInterleavedFlags<'a> {
 // ========================================================================================
 //                              THE KERNEL IMPLEMENTATION
 // ========================================================================================
-
-/// Calculates the score contributions for a single person using a numerically stable,
-/// branchless, SIMD-accelerated algorithm.
-///
-/// This function is the heart of the compute engine. It executes a pre-compiled
-/// plan (`weights`, `flip_flags`, `g1_indices`, `g2_indices`) to maximize throughput.
+/// Calculates the score *adjustments* relative to the dosage-0 baseline for a
+/// single person. This kernel is designed for maximum throughput by only
+/// processing sparse, non-zero dosage genotypes. The result is an adjustment
+/// value that must be ADDED to the pre-calculated baseline score.
 ///
 /// # Safety
 /// The caller must uphold the following contracts:
 /// - All indices in `g1_indices` and `g2_indices` must be valid row indices
 ///   for the `weights` and `flip_flags` matrices.
-/// - `scores_out.len()` must be `== weights.num_scores()`.
-/// - `accumulator_buffer.len()` must be sufficient for the number of scores.
+/// - `accumulator_buffer.len()` must be sufficient for `weights.num_scores()`.
 #[inline]
-pub fn accumulate_scores_for_person(
+pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
     flip_flags: &PaddedInterleavedFlags,
-    scores_out: &mut [f32],
     accumulator_buffer: &mut [SimdVec],
     g1_indices: &[usize],
     g2_indices: &[usize],
 ) {
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
-    let two = SimdVec::splat(2.0);
 
     // --- Reset the Reusable Accumulator Buffer ---
-    accumulator_buffer
-        .iter_mut()
-        .for_each(|acc| *acc = SimdVec::splat(0.0));
+    accumulator_buffer.iter_mut().for_each(|acc| *acc = SimdVec::splat(0.0));
 
-    // --- Loop 1: Accumulate contributions for Dosage=1 variants ---
-    let dosage1 = SimdVec::splat(1.0);
+    // --- Loop 1: Dosage=1 Adjustments ---
+    // Regular Adjustment: d*W - 0 = 1*W
+    // Flipped Adjustment: (2-d)*W - 2*W = -d*W = -1*W
     for &matrix_row_idx in g1_indices {
         for i in 0..num_accumulator_lanes {
-            // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
-            // Using get_unchecked here is a critical performance optimization.
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
                 let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
-
-                // Create a SIMD boolean mask from the u8 flags.
                 let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
 
-                // Calculate BOTH potential outcomes in parallel across all 8 lanes.
-                let contrib_regular = dosage1 * weights_vec;
-                let contrib_flipped = (two - dosage1) * weights_vec;
-
-                // Use a single, branchless instruction (e.g., blendvps) to select
-                // the correct contribution for each of the 8 lanes.
-                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
-
-                *accumulator_buffer.get_unchecked_mut(i) += contribution;
+                let adj_regular = weights_vec;
+                let adj_flipped = -adj_regular;
+                let adjustment = flip_mask.cast().select(adj_flipped, adj_regular);
+                *accumulator_buffer.get_unchecked_mut(i) += adjustment;
             }
         }
     }
 
-    // --- Loop 2: Accumulate contributions for Dosage=2 variants ---
-    let dosage2 = SimdVec::splat(2.0);
+    // --- Loop 2: Dosage=2 Adjustments ---
+    // Regular Adjustment: d*W - 0 = 2*W
+    // Flipped Adjustment: (2-d)*W - 2*W = -d*W = -2*W
+    let two = SimdVec::splat(2.0);
     for &matrix_row_idx in g2_indices {
         for i in 0..num_accumulator_lanes {
-            // SAFETY: All indices and buffer lengths are guaranteed by the caller's contract.
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
                 let flip_flags_u8 = flip_flags.get_simd_lane_unchecked(matrix_row_idx, i);
-
                 let flip_mask = flip_flags_u8.simd_eq(u8x8::splat(1));
 
-                let contrib_regular = dosage2 * weights_vec;
-                // For dosage=2, the flipped contribution is (2-2)*w = 0.
-                let contrib_flipped = SimdVec::splat(0.0);
-
-                        let contribution = flip_mask.cast().select(contrib_flipped, contrib_regular);
-
-                *accumulator_buffer.get_unchecked_mut(i) += contribution;
+                let adj_regular = two * weights_vec;
+                let adj_flipped = -adj_regular;
+                let adjustment = flip_mask.cast().select(adj_flipped, adj_regular);
+                *accumulator_buffer.get_unchecked_mut(i) += adjustment;
             }
         }
-    }
-
-    // --- Final Horizontal Store ---
-    // The results, which have been accumulated vertically in SIMD vectors, are
-    // now written out to the final destination slice.
-    for (i, &acc_vec) in accumulator_buffer.iter().enumerate() {
-        let start = i * LANE_COUNT;
-        let end = (start + LANE_COUNT).min(num_scores);
-        // This temporary array conversion is the correct and safe way to handle
-        // the final, possibly partial, vector without a scalar fallback loop.
-        let temp_array = acc_vec.to_array();
-        scores_out[start..end].copy_from_slice(&temp_array[..(end - start)]);
     }
 }
