@@ -12,7 +12,6 @@ from itertools import combinations
 
 import pandas as pd
 import numpy as np
-import psutil
 
 # ========================================================================================
 #                                   CONFIGURATION
@@ -60,28 +59,6 @@ def print_debug_header(title: str):
     print(f".... {title} ....", flush=True)
     print("." * 80, flush=True)
 
-def print_file_head(file_path: Path):
-    """Prints the header and first 10 lines of a text file for verification."""
-    if not file_path.exists():
-        print(f"File not found: {file_path}", flush=True)
-        return
-    if file_path.suffix in ['.bed']:
-        print_debug_header(f"HEXDUMP (first 250 bytes) OF: {file_path.name}")
-        try:
-            with open(file_path, 'rb') as f:
-                print(f"  {f.read(250).hex()}", flush=True)
-        except Exception as e:
-            print(f"  Could not read binary file: {e}", flush=True)
-    else:
-        print_debug_header(f"HEAD OF: {file_path.name}")
-        try:
-            with open(file_path, 'r', errors='replace') as f:
-                for i, line in enumerate(f):
-                    if i >= 10: break
-                    print(f"  {line.strip()}", flush=True)
-        except Exception as e:
-            print(f"  Could not read file: {e}", flush=True)
-
 def download_and_extract(url: str, dest_dir: Path):
     """Downloads and extracts a file, handling .zip and .gz."""
     filename = Path(url.split('?')[0].split('/')[-1])
@@ -96,13 +73,11 @@ def download_and_extract(url: str, dest_dir: Path):
 
     if outpath.suffix == '.zip':
         with zipfile.ZipFile(outpath, 'r') as z: z.extractall(dest_dir)
-        print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True)
-        outpath.unlink()
+        print(f"[SCRIPT] Extracted ZIP: {filename}", flush=True); outpath.unlink()
     elif outpath.suffix == '.gz':
         dest = dest_dir / filename.stem
         with gzip.open(outpath, 'rb') as f_in, open(dest, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-        print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True)
-        outpath.unlink()
+        print(f"[SCRIPT] Extracted GZ: {filename} -> {dest.name}", flush=True); outpath.unlink()
 
 def run_and_measure(cmd: list, name: str, expected_out_prefix: Path):
     """Executes a command, streams its output, and captures results."""
@@ -120,10 +95,6 @@ def run_and_measure(cmd: list, name: str, expected_out_prefix: Path):
     
     returncode = proc.wait()
     duration = time.perf_counter() - start
-    
-    # After run, print head of generated files based on the expected_out_prefix
-    for p in sorted(expected_out_prefix.parent.glob(f"{expected_out_prefix.name}.*")):
-        print_file_head(p)
         
     result = {'tool': name, 'time_sec': duration, 'returncode': returncode, 'success': returncode == 0, 'stdout': "\n".join(output_lines)}
     if result['success']: print(f"✅ {name} finished in {duration:.2f}s.", flush=True)
@@ -138,11 +109,10 @@ def setup_environment():
         print(f"❌ ERROR: PyLink script not found at: {PYLINK_SCRIPT}", flush=True); sys.exit(1)
     print(f"[SCRIPT] Found PyLink script at: {PYLINK_SCRIPT}", flush=True)
 
-    # CORRECTED: The loop now correctly pairs each URL with its corresponding binary path.
-    for url, binary_path in [(PLINK1_URL, CI_WORKDIR / "plink"), (PLINK2_URL, PLINK2_BINARY)]:
+    # This loop correctly pairs each URL string with its destination binary path.
+    for url_str, binary_path in [(PLINK1_URL, CI_WORKDIR / "plink"), (PLINK2_URL, PLINK2_BINARY)]:
         if not binary_path.exists():
-            download_and_extract(url, CI_WORKDIR)
-            # Find the downloaded binary (it might have a generic name)
+            download_and_extract(url_str, CI_WORKDIR)
             for p in CI_WORKDIR.iterdir():
                 if p.is_file() and p.name.startswith(binary_path.name.split('_')[0]):
                     p.rename(binary_path)
@@ -151,7 +121,7 @@ def setup_environment():
                     break
 
     for zip_name in GENOTYPE_FILES: download_and_extract(f"{GENOTYPE_URL_BASE}{zip_name}?raw=true", CI_WORKDIR)
-    for url in PGS_SCORES.values(): download_and_extract(url, CI_WORKDIR)
+    for url_str in PGS_SCORES.values(): download_and_extract(url_str, CI_WORKDIR)
 
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
     """Creates a new PLINK fileset with harmonized 'chr:pos' variant IDs."""
@@ -165,8 +135,7 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     
     exclude_file = CI_WORKDIR / "variants_to_exclude.txt"
     pd.Series(list(variants_to_exclude)).to_csv(exclude_file, index=False, header=False)
-    print(f"[SCRIPT] Identified {len(variants_to_exclude)} variants at duplicate positions to exclude.", flush=True)
-
+    
     id_map_file = CI_WORKDIR / "id_update_map.txt"
     variants_to_rename[['rsid', 'chr_pos_id']].to_csv(id_map_file, sep=' ', index=False, header=False)
     
@@ -186,7 +155,6 @@ def create_unified_scorefile(score_file: Path) -> pd.DataFrame:
     df.dropna(inplace=True)
     df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
     df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
-    # The score column name is kept generic for the bisection algorithm
     final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
     final_df.columns = ['snp_id', 'effect_allele', 'other_allele', 'effect_weight']
     
@@ -198,33 +166,33 @@ def create_unified_scorefile(score_file: Path) -> pd.DataFrame:
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
     """Analyzes and compares results from multiple tool runs for a single PGS."""
     summary = {'pgs_id': pgs_id, 'success': False}
-    tool_paths = {
-        'gnomon': CI_WORKDIR / f"gnomon_{pgs_id}.sscore",
-        'pylink': CI_WORKDIR / f"pylink_{pgs_id}.sscore",
-        'plink2': CI_WORKDIR / f"plink2_{pgs_id}.sscore",
-    }
-    
     data_frames = []
+    
     for res in pgs_run_results:
         if not res['success']: continue
         tool_name = res['tool'].split('_')[0]
-        path = tool_paths.get(tool_name)
-        if not path or not path.exists(): continue
+        
+        # Determine the correct output file path based on the tool
+        if tool_name == 'gnomon':
+            path = CI_WORKDIR / f"gnomon_{pgs_id}.sscore"
+        elif tool_name == 'plink2':
+            path = CI_WORKDIR / f"plink2_{pgs_id}.sscore"
+        elif tool_name == 'pylink':
+            path = CI_WORKDIR / f"pylink_{pgs_id}.sscore"
+        else:
+            continue
+
+        if not path.exists(): continue
         
         try:
             df_raw = pd.read_csv(path, sep='\s+')
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
+            score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
+            if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
             
-            if tool_name in ['gnomon', 'plink2', 'pylink']:
-                score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-                if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
-                df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
-            else: 
-                df = None # Only handle the three main tools
-
-            if df is not None:
-                df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
-                data_frames.append(df)
+            df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
+            df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
+            data_frames.append(df)
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
@@ -246,24 +214,36 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
 def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
     """Helper for the bisection algorithm. Runs Gnomon & PLINK2 on a variant subset and returns their correlation."""
     temp_score_path = CI_WORKDIR / f"_temp_score_{iteration_name}.tsv"
+    # Ensure columns match the expected unified format
     variant_df.columns = ['snp_id', 'effect_allele', 'other_allele', 'effect_weight']
     variant_df.to_csv(temp_score_path, sep='\t', index=False)
 
-    # --- Run Gnomon ---
-    g_geno_prefix = CI_WORKDIR / f"_g_iter_{iteration_name}"
-    for ext in ['.bed', '.bim', '.fam']:
-        shutil.copy(SHARED_GENOTYPE_PREFIX.with_suffix(ext), g_geno_prefix.with_suffix(ext))
-    g_cmd = [str(GNOMON_BINARY), "--score", str(temp_score_path), str(g_geno_prefix)]
-    run_and_measure(g_cmd, f"Gnomon_Iter_{iteration_name}", g_geno_prefix)
+    # --- Run Gnomon (Corrected) ---
+    # Gnomon implicitly uses the input prefix for output naming. We must give it a unique one
+    # to avoid overwriting files in parallel or sequential runs.
+    g_iter_prefix = CI_WORKDIR / f"_g_iter_{iteration_name}"
+    # The command does NOT take an --out flag.
+    g_cmd = [str(GNOMON_BINARY), "--score", str(temp_score_path), str(SHARED_GENOTYPE_PREFIX)]
+    g_res = run_and_measure(g_cmd, f"Gnomon_Iter_{iteration_name}", SHARED_GENOTYPE_PREFIX)
+    # After running, move the output to the unique name we expect
+    if g_res['success']:
+        try:
+            shutil.move(SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'), g_iter_prefix.with_suffix('.sscore'))
+        except FileNotFoundError:
+            print(f"  > [BISECTION_WARNING] Could not find Gnomon output for iteration {iteration_name}")
+            return -1.0 # Return a value indicating failure
 
     # --- Run PLINK2 ---
     p2_prefix = CI_WORKDIR / f"_p2_iter_{iteration_name}"
     p2_cmd = [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(temp_score_path), "1", "2", "4", "header", "no-mean-imputation", "--out", str(p2_prefix)]
-    run_and_measure(p2_cmd, f"PLINK2_Iter_{iteration_name}", p2_prefix)
-
+    p2_res = run_and_measure(p2_cmd, f"PLINK2_Iter_{iteration_name}", p2_prefix)
+    
     # --- Analyze and return correlation ---
+    if not (g_res['success'] and p2_res['success']):
+        return -1.0 # Signal a failure in one of the tool runs
+
     try:
-        g_df = pd.read_csv(g_geno_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'effect_weight_AVG': 'SCORE_GNOMON'})
+        g_df = pd.read_csv(g_iter_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'effect_weight_AVG': 'SCORE_GNOMON'})
         p2_df = pd.read_csv(p2_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'SCORE_PLINK2'})
         merged = pd.merge(g_df[['IID', 'SCORE_GNOMON']], p2_df[['IID', 'SCORE_PLINK2']], on='IID').dropna()
         if len(merged) < 2: return 1.0
@@ -271,7 +251,7 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
         return correlation if pd.notna(correlation) else 1.0
     except Exception as e:
         print(f"  > [BISECTION_ANALYSIS_ERROR] Could not analyze results for iteration {iteration_name}: {e}", flush=True)
-        return 1.0
+        return -1.0 # Signal a failure
 
 def run_disagreement_discovery(initial_score_df: pd.DataFrame):
     """Performs the bisection search to find the variant causing the most disagreement."""
@@ -302,6 +282,10 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
         corr_b = test_variant_subset(part_b_df, f"{iteration}B")
         print(f"  > Correlation for Part B: {corr_b:.6f}")
 
+        if corr_a < 0 or corr_b < 0:
+            print("❌ Bisection failed due to an error in a sub-test. Aborting discovery.", flush=True)
+            return
+
         if corr_a < CORRELATION_THRESHOLD and corr_b < CORRELATION_THRESHOLD:
             print("[DISCOVERY] Both halves show disagreement. Pursuing the worse one.")
             current_variants_df = part_a_df if corr_a <= corr_b else part_b_df
@@ -322,6 +306,7 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
         print(f"[DISCOVERY] Testing single suspect variant: {variant_id}")
         single_variant_df = pd.DataFrame([row])
         corr = test_variant_subset(single_variant_df, f"final_{variant_id.replace(':', '_')}")
+        if corr < 0: continue # Skip failed runs
         suspect_results.append({'id': variant_id, 'corr': corr, 'df': single_variant_df})
         print(f"  > Correlation for {variant_id}: {corr:.6f}")
     
@@ -359,9 +344,8 @@ def main():
         
         for tool, cmd, out_prefix in commands_to_run:
             res = run_and_measure(cmd, f"{tool}_{pgs_id}", out_prefix)
-            if tool == 'gnomon':
+            if tool == 'gnomon' and res['success']:
                 try:
-                    # Move gnomon's output to a unique name so it doesn't get overwritten.
                     shutil.move(out_prefix.with_suffix('.sscore'), CI_WORKDIR / f"gnomon_{pgs_id}.sscore")
                 except FileNotFoundError:
                     print(f"Warning: Could not find expected Gnomon output at {out_prefix.with_suffix('.sscore')}")
@@ -399,11 +383,12 @@ def print_final_summary(summary_data: list):
             print(f"❌ Analysis for {pgs_id} could not be completed.")
             continue
         
-        num_tools = pgs_summary.get('correlation_matrix').shape[0] if pgs_summary.get('correlation_matrix') is not None else 0
-        print(f"✅ Concordance established using {num_tools} tools.")
-        if pgs_summary.get('correlation_matrix') is not None:
+        corr_matrix = pgs_summary.get('correlation_matrix')
+        if corr_matrix is not None:
+            num_tools = corr_matrix.shape[0]
+            print(f"✅ Concordance established using {num_tools} tools.")
             print_debug_header("Score Correlation Matrix")
-            print(pgs_summary['correlation_matrix'].to_markdown(floatfmt=".8f"))
+            print(corr_matrix.to_markdown(floatfmt=".8f"))
 
 if __name__ == '__main__':
     main()
