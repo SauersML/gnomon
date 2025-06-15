@@ -18,8 +18,8 @@ import requests
 
 # --- Workspace and Paths ---
 WORKDIR = Path("./benchmark_workdir")
-GNOMON_BINARY = Path("./target/release/gnomon").resolve()
-PLINK2_BINARY = WORKDIR / "plink2"
+GNOMON_BINARY_REL = Path("./target/release/gnomon")
+PLINK2_BINARY_REL = WORKDIR / "plink2"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 # --- Benchmark Workloads ---
@@ -32,14 +32,18 @@ DIMENSIONS = [
 
 # --- Data Realism & Variety Parameters ---
 AF_DISTRIBUTIONS = [
-    ('beta', 0.2, 0.2),      # U-shaped: mix of rare and common (simulates WGS)
-    ('uniform', 0.05, 0.5),  # Mostly common (simulates genotyping arrays)
+    ('beta', 0.2, 0.2),
+    ('uniform', 0.05, 0.5),
 ]
 EFFECT_DISTRIBUTIONS = [
-    ('normal', 0, 0.001),   # Simulates a dense polygenic score
-    ('laplace', 0, 0.05),   # Simulates a score with sparse, larger "GWAS hits"
+    ('normal', 0, 0.001),
+    ('laplace', 0, 0.05),
 ]
 SCORE_CORRELATION_PROBABILITY = 0.3
+
+# --- Performance Tuning ---
+# Process variants in chunks to avoid memory errors on large datasets.
+GENERATION_CHUNK_SIZE = 50_000
 
 # ==============================================================================
 #                               HELPER FUNCTIONS
@@ -52,16 +56,16 @@ def print_header(title: str, char: str = "="):
     print(f"{char*4} {title} {char*(width - len(title) - 6)}", flush=True)
     print(char * width, flush=True)
 
-def setup_environment():
+def setup_environment(gnomon_path, plink_path):
     """Prepares the CI environment by creating the workspace and downloading plink2."""
     print_header("Benchmark Setup", "-")
     WORKDIR.mkdir(exist_ok=True)
     
-    if not GNOMON_BINARY.exists():
-        print(f"❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY}'. Please build with 'cargo build --release'.")
+    if not gnomon_path.exists():
+        print(f"❌ ERROR: Gnomon binary not found at '{gnomon_path}'. Please build with 'cargo build --release'.")
         return False
 
-    if not PLINK2_BINARY.exists():
+    if not plink_path.exists():
         print(f"  > PLINK2 not found. Downloading from {PLINK2_URL}...")
         zip_path = WORKDIR / "plink.zip"
         try:
@@ -72,17 +76,17 @@ def setup_environment():
             with zipfile.ZipFile(zip_path, 'r') as z:
                 for member in z.infolist():
                     if member.filename.endswith('plink2') and not member.is_dir():
-                        with z.open(member) as source, open(PLINK2_BINARY, 'wb') as target:
+                        with z.open(member) as source, open(plink_path, 'wb') as target:
                             shutil.copyfileobj(source, target)
                         break
-            PLINK2_BINARY.chmod(0o755)
+            plink_path.chmod(0o755)
             zip_path.unlink()
-            print(f"  > Successfully downloaded and configured PLINK2 at '{PLINK2_BINARY}'.")
+            print(f"  > Successfully downloaded and configured PLINK2 at '{plink_path}'.")
         except Exception as e:
             print(f"❌ ERROR: Failed to download or extract PLINK2: {e}")
             return False
     else:
-        print(f"  > Found existing PLINK2 binary at '{PLINK2_BINARY}'.")
+        print(f"  > Found existing PLINK2 binary at '{plink_path}'.")
     
     return True
 
@@ -101,19 +105,12 @@ class RealisticDataGenerator:
         self.score_file_path = None
         
     def _generate_bim(self):
-        """Generates the .bim file using a fast, fully vectorized approach."""
         print(f"    > Generating .bim file for {self.n_variants} variants (vectorized)...")
         positions = np.sort(np.random.choice(np.arange(1, 50_000_000), self.n_variants, replace=False))
-        
-        # Vectorized allele generation to avoid slow Python loops.
         base_alleles = np.array(['A', 'C', 'G', 'T'])
-        # 1. Generate all reference allele indices at once.
         ref_indices = np.random.randint(0, 4, self.n_variants)
-        # 2. Generate random offsets (1, 2, or 3) to create a different allele.
         offsets = np.random.randint(1, 4, self.n_variants)
-        # 3. Calculate alternate allele indices using modular arithmetic.
         alt_indices = (ref_indices + offsets) % 4
-        # 4. Map indices back to characters in a single operation.
         ref_alleles = base_alleles[ref_indices]
         alt_alleles = base_alleles[alt_indices]
 
@@ -133,43 +130,46 @@ class RealisticDataGenerator:
                 f.write(f"sample_{i} sample_{i} 0 0 0 -9\n")
 
     def _generate_bed(self):
-        """Generates a packed binary .bed file using a high-performance vectorized method."""
-        print("    > Generating .bed file (vectorized)...")
-        p = self.variants_df['af'].values[:, np.newaxis]
-        hwe_probs = np.hstack([(1-p)**2, 2*p*(1-p), p**2])
-        
-        rand_draws = np.random.rand(self.n_variants, self.n_individuals)
-        cum_probs = hwe_probs.cumsum(axis=1)
-        
-        genotypes = (rand_draws > cum_probs[:, [0]]) + (rand_draws > cum_probs[:, [1]])
-        genotypes[(np.random.rand(*genotypes.shape) < 0.01)] = -1
-        
+        """Generates .bed file in chunks to avoid high memory usage."""
+        print(f"    > Generating .bed file (chunked, {GENERATION_CHUNK_SIZE} variants/chunk)...")
         code_map = {0: 0b11, 1: 0b10, 2: 0b00, -1: 0b01}
         mapping_array = np.array([code_map[key] for key in sorted(code_map)], dtype=np.uint8)
-        codes = mapping_array[genotypes.astype(int)]
         
-        padded_n_individuals = (self.n_individuals + 3) // 4 * 4
-        padded_codes = np.full((self.n_variants, padded_n_individuals), code_map[-1], dtype=np.uint8)
-        padded_codes[:, :self.n_individuals] = codes
-        
-        packed_bytes = (padded_codes[:, 0::4])
-        packed_bytes |= (padded_codes[:, 1::4] << 2)
-        packed_bytes |= (padded_codes[:, 2::4] << 4)
-        packed_bytes |= (padded_codes[:, 3::4] << 6)
-
         with open(self.run_prefix.with_suffix(".bed"), 'wb') as f:
             f.write(bytes([0x6c, 0x1b, 0x01]))
-            f.write(packed_bytes.tobytes())
+            
+            for start_idx in range(0, self.n_variants, GENERATION_CHUNK_SIZE):
+                end_idx = min(start_idx + GENERATION_CHUNK_SIZE, self.n_variants)
+                chunk_size = end_idx - start_idx
+                
+                p = self.variants_df['af'].values[start_idx:end_idx, np.newaxis]
+                hwe_probs = np.hstack([(1-p)**2, 2*p*(1-p), p**2])
+                rand_draws = np.random.rand(chunk_size, self.n_individuals)
+                cum_probs = hwe_probs.cumsum(axis=1)
+                
+                genotypes = (rand_draws > cum_probs[:, [0]]) + (rand_draws > cum_probs[:, [1]])
+                genotypes[(np.random.rand(*genotypes.shape) < 0.01)] = -1
+                
+                codes = mapping_array[genotypes.astype(int)]
+                
+                padded_n_individuals = (self.n_individuals + 3) // 4 * 4
+                padded_codes = np.full((chunk_size, padded_n_individuals), code_map[-1], dtype=np.uint8)
+                padded_codes[:, :self.n_individuals] = codes
+                
+                packed_bytes = (padded_codes[:, 0::4])
+                packed_bytes |= (padded_codes[:, 1::4] << 2)
+                packed_bytes |= (padded_codes[:, 2::4] << 4)
+                packed_bytes |= (padded_codes[:, 3::4] << 6)
+                
+                f.write(packed_bytes.tobytes())
             
     def _generate_score_file(self, n_scores):
         print(f"    > Generating .score file with {n_scores} scores...")
         score_data = {"snp_id": self.variants_df['id']}
         score_cols_data = []
-
         for i in range(n_scores):
             is_correlated = (i > 0) and (random.random() < SCORE_CORRELATION_PROBABILITY)
             current_weights = np.zeros(self.n_variants)
-            
             if is_correlated:
                 base_score_col = random.choice(score_cols_data)
                 current_weights = base_score_col.copy()
@@ -188,22 +188,19 @@ class RealisticDataGenerator:
                     indices = np.random.choice(self.n_variants, n_non_zero, replace=False)
                     weights = np.random.normal(p1, p2, n_non_zero) if dist_name == 'normal' else np.random.laplace(p1, p2, n_non_zero)
                     current_weights[indices] = weights
-            
             score_data[f"score_{i+1}"] = current_weights
             score_cols_data.append(current_weights)
 
         score_df = pd.DataFrame(score_data)
         score_df['effect_allele'] = self.variants_df['a2']
         score_df['other_allele'] = self.variants_df['a1']
-        
         score_name_cols = [f"score_{i+1}" for i in range(n_scores)]
         final_cols = ['snp_id', 'effect_allele', 'other_allele'] + score_name_cols
-        
         self.score_file_path = self.run_prefix.with_suffix(".score")
         score_df[final_cols].to_csv(self.score_file_path, sep='\t', index=False, float_format='%.6g')
 
     def generate_all_files(self, n_scores):
-        """FIXED: Calls internal methods with the correct leading underscore."""
+        """FIXED: Correctly calls internal (private) methods."""
         self._generate_bim()
         self._generate_fam()
         self._generate_bed()
@@ -215,8 +212,7 @@ class RealisticDataGenerator:
         for ext in [".bed", ".bim", ".fam", ".score"]:
             try:
                 self.run_prefix.with_suffix(ext).unlink()
-            except FileNotFoundError:
-                pass
+            except FileNotFoundError: pass
 
 # ==============================================================================
 #                       EXECUTION & MONITORING ENGINE
@@ -226,14 +222,11 @@ def run_and_monitor_process(tool_name: str, command: list, log_prefix: str, cwd:
     print(f"  > Running {tool_name} with default max parallelism...")
     command_str_list = [str(c) for c in command]
     print(f"    Command: {' '.join(command_str_list)}")
-
     start_time = time.monotonic()
     log_file_path = WORKDIR / f"{log_prefix}.log"
-    
     try:
         with open(log_file_path, 'w') as log_file:
             process = subprocess.Popen(command_str_list, cwd=cwd, stdout=log_file, stderr=subprocess.STDOUT)
-        
         p = psutil.Process(process.pid)
         peak_rss_mb = 0
         while process.poll() is None:
@@ -241,19 +234,15 @@ def run_and_monitor_process(tool_name: str, command: list, log_prefix: str, cwd:
                 peak_rss_mb = max(peak_rss_mb, p.memory_info().rss / 1024 / 1024)
             except psutil.NoSuchProcess: break
             time.sleep(0.02)
-        
         wall_time = time.monotonic() - start_time
         returncode = process.returncode
-        
         if returncode != 0:
             print(f"  > ❌ {tool_name} FAILED with exit code {returncode}. Log: {log_file_path}")
         else:
             print(f"  > ✅ {tool_name} finished in {wall_time:.2f}s. Peak Memory: {peak_rss_mb:.2f} MB")
-
     except (FileNotFoundError, psutil.NoSuchProcess) as e:
         print(f"  > ❌ ERROR launching {tool_name}: {e}")
         wall_time, peak_rss_mb, returncode = -1, -1, -1
-        
     return {"tool": tool_name, "time_sec": wall_time, "peak_mem_mb": peak_rss_mb, "success": returncode == 0}
 
 # ==============================================================================
@@ -264,20 +253,15 @@ def validate_results(gnomon_output_path: Path, plink2_output_path: Path) -> bool
     try:
         g_df = pd.read_csv(gnomon_output_path, sep='\t').rename(columns={'#IID': 'IID'})
         p_df = pd.read_csv(plink2_output_path, sep=r'\s+').rename(columns={'#FID': 'FID'})
-        
         if len(g_df) != len(p_df):
             print(f"  > ❌ VALIDATION FAILED: Row count mismatch ({len(g_df)} vs {len(p_df)}).")
             return False
-
         g_score_cols = {int(re.search(r'score_(\d+)_AVG', c).group(1)): c for c in g_df.columns if c.endswith('_AVG')}
         p_score_cols = {int(re.search(r'SCORE(\d+)_AVG', c).group(1)): c for c in p_df.columns if c.endswith('_AVG')}
-
         if len(g_score_cols) != len(p_score_cols):
              print(f"  > ❌ VALIDATION FAILED: Score column count mismatch.")
              return False
-
         merged_df = pd.merge(g_df, p_df, on="IID")
-        
         for i in sorted(g_score_cols.keys()):
             g_col, p_col = g_score_cols[i], p_score_cols[i]
             is_close = np.allclose(merged_df[g_col], merged_df[p_col] * 2, rtol=1e-4, atol=1e-7, equal_nan=True)
@@ -285,7 +269,6 @@ def validate_results(gnomon_output_path: Path, plink2_output_path: Path) -> bool
                 diff = np.nanmax(np.abs(merged_df[g_col] - merged_df[p_col] * 2))
                 print(f"  > ❌ VALIDATION FAILED: Scores in '{g_col}' and '{p_col}' do not match. Max diff: {diff}")
                 return False
-        
         print("  > ✅ Validation Successful: Output scores are numerically concordant.")
         return True
     except Exception as e:
@@ -297,28 +280,22 @@ def report_results(results: list):
     if not results:
         print("No results to report.")
         return
-
     df = pd.DataFrame(results)
-    
     try:
         report_df = df.pivot_table(index=['n_variants', 'n_individuals', 'n_scores'], columns='tool', values=['time_sec', 'peak_mem_mb'])
         report_df.columns = [f"{val}_{tool}" for val, tool in report_df.columns]
-        
         print("--- Explanatory Notes ---")
         print("  - Ratios (< 1.0) indicate gnomon is faster or uses less memory.")
         print("  - Time is wall-clock seconds. Memory is peak RSS in Megabytes.")
         print("-------------------------\n")
-        
         if 'time_sec_gnomon' in report_df and 'time_sec_plink2' in report_df:
             report_df['time_ratio_g/p'] = report_df['time_sec_gnomon'] / report_df['time_sec_plink2']
         if 'peak_mem_mb_gnomon' in report_df and 'peak_mem_mb_plink2' in report_df:
             report_df['mem_ratio_g/p'] = report_df['peak_mem_mb_gnomon'] / report_df['peak_mem_mb_plink2']
-
         print(report_df.to_markdown(floatfmt=".3f"))
     except Exception as e:
         print("Could not generate pivot table. Printing raw results.")
         print(df.to_markdown(index=False, floatfmt=".3f"))
-
     summary_path = WORKDIR / "benchmark_summary.csv"
     df.to_csv(summary_path, index=False)
     print(f"\nFull results saved to '{summary_path}'")
@@ -326,13 +303,14 @@ def report_results(results: list):
 def main():
     np.random.seed(42)
     random.seed(42)
+    
+    gnomon_abs_path = GNOMON_BINARY_REL.resolve()
+    plink2_abs_path = PLINK2_BINARY_REL.resolve()
 
-    if not setup_environment():
+    if not setup_environment(gnomon_abs_path, plink2_abs_path):
         exit(1)
 
-    all_results = []
-    failed_runs = 0
-    run_id = 0
+    all_results, failed_runs, run_id = [], 0, 0
 
     for workload_params in DIMENSIONS:
         run_id += 1
@@ -343,19 +321,18 @@ def main():
         )
         data_prefix = generator.generate_all_files(n_scores=workload_params["n_scores"])
 
-        gnomon_cmd = [str(GNOMON_BINARY), "--score", str(generator.score_file_path), str(data_prefix)]
+        gnomon_cmd = [str(gnomon_abs_path), "--score", str(generator.score_file_path), str(data_prefix)]
         gnomon_log = f"run{run_id}_gnomon"
         gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, gnomon_log, WORKDIR)
         gnomon_res.update(workload_params)
         all_results.append(gnomon_res)
         
-        # FIXED: Correctly access n_scores from workload_params dictionary
         n_scores = workload_params["n_scores"]
         score_col_range = f"4-{3 + n_scores}"
         plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
         
         plink2_cmd = [
-            str(PLINK2_BINARY), "--bfile", str(data_prefix), "--score", str(generator.score_file_path),
+            str(plink2_abs_path), "--bfile", str(data_prefix), "--score", str(generator.score_file_path),
             "1", "2", "header", "--score-col-nums", score_col_range, "no-mean-imputation", "--out", str(plink_out_prefix)
         ]
         plink2_log = f"run{run_id}_plink2"
