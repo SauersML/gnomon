@@ -32,12 +32,12 @@ REALISTIC_DIMENSIONS = [
         "test_name": "Large_GWAS_High_Overlap",
         "n_individuals": 50_000,
         "genome_variants": 20_000_000,
-        "target_variants": 3_000_000,
+        "target_variants": 2_000_000,
         "score_files": [
             {
                 "name": "large_gwas",
                 "n_scores": 10,
-                "gwas_source_variants": 2_500_000,
+                "gwas_source_variants": 2_000_000,
                 "overlap_pct": 0.95,
                 "flip_pct": 0.15,
                 "missing_weight_pct": 0.01,
@@ -48,18 +48,18 @@ REALISTIC_DIMENSIONS = [
         "test_name": "Multi_Panel_Modest_Overlap",
         "n_individuals": 10_000,
         "genome_variants": 20_000_000,
-        "target_variants": 1_000_000,
+        "target_variants": 10_000_000,
         "score_files": [
-            {"name": "panel_A", "n_scores": 5, "gwas_source_variants": 500, "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
-            {"name": "panel_B", "n_scores": 8, "gwas_source_variants": 1200, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
-            {"name": "panel_C", "n_scores": 2, "gwas_source_variants": 800, "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
+            {"name": "panel_A", "n_scores": 5,  "gwas_source_variants": 500,   "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
+            {"name": "panel_B", "n_scores": 8,  "gwas_source_variants": 1_200, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
+            {"name": "panel_C", "n_scores": 2,  "gwas_source_variants": 800,   "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
         ],
     },
     {
         "test_name": "Stress_Test_Low_Overlap",
         "n_individuals": 5_000,
         "genome_variants": 20_000_000,
-        "target_variants": 500_000,
+        "target_variants": 20_000_000,
         "score_files": [
             {
                 "name": "discovery_gwas",
@@ -75,7 +75,7 @@ REALISTIC_DIMENSIONS = [
         "test_name": "Dense_Score_Sparse_Geno",
         "n_individuals": 15_000,
         "genome_variants": 10_000_000,
-        "target_variants": 500_000,
+        "target_variants": 6_666_666,
         "score_files": [
             {
                 "name": "dense_score",
@@ -84,7 +84,7 @@ REALISTIC_DIMENSIONS = [
                 "overlap_pct": 0.98,
                 "flip_pct": 0.10,
                 "missing_weight_pct": 0.0,
-                "score_sparsity": 1.0, # 1.0 = fully dense
+                "score_sparsity": 1.0,  # fully dense
             }
         ],
     },
@@ -92,12 +92,12 @@ REALISTIC_DIMENSIONS = [
         "test_name": "Ultra_Scale_Test",
         "n_individuals": 150_000,
         "genome_variants": 30_000_000,
-        "target_variants": 4_000_000,
+        "target_variants": 666_666,
         "score_files": [
             {
                 "name": "ultra_gwas",
                 "n_scores": 80,
-                "gwas_source_variants": 3_000_000,
+                "gwas_source_variants": 666_666,
                 "overlap_pct": 0.95,
                 "flip_pct": 0.15,
                 "missing_weight_pct": 0.01,
@@ -105,6 +105,7 @@ REALISTIC_DIMENSIONS = [
         ],
     },
 ]
+
 
 # --- Data Realism & Variety Parameters ---
 AF_DISTRIBUTIONS = [('beta', 0.2, 0.2), ('uniform', 0.05, 0.5)]
