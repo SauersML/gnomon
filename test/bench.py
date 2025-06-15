@@ -24,7 +24,6 @@ PLINK2_BINARY_REL = WORKDIR / "plink2"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 # --- Benchmark Workloads ---
-n's performance on
 DIMENSIONS = [
     {"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
     {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 15_000, "n_scores": 64},
