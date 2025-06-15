@@ -36,7 +36,7 @@ def sum_column_precise(col):
     """
     # Set precision for this worker process (in BITS). 256 bits is ~77 decimal digits.
     gmpy2.get_context().precision = 256
-    
+
     # Sum the column by converting each float to a gmpy2 high-precision number
     return sum(gmpy2.mpfr(f) for f in col)
 
@@ -54,7 +54,7 @@ def generate_variants_and_weights():
     ref_idx = np.random.randint(0, 4, N_VARIANTS)
     alt_offset = np.random.randint(1, 4, N_VARIANTS)
     alt_idx = (ref_idx + alt_offset) % 4
-    
+
     ref_alleles = alleles[ref_idx]
     alt_alleles = alleles[alt_idx]
 
@@ -101,7 +101,7 @@ def introduce_missingness(genotypes):
     missing_mask = np.random.rand(n_variants, n_individuals) < MISSING_RATE
     genotypes_with_missing = genotypes.astype(float)
     genotypes_with_missing[missing_mask] = -1
-    
+
     print("...Missingness introduced.")
     return genotypes_with_missing.astype(int)
 
@@ -111,7 +111,7 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     and the gmpy2 library for the fastest possible ULTIMATE precision.
     """
     print("Step 5: Calculating ground truth polygenic scores (ULTIMATE PRECISION, ACCELERATED)...")
-    
+
     # --- 1. Vectorized Data Preparation (Fast NumPy part) ---
     effect_weights = variants_df['effect_weight'].values
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
@@ -129,16 +129,23 @@ def calculate_ground_truth_prs(genotypes, variants_df):
 
     # --- 3. Final Averaging & Formatting ---
     variant_counts = valid_mask.sum(axis=0)
-    score_avg = np.divide(score_sums, variant_counts, 
-                          out=np.zeros_like(score_sums, dtype=float), 
-                          where=(variant_counts != 0))
+
+    # --- FIX: Perform division with precise objects, then convert to float ---
+    # A list comprehension cleanly handles the division and the case where count is zero.
+    score_avg_list = [
+        s / v if v != 0 else 0.0
+        for s, v in zip(score_sums, variant_counts)
+    ]
+    # Convert the final list of precise results into a standard NumPy float array.
+    score_avg = np.array(score_avg_list, dtype=float)
+
 
     results_df = pd.DataFrame({
         'FID': [f"sample_{i+1}" for i in range(len(score_avg))],
         'IID': [f"sample_{i+1}" for i in range(len(score_avg))],
         'PRS_AVG': score_avg
     })
-    
+
     print("...PRS calculation complete.")
     return results_df
 
@@ -154,6 +161,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     prs_results_ordered = prs_results[['FID', 'IID', 'PRS_AVG']]
     with open(sscore_filename, 'w') as f:
         f.write('#' + '\t'.join(prs_results_ordered.columns) + '\n')
+        # FIX: Use a high-precision float format to avoid losing accuracy when writing to text.
         prs_results_ordered.to_csv(f, sep='\t', header=False, index=False, na_rep='NA', float_format='%.17g')
     print(f"...Ground truth PRS results written to {sscore_filename}")
 
@@ -170,7 +178,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     with open(prefix.with_suffix(".fam"), 'w') as f:
         for i in range(N_INDIVIDUALS):
             f.write(f"sample_{i+1} sample_{i+1} 0 0 0 -9\n")
-    
+
     bim_df = pd.DataFrame({
         'chr': variants_df['chr'],
         'id': variants_df['chr'].astype(str) + ':' + variants_df['pos'].astype(str),
@@ -178,7 +186,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
         'a1': variants_df['ref'], 'a2': variants_df['alt']
     })
     bim_df.to_csv(prefix.with_suffix(".bim"), sep='\t', header=False, index=False)
-    
+
     code_map = {0: 0b00, -1: 0b01, 1: 0b10, 2: 0b11}
     with open(prefix.with_suffix(".bed"), 'wb') as f:
         f.write(bytes([0x6c, 0x1b, 0x01]))
@@ -188,7 +196,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
                 for k, geno in enumerate(genotypes_with_missing[i, j:j+4]):
                     byte |= (code_map[geno] << (k * 2))
                 f.write(byte.to_bytes(1, 'little'))
-    
+
     print(f"...PLINK files written: {prefix}.bed/.bim/.fam")
 
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
@@ -219,7 +227,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
             {'chr': '1', 'id': '1:60000:T:C', 'cm': 0, 'pos': 60000, 'a1': 'T', 'a2': 'C'}
         ])
         bim_df = pd.DataFrame(bim_data)
-        
+
         score_data = [
             {'snp_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'simple_score': 0.5},
             {'snp_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'simple_score': -0.2},
@@ -295,14 +303,14 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     multiallelic_row = merged_df[merged_df['IID'] == 'id_multiallelic']
     other_rows = merged_df[merged_df['IID'] != 'id_multiallelic']
-    
+
     is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON']) and \
                    np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
     is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2']) and \
                   pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
     is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK']) and \
                    pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
-    
+
     all_ok = is_gnomon_ok and is_plink_ok and is_pylink_ok
 
     if all_ok:
@@ -324,7 +332,7 @@ def run_and_validate_tools(runtimes):
     PLINK2_BINARY_PATH = WORKDIR / "plink2"
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
     PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
-    
+
     overall_success = True
 
     def _print_header(title: str, char: str = "-"):
@@ -336,7 +344,7 @@ def run_and_validate_tools(runtimes):
         cmd_str = [str(c) for c in cmd]
         print(f"  > Command: {' '.join(cmd_str)}")
         print(f"  > CWD: {cwd}")
-        
+
         proc_env = os.environ.copy()
         if "gnomon" in str(cmd_str[0]):
             proc_env["RUST_BACKTRACE"] = "1"
@@ -401,7 +409,7 @@ def run_and_validate_tools(runtimes):
         except Exception as e:
             print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
             return False
-    
+
     def analyze_large_scale_results():
         _print_header("Step D: Analyzing and Comparing Large-Scale Simulation Results")
         try:
@@ -452,7 +460,7 @@ def run_and_validate_tools(runtimes):
 
     # --- Main execution flow for this function ---
     if not setup_tools(): return False
-    
+
     if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
         overall_success = False
 
@@ -464,12 +472,12 @@ def run_and_validate_tools(runtimes):
     if not run_command([GNOMON_BINARY_PATH, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR): overall_success = False
     if not run_command([f"./{PLINK2_BINARY_PATH.name}", "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "plink2_results"], "Large-Scale PLINK2", WORKDIR): overall_success = False
     if not run_command(["python3", PYLINK_SCRIPT_PATH.as_posix(), "--bfile", OUTPUT_PREFIX.name, "--score", OUTPUT_PREFIX.with_suffix(".gnomon.score").name, "--out", "pylink_results", "1", "2", "4"], "Large-Scale PyLink", WORKDIR): overall_success = False
-    
+
     # If any command failed, we can't analyze results. Return the current failure status.
     if not overall_success:
         print("\nSkipping large-scale analysis due to command failure.")
         return False
-        
+
     # Run analysis and update overall success status
     if not analyze_large_scale_results():
         overall_success = False
@@ -527,7 +535,7 @@ def main():
         import traceback
         traceback.print_exc()
         exit_code = 1
-        
+
     finally:
         # This block is GUARANTEED to run, regardless of success, failure, or exceptions.
         print_runtime_summary(runtimes)
@@ -535,14 +543,14 @@ def main():
             cleanup()
         else:
             print("\nSkipping cleanup because 'keep' argument was provided.")
-    
+
     if exit_code == 0:
         print("\n--- Full Simulation and Validation Pipeline Finished Successfully ---")
     else:
         # Use a generic error message as the specific reason for failure
         # has already been printed.
         print("\nError: Process completed with exit code 1.")
-        
+
     sys.exit(exit_code)
 
 if __name__ == "__main__":
