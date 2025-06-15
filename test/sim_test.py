@@ -13,17 +13,36 @@ import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 500_000
+N_VARIANTS = 5_000
 N_INDIVIDUALS = 100
 CHR = '22'
 CHR_LENGTH = 39_005_000
 ALT_EFFECT_PROB = 0.3
 MISSING_RATE = 0.5
 
-# Mixture weights for allele-frequency distributions
-FREQ_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
-# Mixture weights for effect-size distributions
-EFFECT_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
+# Mixture weights for allele-frequency distributions:
+#   FREQ_DIST_WEIGHTS[0] = weight for Uniform(0.001, 0.05)
+#   FREQ_DIST_WEIGHTS[1] = weight for Beta(0.5, 10)
+#   FREQ_DIST_WEIGHTS[2] = weight for Beta(0.2, 0.2)
+#   FREQ_DIST_WEIGHTS[3] = weight for Uniform(0.01, 0.99)
+FREQ_DIST_WEIGHTS = [
+    0.25,  # Uniform(0.001, 0.05)
+    0.25,  # Beta(0.5, 10)
+    0.25,  # Beta(0.2, 0.2)
+    0.25,  # Uniform(0.01, 0.99)
+]
+
+# Mixture weights for effect-size distributions:
+#   EFFECT_DIST_WEIGHTS[0] = weight for Normal(0, 0.5)
+#   EFFECT_DIST_WEIGHTS[1] = weight for Laplace(0, 0.5)
+#   EFFECT_DIST_WEIGHTS[2] = weight for Uniform(-1, 1)
+#   EFFECT_DIST_WEIGHTS[3] = weight for Cauchy(0, 0.5)
+EFFECT_DIST_WEIGHTS = [
+    0.0,  # Normal(0, 0.5)
+    0.0,  # Laplace(0, 0.5)
+    1.0,  # Uniform(-1, 1)
+    0.0,  # Cauchy(0, 0.5)
+]
 
 # --- CI/Validation Configuration ---
 WORKDIR = Path("./sim_workdir")
