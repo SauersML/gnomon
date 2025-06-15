@@ -13,7 +13,7 @@ import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 100
+N_VARIANTS = 5000
 N_INDIVIDUALS = 100
 CHR = '22'
 CHR_LENGTH = 39_005_000
