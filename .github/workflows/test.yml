@@ -148,7 +148,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2 multiprocessing
       - name: Make binary executable
         run: chmod +x target/release/gnomon
       - name: Run Simulation Test
