@@ -27,7 +27,7 @@ PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20
 DIMENSIONS = [
     {"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
     {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 15_000, "n_scores": 64},
-    {"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
+    {"test_type": "sparse", "n_variants": 4_000_000, "n_individuals": 150_000, "n_scores": 80},
     {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
     {
         "test_type": "dense_derived",
