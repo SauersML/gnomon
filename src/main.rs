@@ -395,7 +395,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let compute_handle = task::spawn_blocking(move || {
             // This is the state transition: the dirty buffers are consumed and zeroed,
             // producing clean buffers that are guaranteed to be ready for computation.
-            // This work now happens in parallel on a blocking-safe thread.
+            // This work happens in parallel on a blocking-safe thread.
             let mut clean_scores = dirty_scores_buffer.into_clean();
             let mut clean_counts = dirty_missing_counts_buffer.into_clean();
 
@@ -408,7 +408,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 &mut clean_counts,
                 &tile_pool_clone,
                 &sparse_index_pool_clone,
-                MatrixRowIndex(matrix_row_start),
+                // The `matrix_row_start` from `partition_point` is a `usize`, but the
+                // `MatrixRowIndex` type requires a `u32`. `try_into().unwrap()`
+                // performs a safe, explicit conversion that panics on overflow,
+                // preventing silent data corruption and upholding the design contract.
+                MatrixRowIndex(matrix_row_start.try_into().unwrap()),
                 snps_in_matrix_chunk,
                 bed_row_offset,
             )?;
