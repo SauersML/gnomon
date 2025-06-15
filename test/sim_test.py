@@ -7,7 +7,6 @@ import requests
 import zipfile
 import shutil
 import time
-import math
 import multiprocessing
 import gmpy2
 from pathlib import Path
@@ -21,7 +20,7 @@ ALT_EFFECT_PROB = 0.7
 MISSING_RATE = 0.10
 
 # Mixture weights for allele-frequency distributions
-FREQ_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]  # uniform rare, beta skew, beta U, uniform wide
+FREQ_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]   # uniform rare, beta skew, beta U, uniform wide
 # Mixture weights for effect-size distributions
 EFFECT_DIST_WEIGHTS = [0.4, 0.2, 0.2, 0.2]      # normal, laplace, uniform, cauchy
 
@@ -76,11 +75,11 @@ def sample_effect_sizes(n):
     w = np.empty(n)
     for i, c in enumerate(choices):
         if c == 0:
-            w[i] = np.random.normal(loc=0.0, scale=0.5)
+            w[i] = np.random.normal(0, 0.5)
         elif c == 1:
-            w[i] = np.random.laplace(loc=0.0, scale=0.5)
+            w[i] = np.random.laplace(0, 0.5)
         elif c == 2:
-            w[i] = np.random.uniform(-1.0, 1.0)
+            w[i] = np.random.uniform(-1, 1)
         else:
             w[i] = np.random.standard_cauchy() * 0.5
     return w
@@ -95,7 +94,7 @@ def sample_effect_alleles(n, ref, alt, af):
 
 def generate_variants_and_weights():
     """
-    FIRST: Simulate variant positions, allele frequencies, effect alleles, and effect sizes.
+    FIRST: Derives positions, allele frequencies, effect alleles, and effect sizes.
     """
     print(f"Step 1: Simulating {N_VARIANTS} variants on chr{CHR}...")
     positions = np.random.choice(np.arange(1, CHR_LENGTH + 1), N_VARIANTS, replace=False)
@@ -137,9 +136,8 @@ def generate_genotypes(variants_df):
     q = 1 - p
     hwe_probs = np.vstack([p**2, 2*p*q, q**2]).T
     rand_draws = np.random.rand(N_VARIANTS, N_INDIVIDUALS)
-    cum_probs = hwe_probs.cumsum(axis=1)
-    genotypes = (rand_draws > cum_probs[:, 0, np.newaxis]) + \
-                (rand_draws > cum_probs[:, 1, np.newaxis])
+    cum = hwe_probs.cumsum(axis=1)
+    genotypes = (rand_draws > cum[:, 0, np.newaxis]) + (rand_draws > cum[:, 1, np.newaxis])
 
     print("...Genotype simulation complete.")
     return genotypes.astype(int)
@@ -150,66 +148,63 @@ def introduce_missingness(genotypes):
     """
     print(f"Step 4: Introducing {MISSING_RATE*100:.1f}% missingness...")
     mask = np.random.rand(*genotypes.shape) < MISSING_RATE
-    genotypes_with_missing = genotypes.astype(float)
-    genotypes_with_missing[mask] = -1
-
+    g = genotypes.astype(float)
+    g[mask] = -1
     print("...Missingness introduced.")
-    return genotypes_with_missing.astype(int)
+    return g.astype(int)
 
 def calculate_ground_truth_prs(genotypes, variants_df):
     """
-    Calculates the 'ground truth' PRS using mixed effect sizes and high-precision sums.
+    Calculates the 'ground truth' polygenic score using parallel processing
+    and the gmpy2 library for ultra precision.
     """
-    print("Step 5: Calculating ground truth polygenic scores (ULTIMATE PRECISION, ACCELERATED)...")
-    effect_weights = variants_df['effect_weight'].values
-    is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
-    valid_mask = (genotypes != -1)
-    dosages = genotypes.astype(float)
-    dosages[~is_alt_effect, :] = 2 - dosages[~is_alt_effect, :]
-    score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
+    print("Step 5: Calculating ground truth polygenic scores (ULTIMATE PRECISION)...")
+    w = variants_df['effect_weight'].values
+    is_alt = (variants_df['effect_allele'] == variants_df['alt']).values
+    valid = (genotypes != -1)
+    dos = genotypes.astype(float)
+    dos[~is_alt, :] = 2 - dos[~is_alt, :]
+    comps = np.where(valid, dos * w[:, None], 0)
 
     print(f"    > Dispatching summations to {multiprocessing.cpu_count()} CPU cores...")
     with multiprocessing.Pool() as pool:
-        score_sums = pool.map(sum_column_precise, score_components.T)
+        sums = pool.map(sum_column_precise, comps.T)
 
-    variant_counts = valid_mask.sum(axis=0)
-    score_avg_list = [s / v if v != 0 else 0.0 for s, v in zip(score_sums, variant_counts)]
-    score_avg = np.array(score_avg_list, dtype=float)
-
+    counts = valid.sum(axis=0)
+    avg = np.array([s / c if c != 0 else 0.0 for s, c in zip(sums, counts)], dtype=float)
     results_df = pd.DataFrame({
-        'FID': [f"sample_{i+1}" for i in range(len(score_avg))],
-        'IID': [f"sample_{i+1}" for i in range(len(score_avg))],
-        'PRS_AVG': score_avg
+        'FID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
+        'IID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
+        'PRS_AVG': avg
     })
-
     print("...PRS calculation complete.")
     return results_df
 
 def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix: Path):
     """
-    Writes all output files: .truth.sscore, .gnomon.score, and PLINK bed/bim/fam.
+    Writes all specified output files to the workspace directory.
     """
     print(f"Step 6: Writing all output files to prefix '{prefix}'...")
 
     # a. Ground Truth .truth.sscore
-    sscore_filename = prefix.with_suffix(".truth.sscore")
+    truth_file = prefix.with_suffix(".truth.sscore")
     prs_results[['FID','IID','PRS_AVG']].to_csv(
-        sscore_filename, sep='\t', index=False, header=True, float_format='%.17g'
+        truth_file, sep='\t', index=False, header=True, float_format='%.17g'
     )
-    print(f"...Ground truth PRS results written to {sscore_filename}")
+    print(f"...Ground truth PRS results written to {truth_file}")
 
     # b. Gnomon-native .gnomon.score
-    gnomon_scorefile = prefix.with_suffix(".gnomon.score")
+    gnomon_file = prefix.with_suffix(".gnomon.score")
     gdf = variants_df.copy()
     gdf['snp_id'] = gdf['chr'].astype(str) + ':' + gdf['pos'].astype(str)
     gdf['other_allele'] = np.where(gdf['effect_allele']==gdf['ref'], gdf['alt'], gdf['ref'])
     gdf.rename(columns={'effect_weight':'simulated_score'}, inplace=True)
     gdf[['snp_id','effect_allele','other_allele','simulated_score']].to_csv(
-        gnomon_scorefile, sep='\t', index=False
+        gnomon_file, sep='\t', index=False
     )
-    print(f"...Gnomon-native scorefile written to {gnomon_scorefile}")
+    print(f"...Gnomon-native scorefile written to {gnomon_file}")
 
-    # c. PLINK bed/bim/fam
+    # c. PLINK fileset (.bed, .bim, .fam)
     fam_file = prefix.with_suffix(".fam")
     with open(fam_file,'w') as f:
         for i in range(N_INDIVIDUALS):
@@ -218,11 +213,9 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     bim_file = prefix.with_suffix(".bim")
     bim_df = pd.DataFrame({
         'chr': variants_df['chr'],
-        'id': variants_df['chr'].astype(str)+':'+variants_df['pos'].astype(str),
-        'cm': 0,
-        'pos': variants_df['pos'],
-        'a1': variants_df['ref'],
-        'a2': variants_df['alt']
+        'id': variants_df['chr'].astype(str) + ':' + variants_df['pos'].astype(str),
+        'cm': 0, 'pos': variants_df['pos'],
+        'a1': variants_df['ref'], 'a2': variants_df['alt']
     })
     bim_df.to_csv(bim_file, sep='\t', header=False, index=False)
 
@@ -238,7 +231,9 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
                 f.write(byte.to_bytes(1,'little'))
     print(f"...PLINK files written: {bed_file}, {bim_file}, {fam_file}")
 
-def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
+def run_simple_dosage_test(workdir: Path, gnomon_path: Path,
+                           plink_path: Path, pylink_path: Path,
+                           run_cmd_func):
     """
     Runs a complex, programmatically generated test case to check edge cases.
     Returns True if successful, False otherwise.
@@ -249,121 +244,120 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     print("="*80)
     print(f"Test files will be prefixed: {prefix}")
 
+    # Inner helper functions...
     def _generate_test_data():
-        individuals = ['id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person', 'id_special_case', 'id_multiallelic']
+        individuals = ['id_hom_ref','id_het','id_hom_alt',
+                       'id_new_person','id_special_case','id_multiallelic']
+        # Build bim and score data as in original...
         bim_data = [
-            {'chr': '1', 'id': '1:1000', 'cm': 0, 'pos': 1000, 'a1': 'A', 'a2': 'G'},
-            {'chr': '1', 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'},
-            {'chr': '1', 'id': '1:3000', 'cm': 0, 'pos': 3000, 'a1': 'A', 'a2': 'T'}
+            {'chr':'1','id':'1:1000','cm':0,'pos':1000,'a1':'A','a2':'G'},
+            {'chr':'1','id':'1:2000','cm':0,'pos':2000,'a1':'C','a2':'T'},
+            {'chr':'1','id':'1:3000','cm':0,'pos':3000,'a1':'A','a2':'T'}
         ]
         for i in range(50):
-            pos = 10000 + i
-            bim_data.append({'chr': '1', 'id': f'1:{pos}', 'cm': 0, 'pos': pos, 'a1': 'A', 'a2': 'T'})
+            pos = 10000+i
+            bim_data.append({'chr':'1','id':f'1:{pos}','cm':0,'pos':pos,'a1':'A','a2':'T'})
         bim_data.extend([
-            {'chr': '1', 'id': '1:50000:A:C', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'C'},
-            {'chr': '1', 'id': '1:50000:A:G', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'G'},
-            {'chr': '1', 'id': '1:60000:T:C', 'cm': 0, 'pos': 60000, 'a1': 'T', 'a2': 'C'}
+            {'chr':'1','id':'1:50000:A:C','cm':0,'pos':50000,'a1':'A','a2':'C'},
+            {'chr':'1','id':'1:50000:A:G','cm':0,'pos':50000,'a1':'A','a2':'G'},
+            {'chr':'1','id':'1:60000:T:C','cm':0,'pos':60000,'a1':'T','a2':'C'}
         ])
         bim_df = pd.DataFrame(bim_data)
 
         score_data = [
-            {'snp_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'simple_score': 0.5},
-            {'snp_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'simple_score': -0.2},
-            {'snp_id': '1:3000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': -0.7}
+            {'snp_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
+            {'snp_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
+            {'snp_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7}
         ]
         for i in range(50):
-            pos = 10000 + i
-            score_data.append({'snp_id': f'1:{pos}', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 0.1})
+            pos = 10000+i
+            score_data.append({'snp_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
         score_data.extend([
-            {'snp_id': '1:50000', 'effect_allele': 'A', 'other_allele': 'T', 'simple_score': 10.0},
-            {'snp_id': '1:60000', 'effect_allele': 'C', 'other_allele': 'T', 'simple_score': 1.0}
+            {'snp_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
+            {'snp_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
         ])
         score_df = pd.DataFrame(score_data)
 
         genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
-        genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
-        genotypes_df.loc['1:1000', 'id_het'] = 1
-        genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
-        genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
-        genotypes_df.loc['1:3000', 'id_new_person'] = 1
-        special_case_ids = [f'1:{10000+i}' for i in range(50)]
-        genotypes_df.loc[special_case_ids[:10], 'id_special_case'] = 0
-        genotypes_df.loc[special_case_ids[10:40], 'id_special_case'] = 1
-        genotypes_df.loc[special_case_ids[40:], 'id_special_case'] = 2
-        genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
+        # Assign test genotypes...
+        genotypes_df.loc['1:1000','id_hom_ref'] = 0
+        genotypes_df.loc['1:2000','id_hom_ref'] = 0
+        genotypes_df.loc['1:1000','id_het'] = 1
+        genotypes_df.loc['1:1000','id_hom_alt'] = 2
+        genotypes_df.loc['1:2000','id_hom_alt'] = 2
+        genotypes_df.loc['1:3000','id_new_person'] = 1
+        special_ids = [f'1:{10000+i}' for i in range(50)]
+        genotypes_df.loc[special_ids[:10],'id_special_case'] = 0
+        genotypes_df.loc[special_ids[10:40],'id_special_case'] = 1
+        genotypes_df.loc[special_ids[40:],'id_special_case'] = 2
+        genotypes_df.loc['1:50000:A:C','id_multiallelic'] = 1
+        genotypes_df.loc['1:50000:A:G','id_multiallelic'] = 1
+        genotypes_df.loc['1:60000:T:C','id_multiallelic'] = 1
+
         return bim_df, score_df, individuals, genotypes_df
 
     def _write_plink_files(prefix, bim_df, individuals, genotypes_df):
-        with open(prefix.with_suffix(".fam"), 'w') as f:
+        with open(prefix.with_suffix('.fam'),'w') as f:
             for iid in individuals:
                 f.write(f"{iid} {iid} 0 0 0 -9\n")
-        bim_df[['chr', 'id', 'cm', 'pos', 'a1', 'a2']].to_csv(
-            prefix.with_suffix(".bim"), sep='\t', header=False, index=False
+        bim_df[['chr','id','cm','pos','a1','a2']].to_csv(
+            prefix.with_suffix('.bim'), sep='\t', header=False, index=False
         )
-        code_map = {0:0b00, 1:0b10, 2:0b11, -1:0b01}
-        n_inds = len(individuals)
-        with open(prefix.with_suffix(".bed"), 'wb') as f:
+        code_map = {0:0b00,1:0b10,2:0b11,-1:0b01}
+        n = len(individuals)
+        with open(prefix.with_suffix('.bed'),'wb') as f:
             f.write(bytes([0x6c,0x1b,0x01]))
             for _, row in genotypes_df.iterrows():
-                for j in range(0, n_inds, 4):
-                    byte = 0
-                    for k, geno in enumerate(row.iloc[j:j+4]):
-                        byte |= (code_map[int(geno)] << (k*2))
-                    f.write(byte.to_bytes(1,'little'))
+                for j in range(0,n,4):
+                    b=0
+                    for k,geno in enumerate(row.iloc[j:j+4]):
+                        b |= (code_map[int(geno)]<<(k*2))
+                    f.write(b.to_bytes(1,'little'))
         print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
 
     def _write_score_file(filename, score_df):
         score_df.to_csv(filename, sep='\t', index=False)
         print(f"Programmatically wrote {filename}")
 
-    # Main simple test logic
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
-    truth_df = pd.DataFrame({'IID': individuals, 'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 1.0]})
+    truth_df = pd.DataFrame({'IID':individuals,'SCORE_TRUTH':[0.0,0.5,0.3,-0.7,0.1,1.0]})
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
-    _write_score_file(prefix.with_suffix(".score"), score_df)
+    _write_score_file(prefix.with_suffix('.score'), score_df)
 
-    # Run and validate commands...
-    if not run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
-                        "Simple Gnomon Test", cwd=workdir): return False
-    if not run_cmd_func([f"./{plink_path.name}", "--bfile", prefix.name,
-                        "--score", prefix.with_suffix(".score").name,
-                        "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"],
-                        "Simple PLINK2 Test", cwd=workdir): return False
-    if not run_cmd_func(["python3", pylink_path.as_posix(), "--precise", "--bfile", prefix.name,
-                        "--score", prefix.with_suffix(".score").name,
-                        "--out", "simple_pylink_results", "1", "2", "4"],
-                        "Simple PyLink Test", cwd=workdir): return False
+    if not run_cmd_func([gnomon_path,"--score",prefix.with_suffix('.score').name,prefix.name],
+                        "Simple Gnomon Test",cwd=workdir): return False
+    if not run_cmd_func([f"./{plink_path.name}","--bfile",prefix.name,
+                        "--score",prefix.with_suffix('.score').name,
+                        "1","2","4","header","no-mean-imputation","--out","simple_plink_results"],
+                        "Simple PLINK2 Test",cwd=workdir): return False
+    if not run_cmd_func(["python3",pylink_path.as_posix(),"--precise",
+                        "--bfile",prefix.name,"--score",prefix.with_suffix('.score').name,
+                        "--out","simple_pylink_results","1","2","4"],
+                        "Simple PyLink Test",cwd=workdir): return False
 
     print("\n--- Analyzing Simple Test Results ---")
-    gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t')\
-                      .rename(columns={'#IID':'IID','simple_score_AVG':'SCORE_GNOMON'})[['IID','SCORE_GNOMON']]
-    plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep=r'\s+')\
-                        .rename(columns={'#IID':'IID'})
-    plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PLINK2']]
-    pylink_results_raw = pd.read_csv(workdir / "simple_pylink_results.sscore", sep='\t')\
-                         .rename(columns={'#IID':'IID'})
-    pylink_results = pylink_results_raw.assign(SCORE_PYLINK=pylink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PYLINK']]
-    merged_df = (pd.merge(truth_df, gnomon_results, on='IID', how='left')
-                   .merge(plink_results, on='IID', how='left')
-                   .merge(pylink_results, on='IID', how='left'))
+    gnomon_res = pd.read_csv(workdir/"simple_test.sscore",sep='\t')\
+                    .rename(columns={'#IID':'IID','simple_score_AVG':'SCORE_GNOMON'})[['IID','SCORE_GNOMON']]
+    plink_raw = pd.read_csv(workdir/"simple_plink_results.sscore",sep=r'\s+')\
+                   .rename(columns={'#IID':'IID'})
+    plink_res = plink_raw.assign(SCORE_PLINK2=plink_raw['SCORE1_AVG']*2)[['IID','SCORE_PLINK2']]
+    pylink_raw = pd.read_csv(workdir/"simple_pylink_results.sscore",sep='\t')\
+                    .rename(columns={'#IID':'IID'})
+    pylink_res = pylink_raw.assign(SCORE_PYLINK=pylink_raw['SCORE1_AVG']*2)[['IID','SCORE_PYLINK']]
 
+    merged = truth_df.merge(gnomon_res,on='IID',how='left')\
+                     .merge(plink_res,on='IID',how='left')\
+                     .merge(pylink_res,on='IID',how='left')
     print("\n--- Comparison of Scores ---")
-    print(merged_df.to_markdown(index=False, floatfmt=".6f"))
+    print(merged.to_markdown(index=False,floatfmt=".6f"))
 
-    multiallelic_row = merged_df[merged_df['IID'] == 'id_multiallelic']
-    other_rows = merged_df[merged_df['IID'] != 'id_multiallelic']
+    mult = merged[merged['IID']=='id_multiallelic']
+    other = merged[merged['IID']!='id_multiallelic']
+    ok_g = np.allclose(other['SCORE_TRUTH'],other['SCORE_GNOMON']) and np.allclose(mult['SCORE_TRUTH'],mult['SCORE_GNOMON'])
+    ok_p = np.allclose(other['SCORE_TRUTH'],other['SCORE_PLINK2']) and pd.isna(mult['SCORE_PLINK2'].iloc[0])
+    ok_py= np.allclose(other['SCORE_TRUTH'],other['SCORE_PYLINK']) and pd.isna(mult['SCORE_PYLINK'].iloc[0])
 
-    is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON']) \
-                   and np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
-    is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2']) \
-                  and pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
-    is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK']) \
-                   and pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
-
-    if all([is_gnomon_ok, is_plink_ok, is_pylink_ok]):
+    if ok_g and ok_p and ok_py:
         print("\n✅ Simple Dosage Test Successful")
         return True
     else:
@@ -380,29 +374,26 @@ def run_and_validate_tools(runtimes):
     PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
     overall_success = True
 
-    def _print_header(title: str, char: str = "-"):
-        width = 70
-        print(f"\n{char*4} {title} {'-'*(width - len(title) - 5)}")
+    def _print_header(title):
+        print(f"\n---- {title} {'-'*(60-len(title))}")
 
-    def run_command(cmd, step_name, cwd):
-        _print_header(f"Executing: {step_name}")
-        proc_env = os.environ.copy()
-        if "gnomon" in str(cmd[0]):
-            proc_env["RUST_BACKTRACE"] = "1"
+    def run_command(cmd, step, cwd):
+        _print_header(f"Executing: {step}")
+        env = os.environ.copy()
+        if "gnomon" in str(cmd[0]): env["RUST_BACKTRACE"] = "1"
         start = time.monotonic()
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=proc_env, timeout=600)
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-        success = (result.returncode == 0)
-        if success and "Large-Scale" in step_name:
-            runtimes.append({"Method": step_name.split()[-1], "Runtime (s)": time.monotonic() - start})
-        return success
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=env, timeout=600)
+        print(res.stdout)
+        if res.stderr: print(res.stderr)
+        ok = (res.returncode == 0)
+        if ok and "Large-Scale" in step:
+            runtimes.append({"Method": step.split()[-1], "Runtime (s)": time.monotonic() - start})
+        return ok
 
     def setup_tools():
         _print_header("Step A: Setting up tools")
         if not GNOMON_BINARY_PATH.exists():
-            print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'.")
+            print(f"  > ERROR: Gnomon binary not found: {GNOMON_BINARY_PATH}")
             return False
         if not PLINK2_BINARY_PATH.exists():
             print("  > Downloading PLINK2...")
@@ -418,35 +409,31 @@ def run_and_validate_tools(runtimes):
 
     def analyze_large_scale_results():
         _print_header("Step D: Analyzing Large-Scale Results")
-        truth_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep="\t")\
-                     .rename(columns={"#FID":"FID","PRS_AVG":"SCORE_TRUTH"})[["IID","SCORE_TRUTH"]]
-        gnomon_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".gnomon.score"), sep="\t")\
-                      .rename(columns={"simulated_score_AVG":"SCORE_GNOMON"})[["IID","SCORE_GNOMON"]]
-        plink2_raw = pd.read_csv(WORKDIR/"plink2_results.sscore", sep=r"\s+")\
-                      .rename(columns={"#IID":"IID"})
-        plink2_df = plink2_raw.assign(SCORE_PLINK2=plink2_raw["SCORE1_AVG"]*2)[["IID","SCORE_PLINK2"]]
-        pylink_raw = pd.read_csv(WORKDIR/"pylink_results.sscore", sep="\t")\
-                      .rename(columns={"#IID":"IID"})
-        pylink_df = pylink_raw.assign(SCORE_PYLINK=pylink_raw["SCORE1_AVG"]*2)[["IID","SCORE_PYLINK"]]
-        merged = truth_df.merge(gnomon_df,on="IID").merge(plink2_df,on="IID").merge(pylink_df,on="IID")
-        corr = merged[["SCORE_TRUTH","SCORE_GNOMON","SCORE_PLINK2","SCORE_PYLINK"]].corr()
+        # Read ground truth
+        truth = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t')\
+                  .rename(columns={'#FID':'FID'})[['IID','PRS_AVG']].rename(columns={'PRS_AVG':'SCORE_TRUTH'})
+        # Read gnomon .sscore output
+        gnomon_out = pd.read_csv(OUTPUT_PREFIX.with_suffix(".sscore"), sep='\t')\
+                       .rename(columns={'#IID':'IID','PRS1_AVG':'SCORE_GNOMON'})[['IID','SCORE_GNOMON']]
+        plink2_raw = pd.read_csv(WORKDIR/"plink2_results.sscore", sep=r'\s+')\
+                        .rename(columns={'#IID':'IID'})
+        plink2 = plink2_raw.assign(SCORE_PLINK2=plink2_raw['SCORE1_AVG']*2)[['IID','SCORE_PLINK2']]
+        pylink_raw = pd.read_csv(WORKDIR/"pylink_results.sscore", sep='\t')\
+                        .rename(columns={'#IID':'IID'})
+        pylink = pylink_raw.assign(SCORE_PYLINK=pylink_raw['SCORE1_AVG']*2)[['IID','SCORE_PYLINK']]
+        merged = truth.merge(gnomon_out,on='IID').merge(plink2,on='IID').merge(pylink,on='IID')
+
+        corr = merged[['SCORE_TRUTH','SCORE_GNOMON','SCORE_PLINK2','SCORE_PYLINK']].corr()
         print(corr.to_markdown(floatfmt=".8f"))
         mad = lambda a,b: (a-b).abs().mean()
-        m_g = mad(merged.SCORE_TRUTH, merged.SCORE_GNOMON)
-        m_p = mad(merged.SCORE_TRUTH, merged.SCORE_PLINK2)
-        m_py= mad(merged.SCORE_TRUTH, merged.SCORE_PYLINK)
-        ok_g = corr.loc["SCORE_TRUTH","SCORE_GNOMON"]>CORR_THRESHOLD and m_g<MAD_THRESHOLD
-        ok_p = corr.loc["SCORE_TRUTH","SCORE_PLINK2"]>CORR_THRESHOLD and m_p<MAD_THRESHOLD
-        ok_py= corr.loc["SCORE_TRUTH","SCORE_PYLINK"]>CORR_THRESHOLD and m_py<MAD_THRESHOLD
-        if ok_g and ok_p and ok_py:
-            print("✅ Large-Scale Validation SUCCESS")
-            return True
-        else:
-            print("❌ Large-Scale Validation FAILED")
-            return False
+        m_g,m_p,m_py = mad(merged.SCORE_TRUTH,merged.SCORE_GNOMON), mad(merged.SCORE_TRUTH,merged.SCORE_PLINK2), mad(merged.SCORE_TRUTH,merged.SCORE_PYLINK)
+        ok = (corr.loc['SCORE_TRUTH','SCORE_GNOMON']>CORR_THRESHOLD and m_g<MAD_THRESHOLD and
+              corr.loc['SCORE_TRUTH','SCORE_PLINK2']>CORR_THRESHOLD and m_p<MAD_THRESHOLD and
+              corr.loc['SCORE_TRUTH','SCORE_PYLINK']>CORR_THRESHOLD and m_py<MAD_THRESHOLD)
+        return ok
 
     if not setup_tools(): return False
-    if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
+    if not run_simple_dosage_test(WORKDIR,GNOMON_BINARY_PATH,PLINK2_BINARY_PATH,PYLINK_SCRIPT_PATH,run_command):
         overall_success = False
 
     print("\n" + "="*80)
@@ -467,8 +454,9 @@ def run_and_validate_tools(runtimes):
                        "Large-Scale PyLink",WORKDIR):
         overall_success = False
 
-    if overall_success and not analyze_large_scale_results():
-        overall_success = False
+    if overall_success:
+        if not analyze_large_scale_results():
+            overall_success = False
 
     return overall_success
 
@@ -508,7 +496,6 @@ def main():
         prs_df = calculate_ground_truth_prs(gen_missing, variants_df)
         write_output_files(prs_df, variants_df, gen_missing, OUTPUT_PREFIX)
         print("--- Simulation and File Writing Finished Successfully ---")
-
         if not run_and_validate_tools(runtimes):
             exit_code = 1
 
