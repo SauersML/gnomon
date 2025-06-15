@@ -264,7 +264,7 @@ fn process_tile(
     let zeros_f32 = f32x8::splat(0.0);
 
     for snp_idx in 0..snps_in_chunk {
-        let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx;
+            let global_matrix_row_idx = (matrix_row_start_idx.0 as usize) + snp_idx;
         let row_offset = global_matrix_row_idx * stride;
         let weight_row = &weights_matrix[row_offset..row_offset + stride];
         let flip_row = &flip_mask_matrix[row_offset..row_offset + stride];
@@ -357,7 +357,7 @@ fn process_tile(
                     },
                     3 => {
                         let snp_idx_in_chunk = snp_mini_batch_start + snp_idx_in_mini_batch;
-                        let global_matrix_row_idx = matrix_row_start_idx.0 + snp_idx_in_chunk;
+                                let global_matrix_row_idx = matrix_row_start_idx.0 as usize + snp_idx_in_chunk;
                         let scores_for_this_variant =
                             &prep_result.variant_to_scores_map[global_matrix_row_idx];
                         let weight_row_offset = global_matrix_row_idx * stride;
@@ -388,7 +388,7 @@ fn process_tile(
         }
 
         // --- B. Create Matrix Views for the Mini-Batch ---
-        let matrix_row_offset = matrix_row_start_idx.0 + snp_mini_batch_start;
+                let matrix_row_offset = matrix_row_start_idx.0 as usize + snp_mini_batch_start;
         let matrix_slice_start = matrix_row_offset * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
         let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
@@ -488,9 +488,9 @@ fn pivot_tile(
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
                 let variant_idx_in_chunk = snp_chunk_start + i;
-                    let global_matrix_row_idx = matrix_row_start_idx.0 + variant_idx_in_chunk;
+                        let global_matrix_row_idx = matrix_row_start_idx.0 as usize + variant_idx_in_chunk;
                 let absolute_bed_row = prep_result.required_bim_indices[global_matrix_row_idx];
-                    let relative_bed_row = absolute_bed_row.0 - chunk_bed_row_offset;
+                        let relative_bed_row = absolute_bed_row.0 as usize - chunk_bed_row_offset;
                 let snp_byte_offset = relative_bed_row as u64 * bytes_per_snp;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
 
@@ -516,16 +516,22 @@ fn pivot_tile(
                 let dest_offset = person_idx_in_block * snps_in_chunk + snp_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
 
-                // UNIFIED PATH: Always un-shuffle the transposed vector to write sequential data.
-                // This loop is correct for both full and partial chunks. For `current_snps=8`,
-                // the compiler unrolls this into optimal, branch-free code
-                for j in 0..current_snps {
-                    let dosage_from_shuffled_pos = shuffled_person_row[UNSHUFFLE_MAP[j]];
-                    // SAFETY: `dest_offset + j` is guaranteed to be in-bounds by the loop condition
-                    // and the tile allocation size.
-                    *unsafe { tile.get_unchecked_mut(dest_offset + j) } =
-                        EffectAlleleDosage(dosage_from_shuffled_pos);
-                }
+                        // OPTIMIZATION: Assemble the final row on the stack, then do a single bulk copy.
+                        // This removes the previous `unsafe` block, replacing it with a safe,
+                        // bounds-checked copy that is often optimized to a single instruction.
+
+                        // 1. Create a small, stack-allocated buffer for the unshuffled row.
+                        let mut temp_row = [EffectAlleleDosage::default(); SIMD_LANES];
+
+                        // 2. Un-shuffle the transposed vector into the temporary buffer.
+                            for j in 0..current_snps {
+                            let dosage_value = shuffled_person_row[UNSHUFFLE_MAP[j]];
+                            temp_row[j] = EffectAlleleDosage(dosage_value);
+                            }
+
+                        // 3. Perform a single, bulk copy into the main tile.
+                        tile[dest_offset..dest_offset + current_snps]
+                            .copy_from_slice(&temp_row[..current_snps]);
             }
         }
     }

@@ -155,9 +155,6 @@ pub struct PreparationResult {
     /// The padded width of one row in the matrices. This is always a multiple of
     /// the SIMD lane count and is essential for correct, safe memory access.
     stride: usize,
-    /// A fast, O(1) lookup map to connect a sparse, original `.bim` file row
-    /// index to its dense row index in our compiled matrices.
-    bim_row_to_matrix_row: Vec<Option<MatrixRowIndex>>,
     /// The sorted list of original `.bim` row indices that are required for this
     /// calculation. This is used by the orchestrator to identify relevant chunks
     /// of the `.bed` file.
@@ -199,7 +196,6 @@ impl PreparationResult {
         weights_matrix: Vec<f32>,
         flip_mask_matrix: Vec<u8>,
         stride: usize,
-        bim_row_to_matrix_row: Vec<Option<MatrixRowIndex>>,
         required_bim_indices: Vec<BimRowIndex>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
@@ -216,7 +212,6 @@ impl PreparationResult {
             weights_matrix,
             flip_mask_matrix,
             stride,
-            bim_row_to_matrix_row,
             required_bim_indices,
             score_names,
             score_variant_counts,
@@ -248,10 +243,6 @@ impl PreparationResult {
         self.stride
     }
 
-    #[inline(always)]
-    pub fn bim_row_to_matrix_row(&self) -> &[Option<MatrixRowIndex>] {
-        &self.bim_row_to_matrix_row
-    }
 }
 
 // ========================================================================================
@@ -267,14 +258,17 @@ impl PreparationResult {
 pub struct OriginalPersonIndex(pub u32);
 
 /// An index into the original, full .bim file.
+/// This wraps a u32, which is sufficient for >4 billion variants and halves the
+/// memory usage of index vectors on 64-bit systems compared to usize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct BimRowIndex(pub usize);
+pub struct BimRowIndex(pub u32);
 
 /// An index into the dense, reconciled matrices (`weights_matrix`, `flip_mask_matrix`).
+/// This wraps a u32, which is sufficient for >4 billion variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct MatrixRowIndex(pub usize);
+pub struct MatrixRowIndex(pub u32);
 
 /// An index corresponding to a specific score (a column in the conceptual matrix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

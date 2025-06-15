@@ -13,6 +13,7 @@ use crate::types::{
     BimRowIndex, MatrixRowIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
 };
 use ahash::{AHashMap, AHashSet};
+use nonmax::NonMaxU32;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -125,10 +126,13 @@ pub fn prepare_for_computation(
         return Err(PrepError::NoOverlappingVariants);
     }
 
-    let mut required_bim_indices: Vec<BimRowIndex> = required_bim_indices_set.into_iter().collect();
+                let mut required_bim_indices: Vec<BimRowIndex> =
+                    required_bim_indices_set.into_iter().collect();
     required_bim_indices.sort_unstable();
     let num_reconciled_variants = required_bim_indices.len();
 
+                // This map is an intermediate product that uses niche-optimization for memory efficiency.
+                // It maps from the original .bim row index to a dense matrix row index.
     let bim_row_to_matrix_row_map =
         build_bim_to_matrix_map(&required_bim_indices, total_snps_in_bim);
     let score_name_to_col_index: AHashMap<&str, ScoreColumnIndex> = score_names
@@ -212,7 +216,7 @@ pub fn prepare_for_computation(
         // To find the human-readable snp_id, we map from our internal dense matrix row
         // index back to the original .bim file row index, and then use the reverse
         // map to find the snp_id string.
-        let bim_row = required_bim_indices[bad_item.matrix_row.0];
+                let bim_row = required_bim_indices[bad_item.matrix_row.0 as usize];
         let snp_id = bim_row_to_snp_id
             .get(&bim_row)
             .unwrap_or(&"unknown variant");
@@ -241,7 +245,7 @@ pub fn prepare_for_computation(
         .zip(flip_mask_matrix.par_chunks_mut(stride))
         .enumerate()
         .for_each(|(row_idx, (weights_slice, flip_slice))| {
-            let matrix_row = MatrixRowIndex(row_idx);
+                    let matrix_row = MatrixRowIndex(row_idx as u32);
             let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
             let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
             let items_for_this_row = &work_items[first_item_pos..first_after_pos];
@@ -261,7 +265,6 @@ pub fn prepare_for_computation(
         weights_matrix,
         flip_mask_matrix,
         stride,
-        bim_row_to_matrix_row_map,
         required_bim_indices,
         score_names,
         score_variant_counts,
@@ -288,11 +291,14 @@ fn process_match(
     bim_row_index: BimRowIndex,
     effect_allele: &str,
     weights: &AHashMap<String, f32>,
-    bim_row_to_matrix_row_map: &[Option<MatrixRowIndex>],
+    bim_row_to_matrix_row_map: &[Option<NonMaxU32>],
     score_name_to_col_index: &AHashMap<&str, ScoreColumnIndex>,
     work_for_position: &mut Vec<WorkItem>,
 ) {
-    if let Some(matrix_row) = bim_row_to_matrix_row_map[bim_row_index.0] {
+    // This map uses Option<NonMaxU32> for memory efficiency (4 bytes vs 16).
+    // If a mapping exists, we get the inner `u32` and construct a type-safe `MatrixRowIndex`.
+    if let Some(non_max_index) = bim_row_to_matrix_row_map[bim_row_index.0 as usize] {
+        let matrix_row = MatrixRowIndex(non_max_index.get());
         let reconciliation = if effect_allele == &bim_record.allele2 {
             Reconciliation::Identity
         } else {
@@ -340,7 +346,7 @@ fn index_bim_file(
             bim_index
                 .entry(key)
                 .or_insert_with(Vec::new)
-                .push((record, BimRowIndex(i)));
+                        .push((record, BimRowIndex(i as u32)));
         }
     }
     Ok((bim_index, total_lines))
@@ -491,11 +497,14 @@ fn discover_required_bim_indices(
 fn build_bim_to_matrix_map(
     required_bim_indices: &[BimRowIndex],
     total_bim_snps: usize,
-) -> Vec<Option<MatrixRowIndex>> {
+) -> Vec<Option<NonMaxU32>> {
     let mut bim_row_to_matrix_row = vec![None; total_bim_snps];
     for (matrix_row_idx, &bim_row) in required_bim_indices.iter().enumerate() {
-        if bim_row.0 < total_bim_snps {
-            bim_row_to_matrix_row[bim_row.0] = Some(MatrixRowIndex(matrix_row_idx));
+        if (bim_row.0 as usize) < total_bim_snps {
+            // Create a NonMaxU32, which is guaranteed not to be u32::MAX. This is safe as
+            // the number of variants will not approach this limit.
+            let non_max_index = NonMaxU32::new(matrix_row_idx as u32).unwrap();
+            bim_row_to_matrix_row[bim_row.0 as usize] = Some(non_max_index);
         }
     }
     bim_row_to_matrix_row
