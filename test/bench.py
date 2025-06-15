@@ -24,23 +24,19 @@ PLINK2_BINARY_REL = WORKDIR / "plink2"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 # --- Benchmark Workloads ---
-# The list of benchmark scenarios to run.
-# A new 'dense_derived' test is added to probe gnomon's performance on
-# computationally dense, SIMD-friendly workloads.
+n's performance on
 DIMENSIONS = [
-    # --- Standard Sparse Workloads ---
-    #{"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
-    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 15_000, "n_scores": 50},
-    #{"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
-    #{"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
-    # --- Dense Workload for Gnomon's Strengths ---
+    {"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
+    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 15_000, "n_scores": 64},
+    {"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
+    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
     {
         "test_type": "dense_derived",
         "n_variants": 500_000,
-        "n_individuals": 5_000,
-        "n_basis_scores": 8,      # SIMD-friendly number of basis traits
-        "n_derived_scores": 64,   # Create many derived scores from the basis
-        "n_scores": 64            # Keep for compatibility with reporting
+        "n_individuals": 15_000,
+        "n_basis_scores": 8,
+        "n_derived_scores": 64,
+        "n_scores": 64
     },
 ]
 
