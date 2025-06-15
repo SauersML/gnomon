@@ -13,7 +13,7 @@ import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 5000
+N_VARIANTS = 50000
 N_INDIVIDUALS = 100
 CHR = '22'
 CHR_LENGTH = 39_005_000
@@ -95,7 +95,7 @@ def sample_effect_sizes(n):
     w = np.empty(n)
     for i, c in enumerate(choices):
         if c == 0:
-            w[i] = np.random.normal(0, 0.00000001)
+            w[i] = np.random.normal(0, 0.0001)
         elif c == 1:
             w[i] = np.random.laplace(0, 0.5)
         elif c == 2:
