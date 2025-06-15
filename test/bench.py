@@ -283,7 +283,7 @@ class RealisticDataGenerator:
                 final_score_df[f"score_{sf_config['name']}_{i+1}"] = weights
 
             score_file_path = self.run_prefix.with_suffix(f".{sf_config['name']}.score")
-            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.6g', na_rep='')
+            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.6g', na_rep='NA')
             generated_paths.append(score_file_path)
             
         return generated_paths
