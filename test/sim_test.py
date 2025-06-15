@@ -8,6 +8,8 @@ import zipfile
 import shutil
 import time
 import math
+import multiprocessing
+import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
@@ -24,6 +26,19 @@ OUTPUT_PREFIX = WORKDIR / "simulated_data"
 # New validation thresholds
 CORR_THRESHOLD = 0.99999
 MAD_THRESHOLD = 0.00001
+
+
+# --- HELPER FUNCTION FOR PARALLEL PROCESSING (MUST BE AT TOP LEVEL) ---
+def sum_column_precise(col):
+    """
+    A worker function for multiprocessing. It sums a single column of floats
+    using the ultra-precise and fast gmpy2 library.
+    """
+    # Set precision for this worker process (in BITS). 256 bits is ~77 decimal digits.
+    gmpy2.get_context().precision = 256
+    
+    # Sum the column by converting each float to a gmpy2 high-precision number
+    return sum(gmpy2.mpfr(f) for f in col)
 
 
 def generate_variants_and_weights():
@@ -92,51 +107,41 @@ def introduce_missingness(genotypes):
 
 def calculate_ground_truth_prs(genotypes, variants_df):
     """
-    Calculates the 'ground truth' polygenic score for each individual using a
-    vectorized, high-precision method.
+    Calculates the 'ground truth' polygenic score using parallel processing
+    and the gmpy2 library for the fastest possible ULTIMATE precision.
     """
-    print("Step 5: Calculating ground truth polygenic scores (high-precision)...")
+    print("Step 5: Calculating ground truth polygenic scores (ULTIMATE PRECISION, ACCELERATED)...")
     
-    # --- 1. Vectorized Data Preparation ---
+    # --- 1. Vectorized Data Preparation (Fast NumPy part) ---
     effect_weights = variants_df['effect_weight'].values
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
-    
     valid_mask = (genotypes != -1)
-    
     dosages = genotypes.astype(float)
-    
-    # **FIXED LINE**: Select all rows where the ref allele is the effect allele
-    # and update all individuals for those rows.
     rows_to_flip = ~is_alt_effect
     dosages[rows_to_flip, :] = 2 - dosages[rows_to_flip, :]
-    
-    # --- 2. High-Precision Score Calculation ---
-    # Reshape weights for broadcasting and calculate score components
-    # Set component to 0 for missing genotypes so it doesn't affect the sum
     score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
 
-    # Use math.fsum for a high-precision sum for each individual (column-wise)
-    # This avoids the floating-point error accumulation of np.sum()
-    score_sums = np.array([math.fsum(col) for col in score_components.T])
+    # --- 2. Parallelized, High-Precision Summation (The Acceleration) ---
+    print(f"    > Dispatching summations to {multiprocessing.cpu_count()} CPU cores...")
+    with multiprocessing.Pool() as pool:
+        # The map function applies `sum_column_precise` to each column.
+        score_sums = pool.map(sum_column_precise, score_components.T)
 
-    # --- 3. Final Averaging ---
-    # Count the number of valid (non-missing) variants for each individual
+    # --- 3. Final Averaging & Formatting ---
     variant_counts = valid_mask.sum(axis=0)
-
-    # Calculate the average score, handling the case of zero valid variants
     score_avg = np.divide(score_sums, variant_counts, 
                           out=np.zeros_like(score_sums, dtype=float), 
                           where=(variant_counts != 0))
 
-    # --- 4. Format Output ---
     results_df = pd.DataFrame({
-        'FID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
-        'IID': [f"sample_{i+1}" for i in range(N_INDIVIDUALS)],
+        'FID': [f"sample_{i+1}" for i in range(len(score_avg))],
+        'IID': [f"sample_{i+1}" for i in range(len(score_avg))],
         'PRS_AVG': score_avg
     })
     
     print("...PRS calculation complete.")
     return results_df
+
 
 def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix: Path):
     """
@@ -149,7 +154,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     prs_results_ordered = prs_results[['FID', 'IID', 'PRS_AVG']]
     with open(sscore_filename, 'w') as f:
         f.write('#' + '\t'.join(prs_results_ordered.columns) + '\n')
-        prs_results_ordered.to_csv(f, sep='\t', header=False, index=False, na_rep='NA')
+        prs_results_ordered.to_csv(f, sep='\t', header=False, index=False, na_rep='NA', float_format='%.17g')
     print(f"...Ground truth PRS results written to {sscore_filename}")
 
     # b. Gnomon-native Scorefile
