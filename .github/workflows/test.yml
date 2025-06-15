@@ -11,7 +11,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  PYTHON_VERSION: '3.13'
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
@@ -37,13 +36,10 @@ jobs:
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
           
-          # Date for weekly cache rotation
-          echo "week=$(/bin/date -u '+%Y-%U')" >> $GITHUB_OUTPUT
-          
           echo "Source hash: $SOURCE_HASH"
           echo "Deps hash: $DEPS_HASH"
 
-      # Cache release binary
+      # Try to restore the release binary from cache
       - name: Cache release binary
         id: binary_cache
         uses: actions/cache@v4
@@ -51,8 +47,6 @@ jobs:
           path: |
             target/release/gnomon
           key: ${{ runner.os }}-release-binary-${{ steps.cache_keys.outputs.source_hash }}
-          restore-keys: |
-            ${{ runner.os }}-release-binary-
 
       # Cache Cargo registry (dependencies)
       - name: Cache Cargo registry
@@ -78,13 +72,13 @@ jobs:
             ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
             ${{ runner.os }}-cargo-build-nightly-
 
-      # Cache getdoc binary separately
+      # Cache getdoc binary
       - name: Cache getdoc
         id: getdoc_cache
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/getdoc
-          key: ${{ runner.os }}-getdoc-${{ steps.cache_keys.outputs.week }}
+          key: ${{ runner.os }}-getdoc-v1
 
       - name: Install getdoc
         if: steps.getdoc_cache.outputs.cache-hit != 'true'
@@ -103,14 +97,14 @@ jobs:
           echo "=== Custom Report (getdoc) ==="
           cat report.md
 
-      # Build only if binary cache miss
+      # Only build if binary cache miss
       - name: Build Gnomon release binary
         if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           echo "Binary cache miss - building release binary..."
           cargo build --release
 
-      # Verify cached binary
+      # If cache hit, just verify the binary exists and is executable
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
         run: |
@@ -127,14 +121,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
+          # We upload the whole target directory so the path is identical in the next jobs
           path: |
-            target/release/gnomon
+            target
             report.md
           retention-days: 1
-          compression-level: 9
 
   # ======================================================================
-  # JOB 2: Runs the first Python test (integration)
+  # JOB 2: Runs the first Python test on its own machine.
   # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
@@ -142,46 +136,39 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      # Cache pip dependencies
-      - name: Get pip cache dir
-        id: pip-cache
-        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pip-cache.outputs.dir }}
-          key: ${{ runner.os }}-pip-integration-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-integration-
-            ${{ runner.os }}-pip-
-
+      
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
-          path: .
-
+          path: . # This recreates the 'target' folder and 'report.md' right here
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+      
+      # Cache pip packages
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('test/test.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-integration-
+            ${{ runner.os }}-pip-
+      
       - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip wheel setuptools
-          pip install pandas numpy requests psutil tabulate polars pyarrow
-
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      
       - name: Make binary executable
         run: chmod +x target/release/gnomon
-
+      
       - name: Run Integration Test
         run: python -u test/test.py
 
   # ======================================================================
-  # JOB 3: Runs the simulation test
+  # JOB 3: Runs the second Python test on a third machine.
   # ======================================================================
   python_test_simulation:
     runs-on: ubuntu-latest
@@ -189,101 +176,82 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      # Cache pip dependencies
-      - name: Get pip cache dir
-        id: pip-cache
-        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pip-cache.outputs.dir }}
-          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-simulation-
-            ${{ runner.os }}-pip-
-
+      
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
           path: .
-
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+      
+      # Cache pip packages
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('test/sim_test.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-simulation-
+            ${{ runner.os }}-pip-
+      
       - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip wheel setuptools
-          pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
-
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+      
       - name: Make binary executable
         run: chmod +x target/release/gnomon
-
+      
       - name: Run Simulation Test
-        id: sim_test
+        id: sim_test # ID to reference this step's outcome
         run: python -u test/sim_test.py
 
       - name: Check for OOM Kill on Failure
-        if: failure()
+        if: failure() # This condition means the step only runs if the previous step failed
         run: |
           echo "The simulation test failed. Checking for Out-of-Memory (OOM) errors in kernel logs..."
+          # Dump kernel logs and search for OOM messages.
+          # The '|| true' part ensures this step doesn't fail if grep finds no matches.
           sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found in dmesg. The failure was likely due to another reason."
 
   # ======================================================================
-  # JOB 4: Runs the benchmark test with 8 CPUs
+  # JOB 4: Runs the benchmark test
   # ======================================================================
   python_test_benchmark:
-    runs-on: ubuntu-latest-8-cores  # Request 8-core runner
+    runs-on: ubuntu-latest
     needs: build_and_test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      # Cache pip dependencies
-      - name: Get pip cache dir
-        id: pip-cache
-        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pip-cache.outputs.dir }}
-          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-benchmark-
-            ${{ runner.os }}-pip-
-
+      
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
           path: .
-
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+      
+      # Cache pip packages
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('test/bench.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-benchmark-
+            ${{ runner.os }}-pip-
+      
       - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip wheel setuptools
-          pip install pandas numpy requests psutil tabulate polars pyarrow
-
+        run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      
       - name: Make binary executable
         run: chmod +x target/release/gnomon
-
-      - name: Show CPU info
-        run: |
-          echo "=== CPU Information ==="
-          nproc
-          lscpu | grep -E '^CPU\(s\):|^Model name:|^Thread\(s\) per core:|^Core\(s\) per socket:'
-
+      
       - name: Run Benchmark Test
-        run: |
-          python -u test/bench.py
+        run: python -u test/bench.py
