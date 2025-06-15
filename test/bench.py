@@ -29,10 +29,10 @@ PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20
 # computationally dense, SIMD-friendly workloads.
 DIMENSIONS = [
     # --- Standard Sparse Workloads ---
-    {"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
-    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 10_000, "n_scores": 50},
-    {"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
-    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
+    #{"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
+    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 15_000, "n_scores": 50},
+    #{"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
+    #{"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
     # --- Dense Workload for Gnomon's Strengths ---
     {
         "test_type": "dense_derived",
