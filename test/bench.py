@@ -32,12 +32,12 @@ DIMENSIONS = [
 
 # --- Data Realism & Variety Parameters ---
 AF_DISTRIBUTIONS = [
-    ('beta', 0.2, 0.2),      # U-shaped: mix of rare and common
-    ('uniform', 0.05, 0.5),  # Mostly common
+    ('beta', 0.2, 0.2),      # U-shaped: mix of rare and common (simulates WGS)
+    ('uniform', 0.05, 0.5),  # Mostly common (simulates genotyping arrays)
 ]
 EFFECT_DISTRIBUTIONS = [
     ('normal', 0, 0.001),   # Simulates a dense polygenic score
-    ('laplace', 0, 0.05),   # Simulates a score with sparse, larger
+    ('laplace', 0, 0.05),   # Simulates a score with sparse, larger "GWAS hits"
 ]
 SCORE_CORRELATION_PROBABILITY = 0.3
 
@@ -101,16 +101,19 @@ class RealisticDataGenerator:
         self.score_file_path = None
         
     def _generate_bim(self):
-        """Generates the .bim file using a fast, vectorized approach."""
-        print(f"    > Generating .bim file for {self.n_variants} variants...")
+        """Generates the .bim file using a fast, fully vectorized approach."""
+        print(f"    > Generating .bim file for {self.n_variants} variants (vectorized)...")
         positions = np.sort(np.random.choice(np.arange(1, 50_000_000), self.n_variants, replace=False))
         
-        # Vectorized allele generation
+        # Vectorized allele generation to avoid slow Python loops.
         base_alleles = np.array(['A', 'C', 'G', 'T'])
+        # 1. Generate all reference allele indices at once.
         ref_indices = np.random.randint(0, 4, self.n_variants)
+        # 2. Generate random offsets (1, 2, or 3) to create a different allele.
         offsets = np.random.randint(1, 4, self.n_variants)
+        # 3. Calculate alternate allele indices using modular arithmetic.
         alt_indices = (ref_indices + offsets) % 4
-        
+        # 4. Map indices back to characters in a single operation.
         ref_alleles = base_alleles[ref_indices]
         alt_alleles = base_alleles[alt_indices]
 
@@ -145,12 +148,10 @@ class RealisticDataGenerator:
         mapping_array = np.array([code_map[key] for key in sorted(code_map)], dtype=np.uint8)
         codes = mapping_array[genotypes.astype(int)]
         
-        # Pad the codes matrix to have a column count that is a multiple of 4
         padded_n_individuals = (self.n_individuals + 3) // 4 * 4
         padded_codes = np.full((self.n_variants, padded_n_individuals), code_map[-1], dtype=np.uint8)
         padded_codes[:, :self.n_individuals] = codes
         
-        # Vectorized bit-packing: process all data with 4 fast numpy operations
         packed_bytes = (padded_codes[:, 0::4])
         packed_bytes |= (padded_codes[:, 1::4] << 2)
         packed_bytes |= (padded_codes[:, 2::4] << 4)
@@ -202,10 +203,11 @@ class RealisticDataGenerator:
         score_df[final_cols].to_csv(self.score_file_path, sep='\t', index=False, float_format='%.6g')
 
     def generate_all_files(self, n_scores):
-        self.generate_bim()
-        self.generate_fam()
-        self.generate_bed()
-        self.generate_score_file(n_scores)
+        """FIXED: Calls internal methods with the correct leading underscore."""
+        self._generate_bim()
+        self._generate_fam()
+        self._generate_bed()
+        self._generate_score_file(n_scores)
         return self.run_prefix
 
     def cleanup(self):
@@ -278,8 +280,6 @@ def validate_results(gnomon_output_path: Path, plink2_output_path: Path) -> bool
         
         for i in sorted(g_score_cols.keys()):
             g_col, p_col = g_score_cols[i], p_score_cols[i]
-            # gnomon reports per-variant average. plink2 SCORE_AVG = (SUM) / (2 * num_variants).
-            # We must multiply plink2's average by 2 to make them comparable.
             is_close = np.allclose(merged_df[g_col], merged_df[p_col] * 2, rtol=1e-4, atol=1e-7, equal_nan=True)
             if not is_close:
                 diff = np.nanmax(np.abs(merged_df[g_col] - merged_df[p_col] * 2))
@@ -348,10 +348,12 @@ def main():
         gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, gnomon_log, WORKDIR)
         gnomon_res.update(workload_params)
         all_results.append(gnomon_res)
-
-        plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
+        
+        # FIXED: Correctly access n_scores from workload_params dictionary
         n_scores = workload_params["n_scores"]
         score_col_range = f"4-{3 + n_scores}"
+        plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
+        
         plink2_cmd = [
             str(PLINK2_BINARY), "--bfile", str(data_prefix), "--score", str(generator.score_file_path),
             "1", "2", "header", "--score-col-nums", score_col_range, "no-mean-imputation", "--out", str(plink_out_prefix)
@@ -362,7 +364,6 @@ def main():
         all_results.append(plink2_res)
         
         if gnomon_res["success"] and plink2_res["success"]:
-            # Move Gnomon's output to a unique path to prevent overwrites and aid validation
             gnomon_original_out = data_prefix.with_suffix(".sscore")
             gnomon_unique_out = WORKDIR / f"run{run_id}_gnomon.sscore"
             try:
