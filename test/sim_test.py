@@ -275,7 +275,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     # Run tools, checking for command success
     if not run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name], "Simple Gnomon Test", cwd=workdir): return False
     if not run_cmd_func([f"./{plink_path.name}", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "1", "2", "4", "header", "no-mean-imputation", "--out", "simple_plink_results"], "Simple PLINK2 Test", cwd=workdir): return False
-    if not run_cmd_func(["python3", pylink_path.as_posix(), "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "--out", "simple_pylink_results", "1", "2", "4"], "Simple PyLink Test", cwd=workdir): return False
+    if not run_cmd_func(["python3", pylink_path.as_posix(), "--precise", "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name, "--out", "simple_pylink_results", "1", "2", "4"], "Simple PyLink Test", cwd=workdir): return False
 
     print("\n--- Analyzing Simple Test Results ---")
     gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={'#IID': 'IID', 'simple_score_AVG': 'SCORE_GNOMON'})[['IID', 'SCORE_GNOMON']]
