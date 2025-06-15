@@ -13,17 +13,17 @@ import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 50_000
-N_INDIVIDUALS = 50
+N_VARIANTS = 500_000
+N_INDIVIDUALS = 100
 CHR = '22'
-CHR_LENGTH = 40_000_000
-ALT_EFFECT_PROB = 0.7
-MISSING_RATE = 0.10
+CHR_LENGTH = 39_005_000
+ALT_EFFECT_PROB = 0.3
+MISSING_RATE = 0.5
 
 # Mixture weights for allele-frequency distributions
 FREQ_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
 # Mixture weights for effect-size distributions
-EFFECT_DIST_WEIGHTS = [0.4, 0.2, 0.2, 0.2]
+EFFECT_DIST_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
 
 # --- CI/Validation Configuration ---
 WORKDIR = Path("./sim_workdir")
