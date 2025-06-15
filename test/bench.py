@@ -223,6 +223,8 @@ def validate_results(gnomon_output_path: Path, plink2_output_path: Path) -> bool
         merged_df = pd.merge(g_df, p_df, on="IID")
         for i in sorted(g_score_cols.keys()):
             g_col, p_col = g_score_cols[i], p_score_cols[i]
+            # PLINK2's --score average is over total allele observations (2*variants),
+            # while gnomon's average is over variants. We multiply by 2 to reconcile.
             is_close = np.allclose(merged_df[g_col], merged_df[p_col] * 2, rtol=1e-4, atol=1e-7, equal_nan=True)
             if not is_close:
                 diff = np.nanmax(np.abs(merged_df[g_col] - merged_df[p_col] * 2))
@@ -267,8 +269,12 @@ def main():
         
         n_scores = workload_params["n_scores"]
         score_col_range, plink_out_prefix = f"4-{3 + n_scores}", WORKDIR / f"plink2_run{run_id}"
+        
+        # The PLINK2 command requires careful ordering of modifiers.
+        # --score takes several modifiers, such as 'header' and 'no-mean-imputation'.
+        # --score-col-nums is a separate flag that must come after all --score modifiers.
         plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--score", generator.score_file_path.name,
-                      "1", "2", "header", "--score-col-nums", score_col_range, "no-mean-imputation", "--out", plink_out_prefix.name]
+                      "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range, "--out", plink_out_prefix.name]
         plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
         plink2_res.update(workload_params); all_results.append(plink2_res)
         
@@ -281,7 +287,9 @@ def main():
                     failed_runs += 1
             except FileNotFoundError:
                 print(f"  > ❌ VALIDATION SKIPPED: Gnomon output file not found at {gnomon_original_out}"); failed_runs += 1
-        else: failed_runs += 1
+        else:
+            failed_runs += 1
+        
         generator.cleanup()
 
     report_results(all_results)
