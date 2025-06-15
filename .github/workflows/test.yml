@@ -10,6 +10,8 @@ on:
     types: [opened, synchronize, reopened]
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PYTHON_VERSION: '3.13'
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
@@ -23,50 +25,77 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      # Create a hash of source files for binary caching
-      - name: Generate source hash
-        id: source_hash
+      # Generate comprehensive hashes for better caching
+      - name: Generate cache keys
+        id: cache_keys
         run: |
-          # Hash Cargo.toml and all Rust source files
-          SOURCE_HASH=$(find . -name "Cargo.toml" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
-          echo "hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          # Hash for source files (Rust code changes)
+          SOURCE_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          
+          # Hash for Cargo.toml only (dependency changes)
+          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
+          
+          # Date for weekly cache rotation
+          echo "week=$(/bin/date -u '+%Y-%U')" >> $GITHUB_OUTPUT
+          
           echo "Source hash: $SOURCE_HASH"
+          echo "Deps hash: $DEPS_HASH"
 
-      # Try to restore the release binary from cache
+      # Cache release binary
       - name: Cache release binary
         id: binary_cache
         uses: actions/cache@v4
         with:
           path: |
             target/release/gnomon
-          key: ${{ runner.os }}-release-binary-${{ steps.source_hash.outputs.hash }}
+          key: ${{ runner.os }}-release-binary-${{ steps.cache_keys.outputs.source_hash }}
+          restore-keys: |
+            ${{ runner.os }}-release-binary-
 
-      # Cache Cargo directories (for dependencies and incremental builds)
-      - name: Cache Cargo directories
+      # Cache Cargo registry (dependencies)
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo
-            target
-          key: ${{ runner.os }}-cargo-nightly-${{ steps.source_hash.outputs.hash }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_keys.outputs.deps_hash }}
           restore-keys: |
-            ${{ runner.os }}-cargo-nightly-
+            ${{ runner.os }}-cargo-registry-
+
+      # Cache Cargo build artifacts
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            !target/release/gnomon
+          key: ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.source_hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
+            ${{ runner.os }}-cargo-build-nightly-
+
+      # Cache getdoc binary separately
+      - name: Cache getdoc
+        id: getdoc_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/getdoc
+          key: ${{ runner.os }}-getdoc-${{ steps.cache_keys.outputs.week }}
 
       - name: Install getdoc
+        if: steps.getdoc_cache.outputs.cache-hit != 'true'
         run: |
-          if [ ! -f ~/.cargo/bin/getdoc ]; then
-            echo "Installing getdoc..."
-            cargo +nightly install getdoc --locked
-          else
-            echo "getdoc already installed (cached)"
-          fi
+          echo "Installing getdoc..."
+          cargo +nightly install getdoc --locked
 
       - name: Run Rust unit tests
         id: test_step
         run: cargo +nightly test
         continue-on-error: true
-        env:
-          RUST_BACKTRACE: 1
 
       - name: Generate custom report with getdoc
         run: |
@@ -74,14 +103,14 @@ jobs:
           echo "=== Custom Report (getdoc) ==="
           cat report.md
 
-      # Only build if binary cache miss
+      # Build only if binary cache miss
       - name: Build Gnomon release binary
         if: steps.binary_cache.outputs.cache-hit != 'true'
         run: |
           echo "Binary cache miss - building release binary..."
           cargo build --release
 
-      # If cache hit, just verify the binary exists and is executable
+      # Verify cached binary
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
         run: |
@@ -98,14 +127,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          # We upload the whole target directory so the path is identical in the next jobs
           path: |
-            target
+            target/release/gnomon
             report.md
           retention-days: 1
+          compression-level: 9
 
   # ======================================================================
-  # JOB 2: Runs the first Python test on its own machine.
+  # JOB 2: Runs the first Python test (integration)
   # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
@@ -113,24 +142,46 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # Cache pip dependencies
+      - name: Get pip cache dir
+        id: pip-cache
+        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-integration-
+            ${{ runner.os }}-pip-
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
-          path: . # This recreates the 'target' folder and 'report.md' right here
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.13'
+          path: .
+
       - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install pandas numpy requests psutil tabulate polars pyarrow
+
       - name: Make binary executable
         run: chmod +x target/release/gnomon
+
       - name: Run Integration Test
         run: python -u test/test.py
 
   # ======================================================================
-  # JOB 3: Runs the second Python test on a third machine.
+  # JOB 3: Runs the simulation test
   # ======================================================================
   python_test_simulation:
     runs-on: ubuntu-latest
@@ -138,27 +189,101 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # Cache pip dependencies
+      - name: Get pip cache dir
+        id: pip-cache
+        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-simulation-
+            ${{ runner.os }}-pip-
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-output
           path: .
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.13'
+
       - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+
       - name: Make binary executable
         run: chmod +x target/release/gnomon
+
       - name: Run Simulation Test
-        id: sim_test # ID to reference this step's outcome
+        id: sim_test
         run: python -u test/sim_test.py
 
       - name: Check for OOM Kill on Failure
-        if: failure() # This condition means the step only runs if the previous step failed
+        if: failure()
         run: |
           echo "The simulation test failed. Checking for Out-of-Memory (OOM) errors in kernel logs..."
-          # Dump kernel logs and search for OOM messages.
-          # The '|| true' part ensures this step doesn't fail if grep finds no matches.
           sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found in dmesg. The failure was likely due to another reason."
+
+  # ======================================================================
+  # JOB 4: Runs the benchmark test with 8 CPUs
+  # ======================================================================
+  python_test_benchmark:
+    runs-on: ubuntu-latest-8-cores  # Request 8-core runner
+    needs: build_and_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # Cache pip dependencies
+      - name: Get pip cache dir
+        id: pip-cache
+        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-benchmark-
+            ${{ runner.os }}-pip-
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install pandas numpy requests psutil tabulate polars pyarrow
+
+      - name: Make binary executable
+        run: chmod +x target/release/gnomon
+
+      - name: Show CPU info
+        run: |
+          echo "=== CPU Information ==="
+          nproc
+          lscpu | grep -E '^CPU\(s\):|^Model name:|^Thread\(s\) per core:|^Core\(s\) per socket:'
+
+      - name: Run Benchmark Test
+        run: |
+          python -u test/bench.py
