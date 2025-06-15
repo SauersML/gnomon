@@ -107,6 +107,7 @@ REALISTIC_DIMENSIONS = [
 ]
 
 # --- Data Realism & Variety Parameters ---
+AF_DISTRIBUTIONS = [('beta', 0.2, 0.2), ('uniform', 0.05, 0.5)]
 EFFECT_DISTRIBUTIONS = [('normal', 0, 0.001), ('laplace', 0, 0.05)]
 
 # ==============================================================================
@@ -175,7 +176,7 @@ class RealisticDataGenerator:
         }).set_index('id', drop=False)
 
         self.target_variants_df = genome_df.sample(n=self.params['target_variants'], random_state=42).sort_values('pos').reset_index(drop=True)
-        self.gwas_universe_df = genome_df.copy() # The GWAS universe is the whole genome pool
+        self.gwas_universe_df = genome_df.copy()
 
     def _generate_bim_and_fam(self):
         print(f"    > Generating .bim for {len(self.target_variants_df)} variants and .fam for {self.params['n_individuals']} individuals...")
@@ -201,9 +202,10 @@ class RealisticDataGenerator:
             bytes_per_row = padded_n_individuals // 4
 
             for i in range(n_variants):
+                if (i + 1) % 50000 == 0:
+                    print(f"      ... wrote {i+1}/{n_variants} variants to .bed", flush=True)
                 p = af[i]
                 hwe_probs = np.array([(1-p)**2, 2*p*(1-p), p**2])
-                # Generate genotypes for one variant across all individuals
                 rand_draws = np.random.rand(n_individuals)
                 genotypes = (rand_draws > hwe_probs[0]) + (rand_draws > hwe_probs[0] + hwe_probs[1])
                 genotypes[(np.random.rand(n_individuals) < 0.01)] = -1
@@ -226,9 +228,16 @@ class RealisticDataGenerator:
             n_overlap = int(sf_config['gwas_source_variants'] * sf_config['overlap_pct'])
             n_non_overlap = sf_config['gwas_source_variants'] - n_overlap
             
+            # Ensure we can sample enough unique variants
+            if n_overlap > len(target_variant_ids):
+                raise ValueError(f"Cannot sample {n_overlap} overlapping variants from a pool of {len(target_variant_ids)}")
+            
             overlapping_ids = np.random.choice(list(target_variant_ids), n_overlap, replace=False)
             
             gwas_non_target_ids = self.gwas_universe_df[~self.gwas_universe_df.index.isin(target_variant_ids)].index
+            if n_non_overlap > len(gwas_non_target_ids):
+                 raise ValueError(f"Cannot sample {n_non_overlap} non-overlapping variants from a pool of {len(gwas_non_target_ids)}")
+            
             non_overlapping_ids = np.random.choice(gwas_non_target_ids, n_non_overlap, replace=False)
             
             score_variant_ids = np.concatenate([overlapping_ids, non_overlapping_ids])
@@ -362,8 +371,13 @@ def main():
         params = workload_params.copy()
         print_header(f"Benchmark Run {run_id}/{len(REALISTIC_DIMENSIONS)}: {params['test_name']}")
         
-        generator = RealisticDataGenerator(workload_params=params, workdir=WORKDIR)
-        data_prefix, score_files = generator.generate_all_files()
+        try:
+            generator = RealisticDataGenerator(workload_params=params, workdir=WORKDIR)
+            data_prefix, score_files = generator.generate_all_files()
+        except Exception as e:
+            print(f"  > ❌ Data generation FAILED for {params['test_name']}: {e}")
+            failed_runs += 1
+            continue
 
         # --- Gnomon Execution ---
         gnomon_cmd = [str(gnomon_abs_path)]
@@ -375,14 +389,13 @@ def main():
         
         # --- PLINK2 Execution ---
         plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
-        plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count())]
+        plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
         for sf in score_files:
             with open(sf, 'r') as f:
                 header = f.readline().strip()
                 n_file_scores = len(header.split('\t')) - 3
             score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
-            # PLINK2 requires a full --score block for each file
-            plink2_cmd.extend(["--score", sf.name, "1", "2", "header", "no-mean-imputation", "list-variants", "--score-col-nums", score_col_range])
+            plink2_cmd.extend(["--score", sf.name, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
             
         plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
         plink2_res.update(params); all_results.append(plink2_res)
