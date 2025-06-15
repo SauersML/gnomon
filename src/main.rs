@@ -359,12 +359,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let snps_in_bed_chunk = chunk.num_snps;
         let bed_row_end = bed_row_offset + snps_in_bed_chunk;
 
+        // Use `partition_point` to find the start and end indices in the dense matrix
+        // that correspond to the variants in the current BED chunk.
+        // `try_into().unwrap()` performs a safe, explicit
+        // conversion from the `usize` row offset to the `u32` index type, panicking
+        // on overflow to prevent silent data corruption.
         let matrix_row_start = prep_result
             .required_bim_indices
-            .partition_point(|&x| x.0 < bed_row_offset);
+            .partition_point(|&x| x.0 < bed_row_offset.try_into().unwrap());
         let matrix_row_end = prep_result
             .required_bim_indices
-            .partition_point(|&x| x.0 < bed_row_end);
+            .partition_point(|&x| x.0 < bed_row_end.try_into().unwrap());
 
         let snps_in_matrix_chunk = matrix_row_end - matrix_row_start;
 
