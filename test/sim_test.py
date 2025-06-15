@@ -13,7 +13,7 @@ import gmpy2
 from pathlib import Path
 
 # --- Configuration Parameters ---
-N_VARIANTS = 5_000
+N_VARIANTS = 59_000
 N_INDIVIDUALS = 100
 CHR = '22'
 CHR_LENGTH = 39_005_000
@@ -38,9 +38,9 @@ FREQ_DIST_WEIGHTS = [
 #   EFFECT_DIST_WEIGHTS[2] = weight for Uniform(-1, 1)
 #   EFFECT_DIST_WEIGHTS[3] = weight for Cauchy(0, 0.5)
 EFFECT_DIST_WEIGHTS = [
-    0.0,  # Normal(0, 0.5)
+    1.0,  # Normal(0, 0.5)
     0.0,  # Laplace(0, 0.5)
-    1.0,  # Uniform(-1, 1)
+    0.0,  # Uniform(-1, 1)
     0.0,  # Cauchy(0, 0.5)
 ]
 
