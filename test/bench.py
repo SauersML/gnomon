@@ -24,11 +24,24 @@ PLINK2_BINARY_REL = WORKDIR / "plink2"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
 # --- Benchmark Workloads ---
+# The list of benchmark scenarios to run.
+# A new 'dense_derived' test is added to probe gnomon's performance on
+# computationally dense, SIMD-friendly workloads.
 DIMENSIONS = [
-    {"n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
-    {"n_variants": 500_000, "n_individuals": 10_000, "n_scores": 50},
-    {"n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
-    {"n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
+    # --- Standard Sparse Workloads ---
+    {"test_type": "sparse", "n_variants": 100_000, "n_individuals": 5_000, "n_scores": 10},
+    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 10_000, "n_scores": 50},
+    {"test_type": "sparse", "n_variants": 1_000_000, "n_individuals": 1_000, "n_scores": 99},
+    {"test_type": "sparse", "n_variants": 500_000, "n_individuals": 5_000, "n_scores": 1},
+    # --- Dense Workload for Gnomon's Strengths ---
+    {
+        "test_type": "dense_derived",
+        "n_variants": 500_000,
+        "n_individuals": 5_000,
+        "n_basis_scores": 8,      # SIMD-friendly number of basis traits
+        "n_derived_scores": 64,   # Create many derived scores from the basis
+        "n_scores": 64            # Keep for compatibility with reporting
+    },
 ]
 
 # --- Data Realism & Variety Parameters ---
@@ -132,8 +145,8 @@ class RealisticDataGenerator:
                                (padded_codes[:, 2::4] << 4) | (padded_codes[:, 3::4] << 6)
                 f.write(packed_bytes.tobytes())
             
-    def _generate_score_file(self, n_scores):
-        print(f"    > Generating .score file with {n_scores} scores...")
+    def _generate_sparse_score_file(self, n_scores):
+        print(f"    > Generating SPARSE .score file with {n_scores} scores...")
         score_data, score_cols_data = {"snp_id": self.variants_df['id']}, []
         for i in range(n_scores):
             is_correlated = (i > 0) and (random.random() < SCORE_CORRELATION_PROBABILITY)
@@ -166,8 +179,46 @@ class RealisticDataGenerator:
         self.score_file_path = self.run_prefix.with_suffix(".score")
         score_df[final_cols].to_csv(self.score_file_path, sep='\t', index=False, float_format='%.6g')
 
-    def generate_all_files(self, n_scores):
-        self._generate_bim(); self._generate_fam(); self._generate_bed(); self._generate_score_file(n_scores)
+    def _generate_dense_derived_score_file(self, n_basis_scores, n_derived_scores):
+        print(f"    > Generating DENSE .score file with {n_derived_scores} derived from {n_basis_scores} basis scores...")
+        
+        # 1. Generate dense basis scores (n_variants x n_basis_scores)
+        basis_weights = np.zeros((self.n_variants, n_basis_scores))
+        for i in range(n_basis_scores):
+            dist_name, p1, p2 = random.choice(EFFECT_DISTRIBUTIONS)
+            basis_weights[:, i] = np.random.normal(p1, p2, self.n_variants) if dist_name == 'normal' else np.random.laplace(p1, p2, self.n_variants)
+            
+        # 2. Create a random transformation matrix (n_derived_scores x n_basis_scores)
+        transformation_matrix = np.random.randn(n_derived_scores, n_basis_scores)
+
+        # 3. Create derived weights via matrix multiplication
+        derived_weights = basis_weights @ transformation_matrix.T
+        
+        # 4. Construct the final DataFrame
+        score_data = {f"score_{i+1}": derived_weights[:, i] for i in range(n_derived_scores)}
+        score_df = pd.DataFrame(score_data)
+        score_df.insert(0, 'snp_id', self.variants_df['id'])
+        score_df.insert(1, 'effect_allele', self.variants_df['a2'])
+        score_df.insert(2, 'other_allele', self.variants_df['a1'])
+        
+        # 5. Save to file
+        self.score_file_path = self.run_prefix.with_suffix(".score")
+        score_df.to_csv(self.score_file_path, sep='\t', index=False, float_format='%.6g')
+
+    def generate_all_files(self, workload_params: dict):
+        """Dispatcher for generating all necessary files based on workload type."""
+        self._generate_bim()
+        self._generate_fam()
+        self._generate_bed()
+
+        if workload_params.get("test_type") == "dense_derived":
+            self._generate_dense_derived_score_file(
+                n_basis_scores=workload_params["n_basis_scores"],
+                n_derived_scores=workload_params["n_derived_scores"]
+            )
+        else: # Default to sparse
+            self._generate_sparse_score_file(n_scores=workload_params["n_scores"])
+        
         return self.run_prefix
 
     def cleanup(self):
@@ -216,10 +267,16 @@ def validate_results(gnomon_output_path: Path, plink2_output_path: Path) -> bool
         p_df = pd.read_csv(plink2_output_path, sep=r'\s+').rename(columns={'#FID': 'FID'})
         if len(g_df) != len(p_df):
             print(f"  > ❌ VALIDATION FAILED: Row count mismatch ({len(g_df)} vs {len(p_df)})."); return False
+        
+        # Discover score columns dynamically to handle any number of scores
         g_score_cols = {int(re.search(r'score_(\d+)_AVG', c).group(1)): c for c in g_df.columns if c.endswith('_AVG')}
         p_score_cols = {int(re.search(r'SCORE(\d+)_AVG', c).group(1)): c for c in p_df.columns if c.endswith('_AVG')}
-        if len(g_score_cols) != len(p_score_cols):
-             print(f"  > ❌ VALIDATION FAILED: Score column count mismatch."); return False
+        
+        if not g_score_cols or not p_score_cols:
+            print(f"  > ❌ VALIDATION FAILED: No score columns found in output files."); return False
+        if set(g_score_cols.keys()) != set(p_score_cols.keys()):
+             print(f"  > ❌ VALIDATION FAILED: Score column sets do not match."); return False
+        
         merged_df = pd.merge(g_df, p_df, on="IID")
         for i in sorted(g_score_cols.keys()):
             g_col, p_col = g_score_cols[i], p_score_cols[i]
@@ -238,15 +295,24 @@ def report_results(results: list):
     print_header("Benchmark Summary Report")
     if not results: print("No results to report."); return
     df = pd.DataFrame(results)
+    
+    # Add test_type to the index for clearer reporting
+    index_cols = ['test_type', 'n_variants', 'n_individuals', 'n_scores']
+    # Ensure all index columns exist before pivoting
+    for col in index_cols:
+        if col not in df.columns:
+            df[col] = 'N/A' # Or some other placeholder
+            
     try:
-        report_df = df.pivot_table(index=['n_variants', 'n_individuals', 'n_scores'], columns='tool', values=['time_sec', 'peak_mem_mb'])
+        report_df = df.pivot_table(index=index_cols, columns='tool', values=['time_sec', 'peak_mem_mb'])
         report_df.columns = [f"{val}_{tool}" for val, tool in report_df.columns]
         print("---\n- Ratios (< 1.0) indicate gnomon is faster or uses less memory.\n- Time is wall-clock seconds. Memory is peak RSS in Megabytes.\n---")
         if 'time_sec_gnomon' in report_df and 'time_sec_plink2' in report_df: report_df['time_ratio_g/p'] = report_df['time_sec_gnomon'] / report_df['time_sec_plink2']
         if 'peak_mem_mb_gnomon' in report_df and 'peak_mem_mb_plink2' in report_df: report_df['mem_ratio_g/p'] = report_df['peak_mem_mb_gnomon'] / report_df['peak_mem_mb_plink2']
         print(report_df.to_markdown(floatfmt=".3f"))
     except Exception as e:
-        print("Could not generate pivot table. Printing raw results."); print(df.to_markdown(index=False, floatfmt=".3f"))
+        print(f"Could not generate pivot table. Printing raw results.\n{e}"); print(df.to_markdown(index=False, floatfmt=".3f"))
+    
     summary_path = WORKDIR / "benchmark_summary.csv"
     df.to_csv(summary_path, index=False)
     print(f"\nFull results saved to '{summary_path}'")
@@ -256,35 +322,30 @@ def main():
     gnomon_abs_path, plink2_abs_path = GNOMON_BINARY_REL.resolve(), PLINK2_BINARY_REL.resolve()
     if not setup_environment(gnomon_abs_path, plink2_abs_path): exit(1)
 
-    all_results, failed_runs, run_id = [], 0, 0
-    for workload_params in DIMENSIONS:
-        run_id += 1
-        print_header(f"Benchmark Run {run_id}/{len(DIMENSIONS)}: {workload_params}")
-        generator = RealisticDataGenerator(n_variants=workload_params["n_variants"], n_individuals=workload_params["n_individuals"], workdir=WORKDIR)
-        data_prefix = generator.generate_all_files(n_scores=workload_params["n_scores"])
+    all_results, failed_runs = [], 0
+    for run_id, workload_params in enumerate(DIMENSIONS, 1):
+        # Make a copy to avoid modifying the global list
+        params = workload_params.copy()
+        
+        print_header(f"Benchmark Run {run_id}/{len(DIMENSIONS)}: {params}")
+        generator = RealisticDataGenerator(n_variants=params["n_variants"], n_individuals=params["n_individuals"], workdir=WORKDIR)
+        data_prefix = generator.generate_all_files(workload_params=params)
 
         gnomon_cmd = [str(gnomon_abs_path), "--score", generator.score_file_path.name, data_prefix.name]
         gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
-        gnomon_res.update(workload_params); all_results.append(gnomon_res)
+        gnomon_res.update(params); all_results.append(gnomon_res)
         
-        n_scores = workload_params["n_scores"]
+        n_scores = params["n_scores"]
         
         # PLINK2 expects a single number for a single column, not a range like "4-4".
         # This handles the case where n_scores is 1.
-        if n_scores == 1:
-            score_col_range = "4"
-        else:
-            score_col_range = f"4-{3 + n_scores}"
-        
+        score_col_range = "4" if n_scores == 1 else f"4-{3 + n_scores}"
         plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
         
-        # The PLINK2 command requires careful ordering of modifiers.
-        # --score takes several modifiers, such as 'header' and 'no-mean-imputation'.
-        # --score-col-nums is a separate flag that must come after all --score modifiers.
         plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--score", generator.score_file_path.name,
                       "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range, "--out", plink_out_prefix.name]
         plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
-        plink2_res.update(workload_params); all_results.append(plink2_res)
+        plink2_res.update(params); all_results.append(plink2_res)
         
         if gnomon_res["success"] and plink2_res["success"]:
             gnomon_original_out = data_prefix.with_suffix(".sscore")
