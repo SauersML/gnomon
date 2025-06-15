@@ -268,7 +268,15 @@ def main():
         gnomon_res.update(workload_params); all_results.append(gnomon_res)
         
         n_scores = workload_params["n_scores"]
-        score_col_range, plink_out_prefix = f"4-{3 + n_scores}", WORKDIR / f"plink2_run{run_id}"
+        
+        # PLINK2 expects a single number for a single column, not a range like "4-4".
+        # This handles the case where n_scores is 1.
+        if n_scores == 1:
+            score_col_range = "4"
+        else:
+            score_col_range = f"4-{3 + n_scores}"
+        
+        plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
         
         # The PLINK2 command requires careful ordering of modifiers.
         # --score takes several modifiers, such as 'header' and 'no-mean-imputation'.
