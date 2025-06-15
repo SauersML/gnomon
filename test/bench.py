@@ -24,83 +24,85 @@ GNOMON_BINARY_REL = Path("./target/release/gnomon")
 PLINK2_BINARY_REL = WORKDIR / "plink2"
 PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
 
-# --- The Crucible: Realistic Benchmark Scenarios ---
-# This new configuration drives a generator that creates messy, realistic data
-# to test the architectures under real-world conditions.
+
+# --- The Crucible: Scaled & Focused Benchmark Scenarios ---
+# This configuration is smaller for faster execution and includes specific tests
+# for ACAF-like (common-only variants) vs. standard WGS (includes rare variants) data.
 REALISTIC_DIMENSIONS = [
     {
-        "test_name": "Large_GWAS_High_Overlap",
-        "n_individuals": 50_000,
-        "genome_variants": 20_000_000,
-        "target_variants": 2_000_000,
+        "test_name": "ACAF_Dense_Scores",
+        # Purpose: The core "grudge match". Simulates ACAF data (all common variants)
+        # against a high number of dense scores. This tests the "shitton of scores"
+        # use case where the pivot architecture might have its best chance.
+        "n_individuals": 2_000,
+        "genome_variants": 500_000,
+        "target_variants": 250_000,
+        "af_profile": 'acaf',  # <-- Ensures all variants have MAF > 1%
         "score_files": [
             {
-                "name": "large_gwas",
-                "n_scores": 10,
-                "gwas_source_variants": 2_000_000,
-                "overlap_pct": 0.95,
+                "name": "acaf_dense_panel",
+                "n_scores": 50,
+                "gwas_source_variants": 200_000,
+                "overlap_pct": 0.95, # High overlap between score and genotype files
                 "flip_pct": 0.15,
-                "missing_weight_pct": 0.01,
-            }
-        ],
-    },
-    {
-        "test_name": "Multi_Panel_Modest_Overlap",
-        "n_individuals": 10_000,
-        "genome_variants": 20_000_000,
-        "target_variants": 10_000_000,
-        "score_files": [
-            {"name": "panel_A", "n_scores": 5,  "gwas_source_variants": 500,   "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
-            {"name": "panel_B", "n_scores": 8,  "gwas_source_variants": 1_200, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
-            {"name": "panel_C", "n_scores": 2,  "gwas_source_variants": 800,   "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
-        ],
-    },
-    {
-        "test_name": "Stress_Test_Low_Overlap",
-        "n_individuals": 5_000,
-        "genome_variants": 20_000_000,
-        "target_variants": 20_000_000,
-        "score_files": [
-            {
-                "name": "discovery_gwas",
-                "n_scores": 20,
-                "gwas_source_variants": 4_000_000,
-                "overlap_pct": 0.10,
-                "flip_pct": 0.10,
-                "missing_weight_pct": 0.01,
-            }
-        ],
-    },
-    {
-        "test_name": "Dense_Score_Sparse_Geno",
-        "n_individuals": 15_000,
-        "genome_variants": 10_000_000,
-        "target_variants": 6_666_666,
-        "score_files": [
-            {
-                "name": "dense_score",
-                "n_scores": 64,
-                "gwas_source_variants": 400_000,
-                "overlap_pct": 0.98,
-                "flip_pct": 0.10,
                 "missing_weight_pct": 0.0,
-                "score_sparsity": 1.0,  # fully dense
+                "score_sparsity": 1.0,  # All variants contribute to all scores
             }
         ],
     },
     {
-        "test_name": "Ultra_Scale_Test",
-        "n_individuals": 150_000,
-        "genome_variants": 30_000_000,
-        "target_variants": 666_666,
+        "test_name": "WGS_Standard_Rare",
+        # Purpose: Simulates a standard WGS dataset with a U-shaped AF distribution
+        # (many rare variants). This is the classic scenario where PLINK's sparse
+        # optimizations (`Difflist`) should shine.
+        "n_individuals": 1_000,
+        "genome_variants": 500_000,
+        "target_variants": 300_000,
+        "af_profile": 'standard', # <-- Includes rare variants
         "score_files": [
             {
-                "name": "ultra_gwas",
-                "n_scores": 80,
-                "gwas_source_variants": 666_666,
-                "overlap_pct": 0.95,
+                "name": "gwas_discovery",
+                "n_scores": 10,
+                "gwas_source_variants": 250_000,
+                "overlap_pct": 0.80,
+                "flip_pct": 0.10,
+                "missing_weight_pct": 0.01,
+                "score_sparsity": 0.1, # Simulates a typical sparse score
+            }
+        ],
+    },
+    {
+        "test_name": "Multi_Panel_Modest",
+        # Purpose: A scaled-down test for merging multiple, smaller score files.
+        # This checks the overhead of the preparation phase with complex inputs.
+        "n_individuals": 1_500,
+        "genome_variants": 200_000,
+        "target_variants": 100_000,
+        "af_profile": 'standard',
+        "score_files": [
+            {"name": "panel_A", "n_scores": 5,  "gwas_source_variants": 5_000, "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
+            {"name": "panel_B", "n_scores": 8,  "gwas_source_variants": 12_000, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
+            {"name": "panel_C", "n_scores": 2,  "gwas_source_variants": 8_000,  "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
+        ],
+    },
+    {
+        "test_name": "LargeN_ModestK_ACAF",
+        # Purpose: Another ACAF test, but this time with more individuals and fewer,
+        # sparser scores. This tests how the architectures scale with N (number of people)
+        # when K (number of scores) isn't overwhelmingly large.
+        "n_individuals": 5_000,
+        "genome_variants": 400_000,
+        "target_variants": 200_000,
+        "af_profile": 'acaf',
+        "score_files": [
+            {
+                "name": "largeN_panel",
+                "n_scores": 15,
+                "gwas_source_variants": 50_000,
+                "overlap_pct": 0.90,
                 "flip_pct": 0.15,
                 "missing_weight_pct": 0.01,
+                "score_sparsity": 0.7,
             }
         ],
     },
@@ -108,7 +110,6 @@ REALISTIC_DIMENSIONS = [
 
 
 # --- Data Realism & Variety Parameters ---
-AF_DISTRIBUTIONS = [('beta', 0.2, 0.2), ('uniform', 0.05, 0.5)]
 EFFECT_DISTRIBUTIONS = [('normal', 0, 0.001), ('laplace', 0, 0.05)]
 
 # ==============================================================================
@@ -191,8 +192,14 @@ class RealisticDataGenerator:
     def _generate_bed(self):
         print(f"    > Generating .bed file (memory-efficient, row-by-row)...")
         n_variants, n_individuals = len(self.target_variants_df), self.params['n_individuals']
-        dist_name, p1, p2 = random.choice(AF_DISTRIBUTIONS)
-        af = np.random.beta(p1, p2, n_variants) if dist_name == 'beta' else np.random.uniform(p1, p2, n_variants)
+
+        af_profile = self.params.get('af_profile', 'standard')
+        if af_profile == 'acaf':
+            print("        (Using ACAF allele frequency profile: common variants only, MAF > 1%)")
+            af = np.random.uniform(0.01, 0.5, n_variants)
+        else: # 'standard'
+            print("        (Using standard allele frequency profile: includes rare variants)")
+            af = np.random.beta(0.2, 0.2, n_variants)
         
         code_map = {0: 0b00, 1: 0b10, 2: 0b11, -1: 0b01}
         mapping_array = np.array([code_map[key] for key in sorted(code_map)], dtype=np.uint8)
@@ -229,7 +236,6 @@ class RealisticDataGenerator:
             n_overlap = int(sf_config['gwas_source_variants'] * sf_config['overlap_pct'])
             n_non_overlap = sf_config['gwas_source_variants'] - n_overlap
             
-            # Ensure we can sample enough unique variants
             if n_overlap > len(target_variant_ids):
                 raise ValueError(f"Cannot sample {n_overlap} overlapping variants from a pool of {len(target_variant_ids)}")
             
@@ -291,10 +297,13 @@ class RealisticDataGenerator:
 
     def cleanup(self):
         print("    > Cleaning up generated data files...")
-        extensions = [".bed", ".bim", ".fam"] + [f".{sf['name']}.score" for sf in self.params['score_files']]
+        extensions = [".bed", ".bim", ".fam", ".log"] + [f".{sf['name']}.score" for sf in self.params['score_files']]
         for ext in extensions:
             try: self.run_prefix.with_suffix(ext).unlink(missing_ok=True)
             except IsADirectoryError: pass
+        
+        for f in self.workdir.glob("plink2_run*"):
+            f.unlink(missing_ok=True)
 
 # ==============================================================================
 #                       EXECUTION & MONITORING ENGINE
@@ -306,7 +315,8 @@ def run_and_monitor_process(tool_name: str, command: List[str], cwd: Path) -> Di
     start_time = time.monotonic()
     
     try:
-        process = subprocess.Popen(command, cwd=cwd, stdout=sys.stdout, stderr=sys.stderr, text=True, encoding='utf-8')
+        # Use PIPE to capture stdout/stderr to prevent massive console spew
+        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         p = psutil.Process(process.pid)
         peak_rss_mb = 0
         while process.poll() is None:
@@ -314,15 +324,25 @@ def run_and_monitor_process(tool_name: str, command: List[str], cwd: Path) -> Di
                 peak_rss_mb = max(peak_rss_mb, p.memory_info().rss / 1024 / 1024)
             except psutil.NoSuchProcess: break
             time.sleep(0.02)
+
+        # Capture remaining output
+        stdout, stderr = process.communicate()
         wall_time = time.monotonic() - start_time
         returncode = process.returncode
+        
         if returncode != 0:
             print(f"  > ❌ {tool_name} FAILED with exit code {returncode}.")
+            # Print last few lines of stderr for debugging
+            if stderr:
+                last_lines = "\n".join(stderr.strip().split('\n')[-10:])
+                print(f"      --- Stderr Tail ---\n{last_lines}\n      -------------------")
         else:
             print(f"  > ✅ {tool_name} finished in {wall_time:.2f}s. Peak Memory: {peak_rss_mb:.2f} MB")
+    
     except (FileNotFoundError, psutil.NoSuchProcess) as e:
         print(f"  > ❌ ERROR launching {tool_name}: {e}")
         wall_time, peak_rss_mb, returncode = -1, -1, -1
+
     return {"tool": tool_name, "time_sec": wall_time, "peak_mem_mb": peak_rss_mb, "success": returncode == 0}
 
 # ==============================================================================
@@ -349,14 +369,21 @@ def report_results(results: list):
             df[col] = 'N/A'
             
     try:
-        report_df = df.pivot_table(index=index_cols, columns='tool', values=['time_sec', 'peak_mem_mb'])
-        report_df.columns = [f"{val}_{tool}" for val, tool in report_df.columns]
-        print("---\n- Ratios (< 1.0) indicate gnomon is faster or uses less memory.\n- Time is wall-clock seconds. Memory is peak RSS in Megabytes.\n---")
-        if 'time_sec_gnomon' in report_df and 'time_sec_plink2' in report_df: report_df['time_ratio_g/p'] = report_df['time_sec_gnomon'] / report_df['time_sec_plink2']
-        if 'peak_mem_mb_gnomon' in report_df and 'peak_mem_mb_plink2' in report_df: report_df['mem_ratio_g/p'] = report_df['peak_mem_mb_gnomon'] / report_df['peak_mem_mb_plink2']
-        print(report_df.to_markdown(floatfmt=".3f"))
+        # Filter out failed runs for ratio calculation
+        success_df = df[df['success'] == True].copy()
+        if not success_df.empty:
+            report_df = success_df.pivot_table(index=index_cols, columns='tool', values=['time_sec', 'peak_mem_mb'])
+            report_df.columns = [f"{val}_{tool}" for val, tool in report_df.columns]
+            print("---\n- Ratios (< 1.0) indicate gnomon is faster or uses less memory.\n- Time is wall-clock seconds. Memory is peak RSS in Megabytes.\n---")
+            if 'time_sec_gnomon' in report_df and 'time_sec_plink2' in report_df: report_df['time_ratio_g/p'] = report_df['time_sec_gnomon'] / report_df['time_sec_plink2']
+            if 'peak_mem_mb_gnomon' in report_df and 'peak_mem_mb_plink2' in report_df: report_df['mem_ratio_g/p'] = report_df['peak_mem_mb_gnomon'] / report_df['peak_mem_mb_plink2']
+            print(report_df.to_markdown(floatfmt=".3f"))
+        else:
+            print("No successful runs to generate a comparison report.")
+
     except Exception as e:
-        print(f"Could not generate pivot table. Printing raw results.\n{e}"); print(df.to_markdown(index=False, floatfmt=".3f"))
+        print(f"Could not generate pivot table. Printing raw results.\n{e}")
+        print(df.to_markdown(index=False, floatfmt=".3f"))
     
     summary_path = WORKDIR / "benchmark_summary.csv"
     df.to_csv(summary_path, index=False)
@@ -378,6 +405,7 @@ def main():
         except Exception as e:
             print(f"  > ❌ Data generation FAILED for {params['test_name']}: {e}")
             failed_runs += 1
+            generator.cleanup()
             continue
 
         # --- Gnomon Execution ---
@@ -389,21 +417,26 @@ def main():
         gnomon_res.update(params); all_results.append(gnomon_res)
         
         # --- PLINK2 Execution ---
-        plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
-        plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
-        for sf in score_files:
-            with open(sf, 'r') as f:
-                header = f.readline().strip()
-                n_file_scores = len(header.split('\t')) - 3
-            score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
-            plink2_cmd.extend(["--score", sf.name, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
+        if gnomon_res["success"]: # Only run plink if gnomon succeeded, for comparison
+            plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
+            plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
+            for sf in score_files:
+                with open(sf, 'r') as f:
+                    header = f.readline().strip()
+                    n_file_scores = len(header.split('\t')) - 3
+                score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
+                plink2_cmd.extend(["--score", sf.name, "1", "2", "3", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
             
-        plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
-        plink2_res.update(params); all_results.append(plink2_res)
-        
-        # --- Validation ---
-        if not simplified_validation(gnomon_res["success"], plink2_res["success"]):
+            plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
+            plink2_res.update(params); all_results.append(plink2_res)
+            
+            # --- Validation ---
+            if not simplified_validation(gnomon_res["success"], plink2_res["success"]):
+                failed_runs += 1
+        else:
+            print("  > Skipping PLINK2 run because Gnomon failed.")
             failed_runs += 1
+
         
         generator.cleanup()
 
@@ -411,7 +444,7 @@ def main():
     if failed_runs > 0:
         print(f"\n❌ Benchmark finished with {failed_runs} failed or invalid run(s)."); sys.exit(1)
     else:
-        print("\n🎉 All benchmarks completed and passed validation successfully."); sys.exit(0)
+        print("\n🎉 All benchmarks completed successfully."); sys.exit(0)
 
 if __name__ == "__main__":
     main()
