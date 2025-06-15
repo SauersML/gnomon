@@ -425,8 +425,7 @@ def main():
                     header = f.readline().strip()
                     n_file_scores = len(header.split('\t')) - 3
                 score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
-                plink2_cmd.extend(["--score", sf.name, "1", "2", "3", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
-            
+                plink2_cmd.extend(["--score", sf.name, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])            
             plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
             plink2_res.update(params); all_results.append(plink2_res)
             
