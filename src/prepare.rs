@@ -196,7 +196,7 @@ pub fn prepare_for_computation(
     // This is a sequential grouping operation on the sorted `unique_pairs`, which is fast.
     for &(variant_row, score_col) in &unique_pairs {
         // `variant_row.0` is guaranteed to be a valid index by construction.
-        variant_to_scores_map[variant_row.0].push(score_col);
+        variant_to_scores_map[variant_row.0 as usize].push(score_col);
     }
 
     // --- STAGE 5: PARALLEL SORT & VALIDATION ---
