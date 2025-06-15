@@ -95,7 +95,7 @@ def sample_effect_sizes(n):
     w = np.empty(n)
     for i, c in enumerate(choices):
         if c == 0:
-            w[i] = np.random.normal(0, 0.0001)
+            w[i] = np.random.normal(0, 0.00000001)
         elif c == 1:
             w[i] = np.random.laplace(0, 0.5)
         elif c == 2:
