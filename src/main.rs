@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::task;
 use std::fs::File;
 use cache_size;
+use ryu;
 
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
@@ -550,6 +551,7 @@ fn write_scores_to_file(
         String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 24));
     let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
     let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
+    let mut ryu_buffer = ryu::Buffer::new();
 
     for iid in person_iids {
         let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
@@ -590,7 +592,7 @@ fn write_scores_to_file(
             };
 
             // Write the correctly tab-separated data columns.
-            write!(&mut line_buffer, "\t{:.6}\t{:.4}", avg_score, missing_pct).unwrap();
+            write!(&mut line_buffer, "\t{}\t{}", ryu_buffer.format(avg_score), ryu_buffer.format(missing_pct)).unwrap();
         }
         writeln!(writer, "{}", line_buffer)?;
     }
