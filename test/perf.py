@@ -1,5 +1,3 @@
-# File: test/perf.py
-
 import argparse
 import subprocess
 import sys
