@@ -38,3 +38,4 @@ strip = true
 inherits = "release"
 debug = 1
 strip = false
+no-inline-profiling = []
