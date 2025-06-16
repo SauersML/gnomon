@@ -15,7 +15,6 @@ env:
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
-  # (This job remains unchanged as it is well-structured)
   # ======================================================================
   build_and_test:
     runs-on: ubuntu-latest
@@ -51,7 +50,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Cache Cargo build
+      - name: Cache Cargo build artifacts
         uses: actions/cache@v4
         with:
           path: |
@@ -68,9 +67,9 @@ jobs:
             echo "Binary cache miss - building release binary..."
             cargo build --release
           fi
-          # The 'coz' profile is still useful as it inherits from release and adds debug symbols.
-          echo "Building profiling binary..."
-          cargo build --profile coz
+          # Build using the new 'profiling' profile for perf analysis.
+          echo "Building binary with profiling symbols..."
+          cargo build --profile profiling
 
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
@@ -84,13 +83,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          path: |
-            target
-            # No longer uploading getdoc report or unit test status from here
+          # Upload the entire target directory, which now includes 'release' and 'profiling'
+          path: target
           retention-days: 1
 
   # ======================================================================
-  # JOBS 2-4: Python tests (unchanged, they are well-structured)
+  # JOBS 2-4: Python tests (unchanged)
   # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
@@ -155,7 +153,7 @@ jobs:
       - run: python -u test/bench.py
 
   # ======================================================================
-  # JOB 5: Performance Profiling (HEAVILY REVISED AND FIXED)
+  # JOB 5: Performance Profiling (FIXED and ROBUST)
   # ======================================================================
   performance_reports:
     runs-on: ubuntu-latest
@@ -166,7 +164,8 @@ jobs:
         with: { name: build-output, path: . }
 
       - name: Make profiling binary executable
-        run: chmod +x target/coz/gnomon
+        # Correct path for the new profile
+        run: chmod +x target/profiling/gnomon
 
       - uses: actions/setup-python@v4
         with: { python-version: '3.11' }
@@ -174,37 +173,27 @@ jobs:
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil
 
-      - name: System Diagnostics
-        run: |
-          echo "--- System Information ---"
-          echo "Kernel: $(uname -a)"
-          echo "Distribution: $(lsb_release -a)"
-          echo "------------------------"
-
       - name: Get Kernel Version for Cache Key
         id: kernel_version
         run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
       
-      - name: Cache APT packages for profiling
+      - name: Cache APT packages for perf
         id: apt_cache
         uses: actions/cache@v4
         with:
-          # The paths that apt uses for its package lists and downloaded .deb files
           path: |
             /var/cache/apt/archives
             /var/lib/apt/lists
           key: ${{ runner.os }}-apt-perf-tools-cache-${{ steps.kernel_version.outputs.version }}
 
-      - name: Install Profiling Tools
+      - name: Install Perf Tools
         run: |
-          echo "--- Installing Profiling Tools ---"
+          echo "--- Installing Perf Tools ---"
           CURRENT_KERNEL=$(uname -r)
           echo "Identified running kernel: $CURRENT_KERNEL"
-          # NOTE: coz-profiler has been removed as it is incompatible.
           REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
           echo "Required packages: ${REQUIRED_PACKAGES}"
           
-          # Only run apt-get update if the cache was restored.
           if [ "${{ steps.apt_cache.outputs.cache-hit }}" != 'true' ]; then
             echo "APT cache miss, running apt-get update..."
             sudo apt-get update -y
@@ -218,31 +207,25 @@ jobs:
           echo "Location of perf: $(which perf || echo 'perf not found')"
           echo "Version of perf: $(perf --version || echo 'perf not found')"
           dpkg -l | grep 'linux-tools' || echo "No linux-tools packages found."
-          echo "------------------------------"
 
       - name: Configure Profiler Permissions
         run: |
           echo "--- Configuring Kernel Permissions for Profiling ---"
-          echo "perf_event_paranoid before: $(cat /proc/sys/kernel/perf_event_paranoid)"
-          echo "kptr_restrict before: $(cat /proc/sys/kernel/kptr_restrict)"
-          
           # Set perf_event_paranoid to -1 to allow collection by any user.
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
-          # Set kptr_restrict to 0 to allow kernel symbol resolution. FIXES THE PERMISSION ERROR.
+          # Set kptr_restrict to 0 to allow kernel symbol resolution.
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
-
-          echo "perf_event_paranoid after: $(cat /proc/sys/kernel/perf_event_paranoid)"
-          echo "kptr_restrict after: $(cat /proc/sys/kernel/kptr_restrict)"
-          echo "----------------------------------------------------"
+          echo "Permissions configured."
           
-      - name: Run Profiling Harness (perf only)
+      - name: Run Profiling Harness
         run: |
           echo "--- Starting Profiling Harness ---"
-          # Run the python script, but explicitly tell it to only use 'perf'.
-          python test/perf.py --tool perf
+          # Run the python script. It will now only run perf.
+          python test/perf.py
           echo "--- Profiling Harness Finished ---"
           
       - name: Grant Cache Permissions
+        # This step MUST run, even if the previous step failed, to allow the cache to be saved.
         if: always()
         run: |
           echo "Fixing permissions on APT cache directories for saving..."
@@ -252,8 +235,6 @@ jobs:
         if: always() # Upload even if the run fails
         uses: actions/upload-artifact@v4
         with:
-          name: perf-report-data-${{ github.run_id }}
-          path: |
-            perf.data
-            profile.coz
+          name: perf-data-${{ github.run_id }}
+          path: perf.data
           if-no-files-found: ignore
