@@ -65,7 +65,7 @@ impl SparseIndexPool {
 
 /// Processes one dense, pre-filtered batch of SNP-major data using the person-major
 /// (pivot) path. This path is efficient for batches with high variant density.
-pub fn run_chunk_computation(
+pub fn run_person_major_path(
     snp_major_data: &[u8],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
@@ -74,7 +74,6 @@ pub fn run_chunk_computation(
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: MatrixRowIndex,
     snps_in_chunk: usize,
-    _chunk_bed_row_offset: usize, // DELETE THIS
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // The type system has already guaranteed the buffers are zeroed.
@@ -580,6 +579,158 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
     ]
 }
 
+
+// ========================================================================================
+//                     ADAPTIVE DISPATCHER & SNP-MAJOR PATH
+// ========================================================================================
+
+use crate::types::ComputePath;
+
+// This threshold is used by the dispatcher. If the estimated non-reference allele
+// frequency for a variant is above this value, it's considered "dense" and sent
+// to the high-throughput person-major path. Otherwise, it's "sparse" and sent to
+// the low-overhead SNP-major path. This value can be tuned based on profiling.
+const SNP_DENSITY_THRESHOLD: f32 = 0.05;
+
+/// Assesses a single SNP's data and determines the optimal compute path.
+///
+/// This is the "brain" of the adaptive engine. It uses a fast, hardware-accelerated
+/// heuristic to decide if a variant's data is sparse or dense.
+#[inline]
+pub fn assess_path(snp_data: &[u8], total_people: usize) -> ComputePath {
+    let non_ref_allele_freq = assess_snp_density(snp_data, total_people);
+
+    if non_ref_allele_freq > SNP_DENSITY_THRESHOLD {
+        ComputePath::PersonMajor
+    } else {
+        ComputePath::SnpMajor
+    }
+}
+
+/// Calculates a fast proxy for non-reference allele frequency using `popcnt`.
+///
+/// This function is a key performance enabler. It leverages the `popcnt` (population
+/// count) CPU instruction, which is extremely fast. By viewing the byte slice as
+/// `u64` chunks, it minimizes loop iterations and lets the hardware do the heavy
+// lifting of counting set bits, which is a strong proxy for data density.
+#[inline]
+fn assess_snp_density(snp_data: &[u8], total_people: usize) -> f32 {
+    if total_people == 0 {
+        return 0.0;
+    }
+
+    let (chunks, remainder) = snp_data.as_chunks::<u64>();
+
+    let mut set_bits: u32 = 0;
+    for &chunk in chunks {
+        set_bits += chunk.count_ones();
+    }
+    for &byte in remainder {
+        set_bits += byte.count_ones();
+    }
+    
+    // Normalize by the number of people to get a comparable frequency.
+    // The homozygous-reference genotype (0b00) has a popcnt of 0. All others
+    // have a popcnt > 0. This gives a reliable, self-contained metric.
+    set_bits as f32 / total_people as f32
+}
+
+/// Processes a single sparse SNP using a direct, pivot-free algorithm.
+///
+/// This path is optimized for variants where most individuals have the
+/// homozygous-reference genotype. It avoids the high overhead of the pivot
+/// operation by iterating through individuals and only performing work for
+/// those with non-zero dosages.
+pub fn run_snp_major_path(
+    snp_data: &[u8],
+    prep_result: &PreparationResult,
+    partial_scores_out: &mut CleanScores,
+    partial_missing_counts_out: &mut CleanCounts,
+    snp_matrix_row: MatrixRowIndex,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let num_scores = prep_result.score_names.len();
+    let stride = prep_result.stride();
+
+    // --- 1. Decode this single SNP for all people in the cohort ---
+    // This is a small, temporary allocation that fits on the stack for most cohorts.
+    let dosages = decode_snp(snp_data, prep_result.total_people_in_fam);
+
+    // --- 2. Get pointers to the relevant weight/flip data for this SNP ---
+    let weight_row_offset = snp_matrix_row.0 as usize * stride;
+    let weight_row = &prep_result.weights_matrix()[weight_row_offset..];
+    let flip_row = &prep_result.flip_mask_matrix()[weight_row_offset..];
+    let affected_scores = &prep_result.variant_to_scores_map[snp_matrix_row.0 as usize];
+
+    // --- 3. First pass: Handle missingness and correct baselines ---
+    // It is critical to correct the baseline score for missing individuals *before*
+    // applying adjustments for non-missing ones. This is especially important for
+    // flipped variants, where the baseline score is non-zero.
+    for (original_fam_idx, &dosage) in dosages.iter().enumerate() {
+        if dosage == 3 { // Missing Genotype
+            if let Some(output_idx) = prep_result.person_fam_to_output_idx[original_fam_idx] {
+                let scores_offset = output_idx as usize * num_scores;
+                for score_col_idx in affected_scores {
+                    let col = score_col_idx.0;
+                    // If a variant was flipped, the baseline calculation assumes a score of
+                    // 2 * W. We must subtract this back out for missing individuals.
+                    if flip_row[col] == 1 {
+                        partial_scores_out[scores_offset + col] -= 2.0 * weight_row[col] as f64;
+                    }
+                    partial_missing_counts_out[scores_offset + col] += 1;
+                }
+            }
+        }
+    }
+
+    // --- 4. Main compute pass: Apply adjustments for non-zero dosages ---
+    for (original_fam_idx, &dosage) in dosages.iter().enumerate() {
+        // THE CORE OPTIMIZATION: For a sparse SNP, this branch is highly predictable.
+        // We skip the vast majority of individuals who are homozygous-reference.
+        if dosage == 0 || dosage == 3 {
+            continue;
+        }
+
+        // Check if this person is in our output subset. This is an O(1) lookup.
+        if let Some(output_idx) = prep_result.person_fam_to_output_idx[original_fam_idx] {
+            let scores_offset = output_idx as usize * num_scores;
+            
+            // This person has a non-zero dosage. Apply adjustments to all relevant scores.
+            for score_col_idx in affected_scores {
+                let col = score_col_idx.0;
+                let weight = weight_row[col] as f64;
+                let adjustment = if flip_row[col] == 1 {
+                    -weight * (dosage as f64)
+                } else {
+                    weight * (dosage as f64)
+                };
+                partial_scores_out[scores_offset + col] += adjustment;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Decodes a single SNP's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
+#[inline]
+fn decode_snp(snp_data: &[u8], num_people: usize) -> Vec<u8> {
+    let mut dosages = Vec::with_capacity(num_people);
+    for i in 0..num_people {
+        let byte_index = i / 4;
+        let bit_offset = (i % 4) * 2;
+        let packed_val = (snp_data[byte_index] >> bit_offset) & 0b11;
+        
+        let dosage = match packed_val {
+            0b00 => 0, // Homozygous for first allele
+            0b01 => 3, // Corresponds to PLINK's missing value
+            0b10 => 1, // Heterozygous
+            0b11 => 2, // Homozygous for second allele
+            _ => unreachable!(),
+        };
+        dosages.push(dosage);
+    }
+    dosages
+}
 
 #[cfg(test)]
 mod tests {
