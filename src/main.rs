@@ -12,11 +12,13 @@
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
-use gnomon::io::SnpChunkReader;
-use gnomon::io::SnpChunk;
+use gnomon::io::SnpReader;
 use gnomon::prepare;
 use gnomon::reformat;
-use gnomon::types::{DirtyCounts, DirtyScores, MatrixRowIndex};
+use gnomon::types::{
+    BimRowIndex, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, MatrixRowIndex,
+    OriginalPersonIndex, SnpDataBuffer,
+};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -147,121 +149,40 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 3: Dynamic Runtime Resource Allocation ---
     let resource_alloc_start = Instant::now();
 
-    // This block of code adds detailed timing points for the resource allocation phase.
-    let t0 = Instant::now();
-
     let num_scores = prep_result.score_names.len();
     let result_buffer_size = prep_result.num_people_to_score * num_scores;
     let mut all_scores = vec![0.0f64; result_buffer_size];
     let mut all_missing_counts = vec![0u32; result_buffer_size];
 
-    let t1 = Instant::now();
-    let t2 = Instant::now();
-
+    // These resource pools are shared across all compute tasks.
     let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
     let sparse_index_pool = Arc::new(SparseIndexPool::new());
+    
+    // --- Determine a Target Batch Size for the Person-Major Path ---
+    // The goal is to make batches large enough to amortize the high fixed cost of
+    // the pivot operation, while respecting L3 cache size to keep the tile hot.
+    const PERSON_BLOCK_SIZE: u64 = 4096; // Must match batch.rs
+    const MIN_DENSE_BATCH_SIZE: usize = 1 * 1024 * 1024; // 1 MB
+    const MAX_DENSE_BATCH_SIZE: usize = 256 * 1024 * 1024; // 256 MB
 
-    let t3 = Instant::now();
+    let dense_batch_target_size = {
+        let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or(32 * 1024 * 1024);
+        let bytes_per_snp = prep_result.bytes_per_snp;
 
-    // GOAL: Find the largest I/O Chunk Size that produces a compute `tile` that
-    //       fits within the L3 cache, thus co-optimizing I/O and compute.
-    //
-    // VARIABLES:
-    // S_io_chunk_opt: Optimal I/O Chunk Size (bytes) - The value we want to find.
-    // C_L3:           L3 Cache Size (bytes)
-    // S_person_block: The `PERSON_BLOCK_SIZE` constant (4096)
-    // N_people:       Total number of individuals in the study
-    // N_total_snps:   Total number of SNPs in the genome file
-    // N_score_snps:   Number of relevant SNPs used in the analysis
-    // B_snp:          Bytes per SNP in the .bed file = CEIL(N_people / 4)
-    // D_score:        Density of relevant SNPs = N_score_snps / N_total_snps
-    //
-    // DERIVATION:
-    // 1. The L3 cache constraint: Size(tile) <= C_L3
-    // 2. Tile size definition: Size(tile) = S_person_block * N_chunk_snps_max
-    // 3. From (1) and (2), max SNPs per tile: N_chunk_snps_max = C_L3 / S_person_block
-    // 4. Link tile to I/O chunk: N_chunk_snps_max = (S_io_chunk_opt / B_snp) * D_score
-    // 5. Solving for S_io_chunk_opt: S_io_chunk_opt = (C_L3 * B_snp) / (S_person_block * D_score)
-    //
-    // FINAL FORMULA:
-    // S_io_chunk_opt = (C_L3 * N_total_snps * CEIL(N_people / 4)) / (S_person_block * N_score_snps)
-    //
-    const PERSON_BLOCK_SIZE: u64 = 4096; // Must match the value in `batch.rs`
+        // Calculate the number of SNPs whose pivoted tile would fill the L3 cache.
+        // This is an ideal upper bound for the number of SNPs in a person-major batch.
+        let max_snps_for_l3 = (l3_cache_bytes as u64) / PERSON_BLOCK_SIZE;
 
-    // 1. Determine L3 Cache Size, with a robust fallback.
-    const FALLBACK_L3_CACHE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
-    const MINIMUM_PLAUSIBLE_L3_CACHE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
-
-    // Attempt to detect the L3 cache size. If the detected size is too small to be a
-    // plausible L3 cache (common in virtualized environments), treat it as a
-    // detection failure and use the safe fallback value.
-    let l3_cache_bytes = cache_size::l3_cache_size()
-        .and_then(|size| {
-            if size >= MINIMUM_PLAUSIBLE_L3_CACHE_BYTES {
-                Some(size)
-            } else {
-                // A detected size that is non-zero but smaller than the minimum plausible
-                // size is logged as a warning before reverting to the fallback.
-                eprintln!(
-                    "> Warning: Detected cache size ({} KiB) is implausibly small for L3. Reverting to fallback.",
-                    size / 1024
-                );
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            eprintln!(
-                "> L3 cache size not detected or is implausible. Using safe fallback: {} MiB.",
-                FALLBACK_L3_CACHE_BYTES / 1024 / 1024
-            );
-            FALLBACK_L3_CACHE_BYTES
-        });
-
-    let t4 = Instant::now();
-
-    // This prints the cache size actually being used for the calculation, using
-    // floating-point division for accuracy and including the raw byte count for clarity.
-    eprintln!(
-        "> Using L3 cache size for optimization: {:.2} MiB ({} bytes)",
-        l3_cache_bytes as f64 / (1024.0 * 1024.0),
-        l3_cache_bytes
-    );
-
-    // 2. Get data parameters from the `prep_result`.
-    let n_people = prep_result.total_people_in_fam as u64;
-    let n_total_snps = prep_result.total_snps_in_bim as u64;
-    let n_score_snps = prep_result.num_reconciled_variants as u64;
-
-    // 3. Calculate the theoretically optimal chunk size using our formula.
-    let mut optimal_chunk_size: u64 = 64 * 1024 * 1024; // Default to 64MB.
-
-    if n_score_snps > 0 {
-        let bytes_per_snp = (n_people + 3) / 4;
-
-        // Use u128 for the intermediate multiplication to prevent overflow.
-        let numerator = (l3_cache_bytes as u128)
-            * (n_total_snps as u128)
-            * (bytes_per_snp as u128);
-        let denominator = (PERSON_BLOCK_SIZE as u128) * (n_score_snps as u128);
-
-        if denominator > 0 {
-            optimal_chunk_size = (numerator / denominator) as u64;
-        }
+        // Convert that number of SNPs back into a raw data size.
+        (max_snps_for_l3 * bytes_per_snp) as usize
     }
-
-    let t5 = Instant::now();
-
-    // 4. Apply practical guardrails to the optimal value. We assume sufficient RAM
-    // and apply a fixed upper and lower bound for stability and I/O efficiency.
-    const DYNAMIC_MIN_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB floor for I/O efficiency.
-    const ABSOLUTE_MAX_CHUNK_SIZE: u64 = 512 * 1024 * 1024; // 512 MB fixed safety cap.
-
-    let chunk_size_bytes = optimal_chunk_size
-        .clamp(DYNAMIC_MIN_CHUNK_SIZE, ABSOLUTE_MAX_CHUNK_SIZE) as usize;
-
-    let t6 = Instant::now();
-
+    .clamp(MIN_DENSE_BATCH_SIZE, MAX_DENSE_BATCH_SIZE);
+    
+    // The pipeline depth determines how many I/O and compute tasks can run in parallel.
     const PIPELINE_DEPTH: usize = 2;
+
+    // A pool of reusable buffers for partial results. This avoids re-allocating
+    // the large score/count vectors for every compute task.
     let partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>> =
         Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
     for _ in 0..(PIPELINE_DEPTH + 1) {
@@ -273,198 +194,197 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .unwrap();
     }
 
-    let t7 = Instant::now();
-
-    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpChunk>(PIPELINE_DEPTH);
+    // The pipeline now passes single-SNP data buffers between the I/O producer and
+    // the main consumer/orchestrator thread.
+    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpDataBuffer>(PIPELINE_DEPTH);
     let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
 
-    let t8 = Instant::now();
-
-    {
-        eprintln!("[Allocation Benchmark]");
-        eprintln!("  - Main result buffer alloc:      {:.2?}", t1 - t0);
-        eprintln!("  - Main result buffer init:       {:.2?}", t2 - t1);
-        eprintln!("  - Basic worker pools alloc:      {:.2?}", t3 - t2);
-        eprintln!("  - L3 cache detection:            {:.2?}", t4 - t3);
-        eprintln!("  - Chunk size formula calc:       {:.2?}", t5 - t4);
-        eprintln!("  - Chunk size clamping:           {:.2?}", t6 - t5);
-        eprintln!("  - Partial result pool alloc:     {:.2?}", t7 - t6);
-        eprintln!("  - Pipeline channels setup:       {:.2?}", t8 - t7);
-    }
-
     eprintln!(
-        "> Resource allocation complete in {:.2?}. Determined I/O chunk size to {} MB and pipeline depth to {}",
+        "> Resource allocation complete in {:.2?}. Dense batch target: {} MB. Pipeline depth: {}",
         resource_alloc_start.elapsed(),
-        chunk_size_bytes / 1024 / 1024,
+        dense_batch_target_size / 1024 / 1024,
         PIPELINE_DEPTH
     );
 
-    // --- Phase 4: True Concurrent Pipeline Execution ---
+    // --- Phase 4: Adaptive Concurrent Pipeline Execution ---
+    // Pre-fill the pipeline with empty buffers for the I/O producer to use.
+    // Each buffer is sized to hold exactly one SNP's data.
+    let single_snp_buffer_size = prep_result.bytes_per_snp as usize;
     for _ in 0..PIPELINE_DEPTH {
-        empty_buffer_tx.send(vec![0u8; chunk_size_bytes]).await?;
+        empty_buffer_tx
+            .send(vec![0u8; single_snp_buffer_size])
+            .await?;
     }
 
     let bed_path = plink_prefix.with_extension("bed");
-    let reader = SnpChunkReader::new(
+    let reader = SnpReader::new(
         &bed_path,
         prep_result.bytes_per_snp,
         prep_result.total_snps_in_bim,
     )?;
 
+    // --- I/O Producer Task ---
+    // This task reads SNPs from the .bed file and sends only the relevant ones
+    // to the main orchestrator thread for processing.
+    let prep_clone_for_io = Arc::clone(&prep_result);
     let io_handle = tokio::spawn(async move {
         let mut reader = reader;
-        // The producer loop is now free of logic. It just calls the reader factory
-        // and sends the resulting guaranteed-valid chunk to the consumer.
+        let mut bed_row_cursor: u32 = 0;
+        let mut required_indices_cursor: usize = 0;
+
         'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
-            let read_result = task::spawn_blocking(move || {
-                // The factory method returns a valid chunk or None at EOF.
-                let chunk_opt = reader.read_next_chunk(&mut buffer)?;
-                // The buffer is passed back, potentially empty if it was used.
-                Ok::<_, io::Error>((reader, buffer, chunk_opt))
+            let snp_data_opt = match task::spawn_blocking(move || {
+                let snp_data_opt = reader.read_next_snp(&mut buffer)?;
+                Ok::<_, io::Error>((reader, buffer, snp_data_opt))
             })
             .await
-            .unwrap();
-
-            match read_result {
-                Ok((new_reader, _cleared_buffer, Some(chunk))) => {
-                    reader = new_reader;
-                    // Send the validated chunk to the consumer.
-                    if full_buffer_tx.send(chunk).await.is_err() {
-                        // Consumer has hung up, no point in continuing.
-                        break 'producer;
-                    }
-                }
-                Ok((_new_reader, unused_buffer, None)) => {
-                    // EOF. The reader is now exhausted.
-                    // The buffer we received was not used by the factory. We drop it.
-                    // The producer loop can now terminate.
-                    drop(unused_buffer);
-                    break 'producer;
-                }
-                Err(e) => {
+            {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) | Err(_) => {
                     eprintln!("[I/O Task Error]: {}", e);
                     break 'producer;
                 }
+            };
+            
+            reader = snp_data_opt.0;
+            let unused_buffer = snp_data_opt.1;
+
+            if let Some(filled_buffer) = snp_data_opt.2 {
+                // Check if the SNP we just read is one we actually need.
+                let is_relevant = prep_clone_for_io
+                    .required_bim_indices
+                    .get(required_indices_cursor)
+                    .map_or(false, |&req_idx| req_idx.0 == bed_row_cursor);
+
+                if is_relevant {
+                    required_indices_cursor += 1;
+                    if full_buffer_tx.send(SnpDataBuffer(filled_buffer)).await.is_err() {
+                        break 'producer'; // Consumer hung up.
+                    }
+                } else {
+                    // This SNP is not needed, so recycle its buffer immediately.
+                    if empty_buffer_tx.send(filled_buffer).await.is_err() {
+                        break 'producer';
+                    }
+                }
+                bed_row_cursor += 1;
+            } else {
+                // EOF. Drop the unused buffer and terminate.
+                drop(unused_buffer);
+                break 'producer';
             }
         }
-        // The producer loop has finished (due to EOF, error, or consumer hang-up).
-        // The `full_buffer_tx` is now dropped, which will cause the consumer
-        // loop to terminate gracefully after processing any in-flight chunks.
     });
 
-    let mut bed_row_offset: usize = 0;
-
+    // --- Main Orchestrator Loop ---
+    // This loop receives a stream of *relevant* SNPs and dispatches them.
+    let mut required_indices_cursor: usize = 0;
+    let mut dense_batch = DenseSnpBatch::new_empty(dense_batch_target_size);
+    
     let computation_start = Instant::now();
-    while let Some(chunk) = full_buffer_rx.recv().await {
-        let snps_in_bed_chunk = chunk.num_snps;
-        let bed_row_end = bed_row_offset + snps_in_bed_chunk;
-
-        // Use `partition_point` to find the start and end indices in the dense matrix
-        // that correspond to the variants in the current BED chunk.
-        // `try_into().unwrap()` performs a safe, explicit
-        // conversion from the `usize` row offset to the `u32` index type, panicking
-        // on overflow to prevent silent data corruption.
-        let matrix_row_start = prep_result
-            .required_bim_indices
-            .partition_point(|&x| x.0 < bed_row_offset.try_into().unwrap());
-        let matrix_row_end = prep_result
-            .required_bim_indices
-            .partition_point(|&x| x.0 < bed_row_end.try_into().unwrap());
-
-        let snps_in_matrix_chunk = matrix_row_end - matrix_row_start;
-
-        if snps_in_matrix_chunk == 0 {
-            // This chunk contains no variants relevant to the calculation.
-            // Skip computation and immediately recycle the buffer by sending it back.
-            if empty_buffer_tx.send(chunk.buffer).await.is_err() {
-                break;
+    while let Some(snp_buffer) = full_buffer_rx.recv().await {
+        let matrix_row_index = prep_result.required_bim_indices[required_indices_cursor];
+        required_indices_cursor += 1;
+        
+        // This is a placeholder for the adaptive logic.
+        let path_decision = ComputePath::PersonMajor; 
+        
+        match path_decision {
+            ComputePath::SnpMajor => {
+                // To be implemented: dispatch sparse work.
             }
-            bed_row_offset += snps_in_bed_chunk;
-            continue;
-        }
+            ComputePath::PersonMajor => {
+                // First SNP in a new dense batch? Set the starting metadata.
+                if dense_batch.snp_count == 0 {
+                    dense_batch.start_matrix_row = matrix_row_index;
+                }
+                dense_batch.data.extend_from_slice(&snp_buffer.0);
+                dense_batch.snp_count += 1;
 
+                // Recycle the single-SNP buffer immediately.
+                if empty_buffer_tx.send(snp_buffer.0).await.is_err() {
+                    break;
+                }
+
+                // If the batch is now full, dispatch it for processing.
+                if dense_batch.data.len() >= dense_batch_target_size {
+                    let batch_to_process = std::mem::replace(
+                        &mut dense_batch,
+                        DenseSnpBatch::new_empty(dense_batch_target_size),
+                    );
+                    
+                    let prep_clone = Arc::clone(&prep_result);
+                    let tile_pool_clone = Arc::clone(&tile_pool);
+                    let partial_result_pool_clone = Arc::clone(&partial_result_pool);
+                    let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
+                    let (dirty_scores, dirty_counts) = partial_result_pool_clone.pop().unwrap();
+                    
+                    let compute_handle = task::spawn_blocking(move || {
+                        let mut clean_scores = dirty_scores.into_clean();
+                        let mut clean_counts = dirty_counts.into_clean();
+
+                        // This will be renamed to `run_person_major_path`
+                        batch::run_chunk_computation(
+                            &batch_to_process.data,
+                            &prep_clone,
+                            &mut clean_scores,
+                            &mut clean_counts,
+                            &tile_pool_clone,
+                            &sparse_index_pool_clone,
+                            batch_to_process.start_matrix_row,
+                            batch_to_process.snp_count,
+                            0, // The chunk_bed_row_offset is no longer needed
+                        )?;
+                        
+                        let result = (clean_scores.into_dirty(), clean_counts.into_dirty());
+                        Ok::<_, Box<dyn Error + Send + Sync>>(result)
+                    });
+                    
+                    let (partial_scores, partial_missing_counts) = match compute_handle.await? {
+                        Ok(result) => result,
+                        Err(e) => return Err(e),
+                    };
+
+                    for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) { *master += partial; }
+                    for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) { *master += partial; }
+                    partial_result_pool_clone.push((partial_scores, partial_missing_counts)).unwrap();
+                }
+            }
+        }
+        
+        // Progress reporting
+        if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
+             eprintln!(
+                "> Processed {}/{} relevant variants...",
+                required_indices_cursor,
+                prep_result.num_reconciled_variants
+            );
+        }
+    }
+
+    // After the loop, process any final, non-full dense batch.
+    if dense_batch.snp_count > 0 {
+        // This is a simplified version of the dispatch logic inside the loop.
+        // In a full implementation, this would call the same dispatch helper.
+        eprintln!("> Processing final batch of {} dense SNPs...", dense_batch.snp_count);
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_result_pool_clone = Arc::clone(&partial_result_pool);
         let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-        
-        // Pop the set of "dirty" buffers from the reusable pool.
-        let (dirty_scores_buffer, dirty_missing_counts_buffer) =
-            partial_result_pool_clone.pop().unwrap();
-
+        let (dirty_scores, dirty_counts) = partial_result_pool_clone.pop().unwrap();
         let compute_handle = task::spawn_blocking(move || {
-            // This is the state transition: the dirty buffers are consumed and zeroed,
-            // producing clean buffers that are guaranteed to be ready for computation.
-            // This work happens in parallel on a blocking-safe thread.
-            let mut clean_scores = dirty_scores_buffer.into_clean();
-            let mut clean_counts = dirty_missing_counts_buffer.into_clean();
-
-            // The signature of `run_chunk_computation` now demands clean buffers,
-            // which is enforced by the compiler.
-            batch::run_chunk_computation(
-                &chunk.buffer,
-                &prep_clone,
-                &mut clean_scores,
-                &mut clean_counts,
-                &tile_pool_clone,
-                &sparse_index_pool_clone,
-                // The `matrix_row_start` from `partition_point` is a `usize`, but the
-                // `MatrixRowIndex` type requires a `u32`. `try_into().unwrap()`
-                // performs a safe, explicit conversion that panics on overflow,
-                // preventing silent data corruption and upholding the design contract.
-                MatrixRowIndex(matrix_row_start.try_into().unwrap()),
-                snps_in_matrix_chunk,
-                bed_row_offset,
-            )?;
-
-            // The compute task has filled the buffers, so they are now dirty.
-            // We transition their types back before returning them.
-            let result = (
-                chunk.buffer,
-                clean_scores.into_dirty(),
-                clean_counts.into_dirty(),
-            );
-
+            let mut clean_scores = dirty_scores.into_clean();
+            let mut clean_counts = dirty_counts.into_clean();
+            batch::run_chunk_computation(&dense_batch.data, &prep_clone, &mut clean_scores, &mut clean_counts, &tile_pool_clone, &sparse_index_pool_clone, dense_batch.start_matrix_row, dense_batch.snp_count, 0)?;
+            let result = (clean_scores.into_dirty(), clean_counts.into_dirty());
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
-
-        // The main thread awaits the result from the compute task.
-        let (io_buffer, partial_scores, partial_missing_counts) = match compute_handle.await? {
-            Ok(result) => result,
-            Err(e) => return Err(e),
-        };
-
-        // --- Lean Aggregation Step ---
-        // The `Dirty*` wrapper types implement `IntoIterator`, which allows them to
-        // be used directly in functions like `.zip()` that expect an iterator.
-        for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) {
-            *master += partial;
-        }
-        for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) {
-            *master += partial;
-        }
-
-        // Recycle the I/O buffer to the producer.
-        let send_result = empty_buffer_tx.send(io_buffer).await;
-
-        // Return the still-"dirty" partial result buffers to the pool for the next iteration.
-        partial_result_pool_clone
-            .push((partial_scores, partial_missing_counts))
-            .unwrap();
-
-        if send_result.is_err() {
-            break;
-        }
-
-        bed_row_offset += snps_in_bed_chunk;
-
-        eprintln!(
-            "> Processed chunk: {}/{} variants ({:.1}%)",
-            matrix_row_end,
-            prep_result.num_reconciled_variants,
-            (matrix_row_end as f32 / prep_result.num_reconciled_variants as f32) * 100.0
-        );
+        let (partial_scores, partial_missing_counts) = compute_handle.await?.unwrap();
+        for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) { *master += partial; }
+        for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) { *master += partial; }
+        partial_result_pool_clone.push((partial_scores, partial_missing_counts)).unwrap();
     }
+
 
     io_handle.await?;
     eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
