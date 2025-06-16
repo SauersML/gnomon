@@ -1,14 +1,16 @@
 import subprocess
 import sys
+import os
 from pathlib import Path
 from bench import RealisticDataGenerator
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
+# The binary should have profiling symbols. The CI workflow correctly uses a binary
+# from `target/profiling/gnomon`.
 GNOMON_BINARY = Path("./target/profiling/gnomon").resolve()
 
 # Define a variety of workloads to profile the program under different conditions.
-# The script will loop through each of these and generate a separate perf report.
 WORKLOADS = {
     # A small, clean workload.
     "small_clean": {
@@ -29,7 +31,6 @@ WORKLOADS = {
         ],
     },
     # A larger, more complex workload with multiple, heterogeneous score files.
-    # This simulates a more realistic, demanding use case.
     "large_complex": {
         "test_name": "large_complex",
         "n_individuals": 5_000,
@@ -56,8 +57,7 @@ WORKLOADS = {
             },
         ],
     },
-    # A workload specifically designed to test performance on "messy" data,
-    # with poor overlap, variant mismatches, and missing data.
+    # A workload specifically designed to test performance on "messy" data.
     "messy_data": {
         "test_name": "messy_data",
         "n_individuals": 2_000,
@@ -87,52 +87,35 @@ def print_header(title: str, char: str = "="):
 def run_command(cmd, title, **kwargs):
     """
     Runs a command, streams its output, and on failure, prints the last 20 lines
-    of output for easier debugging.
-
-    Returns:
-        bool: True if the command succeeded, False otherwise.
+    of output for easier debugging. Returns True on success, False on failure.
     """
     print_header(title, char="-")
     cmd_str_list = [str(c) for c in cmd]
     print(f"Executing: {' '.join(cmd_str_list)}", flush=True)
     
     output_lines = []
-    process_failed = False
     try:
+        # Use Popen to stream output in real-time
         proc = subprocess.Popen(
-            cmd_str_list,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace', # Prevents crashes on weird characters
-            **kwargs
+            cmd_str_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', **kwargs
         )
-        
-        # Stream output in real-time while also capturing it
         with proc.stdout:
             for line in iter(proc.stdout.readline, ''):
-                line_stripped = line.rstrip()
-                # The traceback is printed via the test harness, no need to duplicate it here
-                if not process_failed:
-                    sys.stdout.write(f"  > {line_stripped}\n")
-                    sys.stdout.flush()
-                output_lines.append(line_stripped)
-
+                sys.stdout.write(f"  > {line.rstrip()}\n")
+                sys.stdout.flush()
+                output_lines.append(line)
         retcode = proc.wait()
         
         if retcode != 0:
-            process_failed = True
             print(f"\n❌ Command failed with exit code {retcode}", flush=True)
             print("--- Last 20 lines of output for debugging ---", flush=True)
             for l in output_lines[-20:]:
-                print(f"  | {l}", flush=True)
-            print("---------------------------------------------", flush=True)
+                print(f"  | {l.rstrip()}", flush=True)
             return False
-            
-        print(f"\n✅ Command successful.", flush=True)
-        return True
         
+        print("\n✅ Command successful.", flush=True)
+        return True
     except Exception as e:
         print(f"❌ Failed to execute command: {e}", flush=True)
         return False
@@ -140,89 +123,76 @@ def run_command(cmd, title, **kwargs):
 def main():
     """
     Main function to orchestrate data generation, profiling, and reporting.
-    It iterates through a set of predefined workloads and runs perf on each.
+    It generates data for all workloads, then runs them sequentially under a
+    single `perf record` session for a combined report.
     """
     WORKDIR.mkdir(exist_ok=True)
     
-    # Track if any workload fails to exit with an error code at the end
-    any_failures = False
+    commands_to_profile = []
+    generators = []
 
-    for name, params in WORKLOADS.items():
-        print_header(f"STARTING WORKLOAD: {name}", char="*")
-        
-        # Create a dedicated subdirectory for this workload's data
-        run_workdir = WORKDIR / name
-        run_workdir.mkdir(exist_ok=True)
+    # --- 1. Generate Data and Commands for ALL Workloads ---
+    try:
+        for name, params in WORKLOADS.items():
+            print_header(f"Generating data for workload: {name}", char="*")
+            run_workdir = WORKDIR / name
+            run_workdir.mkdir(exist_ok=True)
 
-        generator = None
-        try:
-            # --- 1. Generate Synthetic Data ---
-            print_header(f"[{name}] Generating synthetic data", char="=")
             generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
+            generators.append(generator) # Save for cleanup
             data_prefix, score_files = generator.generate_all_files()
             
-            # Construct the arguments for the gnomon binary
-            gnomon_args = []
+            # Gnomon can accept a directory of score files
             score_dir = run_workdir / f"scores_{name}"
             score_dir.mkdir(exist_ok=True)
-            
-            # Move score files to a dedicated directory and build args
             for sf_path in score_files:
-                new_path = score_dir / sf_path.name
-                sf_path.rename(new_path)
+                sf_path.rename(score_dir / sf_path.name)
             
-            # Gnomon can take a directory as input
-            gnomon_args.extend(["--score", str(score_dir)])
-            gnomon_args.append(str(data_prefix))
+            # Build the full command string
+            command_str = f'echo "--- Running workload: {name} ---" && '
+            command_str += f'"{GNOMON_BINARY}" --score "{score_dir}" "{data_prefix}"'
+            commands_to_profile.append(command_str)
 
-            # --- 2. Run `perf record` ---
-            perf_data_file = WORKDIR / f"perf.{name}.data"
-            perf_record_cmd = [
-                "perf", "record", "-g", 
-                "-o", str(perf_data_file), 
-                "--", str(GNOMON_BINARY)
-            ] + gnomon_args
-            
-            if not run_command(perf_record_cmd, title=f"[{name}] Running `perf record`"):
-                print(f"❌ Profiling failed for workload '{name}'. Skipping report.")
-                any_failures = True
-                continue # Proceed to the next workload
+        # --- 2. Create a single script to run all workloads ---
+        runner_script_path = WORKDIR / "run_all_workloads.sh"
+        with open(runner_script_path, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("set -e\n") # Exit on any error
+            for cmd in commands_to_profile:
+                f.write(f"{cmd}\n")
+        os.chmod(runner_script_path, 0o755)
 
-            # --- 3. Generate `perf report` ---
-            print_header(f"[{name}] Granular Profile Report", char="#")
-            print("# Answers: 'Where did my program spend its time?'")
-            print("# Displaying call-graph, showing only branches consuming > 2% of total time.")
-            
-            if perf_data_file.exists():
-                perf_report_cmd = [
-                    "perf", "report", 
-                    "--stdio",
-                    "--call-graph=graph", 
-                    "--percent-limit=2",
-                    "-i", str(perf_data_file)
-                ]
-                if not run_command(perf_report_cmd, title=f"[{name}] Generating `perf` Call-Graph Report"):
-                    any_failures = True
-            else:
-                print(f"perf.data file not found for workload '{name}'. The profiling run may have failed.")
-                any_failures = True
+        # --- 3. Run `perf record` on the combined script ---
+        perf_data_file = WORKDIR / "perf.combined.data"
+        perf_record_cmd = [
+            "perf", "record", "-g", "-o", str(perf_data_file),
+            "--", str(runner_script_path)
+        ]
+        if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`"):
+            sys.exit("Profiling run failed.")
 
-        except Exception as e:
-            print(f"An unexpected error occurred during workload '{name}': {e}")
-            import traceback
-            traceback.print_exc()
-            any_failures = True
-        
-        finally:
-            if generator:
-                # Cleanup the generated files for the current workload
-                generator.cleanup()
+        # --- 4. Generate a single, combined `perf report` ---
+        if perf_data_file.exists():
+            perf_report_cmd = [
+                "perf", "report", "--stdio", "--call-graph=graph",
+                "--percent-limit=2", "-i", str(perf_data_file)
+            ]
+            run_command(perf_report_cmd, title="Combined Granular Profile Report")
+        else:
+            print(f"Combined perf data file not found at '{perf_data_file}'. The profiling run may have failed.")
+            sys.exit(1)
 
-    if any_failures:
-        print("\n❌ One or more profiling workloads failed.")
-        sys.exit(1)
-    else:
-        print("\n✅ All profiling workloads completed successfully.")
+    finally:
+        # --- 5. Cleanup ---
+        print_header("Cleaning up all generated data", char="~")
+        for gen in generators:
+            gen.cleanup()
+        runner_script = WORKDIR / "run_all_workloads.sh"
+        if runner_script.exists():
+            runner_script.unlink()
+            print(f"Removed temporary script: {runner_script}")
+
+    print("\n✅ All profiling workloads completed successfully.")
 
 
 if __name__ == "__main__":
