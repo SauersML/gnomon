@@ -418,10 +418,6 @@ def main():
         
         # --- PLINK2 Execution ---
         if gnomon_res["success"]: # Only run plink if gnomon succeeded, for comparison
-            for sf_path in score_files:
-                # This read/write cycle is not part of the timed benchmark for either tool.
-                df = pd.read_csv(sf_path, sep='\t', low_memory=False)
-                df.to_csv(sf_path, sep='\t', index=False, float_format='%.8f', na_rep='NA')
             plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
             plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
             for sf in score_files:
