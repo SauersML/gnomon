@@ -171,13 +171,31 @@ def main():
         if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`"):
             sys.exit("Profiling run failed.")
 
-        # --- 4. Generate a single, combined `perf report` ---
+        # --- 4. Generate Reports: Call-Graph and Annotated Source ---
         if perf_data_file.exists():
+            # First, generate the high-level call-graph report
             perf_report_cmd = [
                 "perf", "report", "--stdio", "--call-graph=graph",
                 "--percent-limit=2", "-i", str(perf_data_file)
             ]
             run_command(perf_report_cmd, title="Combined Granular Profile Report")
+
+            # --- NEW: Generate a line-by-line annotated report for the hottest function ---
+            # This will show exactly which lines in the function are consuming the most CPU time,
+            # even after the compiler has inlined other functions into it.
+            hot_function_symbol = "gnomon::batch::process_block"
+            perf_annotate_cmd = [
+                "perf", "annotate",
+                "--stdio",                  # Print to console, not interactive
+                "-l",                       # Show line numbers
+                "-i", str(perf_data_file),  # The data file to use
+                "--symbol", hot_function_symbol, # The function to analyze
+            ]
+            run_command(
+                perf_annotate_cmd,
+                title=f"Line-by-Line Annotation for: {hot_function_symbol}"
+            )
+
         else:
             print(f"Combined perf data file not found at '{perf_data_file}'. The profiling run may have failed.")
             sys.exit(1)
