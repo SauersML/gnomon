@@ -510,10 +510,8 @@ fn pivot_tile(
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
                 let variant_idx_in_chunk = snp_chunk_start + i;
-                        let global_matrix_row_idx = matrix_row_start_idx.0 as usize + variant_idx_in_chunk;
-                let absolute_bed_row = prep_result.required_bim_indices[global_matrix_row_idx];
-                        let relative_bed_row = absolute_bed_row.0 as usize - chunk_bed_row_offset;
-                let snp_byte_offset = relative_bed_row as u64 * bytes_per_snp;
+                // Each SNP's data follows the last one directly.
+                let snp_byte_offset = variant_idx_in_chunk as u64 * bytes_per_snp;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
 
                 let packed_vals =
