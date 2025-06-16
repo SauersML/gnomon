@@ -75,7 +75,7 @@ jobs:
       - name: Build Gnomon binaries (Release and Profiling)
         run: |
           cargo build --release
-          cargo build --profile profiling
+          cargo build --profile profiling --features no-inline-profiling
       
       - name: Fail job if unit tests failed
         if: steps.test_step.outcome == 'failure'
