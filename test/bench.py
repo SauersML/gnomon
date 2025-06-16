@@ -290,6 +290,10 @@ class RealisticDataGenerator:
         if multi_score_dir.is_dir():
             shutil.rmtree(multi_score_dir)
         
+        plink_score_dir = self.workdir / f"plink_scores_{self.params['test_name']}"
+        if plink_score_dir.is_dir():
+            shutil.rmtree(plink_score_dir)
+
         keep_file = self.workdir / f"keep_{self.params['test_name']}.txt"
         if keep_file.exists():
             keep_file.unlink()
@@ -390,13 +394,13 @@ def main():
     for run_id, workload_params in enumerate(REALISTIC_DIMENSIONS, 1):
         params = workload_params.copy()
         test_name = params['test_name']
-        # Rename tests to avoid confusion in the final report
         params['test_name'] = test_name.replace('_FULL', '').replace('_SUBSET', '')
         print_header(f"Benchmark Run {run_id}/{len(REALISTIC_DIMENSIONS)}: {test_name}")
         
         generator = None
         keep_file_path = None
-        plink_merged_score_file = None
+        plink_score_dir = None
+        
         try:
             generator = RealisticDataGenerator(workload_params=params, workdir=WORKDIR)
             data_prefix, score_files = generator.generate_all_files()
@@ -407,46 +411,51 @@ def main():
                 fam_path = data_prefix.with_suffix(".fam")
                 keep_file_path = WORKDIR / f"keep_{params['test_name']}.txt"
                 
-                fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[0, 1], names=['FID', 'IID'])
+                fam_df = pd.read_csv(fam_path, sep=r'\s+', header=None, usecols=[1], names=['IID'], engine='python')
                 sample_size = int(len(fam_df) * subset_pct)
-                sampled_df = fam_df.sample(n=sample_size, random_state=run_id)
-                
-                # Write a two-column keep file for PLINK2, and a one-column file for Gnomon.
-                # This ensures compatibility without making assumptions about tool behavior.
-                keep_file_plink = WORKDIR / f"keep_{params['test_name']}_plink.txt"
-                keep_file_gnomon = WORKDIR / f"keep_{params['test_name']}_gnomon.txt"
-                
-                sampled_df.to_csv(keep_file_plink, sep='\t', header=False, index=False)
-                sampled_df[['IID']].to_csv(keep_file_gnomon, header=False, index=False)
-                
-                print(f"      ... wrote {sample_size} individuals to keep files")
+                fam_df.sample(n=sample_size, random_state=run_id).to_csv(keep_file_path, header=False, index=False)
+                print(f"      ... wrote {sample_size} individuals to '{keep_file_path.name}'")
             else:
                 print("    > Running on full cohort (no subsetting).")
 
-            score_dir = WORKDIR / f"scores_{params['test_name']}"
-            score_dir.mkdir(exist_ok=True)
+            gnomon_score_dir = WORKDIR / f"scores_{params['test_name']}"
+            gnomon_score_dir.mkdir(exist_ok=True)
             
-            moved_score_files = []
+            moved_gnomon_score_files = []
             for sf_path in score_files:
-                new_path = score_dir / sf_path.name
+                new_path = gnomon_score_dir / sf_path.name
                 shutil.move(str(sf_path), str(new_path))
-                moved_score_files.append(new_path)
+                moved_gnomon_score_files.append(new_path)
             
-            gnomon_cmd = [gnomon_abs_path, "--score", score_dir.name, data_prefix.name]
-            if subset_pct:
-                gnomon_cmd.extend(["--keep", keep_file_gnomon.name])
+            gnomon_cmd = [gnomon_abs_path, "--score", gnomon_score_dir.name, data_prefix.name]
+            if keep_file_path:
+                gnomon_cmd.extend(["--keep", keep_file_path.name])
             gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
             gnomon_res['test_name'] = test_name
             all_results.append(gnomon_res)
             
             if gnomon_res["success"]:
+                print("    > Preparing PLINK2-compatible score files (filling NA with 0)...")
+                plink_score_dir = WORKDIR / f"plink_scores_{params['test_name']}"
+                plink_score_dir.mkdir(exist_ok=True)
+                plink_score_files = []
+                for gnomon_sf_path in moved_gnomon_score_files:
+                    df = pd.read_csv(gnomon_sf_path, sep='\t', low_memory=False)
+                    score_columns = [col for col in df.columns if col.startswith('score_')]
+                    if score_columns:
+                        df[score_columns] = df[score_columns].fillna(0)
+                    
+                    plink_sf_path = plink_score_dir / gnomon_sf_path.name
+                    df.to_csv(plink_sf_path, sep='\t', index=False, float_format='%.8f')
+                    plink_score_files.append(plink_sf_path)
+
                 plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
                 
-                if len(moved_score_files) > 1:
-                    print("    > Merging multiple score files for PLINK2 compatibility...")
+                if len(plink_score_files) > 1:
+                    print("    > Merging multiple score files for PLINK2...")
                     merged_df = None
                     id_cols = ['snp_id', 'effect_allele', 'other_allele']
-                    for sf_path in moved_score_files:
+                    for sf_path in plink_score_files:
                         current_df = pd.read_csv(sf_path, sep='\t', low_memory=False)
                         if merged_df is None:
                             merged_df = current_df
@@ -457,15 +466,14 @@ def main():
                     if score_columns:
                         merged_df[score_columns] = merged_df[score_columns].fillna(0)
                     
-                    plink_merged_score_file = WORKDIR / f"plink_merged_{params['test_name']}.score"
-                    merged_df.to_csv(plink_merged_score_file, sep='\t', index=False, float_format='%.8f', na_rep='NA')
-                    active_plink_score_file = plink_merged_score_file
+                    active_plink_score_file = WORKDIR / f"plink_merged_{params['test_name']}.score"
+                    merged_df.to_csv(active_plink_score_file, sep='\t', index=False, float_format='%.8f')
                 else:
-                    active_plink_score_file = moved_score_files[0]
+                    active_plink_score_file = plink_score_files[0]
                     
                 plink2_cmd = [plink2_abs_path, "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
-                if subset_pct:
-                    plink2_cmd.extend(["--keep", keep_file_plink.name])
+                if keep_file_path:
+                    plink2_cmd.extend(["--keep", keep_file_path.name])
                 
                 with open(active_plink_score_file, 'r') as f:
                     header = f.readline().strip()
@@ -491,13 +499,12 @@ def main():
             failed_runs += 1
         
         finally:
-            if plink_merged_score_file and plink_merged_score_file.exists():
-                plink_merged_score_file.unlink()
             if generator:
                 generator.cleanup()
-            if subset_pct:
-                if keep_file_gnomon.exists(): keep_file_gnomon.unlink()
-                if keep_file_plink.exists(): keep_file_plink.unlink()
+            if plink_score_dir and plink_score_dir.exists():
+                shutil.rmtree(plink_score_dir)
+            if keep_file_path and keep_file_path.exists():
+                keep_file_path.unlink()
 
     report_results(all_results)
     if failed_runs > 0:
