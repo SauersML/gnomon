@@ -425,60 +425,79 @@ def main():
         print_header(f"Benchmark Run {run_id}/{len(REALISTIC_DIMENSIONS)}: {params['test_name']}")
         
         generator = None
+        plink_merged_score_file = None
         try:
             generator = RealisticDataGenerator(workload_params=params, workdir=WORKDIR)
             data_prefix, score_files = generator.generate_all_files()
-        except Exception as e:
-            print(f"  > ❌ Data generation FAILED for {params['test_name']}: {e}")
-            failed_runs += 1
-            if generator:
-                generator.cleanup()
-            continue
 
-        # --- Gnomon Execution ---
-        # To robustly handle both single and multiple score files, we will
-        # always place them in a dedicated directory for the test run.
-        score_dir = WORKDIR / f"scores_{params['test_name']}"
-        score_dir.mkdir(exist_ok=True)
-        
-        new_score_files = []
-        for sf_path in score_files:
-            new_path = score_dir / sf_path.name
-            shutil.move(str(sf_path), str(new_path))
-            new_score_files.append(new_path)
-        
-        score_files = new_score_files # This updated list is used by PLINK2 later
+            # --- Gnomon Execution Setup ---
+            # Always place score files in a dedicated directory for robust, unified handling.
+            score_dir = WORKDIR / f"scores_{params['test_name']}"
+            score_dir.mkdir(exist_ok=True)
             
-        gnomon_cmd = [gnomon_abs_path, "--score", score_dir.name, data_prefix.name]
-        gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
-        gnomon_res.update(params); all_results.append(gnomon_res)
-        
-        # --- PLINK2 Execution ---
-        if gnomon_res["success"]: # Only run plink if gnomon succeeded, for comparison
-            plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
-            plink2_cmd = [plink2_abs_path, "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
-            for sf in score_files:
-                with open(sf, 'r') as f:
+            moved_score_files = []
+            for sf_path in score_files:
+                new_path = score_dir / sf_path.name
+                shutil.move(str(sf_path), str(new_path))
+                moved_score_files.append(new_path)
+            
+            # Gnomon is called with the directory containing all score files.
+            gnomon_cmd = [gnomon_abs_path, "--score", score_dir.name, data_prefix.name]
+            gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
+            gnomon_res.update(params); all_results.append(gnomon_res)
+            
+            # --- PLINK2 Execution ---
+            if gnomon_res["success"]:
+                plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
+                
+                # PLINK2 requires a single --score flag. If multiple score files exist, merge them.
+                if len(moved_score_files) > 1:
+                    print("    > Merging multiple score files for PLINK2 compatibility...")
+                    merged_df = None
+                    id_cols = ['snp_id', 'effect_allele', 'other_allele']
+                    for sf_path in moved_score_files:
+                        current_df = pd.read_csv(sf_path, sep='\t', low_memory=False)
+                        if merged_df is None:
+                            merged_df = current_df
+                        else:
+                            merged_df = pd.merge(merged_df, current_df, on=id_cols, how='outer')
+                    
+                    plink_merged_score_file = WORKDIR / f"plink_merged_{params['test_name']}.score"
+                    merged_df.to_csv(plink_merged_score_file, sep='\t', index=False, float_format='%.8f', na_rep='NA')
+                    active_plink_score_file = plink_merged_score_file
+                else:
+                    active_plink_score_file = moved_score_files[0]
+                    
+                # Build and run PLINK2 with the single, correct score file.
+                plink2_cmd = [plink2_abs_path, "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
+                with open(active_plink_score_file, 'r') as f:
                     header = f.readline().strip()
                     n_file_scores = len(header.split('\t')) - 3
+                
                 score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
-                # Use the path relative to the working directory, which is robust
-                # to whether the score file was moved into a subdirectory or not.
-                score_file_arg = sf.relative_to(WORKDIR)
+                score_file_arg = active_plink_score_file.relative_to(WORKDIR)
+                
                 plink2_cmd.extend(["--score", score_file_arg, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
-            
-            plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
-            plink2_res.update(params); all_results.append(plink2_res)
-            
-            # --- Validation ---
-            if not simplified_validation(gnomon_res["success"], plink2_res["success"]):
-                failed_runs += 1
-        else:
-            print("  > Skipping PLINK2 run because Gnomon failed.")
-            failed_runs += 1
 
-        if generator:
-            generator.cleanup()
+                plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
+                plink2_res.update(params); all_results.append(plink2_res)
+                
+                if not simplified_validation(gnomon_res["success"], plink2_res["success"]):
+                    failed_runs += 1
+            else:
+                print("  > Skipping PLINK2 run because Gnomon failed.")
+                failed_runs += 1
+
+        except Exception as e:
+            print(f"  > ❌ Test run FAILED for {params['test_name']}: {e}")
+            failed_runs += 1
+        
+        finally:
+            # --- Cleanup for this iteration ---
+            if plink_merged_score_file and plink_merged_score_file.exists():
+                plink_merged_score_file.unlink()
+            if generator:
+                generator.cleanup()
 
     report_results(all_results)
     if failed_runs > 0:
