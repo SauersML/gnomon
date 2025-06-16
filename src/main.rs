@@ -9,7 +9,6 @@
 // the other modules. It owns all major resources and manages the application lifecycle
 // from argument parsing to final output.
 
-use coz;
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
@@ -465,11 +464,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             prep_result.num_reconciled_variants,
             (matrix_row_end as f32 / prep_result.num_reconciled_variants as f32) * 100.0
         );
-
-        // Define a progress point for the causal profiler. This tells `coz` that
-        // the goal is to maximize the rate at which this point is reached, which
-        // corresponds to maximizing the number of chunks processed per second.
-        coz::progress!("chunk-processed");
     }
 
     io_handle.await?;
