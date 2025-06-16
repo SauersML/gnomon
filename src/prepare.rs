@@ -285,6 +285,7 @@ pub fn prepare_for_computation(
         total_snps_in_bim,
         num_reconciled_variants,
         bytes_per_snp,
+        person_fam_to_output_idx,
     ))
 }
 
