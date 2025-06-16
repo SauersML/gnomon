@@ -127,7 +127,7 @@ def main():
             print(f"    > Generating a {PROFILING_SUBSET_PCT:.0%} random subset for profiling...")
             fam_path = data_prefix.with_suffix(".fam")
             keep_file_path = run_workdir / f"keep_{name}.txt"
-            fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[1], names=['IID'])
+            fam_df = pd.read_csv(fam_path, sep=r'\s+', header=None, usecols=[1], names=['IID'], engine='python')
             sample_size = int(len(fam_df) * PROFILING_SUBSET_PCT)
             fam_df.sample(n=sample_size, random_state=42).to_csv(keep_file_path, header=False, index=False)
             print(f"      ... wrote {sample_size} individuals to '{keep_file_path.name}'")
@@ -135,7 +135,10 @@ def main():
             score_dir = run_workdir / f"scores_{name}"
             score_dir.mkdir(exist_ok=True)
             for sf_path in score_files:
-                sf_path.rename(score_dir / sf_path.name)
+                # FIX: Use shutil.move for robust file moving, which is less
+                # error-prone than pathlib.rename across different filesystems
+                # or in containerized environments.
+                shutil.move(str(sf_path), score_dir)
             
             command_str = (f'echo "--- Running workload: {name} on {PROFILING_SUBSET_PCT:.0%} subset ---" && '
                            f'"{GNOMON_BINARY}" --score "{score_dir}" --keep "{keep_file_path}" "{data_prefix}"')
