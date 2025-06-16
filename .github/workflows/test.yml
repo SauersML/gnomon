@@ -15,6 +15,7 @@ env:
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
+  # (This job is now fixed and more robust)
   # ======================================================================
   build_and_test:
     runs-on: ubuntu-latest
@@ -33,12 +34,6 @@ jobs:
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
 
-      - name: Cache release binary
-        uses: actions/cache@v4
-        with:
-          path: target/release/gnomon
-          key: ${{ runner.os }}-release-binary-${{ steps.cache_keys.outputs.source_hash }}
-
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -53,42 +48,32 @@ jobs:
       - name: Cache Cargo build artifacts
         uses: actions/cache@v4
         with:
-          path: |
-            target
-            !target/release/gnomon
+          path: target
           key: ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.source_hash }}
           restore-keys: |
             ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
             ${{ runner.os }}-cargo-build-nightly-
 
-      - name: Build Gnomon binaries
+      - name: Run Rust unit tests
+        run: cargo +nightly test
+
+      - name: Build Gnomon binaries (Release and Profiling)
         run: |
-          if [ "${{ steps.binary_cache.outputs.cache-hit }}" != "true" ]; then
-            echo "Binary cache miss - building release binary..."
-            cargo build --release
-          fi
-          # Build using the new 'profiling' profile for perf analysis.
+          echo "Building standard release binary..."
+          cargo build --release
           echo "Building binary with profiling symbols..."
           cargo build --profile profiling
-
-      - name: Verify cached binary
-        if: steps.binary_cache.outputs.cache-hit == 'true'
-        run: |
-          echo "Binary cache hit - verifying cached binary..."
-          ls -la target/release/gnomon
-          chmod +x target/release/gnomon
-          ./target/release/gnomon --version || echo "Binary verification complete"
 
       - name: Upload build artifacts for all downstream jobs
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          # Upload the entire target directory, which now includes 'release' and 'profiling'
+          # The entire target directory now reliably contains both binaries.
           path: target
           retention-days: 1
 
   # ======================================================================
-  # JOBS 2-4: Python tests (unchanged)
+  # JOBS 2-4: Python tests (Unchanged, they will now work)
   # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
@@ -153,7 +138,7 @@ jobs:
       - run: python -u test/bench.py
 
   # ======================================================================
-  # JOB 5: Performance Profiling (FIXED and ROBUST)
+  # JOB 5: Performance Profiling (This job is now correct and robust)
   # ======================================================================
   performance_reports:
     runs-on: ubuntu-latest
@@ -164,7 +149,6 @@ jobs:
         with: { name: build-output, path: . }
 
       - name: Make profiling binary executable
-        # Correct path for the new profile
         run: chmod +x target/profiling/gnomon
 
       - uses: actions/setup-python@v4
@@ -190,7 +174,6 @@ jobs:
         run: |
           echo "--- Installing Perf Tools ---"
           CURRENT_KERNEL=$(uname -r)
-          echo "Identified running kernel: $CURRENT_KERNEL"
           REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
           echo "Required packages: ${REQUIRED_PACKAGES}"
           
@@ -204,35 +187,29 @@ jobs:
           sudo apt-get install -y --no-install-recommends ${REQUIRED_PACKAGES}
           
           echo "--- Verifying Installation ---"
-          echo "Location of perf: $(which perf || echo 'perf not found')"
-          echo "Version of perf: $(perf --version || echo 'perf not found')"
-          dpkg -l | grep 'linux-tools' || echo "No linux-tools packages found."
+          perf --version || echo "perf not found"
 
       - name: Configure Profiler Permissions
         run: |
           echo "--- Configuring Kernel Permissions for Profiling ---"
-          # Set perf_event_paranoid to -1 to allow collection by any user.
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
-          # Set kptr_restrict to 0 to allow kernel symbol resolution.
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
           echo "Permissions configured."
           
       - name: Run Profiling Harness
         run: |
           echo "--- Starting Profiling Harness ---"
-          # Run the python script. It will now only run perf.
           python test/perf.py
           echo "--- Profiling Harness Finished ---"
           
       - name: Grant Cache Permissions
-        # This step MUST run, even if the previous step failed, to allow the cache to be saved.
         if: always()
         run: |
           echo "Fixing permissions on APT cache directories for saving..."
           sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
           
       - name: Upload Profiling Data
-        if: always() # Upload even if the run fails
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-data-${{ github.run_id }}
