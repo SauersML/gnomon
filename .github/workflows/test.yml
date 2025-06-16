@@ -11,6 +11,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+
 jobs:
   # ======================================================================
   # JOB 1: Handles all Rust compilation, testing, and artifact creation.
@@ -24,31 +25,23 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      # Generate comprehensive hashes for better caching
       - name: Generate cache keys
         id: cache_keys
         run: |
-          # Hash for source files (Rust code changes)
           SOURCE_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
-          
-          # Hash for Cargo.toml only (dependency changes)
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
-          
           echo "Source hash: $SOURCE_HASH"
           echo "Deps hash: $DEPS_HASH"
 
-      # Try to restore the release binary from cache
       - name: Cache release binary
         id: binary_cache
         uses: actions/cache@v4
         with:
-          path: |
-            target/release/gnomon
+          path: target/release/gnomon
           key: ${{ runner.os }}-release-binary-${{ steps.cache_keys.outputs.source_hash }}
 
-      # Cache Cargo registry (dependencies)
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -60,7 +53,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      # Cache Cargo build artifacts
       - name: Cache Cargo build
         uses: actions/cache@v4
         with:
@@ -72,8 +64,7 @@ jobs:
             ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
             ${{ runner.os }}-cargo-build-nightly-
 
-      # Cache getdoc binary
-      - name: Cache getdoc
+      - name: Cache getdoc binary
         id: getdoc_cache
         uses: actions/cache@v4
         with:
@@ -98,7 +89,6 @@ jobs:
           cat report.md
 
       - name: Build Gnomon binaries
-        # Build both the release binary (if not cached) and the profiling binary.
         run: |
           if [ "${{ steps.binary_cache.outputs.cache-hit }}" != "true" ]; then
             echo "Binary cache miss - building release binary..."
@@ -107,7 +97,6 @@ jobs:
           echo "Building profiling binary (coz profile)..."
           cargo build --profile coz
 
-      # If release cache hit, just verify the binary exists and is executable
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
         run: |
@@ -124,148 +113,81 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          # We upload the whole target directory so the path is identical in the next jobs.
-          # This now includes both target/release and target/coz.
           path: |
             target
             report.md
           retention-days: 1
 
   # ======================================================================
-  # JOB 2: Runs the first Python test on its own machine.
+  # JOB 2-4: Python tests (unchanged, they are well-structured)
   # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
     needs: build_and_test
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: . # This recreates the 'target' folder and 'report.md' right here
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.13'
-      
-      # Cache pip packages
-      - name: Cache pip packages
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: build-output, path: . }
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-integration-${{ hashFiles('test/test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-integration-
-            ${{ runner.os }}-pip-
-      
-      - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow
-      
-      - name: Make binary executable
-        run: chmod +x target/release/gnomon
-      
-      - name: Run Integration Test
-        run: python -u test/test.py
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      - run: chmod +x target/release/gnomon
+      - run: python -u test/test.py
 
-  # ======================================================================
-  # JOB 3: Runs the second Python test on a third machine.
-  # ======================================================================
   python_test_simulation:
     runs-on: ubuntu-latest
     needs: build_and_test
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: .
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.13'
-      
-      # Cache pip packages
-      - name: Cache pip packages
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: build-output, path: . }
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-simulation-${{ hashFiles('test/sim_test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-simulation-
-            ${{ runner.os }}-pip-
-      
-      - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
-      
-      - name: Make binary executable
-        run: chmod +x target/release/gnomon
-      
-      - name: Run Simulation Test
-        id: sim_test # ID to reference this step's outcome
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+      - run: chmod +x target/release/gnomon
+      - id: sim_test
         run: python -u test/sim_test.py
-
-      - name: Check for OOM Kill on Failure
-        if: failure() # This condition means the step only runs if the previous step failed
+      - if: failure()
         run: |
-          echo "The simulation test failed. Checking for Out-of-Memory (OOM) errors in kernel logs..."
-          # Dump kernel logs and search for OOM messages.
-          # The '|| true' part ensures this step doesn't fail if grep finds no matches.
-          sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found in dmesg. The failure was likely due to another reason."
+          echo "The simulation test failed. Checking for OOM errors in kernel logs..."
+          sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found."
 
-  # ======================================================================
-  # JOB 4: Runs the benchmark test
-  # ======================================================================
   python_test_benchmark:
     runs-on: ubuntu-latest
     needs: build_and_test
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: .
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.13'
-      
-      # Cache pip packages
-      - name: Cache pip packages
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: build-output, path: . }
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('test/bench.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-benchmark-
-            ${{ runner.os }}-pip-
-      
-      - name: Install Python dependencies
-        run: pip install pandas numpy requests psutil tabulate polars pyarrow
-      
-      - name: Make binary executable
-        run: chmod +x target/release/gnomon
-      
-      - name: Run Benchmark Test
-        run: python -u test/bench.py
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      - run: chmod +x target/release/gnomon
+      - run: python -u test/bench.py
 
   # ======================================================================
-  # JOB 5: Performance Profiling (Runs in parallel with other tests)
+  # JOB 5: Performance Profiling (HEAVILY REVISED AND IMPROVED)
   # ======================================================================
   performance_reports:
     runs-on: ubuntu-latest
-    # This job now depends only on the build job, allowing it to run in parallel.
     needs: build_and_test
     steps:
       - name: Checkout repository
@@ -273,32 +195,85 @@ jobs:
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: .
+        with: { name: build-output, path: . }
 
       - name: Make profiling binary executable
         run: chmod +x target/coz/gnomon
 
       - name: Set up Python
         uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
 
       - name: Install Python dependencies
-        # These are required by bench.py, which our perf.py script imports from.
         run: pip install pandas numpy requests psutil
+
+      - name: System Diagnostics
+        run: |
+          echo "--- System Information ---"
+          echo "Kernel: $(uname -a)"
+          echo "Distribution: $(lsb_release -a)"
+          echo "CPU Cores: $(nproc)"
+          echo "--- Filesystem ---"
+          df -h
+          echo "--- Memory ---"
+          free -h
+          echo "------------------------"
+
+      - name: Get Kernel Version for Cache Key
+        id: kernel_version
+        run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
+      
+      - name: Cache APT packages for profiling
+        id: apt_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-apt-profiler-cache-${{ steps.kernel_version.outputs.version }}
 
       - name: Install Profiling Tools
         run: |
-          sudo apt-get update
-          # Install the causal profiler and the kernel-specific perf tools for Ubuntu.
-          # This command dynamically finds the tools for the running kernel.
-          sudo apt-get install -y coz-profiler linux-tools-common linux-tools-generic linux-tools-$(uname -r)
+          echo "--- Installing Profiling Tools ---"
+          
+          # This variable holds the exact kernel version we are running
+          CURRENT_KERNEL=$(uname -r)
+          echo "Identified running kernel: $CURRENT_KERNEL"
+          
+          # The list of packages we need to ensure are installed
+          REQUIRED_PACKAGES="coz-profiler linux-tools-common linux-tools-${CURRENT_KERNEL}"
+          echo "Required packages: ${REQUIRED_PACKAGES}"
+          
+          # Only run apt-get update if the cache was not restored
+          if [ "${{ steps.apt_cache.outputs.cache-hit }}" != 'true' ]; then
+            echo "APT cache miss, running apt-get update..."
+            sudo apt-get update
+          else
+            echo "APT cache hit, skipping apt-get update."
+          fi
+          
+          # Install the specific packages needed. This is much more robust.
+          # The `--no-install-recommends` flag keeps the install lean.
+          sudo apt-get install -y --no-install-recommends ${REQUIRED_PACKAGES}
+          
+          echo "--- Verifying Installation ---"
+          echo "Location of perf: $(which perf || echo 'not found')"
+          echo "Version of perf: $(perf --version || echo 'not found')"
+          echo "Installed linux-tools packages:"
+          dpkg -l | grep 'linux-tools' || echo "No linux-tools packages found."
+          echo "------------------------------"
 
       - name: Configure perf_event for Profilers
-        # Both coz and perf require this permission level to collect performance data.
-        run: sudo sh -c 'echo 1 >/proc/sys/kernel/perf_event_paranoid'
+        run: |
+          echo "--- Configuring perf_event_paranoid ---"
+          echo "Value before change: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          # Both coz and perf require this permission level to collect performance data.
+          sudo sh -c 'echo 1 >/proc/sys/kernel/perf_event_paranoid'
+          echo "Value after change:  $(cat /proc/sys/kernel/perf_event_paranoid)"
+          echo "---------------------------------------"
 
       - name: Run Profiling Harness
-        run: python test/perf.py --tool all
+        run: |
+          echo "--- Starting Profiling Harness ---"
+          python test/perf.py --tool all
+          echo "--- Profiling Harness Finished ---"
