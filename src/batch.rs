@@ -4,8 +4,6 @@
 //
 // ========================================================================================
 //
-// ### Purpose ###
-//
 // This module contains the synchronous, CPU-bound core of the compute pipeline. It is
 // designed to be called from a higher-level asynchronous orchestrator within a
 // `spawn_blocking` context. Its sole responsibility is to take a raw, SNP-major
