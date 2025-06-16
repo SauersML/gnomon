@@ -332,13 +332,20 @@ fn process_tile(
         let thread_indices = sparse_index_pool.get_or_default();
         let (g1_indices, g2_indices, missing_events) = &mut *thread_indices.borrow_mut();
 
-        g1_indices.iter_mut().for_each(Vec::clear);
-        g2_indices.iter_mut().for_each(Vec::clear);
-        missing_events.clear(); // Clear the events from the previous mini-batch
+        // This logic ensures we only grow the vectors, then clear the relevant inner
+        // vectors, preserving their allocated capacity. This prevents a "malloc storm"
+        // that occurs when the outer vector is truncated and forced to re-allocate
+        // all its inner vectors on the next full-sized block.
+        if g1_indices.len() < num_people_in_block {
+            g1_indices.resize_with(num_people_in_block, Default::default);
+        }
+        g1_indices.iter_mut().take(num_people_in_block).for_each(|v| v.clear());
 
-        g1_indices.resize_with(num_people_in_block, Vec::new);
-        g2_indices.resize_with(num_people_in_block, Vec::new);
-        // We don't need to resize missing_events, just let it grow.
+        if g2_indices.len() < num_people_in_block {
+            g2_indices.resize_with(num_people_in_block, Default::default);
+        }
+        g2_indices.iter_mut().take(num_people_in_block).for_each(|v| v.clear());
+        missing_events.clear();
 
         for person_idx in 0..num_people_in_block {
             let genotype_tile_row_offset = person_idx * snps_in_chunk;
