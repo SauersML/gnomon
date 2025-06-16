@@ -289,8 +289,9 @@ jobs:
       - name: Install Profiling Tools
         run: |
           sudo apt-get update
-          # Install both the causal profiler and the standard Linux perf tools
-          sudo apt-get install -y coz-profiler linux-perf
+          # Install the causal profiler and the kernel-specific perf tools for Ubuntu.
+          # This command dynamically finds the tools for the running kernel.
+          sudo apt-get install -y coz-profiler linux-tools-common linux-tools-generic linux-tools-$(uname -r)
 
       - name: Configure perf_event for Profilers
         # Both coz and perf require this permission level to collect performance data.
