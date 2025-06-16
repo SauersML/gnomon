@@ -264,7 +264,7 @@ class RealisticDataGenerator:
             if score_columns:
                 final_score_df.dropna(subset=score_columns, how='all', inplace=True)
 
-            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.8f', na_rep='NA')
+            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.8f', na_rep='')
             generated_paths.append(score_file_path)
             
         return generated_paths
