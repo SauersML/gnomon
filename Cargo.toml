@@ -26,7 +26,6 @@ num_cpus = "1.17.0"
 cache-size = "0.7.0"
 ryu = "1.0.20"
 nonmax = "0.5.5"
-coz = "0.1.3"
 
 [profile.release]
 opt-level = 3
@@ -34,8 +33,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[profile.coz]
-inherits = "release"
-debug = 1
-strip = false
