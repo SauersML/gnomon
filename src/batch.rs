@@ -474,7 +474,6 @@ fn pivot_tile(
     prep_result: &PreparationResult,
     matrix_row_start_idx: MatrixRowIndex,
     snps_in_chunk: usize,
-    chunk_bed_row_offset: usize,
 ) {
     let num_people_in_block = person_indices_in_block.len();
     let bytes_per_snp = prep_result.bytes_per_snp;
