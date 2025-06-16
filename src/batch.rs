@@ -192,7 +192,6 @@ fn process_block(
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: MatrixRowIndex,
     snps_in_chunk: usize,
-    chunk_bed_row_offset: usize,
 ) {
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
 
