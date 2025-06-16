@@ -63,8 +63,8 @@ impl SparseIndexPool {
 //                                   PUBLIC API
 // ========================================================================================
 
-/// Processes one chunk of SNP-major data, mutating a provided slice with partial scores.
-/// This is the sole public entry point into the synchronous compute engine.
+/// Processes one dense, pre-filtered batch of SNP-major data using the person-major
+/// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_chunk_computation(
     snp_major_data: &[u8],
     prep_result: &PreparationResult,
@@ -74,7 +74,7 @@ pub fn run_chunk_computation(
     sparse_index_pool: &SparseIndexPool,
     matrix_row_start_idx: MatrixRowIndex,
     snps_in_chunk: usize,
-    chunk_bed_row_offset: usize,
+    _chunk_bed_row_offset: usize, // DELETE THIS
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // The type system has already guaranteed the buffers are zeroed.
@@ -106,7 +106,6 @@ pub fn run_chunk_computation(
                 sparse_index_pool,
                 matrix_row_start_idx,
                 snps_in_chunk,
-                chunk_bed_row_offset,
             );
         }
         PersonSubset::Indices(indices) => {
@@ -121,7 +120,6 @@ pub fn run_chunk_computation(
                 sparse_index_pool,
                 matrix_row_start_idx,
                 snps_in_chunk,
-                chunk_bed_row_offset,
             );
         }
     };
