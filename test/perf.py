@@ -115,7 +115,6 @@ def main():
     generators_and_paths = []
 
     try:
-        # --- 1. Generate Data and Commands for ALL Workloads ---
         for name, params in WORKLOADS.items():
             print_header(f"Generating data for workload: {name}", char="*")
             run_workdir = WORKDIR / name
@@ -123,15 +122,14 @@ def main():
 
             generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
             data_prefix, score_files = generator.generate_all_files()
-            generators_and_paths.append((generator, run_workdir)) # Save for cleanup
+            generators_and_paths.append((generator, run_workdir))
 
-            # --- ADDED: Unconditionally generate a keep file for profiling ---
             print(f"    > Generating a {PROFILING_SUBSET_PCT:.0%} random subset for profiling...")
             fam_path = data_prefix.with_suffix(".fam")
             keep_file_path = run_workdir / f"keep_{name}.txt"
-            fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[0, 1], names=['FID', 'IID'])
+            fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[1], names=['IID'])
             sample_size = int(len(fam_df) * PROFILING_SUBSET_PCT)
-            fam_df.sample(n=sample_size, random_state=42).to_csv(keep_file_path, sep='\t', header=False, index=False)
+            fam_df.sample(n=sample_size, random_state=42).to_csv(keep_file_path, header=False, index=False)
             print(f"      ... wrote {sample_size} individuals to '{keep_file_path.name}'")
 
             score_dir = run_workdir / f"scores_{name}"
@@ -139,30 +137,25 @@ def main():
             for sf_path in score_files:
                 sf_path.rename(score_dir / sf_path.name)
             
-            # --- MODIFIED: Build command with --keep flag ---
             command_str = (f'echo "--- Running workload: {name} on {PROFILING_SUBSET_PCT:.0%} subset ---" && '
                            f'"{GNOMON_BINARY}" --score "{score_dir}" --keep "{keep_file_path}" "{data_prefix}"')
             commands_to_profile.append(command_str)
 
-        # --- 2. Create a single script to run all workloads ---
         runner_script_path = WORKDIR / "run_all_workloads.sh"
         with open(runner_script_path, "w") as f:
             f.write("#!/bin/bash\nset -e\n")
             f.write('\n'.join(commands_to_profile))
         os.chmod(runner_script_path, 0o755)
 
-        # --- 3. Run `perf record` on the combined script ---
-        # The output file is now placed in the top-level directory to match CI expectations
         perf_data_file = Path("./perf.data").resolve()
         perf_record_cmd = [
             "perf", "record", "-g", "-o", str(perf_data_file),
             "--", str(runner_script_path)
         ]
-        # Run from WORKDIR so relative paths in script are correct
-        if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`", cwd=WORKDIR):
+        
+        if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`"):
             sys.exit("Profiling run failed.")
 
-        # --- 4. Generate Reports ---
         if perf_data_file.exists():
             perf_report_cmd = [
                 "perf", "report", "--stdio", "--call-graph=graph",
@@ -182,11 +175,8 @@ def main():
             sys.exit(1)
 
     finally:
-        # --- 5. Cleanup ---
         print_header("Cleaning up all generated data", char="~")
         for gen, path in generators_and_paths:
-            # The RealisticDataGenerator cleanup is relative to its own workdir,
-            # but here we can just remove the whole per-workload directory.
             if path.exists():
                 shutil.rmtree(path)
                 print(f"Removed workload directory: {path}")
