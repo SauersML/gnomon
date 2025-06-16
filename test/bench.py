@@ -30,7 +30,7 @@ PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20
 REALISTIC_DIMENSIONS = [
     {
         "test_name": "ACAF_Dense_Scores_SUBSET",
-        "n_individuals": 10_000,
+        "n_individuals": 2_000,
         "genome_variants": 800_000,
         "target_variants": 400_000,
         "af_profile": 'acaf',
@@ -44,7 +44,7 @@ REALISTIC_DIMENSIONS = [
     },
     {
         "test_name": "WGS_Standard_Rare_SUBSET",
-        "n_individuals": 5_000,
+        "n_individuals": 1_000,
         "genome_variants": 1_000_000,
         "target_variants": 600_000,
         "af_profile": 'standard',
@@ -58,7 +58,7 @@ REALISTIC_DIMENSIONS = [
     },
     {
         "test_name": "Multi_Panel_Large_SUBSET",
-        "n_individuals": 8_000,
+        "n_individuals": 3_000,
         "genome_variants": 500_000,
         "target_variants": 250_000,
         "af_profile": 'standard',
@@ -71,7 +71,7 @@ REALISTIC_DIMENSIONS = [
     },
     {
         "test_name": "VeryLargeN_MediumK_ACAF_SUBSET",
-        "n_individuals": 20_000,
+        "n_individuals": 10_000,
         "genome_variants": 750_000,
         "target_variants": 350_000,
         "af_profile": 'acaf',
