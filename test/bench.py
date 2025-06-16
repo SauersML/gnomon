@@ -283,7 +283,7 @@ class RealisticDataGenerator:
                 final_score_df[f"score_{sf_config['name']}_{i+1}"] = weights
 
             score_file_path = self.run_prefix.with_suffix(f".{sf_config['name']}.score")
-            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.6g', na_rep='NA')
+            final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.8f', na_rep='NA')
             generated_paths.append(score_file_path)
             
         return generated_paths
@@ -421,8 +421,7 @@ def main():
             for sf_path in score_files:
                 # This read/write cycle is not part of the timed benchmark for either tool.
                 df = pd.read_csv(sf_path, sep='\t', low_memory=False)
-                df.to_csv(sf_path, sep='\t', index=False, float_format='%.6g', na_rep='NA')
-
+                df.to_csv(sf_path, sep='\t', index=False, float_format='%.8f', na_rep='NA')
             plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
             plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
             for sf in score_files:
