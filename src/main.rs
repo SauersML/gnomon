@@ -13,11 +13,9 @@ use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
 use gnomon::io::SnpReader;
-use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::{
-    BimRowIndex, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, MatrixRowIndex,
-    OriginalPersonIndex, SnpDataBuffer,
+    BimRowIndex, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, MatrixRowIndex, SnpDataBuffer,
 };
 use std::error::Error;
 use std::ffi::OsString;
