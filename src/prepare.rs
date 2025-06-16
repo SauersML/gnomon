@@ -80,7 +80,16 @@ pub fn prepare_for_computation(
     let (person_subset, final_person_iids) =
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
     let num_people_to_score = final_person_iids.len();
-
+    
+    // Build the mapping from original .fam index to the final, compact output index.
+    // This is essential for the SNP-major compute path to work with subsets.
+    let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
+    for (output_idx, iid) in final_person_iids.iter().enumerate() {
+        if let Some(&original_fam_idx) = iid_to_original_idx.get(iid) {
+            person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
+        }
+    }
+    
     // --- STAGE 1: PARALLEL PARSE & MERGE SCORE FILES ---
     eprintln!(
         "> Pass 1: Parsing and merging {} score file(s) in parallel...",
