@@ -1,14 +1,18 @@
 import subprocess
 import sys
 import os
+import shutil
 from pathlib import Path
-from bench import RealisticDataGenerator
+from bench import RealisticDataGenerator # Re-use the data generator
+import pandas as pd
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
 # The binary should have profiling symbols. The CI workflow correctly uses a binary
 # from `target/profiling/gnomon`.
 GNOMON_BINARY = Path("./target/profiling/gnomon").resolve()
+# All profiling runs are executed on a fixed-size random subset of individuals
+PROFILING_SUBSET_PCT = 0.10
 
 # Define a variety of workloads to profile the program under different conditions.
 WORKLOADS = {
@@ -20,13 +24,8 @@ WORKLOADS = {
         "target_variants": 40_000,
         "score_files": [
             {
-                "name": "high_quality_score",
-                "n_scores": 5,
-                "gwas_source_variants": 40_000,
-                "overlap_pct": 0.95,
-                "flip_pct": 0.01,
-                "missing_weight_pct": 0.0,
-                "score_sparsity": 1.0,
+                "name": "high_quality_score", "n_scores": 5, "gwas_source_variants": 40_000,
+                "overlap_pct": 0.95, "flip_pct": 0.01, "missing_weight_pct": 0.0, "score_sparsity": 1.0,
             }
         ],
     },
@@ -38,22 +37,12 @@ WORKLOADS = {
         "target_variants": 200_000,
         "score_files": [
             {
-                "name": "large_score_1",
-                "n_scores": 10,
-                "gwas_source_variants": 150_000,
-                "overlap_pct": 0.90,
-                "flip_pct": 0.05,
-                "missing_weight_pct": 0.01,
-                "score_sparsity": 1.0,
+                "name": "large_score_1", "n_scores": 10, "gwas_source_variants": 150_000,
+                "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.01, "score_sparsity": 1.0,
             },
             {
-                "name": "large_score_2",
-                "n_scores": 8,
-                "gwas_source_variants": 120_000,
-                "overlap_pct": 0.80,
-                "flip_pct": 0.02,
-                "missing_weight_pct": 0.05,
-                "score_sparsity": 0.9,
+                "name": "large_score_2", "n_scores": 8, "gwas_source_variants": 120_000,
+                "overlap_pct": 0.80, "flip_pct": 0.02, "missing_weight_pct": 0.05, "score_sparsity": 0.9,
             },
         ],
     },
@@ -65,13 +54,8 @@ WORKLOADS = {
         "target_variants": 100_000,
         "score_files": [
             {
-                "name": "messy_score",
-                "n_scores": 4,
-                "gwas_source_variants": 50_000,
-                "overlap_pct": 0.50, # Low overlap
-                "flip_pct": 0.15,      # High error rate
-                "missing_weight_pct": 0.20, # 20% of weights missing
-                "score_sparsity": 0.7,
+                "name": "messy_score", "n_scores": 4, "gwas_source_variants": 50_000,
+                "overlap_pct": 0.50, "flip_pct": 0.15, "missing_weight_pct": 0.20, "score_sparsity": 0.7,
             }
         ],
     },
@@ -92,10 +76,9 @@ def run_command(cmd, title, **kwargs):
     print_header(title, char="-")
     cmd_str_list = [str(c) for c in cmd]
     print(f"Executing: {' '.join(cmd_str_list)}", flush=True)
-    
+
     output_lines = []
     try:
-        # Use Popen to stream output in real-time
         proc = subprocess.Popen(
             cmd_str_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding='utf-8', errors='replace', **kwargs
@@ -106,14 +89,14 @@ def run_command(cmd, title, **kwargs):
                 sys.stdout.flush()
                 output_lines.append(line)
         retcode = proc.wait()
-        
+
         if retcode != 0:
             print(f"\n❌ Command failed with exit code {retcode}", flush=True)
             print("--- Last 20 lines of output for debugging ---", flush=True)
             for l in output_lines[-20:]:
                 print(f"  | {l.rstrip()}", flush=True)
             return False
-        
+
         print("\n✅ Command successful.", flush=True)
         return True
     except Exception as e:
@@ -129,82 +112,85 @@ def main():
     WORKDIR.mkdir(exist_ok=True)
     
     commands_to_profile = []
-    generators = []
+    generators_and_paths = []
 
-    # --- 1. Generate Data and Commands for ALL Workloads ---
     try:
+        # --- 1. Generate Data and Commands for ALL Workloads ---
         for name, params in WORKLOADS.items():
             print_header(f"Generating data for workload: {name}", char="*")
             run_workdir = WORKDIR / name
             run_workdir.mkdir(exist_ok=True)
 
             generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
-            generators.append(generator) # Save for cleanup
             data_prefix, score_files = generator.generate_all_files()
-            
-            # Gnomon can accept a directory of score files
+            generators_and_paths.append((generator, run_workdir)) # Save for cleanup
+
+            # --- ADDED: Unconditionally generate a keep file for profiling ---
+            print(f"    > Generating a {PROFILING_SUBSET_PCT:.0%} random subset for profiling...")
+            fam_path = data_prefix.with_suffix(".fam")
+            keep_file_path = run_workdir / f"keep_{name}.txt"
+            fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[0, 1], names=['FID', 'IID'])
+            sample_size = int(len(fam_df) * PROFILING_SUBSET_PCT)
+            fam_df.sample(n=sample_size, random_state=42).to_csv(keep_file_path, sep='\t', header=False, index=False)
+            print(f"      ... wrote {sample_size} individuals to '{keep_file_path.name}'")
+
             score_dir = run_workdir / f"scores_{name}"
             score_dir.mkdir(exist_ok=True)
             for sf_path in score_files:
                 sf_path.rename(score_dir / sf_path.name)
             
-            # Build the full command string
-            command_str = f'echo "--- Running workload: {name} ---" && '
-            command_str += f'"{GNOMON_BINARY}" --score "{score_dir}" "{data_prefix}"'
+            # --- MODIFIED: Build command with --keep flag ---
+            command_str = (f'echo "--- Running workload: {name} on {PROFILING_SUBSET_PCT:.0%} subset ---" && '
+                           f'"{GNOMON_BINARY}" --score "{score_dir}" --keep "{keep_file_path}" "{data_prefix}"')
             commands_to_profile.append(command_str)
 
         # --- 2. Create a single script to run all workloads ---
         runner_script_path = WORKDIR / "run_all_workloads.sh"
         with open(runner_script_path, "w") as f:
-            f.write("#!/bin/bash\n")
-            f.write("set -e\n") # Exit on any error
-            for cmd in commands_to_profile:
-                f.write(f"{cmd}\n")
+            f.write("#!/bin/bash\nset -e\n")
+            f.write('\n'.join(commands_to_profile))
         os.chmod(runner_script_path, 0o755)
 
         # --- 3. Run `perf record` on the combined script ---
-        perf_data_file = WORKDIR / "perf.combined.data"
+        # The output file is now placed in the top-level directory to match CI expectations
+        perf_data_file = Path("./perf.data").resolve()
         perf_record_cmd = [
             "perf", "record", "-g", "-o", str(perf_data_file),
             "--", str(runner_script_path)
         ]
-        if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`"):
+        # Run from WORKDIR so relative paths in script are correct
+        if not run_command(perf_record_cmd, title="Running ALL workloads under `perf record`", cwd=WORKDIR):
             sys.exit("Profiling run failed.")
 
-        # --- 4. Generate Reports: Call-Graph and Annotated Source ---
+        # --- 4. Generate Reports ---
         if perf_data_file.exists():
-            # First, generate the high-level call-graph report
             perf_report_cmd = [
                 "perf", "report", "--stdio", "--call-graph=graph",
                 "--percent-limit=2", "-i", str(perf_data_file)
             ]
             run_command(perf_report_cmd, title="Combined Granular Profile Report")
 
-            # --- NEW: Generate a line-by-line annotated report for the hottest function ---
-            # This will show exactly which lines in the function are consuming the most CPU time,
-            # even after the compiler has inlined other functions into it.
             hot_function_symbol = "gnomon::batch::process_block"
             perf_annotate_cmd = [
-                "perf", "annotate",
-                "--stdio",                  # Print to console, not interactive
-                "-l",                       # Show line numbers
-                "-i", str(perf_data_file),  # The data file to use
-                "--symbol", hot_function_symbol, # The function to analyze
+                "perf", "annotate", "--stdio", "-l",
+                "-i", str(perf_data_file), "--symbol", hot_function_symbol,
             ]
-            run_command(
-                perf_annotate_cmd,
-                title=f"Line-by-Line Annotation for: {hot_function_symbol}"
-            )
+            run_command(perf_annotate_cmd, title=f"Line-by-Line Annotation for: {hot_function_symbol}")
 
         else:
-            print(f"Combined perf data file not found at '{perf_data_file}'. The profiling run may have failed.")
+            print(f"Combined perf data file not found at '{perf_data_file}'. Profiling may have failed.")
             sys.exit(1)
 
     finally:
         # --- 5. Cleanup ---
         print_header("Cleaning up all generated data", char="~")
-        for gen in generators:
-            gen.cleanup()
+        for gen, path in generators_and_paths:
+            # The RealisticDataGenerator cleanup is relative to its own workdir,
+            # but here we can just remove the whole per-workload directory.
+            if path.exists():
+                shutil.rmtree(path)
+                print(f"Removed workload directory: {path}")
+
         runner_script = WORKDIR / "run_all_workloads.sh"
         if runner_script.exists():
             runner_script.unlink()
@@ -212,11 +198,9 @@ def main():
 
     print("\n✅ All profiling workloads completed successfully.")
 
-
 if __name__ == "__main__":
     if not GNOMON_BINARY.exists():
         print(f"❌ Error: Compiled profiling binary not found at {GNOMON_BINARY}")
         print("Please ensure you have built the project with: cargo build --profile profiling")
         sys.exit(1)
-
     main()
