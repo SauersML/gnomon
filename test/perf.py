@@ -5,8 +5,7 @@ from bench import RealisticDataGenerator
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
-# The binary should be a standard, optimized release build.
-GNOMON_BINARY = Path("./target/release/gnomon").resolve()
+GNOMON_BINARY = Path("./target/profiling/gnomon").resolve()
 
 # Define a variety of workloads to profile the program under different conditions.
 # The script will loop through each of these and generate a separate perf report.
@@ -21,7 +20,7 @@ WORKLOADS = {
             {
                 "name": "high_quality_score",
                 "n_scores": 5,
-                "gwas_source_variants": 80_000,
+                "gwas_source_variants": 40_000,
                 "overlap_pct": 0.95,
                 "flip_pct": 0.01,
                 "missing_weight_pct": 0.0,
@@ -98,6 +97,7 @@ def run_command(cmd, title, **kwargs):
     print(f"Executing: {' '.join(cmd_str_list)}", flush=True)
     
     output_lines = []
+    process_failed = False
     try:
         proc = subprocess.Popen(
             cmd_str_list,
@@ -113,13 +113,16 @@ def run_command(cmd, title, **kwargs):
         with proc.stdout:
             for line in iter(proc.stdout.readline, ''):
                 line_stripped = line.rstrip()
-                sys.stdout.write(f"  > {line_stripped}\n")
-                sys.stdout.flush()
+                # The traceback is printed via the test harness, no need to duplicate it here
+                if not process_failed:
+                    sys.stdout.write(f"  > {line_stripped}\n")
+                    sys.stdout.flush()
                 output_lines.append(line_stripped)
 
         retcode = proc.wait()
         
         if retcode != 0:
+            process_failed = True
             print(f"\n❌ Command failed with exit code {retcode}", flush=True)
             print("--- Last 20 lines of output for debugging ---", flush=True)
             for l in output_lines[-20:]:
@@ -141,6 +144,9 @@ def main():
     """
     WORKDIR.mkdir(exist_ok=True)
     
+    # Track if any workload fails to exit with an error code at the end
+    any_failures = False
+
     for name, params in WORKLOADS.items():
         print_header(f"STARTING WORKLOAD: {name}", char="*")
         
@@ -148,50 +154,81 @@ def main():
         run_workdir = WORKDIR / name
         run_workdir.mkdir(exist_ok=True)
 
-        # --- 1. Generate Synthetic Data ---
-        print_header(f"[{name}] Generating synthetic data", char="=")
-        generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
-        data_prefix, score_files = generator.generate_all_files()
-        
-        # Construct the arguments for the gnomon binary
-        gnomon_args = []
-        for sf_path in score_files:
-            gnomon_args.extend(["--score", str(sf_path)])
-        gnomon_args.append(str(data_prefix))
+        generator = None
+        try:
+            # --- 1. Generate Synthetic Data ---
+            print_header(f"[{name}] Generating synthetic data", char="=")
+            generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
+            data_prefix, score_files = generator.generate_all_files()
+            
+            # Construct the arguments for the gnomon binary
+            gnomon_args = []
+            score_dir = run_workdir / f"scores_{name}"
+            score_dir.mkdir(exist_ok=True)
+            
+            # Move score files to a dedicated directory and build args
+            for sf_path in score_files:
+                new_path = score_dir / sf_path.name
+                sf_path.rename(new_path)
+            
+            # Gnomon can take a directory as input
+            gnomon_args.extend(["--score", str(score_dir)])
+            gnomon_args.append(str(data_prefix))
 
-        # --- 2. Run `perf record` ---
-        perf_data_file = WORKDIR / f"perf.{name}.data"
-        perf_record_cmd = [
-            "perf", "record", "-g", 
-            "-o", str(perf_data_file), 
-            "--", str(GNOMON_BINARY)
-        ] + gnomon_args
-        
-        if not run_command(perf_record_cmd, title=f"[{name}] Running `perf record`"):
-            print(f"❌ Profiling failed for workload '{name}'. Skipping report.")
-            continue # Proceed to the next workload
+            # --- 2. Run `perf record` ---
+            perf_data_file = WORKDIR / f"perf.{name}.data"
+            perf_record_cmd = [
+                "perf", "record", "-g", 
+                "-o", str(perf_data_file), 
+                "--", str(GNOMON_BINARY)
+            ] + gnomon_args
+            
+            if not run_command(perf_record_cmd, title=f"[{name}] Running `perf record`"):
+                print(f"❌ Profiling failed for workload '{name}'. Skipping report.")
+                any_failures = True
+                continue # Proceed to the next workload
 
-        # --- 3. Generate `perf report` ---
-        print_header(f"[{name}] Granular Profile Report", char="#")
-        print("# Answers: 'Where did my program spend its time?'")
-        print("# Displaying call-graph, showing only branches consuming > 2% of total time.")
+            # --- 3. Generate `perf report` ---
+            print_header(f"[{name}] Granular Profile Report", char="#")
+            print("# Answers: 'Where did my program spend its time?'")
+            print("# Displaying call-graph, showing only branches consuming > 2% of total time.")
+            
+            if perf_data_file.exists():
+                perf_report_cmd = [
+                    "perf", "report", 
+                    "--stdio",
+                    "--call-graph=graph", 
+                    "--percent-limit=2",
+                    "-i", str(perf_data_file)
+                ]
+                if not run_command(perf_report_cmd, title=f"[{name}] Generating `perf` Call-Graph Report"):
+                    any_failures = True
+            else:
+                print(f"perf.data file not found for workload '{name}'. The profiling run may have failed.")
+                any_failures = True
+
+        except Exception as e:
+            print(f"An unexpected error occurred during workload '{name}': {e}")
+            import traceback
+            traceback.print_exc()
+            any_failures = True
         
-        if perf_data_file.exists():
-            perf_report_cmd = [
-                "perf", "report", 
-                "--stdio",
-                "--call-graph=graph", 
-                "--percent-limit=2",
-                "-i", str(perf_data_file)
-            ]
-            run_command(perf_report_cmd, title=f"[{name}] Generating `perf` Call-Graph Report")
-        else:
-            print(f"perf.data file not found for workload '{name}'. The profiling run may have failed.")
+        finally:
+            if generator:
+                # Cleanup the generated files for the current workload
+                generator.cleanup()
+
+    if any_failures:
+        print("\n❌ One or more profiling workloads failed.")
+        sys.exit(1)
+    else:
+        print("\n✅ All profiling workloads completed successfully.")
+
 
 if __name__ == "__main__":
     if not GNOMON_BINARY.exists():
-        print(f"❌ Error: Compiled binary not found at {GNOMON_BINARY}")
-        print("Please ensure you have built the project with: cargo build --release")
+        print(f"❌ Error: Compiled profiling binary not found at {GNOMON_BINARY}")
+        print("Please ensure you have built the project with: cargo build --profile profiling")
         sys.exit(1)
 
     main()
