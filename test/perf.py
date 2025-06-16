@@ -1,10 +1,10 @@
+# File: test/perf.py
+
 import argparse
 import subprocess
 import sys
 from pathlib import Path
-# Import the data generator directly from the existing bench.py script.
 from bench import RealisticDataGenerator
-
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
@@ -26,7 +26,7 @@ PERF_WORKLOAD = {
             "overlap_pct": 0.90,
             "flip_pct": 0.10,
             "missing_weight_pct": 0.0,
-            "score_sparsity": 0.3,
+            "score_sparsity": 1.0,  # Dense score to ensure all variants are used
         }
     ],
 }
@@ -44,15 +44,18 @@ def run_command(cmd, title, **kwargs):
     This is ideal for CI environments where seeing live output is important.
     """
     print_header(title, char="-")
-    print(f"Executing: {' '.join(map(str, cmd))}", flush=True)
+    # Ensure all command arguments are strings for display and execution
+    cmd_str_list = [str(c) for c in cmd]
+    print(f"Executing: {' '.join(cmd_str_list)}", flush=True)
     try:
         # Popen allows real-time streaming of stdout/stderr.
         proc = subprocess.Popen(
-            [str(c) for c in cmd],
+            cmd_str_list,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
+            **kwargs
         )
         with proc.stdout:
             for line in iter(proc.stdout.readline, ''):
@@ -72,11 +75,15 @@ def run_command(cmd, title, **kwargs):
 def main(args):
     """Main function to orchestrate data generation, profiling, and reporting."""
     print_header("Setting up synthetic data for profiling run")
+    # Ensure the working directory exists before trying to save files into it.
+    WORKDIR.mkdir(exist_ok=True)
+    
     # Use the imported data generator class.
     generator = RealisticDataGenerator(workload_params=PERF_WORKLOAD, workdir=WORKDIR)
     data_prefix, score_files = generator.generate_all_files()
 
-    # Define the core arguments for the gnomon binary.
+    # Define the core arguments for the gnomon binary. These paths must be
+    # specified relative to where the commands will be run (the project root).
     gnomon_args = ["--score", str(score_files[0]), str(data_prefix)]
 
     # --- Causal Profiling (coz) ---
