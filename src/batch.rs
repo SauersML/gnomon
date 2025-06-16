@@ -175,7 +175,6 @@ fn process_people_iterator<'a, I>(
                 sparse_index_pool,
                 matrix_row_start_idx,
                 snps_in_chunk,
-                chunk_bed_row_offset,
             );
         });
 }
