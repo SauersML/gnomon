@@ -462,7 +462,15 @@ def main():
                         else:
                             merged_df = pd.merge(merged_df, current_df, on=id_cols, how='outer')
                     
+                    # After the outer merge, some variants will have NaN for scores from panels
+                    # they weren't in. PLINK2 requires a numeric coefficient. Fill NaN with 0.
+                    score_columns = [col for col in merged_df.columns if col.startswith('score_')]
+                    if score_columns:
+                        merged_df[score_columns] = merged_df[score_columns].fillna(0)
+                    
                     plink_merged_score_file = WORKDIR / f"plink_merged_{params['test_name']}.score"
+                    # Writing the file with a specific float format. na_rep is now less critical
+                    # but kept for consistency in case of other unexpected NaNs.
                     merged_df.to_csv(plink_merged_score_file, sep='\t', index=False, float_format='%.8f', na_rep='NA')
                     active_plink_score_file = plink_merged_score_file
                 else:
