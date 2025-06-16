@@ -119,6 +119,43 @@ impl DerefMut for CleanCounts {
 //                            High-Level Data Contracts
 // ========================================================================================
 
+/// A buffer containing the raw, un-decoded genotype data for a single SNP,
+/// matching the PLINK .bed file's SNP-major layout.
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct SnpDataBuffer(pub Vec<u8>);
+
+/// A batch of raw SNP-major data, curated to contain only variants
+/// suitable for the high-throughput person-major compute path.
+#[derive(Debug)]
+pub struct DenseSnpBatch {
+    /// A contiguous buffer of SNP-major data.
+    pub data: Vec<u8>,
+    /// The matrix row index of the first SNP in this batch.
+    pub start_matrix_row: MatrixRowIndex,
+    /// The total number of SNPs in this batch.
+    pub snp_count: usize,
+}
+
+impl DenseSnpBatch {
+    /// Creates a new, empty batch with a pre-allocated data buffer.
+    pub fn new_empty(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(capacity),
+            start_matrix_row: MatrixRowIndex(0), // Dummy value, to be set on first push.
+            snp_count: 0,
+        }
+    }
+}
+
+/// Represents the dispatcher's decision for which compute path to use for a
+/// given unit of work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputePath {
+    SnpMajor,
+    PersonMajor,
+}
+
 /// Defines the subset of individuals to be processed by the engine.
 ///
 /// This enum makes the program's control flow explicit and type-safe. It is
@@ -137,30 +174,24 @@ pub enum PersonSubset {
 ///
 /// The successful creation of this struct is a guarantee that all input files were
 /// valid and consistent. It contains the hyper-optimized data matrices that the
-/// compute kernel (the "Virtual Machine") will execute.
+/// compute engine will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    // --- PRIVATE, COMPILED DATA MATRICES for the VM ---
+    // --- PRIVATE, COMPILED DATA MATRICES ---
     // These fields are private to guarantee their invariants. They are created once
-    // by the `prepare` module and can only be read by downstream modules. This
-    // "Airlock" pattern makes invalid states unrepresentable.
-
-    /// A flat, padded matrix of original effect weights. Rows correspond to variants,
-    /// and columns correspond to scores.
+    // by the `prepare` module and can only be read by downstream modules.
     weights_matrix: Vec<f32>,
-    /// A flat, padded matrix of flags indicating if a variant was flipped during
-    /// reconciliation (1 for flipped, 0 for not flipped). It is dimensionally
-    /// identical to `weights_matrix`.
     flip_mask_matrix: Vec<u8>,
-    /// The padded width of one row in the matrices. This is always a multiple of
-    /// the SIMD lane count and is essential for correct, safe memory access.
     stride: usize,
-    /// The sorted list of original `.bim` row indices that are required for this
-    /// calculation. This is used by the orchestrator to identify relevant chunks
-    /// of the `.bed` file.
-    pub required_bim_indices: Vec<BimRowIndex>,
 
-    // --- PUBLIC METADATA & FINAL CALCULATION DATA ---
+    // --- PUBLIC METADATA & LOOKUP TABLES ---
+    /// The sorted list of original `.bim` row indices that are required for this
+    /// calculation. This is used by the I/O producer to filter the `.bed` file.
+    pub required_bim_indices: Vec<BimRowIndex>,
+    /// A map from a person's original .fam index to their compact output index.
+    /// `None` if the person is not in the scored subset.
+    /// Essential for O(1) lookups in the SNP-major path.
+    pub person_fam_to_output_idx: Vec<Option<u32>>,
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
     /// A vector containing the total number of variants that contribute to each score.
@@ -168,7 +199,7 @@ pub struct PreparationResult {
     /// The order matches `score_names`.
     pub score_variant_counts: Vec<u32>,
     /// A "missingness blueprint" mapping each dense matrix row (variant) to the
-    /// score column indices it affects. This enables efficient missingness tracking.
+    /// score column indices it affects.
     pub variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
@@ -207,6 +238,7 @@ impl PreparationResult {
         total_snps_in_bim: usize,
         num_reconciled_variants: usize,
         bytes_per_snp: u64,
+        person_fam_to_output_idx: Vec<Option<u32>>,
     ) -> Self {
         Self {
             weights_matrix,
@@ -223,6 +255,7 @@ impl PreparationResult {
             total_snps_in_bim,
             num_reconciled_variants,
             bytes_per_snp,
+            person_fam_to_output_idx,
         }
     }
 
@@ -242,7 +275,6 @@ impl PreparationResult {
     pub fn stride(&self) -> usize {
         self.stride
     }
-
 }
 
 // ========================================================================================
