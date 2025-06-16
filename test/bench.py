@@ -26,61 +26,62 @@ PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20
 
 
 # --- The Crucible: Scaled & Focused Benchmark Scenarios ---
-# One benchmark runs on the full cohort. All others run on a random subset.
+# All benchmarks run on a random subset of a larger generated cohort.
 REALISTIC_DIMENSIONS = [
     {
-        "test_name": "ACAF_Dense_Scores_FULL",
-        "n_individuals": 2_000,
-        "genome_variants": 500_000,
-        "target_variants": 250_000,
+        "test_name": "ACAF_Dense_Scores_SUBSET",
+        "n_individuals": 10_000,
+        "genome_variants": 800_000,
+        "target_variants": 400_000,
         "af_profile": 'acaf',
         "score_files": [
             {
-                "name": "acaf_dense_panel", "n_scores": 50, "gwas_source_variants": 200_000,
+                "name": "acaf_dense_panel_large", "n_scores": 100, "gwas_source_variants": 350_000,
                 "overlap_pct": 0.95, "flip_pct": 0.15, "missing_weight_pct": 0.0, "score_sparsity": 1.0,
             }
         ],
+        "subset_pct": 0.02,
     },
     {
         "test_name": "WGS_Standard_Rare_SUBSET",
-        "n_individuals": 1_000,
-        "genome_variants": 500_000,
-        "target_variants": 300_000,
+        "n_individuals": 5_000,
+        "genome_variants": 1_000_000,
+        "target_variants": 600_000,
         "af_profile": 'standard',
         "score_files": [
             {
-                "name": "gwas_discovery", "n_scores": 10, "gwas_source_variants": 250_000,
+                "name": "gwas_discovery_large", "n_scores": 20, "gwas_source_variants": 500_000,
                 "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.01, "score_sparsity": 0.1,
             }
         ],
         "subset_pct": 0.10,
     },
     {
-        "test_name": "Multi_Panel_Modest_SUBSET",
-        "n_individuals": 1_500,
-        "genome_variants": 200_000,
-        "target_variants": 100_000,
+        "test_name": "Multi_Panel_Large_SUBSET",
+        "n_individuals": 8_000,
+        "genome_variants": 500_000,
+        "target_variants": 250_000,
         "af_profile": 'standard',
         "score_files": [
-            {"name": "panel_A", "n_scores": 5,  "gwas_source_variants": 5_000, "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
-            {"name": "panel_B", "n_scores": 8,  "gwas_source_variants": 12_000, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
-            {"name": "panel_C", "n_scores": 2,  "gwas_source_variants": 8_000,  "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
+            {"name": "panel_A_lg", "n_scores": 10, "gwas_source_variants": 15_000, "overlap_pct": 0.80, "flip_pct": 0.10, "missing_weight_pct": 0.02},
+            {"name": "panel_B_lg", "n_scores": 15, "gwas_source_variants": 30_000, "overlap_pct": 0.85, "flip_pct": 0.20, "missing_weight_pct": 0.05},
+            {"name": "panel_C_lg", "n_scores": 5,  "gwas_source_variants": 20_000, "overlap_pct": 0.90, "flip_pct": 0.05, "missing_weight_pct": 0.0},
         ],
         "subset_pct": 0.05,
     },
     {
-        "test_name": "LargeN_ModestK_ACAF_SUBSET",
-        "n_individuals": 5_000,
-        "genome_variants": 400_000,
-        "target_variants": 200_000,
+        "test_name": "VeryLargeN_MediumK_ACAF_SUBSET",
+        "n_individuals": 20_000,
+        "genome_variants": 750_000,
+        "target_variants": 350_000,
         "af_profile": 'acaf',
         "score_files": [
             {
-                "name": "largeN_panel", "n_scores": 15, "gwas_source_variants": 50_000,
+                "name": "v_largeN_panel", "n_scores": 30, "gwas_source_variants": 100_000,
                 "overlap_pct": 0.90, "flip_pct": 0.15, "missing_weight_pct": 0.01, "score_sparsity": 0.7,
             }
         ],
-        "subset_pct": 0.01,
+        "subset_pct": 0.03,
     },
 ]
 
