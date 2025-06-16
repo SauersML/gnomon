@@ -97,14 +97,17 @@ jobs:
           echo "=== Custom Report (getdoc) ==="
           cat report.md
 
-      # Only build if binary cache miss
-      - name: Build Gnomon release binary
-        if: steps.binary_cache.outputs.cache-hit != 'true'
+      - name: Build Gnomon binaries
+        # Build both the release binary (if not cached) and the profiling binary.
         run: |
-          echo "Binary cache miss - building release binary..."
-          cargo build --release
+          if [ "${{ steps.binary_cache.outputs.cache-hit }}" != "true" ]; then
+            echo "Binary cache miss - building release binary..."
+            cargo build --release
+          fi
+          echo "Building profiling binary (coz profile)..."
+          cargo build --profile coz
 
-      # If cache hit, just verify the binary exists and is executable
+      # If release cache hit, just verify the binary exists and is executable
       - name: Verify cached binary
         if: steps.binary_cache.outputs.cache-hit == 'true'
         run: |
@@ -117,11 +120,12 @@ jobs:
         if: steps.test_step.outcome == 'failure'
         run: exit 1
 
-      - name: Upload build artifacts for Python jobs
+      - name: Upload build artifacts for all downstream jobs
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          # We upload the whole target directory so the path is identical in the next jobs
+          # We upload the whole target directory so the path is identical in the next jobs.
+          # This now includes both target/release and target/coz.
           path: |
             target
             report.md
@@ -257,15 +261,21 @@ jobs:
         run: python -u test/bench.py
 
   # ======================================================================
-  # JOB 5: Performance Profiling (Causal and Traditional)
+  # JOB 5: Performance Profiling (Runs in parallel with other tests)
   # ======================================================================
   performance_reports:
     runs-on: ubuntu-latest
-    # This job runs only after all other tests pass successfully.
-    needs: [python_test_integration, python_test_simulation, python_test_benchmark]
+    # This job now depends only on the build job, allowing it to run in parallel.
+    needs: build_and_test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -285,30 +295,6 @@ jobs:
       - name: Configure perf_event for Profilers
         # Both coz and perf require this permission level to collect performance data.
         run: sudo sh -c 'echo 1 >/proc/sys/kernel/perf_event_paranoid'
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Generate cache key for dependencies
-        id: cache_keys
-        run: |
-          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
-          echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_keys.outputs.deps_hash }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Build for profiling
-        # The 'coz' profile includes debug symbols, which both profilers need.
-        run: cargo +nightly build --profile coz --locked
 
       - name: Run Profiling Harness
         run: python test/perf.py --tool all
