@@ -255,3 +255,60 @@ jobs:
       
       - name: Run Benchmark Test
         run: python -u test/bench.py
+
+  # ======================================================================
+  # JOB 5: Performance Profiling (Causal and Traditional)
+  # ======================================================================
+  performance_reports:
+    runs-on: ubuntu-latest
+    # This job runs only after all other tests pass successfully.
+    needs: [python_test_integration, python_test_simulation, python_test_benchmark]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        # These are required by bench.py, which our perf.py script imports from.
+        run: pip install pandas numpy requests psutil
+
+      - name: Install Profiling Tools
+        run: |
+          sudo apt-get update
+          # Install both the causal profiler and the standard Linux perf tools
+          sudo apt-get install -y coz-profiler linux-perf
+
+      - name: Configure perf_event for Profilers
+        # Both coz and perf require this permission level to collect performance data.
+        run: sudo sh -c 'echo 1 >/proc/sys/kernel/perf_event_paranoid'
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Generate cache key for dependencies
+        id: cache_keys
+        run: |
+          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_keys.outputs.deps_hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build for profiling
+        # The 'coz' profile includes debug symbols, which both profilers need.
+        run: cargo +nightly build --profile coz --locked
+
+      - name: Run Profiling Harness
+        run: python test/perf.py --tool all
