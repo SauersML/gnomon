@@ -1,32 +1,25 @@
 // ========================================================================================
 //
-//              HIGH-PERFORMANCE, SYNCHRONOUS, ENCAPSULATED BLOCK READER
+//          HIGH-PERFORMANCE, SYNCHRONOUS, SINGLE-SNP MEMORY-MAPPED READER
 //
 // ========================================================================================
 //
 // ### Purpose ###
 //
 // This module provides a high-performance, synchronous reader for moving raw,
-// sequential chunks of data from a memory-mapped .bed file.
+// sequential, single-SNP data rows from a memory-mapped .bed file. It operates
+// on a `mmap`'d region for zero-copy reads from the OS page cache, which is
+// ideal for the producer-consumer pipeline in the main orchestrator.
 
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-/// A self-contained, validated chunk of SNP-major data.
-///
-/// The existence of this struct is a guarantee that `buffer.len()` is a
-/// multiple of `bytes_per_snp` and that `num_snps` is correct. This makes
-/// inconsistent states unrepresentable in the rest of the application.
-pub struct SnpChunk {
-    pub buffer: Vec<u8>,
-    pub num_snps: usize,
-}
-
-/// A high-performance reader for moving raw, sequential chunks of data from a
-/// memory-mapped .bed file. It acts as a factory for producing valid `SnpChunk`s.
-pub struct SnpChunkReader {
+/// A high-performance reader for moving raw, sequential, single-SNP data rows
+/// from a memory-mapped .bed file. It operates on a `mmap`'d region for zero-copy
+/// reads from the OS page cache.
+pub struct SnpReader {
     /// A memory map of the entire .bed file. This provides a zero-cost "view" of
     /// the file on disk, not data loaded into RAM.
     mmap: Mmap,
@@ -44,8 +37,8 @@ pub struct SnpChunkReader {
     bytes_per_snp: u64,
 }
 
-impl SnpChunkReader {
-    /// Creates a new `SnpChunkReader` after performing critical validation.
+impl SnpReader {
+    /// Creates a new `SnpReader` after performing critical validation.
     ///
     /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
     /// file exists, is a valid PLINK .bed file, and has a size consistent with the
@@ -89,7 +82,7 @@ impl SnpChunkReader {
             ));
         }
 
-        Ok(SnpChunkReader {
+        Ok(SnpReader {
             mmap,
             cursor: 3, // Start reading after the 3-byte magic number.
             file_size,
@@ -98,64 +91,51 @@ impl SnpChunkReader {
         })
     }
 
-    /// Reads the next chunk of SNP data, producing a validated `SnpChunk`.
+    /// Reads the data for the next single SNP.
     ///
-    /// This is a "smart factory" method. It takes a mutable buffer to use for I/O,
-    /// fills it with a non-partial amount of SNP data, and returns a type-safe
-    /// struct that guarantees correctness.
+    /// This function is designed for high-throughput, sequential reading. It takes an
+    /// empty buffer from a pool, fills it with the data for exactly one SNP, and
+    /// returns it. This allows the calling context to reuse buffer allocations.
     ///
     /// # Arguments
-    /// * `buf`: A mutable `Vec` which will be used for the read. Its capacity
-    ///          is respected. The method takes ownership of the buffer's memory
-    ///          via `std::mem::take`, leaving an empty `Vec` in its place.
+    /// * `buf`: A mutable `Vec` whose allocation will be used for the read. The
+    ///          method takes ownership of the buffer's memory via `std::mem::take`,
+    ///          leaving an empty `Vec` in its place.
     ///
     /// # Returns
-    /// * `Ok(Some(SnpChunk))`: On a successful read.
+    /// * `Ok(Some(Vec<u8>))`: On a successful read, returns the buffer now filled with SNP data.
     /// * `Ok(None)`: If the end of the file is reached.
     /// * `Err(e)`: On an I/O error.
-    pub fn read_next_chunk(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<SnpChunk>> {
+    pub fn read_next_snp(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
         if self.cursor >= self.file_size {
             return Ok(None); // Graceful EOF
         }
 
-        let bytes_remaining = self.file_size - self.cursor;
-        let max_bytes_to_read = (buf.capacity() as u64).min(bytes_remaining) as usize;
+        let bytes_per_snp = self.bytes_per_snp as usize;
 
-        if max_bytes_to_read == 0 {
+        // Make sure there is enough data left in the file for one full SNP.
+        if self.file_size - self.cursor < self.bytes_per_snp {
+            // This case handles trailing bytes in a file that are not a full SNP.
+            self.cursor = self.file_size;
             return Ok(None);
         }
-
-        // Round down to the nearest whole SNP. This is the core of the correctness guarantee.
-        let num_snps = if self.bytes_per_snp > 0 {
-            max_bytes_to_read / self.bytes_per_snp as usize
-        } else {
-            0
-        };
-
-        if num_snps == 0 {
-            // Not enough space in the remaining file for even one full SNP.
-            return Ok(None);
-        }
-
-        let final_bytes_to_copy = num_snps * self.bytes_per_snp as usize;
 
         // Take ownership of the buffer's allocation, leaving an empty vector behind.
         let mut owned_buf = std::mem::take(buf);
-        // Use unsafe set_len because we are about to fill it. This is faster than resize.
+        // We are about to fill the buffer completely.
+        // We guarantee the length is correct before the copy.
+        // This is safe because we just checked that enough bytes remain.
         unsafe {
-            owned_buf.set_len(final_bytes_to_copy);
+            owned_buf.set_len(bytes_per_snp);
         }
 
-        let src_end = self.cursor as usize + final_bytes_to_copy;
+        let src_end = self.cursor as usize + bytes_per_snp;
         let src_slice = &self.mmap[self.cursor as usize..src_end];
 
         owned_buf.copy_from_slice(src_slice);
 
-        self.cursor += final_bytes_to_copy as u64;
+        self.cursor += bytes_per_snp as u64;
 
-        Ok(Some(SnpChunk {
-            buffer: owned_buf,
-            num_snps,
-        }))
+        Ok(Some(owned_buf))
     }
 }
