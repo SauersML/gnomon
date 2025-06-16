@@ -1,4 +1,3 @@
-import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -6,27 +5,77 @@ from bench import RealisticDataGenerator
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
-# The binary is built with the 'coz' profile, so it's in the 'coz' subdirectory.
-GNOMON_BINARY = Path("./target/coz/gnomon").resolve()
+# The binary should be a standard, optimized release build.
+GNOMON_BINARY = Path("./target/release/gnomon").resolve()
 
-# A small, fast-to-generate configuration tailored for CI profiling runs.
-# It should be complex enough to exercise the core logic but fast enough for CI.
-PERF_WORKLOAD = {
-    "test_name": "ci_perf_small",
-    "n_individuals": 500,
-    "genome_variants": 50_000,
-    "target_variants": 20_000,
-    "score_files": [
-        {
-            "name": "perf_score",
-            "n_scores": 5,
-            "gwas_source_variants": 15_000,
-            "overlap_pct": 0.90,
-            "flip_pct": 0.10,
-            "missing_weight_pct": 0.0,
-            "score_sparsity": 1.0,
-        }
-    ],
+# Define a variety of workloads to profile the program under different conditions.
+# The script will loop through each of these and generate a separate perf report.
+WORKLOADS = {
+    # A small, clean workload.
+    "small_clean": {
+        "test_name": "small_clean",
+        "n_individuals": 1_000,
+        "genome_variants": 100_000,
+        "target_variants": 40_000,
+        "score_files": [
+            {
+                "name": "high_quality_score",
+                "n_scores": 5,
+                "gwas_source_variants": 80_000,
+                "overlap_pct": 0.95,
+                "flip_pct": 0.01,
+                "missing_weight_pct": 0.0,
+                "score_sparsity": 1.0,
+            }
+        ],
+    },
+    # A larger, more complex workload with multiple, heterogeneous score files.
+    # This simulates a more realistic, demanding use case.
+    "large_complex": {
+        "test_name": "large_complex",
+        "n_individuals": 5_000,
+        "genome_variants": 1_000_000,
+        "target_variants": 200_000,
+        "score_files": [
+            {
+                "name": "large_score_1",
+                "n_scores": 10,
+                "gwas_source_variants": 150_000,
+                "overlap_pct": 0.90,
+                "flip_pct": 0.05,
+                "missing_weight_pct": 0.01,
+                "score_sparsity": 1.0,
+            },
+            {
+                "name": "large_score_2",
+                "n_scores": 8,
+                "gwas_source_variants": 120_000,
+                "overlap_pct": 0.80,
+                "flip_pct": 0.02,
+                "missing_weight_pct": 0.05,
+                "score_sparsity": 0.9,
+            },
+        ],
+    },
+    # A workload specifically designed to test performance on "messy" data,
+    # with poor overlap, variant mismatches, and missing data.
+    "messy_data": {
+        "test_name": "messy_data",
+        "n_individuals": 2_000,
+        "genome_variants": 200_000,
+        "target_variants": 100_000,
+        "score_files": [
+            {
+                "name": "messy_score",
+                "n_scores": 4,
+                "gwas_source_variants": 50_000,
+                "overlap_pct": 0.50, # Low overlap
+                "flip_pct": 0.15,      # High error rate
+                "missing_weight_pct": 0.20, # 20% of weights missing
+                "score_sparsity": 0.7,
+            }
+        ],
+    },
 }
 
 def print_header(title: str, char: str = "="):
@@ -85,51 +134,49 @@ def run_command(cmd, title, **kwargs):
         print(f"❌ Failed to execute command: {e}", flush=True)
         return False
 
-def main(args):
-    """Main function to orchestrate data generation, profiling, and reporting."""
-    print_header("Setting up synthetic data for profiling run")
+def main():
+    """
+    Main function to orchestrate data generation, profiling, and reporting.
+    It iterates through a set of predefined workloads and runs perf on each.
+    """
     WORKDIR.mkdir(exist_ok=True)
     
-    generator = RealisticDataGenerator(workload_params=PERF_WORKLOAD, workdir=WORKDIR)
-    data_prefix, score_files = generator.generate_all_files()
-
-    gnomon_args = ["--score", str(score_files[0]), str(data_prefix)]
-
-    # --- Causal Profiling (coz) ---
-    if args.tool in ['coz', 'all']:
-        coz_cmd = ["coz", "run", "---", str(GNOMON_BINARY)] + gnomon_args
-        coz_succeeded = run_command(coz_cmd, title="Running Causal Profiler (coz)")
-
-        print_header("Causal Profile Report (coz)", char="*")
-        print("# Answers: 'If I speed this line up, what's the throughput impact?'")
-        profile_file = Path("profile.coz")
+    for name, params in WORKLOADS.items():
+        print_header(f"STARTING WORKLOAD: {name}", char="*")
         
-        if coz_succeeded and profile_file.exists():
-            # Use a shell command to sort the text output by the 4th column (speedup %).
-            subprocess.run(
-                f"(head -n 2 {profile_file} && tail -n +3 {profile_file} | sort -t$'\\t' -k4,4nr) || cat {profile_file}",
-                shell=True, check=False, executable='/bin/bash'
-            )
-        else:
-            print("profile.coz not found. The profiling run may have failed.")
-            print("\nNOTE: `coz` often fails with complex multi-threaded applications (e.g., those using Tokio and Rayon).")
-            print("This is a known limitation of the profiler, not necessarily a bug in your code.")
-            print("The `perf` profiler is more robust and should be used as the primary source of truth.\n")
+        # Create a dedicated subdirectory for this workload's data
+        run_workdir = WORKDIR / name
+        run_workdir.mkdir(exist_ok=True)
 
-    # --- Traditional Profiling (perf) with Call-Graph and Filtering ---
-    if args.tool in ['perf', 'all']:
-        perf_data_file = Path("./perf.data")
-        perf_record_cmd = ["perf", "record", "-g", "-o", str(perf_data_file), "--", str(GNOMON_BINARY)] + gnomon_args
-        run_command(perf_record_cmd, title="Running Traditional Profiler (perf record)")
+        # --- 1. Generate Synthetic Data ---
+        print_header(f"[{name}] Generating synthetic data", char="=")
+        generator = RealisticDataGenerator(workload_params=params, workdir=run_workdir)
+        data_prefix, score_files = generator.generate_all_files()
+        
+        # Construct the arguments for the gnomon binary
+        gnomon_args = []
+        for sf_path in score_files:
+            gnomon_args.extend(["--score", str(sf_path)])
+        gnomon_args.append(str(data_prefix))
 
-        print_header("Granular Profile Report (perf)", char="*")
+        # --- 2. Run `perf record` ---
+        perf_data_file = WORKDIR / f"perf.{name}.data"
+        perf_record_cmd = [
+            "perf", "record", "-g", 
+            "-o", str(perf_data_file), 
+            "--", str(GNOMON_BINARY)
+        ] + gnomon_args
+        
+        if not run_command(perf_record_cmd, title=f"[{name}] Running `perf record`"):
+            print(f"❌ Profiling failed for workload '{name}'. Skipping report.")
+            continue # Proceed to the next workload
+
+        # --- 3. Generate `perf report` ---
+        print_header(f"[{name}] Granular Profile Report", char="#")
         print("# Answers: 'Where did my program spend its time?'")
         print("# Displaying call-graph, showing only branches consuming > 2% of total time.")
         
         if perf_data_file.exists():
-            # This is the key change:
-            # --call-graph=graph : Shows an indented call tree.
-            # --percent-limit=2  : Hides all entries that account for less than 2% of the total samples.
             perf_report_cmd = [
                 "perf", "report", 
                 "--stdio",
@@ -137,18 +184,14 @@ def main(args):
                 "--percent-limit=2",
                 "-i", str(perf_data_file)
             ]
-            run_command(perf_report_cmd, title="Generating Granular `perf` Call-Graph Report")
+            run_command(perf_report_cmd, title=f"[{name}] Generating `perf` Call-Graph Report")
         else:
-            print("perf.data not found. The profiling run may have failed.")
+            print(f"perf.data file not found for workload '{name}'. The profiling run may have failed.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Performance Profiling Harness for Gnomon")
-    parser.add_argument('--tool', choices=['coz', 'perf', 'all'], default='all', help="Which profiler(s) to run.")
-    args = parser.parse_args()
-
     if not GNOMON_BINARY.exists():
         print(f"❌ Error: Compiled binary not found at {GNOMON_BINARY}")
-        print("Please ensure you have built the project with: cargo build --profile coz")
+        print("Please ensure you have built the project with: cargo build --release")
         sys.exit(1)
 
-    main(args)
+    main()
