@@ -143,7 +143,6 @@ fn process_people_iterator<'a, I>(
     sparse_index_pool: &'a SparseIndexPool,
     matrix_row_start_idx: MatrixRowIndex,
     snps_in_chunk: usize,
-    chunk_bed_row_offset: usize,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
