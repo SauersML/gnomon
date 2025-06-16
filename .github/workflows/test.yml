@@ -277,6 +277,9 @@ jobs:
           name: build-output
           path: .
 
+      - name: Make profiling binary executable
+        run: chmod +x target/coz/gnomon
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
