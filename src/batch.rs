@@ -41,11 +41,12 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
 /// A thread-local pool for reusing the memory buffers required for storing
-/// sparse indices (`g1_indices`, `g2_indices`). This is a critical performance
-/// optimization that avoids heap allocations in the hot compute path.
+/// sparse indices (`g1_indices`, `g2_indices`) and deferred missingness events.
+/// This is a critical performance optimization that avoids heap allocations in
+/// the hot compute path.
 #[derive(Default, Debug)]
 pub struct SparseIndexPool {
-    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)>>,
+    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)>>,
 }
 
 impl SparseIndexPool {
@@ -55,7 +56,7 @@ impl SparseIndexPool {
 
     /// Gets the thread-local buffer of sparse indices, creating it if it doesn't exist.
     #[inline(always)]
-    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
+    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)> {
         self.pool.get_or_default()
     }
 }
@@ -329,13 +330,17 @@ fn process_tile(
             continue;
         }
 
-        // --- A. Build Sparse Indices and Handle Missingness for the Mini-Batch ---
+        // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
         let thread_indices = sparse_index_pool.get_or_default();
-        let (g1_indices, g2_indices) = &mut *thread_indices.borrow_mut();
+        let (g1_indices, g2_indices, missing_events) = &mut *thread_indices.borrow_mut();
+
         g1_indices.iter_mut().for_each(Vec::clear);
         g2_indices.iter_mut().for_each(Vec::clear);
+        missing_events.clear(); // Clear the events from the previous mini-batch
+
         g1_indices.resize_with(num_people_in_block, Vec::new);
         g2_indices.resize_with(num_people_in_block, Vec::new);
+        // We don't need to resize missing_events, just let it grow.
 
         for person_idx in 0..num_people_in_block {
             let genotype_tile_row_offset = person_idx * snps_in_chunk;
@@ -358,31 +363,11 @@ fn process_tile(
                             .push(snp_idx_in_mini_batch)
                     },
                     3 => {
+                        // THE FIX: Defer the expensive work.
+                        // Instead of doing the lookups and calculations now,
+                        // just record the event and move on. This is extremely fast.
                         let snp_idx_in_chunk = snp_mini_batch_start + snp_idx_in_mini_batch;
-                                let global_matrix_row_idx = matrix_row_start_idx.0 as usize + snp_idx_in_chunk;
-                        let scores_for_this_variant =
-                            &prep_result.variant_to_scores_map[global_matrix_row_idx];
-                        let weight_row_offset = global_matrix_row_idx * stride;
-                        let weight_row =
-                            &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
-                        let flip_row =
-                            &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
-
-                        let person_scores_slice = &mut block_scores_out
-                            [person_idx * num_scores..(person_idx + 1) * num_scores];
-                        let person_missing_counts_slice = &mut block_missing_counts_out
-                            [person_idx * num_scores..(person_idx + 1) * num_scores];
-
-                        for &score_idx in scores_for_this_variant {
-                            let score_col = score_idx.0;
-                            unsafe {
-                                *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
-                                if flip_row[score_col] == 1 {
-                                    *person_scores_slice.get_unchecked_mut(score_col) -=
-                                        2.0 * (weight_row[score_col] as f64);
-                                }
-                            }
-                        }
+                        missing_events.push((person_idx, snp_idx_in_chunk));
                     }
                     _ => (),
                 }
@@ -390,7 +375,7 @@ fn process_tile(
         }
 
         // --- B. Create Matrix Views for the Mini-Batch ---
-                let matrix_row_offset = matrix_row_start_idx.0 as usize + snp_mini_batch_start;
+        let matrix_row_offset = matrix_row_start_idx.0 as usize + snp_mini_batch_start;
         let matrix_slice_start = matrix_row_offset * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
         let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
@@ -429,13 +414,13 @@ fn process_tile(
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(&current_scores_low.to_array());
+                        scores_slice_low.copy_from_slice(¤t_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
                         let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
                         current_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(&current_scores_high.to_array());
+                        scores_slice_high.copy_from_slice(¤t_scores_high.to_array());
                     } else {
                         let start = scores_offset;
                         let end = num_scores;
@@ -446,6 +431,35 @@ fn process_tile(
                     }
                 }
             });
+
+        // --- All Deferred Missing Events in a Batch ---
+        // Now that the fast-path work is done, we process the slow-path work all at once.
+        for &(person_idx, snp_idx_in_chunk) in missing_events.iter() {
+            let global_matrix_row_idx = matrix_row_start_idx.0 as usize + snp_idx_in_chunk;
+            let scores_for_this_variant =
+                &prep_result.variant_to_scores_map[global_matrix_row_idx];
+            let weight_row_offset = global_matrix_row_idx * stride;
+            let weight_row =
+                &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+            let flip_row =
+                &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+
+            let person_scores_slice = &mut block_scores_out
+                [person_idx * num_scores..(person_idx + 1) * num_scores];
+            let person_missing_counts_slice = &mut block_missing_counts_out
+                [person_idx * num_scores..(person_idx + 1) * num_scores];
+
+            for &score_idx in scores_for_this_variant {
+                let score_col = score_idx.0;
+                unsafe {
+                    *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
+                    if flip_row[score_col] == 1 {
+                        *person_scores_slice.get_unchecked_mut(score_col) -=
+                            2.0 * (weight_row[score_col] as f64);
+                    }
+                }
+            }
+        }
     }
 }
 
