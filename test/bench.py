@@ -283,6 +283,14 @@ class RealisticDataGenerator:
                 final_score_df[f"score_{sf_config['name']}_{i+1}"] = weights
 
             score_file_path = self.run_prefix.with_suffix(f".{sf_config['name']}.score")
+
+            # Before writing, remove rows that have NaN values in any of the score columns.
+            # This simulates variants that are dropped from a score file due to missing data,
+            # and ensures compatibility with parsers that don't handle 'NA' strings.
+            score_columns = [col for col in final_score_df.columns if col.startswith('score_')]
+            if score_columns:
+                final_score_df.dropna(subset=score_columns, inplace=True)
+
             final_score_df.to_csv(score_file_path, sep='\t', index=False, float_format='%.8f', na_rep='NA')
             generated_paths.append(score_file_path)
             
@@ -304,6 +312,11 @@ class RealisticDataGenerator:
         
         for f in self.workdir.glob("plink2_run*"):
             f.unlink(missing_ok=True)
+
+        # Clean up the dedicated directory for multiple score files if it exists.
+        multi_score_dir = self.workdir / f"scores_{self.params['test_name']}"
+        if multi_score_dir.is_dir():
+            shutil.rmtree(multi_score_dir)
 
 # ==============================================================================
 #                       EXECUTION & MONITORING ENGINE
@@ -410,8 +423,26 @@ def main():
 
         # --- Gnomon Execution ---
         gnomon_cmd = [str(gnomon_abs_path)]
-        for sf in score_files:
-            gnomon_cmd.extend(["--score", sf.name])
+        if len(score_files) > 1:
+            # Gnomon handles multiple score files by accepting a directory path.
+            # We create a temporary directory, move the score files into it,
+            # and then update our list of paths to point to the new locations.
+            score_dir = WORKDIR / f"scores_{params['test_name']}"
+            score_dir.mkdir(exist_ok=True)
+            
+            new_score_files = []
+            for sf_path in score_files:
+                new_path = score_dir / sf_path.name
+                shutil.move(str(sf_path), str(new_path))
+                new_score_files.append(new_path)
+            
+            score_files = new_score_files # This updated list is used by PLINK2 later
+            gnomon_cmd.extend(["--score", score_dir.name])
+        else:
+            # For a single score file, just pass its name.
+            if score_files: # Ensure list is not empty
+                gnomon_cmd.extend(["--score", score_files[0].name])
+        
         gnomon_cmd.append(data_prefix.name)
         gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
         gnomon_res.update(params); all_results.append(gnomon_res)
@@ -425,7 +456,10 @@ def main():
                     header = f.readline().strip()
                     n_file_scores = len(header.split('\t')) - 3
                 score_col_range = "4" if n_file_scores == 1 else f"4-{3 + n_file_scores}"
-                plink2_cmd.extend(["--score", sf.name, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
+                # Use the path relative to the working directory, which is robust
+                # to whether the score file was moved into a subdirectory or not.
+                score_file_arg = sf.relative_to(WORKDIR)
+                plink2_cmd.extend(["--score", str(score_file_arg), "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
             
             plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
             plink2_res.update(params); all_results.append(plink2_res)
