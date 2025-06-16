@@ -307,13 +307,14 @@ class RealisticDataGenerator:
         print("    > Cleaning up generated data files...")
         extensions = [".bed", ".bim", ".fam", ".log"] + [f".{sf['name']}.score" for sf in self.params['score_files']]
         for ext in extensions:
+            # The original score files might have been moved, so this may fail silently, which is fine.
             try: self.run_prefix.with_suffix(ext).unlink(missing_ok=True)
             except IsADirectoryError: pass
         
         for f in self.workdir.glob("plink2_run*"):
             f.unlink(missing_ok=True)
 
-        # Clean up the dedicated directory for multiple score files if it exists.
+        # Clean up the dedicated directory for score files if it exists.
         multi_score_dir = self.workdir / f"scores_{self.params['test_name']}"
         if multi_score_dir.is_dir():
             shutil.rmtree(multi_score_dir)
@@ -324,12 +325,14 @@ class RealisticDataGenerator:
 
 def run_and_monitor_process(tool_name: str, command: List[str], cwd: Path) -> Dict[str, Any]:
     print(f"  > Running {tool_name} with default max parallelism...")
-    print(f"    Command: {' '.join(command)}")
+    # Ensure all command arguments are strings for display and execution
+    cmd_str_list = [str(c) for c in command]
+    print(f"    Command: {' '.join(cmd_str_list)}")
     start_time = time.monotonic()
     
     try:
         # Use PIPE to capture stdout/stderr to prevent massive console spew
-        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        process = subprocess.Popen(cmd_str_list, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         p = psutil.Process(process.pid)
         peak_rss_mb = 0
         while process.poll() is None:
@@ -385,8 +388,17 @@ def report_results(results: list):
         # Filter out failed runs for ratio calculation
         success_df = df[df['success'] == True].copy()
         if not success_df.empty:
-            report_df = success_df.pivot_table(index=index_cols, columns='tool', values=['time_sec', 'peak_mem_mb'])
-            report_df.columns = [f"{val}_{tool}" for val, tool in report_df.columns]
+            # Create a pivot table for successful runs. Unsuccessful runs will result in NaNs.
+            pivoted = success_df.pivot_table(
+                index=index_cols, columns='tool', values=['time_sec', 'peak_mem_mb'], aggfunc='first'
+            )
+            # Flatten the multi-level column index
+            pivoted.columns = [f"{val}_{tool}" for val, tool in pivoted.columns]
+            
+            # Reindex to ensure all tests are present in the final report, even if they failed.
+            all_test_names = [d['test_name'] for d in REALISTIC_DIMENSIONS]
+            report_df = pivoted.reindex(all_test_names)
+
             print("---\n- Ratios (< 1.0) indicate gnomon is faster or uses less memory.\n- Time is wall-clock seconds. Memory is peak RSS in Megabytes.\n---")
             if 'time_sec_gnomon' in report_df and 'time_sec_plink2' in report_df: report_df['time_ratio_g/p'] = report_df['time_sec_gnomon'] / report_df['time_sec_plink2']
             if 'peak_mem_mb_gnomon' in report_df and 'peak_mem_mb_plink2' in report_df: report_df['mem_ratio_g/p'] = report_df['peak_mem_mb_gnomon'] / report_df['peak_mem_mb_plink2']
@@ -412,45 +424,39 @@ def main():
         params = workload_params.copy()
         print_header(f"Benchmark Run {run_id}/{len(REALISTIC_DIMENSIONS)}: {params['test_name']}")
         
+        generator = None
         try:
             generator = RealisticDataGenerator(workload_params=params, workdir=WORKDIR)
             data_prefix, score_files = generator.generate_all_files()
         except Exception as e:
             print(f"  > ❌ Data generation FAILED for {params['test_name']}: {e}")
             failed_runs += 1
-            generator.cleanup()
+            if generator:
+                generator.cleanup()
             continue
 
         # --- Gnomon Execution ---
-        gnomon_cmd = [str(gnomon_abs_path)]
-        if len(score_files) > 1:
-            # Gnomon handles multiple score files by accepting a directory path.
-            # We create a temporary directory, move the score files into it,
-            # and then update our list of paths to point to the new locations.
-            score_dir = WORKDIR / f"scores_{params['test_name']}"
-            score_dir.mkdir(exist_ok=True)
-            
-            new_score_files = []
-            for sf_path in score_files:
-                new_path = score_dir / sf_path.name
-                shutil.move(str(sf_path), str(new_path))
-                new_score_files.append(new_path)
-            
-            score_files = new_score_files # This updated list is used by PLINK2 later
-            gnomon_cmd.extend(["--score", score_dir.name])
-        else:
-            # For a single score file, just pass its name.
-            if score_files: # Ensure list is not empty
-                gnomon_cmd.extend(["--score", score_files[0].name])
+        # To robustly handle both single and multiple score files, we will
+        # always place them in a dedicated directory for the test run.
+        score_dir = WORKDIR / f"scores_{params['test_name']}"
+        score_dir.mkdir(exist_ok=True)
         
-        gnomon_cmd.append(data_prefix.name)
+        new_score_files = []
+        for sf_path in score_files:
+            new_path = score_dir / sf_path.name
+            shutil.move(str(sf_path), str(new_path))
+            new_score_files.append(new_path)
+        
+        score_files = new_score_files # This updated list is used by PLINK2 later
+            
+        gnomon_cmd = [gnomon_abs_path, "--score", score_dir.name, data_prefix.name]
         gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)
         gnomon_res.update(params); all_results.append(gnomon_res)
         
         # --- PLINK2 Execution ---
         if gnomon_res["success"]: # Only run plink if gnomon succeeded, for comparison
             plink_out_prefix = WORKDIR / f"plink2_run{run_id}"
-            plink2_cmd = [str(plink2_abs_path), "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
+            plink2_cmd = [plink2_abs_path, "--bfile", data_prefix.name, "--out", plink_out_prefix.name, "--threads", str(os.cpu_count() or 1)]
             for sf in score_files:
                 with open(sf, 'r') as f:
                     header = f.readline().strip()
@@ -459,7 +465,7 @@ def main():
                 # Use the path relative to the working directory, which is robust
                 # to whether the score file was moved into a subdirectory or not.
                 score_file_arg = sf.relative_to(WORKDIR)
-                plink2_cmd.extend(["--score", str(score_file_arg), "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
+                plink2_cmd.extend(["--score", score_file_arg, "1", "2", "header", "no-mean-imputation", "--score-col-nums", score_col_range])
             
             plink2_res = run_and_monitor_process("plink2", plink2_cmd, WORKDIR)
             plink2_res.update(params); all_results.append(plink2_res)
@@ -471,8 +477,8 @@ def main():
             print("  > Skipping PLINK2 run because Gnomon failed.")
             failed_runs += 1
 
-        
-        generator.cleanup()
+        if generator:
+            generator.cleanup()
 
     report_results(all_results)
     if failed_runs > 0:
