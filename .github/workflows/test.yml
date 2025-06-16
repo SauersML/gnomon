@@ -13,10 +13,6 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ======================================================================
-  # JOB 1: Handles all Rust compilation, testing, and artifact creation.
-  # (This job is now fixed and more robust)
-  # ======================================================================
   build_and_test:
     runs-on: ubuntu-latest
     steps:
@@ -53,28 +49,47 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
             ${{ runner.os }}-cargo-build-nightly-
+      
+      - name: Cache getdoc binary
+        id: getdoc_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/getdoc
+          key: ${{ runner.os }}-getdoc-v1
+
+      - name: Install getdoc
+        if: steps.getdoc_cache.outputs.cache-hit != 'true'
+        run: cargo +nightly install getdoc --locked
 
       - name: Run Rust unit tests
+        id: test_step
         run: cargo +nightly test
+        continue-on-error: true
+
+      - name: Generate custom report with getdoc
+        if: always()
+        run: |
+          ~/.cargo/bin/getdoc
+          cat report.md
 
       - name: Build Gnomon binaries (Release and Profiling)
         run: |
-          echo "Building standard release binary..."
           cargo build --release
-          echo "Building binary with profiling symbols..."
           cargo build --profile profiling
+      
+      - name: Fail job if unit tests failed
+        if: steps.test_step.outcome == 'failure'
+        run: exit 1
 
       - name: Upload build artifacts for all downstream jobs
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          # The entire target directory now reliably contains both binaries.
-          path: target
+          path: |
+            target
+            report.md
           retention-days: 1
 
-  # ======================================================================
-  # JOBS 2-4: Python tests (Unchanged, they will now work)
-  # ======================================================================
   python_test_integration:
     runs-on: ubuntu-latest
     needs: build_and_test
@@ -83,8 +98,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-output
-          # FIX: Download artifact contents INTO a 'target' directory
-          path: target
+          path: .
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -105,8 +119,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-output
-          # FIX: Download artifact contents INTO a 'target' directory
-          path: target
+          path: .
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -132,8 +145,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-output
-          # FIX: Download artifact contents INTO a 'target' directory
-          path: target
+          path: .
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -146,9 +158,6 @@ jobs:
       - run: chmod +x target/release/gnomon
       - run: python -u test/bench.py
 
-  # ======================================================================
-  # JOB 5: Performance Profiling (This job is now correct and robust)
-  # ======================================================================
   performance_reports:
     runs-on: ubuntu-latest
     needs: build_and_test
@@ -157,8 +166,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-output
-          # FIX: Download artifact contents INTO a 'target' directory
-          path: target
+          path: .
 
       - name: Make profiling binary executable
         run: chmod +x target/profiling/gnomon
@@ -168,6 +176,16 @@ jobs:
 
       - name: Install Python dependencies
         run: pip install pandas numpy requests psutil
+
+      - name: System Diagnostics
+        run: |
+          echo "--- System Information ---"
+          echo "Kernel: $(uname -a)"
+          echo "Distribution: $(lsb_release -a)"
+          echo "CPU Cores: $(nproc)"
+          echo "--- Memory ---"
+          free -h
+          echo "------------------------"
 
       - name: Get Kernel Version for Cache Key
         id: kernel_version
@@ -184,41 +202,25 @@ jobs:
 
       - name: Install Perf Tools
         run: |
-          echo "--- Installing Perf Tools ---"
           CURRENT_KERNEL=$(uname -r)
           REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
-          echo "Required packages: ${REQUIRED_PACKAGES}"
-          
           if [ "${{ steps.apt_cache.outputs.cache-hit }}" != 'true' ]; then
-            echo "APT cache miss, running apt-get update..."
             sudo apt-get update -y
-          else
-            echo "APT cache hit, skipping apt-get update."
           fi
-          
           sudo apt-get install -y --no-install-recommends ${REQUIRED_PACKAGES}
-          
-          echo "--- Verifying Installation ---"
-          perf --version || echo "perf not found"
+          perf --version
 
       - name: Configure Profiler Permissions
         run: |
-          echo "--- Configuring Kernel Permissions for Profiling ---"
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
-          echo "Permissions configured."
           
       - name: Run Profiling Harness
-        run: |
-          echo "--- Starting Profiling Harness ---"
-          python test/perf.py
-          echo "--- Profiling Harness Finished ---"
+        run: python test/perf.py
           
       - name: Grant Cache Permissions
         if: always()
-        run: |
-          echo "Fixing permissions on APT cache directories for saving..."
-          sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
+        run: sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
           
       - name: Upload Profiling Data
         if: always()
