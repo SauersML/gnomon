@@ -127,7 +127,7 @@ def main():
             print(f"    > Generating a {PROFILING_SUBSET_PCT:.0%} random subset for profiling...")
             fam_path = data_prefix.with_suffix(".fam")
             keep_file_path = run_workdir / f"keep_{name}.txt"
-            fam_df = pd.read_csv(fam_path, sep=r'\s+', header=None, usecols=[1], names=['IID'], engine='python')
+            fam_df = pd.read_csv(fam_path, sep='\s+', header=None, usecols=[1], names=['IID'], engine='python')
             sample_size = int(len(fam_df) * PROFILING_SUBSET_PCT)
             fam_df.sample(n=sample_size, random_state=42).to_csv(keep_file_path, header=False, index=False)
             print(f"      ... wrote {sample_size} individuals to '{keep_file_path.name}'")
@@ -135,9 +135,6 @@ def main():
             score_dir = run_workdir / f"scores_{name}"
             score_dir.mkdir(exist_ok=True)
             for sf_path in score_files:
-                # FIX: Use shutil.move for robust file moving, which is less
-                # error-prone than pathlib.rename across different filesystems
-                # or in containerized environments.
                 shutil.move(str(sf_path), score_dir)
             
             command_str = (f'echo "--- Running workload: {name} on {PROFILING_SUBSET_PCT:.0%} subset ---" && '
@@ -166,12 +163,20 @@ def main():
             ]
             run_command(perf_report_cmd, title="Combined Granular Profile Report")
 
-            hot_function_symbol = "gnomon::batch::process_block"
-            perf_annotate_cmd = [
-                "perf", "annotate", "--stdio", "-l",
-                "-i", str(perf_data_file), "--symbol", hot_function_symbol,
+            # --- FIX: Annotate the functions that actually do the work ---
+            hot_functions = [
+                "gnomon::batch::process_tile",
+                "gnomon::batch::pivot_tile"
             ]
-            run_command(perf_annotate_cmd, title=f"Line-by-Line Annotation for: {hot_function_symbol}")
+
+            for symbol in hot_functions:
+                perf_annotate_cmd = [
+                    "perf", "annotate", "--stdio", "-l",
+                    "-i", str(perf_data_file), "--symbol", symbol,
+                ]
+                # This command can still "succeed" with a zero exit code while
+                # printing the error, so we don't need to check its return value.
+                run_command(perf_annotate_cmd, title=f"Line-by-Line Annotation for: {symbol}")
 
         else:
             print(f"Combined perf data file not found at '{perf_data_file}'. Profiling may have failed.")
