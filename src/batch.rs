@@ -207,7 +207,6 @@ fn process_block(
         prep_result,
         matrix_row_start_idx,
         snps_in_chunk,
-        chunk_bed_row_offset,
     );
 
     process_tile(
