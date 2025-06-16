@@ -33,6 +33,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+coz = "0.1.3"
 
 [profile.coz]
 inherits = "release"
