@@ -249,7 +249,11 @@ async fn run_orchestration_loop(
 
     // This is the main loop of the application's concurrent phase.
     'orchestrator: while let Some(snp_buffer) = full_buffer_rx.recv().await {
-        let matrix_row_index = context.prep_result.required_bim_indices[required_indices_cursor];
+        // The orchestrator receives a buffer only for SNPs that are required. Since the
+        // I/O producer reads them in the sorted order defined by `required_bim_indices`,
+        // the `required_indices_cursor` directly corresponds to the row index in the
+        // dense compute matrices.
+        let matrix_row_index = MatrixRowIndex(required_indices_cursor as u32);
         required_indices_cursor += 1;
 
         // The "brain" of the adaptive engine: make the dispatch decision.
