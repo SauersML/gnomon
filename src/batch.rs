@@ -242,13 +242,13 @@ fn process_tile<'a>(
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &'a SparseIndexPool,
 ) {
-    let variants_in_chunk = reconciled_variant_indices.len();
+    let variants_in_chunk = reconciled_variant_indices_for_batch.len();
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if variants_in_chunk > 0 { tile.len() / variants_in_chunk } else { 0 };
     if num_people_in_block == 0 {
         return;
     }
-    let padded_score_count = prep_result.padded_score_count();
+    let padded_score_count = prep_result.padded_score_count;
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
 
     // --- Part 1: Pre-calculate the chunk-wide baseline for flipped variants (SIMD OPTIMIZED) ---
@@ -441,7 +441,7 @@ fn process_tile<'a>(
         for &(person_idx, variant_idx_in_chunk) in missing_events.iter() {
             // This is a rare, slow path for missing data. We use the index metadata
             // to look up the global information needed.
-            let global_matrix_row_idx = reconciled_variant_indices[variant_idx_in_chunk].0 as usize;
+            let global_matrix_row_idx = reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
             let scores_for_this_variant =
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
             
@@ -668,7 +668,7 @@ pub fn run_variant_major_path(
     reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-    let padded_score_count = prep_result.padded_score_count();
+    let padded_score_count = prep_result.padded_score_count;
 
     // --- 1. Decode this single variant for all people in the cohort ---
     // This is a small, temporary allocation that fits on the stack for most cohorts.
