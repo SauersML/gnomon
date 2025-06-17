@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // This is the primary asynchronous phase. It spawns the I/O producer and
     // orchestrator tasks, which run concurrently to maximize throughput.
     let computation_start = Instant::now();
-    run_pipeline(&mut context, &plink_prefix).await?;
+    pipeline::run(&mut context, &plink_prefix).await?;
     eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
 
     // --- Phase 4: Finalization & Output ---
