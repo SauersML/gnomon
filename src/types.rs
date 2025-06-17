@@ -125,27 +125,31 @@ impl DerefMut for CleanCounts {
 #[derive(Debug)]
 pub struct PackedVariantGenotypes(pub Vec<u8>);
 
-/// A batch of raw SNP-major data, curated to contain only variants
-/// suitable for the high-throughput person-major compute path.
+/// The data payload of a non-empty `DenseVariantBatch`. This struct is public
+/// to allow the pipeline orchestrator to own and move the data out of a
+/// `DenseVariantBatch::Buffering` state.
 #[derive(Debug)]
-pub struct DenseVariantBatch {
-    /// A contiguous buffer of SNP-major data.
+pub struct DenseVariantBatchData {
+    /// A contiguous buffer of packed variant genotype data.
     pub data: Vec<u8>,
-    /// The matrix row indices for each corresponding SNP in the `data` buffer.
+    /// The reconciled variant indices for each corresponding variant in the `data` buffer.
     /// This metadata is critical for looking up weights and flip flags.
     pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
 }
 
-impl DenseVariantBatch {
-    /// Creates a new, empty batch with a pre-allocated data buffer.
-    pub fn new_empty(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-            // The metadata vector starts empty. Its length will always track
-            // the number of SNPs in the batch.
-            reconciled_variant_indices: Vec::new(),
-        }
-    }
+/// A batch of raw variant data, curated to contain only "dense" variants
+/// suitable for the high-throughput person-major compute path.
+///
+/// This enum enforces a state machine at compile time: a batch is either
+/// `Empty` or it is `Buffering`. This makes it impossible to dispatch an empty
+/// batch or add data to a batch that has already been dispatched, preventing a
+/// class of logic errors.
+#[derive(Debug)]
+pub enum DenseVariantBatch {
+    /// Represents a batch that has no variants. This is the initial state.
+    Empty,
+    /// Represents a batch that is actively accumulating variants.
+    Buffering(DenseVariantBatchData),
 }
 
 /// Represents the dispatcher's decision for which compute path to use for a
