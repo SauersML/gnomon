@@ -239,22 +239,23 @@ pub fn prepare_for_computation(
     // --- STAGE 6: POPULATE COMPUTE STRUCTURES ---
     eprintln!("> Pass 6: Populating compute structures with maximum parallelism...");
 
-    // The `padded_score_count` is the padded row width for each variant's data, ensuring
+    // The `stride` is the padded row width for each variant's data, ensuring
     // that each row can be processed with full SIMD vectors without scalar fallbacks.
-    let padded_score_count = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let matrix_size = num_reconciled_variants * stride;
 
-    // Create the per-variant data structures in parallel. Each variant gets its own
-    // self-contained, padded (weights, flips) tuple. This "Structure of Arrays" to
-    // "Array of Structures" transformation is key to enabling efficient "gather"
-    // operations in the pipeline, as it makes all data for a single variant
-    // contiguous and easily accessible.
-    let variant_data: Vec<(Vec<f32>, Vec<u8>)> = (0..num_reconciled_variants)
-        .into_par_iter()
-        .map(|row_idx| {
-            let mut weights_for_variant = vec![0.0f32; padded_score_count];
-            let mut flips_for_variant = vec![0u8; padded_score_count];
+    let mut weights_matrix = vec![0.0f32; matrix_size];
+    let mut flip_mask_matrix = vec![0u8; matrix_size];
 
+    // Use a parallel iterator over chunks to populate the matrices contention-free.
+    // Accessing disjoint row chunks via `par_chunks_mut` prevents data races.
+    weights_matrix
+        .par_chunks_mut(stride)
+        .zip(flip_mask_matrix.par_chunks_mut(stride))
+        .enumerate()
+        .for_each(|(row_idx, (weight_row_slice, flip_row_slice))| {
             let reconciled_variant_idx = ReconciledVariantIndex(row_idx as u32);
+
             // `partition_point` is used on the sorted `work_items` to efficiently find
             // the slice of items corresponding to the current variant row. This is a key
             // algorithmic optimization that avoids repeated linear scans.
@@ -266,20 +267,19 @@ pub fn prepare_for_computation(
 
             for item in items_for_this_row {
                 let col = item.col_idx.0;
-                weights_for_variant[col] = item.weight;
+                weight_row_slice[col] = item.weight;
                 if item.is_flipped {
-                    flips_for_variant[col] = 1;
+                    flip_row_slice[col] = 1;
                 }
             }
-            (weights_for_variant, flips_for_variant)
-        })
-        .collect();
+        });
 
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     Ok(PreparationResult::new(
-        variant_data,
-        padded_score_count,
+        weights_matrix,
+        flip_mask_matrix,
+        stride,
         required_bim_indices,
         score_names,
         score_variant_counts,
