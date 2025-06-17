@@ -1,4 +1,4 @@
--- proofs/Framework.lean
+-- proofs/Calibrator.lean
 -- This file will contain all definitions, theorems, and proofs for the project.
 
 import Mathlib.Probability.Basic
