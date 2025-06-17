@@ -180,37 +180,34 @@ fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
     prep_result: &PreparationResult,
     snp_major_data: &[u8],
+    metadata: &[MatrixRowIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    matrix_row_start_idx: MatrixRowIndex,
-    snps_in_chunk: usize,
 ) {
+    let snps_in_chunk = metadata.len();
     let tile_size = person_indices_in_block.len() * snps_in_chunk;
 
     let mut tile = tile_pool.pop().unwrap_or_default();
     tile.clear();
     tile.resize(tile_size, EffectAlleleDosage::default());
 
-    // This pivot function now has a single, clear responsibility.
+    // This pivot function has a single, clear responsibility.
     pivot_tile(
         snp_major_data,
         person_indices_in_block,
         &mut tile,
         prep_result,
-        matrix_row_start_idx,
-        snps_in_chunk,
     );
 
     process_tile(
         &tile,
         prep_result,
+        metadata,
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
-        snps_in_chunk,
-        matrix_row_start_idx,
     );
 
     // Return the tile to the pool for reuse.
