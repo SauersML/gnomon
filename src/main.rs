@@ -298,15 +298,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 // To be implemented: dispatch sparse work.
             }
             ComputePath::PersonMajor => {
-                // First SNP in a new dense batch? Set the starting metadata.
-                if dense_batch.snp_count == 0 {
-                    dense_batch.start_matrix_row = matrix_row_index;
-                }
                 dense_batch.data.extend_from_slice(&snp_buffer.0);
-                dense_batch.snp_count += 1;
+                dense_batch.metadata.push(matrix_row_index);
 
                 // Recycle the single-SNP buffer immediately.
-                if empty_buffer_tx.send(snp_buffer.0).await.is_err() {
+                if empty_buffer_tx.send(IoCommand::Read(snp_buffer.0)).await.is_err() {
                     break;
                 }
 
