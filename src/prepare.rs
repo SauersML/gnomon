@@ -10,7 +10,7 @@
 // multiple score files.
 
 use crate::types::{
-    BimRowIndex, MatrixRowIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
+    BimRowIndex, ReconciledVariantIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
 };
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
@@ -49,7 +49,7 @@ struct BimRecord {
 /// A temporary, internal representation of a single score definition for a
 /// variant, created during the reconciliation process.
 struct WorkItem {
-    matrix_row: MatrixRowIndex,
+    reconciled_variant_idx: ReconciledVariantIndex,
     col_idx: ScoreColumnIndex,
     weight: f32,
     is_flipped: bool,
@@ -108,8 +108,8 @@ pub fn prepare_for_computation(
         for name in score_names_part {
             final_score_names.insert(name);
         }
-        for (snp_id, entries) in score_map_part.drain() {
-            final_score_map.entry(snp_id).or_default().extend(entries);
+        for (variant_id, entries) in score_map_part.drain() {
+            final_score_map.entry(variant_id).or_default().extend(entries);
         }
     }
     let score_names: Vec<String> = final_score_names.into_iter().collect();
@@ -117,15 +117,15 @@ pub fn prepare_for_computation(
     // --- STAGE 2: SKELETON & MAP CONSTRUCTION ---
     eprintln!("> Pass 2: Indexing genotype data...");
     let bim_path = plink_prefix.with_extension("bim");
-    let (bim_index, total_snps_in_bim) = index_bim_file(&bim_path)?;
-    // Create a reverse map from the original bim file row index to its snp_id string.
+    let (bim_index, total_variants_in_bim) = index_bim_file(&bim_path)?;
+    // Create a reverse map from the original bim file row index to its variant_id string.
     // This is used for fast, user-friendly error reporting if duplicates are found.
-    let bim_row_to_snp_id: AHashMap<BimRowIndex, &str> = bim_index
+    let bim_row_to_variant_id: AHashMap<BimRowIndex, &str> = bim_index
         .iter()
-        .flat_map(|(snp_id, records)| {
+        .flat_map(|(variant_id, records)| {
             records
                 .iter()
-                .map(move |(_, bim_row)| (*bim_row, snp_id.as_str()))
+                .map(move |(_, bim_row)| (*bim_row, variant_id.as_str()))
         })
         .collect();
 
@@ -142,8 +142,8 @@ pub fn prepare_for_computation(
 
                 // This map is an intermediate product that uses niche-optimization for memory efficiency.
                 // It maps from the original .bim row index to a dense matrix row index.
-    let bim_row_to_matrix_row_map =
-        build_bim_to_matrix_map(&required_bim_indices, total_snps_in_bim);
+    let bim_row_to_reconciled_variant_map =
+        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
     let score_name_to_col_index: AHashMap<&str, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()
@@ -154,9 +154,9 @@ pub fn prepare_for_computation(
     eprintln!("> Pass 3: Reconciling variants and compiling work items...");
     let mut work_items: Vec<WorkItem> = final_score_map
         .par_iter()
-        .flat_map(|(snp_id, score_lines)| {
+        .flat_map(|(variant_id, score_lines)| {
             let mut work_for_position = Vec::new();
-            if let Some(bim_records) = bim_index.get(snp_id) {
+            if let Some(bim_records) = bim_index.get(variant_id) {
                 for (effect_allele, other_allele, weights) in score_lines {
                     // Call the single authoritative resolver to get the definitive list of matches.
                     let winning_matches =
@@ -170,7 +170,7 @@ pub fn prepare_for_computation(
                             *bim_row_index,
                             effect_allele,
                             weights,
-                            &bim_row_to_matrix_row_map,
+                            &bim_row_to_reconciled_variant_map,
                             &score_name_to_col_index,
                             &mut work_for_position,
                         );
@@ -186,9 +186,9 @@ pub fn prepare_for_computation(
 
     // To correctly count variants per score and build the missingness map, we need
     // a unique set of (variant, score) pairings.
-    let mut unique_pairs: Vec<(MatrixRowIndex, ScoreColumnIndex)> = work_items
+    let mut unique_pairs: Vec<(ReconciledVariantIndex, ScoreColumnIndex)> = work_items
         .par_iter()
-        .map(|item| (item.matrix_row, item.col_idx))
+        .map(|item| (item.reconciled_variant_idx, item.col_idx))
         .collect();
     unique_pairs.par_sort_unstable();
     unique_pairs.dedup();
@@ -213,26 +213,26 @@ pub fn prepare_for_computation(
     // Sort by matrix row and then column index. This groups any potential duplicate
     // definitions for the same (variant, score) cell right next to each other,
     // which allows for a fast linear scan to detect them.
-    work_items.par_sort_unstable_by_key(|item| (item.matrix_row, item.col_idx));
+    work_items.par_sort_unstable_by_key(|item| (item.reconciled_variant_idx, item.col_idx));
 
     // After sorting, a single pass over adjacent items can efficiently detect duplicates.
     // This check ensures that every variant is defined only once per score.
     if let Some(w) = work_items.windows(2).find(|w| {
-        w[0].matrix_row == w[1].matrix_row && w[0].col_idx == w[1].col_idx
+        w[0].reconciled_variant_idx == w[1].reconciled_variant_idx && w[0].col_idx == w[1].col_idx
     }) {
         let bad_item = &w[0];
         let score_name = &score_names[bad_item.col_idx.0];
-        // To find the human-readable snp_id, we map from our internal dense matrix row
+        // To find the human-readable variant_id, we map from our internal dense matrix row
         // index back to the original .bim file row index, and then use the reverse
-        // map to find the snp_id string.
-                let bim_row = required_bim_indices[bad_item.matrix_row.0 as usize];
-        let snp_id = bim_row_to_snp_id
+        // map to find the variant_id string.
+                let bim_row = required_bim_indices[bad_item.reconciled_variant_idx.0 as usize];
+        let variant_id = bim_row_to_variant_id
             .get(&bim_row)
             .unwrap_or(&"unknown variant");
 
         return Err(PrepError::Parse(format!(
             "Ambiguous input: The score '{}' is defined more than once for variant '{}'. Each variant must have exactly one definition per score.",
-            score_name, snp_id
+            score_name, variant_id
         )));
     }
 
@@ -241,22 +241,22 @@ pub fn prepare_for_computation(
 
     // The stride is the padded row width of the matrices, ensuring each row
     // begins on a SIMD-friendly memory boundary.
-    let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
-    let matrix_size = num_reconciled_variants * stride;
+    let padded_score_count = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let matrix_size = num_reconciled_variants * padded_score_count;
 
-    let mut weights_matrix = vec![0.0f32; matrix_size];
-    let mut flip_mask_matrix = vec![0u8; matrix_size];
+    let mut variant_score_weights = vec![0.0f32; matrix_size];
+    let mut variant_score_flips = vec![0u8; matrix_size];
 
     // Populate both the weights and flip mask matrices in parallel.
     // This is the O(N*K) workhorse of the preparation phase.
-    weights_matrix
-        .par_chunks_mut(stride)
-        .zip(flip_mask_matrix.par_chunks_mut(stride))
+    variant_score_weights
+        .par_chunks_mut(padded_score_count)
+        .zip(variant_score_flips.par_chunks_mut(padded_score_count))
         .enumerate()
         .for_each(|(row_idx, (weights_slice, flip_slice))| {
-                    let matrix_row = MatrixRowIndex(row_idx as u32);
-            let first_item_pos = work_items.partition_point(|item| item.matrix_row < matrix_row);
-            let first_after_pos = work_items.partition_point(|item| item.matrix_row <= matrix_row);
+                    let reconciled_variant_idx = ReconciledVariantIndex(row_idx as u32);
+            let first_item_pos = work_items.partition_point(|item| item.reconciled_variant_idx < reconciled_variant_idx);
+            let first_after_pos = work_items.partition_point(|item| item.reconciled_variant_idx <= reconciled_variant_idx);
             let items_for_this_row = &work_items[first_item_pos..first_after_pos];
 
             for item in items_for_this_row {
@@ -269,11 +269,11 @@ pub fn prepare_for_computation(
         });
 
     // --- FINAL CONSTRUCTION ---
-    let bytes_per_snp = (total_people_in_fam as u64 + 3) / 4;
+    let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     Ok(PreparationResult::new(
-        weights_matrix,
-        flip_mask_matrix,
-        stride,
+        variant_score_weights,
+        variant_score_flips,
+        padded_score_count,
         required_bim_indices,
         score_names,
         score_variant_counts,
@@ -282,9 +282,9 @@ pub fn prepare_for_computation(
         final_person_iids,
         num_people_to_score,
         total_people_in_fam,
-        total_snps_in_bim,
+        total_variants_in_bim,
         num_reconciled_variants,
-        bytes_per_snp,
+        bytes_per_variant,
         person_fam_to_output_idx,
     ))
 }
@@ -301,14 +301,14 @@ fn process_match(
     bim_row_index: BimRowIndex,
     effect_allele: &str,
     weights: &AHashMap<String, f32>,
-    bim_row_to_matrix_row_map: &[Option<NonMaxU32>],
+    bim_row_to_reconciled_variant_map: &[Option<NonMaxU32>],
     score_name_to_col_index: &AHashMap<&str, ScoreColumnIndex>,
     work_for_position: &mut Vec<WorkItem>,
 ) {
     // This map uses Option<NonMaxU32> for memory efficiency (4 bytes vs 16).
-    // If a mapping exists, we get the inner `u32` and construct a type-safe `MatrixRowIndex`.
-    if let Some(non_max_index) = bim_row_to_matrix_row_map[bim_row_index.0 as usize] {
-        let matrix_row = MatrixRowIndex(non_max_index.get());
+    // If a mapping exists, we get the inner `u32` and construct a type-safe `ReconciledVariantIndex`.
+    if let Some(non_max_index) = bim_row_to_reconciled_variant_map[bim_row_index.0 as usize] {
+        let reconciled_variant_idx = ReconciledVariantIndex(non_max_index.get());
         let reconciliation = if effect_allele == &bim_record.allele2 {
             Reconciliation::Identity
         } else {
@@ -319,7 +319,7 @@ fn process_match(
             if let Some(&col_idx) = score_name_to_col_index.get(score_name.as_str()) {
                 let is_flipped = matches!(reconciliation, Reconciliation::Flip);
                 work_for_position.push(WorkItem {
-                    matrix_row,
+                    reconciled_variant_idx,
                     col_idx,
                     weight: *weight,
                     is_flipped,
@@ -396,16 +396,16 @@ fn parse_and_group_score_file(
     let header_parts: Vec<&str> = header_line.trim().split('\t').collect();
     if header_parts.len() < 4 {
         return Err(PrepError::Header(format!(
-            "Invalid header in '{}': Expected at least 4 columns (snp_id, effect_allele, other_allele, score_name), found {}",
+            "Invalid header in '{}': Expected at least 4 columns (variant_id, effect_allele, other_allele, score_name), found {}",
             score_path.display(),
             header_parts.len()
         )));
     }
-    if header_parts[0] != "snp_id"
+    if header_parts[0] != "variant_id"
         || header_parts[1] != "effect_allele"
         || header_parts[2] != "other_allele"
     {
-        return Err(PrepError::Header(format!("Invalid header in '{}': Must start with 'snp_id\teffect_allele\tother_allele'.", score_path.display())));
+        return Err(PrepError::Header(format!("Invalid header in '{}': Must start with 'variant_id\teffect_allele\tother_allele'.", score_path.display())));
     }
 
     let score_names: Vec<String> = header_parts[3..].iter().map(|s| s.to_string()).collect();
@@ -422,7 +422,7 @@ fn parse_and_group_score_file(
             continue; // Skip malformed lines
         }
 
-        let snp_id = fields[0].to_string();
+        let variant_id = fields[0].to_string();
         let effect_allele = fields[1].to_string();
         let other_allele = fields[2].to_string();
 
@@ -442,7 +442,7 @@ fn parse_and_group_score_file(
             }
         }
         score_map
-            .entry(snp_id)
+            .entry(variant_id)
             .or_default()
             .push((effect_allele, other_allele, weights));
     }
@@ -456,9 +456,9 @@ fn discover_required_bim_indices(
 ) -> Result<BTreeSet<BimRowIndex>, PrepError> {
     let required_indices_results: Vec<_> = score_map
         .par_iter()
-        .map(|(snp_id, score_lines)| {
+        .map(|(variant_id, score_lines)| {
             let mut set_for_snp = BTreeSet::new();
-            if let Some(bim_records) = bim_index.get(snp_id) {
+            if let Some(bim_records) = bim_index.get(variant_id) {
                 for (effect_allele, other_allele, _weights) in score_lines {
                     // Call the single authoritative resolver to get the definitive list of matches.
                     let winning_matches =
@@ -486,7 +486,7 @@ fn discover_required_bim_indices(
                             if !AMBIGUITY_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "Warning: At least one variant was automatically reconciled due to mismatched allele sets (e.g., variant '{}'). Gnomon is proceeding by matching on the effect allele.",
-                                    snp_id
+                                    variant_id
                                 );
                             }
                         }
@@ -504,20 +504,20 @@ fn discover_required_bim_indices(
     Ok(final_set)
 }
 
-fn build_bim_to_matrix_map(
+fn build_bim_to_reconciled_variant_map(
     required_bim_indices: &[BimRowIndex],
-    total_bim_snps: usize,
+    total_variants_in_bim: usize,
 ) -> Vec<Option<NonMaxU32>> {
-    let mut bim_row_to_matrix_row = vec![None; total_bim_snps];
-    for (matrix_row_idx, &bim_row) in required_bim_indices.iter().enumerate() {
-        if (bim_row.0 as usize) < total_bim_snps {
+    let mut bim_row_to_reconciled_variant_map = vec![None; total_variants_in_bim];
+    for (reconciled_variant_idx, &bim_row) in required_bim_indices.iter().enumerate() {
+        if (bim_row.0 as usize) < total_variants_in_bim {
             // Create a NonMaxU32, which is guaranteed not to be u32::MAX. This is safe as
             // the number of variants will not approach this limit.
-            let non_max_index = NonMaxU32::new(matrix_row_idx as u32).unwrap();
-            bim_row_to_matrix_row[bim_row.0 as usize] = Some(non_max_index);
+            let non_max_index = NonMaxU32::new(reconciled_variant_idx as u32).unwrap();
+            bim_row_to_reconciled_variant_map[bim_row.0 as usize] = Some(non_max_index);
         }
     }
-    bim_row_to_matrix_row
+    bim_row_to_reconciled_variant_map
 }
 
 fn resolve_person_subset(

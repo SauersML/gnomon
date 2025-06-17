@@ -13,7 +13,7 @@
 // It will panic / overflow if we try.
 
 use crate::kernel;
-use crate::types::{CleanCounts, CleanScores, MatrixRowIndex};
+use crate::types::{CleanCounts, CleanScores, ReconciledVariantIndex};
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
 };
@@ -66,8 +66,8 @@ impl SparseIndexPool {
 /// Processes one dense, pre-filtered batch of SNP-major data using the person-major
 /// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_person_major_path(
-    snp_major_data: &[u8],
-    metadata: &[MatrixRowIndex],
+    variant_major_data: &[u8],
+    reconciled_variant_indices: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
     partial_missing_counts_out: &mut CleanCounts,
@@ -96,8 +96,8 @@ pub fn run_person_major_path(
                 .map(OriginalPersonIndex);
             process_people_iterator(
                 iter,
-                snp_major_data,
-                metadata,
+                variant_major_data,
+                reconciled_variant_indices,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
@@ -109,8 +109,8 @@ pub fn run_person_major_path(
             let iter = indices.par_iter().copied().map(OriginalPersonIndex);
             process_people_iterator(
                 iter,
-                snp_major_data,
-                metadata,
+                variant_major_data,
+                reconciled_variant_indices,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
@@ -131,8 +131,8 @@ pub fn run_person_major_path(
 /// for high-performance, in-place mutation.
 fn process_people_iterator<'a, I>(
     iter: I,
-    snp_major_data: &'a [u8],
-    metadata: &[MatrixRowIndex],
+    variant_major_data: &'a [u8],
+    reconciled_variant_indices: &[ReconciledVariantIndex],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f64],
     partial_missing_counts: &'a mut [u32],
@@ -163,8 +163,8 @@ fn process_people_iterator<'a, I>(
             process_block(
                 person_indices_in_block,
                 prep_result,
-                snp_major_data,
-                metadata,
+                variant_major_data,
+                reconciled_variant_indices,
                 block_scores_out,
                 block_missing_counts_out,
                 tile_pool,
@@ -179,15 +179,15 @@ fn process_people_iterator<'a, I>(
 fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
     prep_result: &PreparationResult,
-    snp_major_data: &[u8],
-    metadata: &[MatrixRowIndex],
+    variant_major_data: &[u8],
+    reconciled_variant_indices: &[ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
 ) {
-    let snps_in_chunk = metadata.len();
-    let tile_size = person_indices_in_block.len() * snps_in_chunk;
+    let variants_in_chunk = reconciled_variant_indices.len();
+    let tile_size = person_indices_in_block.len() * variants_in_chunk;
 
     let mut tile = tile_pool.pop().unwrap_or_default();
     tile.clear();
@@ -195,7 +195,7 @@ fn process_block(
 
     // This pivot function has a single, clear responsibility.
     pivot_tile(
-        snp_major_data,
+        variant_major_data,
         person_indices_in_block,
         &mut tile,
         prep_result,
@@ -204,7 +204,7 @@ fn process_block(
     process_tile(
         &tile,
         prep_result,
-        metadata,
+        reconciled_variant_indices,
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
@@ -221,27 +221,27 @@ fn process_block(
 fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
-    metadata: &[MatrixRowIndex],
+    reconciled_variant_indices: &[ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
 ) {
-    let snps_in_chunk = metadata.len();
+    let variants_in_chunk = reconciled_variant_indices.len();
     let num_scores = prep_result.score_names.len();
-    let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
+    let num_people_in_block = if variants_in_chunk > 0 { tile.len() / variants_in_chunk } else { 0 };
     if num_people_in_block == 0 {
         return;
     }
-    let stride = prep_result.stride();
+    let padded_score_count = prep_result.padded_score_count();
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
 
     // --- Part 1: Pre-calculate the chunk-wide baseline for flipped variants (SIMD OPTIMIZED) ---
     // This baseline represents the score every person would get if they were
     // homozygous-reference for all flipped variants in this chunk. This is a hot
     // loop and is optimized to be branch-free using SIMD masking.
-    let mut chunk_baseline = vec![0.0f64; stride]; // Use f64 for high-precision baseline.
-    let weights_matrix = prep_result.weights_matrix();
-    let flip_mask_matrix = prep_result.flip_mask_matrix();
+    let mut chunk_baseline = vec![0.0f64; padded_score_count]; // Use f64 for high-precision baseline.
+    let variant_score_weights = prep_result.variant_score_weights();
+    let variant_score_flips = prep_result.variant_score_flips();
 
     // Pre-load constants for the loop.
     let simd_lanes_f32 = std::mem::size_of::<f32x8>() / std::mem::size_of::<f32>();
@@ -249,11 +249,11 @@ fn process_tile(
     let two_f32 = f32x8::splat(2.0);
     let zeros_f32 = f32x8::splat(0.0);
 
-    for snp_idx in 0..snps_in_chunk {
-        let global_matrix_row_idx = metadata[snp_idx].0 as usize;
-        let row_offset = global_matrix_row_idx * stride;
-        let weight_row = &weights_matrix[row_offset..row_offset + stride];
-        let flip_row = &flip_mask_matrix[row_offset..row_offset + stride];
+    for snp_idx in 0..variants_in_chunk {
+        let global_matrix_row_idx = reconciled_variant_indices[snp_idx].0 as usize;
+        let row_offset = global_matrix_row_idx * padded_score_count;
+        let weight_row = &variant_score_weights[row_offset..row_offset + padded_score_count];
+        let flip_row = &variant_score_flips[row_offset..row_offset + padded_score_count];
 
         // Process full SIMD vectors
         for i in 0..num_simd_chunks {
@@ -306,9 +306,9 @@ fn process_tile(
 
 // --- Part 2: Main Processing Loop (Mini-Batching) ---
     // Iterate over the tile in small, accuracy-preserving chunks.
-    for snp_mini_batch_start in (0..snps_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
+    for snp_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =
-            (snps_in_chunk - snp_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
+            (variants_in_chunk - snp_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
         if mini_batch_size == 0 {
             continue;
         }
@@ -333,7 +333,7 @@ fn process_tile(
         missing_events.clear();
 
         for person_idx in 0..num_people_in_block {
-            let genotype_tile_row_offset = person_idx * snps_in_chunk;
+            let genotype_tile_row_offset = person_idx * variants_in_chunk;
             let mini_batch_genotype_start = genotype_tile_row_offset + snp_mini_batch_start;
             let genotype_row_for_mini_batch =
                 &tile[mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size];
@@ -374,15 +374,15 @@ fn process_tile(
          * loop. As this function is called in parallel for many dense chunks, this
          * results in high-frequency allocations.
          */
-        let mut weights_chunk = Vec::with_capacity(mini_batch_size * stride);
-        let mut flip_flags_chunk = Vec::with_capacity(mini_batch_size * stride);
+        let mut weights_chunk = Vec::with_capacity(mini_batch_size * padded_score_count);
+        let mut flip_flags_chunk = Vec::with_capacity(mini_batch_size * padded_score_count);
 
         for i in 0..mini_batch_size {
             let snp_idx_in_chunk = snp_mini_batch_start + i;
-            let matrix_row_idx = metadata[snp_idx_in_chunk].0 as usize;
-            let row_offset = matrix_row_idx * stride;
-            weights_chunk.extend_from_slice(&weights_matrix[row_offset..row_offset + stride]);
-            flip_flags_chunk.extend_from_slice(&flip_mask_matrix[row_offset..row_offset + stride]);
+            let matrix_row_idx = reconciled_variant_indices[snp_idx_in_chunk].0 as usize;
+            let row_offset = matrix_row_idx * padded_score_count;
+            weights_chunk.extend_from_slice(&variant_score_weights[row_offset..row_offset + padded_score_count]);
+            flip_flags_chunk.extend_from_slice(&variant_score_flips[row_offset..row_offset + padded_score_count]);
         }
 
         let weights = kernel::PaddedInterleavedWeights::new(&weights_chunk, mini_batch_size, num_scores)
@@ -439,14 +439,14 @@ fn process_tile(
         // --- All Deferred Missing Events in a Batch ---
         // Now that the fast-path work is done, we process the slow-path work all at once.
         for &(person_idx, snp_idx_in_chunk) in missing_events.iter() {
-            let global_matrix_row_idx = metadata[snp_idx_in_chunk].0 as usize;
+            let global_matrix_row_idx = reconciled_variant_indices[snp_idx_in_chunk].0 as usize;
             let scores_for_this_variant =
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
-            let weight_row_offset = global_matrix_row_idx * stride;
+            let weight_row_offset = global_matrix_row_idx * padded_score_count;
             let weight_row =
-                &weights_matrix[weight_row_offset..weight_row_offset + num_scores];
+                &variant_score_weights[weight_row_offset..weight_row_offset + num_scores];
             let flip_row =
-                &flip_mask_matrix[weight_row_offset..weight_row_offset + num_scores];
+                &variant_score_flips[weight_row_offset..weight_row_offset + num_scores];
 
             let person_scores_slice = &mut block_scores_out
                 [person_idx * num_scores..(person_idx + 1) * num_scores];
@@ -473,14 +473,14 @@ fn process_tile(
 #[inline]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
 fn pivot_tile(
-    snp_major_data: &[u8],
+    variant_major_data: &[u8],
     person_indices_in_block: &[OriginalPersonIndex],
     tile: &mut [EffectAlleleDosage],
     prep_result: &PreparationResult,
 ) {
     let num_people_in_block = person_indices_in_block.len();
-    let bytes_per_snp = prep_result.bytes_per_snp;
-    let snps_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
+    let bytes_per_variant = prep_result.bytes_per_variant;
+    let variants_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
 
     // Maps a desired sequential SNP index (0-7) to its physical source location within
     // the shuffled vector produced by the `transpose_8x8_u8` function. This is used
@@ -501,8 +501,8 @@ fn pivot_tile(
         let person_byte_indices = person_indices / U64xN::splat(4);
         let bit_shifts = (person_indices % U64xN::splat(4)) * U64xN::splat(2);
 
-        for snp_chunk_start in (0..snps_in_chunk).step_by(SIMD_LANES) {
-            let remaining_snps = snps_in_chunk - snp_chunk_start;
+        for snp_chunk_start in (0..variants_in_chunk).step_by(SIMD_LANES) {
+            let remaining_snps = variants_in_chunk - snp_chunk_start;
             let current_snps = remaining_snps.min(SIMD_LANES);
 
             // --- 1. Decode a block of up to 8 SNPs using SIMD ---
@@ -511,11 +511,11 @@ fn pivot_tile(
                 let variant_idx_in_batch = snp_chunk_start + i;
 
                 // The offset is simply its index in the batch multiplied by the bytes per SNP.
-                let snp_byte_offset = variant_idx_in_batch as u64 * bytes_per_snp;
+                let snp_byte_offset = variant_idx_in_batch as u64 * bytes_per_variant;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
 
                 let packed_vals =
-                    U8xN::gather_or_default(snp_major_data, source_byte_indices.cast());
+                    U8xN::gather_or_default(variant_major_data, source_byte_indices.cast());
                 let two_bit_genotypes = (packed_vals >> bit_shifts.cast()) & U8xN::splat(0b11);
 
                 let one = U8xN::splat(1);
@@ -533,7 +533,7 @@ fn pivot_tile(
             // --- 3. Write data to the tile, handling full and partial chunks correctly ---
             for i in 0..current_lanes {
                 let person_idx_in_block = person_chunk_start + i;
-                let dest_offset = person_idx_in_block * snps_in_chunk + snp_chunk_start;
+                let dest_offset = person_idx_in_block * variants_in_chunk + snp_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
 
                         // OPTIMIZATION: Assemble the final row on the stack, then do a single bulk copy.
@@ -605,8 +605,8 @@ const SNP_DENSITY_THRESHOLD: f32 = 0.05;
 /// This is the "brain" of the adaptive engine. It uses a fast, hardware-accelerated
 /// heuristic to decide if a variant's data is sparse or dense.
 #[inline]
-pub fn assess_path(snp_data: &[u8], total_people: usize) -> ComputePath {
-    let non_ref_allele_freq = assess_snp_density(snp_data, total_people);
+pub fn assess_path(variant_data: &[u8], total_people: usize) -> ComputePath {
+    let non_ref_allele_freq = assess_variant_density(variant_data, total_people);
 
     if non_ref_allele_freq > SNP_DENSITY_THRESHOLD {
         ComputePath::PersonMajor
@@ -622,7 +622,7 @@ pub fn assess_path(snp_data: &[u8], total_people: usize) -> ComputePath {
 /// `u64` chunks, it minimizes loop iterations and lets the hardware do the heavy
 // lifting of counting set bits, which is a strong proxy for data density.
 #[inline]
-fn assess_snp_density(snp_data: &[u8], total_people: usize) -> f32 {
+fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
     if total_people == 0 {
         return 0.0;
     }
@@ -631,7 +631,7 @@ fn assess_snp_density(snp_data: &[u8], total_people: usize) -> f32 {
     let mut set_bits: u32 = 0;
 
     // Process full 8-byte chunks using `chunks_exact` for safety and performance.
-    let chunks = snp_data.chunks_exact(CHUNK_SIZE);
+    let chunks = variant_data.chunks_exact(CHUNK_SIZE);
     let remainder = chunks.remainder();
     for chunk in chunks {
         // This conversion is safe because chunks_exact guarantees the slice length is CHUNK_SIZE.
@@ -656,25 +656,25 @@ fn assess_snp_density(snp_data: &[u8], total_people: usize) -> f32 {
 /// homozygous-reference genotype. It avoids the high overhead of the pivot
 /// operation by iterating through individuals and only performing work for
 /// those with non-zero dosages.
-pub fn run_snp_major_path(
-    snp_data: &[u8],
+pub fn run_variant_major_path(
+    variant_data: &[u8],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
     partial_missing_counts_out: &mut CleanCounts,
-    snp_matrix_row: MatrixRowIndex,
+    reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-    let stride = prep_result.stride();
+    let padded_score_count = prep_result.padded_score_count();
 
     // --- 1. Decode this single SNP for all people in the cohort ---
     // This is a small, temporary allocation that fits on the stack for most cohorts.
-    let dosages = decode_snp(snp_data, prep_result.total_people_in_fam);
+    let dosages = decode_variant_genotypes(variant_data, prep_result.total_people_in_fam);
 
     // --- 2. Get pointers to the relevant weight/flip data for this SNP ---
-    let weight_row_offset = snp_matrix_row.0 as usize * stride;
-    let weight_row = &prep_result.weights_matrix()[weight_row_offset..];
-    let flip_row = &prep_result.flip_mask_matrix()[weight_row_offset..];
-    let affected_scores = &prep_result.variant_to_scores_map[snp_matrix_row.0 as usize];
+    let weight_row_offset = reconciled_variant_index.0 as usize * padded_score_count;
+    let weight_row = &prep_result.variant_score_weights()[weight_row_offset..];
+    let flip_row = &prep_result.variant_score_flips()[weight_row_offset..];
+    let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
 
     // --- 3. First pass: Handle missingness and correct baselines ---
     // It is critical to correct the baseline score for missing individuals *before*
@@ -728,12 +728,12 @@ pub fn run_snp_major_path(
 
 /// Decodes a single SNP's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
 #[inline]
-fn decode_snp(snp_data: &[u8], num_people: usize) -> Vec<u8> {
+fn decode_variant_genotypes(variant_data: &[u8], num_people: usize) -> Vec<u8> {
     let mut dosages = Vec::with_capacity(num_people);
     for i in 0..num_people {
         let byte_index = i / 4;
         let bit_offset = (i % 4) * 2;
-        let packed_val = (snp_data[byte_index] >> bit_offset) & 0b11;
+        let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
         
         let dosage = match packed_val {
             0b00 => 0, // Homozygous for first allele

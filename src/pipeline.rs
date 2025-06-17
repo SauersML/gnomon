@@ -10,11 +10,11 @@
 // in `main.rs`.
 
 use crate::batch::{self, SparseIndexPool};
-use crate::io::SnpReader;
+use crate::io::BedReader;
 use crate::types::PreparationResult;
 use crate::types::{
-    ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, EffectAlleleDosage, MatrixRowIndex,
-    SnpDataBuffer,
+    ComputePath, DenseVariantBatch, DirtyCounts, DirtyScores, EffectAlleleDosage, ReconciledVariantIndex,
+    PackedVariantGenotypes,
 };
 use cache_size;
 use crossbeam_queue::ArrayQueue;
@@ -43,7 +43,7 @@ pub struct PipelineContext {
     // Sharable, thread-safe resource pools.
     tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
     sparse_index_pool: Arc<SparseIndexPool>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+    kernel_input_buffer_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 
     // The final destination for all computed data, accessible after the pipeline runs.
     pub all_scores: Vec<f64>,
@@ -64,9 +64,9 @@ impl PipelineContext {
         // Size the pool to avoid deadlocks. It must be at least as large as the
         // maximum number of tasks that can be running concurrently.
         const MAX_IN_FLIGHT_TASKS: usize = 32;
-        let partial_result_pool = Arc::new(ArrayQueue::new(MAX_IN_FLIGHT_TASKS));
+        let kernel_input_buffer_pool = Arc::new(ArrayQueue::new(MAX_IN_FLIGHT_TASKS));
         for _ in 0..MAX_IN_FLIGHT_TASKS {
-            partial_result_pool
+            kernel_input_buffer_pool
                 .push((
                     DirtyScores(vec![0.0f64; result_buffer_size]),
                     DirtyCounts(vec![0u32; result_buffer_size]),
@@ -78,7 +78,7 @@ impl PipelineContext {
             prep_result,
             tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2)),
             sparse_index_pool: Arc::new(SparseIndexPool::new()),
-            partial_result_pool,
+            kernel_input_buffer_pool,
             all_scores: vec![0.0f64; result_buffer_size],
             all_missing_counts: vec![0u32; result_buffer_size],
             compute_handles: Vec::with_capacity(256),
@@ -106,10 +106,10 @@ pub async fn run(
 
     // Pre-fill the pipeline with empty buffers. The I/O task will immediately
     // receive these and begin reading from the file.
-    let single_snp_buffer_size = context.prep_result.bytes_per_snp as usize;
+    let single_variant_buffer_size = context.prep_result.bytes_per_variant as usize;
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
-            .send(IoCommand::Read(vec![0u8; single_snp_buffer_size]))
+            .send(IoCommand::Read(vec![0u8; single_variant_buffer_size]))
             .await?;
     }
 
@@ -163,13 +163,13 @@ enum IoCommand {
 fn spawn_io_producer_task(
     prep_result: Arc<PreparationResult>,
     plink_prefix: PathBuf,
-    full_buffer_tx: mpsc::Sender<SnpDataBuffer>,
+    full_buffer_tx: mpsc::Sender<PackedVariantGenotypes>,
     mut empty_buffer_rx: mpsc::Receiver<IoCommand>,
 ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
     tokio::spawn(async move {
         // --- One-time setup within the spawned task ---
         let bed_path = plink_prefix.with_extension("bed");
-        let mut reader = match SnpReader::new(
+        let mut reader = match BedReader::new(
             &bed_path,
             prep_result.bytes_per_snp,
             prep_result.total_snps_in_bim,
@@ -193,8 +193,8 @@ fn spawn_io_producer_task(
             // to avoid stalling the async runtime.
             let (new_reader, filled_buffer_opt) =
                 match task::spawn_blocking(move || {
-                    let snp_data_opt = reader.read_next_snp(&mut buffer_to_fill)?;
-                    Ok::<_, io::Error>((reader, snp_data_opt))
+                    let variant_data_opt = reader.read_next_variant(&mut buffer_to_fill)?;
+                    Ok::<_, io::Error>((reader, variant_data_opt))
                 })
                 .await
                 {
@@ -216,7 +216,7 @@ fn spawn_io_producer_task(
                 if is_relevant {
                     // This SNP is needed. Send it to the orchestrator for processing.
                     required_indices_cursor += 1;
-                    if full_buffer_tx.send(SnpDataBuffer(filled_buffer)).await.is_err() {
+                    if full_buffer_tx.send(PackedVariantGenotypes(filled_buffer)).await.is_err() {
                         // The orchestrator has hung up (channel closed). Shut down.
                         break 'producer;
                         
@@ -240,25 +240,25 @@ fn spawn_io_producer_task(
 /// The core orchestration loop that receives and dispatches SNPs.
 async fn run_orchestration_loop(
     context: &mut PipelineContext,
-    full_buffer_rx: &mut mpsc::Receiver<SnpDataBuffer>,
+    full_buffer_rx: &mut mpsc::Receiver<PackedVariantGenotypes>,
     empty_buffer_tx: &mpsc::Sender<IoCommand>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut required_indices_cursor: usize = 0;
-    let dense_batch_capacity = calculate_dense_batch_capacity(context.prep_result.bytes_per_snp);
-    let mut dense_batch = DenseSnpBatch::new_empty(dense_batch_capacity);
+    let dense_batch_capacity = calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
+    let mut dense_batch = DenseVariantBatch::new_empty(dense_batch_capacity);
 
     // This is the main loop of the application's concurrent phase.
-    'orchestrator: while let Some(snp_buffer) = full_buffer_rx.recv().await {
+    'orchestrator: while let Some(packed_genotypes) = full_buffer_rx.recv().await {
         // The orchestrator receives a buffer only for SNPs that are required. Since the
         // I/O producer reads them in the sorted order defined by `required_bim_indices`,
         // the `required_indices_cursor` directly corresponds to the row index in the
         // dense compute matrices.
-        let matrix_row_index = MatrixRowIndex(required_indices_cursor as u32);
+        let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
         required_indices_cursor += 1;
 
         // The "brain" of the adaptive engine: make the dispatch decision.
         let path_decision =
-            batch::assess_path(&snp_buffer.0, context.prep_result.total_people_in_fam);
+            batch::assess_path(&packed_genotypes.0, context.prep_result.total_people_in_fam);
 
         match path_decision {
             ComputePath::SnpMajor => {
@@ -267,23 +267,23 @@ async fn run_orchestration_loop(
                 dispatch_and_clear_dense_batch(&mut dense_batch, context);
 
                 // Now, dispatch the sparse SNP for immediate computation.
-                let handle = dispatch_snp_major_path(
-                    snp_buffer,
-                    matrix_row_index,
+                let handle = dispatch_variant_major_path(
+                    packed_genotypes,
+                    reconciled_variant_index,
                     context.prep_result.clone(),
-                    context.partial_result_pool.clone(),
+                    context.kernel_input_buffer_pool.clone(),
                 );
                 context.compute_handles.push(handle);
             }
             ComputePath::PersonMajor => {
                 // Add the dense SNP's data and metadata to the current batch.
-                dense_batch.data.extend_from_slice(&snp_buffer.0);
-                dense_batch.metadata.push(matrix_row_index);
+                dense_batch.data.extend_from_slice(&packed_genotypes.0);
+                dense_batch.reconciled_variant_indices.push(reconciled_variant_index);
 
                 // Immediately recycle the now-empty buffer by sending a `Read`
                 // command back to the I/O producer.
                 if empty_buffer_tx
-                    .send(IoCommand::Read(snp_buffer.0))
+                    .send(IoCommand::Read(packed_genotypes.0))
                     .await
                     .is_err()
                 {
@@ -342,7 +342,7 @@ async fn aggregate_results(
 
                 // 2. Return the large partial result buffers to the shared pool for reuse.
                 context
-                    .partial_result_pool
+                    .kernel_input_buffer_pool
                     .push((result.scores, result.counts))
                     .unwrap();
 
@@ -365,17 +365,17 @@ async fn aggregate_results(
 
 /// Dispatches a dense batch and adds its handle to the context.
 fn dispatch_and_clear_dense_batch(
-    dense_batch: &mut DenseSnpBatch,
+    dense_batch: &mut DenseVariantBatch,
     context: &mut PipelineContext,
 ) {
-    if dense_batch.metadata.is_empty() {
+    if dense_batch.reconciled_variant_indices.is_empty() {
         return;
     }
 
     // Take ownership of the batch and reset the original via a highly efficient swap.
     let batch_to_process = std::mem::replace(
         dense_batch,
-        DenseSnpBatch::new_empty(dense_batch.data.capacity()),
+        DenseVariantBatch::new_empty(dense_batch.data.capacity()),
     );
 
     // We clone the Arcs from the context, which is a cheap reference count bump.
@@ -384,7 +384,7 @@ fn dispatch_and_clear_dense_batch(
         context.prep_result.clone(),
         context.tile_pool.clone(),
         context.sparse_index_pool.clone(),
-        context.partial_result_pool.clone(),
+        context.kernel_input_buffer_pool.clone(),
     );
 
     context.compute_handles.push(handle);
@@ -392,15 +392,15 @@ fn dispatch_and_clear_dense_batch(
 
 /// Spawns a blocking task for the person-major path.
 fn dispatch_person_major_batch(
-    batch_to_process: DenseSnpBatch,
+    batch_to_process: DenseVariantBatch,
     prep_result: Arc<PreparationResult>,
     tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
     sparse_index_pool: Arc<SparseIndexPool>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+    kernel_input_buffer_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 ) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
     task::spawn_blocking(move || {
         // Acquire a set of partial result buffers from the pool.
-        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+        let (dirty_scores, dirty_counts) = kernel_input_buffer_pool.pop().unwrap();
 
         // Transition the buffers to the "Clean" state, zeroing them.
         let mut clean_scores = dirty_scores.into_clean();
@@ -409,7 +409,7 @@ fn dispatch_person_major_batch(
         // Dispatch to the synchronous, CPU-bound compute function.
         batch::run_person_major_path(
             &batch_to_process.data,
-            &batch_to_process.metadata,
+            &batch_to_process.reconciled_variant_indices,
             &prep_result,
             &mut clean_scores,
             &mut clean_counts,
@@ -430,30 +430,30 @@ fn dispatch_person_major_batch(
 }
 
 /// Spawns a blocking task for the SNP-major path.
-fn dispatch_snp_major_path(
-    snp_buffer: SnpDataBuffer,
-    matrix_row_index: MatrixRowIndex,
+fn dispatch_variant_major_path(
+    packed_genotypes: PackedVariantGenotypes,
+    reconciled_variant_index: ReconciledVariantIndex,
     prep_result: Arc<PreparationResult>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+    kernel_input_buffer_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 ) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
     task::spawn_blocking(move || {
-        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+        let (dirty_scores, dirty_counts) = kernel_input_buffer_pool.pop().unwrap();
         let mut clean_scores = dirty_scores.into_clean();
         let mut clean_counts = dirty_counts.into_clean();
 
-        batch::run_snp_major_path(
-            &snp_buffer.0,
+        batch::run_variant_major_path(
+            &packed_genotypes.0,
             &prep_result,
             &mut clean_scores,
             &mut clean_counts,
-            matrix_row_index,
+            reconciled_variant_index,
         )?;
 
         // The small I/O buffer is passed back for recycling.
         let result = ComputeTaskResult {
             scores: clean_scores.into_dirty(),
             counts: clean_counts.into_dirty(),
-            recycled_buffer: Some(snp_buffer.0),
+            recycled_buffer: Some(packed_genotypes.0),
         };
         Ok(result)
     })
@@ -463,13 +463,13 @@ fn dispatch_snp_major_path(
 ///
 /// This heuristic aims to size the pivoted tile to fit comfortably in L3 cache, which
 /// is critical for the performance of the pivot operation.
-fn calculate_dense_batch_capacity(bytes_per_snp: u64) -> usize {
+fn calculate_dense_batch_capacity(bytes_per_variant: u64) -> usize {
     const PERSON_BLOCK_SIZE: u64 = 4096; // Must match batch.rs
     const MIN_DENSE_BATCH_SIZE: usize = 1 * 1024 * 1024; // 1MB
     const MAX_DENSE_BATCH_SIZE: usize = 256 * 1024 * 1024; // 256MB
 
     let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or(32 * 1024 * 1024);
-    let max_snps_for_l3 = (l3_cache_bytes as u64) / PERSON_BLOCK_SIZE;
+    let max_variants_for_l3 = (l3_cache_bytes as u64) / PERSON_BLOCK_SIZE;
 
-    ((max_snps_for_l3 * bytes_per_snp) as usize).clamp(MIN_DENSE_BATCH_SIZE, MAX_DENSE_BATCH_SIZE)
+    ((max_variants_for_l3 * bytes_per_variant) as usize).clamp(MIN_DENSE_BATCH_SIZE, MAX_DENSE_BATCH_SIZE)
 }
