@@ -131,10 +131,9 @@ pub struct SnpDataBuffer(pub Vec<u8>);
 pub struct DenseSnpBatch {
     /// A contiguous buffer of SNP-major data.
     pub data: Vec<u8>,
-    /// The matrix row index of the first SNP in this batch.
-    pub start_matrix_row: MatrixRowIndex,
-    /// The total number of SNPs in this batch.
-    pub snp_count: usize,
+    /// The matrix row indices for each corresponding SNP in the `data` buffer.
+    /// This metadata is critical for looking up weights and flip flags.
+    pub metadata: Vec<MatrixRowIndex>,
 }
 
 impl DenseSnpBatch {
@@ -142,8 +141,9 @@ impl DenseSnpBatch {
     pub fn new_empty(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
-            start_matrix_row: MatrixRowIndex(0), // Dummy value, to be set on first push.
-            snp_count: 0,
+            // The metadata vector starts empty. Its length will always track
+            // the number of SNPs in the batch.
+            metadata: Vec::new(),
         }
     }
 }
