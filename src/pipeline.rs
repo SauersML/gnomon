@@ -302,6 +302,7 @@ async fn run_orchestration_loop(
                                 weights,
                                 flips,
                                 variant_count: 1,
+                                reconciled_variant_indices: vec![reconciled_variant_index],
                             })
                         }
                         DenseVariantBatch::Buffering(mut batch_data) => {
@@ -310,6 +311,7 @@ async fn run_orchestration_loop(
                             let (weights, flips) = &context.prep_result.variant_data[reconciled_variant_index.0 as usize];
                             batch_data.weights.extend_from_slice(weights);
                             batch_data.flips.extend_from_slice(flips);
+                            batch_data.reconciled_variant_indices.push(reconciled_variant_index);
                             batch_data.variant_count += 1;
                             DenseVariantBatch::Buffering(batch_data)
                         }
