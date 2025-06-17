@@ -69,7 +69,6 @@ pub fn run_person_major_path(
     variant_major_data: &[u8],
     weights: &[f32],
     flips: &[u8],
-    variant_count: usize,
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
@@ -102,7 +101,7 @@ pub fn run_person_major_path(
                 variant_major_data,
                 weights,
                 flips,
-                reconciled_variant_indices,
+                reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
@@ -117,7 +116,7 @@ pub fn run_person_major_path(
                 variant_major_data,
                 weights,
                 flips,
-                reconciled_variant_indices,
+                reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
@@ -141,7 +140,6 @@ fn process_people_iterator<'a, I>(
     variant_major_data: &'a [u8],
     weights: &'a [f32],
     flips: &'a [u8],
-    variant_count: usize,
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f64],
@@ -176,7 +174,7 @@ fn process_people_iterator<'a, I>(
                 variant_major_data,
                 weights,
                 flips,
-                reconciled_variant_indices,
+                reconciled_variant_indices_for_batch,
                 block_scores_out,
                 block_missing_counts_out,
                 tile_pool,
@@ -188,19 +186,19 @@ fn process_people_iterator<'a, I>(
 /// Processes a single block of individuals.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
-fn process_block(
-    person_indices_in_block: &[OriginalPersonIndex],
-    prep_result: &PreparationResult,
-    variant_major_data: &[u8],
-    weights: &[f32],
-    flips: &[u8],
-    reconciled_variant_indices: &[ReconciledVariantIndex],
+fn process_block<'a>(
+    person_indices_in_block: &'a [OriginalPersonIndex],
+    prep_result: &'a PreparationResult,
+    variant_major_data: &'a [u8],
+    weights: &'a [f32],
+    flips: &'a [u8],
+    reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
-    tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-    sparse_index_pool: &SparseIndexPool,
+    tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
+    sparse_index_pool: &'a SparseIndexPool,
 ) {
-    let variants_in_chunk = reconciled_variant_indices.len();
+    let variants_in_chunk = reconciled_variant_indices_for_batch.len();
     let tile_size = person_indices_in_block.len() * variants_in_chunk;
 
     let mut tile = tile_pool.pop().unwrap_or_default();
@@ -220,7 +218,7 @@ fn process_block(
         prep_result,
         weights,
         flips,
-        reconciled_variant_indices,
+        reconciled_variant_indices_for_batch,
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
@@ -234,15 +232,15 @@ fn process_block(
 /// calculating a baseline score and pre-computing sparse indices.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
-fn process_tile(
-    tile: &[EffectAlleleDosage],
-    prep_result: &PreparationResult,
-    weights_for_batch: &[f32],
-    flips_for_batch: &[u8],
-    reconciled_variant_indices: &[ReconciledVariantIndex],
+fn process_tile<'a>(
+    tile: &'a [EffectAlleleDosage],
+    prep_result: &'a PreparationResult,
+    weights_for_batch: &'a [f32],
+    flips_for_batch: &'a [u8],
+    reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
-    sparse_index_pool: &SparseIndexPool,
+    sparse_index_pool: &'a SparseIndexPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices.len();
     let num_scores = prep_result.score_names.len();
@@ -420,13 +418,13 @@ fn process_tile(
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(¤t_scores_low.to_array());
+                        scores_slice_low.copy_from_slice(&current_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
                         let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
                         current_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(¤t_scores_high.to_array());
+                        scores_slice_high.copy_from_slice(&current_scores_high.to_array());
                     } else {
                         let start = scores_offset;
                         let end = num_scores;
