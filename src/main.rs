@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // The pipeline now passes single-SNP data buffers between the I/O producer and
     // the main consumer/orchestrator thread.
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpDataBuffer>(PIPELINE_DEPTH);
-    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<(Vec<u8>, bool)>(PIPELINE_DEPTH);
+    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<IoCommand>(PIPELINE_DEPTH);
 
     eprintln!(
         "> Resource allocation complete in {:.2?}. Dense batch target: {} MB. Pipeline depth: {}",
