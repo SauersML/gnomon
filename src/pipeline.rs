@@ -61,7 +61,6 @@ impl PipelineContext {
     pub fn new(prep_result: Arc<PreparationResult>) -> Self {
         let num_scores = prep_result.score_names.len();
         let result_buffer_size = prep_result.num_people_to_score * num_scores;
-
         let partial_result_pool = Arc::new(ArrayQueue::new(MAX_IN_FLIGHT_TASKS));
         for _ in 0..MAX_IN_FLIGHT_TASKS {
             partial_result_pool
