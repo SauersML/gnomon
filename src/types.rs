@@ -154,6 +154,16 @@ pub enum DenseVariantBatch {
     Buffering(DenseVariantBatchData),
 }
 
+impl DenseVariantBatch {
+    /// Consumes the batch and returns the inner data if it was buffering,
+    /// otherwise panics. This is used when a batch is known to be full.
+    pub fn into_data(self) -> DenseVariantBatchData {
+        match self {
+            DenseVariantBatch::Buffering(data) => data,
+            DenseVariantBatch::Empty => panic!("called `into_data()` on an `Empty` DenseVariantBatch"),
+        }
+    }
+}
 /// Represents the dispatcher's decision for which compute path to use for a
 /// given unit of work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
