@@ -36,7 +36,7 @@ pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
 
     // Check if the header matches the expected native format.
     let header = line.trim();
-    if header.starts_with("snp_id	effect_allele	other_allele	") {
+    if header.starts_with("variant_id	effect_allele	other_allele	") {
         Ok(true)
     } else {
         Ok(false)
@@ -117,7 +117,7 @@ pub fn reformat_pgs_file(input_path: &Path) -> Result<PathBuf, ReformatError> {
     // Phase 3: Open writer and emit native header
     let out_file = File::create(&output_path)?;
     let mut writer = BufWriter::with_capacity(1 << 20, out_file);
-    writeln!(writer, "snp_id\teffect_allele\tother_allele\t{}", score_label)?;
+    writeln!(writer, "variant_id\teffect_allele\tother_allele\t{}", score_label)?;
 
     // Phase 4: Process first data line (header_line is not data)
     // Skip header_line itself
