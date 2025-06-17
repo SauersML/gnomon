@@ -26,6 +26,7 @@ num_cpus = "1.17.0"
 cache-size = "0.7.0"
 ryu = "1.0.20"
 nonmax = "0.5.5"
+futures = "0.3.31"
 
 [profile.release]
 opt-level = 3
