@@ -121,8 +121,8 @@ impl DerefMut for CleanCounts {
 //                            High-Level Data Contracts
 // ========================================================================================
 
-/// A buffer containing the raw, un-decoded genotype data for a single SNP,
-/// matching the PLINK .bed file's SNP-major layout.
+/// A buffer containing the raw, un-decoded genotype data for a single variant,
+/// matching the PLINK .bed file's variant-major layout.
 #[repr(transparent)]
 #[derive(Debug)]
 pub struct PackedVariantGenotypes(pub Vec<u8>);
@@ -196,7 +196,7 @@ pub struct PreparationResult {
     pub required_bim_indices: Vec<BimRowIndex>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
-    /// Essential for O(1) lookups in the SNP-major path.
+    /// Essential for O(1) lookups in the variant-major path.
     pub person_fam_to_output_idx: Vec<Option<u32>>,
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
@@ -221,7 +221,7 @@ pub struct PreparationResult {
     /// The number of variants successfully reconciled and included in the matrices.
     /// This corresponds to the number of rows in the compiled matrices.
     pub num_reconciled_variants: usize,
-    /// The number of bytes per SNP in the .bed file, calculated as CEIL(total_people_in_fam / 4).
+    /// The number of bytes per variant in the .bed file, calculated as CEIL(total_people_in_fam / 4).
     pub bytes_per_variant: u64,
 }
 
