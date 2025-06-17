@@ -365,11 +365,18 @@ fn process_tile(
         }
 
         // --- B. Create Matrix Views for the Mini-Batch ---
-        let matrix_row_offset = matrix_row_start_idx.0 as usize + snp_mini_batch_start;
-        let matrix_slice_start = matrix_row_offset * stride;
-        let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
-        let weights_chunk = &weights_matrix[matrix_slice_start..matrix_slice_end];
-        let flip_flags_chunk = &flip_mask_matrix[matrix_slice_start..matrix_slice_end];
+        // Since the SNPs in the batch may not be contiguous in the original file,
+        // we can no longer use a simple slice. Instead, we must gather the rows.
+        let mut weights_chunk = Vec::with_capacity(mini_batch_size * stride);
+        let mut flip_flags_chunk = Vec::with_capacity(mini_batch_size * stride);
+
+        for i in 0..mini_batch_size {
+            let snp_idx_in_chunk = snp_mini_batch_start + i;
+            let matrix_row_idx = metadata[snp_idx_in_chunk].0 as usize;
+            let row_offset = matrix_row_idx * stride;
+            weights_chunk.extend_from_slice(&weights_matrix[row_offset..row_offset + stride]);
+            flip_flags_chunk.extend_from_slice(&flip_mask_matrix[row_offset..row_offset + stride]);
+        }
 
         let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
             .expect("CRITICAL: Mini-batch weights matrix validation failed.");
