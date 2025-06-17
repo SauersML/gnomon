@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               THE TACTICAL PIPELINE EXECUTOR
+//                            THE TACTICAL PIPELINE EXECUTOR
 //
 // ========================================================================================
 //
@@ -45,9 +45,9 @@ pub struct PipelineContext {
     pub prep_result: Arc<PreparationResult>,
 
     // Sharable, thread-safe resource pools.
-    tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
-    sparse_index_pool: Arc<SparseIndexPool>,
-    kernel_input_buffer_pool: Arc<KernelInputBufferPool>,
+    pub tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
+    pub sparse_index_pool: Arc<SparseIndexPool>,
+    pub kernel_input_buffer_pool: Arc<KernelInputBufferPool>,
     pub partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 
     // The final destination for all computed data, accessible after the pipeline runs.
@@ -235,114 +235,68 @@ async fn run_orchestration_loop(
     let dense_batch_capacity =
         calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
     let mut dense_batch = DenseVariantBatch::Empty;
-
-    // The semaphore gates access to the compute task pool. Its number of permits
-    // must equal the number of available resource sets (`partial_result_pool`).
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_TASKS));
-
-    // This stream will manage all in-flight JoinHandles, allowing us to poll
-    // for the next completed task in any order.
     let mut in_flight_tasks = FuturesUnordered::new();
 
     loop {
         tokio::select! {
-            // Branch 1: A completed compute task has returned a result.
-            // `biased` ensures we prefer to reap completed tasks to free up resources
-            // before trying to spawn new ones.
             biased;
             Some(task_result) = in_flight_tasks.next() => {
-                // A task finished. Release its semaphore permit immediately so a new
-                // task can be spawned.
                 semaphore.add_permits(1);
-
                 match task_result? {
                     Ok((scores, counts)) => {
-                        // Aggregate the results into the master buffers.
-                        for (master, &partial) in context.all_scores.iter_mut().zip(&scores) {
-                            *master += partial;
-                        }
-                        for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) {
-                            *master += partial;
-                        }
-                        // Return the large partial result buffers to the shared pool for reuse.
+                        for (master, &partial) in context.all_scores.iter_mut().zip(&scores) { *master += partial; }
+                        for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) { *master += partial; }
                         context.partial_result_pool.push((scores, counts)).unwrap();
                     }
                     Err(e) => return Err(e),
                 }
             },
 
-            // Branch 2: New data has arrived from the I/O producer.
             maybe_buffer = full_buffer_rx.recv() => {
-                let Some(filled_buffer) = maybe_buffer else {
-                    // The I/O producer has finished and the channel is closed.
-                    // No more new data will arrive. Break the loop.
-                    break;
-                };
-
-                // Before we can spawn a task, we MUST acquire a permit.
-                // If the semaphore is at its limit (MAX_IN_FLIGHT_TASKS), this
-                // will asynchronously wait, providing backpressure.
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let Some(filled_buffer) = maybe_buffer else { break; };
 
                 let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
                 required_indices_cursor += 1;
 
-                let path_decision =
-                    batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
+                let path_decision = batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
 
-                let work_parcel = match path_decision {
-                    ComputePath::VariantMajor => {
-                        if let DenseVariantBatch::Buffering(data) = dense_batch {
-                            let parcel = WorkParcel::Dense(data);
-                            let handle = dispatch_work(parcel, context, permit);
-                            in_flight_tasks.push(handle);
-                            // We used one permit for the dense batch, now we need another.
-                            let new_permit = semaphore.clone().acquire_owned().await.unwrap();
-                            let sparse_parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
-                            let sparse_handle = dispatch_work(sparse_parcel, context, new_permit);
-                            in_flight_tasks.push(sparse_handle);
-                        } else {
-                            let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
-                            let handle = dispatch_work(parcel, context, permit);
-                            in_flight_tasks.push(handle);
-                        }
-                        dense_batch = DenseVariantBatch::Empty;
-                    },
-                    ComputePath::PersonMajor => {
-                        dense_batch = match dense_batch {
-                            DenseVariantBatch::Empty => {
-                                let mut data = Vec::with_capacity(dense_batch_capacity);
-                                data.extend_from_slice(&filled_buffer);
-                                DenseVariantBatch::Buffering(DenseVariantBatchData {
-                                    data,
-                                    reconciled_variant_indices: vec![reconciled_variant_index],
-                                })
-                            }
-                            DenseVariantBatch::Buffering(mut batch_data) => {
-                                batch_data.data.extend_from_slice(&filled_buffer);
-                                batch_data.reconciled_variant_indices.push(reconciled_variant_index);
-                                DenseVariantBatch::Buffering(batch_data)
-                            }
-                        };
-                        // Give the permit back since we are just buffering and not dispatching yet.
-                        drop(permit);
-                    }
-                };
-
-                // Symmetrical I/O Buffer Management: The I/O buffer is always returned.
-                if empty_buffer_tx.send(filled_buffer).await.is_err() {
-                    break;
-                }
-
-                // If a dense batch is now full, dispatch it.
-                if let DenseVariantBatch::Buffering(data) = &dense_batch {
-                    if data.data.len() >= dense_batch_capacity {
+                if let ComputePath::VariantMajor = path_decision {
+                    if let DenseVariantBatch::Buffering(data) = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty) {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        let parcel = WorkParcel::Dense(std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty).into_data());
-                        let handle = dispatch_work(parcel, context, permit);
+                        let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
                         in_flight_tasks.push(handle);
                     }
+
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
+                    let handle = dispatch_work(parcel, context, permit);
+                    in_flight_tasks.push(handle);
+                } else { // PersonMajor
+                    dense_batch = match dense_batch {
+                        DenseVariantBatch::Empty => {
+                            let mut data = Vec::with_capacity(dense_batch_capacity);
+                            data.extend_from_slice(&filled_buffer);
+                            DenseVariantBatch::Buffering(DenseVariantBatchData { data, reconciled_variant_indices: vec![reconciled_variant_index] })
+                        }
+                        DenseVariantBatch::Buffering(mut batch_data) => {
+                            batch_data.data.extend_from_slice(&filled_buffer);
+                            batch_data.reconciled_variant_indices.push(reconciled_variant_index);
+                            DenseVariantBatch::Buffering(batch_data)
+                        }
+                    };
+
+                    if let DenseVariantBatch::Buffering(data) = &dense_batch {
+                        if data.data.len() >= dense_batch_capacity {
+                           let permit = semaphore.clone().acquire_owned().await.unwrap();
+                           let parcel = WorkParcel::Dense(std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty).into_data());
+                           let handle = dispatch_work(parcel, context, permit);
+                           in_flight_tasks.push(handle);
+                        }
+                    }
                 }
+
+                if empty_buffer_tx.send(filled_buffer).await.is_err() { break; }
 
                 if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
                     eprintln!( "> Processed {}/{} relevant variants...", required_indices_cursor, context.prep_result.num_reconciled_variants);
@@ -351,29 +305,18 @@ async fn run_orchestration_loop(
         }
     }
 
-    // After the I/O producer is done, flush any remaining dense batch.
     if let DenseVariantBatch::Buffering(data) = dense_batch {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let parcel = WorkParcel::Dense(data);
-        let handle = dispatch_work(parcel, context, permit);
+        let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
         in_flight_tasks.push(handle);
     }
 
-    // Wait for all remaining in-flight tasks to complete.
     while let Some(task_result) = in_flight_tasks.next().await {
         match task_result? {
             Ok((scores, counts)) => {
-                for (master, &partial) in context.all_scores.iter_mut().zip(&scores) {
-                    *master += partial;
-                }
-                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts)
-                {
-                    *master += partial;
-                }
-                context
-                    .partial_result_pool
-                    .push((scores, counts))
-                    .unwrap();
+                for (master, &partial) in context.all_scores.iter_mut().zip(&scores) { *master += partial; }
+                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) { *master += partial; }
+                context.partial_result_pool.push((scores, counts)).unwrap();
             }
             Err(e) => return Err(e),
         }
