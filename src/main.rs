@@ -284,6 +284,102 @@ async fn run_pipeline(
     Ok(())
 }
 
+/// **Helper:** Spawns the I/O producer task in the background.
+///
+/// This function is the "factory" for the I/O producer thread. It's responsible for:
+/// 1. Creating the `SnpReader` to access the `.bed` file.
+/// 2. Spawning a new asynchronous `tokio` task.
+/// 3. Moving all necessary state (channel ends, config) into the task.
+/// 4. Returning a `JoinHandle` to the calling function, allowing it to await the
+///    I/O task's completion and handle any errors.
+///
+/// The spawned task's core logic is a loop that:
+/// - Awaits a command from the orchestrator via the `empty_buffer_rx` channel.
+/// - Upon receiving a `Read` command with an empty buffer, it uses `spawn_blocking`
+///   to perform a synchronous file read without blocking the `tokio` runtime.
+/// - It filters the read SNP, sending only relevant data to the orchestrator via
+///   the `full_buffer_tx` channel. Irrelevant SNP buffers are simply dropped,
+///   and the task waits for a new `Read` command to replenish the pipeline.
+/// - Upon receiving a `Shutdown` command, it terminates gracefully.
+fn spawn_io_producer_task(
+    prep_result: Arc<prepare::PreparationResult>,
+    plink_prefix: PathBuf,
+    full_buffer_tx: mpsc::Sender<SnpDataBuffer>,
+    mut empty_buffer_rx: mpsc::Receiver<IoCommand>,
+) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
+    tokio::spawn(async move {
+        // --- One-time setup within the spawned task ---
+        let bed_path = plink_prefix.with_extension("bed");
+        let mut reader = match SnpReader::new(
+            &bed_path,
+            prep_result.bytes_per_snp,
+            prep_result.total_snps_in_bim,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+        };
+
+        let mut bed_row_cursor: u32 = 0;
+        let mut required_indices_cursor: usize = 0;
+
+        // --- Main I/O Producer Loop ---
+        // This loop is driven by the orchestrator, which sends commands.
+        'producer: while let Some(command) = empty_buffer_rx.recv().await {
+            let mut buffer_to_fill = match command {
+                IoCommand::Read(buffer) => buffer,
+                IoCommand::Shutdown => break 'producer,
+            };
+
+            // Perform the synchronous, potentially blocking file I/O in a dedicated thread
+            // to avoid stalling the async runtime.
+            let (new_reader, filled_buffer_opt) =
+                match task::spawn_blocking(move || {
+                    let snp_data_opt = reader.read_next_snp(&mut buffer_to_fill)?;
+                    // The filled buffer is returned inside the Option, while the original
+                    // buffer's (now empty) allocation is returned outside.
+                    Ok::<_, io::Error>((reader, snp_data_opt))
+                })
+                .await
+                {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(e)) => return Err(Box::new(e)), // I/O error from within spawn_blocking
+                    Err(e) => return Err(Box::new(e)), // JoinError (e.g., task panicked)
+                };
+            
+            // The reader state is updated after the blocking operation completes.
+            reader = new_reader;
+
+            if let Some(filled_buffer) = filled_buffer_opt {
+                // Check if the SNP we just read is one we actually need for the calculation.
+                let is_relevant = prep_result
+                    .required_bim_indices
+                    .get(required_indices_cursor)
+                    .map_or(false, |&req_idx| req_idx.0 == bed_row_cursor);
+
+                if is_relevant {
+                    // This SNP is needed. Send it to the orchestrator for processing.
+                    required_indices_cursor += 1;
+                    if full_buffer_tx.send(SnpDataBuffer(filled_buffer)).await.is_err() {
+                        // The orchestrator has hung up (channel closed). Shut down.
+                        break 'producer;
+                    }
+                } else {
+                    // This SNP is not relevant. The buffer and its data are simply
+                    // dropped. The orchestrator is responsible for sending a new
+                    // `IoCommand::Read` to keep the pipeline full. This creates a
+                    // robust, single-direction flow for buffer management.
+                    drop(filled_buffer);
+                }
+                bed_row_cursor += 1;
+            } else {
+                // `read_next_snp` returned `None`, indicating End-Of-File.
+                break 'producer';
+            }
+        }
+        Ok(())
+    })
+}
+
 
 /// **Helper:** Handles the final file writing.
 ///
