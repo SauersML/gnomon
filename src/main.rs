@@ -380,6 +380,113 @@ fn spawn_io_producer_task(
     })
 }
 
+/// **Helper:** The core orchestration loop that receives and dispatches SNPs.
+///
+/// This function is the "Consumer-Dispatcher" of the pipeline. It runs in a loop,
+/// receiving single, relevant SNPs from the I/O producer. For each SNP, it performs
+/// the following actions:
+///
+/// 1.  Calls `batch::assess_path` to make a fast, data-driven decision on whether
+///     the SNP is "dense" or "sparse".
+/// 2.  **If Sparse:** It first dispatches any pending batch of dense SNPs to preserve
+///     order, then immediately dispatches the sparse SNP for computation. The compute
+///     task's `JoinHandle` is added to the context.
+/// 3.  **If Dense:** It appends the SNP's data to a growing `DenseSnpBatch`. The SNP's
+///     small buffer is immediately recycled. If the batch reaches its target capacity,
+///     it is dispatched for computation and its `JoinHandle` is added to the context.
+///
+/// This function never `await`s a compute task, ensuring the orchestration loop
+/// is never blocked and can continuously process the incoming stream of SNPs to
+/// maximize pipeline throughput.
+async fn run_orchestration_loop(
+    context: &mut PipelineContext,
+    full_buffer_rx: &mut mpsc::Receiver<SnpDataBuffer>,
+    empty_buffer_tx: &mpsc::Sender<IoCommand>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut required_indices_cursor: usize = 0;
+
+    // --- Determine a Target Batch Size for the Person-Major Path ---
+    // This is calculated once, based on L3 cache size, to optimize the pivot operation.
+    let dense_batch_capacity = {
+        const PERSON_BLOCK_SIZE: u64 = 4096; // Must match batch.rs
+        const MIN_DENSE_BATCH_SIZE: usize = 1 * 1024 * 1024; // 1MB
+        const MAX_DENSE_BATCH_SIZE: usize = 256 * 1024 * 1024; // 256MB
+
+        let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or(32 * 1024 * 1024);
+        let bytes_per_snp = context.prep_result.bytes_per_snp;
+        let max_snps_for_l3 = (l3_cache_bytes as u64) / PERSON_BLOCK_SIZE;
+        ((max_snps_for_l3 * bytes_per_snp) as usize)
+            .clamp(MIN_DENSE_BATCH_SIZE, MAX_DENSE_BATCH_SIZE)
+    };
+    let mut dense_batch = DenseSnpBatch::new_empty(dense_batch_capacity);
+
+    // This is the main loop of the application's concurrent phase.
+    'orchestrator: while let Some(snp_buffer) = full_buffer_rx.recv().await {
+        // Get the metadata for the SNP we just received.
+        let matrix_row_index = context.prep_result.required_bim_indices[required_indices_cursor];
+        required_indices_cursor += 1;
+
+        // The "brain" of the adaptive engine: make the dispatch decision.
+        let path_decision =
+            batch::assess_path(&snp_buffer.0, context.prep_result.total_people_in_fam);
+
+        match path_decision {
+            ComputePath::SnpMajor => {
+                // To preserve processing order, we must flush any pending dense SNPs
+                // before processing this sparse one.
+                dispatch_and_clear_dense_batch(&mut dense_batch, context);
+
+                // Now, dispatch the sparse SNP for immediate computation.
+                let handle = dispatch_snp_major_path(
+                    snp_buffer,
+                    matrix_row_index,
+                    context.prep_result.clone(),
+                    context.partial_result_pool.clone(),
+                );
+                context.compute_handles.push(handle);
+            }
+            ComputePath::PersonMajor => {
+                // Add the dense SNP's data and metadata to the current batch.
+                dense_batch.data.extend_from_slice(&snp_buffer.0);
+                dense_batch.metadata.push(matrix_row_index);
+
+                // Immediately recycle the now-empty buffer by sending a `Read`
+                // command back to the I/O producer.
+                if empty_buffer_tx
+                    .send(IoCommand::Read(snp_buffer.0))
+                    .await
+                    .is_err()
+                {
+                    // I/O thread has shut down unexpectedly. Terminate the loop.
+                    break 'orchestrator;
+                }
+
+                // If the batch has reached its target capacity, dispatch it.
+                if dense_batch.data.len() >= dense_batch.data.capacity() {
+                    dispatch_and_clear_dense_batch(&mut dense_batch, context);
+                }
+            }
+        }
+
+        if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
+            eprintln!(
+                "> Processed {}/{} relevant variants...",
+                required_indices_cursor, context.prep_result.num_reconciled_variants
+            );
+        }
+    }
+
+    // The loop has finished, meaning the I/O producer has closed its channel.
+    // We must flush any final, partially-filled dense batch.
+    dispatch_and_clear_dense_batch(&mut dense_batch, context);
+
+    // Finally, tell the I/O producer to shut down gracefully.
+    // It might have already terminated, so we ignore any potential send error.
+    let _ = empty_buffer_tx.send(IoCommand::Shutdown).await;
+
+    Ok(())
+}
+
 
 /// **Helper:** Handles the final file writing.
 ///
