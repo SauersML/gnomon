@@ -455,7 +455,7 @@ def main():
                 if len(plink_score_files) > 1:
                     print("    > Merging multiple score files for PLINK2...")
                     merged_df = None
-                    id_cols = ['snp_id', 'effect_allele', 'other_allele']
+                    id_cols = ['variant_id', 'effect_allele', 'other_allele']
                     for sf_path in plink_score_files:
                         current_df = pd.read_csv(sf_path, sep='\t', low_memory=False)
                         if merged_df is None:
