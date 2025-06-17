@@ -11,10 +11,10 @@
 
 use crate::batch::{self, SparseIndexPool};
 use crate::io::SnpReader;
-use crate::prepare::PreparationResult;
+use crate::types::PreparationResult;
 use crate::types::{
-    CleanCounts, CleanScores, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores,
-    EffectAlleleDosage, MatrixRowIndex, SnpDataBuffer,
+    ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, EffectAlleleDosage, MatrixRowIndex,
+    SnpDataBuffer,
 };
 use cache_size;
 use crossbeam_queue::ArrayQueue;
