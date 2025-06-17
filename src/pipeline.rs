@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               THE TACTICAL PIPELINE EXECUTOR (ROBUST & DEADLOCK-PROOF)
+//               THE TACTICAL PIPELINE EXECUTOR
 //
 // ========================================================================================
 //
@@ -435,13 +435,6 @@ impl From<DenseVariantBatch> for Option<WorkParcel> {
             DenseVariantBatch::Empty => None,
             DenseVariantBatch::Buffering(data) => Some(WorkParcel::Dense(data)),
         }
-    }
-}
-
-// Implement for direct parcel dispatch as well.
-impl From<WorkParcel> for Option<WorkParcel> {
-    fn from(parcel: WorkParcel) -> Self {
-        Some(parcel)
     }
 }
 
