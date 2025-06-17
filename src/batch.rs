@@ -668,7 +668,6 @@ pub fn run_variant_major_path(
     reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-    let padded_score_count = prep_result.padded_score_count;
 
     // --- 1. Decode this single variant for all people in the cohort ---
     // This is a small, temporary allocation that fits on the stack for most cohorts.
