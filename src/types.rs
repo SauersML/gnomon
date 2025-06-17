@@ -139,10 +139,12 @@ pub struct DenseVariantBatchData {
     pub weights: Vec<f32>,
     /// A contiguous buffer of pre-gathered, padded flips for the variants in this batch.
     pub flips: Vec<u8>,
+    /// The number of variants in this batch. This is the source of truth for the batch size.
+    pub variant_count: usize,
     /// The reconciled variant indices for each corresponding variant in the batch.
     /// This is used by the compute engine to look up global metadata for rare
     /// events like missingness handling.
-    pub reconciled_indices_for_batch: Vec<ReconciledVariantIndex>,
+    pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
 }
 
 /// A batch of raw variant data, curated to contain only "dense" variants
