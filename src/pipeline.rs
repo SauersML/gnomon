@@ -369,7 +369,6 @@ fn dispatch_work(
     let partial_result_pool = context.partial_result_pool.clone();
     let tile_pool = context.tile_pool.clone();
     let sparse_index_pool = context.sparse_index_pool.clone();
-    let kernel_input_buffer_pool = context.kernel_input_buffer_pool.clone();
 
     task::spawn_blocking(move || {
         // This permit is held for the duration of the blocking task. When this
@@ -397,15 +396,18 @@ fn dispatch_work(
                 )?;
             }
             WorkParcel::Dense(data) => {
+                // The person-major path now receives the pre-gathered, contiguous data,
+                // restoring its performance by eliminating the gather-scatter bottleneck.
                 batch::run_person_major_path(
                     &data.data,
-                    &data.reconciled_variant_indices,
+                    &data.weights,
+                    &data.flips,
+                    data.variant_count,
                     &prep_result,
                     &mut clean_scores,
                     &mut clean_counts,
                     &tile_pool,
                     &sparse_index_pool,
-                    &kernel_input_buffer_pool,
                 )?;
             }
         }
