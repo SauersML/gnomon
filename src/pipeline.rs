@@ -405,6 +405,7 @@ fn dispatch_work(
                     &data.weights,
                     &data.flips,
                     data.variant_count,
+                    &data.reconciled_variant_indices,
                     &prep_result,
                     &mut clean_scores,
                     &mut clean_counts,
