@@ -198,12 +198,18 @@ pub enum PersonSubset {
 /// compute engine will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    // --- PRIVATE, COMPILED DATA MATRICES ---
-    // These fields are private to guarantee their invariants. They are created once
-    // by the `prepare` module and can only be read by downstream modules.
-    variant_score_weights: Vec<f32>,
-    variant_score_flips: Vec<u8>,
-    padded_score_count: usize,
+    // --- COMPILED DATA & METADATA ---
+    // The `variant_data` field stores weight/flip info per-variant, which is
+    // efficient for the gather-on-assemble strategy used by the pipeline.
+    // The fields are public to be read by downstream modules.
+
+    /// A vector where each element is a tuple containing the padded `(weights, flips)`
+    /// for a single reconciled variant. The index of this vector corresponds to the
+    /// `ReconciledVariantIndex`.
+    pub variant_data: Vec<(Vec<f32>, Vec<u8>)>,
+    /// The padded width of a single variant's score data, rounded up to the
+    /// nearest multiple of the SIMD vector width.
+    pub padded_score_count: usize,
 
     // --- PUBLIC METADATA & LOOKUP TABLES ---
     /// The sorted list of original `.bim` row indices that are required for this
