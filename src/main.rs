@@ -829,14 +829,25 @@ fn write_scores_to_file(
     writer.flush()
 }
 
-/// Dispatches the current dense SNP batch for processing and resets the batch.
+/// **Helper:** Dispatches a dense batch and adds its handle to the context.
+///
+/// This function encapsulates the logic for processing a batch of dense SNPs.
+/// It takes the current `dense_batch` and a mutable reference to the main
+/// `PipelineContext`. Its responsibilities are to:
+///
+/// 1.  Check if the batch is non-empty.
+/// 2.  Use `std::mem::replace` to efficiently take ownership of the batch data,
+///     leaving an empty, reset batch in its place.
+/// 3.  Call `dispatch_person_major_batch`, cloning the necessary `Arc`s from the
+///     context to move them into the new compute task.
+/// 4.  Push the returned `JoinHandle` into the context's `compute_handles` vector
+///     for later aggregation.
+///
+/// This approach simplifies the calling code in `run_orchestration_loop` and
+/// centralizes the logic for handling dense SNP batches.
 fn dispatch_and_clear_dense_batch(
     dense_batch: &mut DenseSnpBatch,
-    prep_result: Arc<prepare::PreparationResult>,
-    tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
-    sparse_index_pool: Arc<SparseIndexPool>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
-    handles: &mut Vec<task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>>>,
+    context: &mut PipelineContext,
 ) {
     // --- Guard Clause: Do nothing if the batch is empty ---
     if dense_batch.metadata.is_empty() {
@@ -852,15 +863,15 @@ fn dispatch_and_clear_dense_batch(
     );
 
     // --- Dispatch the computation using the dedicated helper ---
-    // This avoids duplicating the task spawning logic.
+    // We clone the Arcs from the context, which is a cheap reference count bump.
     let handle = dispatch_person_major_batch(
         batch_to_process,
-        prep_result,
-        tile_pool,
-        sparse_index_pool,
-        partial_result_pool,
+        context.prep_result.clone(),
+        context.tile_pool.clone(),
+        context.sparse_index_pool.clone(),
+        context.partial_result_pool.clone(),
     );
 
-    // Add the handle for the newly spawned task to the main list for later processing.
-    handles.push(handle);
+    // --- Add the handle to the context for later processing ---
+    context.compute_handles.push(handle);
 }
