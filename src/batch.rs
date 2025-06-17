@@ -67,13 +67,12 @@ impl SparseIndexPool {
 /// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_person_major_path(
     snp_major_data: &[u8],
+    metadata: &[MatrixRowIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
     partial_missing_counts_out: &mut CleanCounts,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    matrix_row_start_idx: MatrixRowIndex,
-    snps_in_chunk: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // The type system has already guaranteed the buffers are zeroed.
@@ -98,13 +97,12 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 snp_major_data,
+                metadata,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                matrix_row_start_idx,
-                snps_in_chunk,
             );
         }
         PersonSubset::Indices(indices) => {
@@ -112,13 +110,12 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 snp_major_data,
+                metadata,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                matrix_row_start_idx,
-                snps_in_chunk,
             );
         }
     };
