@@ -126,7 +126,7 @@ def setup_environment():
 def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path):
     """Creates a new PLINK fileset with harmonized 'chr:pos' variant IDs."""
     print_header("SYNCHRONIZING GENOTYPE DATA", char='.')
-    bim_df = pd.read_csv(original_prefix.with_suffix('.bim'), sep='\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
+    bim_df = pd.read_csv(original_prefix.with_suffix('.bim'), sep=r'\s+', header=None, names=['chrom', 'rsid', 'cm', 'pos', 'a1', 'a2'], dtype=str)
     bim_df['chr_pos_id'] = bim_df['chrom'] + ':' + bim_df['pos']
     
     duplicate_pos = bim_df[bim_df.duplicated(subset=['chr_pos_id'], keep=False)]
@@ -156,7 +156,7 @@ def create_unified_scorefile(score_file: Path) -> pd.DataFrame:
     df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
     df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
     final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
-    final_df.columns = ['snp_id', 'effect_allele', 'other_allele', 'effect_weight']
+    final_df.columns = ['variant_id', 'effect_allele', 'other_allele', 'effect_weight']
     
     out_path = CI_WORKDIR / f"{pgs_id}_unified_format.tsv"
     final_df.to_csv(out_path, sep='\t', index=False)
@@ -185,7 +185,7 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         if not path.exists(): continue
         
         try:
-            df_raw = pd.read_csv(path, sep='\s+')
+            df_raw = pd.read_csv(path, sep=r'\s+')
             id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
             score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
             if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
@@ -215,7 +215,7 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
     """Helper for the bisection algorithm. Runs Gnomon & PLINK2 on a variant subset and returns their correlation."""
     temp_score_path = CI_WORKDIR / f"_temp_score_{iteration_name}.tsv"
     # Ensure columns match the expected unified format
-    variant_df.columns = ['snp_id', 'effect_allele', 'other_allele', 'effect_weight']
+    variant_df.columns = ['variant_id', 'effect_allele', 'other_allele', 'effect_weight']
     variant_df.to_csv(temp_score_path, sep='\t', index=False)
 
     # --- Run Gnomon (Corrected) ---
@@ -243,8 +243,8 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
         return -1.0 # Signal a failure in one of the tool runs
 
     try:
-        g_df = pd.read_csv(g_iter_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'effect_weight_AVG': 'SCORE_GNOMON'})
-        p2_df = pd.read_csv(p2_prefix.with_suffix(".sscore"), sep='\s+').rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'SCORE_PLINK2'})
+        g_df = pd.read_csv(g_iter_prefix.with_suffix(".sscore"), sep=r'\s+').rename(columns={'#IID': 'IID', 'effect_weight_AVG': 'SCORE_GNOMON'})
+        p2_df = pd.read_csv(p2_prefix.with_suffix(".sscore"), sep=r'\s+').rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'SCORE_PLINK2'})
         merged = pd.merge(g_df[['IID', 'SCORE_GNOMON']], p2_df[['IID', 'SCORE_PLINK2']], on='IID').dropna()
         if len(merged) < 2: return 1.0
         correlation = merged['SCORE_GNOMON'].corr(merged['SCORE_PLINK2'])
@@ -261,11 +261,11 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
     # This is the step to prevent testing partitions with zero overlapping variants
     # Shouldn't affect anything but just speeds it up. Unnecessary to do
     print("[DISCOVERY] Pre-filtering score file against genotype data...")
-    bim_df = pd.read_csv(SHARED_GENOTYPE_PREFIX.with_suffix('.bim'), sep='\s+', header=None, usecols=[1], names=['snp_id'], dtype=str)
-    valid_snp_ids = set(bim_df['snp_id'])
+    bim_df = pd.read_csv(SHARED_GENOTYPE_PREFIX.with_suffix('.bim'), sep=r'\s+', header=None, usecols=[1], names=['variant_id'], dtype=str)
+    valid_variant_ids = set(bim_df['variant_id'])
     
     # The list of variants to search is the intersection of the score file and the bim file.
-    searchable_variants_df = initial_score_df[initial_score_df['snp_id'].isin(valid_snp_ids)].copy()
+    searchable_variants_df = initial_score_df[initial_score_df['variant_id'].isin(valid_variant_ids)].copy()
     
     if searchable_variants_df.empty:
         print("❌ Bisection failed: No overlapping variants found between score file and genotype data. Aborting discovery.", flush=True)
@@ -330,7 +330,7 @@ def run_disagreement_discovery(initial_score_df: pd.DataFrame):
     print_header(f"Final Pinpointing: {len(current_variants_df)} suspect variants", "-")
     suspect_results = []
     for i, row in current_variants_df.iterrows():
-        variant_id = row['snp_id']
+        variant_id = row['variant_id']
         print(f"[DISCOVERY] Testing single suspect variant: {variant_id}")
         single_variant_df = pd.DataFrame([row])
         corr = test_variant_subset(single_variant_df, f"final_{variant_id.replace(':', '_')}")

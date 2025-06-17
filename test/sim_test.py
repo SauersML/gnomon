@@ -216,10 +216,10 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     # b. Gnomon-native scorefile
     gnomon_scorefile = prefix.with_suffix(".gnomon.score")
     gdf = variants_df.copy()
-    gdf['snp_id'] = gdf['chr'].astype(str) + ':' + gdf['pos'].astype(str)
+    gdf['variant_id'] = gdf['chr'].astype(str) + ':' + gdf['pos'].astype(str)
     gdf['other_allele'] = np.where(gdf['effect_allele'] == gdf['ref'], gdf['alt'], gdf['ref'])
     gdf.rename(columns={'effect_weight': 'simulated_score'}, inplace=True)
-    gdf[['snp_id', 'effect_allele', 'other_allele', 'simulated_score']].to_csv(
+    gdf[['variant_id', 'effect_allele', 'other_allele', 'simulated_score']].to_csv(
         gnomon_scorefile, sep='\t', index=False
     )
     print(f"...Gnomon-native scorefile written to {gnomon_scorefile}")
@@ -285,16 +285,16 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         bim_df = pd.DataFrame(bim_data)
 
         score_data = [
-            {'snp_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
-            {'snp_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
-            {'snp_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7}
+               {'variant_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
+               {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
+               {'variant_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7}
         ]
         for i in range(50):
             pos = 10000 + i
-            score_data.append({'snp_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
+               score_data.append({'variant_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
         score_data.extend([
-            {'snp_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
-            {'snp_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
+               {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
+               {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
         ])
         score_df = pd.DataFrame(score_data)
 
