@@ -6,7 +6,7 @@
 //
 // This module contains the synchronous, CPU-bound core of the compute pipeline. It is
 // designed to be called from a higher-level asynchronous orchestrator within a
-// `spawn_blocking` context. Its sole responsibility is to take a raw, SNP-major
+// `spawn_blocking` context. Its sole responsibility is to take a raw, variant-major
 // chunk of genotype data, pivot it into a person-major tile, generate a sparse
 // index of non-zero work, and dispatch it to the kernel. It performs ZERO
 // scientific logic or reconciliation. We don't support over 100 scores yet.
@@ -83,7 +83,7 @@ impl KernelInputBufferPool {
 //                                   PUBLIC API
 // ========================================================================================
 
-/// Processes one dense, pre-filtered batch of SNP-major data using the person-major
+/// Processes one dense, pre-filtered batch of variant-major data using the person-major
 /// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
@@ -277,8 +277,8 @@ fn process_tile(
     let two_f32 = f32x8::splat(2.0);
     let zeros_f32 = f32x8::splat(0.0);
 
-    for snp_idx in 0..variants_in_chunk {
-        let global_matrix_row_idx = reconciled_variant_indices[snp_idx].0 as usize;
+    for variant_idx in 0..variants_in_chunk {
+        let global_matrix_row_idx = reconciled_variant_indices[variant_idx].0 as usize;
         let row_offset = global_matrix_row_idx * padded_score_count;
         let weight_row = &variant_score_weights[row_offset..row_offset + padded_score_count];
         let flip_row = &variant_score_flips[row_offset..row_offset + padded_score_count];
@@ -334,9 +334,9 @@ fn process_tile(
 
     // --- Part 2: Main Processing Loop (Mini-Batching) ---
     // Iterate over the tile in small, accuracy-preserving chunks.
-    for snp_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
+    for variant_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =
-            (variants_in_chunk - snp_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
+            (variants_in_chunk - variant_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
         if mini_batch_size == 0 {
             continue;
         }
@@ -362,30 +362,30 @@ fn process_tile(
 
         for person_idx in 0..num_people_in_block {
             let genotype_tile_row_offset = person_idx * variants_in_chunk;
-            let mini_batch_genotype_start = genotype_tile_row_offset + snp_mini_batch_start;
+            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start;
             let genotype_row_for_mini_batch =
                 &tile[mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size];
 
-            for (snp_idx_in_mini_batch, &dosage) in
+            for (variant_idx_in_mini_batch, &dosage) in
                 genotype_row_for_mini_batch.iter().enumerate()
             {
                 match dosage.0 {
                     1 => unsafe {
                         g1_indices
                             .get_unchecked_mut(person_idx)
-                            .push(snp_idx_in_mini_batch)
+                            .push(variant_idx_in_mini_batch)
                     },
                     2 => unsafe {
                         g2_indices
                             .get_unchecked_mut(person_idx)
-                            .push(snp_idx_in_mini_batch)
+                            .push(variant_idx_in_mini_batch)
                     },
                     3 => {
-                        // THE FIX: Defer the expensive work.
+                        // Defer the expensive work.
                         // Instead of doing the lookups and calculations now,
                         // just record the event and move on. This is extremely fast.
-                        let snp_idx_in_chunk = snp_mini_batch_start + snp_idx_in_mini_batch;
-                        missing_events.push((person_idx, snp_idx_in_chunk));
+                        let variant_idx_in_chunk = variant_mini_batch_start + variant_idx_in_mini_batch;
+                        missing_events.push((person_idx, variant_idx_in_chunk));
                     }
                     _ => (),
                 }
@@ -403,8 +403,8 @@ fn process_tile(
         // This copy loop now fills the pre-allocated, thread-local buffers.
         // It's just as fast as before, but without the allocation overhead.
         for i in 0..mini_batch_size {
-            let snp_idx_in_chunk = snp_mini_batch_start + i;
-            let matrix_row_idx = reconciled_variant_indices[snp_idx_in_chunk].0 as usize;
+            let variant_idx_in_chunk = variant_mini_batch_start + i;
+            let matrix_row_idx = reconciled_variant_indices[variant_idx_in_chunk].0 as usize;
             let row_offset = matrix_row_idx * padded_score_count;
             weights_chunk.extend_from_slice(&variant_score_weights[row_offset..row_offset + padded_score_count]);
             flip_flags_chunk.extend_from_slice(&variant_score_flips[row_offset..row_offset + padded_score_count]);
@@ -463,8 +463,8 @@ fn process_tile(
 
         // --- All Deferred Missing Events in a Batch ---
         // Now that the fast-path work is done, we process the slow-path work all at once.
-        for &(person_idx, snp_idx_in_chunk) in missing_events.iter() {
-            let global_matrix_row_idx = reconciled_variant_indices[snp_idx_in_chunk].0 as usize;
+        for &(person_idx, variant_idx_in_chunk) in missing_events.iter() {
+            let global_matrix_row_idx = reconciled_variant_indices[variant_idx_in_chunk].0 as usize;
             let scores_for_this_variant =
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
             let weight_row_offset = global_matrix_row_idx * padded_score_count;
@@ -493,7 +493,7 @@ fn process_tile(
 }
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
-/// This function's sole purpose is to pivot raw genotype dosages from the SNP-major
+/// This function's sole purpose is to pivot raw genotype dosages from the variant-major
 /// .bed layout to a person-major tile layout. It performs no reconciliation.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
@@ -507,7 +507,7 @@ fn pivot_tile(
     let bytes_per_variant = prep_result.bytes_per_variant;
     let variants_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
 
-    // Maps a desired sequential SNP index (0-7) to its physical source location within
+    // Maps a desired sequential variant index (0-7) to its physical source location within
     // the shuffled vector produced by the `transpose_8x8_u8` function. This is used
     // to "un-shuffle" the data into the correct sequential order in the tile.
     const UNSHUFFLE_MAP: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
@@ -526,18 +526,18 @@ fn pivot_tile(
         let person_byte_indices = person_indices / U64xN::splat(4);
         let bit_shifts = (person_indices % U64xN::splat(4)) * U64xN::splat(2);
 
-        for snp_chunk_start in (0..variants_in_chunk).step_by(SIMD_LANES) {
-            let remaining_snps = variants_in_chunk - snp_chunk_start;
-            let current_snps = remaining_snps.min(SIMD_LANES);
+        for variant_chunk_start in (0..variants_in_chunk).step_by(SIMD_LANES) {
+            let remaining_variants = variants_in_chunk - variant_chunk_start;
+            let current_variants = remaining_variants.min(SIMD_LANES);
 
-            // --- 1. Decode a block of up to 8 SNPs using SIMD ---
+            // --- 1. Decode a block of up to 8 variants using SIMD ---
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
-            for i in 0..current_snps {
-                let variant_idx_in_batch = snp_chunk_start + i;
+            for i in 0..current_variants {
+                let variant_idx_in_batch = variant_chunk_start + i;
 
-                // The offset is simply its index in the batch multiplied by the bytes per SNP.
-                let snp_byte_offset = variant_idx_in_batch as u64 * bytes_per_variant;
-                let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
+                // The offset is simply its index in the batch multiplied by the bytes per variant.
+                let variant_byte_offset = variant_idx_in_batch as u64 * bytes_per_variant;
+                let source_byte_indices = U64xN::splat(variant_byte_offset) + person_byte_indices;
 
                 let packed_vals =
                     U8xN::gather_or_default(variant_major_data, source_byte_indices.cast());
@@ -558,7 +558,7 @@ fn pivot_tile(
             // --- 3. Write data to the tile, handling full and partial chunks correctly ---
             for i in 0..current_lanes {
                 let person_idx_in_block = person_chunk_start + i;
-                let dest_offset = person_idx_in_block * variants_in_chunk + snp_chunk_start;
+                let dest_offset = person_idx_in_block * variants_in_chunk + variant_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
 
                         // OPTIMIZATION: Assemble the final row on the stack, then do a single bulk copy.
@@ -569,14 +569,14 @@ fn pivot_tile(
                         let mut temp_row = [EffectAlleleDosage::default(); SIMD_LANES];
 
                         // 2. Un-shuffle the transposed vector into the temporary buffer.
-                            for j in 0..current_snps {
+                            for j in 0..current_variants {
                             let dosage_value = shuffled_person_row[UNSHUFFLE_MAP[j]];
                             temp_row[j] = EffectAlleleDosage(dosage_value);
                             }
 
                         // 3. Perform a single, bulk copy into the main tile.
-                        tile[dest_offset..dest_offset + current_snps]
-                            .copy_from_slice(&temp_row[..current_snps]);
+                        tile[dest_offset..dest_offset + current_variants]
+                            .copy_from_slice(&temp_row[..current_variants]);
             }
         }
     }
@@ -614,7 +614,7 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
 
 
 // ========================================================================================
-//                     ADAPTIVE DISPATCHER & SNP-MAJOR PATH
+//                     ADAPTIVE DISPATCHER & variant-MAJOR PATH
 // ========================================================================================
 
 use crate::types::ComputePath;
@@ -622,10 +622,10 @@ use crate::types::ComputePath;
 // This threshold is used by the dispatcher. If the estimated non-reference allele
 // frequency for a variant is above this value, it's considered "dense" and sent
 // to the high-throughput person-major path. Otherwise, it's "sparse" and sent to
-// the low-overhead SNP-major path. This value can be tuned based on profiling.
-const SNP_DENSITY_THRESHOLD: f32 = 0.05;
+// the low-overhead variant-major path. This value can be tuned based on profiling.
+const variant_DENSITY_THRESHOLD: f32 = 0.05;
 
-/// Assesses a single SNP's data and determines the optimal compute path.
+/// Assesses a single variant's data and determines the optimal compute path.
 ///
 /// This is the "brain" of the adaptive engine. It uses a fast, hardware-accelerated
 /// heuristic to decide if a variant's data is sparse or dense.
@@ -633,7 +633,7 @@ const SNP_DENSITY_THRESHOLD: f32 = 0.05;
 pub fn assess_path(variant_data: &[u8], total_people: usize) -> ComputePath {
     let non_ref_allele_freq = assess_variant_density(variant_data, total_people);
 
-    if non_ref_allele_freq > SNP_DENSITY_THRESHOLD {
+    if non_ref_allele_freq > variant_DENSITY_THRESHOLD {
         ComputePath::PersonMajor
     } else {
         ComputePath::VariantMajor
@@ -675,7 +675,7 @@ fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
     set_bits as f32 / total_people as f32
 }
 
-/// Processes a single sparse SNP using a direct, pivot-free algorithm.
+/// Processes a single sparse variant using a direct, pivot-free algorithm.
 ///
 /// This path is optimized for variants where most individuals have the
 /// homozygous-reference genotype. It avoids the high overhead of the pivot
@@ -691,11 +691,11 @@ pub fn run_variant_major_path(
     let num_scores = prep_result.score_names.len();
     let padded_score_count = prep_result.padded_score_count();
 
-    // --- 1. Decode this single SNP for all people in the cohort ---
+    // --- 1. Decode this single variant for all people in the cohort ---
     // This is a small, temporary allocation that fits on the stack for most cohorts.
     let dosages = decode_variant_genotypes(variant_data, prep_result.total_people_in_fam);
 
-    // --- 2. Get pointers to the relevant weight/flip data for this SNP ---
+    // --- 2. Get pointers to the relevant weight/flip data for this variant ---
     let weight_row_offset = reconciled_variant_index.0 as usize * padded_score_count;
     let weight_row = &prep_result.variant_score_weights()[weight_row_offset..];
     let flip_row = &prep_result.variant_score_flips()[weight_row_offset..];
@@ -724,7 +724,7 @@ pub fn run_variant_major_path(
 
     // --- 4. Main compute pass: Apply adjustments for non-zero dosages ---
     for (original_fam_idx, &dosage) in dosages.iter().enumerate() {
-        // THE CORE OPTIMIZATION: For a sparse SNP, this branch is highly predictable.
+        // THE CORE OPTIMIZATION: For a sparse variant, this branch is highly predictable.
         // We skip the vast majority of individuals who are homozygous-reference.
         if dosage == 0 || dosage == 3 {
             continue;
@@ -751,7 +751,7 @@ pub fn run_variant_major_path(
     Ok(())
 }
 
-/// Decodes a single SNP's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
+/// Decodes a single variant's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
 #[inline]
 fn decode_variant_genotypes(variant_data: &[u8], num_people: usize) -> Vec<u8> {
     let mut dosages = Vec::with_capacity(num_people);
@@ -777,24 +777,24 @@ mod tests {
     use super::*;
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
-        // This map from a logical SNP index (0-7) to its physical byte position
+        // This map from a logical variant index (0-7) to its physical byte position
         // in the transposed person-vector
-        const SNP_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+        const variant_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
-        // 1. SETUP: Create a known 8x8 matrix of SNP-major data.
-        // We use unique, traceable values: `(person_idx+1)*10 + (snp_idx+1)`.
-        let mut snp_major_matrix = [[0u8; 8]; 8];
-        for snp_idx in 0..8 {
+        // 1. SETUP: Create a known 8x8 matrix of variant-major data.
+        // We use unique, traceable values: `(person_idx+1)*10 + (variant_idx+1)`.
+        let mut variant_major_matrix = [[0u8; 8]; 8];
+        for variant_idx in 0..8 {
             for person_idx in 0..8 {
-                let val = ((person_idx + 1) * 10 + (snp_idx + 1)) as u8;
-                snp_major_matrix[snp_idx][person_idx] = val;
+                let val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
+                variant_major_matrix[variant_idx][person_idx] = val;
             }
         }
 
         // Convert the scalar matrix into the SIMD vector format required by the function.
-        // `input_vectors[j]` will hold data for SNP `j` across all 8 people.
+        // `input_vectors[j]` will hold data for variant `j` across all 8 people.
         let input_vectors: [U8xN; 8] = core::array::from_fn(|j| {
-            U8xN::from_array(snp_major_matrix[j])
+            U8xN::from_array(variant_major_matrix[j])
         });
 
         // 2. EXECUTION: Perform the transpose operation we want to probe.
@@ -802,12 +802,12 @@ mod tests {
 
         // 3. VERIFICATION & REPORTING: Print the ground truth and assert correctness.
         eprintln!("\n\n=============== EMPIRICAL TRANSPOSE VERIFICATION ===============");
-        eprintln!("Input Matrix (SNP-Major): One row per SNP");
-        for snp_idx in 0..8 {
-            eprintln!("  SNP {:?}: {:?}", snp_idx, snp_major_matrix[snp_idx]);
+        eprintln!("Input Matrix (variant-Major): One row per variant");
+        for variant_idx in 0..8 {
+            eprintln!("  variant {:?}: {:?}", variant_idx, variant_major_matrix[variant_idx]);
         }
         eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
-        eprintln!("Each row represents data for one Person, across all 8 SNPs...");
+        eprintln!("Each row represents data for one Person, across all 8 variants...");
 
         let mut all_tests_passed = true;
         for person_idx in 0..8 {
@@ -815,28 +815,28 @@ mod tests {
             eprintln!("  Person {:?}: {:?}", person_idx, person_row_actual);
 
             // Now, verify the contents of this person's row.
-            // This loop will FAIL if the SNP data is not shuffled as hypothesized.
-            for snp_idx in 0..8 {
-                let expected_val = ((person_idx + 1) * 10 + (snp_idx + 1)) as u8;
+            // This loop will FAIL if the variant data is not shuffled as hypothesized.
+            for variant_idx in 0..8 {
+                let expected_val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
                 
                 // Get the actual value from the shuffled location.
-                let val_from_shuffled_pos = person_row_actual[SNP_TO_SHUFFLED_POS[snp_idx]];
+                let val_from_shuffled_pos = person_row_actual[variant_TO_SHUFFLED_POS[variant_idx]];
                 
                 // Also get the value from the naive sequential position.
-                let val_from_naive_pos = person_row_actual[snp_idx];
+                let val_from_naive_pos = person_row_actual[variant_idx];
 
                 if val_from_shuffled_pos != expected_val {
                     all_tests_passed = false;
                     eprintln!(
                         "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
-                        person_idx, snp_idx, expected_val, SNP_TO_SHUFFLED_POS[snp_idx], val_from_shuffled_pos
+                        person_idx, variant_idx, expected_val, variant_TO_SHUFFLED_POS[variant_idx], val_from_shuffled_pos
                     );
                 }
-                if val_from_naive_pos == expected_val && SNP_TO_SHUFFLED_POS[snp_idx] != snp_idx {
+                if val_from_naive_pos == expected_val && variant_TO_SHUFFLED_POS[variant_idx] != variant_idx {
                      all_tests_passed = false;
                      eprintln!(
                         "    -> FAIL: Naive position [{}] unexpectedly held the correct value for S{}!",
-                        snp_idx, snp_idx
+                        variant_idx, variant_idx
                     );
                 }
             }
@@ -844,6 +844,6 @@ mod tests {
         eprintln!("==============================================================\n");
 
         assert!(all_tests_passed, "The transpose output layout does not match the expected shuffle pattern.");
-        eprintln!("✅ SUCCESS: The transpose function shuffles SNPs within each person-vector as hypothesized.");
+        eprintln!("✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized.");
     }
 }
