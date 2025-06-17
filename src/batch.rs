@@ -67,8 +67,6 @@ impl SparseIndexPool {
 /// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
-    weights: &[f32],
-    flips: &[u8],
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
@@ -77,8 +75,6 @@ pub fn run_person_major_path(
     sparse_index_pool: &SparseIndexPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
-    // The type system has already guaranteed the buffers are zeroed.
-    // We only need to check the length, which is possible via Deref.
     let expected_len = prep_result.num_people_to_score * prep_result.score_names.len();
     if partial_scores_out.len() != expected_len {
         return Err(Box::from(format!(
@@ -88,9 +84,32 @@ pub fn run_person_major_path(
         )));
     }
 
-    // --- Dispatch to Generic Parallel Iterator ---
-    // DerefMut coercion allows the typed wrappers to be passed as mutable slices
-    // to the internal implementation, which requires no changes.
+    // === STAGE 1: SINGLE-THREADED GATHER (Eliminates Contention) ===
+    let stride = prep_result.stride();
+    let num_variants_in_batch = reconciled_variant_indices_for_batch.len();
+    let batch_matrix_size = num_variants_in_batch * stride;
+
+    let mut weights_for_batch = Vec::with_capacity(batch_matrix_size);
+    let mut flips_for_batch = Vec::with_capacity(batch_matrix_size);
+
+    // This is safe because we just allocated the capacity.
+    unsafe {
+        weights_for_batch.set_len(batch_matrix_size);
+        flips_for_batch.set_len(batch_matrix_size);
+    }
+
+    for (i, &reconciled_idx) in reconciled_variant_indices_for_batch.iter().enumerate() {
+        let dest_offset = i * stride;
+        let src_offset = reconciled_idx.0 as usize * stride;
+
+        weights_for_batch[dest_offset..dest_offset + stride]
+            .copy_from_slice(&prep_result.weights_matrix()[src_offset..src_offset + stride]);
+
+        flips_for_batch[dest_offset..dest_offset + stride]
+            .copy_from_slice(&prep_result.flip_mask_matrix()[src_offset..src_offset + stride]);
+    }
+
+    // === STAGE 2: MULTI-THREADED COMPUTE ===
     match &prep_result.person_subset {
         PersonSubset::All => {
             let iter = (0..prep_result.total_people_in_fam as u32)
@@ -99,8 +118,8 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 variant_major_data,
-                weights,
-                flips,
+                &weights_for_batch,
+                &flips_for_batch,
                 reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
@@ -114,8 +133,8 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 variant_major_data,
-                weights,
-                flips,
+                &weights_for_batch,
+                &flips_for_batch,
                 reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
@@ -248,14 +267,14 @@ fn process_tile<'a>(
     if num_people_in_block == 0 {
         return;
     }
-    let padded_score_count = prep_result.padded_score_count;
+    let stride = prep_result.stride();
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
 
     // --- Part 1: Pre-calculate the chunk-wide baseline for flipped variants (SIMD OPTIMIZED) ---
     // This baseline represents the score every person would get if they were
     // homozygous-reference for all flipped variants in this chunk. This is a hot
     // loop and is optimized to be branch-free using SIMD masking.
-    let mut chunk_baseline = vec![0.0f64; padded_score_count]; // Use f64 for high-precision baseline.
+    let mut chunk_baseline = vec![0.0f64; stride]; // Use f64 for high-precision baseline.
     
     // Pre-load constants for the loop.
     let simd_lanes_f32 = std::mem::size_of::<f32x8>() / std::mem::size_of::<f32>();
@@ -264,9 +283,9 @@ fn process_tile<'a>(
     let zeros_f32 = f32x8::splat(0.0);
 
     for variant_idx in 0..variants_in_chunk {
-        let row_offset = variant_idx * padded_score_count;
-        let weight_row = &weights_for_batch[row_offset..row_offset + padded_score_count];
-        let flip_row = &flips_for_batch[row_offset..row_offset + padded_score_count];
+        let row_offset = variant_idx * stride;
+        let weight_row = &weights_for_batch[row_offset..row_offset + stride];
+        let flip_row = &flips_for_batch[row_offset..row_offset + stride];
 
         // Process full SIMD vectors
         for i in 0..num_simd_chunks {
@@ -380,8 +399,8 @@ fn process_tile<'a>(
         // --- B. Create Kernel Input Views (Zero-Cost Slicing) ---
         // This is now extremely fast. We just create views over the contiguous,
         // pre-gathered data that was passed in for the entire batch.
-        let matrix_slice_start = variant_mini_batch_start * padded_score_count;
-        let matrix_slice_end = matrix_slice_start + (mini_batch_size * padded_score_count);
+        let matrix_slice_start = variant_mini_batch_start * stride;
+        let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
         let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
         let flip_flags_chunk = &flips_for_batch[matrix_slice_start..matrix_slice_end];
 
@@ -418,13 +437,13 @@ fn process_tile<'a>(
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(&current_scores_low.to_array());
+                        scores_slice_low.copy_from_slice(¤t_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
                         let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
                         current_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(&current_scores_high.to_array());
+                        scores_slice_high.copy_from_slice(¤t_scores_high.to_array());
                     } else {
                         let start = scores_offset;
                         let end = num_scores;
@@ -446,7 +465,7 @@ fn process_tile<'a>(
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
             
             // For the baseline correction, we use the pre-gathered batch data, which is fast.
-            let weight_row_offset = variant_idx_in_chunk * padded_score_count;
+            let weight_row_offset = variant_idx_in_chunk * stride;
             let weight_row =
                 &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
             let flip_row =
@@ -674,8 +693,11 @@ pub fn run_variant_major_path(
     let dosages = decode_variant_genotypes(variant_data, prep_result.total_people_in_fam);
 
     // --- 2. Get pointers to the relevant weight/flip data for this variant ---
-    // This lookup is efficient as it accesses a pre-packaged tuple of data.
-    let (weight_row, flip_row) = &prep_result.variant_data[reconciled_variant_index.0 as usize];
+    // This is an efficient calculation of the offset into the global contiguous matrices.
+    let stride = prep_result.stride();
+    let row_offset = reconciled_variant_index.0 as usize * stride;
+    let weight_row = &prep_result.weights_matrix()[row_offset..row_offset + stride];
+    let flip_row = &prep_result.flip_mask_matrix()[row_offset..row_offset + stride];
     let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
 
     // --- 3. First pass: Handle missingness and correct baselines ---
