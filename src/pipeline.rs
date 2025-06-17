@@ -260,8 +260,8 @@ async fn run_orchestration_loop(
         required_indices_cursor += 1;
 
         let path_decision =
-            batch::assess_variant_density(&packed_genotypes.0, context.prep_result.total_people_in_fam);
-
+            batch::assess_path(&packed_genotypes.0, context.prep_result.total_people_in_fam);
+    
         match path_decision {
             ComputePath::VariantMajor => {
                 // To preserve processing order, we must flush any pending dense batch
