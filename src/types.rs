@@ -123,27 +123,27 @@ impl DerefMut for CleanCounts {
 /// matching the PLINK .bed file's SNP-major layout.
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct SnpDataBuffer(pub Vec<u8>);
+pub struct PackedVariantGenotypes(pub Vec<u8>);
 
 /// A batch of raw SNP-major data, curated to contain only variants
 /// suitable for the high-throughput person-major compute path.
 #[derive(Debug)]
-pub struct DenseSnpBatch {
+pub struct DenseVariantBatch {
     /// A contiguous buffer of SNP-major data.
     pub data: Vec<u8>,
     /// The matrix row indices for each corresponding SNP in the `data` buffer.
     /// This metadata is critical for looking up weights and flip flags.
-    pub metadata: Vec<MatrixRowIndex>,
+    pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
 }
 
-impl DenseSnpBatch {
+impl DenseVariantBatch {
     /// Creates a new, empty batch with a pre-allocated data buffer.
     pub fn new_empty(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
             // The metadata vector starts empty. Its length will always track
             // the number of SNPs in the batch.
-            metadata: Vec::new(),
+            reconciled_variant_indices: Vec::new(),
         }
     }
 }
@@ -180,9 +180,9 @@ pub struct PreparationResult {
     // --- PRIVATE, COMPILED DATA MATRICES ---
     // These fields are private to guarantee their invariants. They are created once
     // by the `prepare` module and can only be read by downstream modules.
-    weights_matrix: Vec<f32>,
-    flip_mask_matrix: Vec<u8>,
-    stride: usize,
+    variant_score_weights: Vec<f32>,
+    variant_score_flips: Vec<u8>,
+    padded_score_count: usize,
 
     // --- PUBLIC METADATA & LOOKUP TABLES ---
     /// The sorted list of original `.bim` row indices that are required for this
@@ -211,12 +211,12 @@ pub struct PreparationResult {
     /// The total number of individuals found in the original .fam file.
     pub total_people_in_fam: usize,
     /// The total number of variants found in the original .bim file.
-    pub total_snps_in_bim: usize,
+    pub total_variants_in_bim: usize,
     /// The number of variants successfully reconciled and included in the matrices.
     /// This corresponds to the number of rows in the compiled matrices.
     pub num_reconciled_variants: usize,
     /// The number of bytes per SNP in the .bed file, calculated as CEIL(total_people_in_fam / 4).
-    pub bytes_per_snp: u64,
+    pub bytes_per_variant: u64,
 }
 
 impl PreparationResult {
@@ -224,9 +224,9 @@ impl PreparationResult {
     /// Only the `prepare` module can construct this "proof token".
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        weights_matrix: Vec<f32>,
-        flip_mask_matrix: Vec<u8>,
-        stride: usize,
+        variant_score_weights: Vec<f32>,
+        variant_score_flips: Vec<u8>,
+        padded_score_count: usize,
         required_bim_indices: Vec<BimRowIndex>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
@@ -235,15 +235,15 @@ impl PreparationResult {
         final_person_iids: Vec<String>,
         num_people_to_score: usize,
         total_people_in_fam: usize,
-        total_snps_in_bim: usize,
+        total_variants_in_bim: usize,
         num_reconciled_variants: usize,
-        bytes_per_snp: u64,
+        bytes_per_variant: u64,
         person_fam_to_output_idx: Vec<Option<u32>>,
     ) -> Self {
         Self {
-            weights_matrix,
-            flip_mask_matrix,
-            stride,
+            variant_score_weights,
+            variant_score_flips,
+            padded_score_count,
             required_bim_indices,
             score_names,
             score_variant_counts,
@@ -252,9 +252,9 @@ impl PreparationResult {
             final_person_iids,
             num_people_to_score,
             total_people_in_fam,
-            total_snps_in_bim,
+            total_variants_in_bim,
             num_reconciled_variants,
-            bytes_per_snp,
+            bytes_per_variant,
             person_fam_to_output_idx,
         }
     }
@@ -262,18 +262,18 @@ impl PreparationResult {
     // --- Public Getters for Private Data ---
 
     #[inline(always)]
-    pub fn weights_matrix(&self) -> &[f32] {
-        &self.weights_matrix
+    pub fn variant_score_weights(&self) -> &[f32] {
+        &self.variant_score_weights
     }
 
     #[inline(always)]
-    pub fn flip_mask_matrix(&self) -> &[u8] {
-        &self.flip_mask_matrix
+    pub fn variant_score_flips(&self) -> &[u8] {
+        &self.variant_score_flips
     }
 
     #[inline(always)]
-    pub fn stride(&self) -> usize {
-        self.stride
+    pub fn padded_score_count(&self) -> usize {
+        self.padded_score_count
     }
 }
 
@@ -300,7 +300,7 @@ pub struct BimRowIndex(pub u32);
 /// This wraps a u32, which is sufficient for >4 billion variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct MatrixRowIndex(pub u32);
+pub struct ReconciledVariantIndex(pub u32);
 
 /// An index corresponding to a specific score (a column in the conceptual matrix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
