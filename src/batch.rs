@@ -138,13 +138,14 @@ pub fn run_person_major_path(
 fn process_people_iterator<'a, I>(
     iter: I,
     variant_major_data: &'a [u8],
-    reconciled_variant_indices: &[ReconciledVariantIndex],
+    weights: &'a [f32],
+    flips: &'a [u8],
+    reconciled_variant_indices: &'a [ReconciledVariantIndex],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f64],
     partial_missing_counts: &'a mut [u32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
-    kernel_input_buffer_pool: &'a KernelInputBufferPool,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
@@ -171,12 +172,13 @@ fn process_people_iterator<'a, I>(
                 person_indices_in_block,
                 prep_result,
                 variant_major_data,
+                weights,
+                flips,
                 reconciled_variant_indices,
                 block_scores_out,
                 block_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                kernel_input_buffer_pool,
             );
         });
 }
@@ -188,12 +190,13 @@ fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
     prep_result: &PreparationResult,
     variant_major_data: &[u8],
+    weights: &[f32],
+    flips: &[u8],
     reconciled_variant_indices: &[ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices.len();
     let tile_size = person_indices_in_block.len() * variants_in_chunk;
@@ -213,11 +216,12 @@ fn process_block(
     process_tile(
         &tile,
         prep_result,
+        weights,
+        flips,
         reconciled_variant_indices,
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
-        kernel_input_buffer_pool,
     );
 
     // Return the tile to the pool for reuse.
