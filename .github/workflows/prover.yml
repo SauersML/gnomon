@@ -1,0 +1,31 @@
+name: Lean Prover CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'proofs/**'            # Any file inside the proofs directory
+      - 'lakefile.lean'        # The Lean project configuration
+      - 'lean-toolchain'       # The Lean version file
+      - '.github/workflows/prover.yml' # The workflow file itself
+
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'proofs/**'
+      - 'lakefile.lean'
+      - 'lean-toolchain'
+      - '.github/workflows/prover.yml'
+
+  workflow_dispatch:
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Lean project
+        uses: leanprover/lean-action@v1
