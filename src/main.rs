@@ -657,29 +657,6 @@ fn write_scores_to_file(
 }
 
 /// Dispatches the current dense SNP batch for processing and resets the batch.
-///
-/// This function is the sole entry point for sending a batch of "dense" variants
-/// to the high-throughput, person-major compute path. It is designed to be
-/// non-blocking from the orchestrator's perspective.
-///
-/// # Key Behaviors:
-/// 1.  **Idempotent:** If the batch is empty, it returns immediately with no action.
-/// 2.  **Ownership Transfer:** It takes ownership of the batch's contents using
-///     `std::mem::replace`, leaving the original `dense_batch` empty but with its
-///     allocated capacity intact, preventing future reallocations.
-/// 3.  **Asynchronous Execution:** It spawns the CPU-bound work onto a blocking
-///     thread using `task::spawn_blocking`, freeing the main async orchestrator
-///     to continue processing I/O.
-/// 4.  **Resource Management:** It correctly pulls a set of partial result buffers
-///     from the shared pool to be used by the compute task.
-///
-/// # Arguments
-/// * `dense_batch` - A mutable reference to the `DenseSnpBatch` being assembled.
-/// * `prep_result` - The `Arc`'d "computation blueprint".
-/// * `tile_pool` - The `Arc`'d pool of reusable tile buffers.
-/// * `sparse_index_pool` - The `Arc`'d pool of sparse index structures.
-/// * `partial_result_pool` - The `Arc`'d pool of reusable partial result buffers.
-/// * `handles` - The vector where the `JoinHandle` for the new task will be stored.
 fn dispatch_and_clear_dense_batch(
     dense_batch: &mut DenseSnpBatch,
     prep_result: Arc<prepare::PreparationResult>,
@@ -701,43 +678,15 @@ fn dispatch_and_clear_dense_batch(
         DenseSnpBatch::new_empty(dense_batch.data.capacity()),
     );
 
-    // Clone the shared resource handles to move them into the async task.
-    let prep_clone = Arc::clone(&prep_result);
-    let tile_pool_clone = Arc::clone(&tile_pool);
-    let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-    let partial_result_pool_clone = Arc::clone(&partial_result_pool);
-
-    // --- Dispatch the computation to a blocking thread ---
-    let handle = task::spawn_blocking(move || {
-        // Pop a pre-allocated, "dirty" buffer set from the pool. This may block
-        // briefly if the pipeline is full, which provides natural backpressure.
-        let (dirty_scores, dirty_counts) = partial_result_pool_clone.pop().unwrap();
-
-        // Zero out the buffers, transitioning them to the "Clean" state.
-        let mut clean_scores = dirty_scores.into_clean();
-        let mut clean_counts = dirty_counts.into_clean();
-
-        // Execute the CPU-bound, person-major computation path.
-        batch::run_person_major_path(
-            &batch_to_process.data,
-            &prep_clone,
-            &mut clean_scores,
-            &mut clean_counts,
-            &tile_pool_clone,
-            &sparse_index_pool_clone,
-            &batch_to_process.metadata,
-        )?;
-
-        // Package the results into the unified result type.
-        let result = ComputeTaskResult {
-            scores: clean_scores.into_dirty(),
-            counts: clean_counts.into_dirty(),
-            // A dense batch consumes its data; there is no single-SNP I/O buffer to recycle.
-            recycled_buffer: None,
-        };
-
-        Ok::<_, Box<dyn Error + Send + Sync>>(result)
-    });
+    // --- Dispatch the computation using the dedicated helper ---
+    // This avoids duplicating the task spawning logic.
+    let handle = dispatch_person_major_batch(
+        batch_to_process,
+        prep_result,
+        tile_pool,
+        sparse_index_pool,
+        partial_result_pool,
+    );
 
     // Add the handle for the newly spawned task to the main list for later processing.
     handles.push(handle);
