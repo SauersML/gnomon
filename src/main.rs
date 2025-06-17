@@ -487,6 +487,67 @@ async fn run_orchestration_loop(
     Ok(())
 }
 
+/// **Helper:** Awaits all in-flight compute tasks and aggregates their results.
+///
+/// This function is the synchronization point of the pipeline. It iterates through
+/// all spawned `JoinHandle`s stored in the context, awaits their completion, and
+/// performs three critical actions for each result:
+///
+/// 1.  **Aggregates** the partial scores and counts into the master result buffers.
+///     This is done with efficient, auto-vectorizable iterators.
+/// 2.  **Recycles** the large partial result vectors (`DirtyScores`, `DirtyCounts`)
+///     back into their shared pool to be reused by future tasks.
+/// 3.  **Recycles** the small `SnpDataBuffer` from sparse tasks by sending it back
+///     to the I/O producer, if it is still running.
+///
+/// It robustly handles potential task panics and gracefully handles the case
+/// where the I/O producer has already shut down.
+async fn aggregate_results(
+    context: &mut PipelineContext,
+    empty_buffer_tx: &mpsc::Sender<IoCommand>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Take ownership of the handles, leaving an empty Vec in the context.
+    // This is an efficient O(1) swap.
+    for handle in std::mem::take(&mut context.compute_handles) {
+        // Await the task's completion. The first `?` handles task panics (JoinError),
+        // and the second `?` handles business-logic errors returned by the task itself.
+        match handle.await? {
+            Ok(result) => {
+                // 1. Aggregate scores and counts into the master buffers.
+                // This `zip` iterator is highly performant and will likely be auto-vectorized.
+                for (master, &partial) in context.all_scores.iter_mut().zip(&result.scores) {
+                    *master += partial;
+                }
+                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&result.counts)
+                {
+                    *master += partial;
+                }
+
+                // 2. Return the large partial result buffers to the shared pool for reuse.
+                // This unwrap is safe because we pop one set of buffers for every task we
+                // spawn, so the pool cannot be full when we push them back.
+                context
+                    .partial_result_pool
+                    .push((result.scores, result.counts))
+                    .unwrap();
+
+                // 3. If the task was for a sparse SNP, recycle its small I/O buffer.
+                if let Some(recycled_buffer) = result.recycled_buffer {
+                    // Use a non-blocking `try_send`. If the I/O task has already shut down,
+                    // the channel will be closed, and this will return an `Err`.
+                    // We gracefully ignore this error, as the buffer is no longer needed.
+                    let _ = empty_buffer_tx.try_send(IoCommand::Read(recycled_buffer));
+                }
+            }
+            Err(e) => {
+                // A task returned a business-logic error. Propagate it immediately.
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 
 /// **Helper:** Handles the final file writing.
 ///
