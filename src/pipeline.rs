@@ -351,44 +351,46 @@ fn spawn_io_producer_task(
     full_buffer_tx: mpsc::Sender<Vec<u8>>,
     mut empty_buffer_rx: mpsc::Receiver<Vec<u8>>,
 ) -> JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-    tokio::spawn(task::spawn_blocking(move || {
-        // --- Setup Phase (inside the dedicated blocking thread) ---
-        let bed_path = plink_prefix.with_extension("bed");
-        let mut reader = match BedReader::new(
-            &bed_path,
-            prep_result.bytes_per_variant,
-            prep_result.total_variants_in_bim,
-        ) {
-            Ok(r) => r,
-            Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
-        };
+    tokio::spawn(async move {
+        // task::spawn_blocking runs the provided closure on a dedicated thread pool
+        // for blocking operations. We await its completion.
+        match task::spawn_blocking(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            // --- Setup Phase (inside the dedicated blocking thread) ---
+            let bed_path = plink_prefix.with_extension("bed");
+            let mut reader = BedReader::new(
+                &bed_path,
+                prep_result.bytes_per_variant,
+                prep_result.total_variants_in_bim,
+            )?;
 
-        // --- Producer Loop ---
-        // This loop will run until the orchestrator drops its receiver or we reach EOF.
-        // We use `blocking_recv` because we are in a synchronous context.
-        while let Some(mut buffer) = empty_buffer_rx.blocking_recv() {
-            // Read the very next variant row from the memory-mapped file.
-            let variant_data_opt = match reader.read_next_variant(&mut buffer) {
-                Ok(data) => data,
-                Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
-            };
+            // --- Producer Loop ---
+            // This loop will run until the orchestrator drops its receiver or we reach EOF.
+            // We use `blocking_recv` because we are in a synchronous context.
+            while let Some(mut buffer) = empty_buffer_rx.blocking_recv() {
+                // Read the very next variant row from the memory-mapped file.
+                let variant_data_opt = reader.read_next_variant(&mut buffer)?;
 
-            if let Some(filled_buffer) = variant_data_opt {
-                // Immediately send the filled buffer to the orchestrator.
-                // If this fails, the orchestrator has shut down, so we can exit.
-                if full_buffer_tx.blocking_send(filled_buffer).is_err() {
+                if let Some(filled_buffer) = variant_data_opt {
+                    // Immediately send the filled buffer to the orchestrator.
+                    // If this fails, the orchestrator has shut down, so we can exit.
+                    if full_buffer_tx.blocking_send(filled_buffer).is_err() {
+                        break;
+                    }
+                } else {
+                    // `None` signifies end-of-file. The producer's job is done.
                     break;
                 }
-            } else {
-                // `None` signifies end-of-file. The producer's job is done.
-                break;
             }
+            Ok(())
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()), // Blocking task succeeded.
+            Ok(Err(e)) => Err(e), // Blocking task returned an error.
+            Err(join_error) => Err(Box::new(join_error) as Box<dyn Error + Send + Sync>), // Blocking task panicked.
         }
-
-        Ok(())
-    }))
+    })
 }
-
 
 /// A unified dispatcher that takes a `WorkParcel`, spawns the appropriate compute
 /// task, and returns a `JoinHandle` to its result. The provided `SemaphorePermit`
