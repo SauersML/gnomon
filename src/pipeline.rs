@@ -8,7 +8,7 @@
 // prevent resource-based deadlocks and resource exhaustion panics by enforcing a
 // strict, semaphore-gated lifecycle for all compute tasks.
 
-use crate::batch::{self, KernelInputBufferPool, SparseIndexPool};
+use crate::batch::{self, SparseIndexPool};
 use crate::io::BedReader;
 use crate::types::{
     ComputePath, DenseVariantBatch, DenseVariantBatchData, DirtyCounts, DirtyScores,
