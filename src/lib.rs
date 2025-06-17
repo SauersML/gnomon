@@ -5,3 +5,4 @@ pub mod kernel;
 pub mod prepare;
 pub mod types;
 pub mod reformat;
+pub mod pipeline;
