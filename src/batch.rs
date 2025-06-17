@@ -437,7 +437,7 @@ fn process_tile<'a>(
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(¤t_scores_low.to_array());
+                        scores_slice_low.copy_from_slice(current_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
