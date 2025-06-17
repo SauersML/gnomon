@@ -239,40 +239,46 @@ pub fn prepare_for_computation(
     // --- STAGE 6: POPULATE COMPUTE STRUCTURES ---
     eprintln!("> Pass 6: Populating compute structures with maximum parallelism...");
 
-    // The stride is the padded row width of the matrices, ensuring each row
-    // begins on a SIMD-friendly memory boundary.
+    // The `padded_score_count` is the padded row width for each variant's data, ensuring
+    // that each row can be processed with full SIMD vectors without scalar fallbacks.
     let padded_score_count = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
-    let matrix_size = num_reconciled_variants * padded_score_count;
 
-    let mut variant_score_weights = vec![0.0f32; matrix_size];
-    let mut variant_score_flips = vec![0u8; matrix_size];
+    // Create the per-variant data structures in parallel. Each variant gets its own
+    // self-contained, padded (weights, flips) tuple. This "Structure of Arrays" to
+    // "Array of Structures" transformation is key to enabling efficient "gather"
+    // operations in the pipeline, as it makes all data for a single variant
+    // contiguous and easily accessible.
+    let variant_data: Vec<(Vec<f32>, Vec<u8>)> = (0..num_reconciled_variants)
+        .into_par_iter()
+        .map(|row_idx| {
+            let mut weights_for_variant = vec![0.0f32; padded_score_count];
+            let mut flips_for_variant = vec![0u8; padded_score_count];
 
-    // Populate both the weights and flip mask matrices in parallel.
-    // This is the O(N*K) workhorse of the preparation phase.
-    variant_score_weights
-        .par_chunks_mut(padded_score_count)
-        .zip(variant_score_flips.par_chunks_mut(padded_score_count))
-        .enumerate()
-        .for_each(|(row_idx, (weights_slice, flip_slice))| {
-                    let reconciled_variant_idx = ReconciledVariantIndex(row_idx as u32);
-            let first_item_pos = work_items.partition_point(|item| item.reconciled_variant_idx < reconciled_variant_idx);
-            let first_after_pos = work_items.partition_point(|item| item.reconciled_variant_idx <= reconciled_variant_idx);
+            let reconciled_variant_idx = ReconciledVariantIndex(row_idx as u32);
+            // `partition_point` is used on the sorted `work_items` to efficiently find
+            // the slice of items corresponding to the current variant row. This is a key
+            // algorithmic optimization that avoids repeated linear scans.
+            let first_item_pos =
+                work_items.partition_point(|item| item.reconciled_variant_idx < reconciled_variant_idx);
+            let first_after_pos =
+                work_items.partition_point(|item| item.reconciled_variant_idx <= reconciled_variant_idx);
             let items_for_this_row = &work_items[first_item_pos..first_after_pos];
 
             for item in items_for_this_row {
                 let col = item.col_idx.0;
-                weights_slice[col] = item.weight;
+                weights_for_variant[col] = item.weight;
                 if item.is_flipped {
-                    flip_slice[col] = 1;
+                    flips_for_variant[col] = 1;
                 }
             }
-        });
+            (weights_for_variant, flips_for_variant)
+        })
+        .collect();
 
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     Ok(PreparationResult::new(
-        variant_score_weights,
-        variant_score_flips,
+        variant_data,
         padded_score_count,
         required_bim_indices,
         score_names,
