@@ -13,6 +13,7 @@ use clap::Parser;
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
+use gnomon::types::PreparationResult;
 use ryu;
 use std::error::Error;
 use std::ffi::OsString;
@@ -93,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 fn run_preparation_phase(
     plink_prefix: &Path,
     args: &Args,
-) -> Result<Arc<prepare::PreparationResult>, Box<dyn Error + Send + Sync>> {
+) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     eprintln!("> Using PLINK prefix: {}", plink_prefix.display());
     let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
