@@ -623,7 +623,7 @@ use crate::types::ComputePath;
 // frequency for a variant is above this value, it's considered "dense" and sent
 // to the high-throughput person-major path. Otherwise, it's "sparse" and sent to
 // the low-overhead variant-major path. This value can be tuned based on profiling.
-const variant_DENSITY_THRESHOLD: f32 = 0.05;
+const VARIANT_DENSITY_THRESHOLD: f32 = 0.05;
 
 /// Assesses a single variant's data and determines the optimal compute path.
 ///
@@ -633,7 +633,7 @@ const variant_DENSITY_THRESHOLD: f32 = 0.05;
 pub fn assess_path(variant_data: &[u8], total_people: usize) -> ComputePath {
     let non_ref_allele_freq = assess_variant_density(variant_data, total_people);
 
-    if non_ref_allele_freq > variant_DENSITY_THRESHOLD {
+    if non_ref_allele_freq > VARIANT_DENSITY_THRESHOLD {
         ComputePath::PersonMajor
     } else {
         ComputePath::VariantMajor
