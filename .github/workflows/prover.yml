@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: leanprovercommunity/mathlib:latest
+      options: --user root
     timeout-minutes: 5
     
     steps:
@@ -30,6 +31,8 @@ jobs:
         
       - name: Build and prove
         run: |
-          # Mathlib is already installed in the container!
-          # Just build our files
-          lake build Calibrator --no-cache
+          # Fix permissions for the lean user
+          chown -R 1000:1000 .
+          
+          # Run as the lean user
+          su lean -c "lake build Calibrator --no-cache"
