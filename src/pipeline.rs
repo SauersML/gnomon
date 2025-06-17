@@ -319,9 +319,11 @@ async fn aggregate_results(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Take ownership of the handles, leaving an empty Vec in the context.
     for handle in std::mem::take(&mut context.compute_handles) {
-        // Await the task's completion. The first `?` handles task panics (JoinError),
-        // and the second `?` handles business-logic errors returned by the task itself.
-        match handle.await?? {
+        // Await the task's completion, propagating JoinErrors (e.g., panics) with `?`.
+        let task_result = handle.await?;
+
+        // Now match on the business-logic `Result` returned by the task itself.
+        match task_result {
             Ok(result) => {
                 // 1. Aggregate scores and counts into the master buffers.
                 // This `zip` iterator is highly performant and likely auto-vectorized.
