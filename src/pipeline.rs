@@ -379,12 +379,9 @@ fn dispatch_work(
                 )?;
             }
             WorkParcel::Dense(data) => {
-                // The person-major path now receives the pre-gathered, contiguous data,
-                // restoring its performance by eliminating the gather-scatter bottleneck.
+                // The person-major path now receives the "recipe" and performs the gather internally.
                 batch::run_person_major_path(
                     &data.data,
-                    &data.weights,
-                    &data.flips,
                     &data.reconciled_variant_indices,
                     &prep_result,
                     &mut clean_scores,
