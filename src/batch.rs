@@ -59,26 +59,6 @@ impl SparseIndexPool {
     }
 }
 
-/// A thread-local pool for reusing the large memory buffers required for gathering
-/// non-contiguous kernel input data. This is an implementation detail of the
-/// batch module, exposed publicly for resource management by the pipeline.
-#[derive(Default, Debug)]
-pub struct KernelInputBufferPool {
-    pool: ThreadLocal<RefCell<(Vec<f32>, Vec<u8>)>>,
-}
-
-impl KernelInputBufferPool {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Gets the thread-local buffer tuple, creating it if it doesn't exist.
-    #[inline(always)]
-    fn get_or_default(&self) -> &RefCell<(Vec<f32>, Vec<u8>)> {
-        self.pool.get_or_default()
-    }
-}
-
 // ========================================================================================
 //                                   PUBLIC API
 // ========================================================================================
@@ -87,13 +67,14 @@ impl KernelInputBufferPool {
 /// (pivot) path. This path is efficient for batches with high variant density.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
+    weights: &[f32],
+    flips: &[u8],
     reconciled_variant_indices: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut CleanScores,
     partial_missing_counts_out: &mut CleanCounts,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
-    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // The type system has already guaranteed the buffers are zeroed.
@@ -118,13 +99,14 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 variant_major_data,
+                weights,
+                flips,
                 reconciled_variant_indices,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                kernel_input_buffer_pool,
             );
         }
         PersonSubset::Indices(indices) => {
@@ -132,13 +114,14 @@ pub fn run_person_major_path(
             process_people_iterator(
                 iter,
                 variant_major_data,
+                weights,
+                flips,
                 reconciled_variant_indices,
                 prep_result,
                 partial_scores_out,
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                kernel_input_buffer_pool,
             );
         }
     };
