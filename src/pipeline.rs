@@ -237,63 +237,87 @@ fn spawn_io_producer_task(
     })
 }
 
-/// The core orchestration loop that receives and dispatches SNPs.
+/// The core orchestration loop that receives and dispatches variants.
+/// This function is responsible for managing the `DenseVariantBatch` state machine.
 async fn run_orchestration_loop(
     context: &mut PipelineContext,
     full_buffer_rx: &mut mpsc::Receiver<PackedVariantGenotypes>,
     empty_buffer_tx: &mpsc::Sender<IoCommand>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut required_indices_cursor: usize = 0;
-    let dense_batch_capacity = calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
-    let mut dense_batch = DenseVariantBatch::new_empty(dense_batch_capacity);
+    let dense_batch_capacity =
+        calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
+    let mut dense_batch = DenseVariantBatch::Empty;
 
-    // This is the main loop of the application's concurrent phase.
     'orchestrator: while let Some(packed_genotypes) = full_buffer_rx.recv().await {
-        // The orchestrator receives a buffer only for SNPs that are required. Since the
-        // I/O producer reads them in the sorted order defined by `required_bim_indices`,
-        // the `required_indices_cursor` directly corresponds to the row index in the
-        // dense compute matrices.
         let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
         required_indices_cursor += 1;
 
-        // The "brain" of the adaptive engine: make the dispatch decision.
-        let path_decision =
-            batch::assess_path(&packed_genotypes.0, context.prep_result.total_people_in_fam);
+        let path_decision = batch::assess_path(
+            &packed_genotypes.0,
+            context.prep_result.total_people_in_fam,
+        );
 
         match path_decision {
-            ComputePath::SnpMajor => {
-                // To preserve processing order, we must flush any pending dense SNPs
-                // before processing this sparse one.
-                dispatch_and_clear_dense_batch(&mut dense_batch, context);
+            ComputePath::VariantMajor => {
+                // To preserve order, we must flush any pending dense batch.
+                // We take ownership of the batch state, replacing it with Empty.
+                let batch_to_flush = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty);
+                // If the batch we took was buffering data, dispatch it.
+                if let DenseVariantBatch::Buffering(data) = batch_to_flush {
+                    dispatch_dense_batch(data, context);
+                }
 
-                // Now, dispatch the sparse SNP for immediate computation.
+                // Now, dispatch the sparse variant for immediate computation.
                 let handle = dispatch_variant_major_path(
                     packed_genotypes,
                     reconciled_variant_index,
                     context.prep_result.clone(),
-                    context.kernel_input_buffer_pool.clone(),
+                    context.partial_result_pool.clone(),
                 );
                 context.compute_handles.push(handle);
             }
             ComputePath::PersonMajor => {
-                // Add the dense SNP's data and metadata to the current batch.
-                dense_batch.data.extend_from_slice(&packed_genotypes.0);
-                dense_batch.reconciled_variant_indices.push(reconciled_variant_index);
+                let updated_batch = match dense_batch {
+                    // If the batch was empty, create a new one.
+                    DenseVariantBatch::Empty => {
+                        let mut data = Vec::with_capacity(dense_batch_capacity);
+                        data.extend_from_slice(&packed_genotypes.0);
+                        let batch_data = DenseVariantBatchData {
+                            data,
+                            reconciled_variant_indices: vec![reconciled_variant_index],
+                        };
+                        DenseVariantBatch::Buffering(batch_data)
+                    }
+                    // If it was already buffering, add to the existing data.
+                    DenseVariantBatch::Buffering(mut batch_data) => {
+                        batch_data.data.extend_from_slice(&packed_genotypes.0);
+                        batch_data
+                            .reconciled_variant_indices
+                            .push(reconciled_variant_index);
+                        DenseVariantBatch::Buffering(batch_data)
+                    }
+                };
+                dense_batch = updated_batch;
 
-                // Immediately recycle the now-empty buffer by sending a `Read`
-                // command back to the I/O producer.
+                // Recycle the now-empty buffer immediately.
                 if empty_buffer_tx
                     .send(IoCommand::Read(packed_genotypes.0))
                     .await
                     .is_err()
                 {
-                    // I/O thread has shut down unexpectedly. Terminate the loop.
-                    break 'orchestrator;
+                    break 'orchestrator';
                 }
 
-                // If the batch has reached its target capacity, dispatch it.
-                if dense_batch.data.len() >= dense_batch.data.capacity() {
-                    dispatch_and_clear_dense_batch(&mut dense_batch, context);
+                // Check if the batch is now full.
+                if let DenseVariantBatch::Buffering(data) = &dense_batch {
+                    if data.data.len() >= dense_batch_capacity {
+                        let batch_to_dispatch =
+                            std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty);
+                        if let DenseVariantBatch::Buffering(payload) = batch_to_dispatch {
+                            dispatch_dense_batch(payload, context);
+                        }
+                    }
                 }
             }
         }
@@ -306,12 +330,11 @@ async fn run_orchestration_loop(
         }
     }
 
-    // The loop has finished, meaning the I/O producer has closed its channel.
-    // We must flush any final, partially-filled dense batch.
-    dispatch_and_clear_dense_batch(&mut dense_batch, context);
+    // The loop has finished; flush any final, partially-filled dense batch.
+    if let DenseVariantBatch::Buffering(data) = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty) {
+        dispatch_dense_batch(data, context);
+    }
 
-    // Finally, tell the I/O producer to shut down gracefully.
-    // It might have already terminated, so we ignore any potential send error.
     let _ = empty_buffer_tx.send(IoCommand::Shutdown).await;
 
     Ok(())
