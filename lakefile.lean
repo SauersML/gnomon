@@ -5,7 +5,7 @@ package calibration where
   srcDir := "proofs"
 
 require mathlib from git
-  "https://github.com/leanprover-community/mathlib4.git" @ "v4.21.0"
+  "https://github.com/leanprover-community/mathlib4.git" @ "v4.12.0"
 
 @[default_target]
-lean_lib Framework where
+lean_lib Calibrator where
