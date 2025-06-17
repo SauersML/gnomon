@@ -627,12 +627,19 @@ fn assess_snp_density(snp_data: &[u8], total_people: usize) -> f32 {
         return 0.0;
     }
 
-    let (chunks, remainder) = snp_data.as_chunks::<u64>();
-
+    const CHUNK_SIZE: usize = std::mem::size_of::<u64>();
     let mut set_bits: u32 = 0;
-    for &chunk in chunks {
-        set_bits += chunk.count_ones();
+
+    // Process full 8-byte chunks using `chunks_exact` for safety and performance.
+    let chunks = snp_data.chunks_exact(CHUNK_SIZE);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        // This conversion is safe because chunks_exact guarantees the slice length is CHUNK_SIZE.
+        let val = u64::from_ne_bytes(chunk.try_into().unwrap());
+        set_bits += val.count_ones();
     }
+
+    // Process the remainder byte by byte.
     for &byte in remainder {
         set_bits += byte.count_ones();
     }
