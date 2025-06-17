@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // The pipeline now passes single-SNP data buffers between the I/O producer and
     // the main consumer/orchestrator thread.
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpDataBuffer>(PIPELINE_DEPTH);
-    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
+    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<(Vec<u8>, bool)>(PIPELINE_DEPTH);
 
     eprintln!(
         "> Resource allocation complete in {:.2?}. Dense batch target: {} MB. Pipeline depth: {}",
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let single_snp_buffer_size = prep_result.bytes_per_snp as usize;
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
-            .send(vec![0u8; single_snp_buffer_size])
+            .send((vec![0u8; single_snp_buffer_size], true))
             .await?;
     }
 
@@ -423,6 +423,65 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 // ========================================================================================
 //                                  HELPER FUNCTIONS
 // ========================================================================================
+
+// A type alias for the result of a compute task.
+type ComputeResult = (DirtyScores, DirtyCounts, Option<Vec<u8>>);
+
+/// Dispatches a batch of dense SNPs to the person-major compute path.
+fn dispatch_person_major_batch(
+    batch_to_process: DenseSnpBatch,
+    prep_result: Arc<prepare::PreparationResult>,
+    tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
+    sparse_index_pool: Arc<SparseIndexPool>,
+    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+) -> task::JoinHandle<Result<ComputeResult, Box<dyn Error + Send + Sync>>> {
+    task::spawn_blocking(move || {
+        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+        let mut clean_scores = dirty_scores.into_clean();
+        let mut clean_counts = dirty_counts.into_clean();
+
+        batch::run_person_major_path(
+            &batch_to_process.data,
+            &prep_result,
+            &mut clean_scores,
+            &mut clean_counts,
+            &tile_pool,
+            &sparse_index_pool,
+            batch_to_process.start_matrix_row,
+            batch_to_process.snp_count,
+        )?;
+        
+        let result = (clean_scores.into_dirty(), clean_counts.into_dirty(), None);
+        Ok(result)
+    })
+}
+
+/// Dispatches a single sparse SNP to the SNP-major compute path.
+fn dispatch_snp_major_path(
+    snp_buffer: SnpDataBuffer,
+    matrix_row_index: MatrixRowIndex,
+    prep_result: Arc<prepare::PreparationResult>,
+    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+) -> task::JoinHandle<Result<ComputeResult, Box<dyn Error + Send + Sync>>> {
+    task::spawn_blocking(move || {
+        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+        let mut clean_scores = dirty_scores.into_clean();
+        let mut clean_counts = dirty_counts.into_clean();
+
+        batch::run_snp_major_path(
+            &snp_buffer.0,
+            &prep_result,
+            &mut clean_scores,
+            &mut clean_counts,
+            matrix_row_index,
+        )?;
+
+        // The SNP buffer is passed back so it can be recycled.
+        let result = (clean_scores.into_dirty(), clean_counts.into_dirty(), Some(snp_buffer.0));
+        Ok(result)
+    })
+}
+
 
 /// Intelligently resolves the user-provided input path to a PLINK prefix.
 fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
