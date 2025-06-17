@@ -164,12 +164,11 @@ fn process_people_iterator<'a, I>(
                 person_indices_in_block,
                 prep_result,
                 snp_major_data,
+                metadata,
                 block_scores_out,
                 block_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
-                matrix_row_start_idx,
-                snps_in_chunk,
             );
         });
 }
