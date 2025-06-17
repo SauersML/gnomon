@@ -129,14 +129,18 @@ pub struct PackedVariantGenotypes(pub Vec<u8>);
 
 /// The data payload of a non-empty `DenseVariantBatch`. This struct is public
 /// to allow the pipeline orchestrator to own and move the data out of a
-/// `DenseVariantBatch::Buffering` state.
+/// `DenseVariantBatch::Buffering` state. It contains all data required for the
+/// person-major path, pre-gathered into contiguous buffers.
 #[derive(Debug)]
 pub struct DenseVariantBatchData {
     /// A contiguous buffer of packed variant genotype data.
     pub data: Vec<u8>,
-    /// The reconciled variant indices for each corresponding variant in the `data` buffer.
-    /// This metadata is critical for looking up weights and flip flags.
-    pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
+    /// A contiguous buffer of pre-gathered, padded weights for the variants in this batch.
+    pub weights: Vec<f32>,
+    /// A contiguous buffer of pre-gathered, padded flips for the variants in this batch.
+    pub flips: Vec<u8>,
+    /// The number of variants in this batch.
+    pub variant_count: usize,
 }
 
 /// A batch of raw variant data, curated to contain only "dense" variants
@@ -164,6 +168,7 @@ impl DenseVariantBatch {
         }
     }
 }
+
 /// Represents the dispatcher's decision for which compute path to use for a
 /// given unit of work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
