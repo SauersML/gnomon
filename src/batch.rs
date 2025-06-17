@@ -432,7 +432,7 @@ fn process_tile(
         // --- All Deferred Missing Events in a Batch ---
         // Now that the fast-path work is done, we process the slow-path work all at once.
         for &(person_idx, snp_idx_in_chunk) in missing_events.iter() {
-            let global_matrix_row_idx = matrix_row_start_idx.0 as usize + snp_idx_in_chunk;
+            let global_matrix_row_idx = metadata[snp_idx_in_chunk].0 as usize;
             let scores_for_this_variant =
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
             let weight_row_offset = global_matrix_row_idx * stride;
