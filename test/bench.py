@@ -238,7 +238,7 @@ class RealisticDataGenerator:
             score_df_source.loc[flip_indices, 'effect_allele'] = score_df_source.loc[flip_indices, 'other_allele']
             score_df_source.loc[flip_indices, 'other_allele'] = orig_eff
             
-            final_score_df = score_df_source[['id', 'effect_allele', 'other_allele']].rename(columns={'id': 'snp_id'})
+            final_score_df = score_df_source[['id', 'effect_allele', 'other_allele']].rename(columns={'id': 'variant_id'})
             n_variants_in_score = len(final_score_df)
             for i in range(sf_config['n_scores']):
                 dist_name, p1, p2 = random.choice(EFFECT_DISTRIBUTIONS)
