@@ -230,7 +230,7 @@ fn spawn_io_producer_task(
                 bed_row_cursor += 1;
             } else {
                 // `read_next_snp` returned `None`, indicating End-Of-File.
-                break 'producer';
+                break 'producer;
             }
         }
         Ok(())
