@@ -307,7 +307,7 @@ async fn run_orchestration_loop(
                     .await
                     .is_err()
                 {
-                    break 'orchestrator';
+                    break 'orchestrator;
                 }
 
                 // After adding, check if the batch is now full and needs to be dispatched.
