@@ -253,7 +253,10 @@ async fn run_orchestration_loop(
             },
 
             maybe_buffer = full_buffer_rx.recv() => {
-                let Some(filled_buffer) = maybe_buffer else { break; };
+                let filled_buffer = match maybe_buffer {
+                    Some(buffer) => buffer,
+                    None => break,
+                };
 
                 let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
                 required_indices_cursor += 1;
