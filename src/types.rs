@@ -251,8 +251,7 @@ impl PreparationResult {
     /// Only the `prepare` module can construct this "proof token".
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        variant_score_weights: Vec<f32>,
-        variant_score_flips: Vec<u8>,
+        variant_data: Vec<(Vec<f32>, Vec<u8>)>,
         padded_score_count: usize,
         required_bim_indices: Vec<BimRowIndex>,
         score_names: Vec<String>,
@@ -268,8 +267,7 @@ impl PreparationResult {
         person_fam_to_output_idx: Vec<Option<u32>>,
     ) -> Self {
         Self {
-            variant_score_weights,
-            variant_score_flips,
+            variant_data,
             padded_score_count,
             required_bim_indices,
             score_names,
@@ -284,23 +282,6 @@ impl PreparationResult {
             bytes_per_variant,
             person_fam_to_output_idx,
         }
-    }
-
-    // --- Public Getters for Private Data ---
-
-    #[inline(always)]
-    pub fn variant_score_weights(&self) -> &[f32] {
-        &self.variant_score_weights
-    }
-
-    #[inline(always)]
-    pub fn variant_score_flips(&self) -> &[u8] {
-        &self.variant_score_flips
-    }
-
-    #[inline(always)]
-    pub fn padded_score_count(&self) -> usize {
-        self.padded_score_count
     }
 }
 
