@@ -11,6 +11,8 @@
 // By centralizing these definitions, we create a single source of truth and enforce
 // a clean, one-way dependency graph where high-level modules can depend on these
 // core types, but not on each other's implementation details.
+//
+// This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
 use std::ops::{Deref, DerefMut};
 
