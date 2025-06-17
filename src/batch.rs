@@ -250,7 +250,7 @@ fn process_tile(
     let zeros_f32 = f32x8::splat(0.0);
 
     for snp_idx in 0..snps_in_chunk {
-            let global_matrix_row_idx = (matrix_row_start_idx.0 as usize) + snp_idx;
+        let global_matrix_row_idx = metadata[snp_idx].0 as usize;
         let row_offset = global_matrix_row_idx * stride;
         let weight_row = &weights_matrix[row_offset..row_offset + stride];
         let flip_row = &flip_mask_matrix[row_offset..row_offset + stride];
