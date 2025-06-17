@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let single_snp_buffer_size = prep_result.bytes_per_snp as usize;
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
-            .send((vec![0u8; single_snp_buffer_size], true))
+            .send(IoCommand::Read(vec![0u8; single_snp_buffer_size]))
             .await?;
     }
 
@@ -230,10 +230,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut bed_row_cursor: u32 = 0;
         let mut required_indices_cursor: usize = 0;
 
-        'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
+        'producer: while let Some(command) = empty_buffer_rx.recv().await {
+            let mut buffer_vec = match command {
+                IoCommand::Read(buffer) => buffer,
+                IoCommand::Shutdown => break 'producer,
+            };
+
             let snp_data_opt = match task::spawn_blocking(move || {
-                let snp_data_opt = reader.read_next_snp(&mut buffer)?;
-                Ok::<_, io::Error>((reader, buffer, snp_data_opt))
+                let snp_data_opt = reader.read_next_snp(&mut buffer_vec)?;
+                Ok::<_, io::Error>((reader, buffer_vec, snp_data_opt))
             })
             .await
             {
@@ -260,8 +265,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         break 'producer'; // Consumer hung up.
                     }
                 } else {
-                    // This SNP is not needed, so recycle its buffer immediately.
-                    if empty_buffer_tx.send(filled_buffer).await.is_err() {
+                    // This SNP is not needed, so recycle its buffer immediately
+                    // by sending a new `Read` command.
+                    if empty_buffer_tx.send(IoCommand::Read(filled_buffer)).await.is_err() {
                         break 'producer';
                     }
                 }
