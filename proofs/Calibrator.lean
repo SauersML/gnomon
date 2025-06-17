@@ -7,13 +7,10 @@ import Mathlib.Probability.Notation
 import Mathlib.Probability.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Analysis.SpecialFunctions.Log.Basic
-import Mathlib.LinearAlgebra.Matrix.Determinant
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.LinearAlgebra.GeneralLinearGroup
 import Mathlib.MeasureTheory.Function.L2Space
-import Mathlib.Statistics.BasicStatistics
 import Mathlib.Analysis.InnerProductSpace.Basic
-import Mathlib.Analysis.NormedSpace.Basic
 
 -- The project's root namespace, as defined in `lakefile.lean`.
 namespace Calibrator
