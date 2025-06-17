@@ -10,28 +10,18 @@
 // from argument parsing to final output.
 
 use clap::Parser;
-use crossbeam_queue::ArrayQueue;
-use gnomon::batch::{self, SparseIndexPool};
-use gnomon::io::SnpReader;
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
-use gnomon::types::{
-    BimRowIndex, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, MatrixRowIndex, SnpDataBuffer,
-};
+use ryu;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
-use tokio::task;
-use std::fs::File;
-use cache_size;
-use ryu;
 
 // ========================================================================================
 //                              COMMAND-LINE INTERFACE DEFINITION
