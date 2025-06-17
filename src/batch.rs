@@ -636,7 +636,7 @@ pub fn assess_path(variant_data: &[u8], total_people: usize) -> ComputePath {
     if non_ref_allele_freq > SNP_DENSITY_THRESHOLD {
         ComputePath::PersonMajor
     } else {
-        ComputePath::SnpMajor
+        ComputePath::VariantMajor
     }
 }
 
