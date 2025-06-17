@@ -59,6 +59,26 @@ impl SparseIndexPool {
     }
 }
 
+/// A thread-local pool for reusing the large memory buffers required for gathering
+/// non-contiguous kernel input data. This is an implementation detail of the
+/// batch module, exposed publicly for resource management by the pipeline.
+#[derive(Default, Debug)]
+pub struct KernelInputBufferPool {
+    pool: ThreadLocal<RefCell<(Vec<f32>, Vec<u8>)>>,
+}
+
+impl KernelInputBufferPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Gets the thread-local buffer tuple, creating it if it doesn't exist.
+    #[inline(always)]
+    fn get_or_default(&self) -> &RefCell<(Vec<f32>, Vec<u8>)> {
+        self.pool.get_or_default()
+    }
+}
+
 // ========================================================================================
 //                                   PUBLIC API
 // ========================================================================================
@@ -73,6 +93,7 @@ pub fn run_person_major_path(
     partial_missing_counts_out: &mut CleanCounts,
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
+    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     // The type system has already guaranteed the buffers are zeroed.
@@ -103,6 +124,7 @@ pub fn run_person_major_path(
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
+                kernel_input_buffer_pool,
             );
         }
         PersonSubset::Indices(indices) => {
@@ -116,6 +138,7 @@ pub fn run_person_major_path(
                 partial_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
+                kernel_input_buffer_pool,
             );
         }
     };
@@ -138,6 +161,7 @@ fn process_people_iterator<'a, I>(
     partial_missing_counts: &'a mut [u32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
+    kernel_input_buffer_pool: &'a KernelInputBufferPool,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
@@ -169,6 +193,7 @@ fn process_people_iterator<'a, I>(
                 block_missing_counts_out,
                 tile_pool,
                 sparse_index_pool,
+                kernel_input_buffer_pool,
             );
         });
 }
@@ -185,6 +210,7 @@ fn process_block(
     block_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
+    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices.len();
     let tile_size = person_indices_in_block.len() * variants_in_chunk;
@@ -208,6 +234,7 @@ fn process_block(
         block_scores_out,
         block_missing_counts_out,
         sparse_index_pool,
+        kernel_input_buffer_pool,
     );
 
     // Return the tile to the pool for reuse.
@@ -225,6 +252,7 @@ fn process_tile(
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
+    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices.len();
     let num_scores = prep_result.score_names.len();
@@ -304,7 +332,7 @@ fn process_tile(
         person_scores[..num_scores].copy_from_slice(&chunk_baseline[..num_scores]);
     }
 
-// --- Part 2: Main Processing Loop (Mini-Batching) ---
+    // --- Part 2: Main Processing Loop (Mini-Batching) ---
     // Iterate over the tile in small, accuracy-preserving chunks.
     for snp_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =
@@ -364,19 +392,16 @@ fn process_tile(
             }
         }
 
-        // --- B. Create Matrix Views for the Mini-Batch ---
-        // Since the SNPs in the batch may not be contiguous in the original file,
-        // we can no longer use a simple slice. Instead, we must gather the rows.
+        // --- B. GATHER Kernel Input Data using the Reusable Pool ---
+        let thread_buffers = kernel_input_buffer_pool.get_or_default();
+        let (weights_chunk, flip_flags_chunk) = &mut *thread_buffers.borrow_mut();
 
-        /*
-         * PERFORMANCE-CRITICAL PATH: The logic below creates new, heap-allocated vectors
-         * (`weights_chunk`, `flip_flags_chunk`) on every single iteration of this mini-batch
-         * loop. As this function is called in parallel for many dense chunks, this
-         * results in high-frequency allocations.
-         */
-        let mut weights_chunk = Vec::with_capacity(mini_batch_size * padded_score_count);
-        let mut flip_flags_chunk = Vec::with_capacity(mini_batch_size * padded_score_count);
+        // Clear the buffers to reset their length to 0, but KEEP their memory.
+        weights_chunk.clear();
+        flip_flags_chunk.clear();
 
+        // This copy loop now fills the pre-allocated, thread-local buffers.
+        // It's just as fast as before, but without the allocation overhead.
         for i in 0..mini_batch_size {
             let snp_idx_in_chunk = snp_mini_batch_start + i;
             let matrix_row_idx = reconciled_variant_indices[snp_idx_in_chunk].0 as usize;
