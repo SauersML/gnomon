@@ -185,7 +185,7 @@ jobs:
       - name: Validate build outputs
         run: |
           echo "================================================="
-          echo "✅ FINAL VALIDATION"
+          echo " FINAL VALIDATION"
           echo "================================================="
           # This is the definitive check. If the .olean file exists,
           # the build was truly successful.
