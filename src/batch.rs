@@ -199,7 +199,7 @@ fn process_people_iterator<'a, I>(
 }
 
 /// Processes a single block of individuals.
-#[inline]
+#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
 fn process_block(
     person_indices_in_block: &[OriginalPersonIndex],
@@ -243,7 +243,7 @@ fn process_block(
 
 /// Dispatches a single, pivoted, person-major tile to the compute kernel after
 /// calculating a baseline score and pre-computing sparse indices.
-#[inline]
+#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
 fn process_tile(
     tile: &[EffectAlleleDosage],
@@ -495,7 +495,7 @@ fn process_tile(
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
 /// This function's sole purpose is to pivot raw genotype dosages from the SNP-major
 /// .bed layout to a person-major tile layout. It performs no reconciliation.
-#[inline]
+#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
 fn pivot_tile(
     variant_major_data: &[u8],
