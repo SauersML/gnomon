@@ -219,6 +219,7 @@ fn spawn_io_producer_task(
                     if full_buffer_tx.send(SnpDataBuffer(filled_buffer)).await.is_err() {
                         // The orchestrator has hung up (channel closed). Shut down.
                         break 'producer;
+                        
                     }
                 } else {
                     // This SNP is not relevant. The buffer and its data are simply
