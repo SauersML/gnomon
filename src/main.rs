@@ -363,10 +363,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     // After the loop, process any final, non-full dense batch.
-    if dense_batch.snp_count > 0 {
+    if !dense_batch.metadata.is_empty() {
         // This is a simplified version of the dispatch logic inside the loop.
         // In a full implementation, this would call the same dispatch helper.
-        eprintln!("> Processing final batch of {} dense SNPs...", dense_batch.snp_count);
+        // FIX LATER.
+        eprintln!("> Processing final batch of {} dense SNPs...", dense_batch.metadata.len());
         let prep_clone = Arc::clone(&prep_result);
         let tile_pool_clone = Arc::clone(&tile_pool);
         let partial_result_pool_clone = Arc::clone(&partial_result_pool);
@@ -375,7 +376,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let compute_handle = task::spawn_blocking(move || {
             let mut clean_scores = dirty_scores.into_clean();
             let mut clean_counts = dirty_counts.into_clean();
-            batch::run_chunk_computation(&dense_batch.data, &prep_clone, &mut clean_scores, &mut clean_counts, &tile_pool_clone, &sparse_index_pool_clone, dense_batch.start_matrix_row, dense_batch.snp_count, 0)?;
+            batch::run_person_major_path(&dense_batch.data, &dense_batch.metadata, &prep_clone, &mut clean_scores, &mut clean_counts, &tile_pool_clone, &sparse_index_pool_clone)?;
             let result = (clean_scores.into_dirty(), clean_counts.into_dirty());
             Ok::<_, Box<dyn Error + Send + Sync>>(result)
         });
@@ -384,7 +385,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) { *master += partial; }
         partial_result_pool_clone.push((partial_scores, partial_missing_counts)).unwrap();
     }
-
 
     io_handle.await?;
     eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
