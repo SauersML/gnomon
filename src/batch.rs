@@ -435,15 +435,15 @@ fn process_tile<'a>(
                         let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
-                        let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
-                        current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(current_scores_low.to_array());
+                        let mut present_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
+                        present_scores_low += adj_low_f64x4;
+                        scores_slice_low.copy_from_slice(&present_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
-                        let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
-                        current_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(current_scores_high.to_array());
+                        let mut present_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
+                        present_scores_high += adj_high_f64x4;
+                        scores_slice_high.copy_from_slice(&present_scores_high.to_array());
                     } else {
                         let start = scores_offset;
                         let end = num_scores;
@@ -512,10 +512,10 @@ fn pivot_tile(
 
     for person_chunk_start in (0..num_people_in_block).step_by(SIMD_LANES) {
         let remaining_people = num_people_in_block - person_chunk_start;
-        let current_lanes = remaining_people.min(SIMD_LANES);
+        let present_lanes = remaining_people.min(SIMD_LANES);
 
         let person_indices = U64xN::from_array(core::array::from_fn(|i| {
-            if i < current_lanes {
+            if i < present_lanes {
                 person_indices_in_block[person_chunk_start + i].0 as u64
             } else {
                 0
@@ -526,11 +526,11 @@ fn pivot_tile(
 
         for variant_chunk_start in (0..variants_in_chunk).step_by(SIMD_LANES) {
             let remaining_variants = variants_in_chunk - variant_chunk_start;
-            let current_variants = remaining_variants.min(SIMD_LANES);
+            let present_variants = remaining_variants.min(SIMD_LANES);
 
             // --- 1. Decode a block of up to 8 variants using SIMD ---
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
-            for i in 0..current_variants {
+            for i in 0..present_variants {
                 let variant_idx_in_batch = variant_chunk_start + i;
 
                 // The offset is simply its index in the batch multiplied by the bytes per variant.
@@ -554,7 +554,7 @@ fn pivot_tile(
             let person_data_vectors = transpose_8x8_u8(dosage_vectors);
 
             // --- 3. Write data to the tile, handling full and partial chunks correctly ---
-            for i in 0..current_lanes {
+            for i in 0..present_lanes {
                 let person_idx_in_block = person_chunk_start + i;
                 let dest_offset = person_idx_in_block * variants_in_chunk + variant_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
@@ -567,14 +567,14 @@ fn pivot_tile(
                         let mut temp_row = [EffectAlleleDosage::default(); SIMD_LANES];
 
                         // 2. Un-shuffle the transposed vector into the temporary buffer.
-                            for j in 0..current_variants {
+                            for j in 0..present_variants {
                             let dosage_value = shuffled_person_row[UNSHUFFLE_MAP[j]];
                             temp_row[j] = EffectAlleleDosage(dosage_value);
                             }
 
                         // 3. Perform a single, bulk copy into the main tile.
-                        tile[dest_offset..dest_offset + current_variants]
-                            .copy_from_slice(&temp_row[..current_variants]);
+                        tile[dest_offset..dest_offset + present_variants]
+                            .copy_from_slice(&temp_row[..present_variants]);
             }
         }
     }
