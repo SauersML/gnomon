@@ -424,6 +424,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 //                                  HELPER FUNCTIONS
 // ========================================================================================
 
+/// Represents the concrete action the orchestrator must take for a given SNP.
+enum DispatchAction {
+    /// The SNP is sparse and should be processed immediately.
+    ProcessSparse {
+        snp_buffer: SnpDataBuffer,
+        matrix_row_index: MatrixRowIndex,
+    },
+    /// The SNP is dense and should be added to the pending batch.
+    BufferDense {
+        snp_buffer: SnpDataBuffer,
+        matrix_row_index: MatrixRowIndex,
+    },
+}
+
 // A type alias for the result of a compute task.
 type ComputeResult = (DirtyScores, DirtyCounts, Option<Vec<u8>>);
 
