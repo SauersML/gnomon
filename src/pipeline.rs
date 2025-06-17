@@ -5,8 +5,8 @@
 // ========================================================================================
 //
 // This module contains the "how" of the concurrent pipeline. It is architected to
-// prevent resource-based deadlocks by enforcing a strict and symmetrical lifecycle for
-// all I/O buffers.
+// prevent resource-based deadlocks and resource exhaustion panics by enforcing a
+// strict, semaphore-gated lifecycle for all compute tasks.
 
 use crate::batch::{self, KernelInputBufferPool, SparseIndexPool};
 use crate::io::BedReader;
@@ -16,17 +16,24 @@ use crate::types::{
 };
 use cache_size;
 use crossbeam_queue::ArrayQueue;
+use futures::stream::{FuturesUnordered, StreamExt};
 use num_cpus;
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::{self, JoinHandle};
 
 // ========================================================================================
 //                          PUBLIC API & CONTEXT
 // ========================================================================================
+
+/// The maximum number of concurrent compute tasks allowed to be in-flight. This value
+/// is also used to size the `partial_result_pool`, and it determines the number of
+/// permits in the `Semaphore` that gates task dispatch. It must be a value greater
+/// than `PIPELINE_DEPTH` to prevent deadlocks.
+const MAX_IN_FLIGHT_TASKS: usize = 32;
 
 /// Owns shared resource pools and the final result buffers for the pipeline.
 ///
@@ -41,15 +48,11 @@ pub struct PipelineContext {
     tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
     sparse_index_pool: Arc<SparseIndexPool>,
     kernel_input_buffer_pool: Arc<KernelInputBufferPool>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+    pub partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 
     // The final destination for all computed data, accessible after the pipeline runs.
     pub all_scores: Vec<f64>,
     pub all_missing_counts: Vec<u32>,
-
-    // A list of all in-flight compute tasks, private to this module.
-    join_handles:
-        Vec<task::JoinHandle<Result<(DirtyScores, DirtyCounts), Box<dyn Error + Send + Sync>>>>,
 }
 
 impl PipelineContext {
@@ -59,10 +62,6 @@ impl PipelineContext {
         let num_scores = prep_result.score_names.len();
         let result_buffer_size = prep_result.num_people_to_score * num_scores;
 
-        // The number of parallel compute tasks can be higher than the I/O depth.
-        // Size the pool to avoid deadlocks. It must be at least as large as the
-        // maximum number of tasks that can be running concurrently.
-        const MAX_IN_FLIGHT_TASKS: usize = 32;
         let partial_result_pool = Arc::new(ArrayQueue::new(MAX_IN_FLIGHT_TASKS));
         for _ in 0..MAX_IN_FLIGHT_TASKS {
             partial_result_pool
@@ -81,7 +80,6 @@ impl PipelineContext {
             partial_result_pool,
             all_scores: vec![0.0f64; result_buffer_size],
             all_missing_counts: vec![0u32; result_buffer_size],
-            join_handles: Vec::with_capacity(256),
         }
     }
 }
@@ -123,12 +121,9 @@ pub async fn run(
     );
 
     // Run the main orchestration loop, which receives data from the I/O task
-    // and spawns compute tasks.
+    // and spawns compute tasks. This function now contains all dispatch, aggregation,
+    // and backpressure logic.
     run_orchestration_loop(context, &mut full_buffer_rx, &empty_buffer_tx).await?;
-
-    // After the orchestration loop finishes, await all spawned compute tasks
-    // and aggregate their results into the context's master buffers.
-    aggregate_results(context).await?;
 
     // Finally, await the I/O handle to ensure it has terminated cleanly and
     // propagate any errors it may have encountered.
@@ -145,7 +140,7 @@ pub async fn run(
 /// This enum decouples the I/O transport mechanism (the buffer) from the compute
 /// payload. By taking ownership of the necessary data, it guarantees that a compute
 /// task has everything it needs and prevents I/O buffers from being accidentally
-/// captured and held by long-running tasks, which was the source of the deadlock.
+/// captured and held by long-running tasks.
 enum WorkParcel {
     /// A single variant to be processed by the low-overhead variant-major path.
     Sparse {
@@ -166,9 +161,8 @@ fn spawn_io_producer_task(
     plink_prefix: PathBuf,
     full_buffer_tx: mpsc::Sender<Vec<u8>>,
     mut empty_buffer_rx: mpsc::Receiver<Vec<u8>>,
-) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
+) -> JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
     tokio::spawn(async move {
-        // --- One-time setup within the spawned task ---
         let bed_path = plink_prefix.with_extension("bed");
         let mut reader = match BedReader::new(
             &bed_path,
@@ -182,11 +176,7 @@ fn spawn_io_producer_task(
         let mut bed_row_cursor: u32 = 0;
         let mut required_indices_cursor: usize = 0;
 
-        // --- Main I/O Producer Loop ---
-        // This loop is driven by the orchestrator sending an empty buffer to fill.
         'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
-            // This inner loop ensures we hold onto the buffer until we find a relevant
-            // variant to send to the orchestrator.
             'read_loop: loop {
                 let (new_reader, filled_buffer_opt) = match task::spawn_blocking(move || {
                     let variant_data_opt = reader.read_next_variant(&mut buffer)?;
@@ -198,37 +188,27 @@ fn spawn_io_producer_task(
                     Ok(Err(e)) => return Err(Box::new(e)),
                     Err(e) => return Err(Box::new(e)),
                 };
-
                 reader = new_reader;
 
                 if let Some(filled_buffer) = filled_buffer_opt {
-                    // We must regain ownership of the buffer to reuse it in the next iteration.
                     buffer = filled_buffer;
-
                     let is_relevant = prep_result
                         .required_bim_indices
                         .get(required_indices_cursor)
                         .map_or(false, |&req_idx| req_idx.0 == bed_row_cursor);
 
-                    // We must advance the cursor *after* the check to stay in sync.
                     bed_row_cursor += 1;
 
                     if is_relevant {
                         required_indices_cursor += 1;
                         if full_buffer_tx.send(buffer).await.is_err() {
-                            // The orchestrator has hung up. Shut down.
                             break 'producer;
                         }
-                        // We have successfully sent the buffer, so we must now break the
-                        // inner loop to await a new empty buffer from the orchestrator.
                         break 'read_loop;
                     } else {
-                        // This variant is not relevant. The loop continues, reusing the
-                        // *same buffer* to read the next variant from the file.
                         continue 'read_loop;
                     }
                 } else {
-                    // End-Of-File reached. Terminate the producer task.
                     break 'producer;
                 }
             }
@@ -237,9 +217,15 @@ fn spawn_io_producer_task(
     })
 }
 
-/// The core orchestration loop that receives and dispatches variants.
-/// This function is responsible for managing the `DenseVariantBatch` state machine
-/// and ensuring the I/O buffer pipeline remains full to prevent deadlocks.
+/// The core orchestration loop that receives, dispatches, and aggregates work.
+///
+/// This function is the heart of the robust pipeline. It uses a `tokio::select!`
+/// loop to concurrently handle two main activities:
+/// 1. Receiving new variant data from the I/O producer.
+/// 2. Receiving results from any completed compute task.
+///
+/// A `Semaphore` is used to enforce a strict limit on the number of concurrent
+/// tasks, preventing resource exhaustion and providing natural backpressure.
 async fn run_orchestration_loop(
     context: &mut PipelineContext,
     full_buffer_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -250,96 +236,133 @@ async fn run_orchestration_loop(
         calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
     let mut dense_batch = DenseVariantBatch::Empty;
 
-    'orchestrator: while let Some(filled_buffer) = full_buffer_rx.recv().await {
-        let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
-        required_indices_cursor += 1;
+    // The semaphore gates access to the compute task pool. Its number of permits
+    // must equal the number of available resource sets (`partial_result_pool`).
+    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_TASKS));
 
-        let path_decision =
-            batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
+    // This stream will manage all in-flight JoinHandles, allowing us to poll
+    // for the next completed task in any order.
+    let mut in_flight_tasks = FuturesUnordered::new();
 
-        match path_decision {
-            ComputePath::VariantMajor => {
-                // To preserve ordering, we must flush any pending dense batch first.
-                dense_batch = dispatch_work(dense_batch, context);
+    loop {
+        tokio::select! {
+            // Branch 1: A completed compute task has returned a result.
+            // `biased` ensures we prefer to reap completed tasks to free up resources
+            // before trying to spawn new ones.
+            biased;
+            Some(task_result) = in_flight_tasks.next() => {
+                // A task finished. Release its semaphore permit immediately so a new
+                // task can be spawned.
+                semaphore.add_permits(1);
 
-                // Create a work parcel by cloning the data from the I/O buffer.
-                // This is a small cost for the much less frequent sparse path,
-                // and it guarantees the I/O buffer can be immediately recycled.
-                let parcel = WorkParcel::Sparse {
-                    data: filled_buffer.clone(),
-                    reconciled_variant_index,
+                match task_result? {
+                    Ok((scores, counts)) => {
+                        // Aggregate the results into the master buffers.
+                        for (master, &partial) in context.all_scores.iter_mut().zip(&scores) {
+                            *master += partial;
+                        }
+                        for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) {
+                            *master += partial;
+                        }
+                        // Return the large partial result buffers to the shared pool for reuse.
+                        context.partial_result_pool.push((scores, counts)).unwrap();
+                    }
+                    Err(e) => return Err(e),
+                }
+            },
+
+            // Branch 2: New data has arrived from the I/O producer.
+            maybe_buffer = full_buffer_rx.recv() => {
+                let Some(filled_buffer) = maybe_buffer else {
+                    // The I/O producer has finished and the channel is closed.
+                    // No more new data will arrive. Break the loop.
+                    break;
                 };
-                dispatch_work(parcel, context);
-            }
-            ComputePath::PersonMajor => {
-                // This match handles the state transitions for the dense batch.
-                dense_batch = match dense_batch {
-                    DenseVariantBatch::Empty => {
-                        let mut data = Vec::with_capacity(dense_batch_capacity);
-                        data.extend_from_slice(&filled_buffer);
-                        let batch_data = DenseVariantBatchData {
-                            data,
-                            reconciled_variant_indices: vec![reconciled_variant_index],
+
+                // Before we can spawn a task, we MUST acquire a permit.
+                // If the semaphore is at its limit (MAX_IN_FLIGHT_TASKS), this
+                // will asynchronously wait, providing backpressure.
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
+                required_indices_cursor += 1;
+
+                let path_decision =
+                    batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
+
+                let work_parcel = match path_decision {
+                    ComputePath::VariantMajor => {
+                        if let DenseVariantBatch::Buffering(data) = dense_batch {
+                            let parcel = WorkParcel::Dense(data);
+                            let handle = dispatch_work(parcel, context, permit);
+                            in_flight_tasks.push(handle);
+                            // We used one permit for the dense batch, now we need another.
+                            let new_permit = semaphore.clone().acquire_owned().await.unwrap();
+                            let sparse_parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
+                            let sparse_handle = dispatch_work(sparse_parcel, context, new_permit);
+                            in_flight_tasks.push(sparse_handle);
+                        } else {
+                            let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
+                            let handle = dispatch_work(parcel, context, permit);
+                            in_flight_tasks.push(handle);
+                        }
+                        dense_batch = DenseVariantBatch::Empty;
+                    },
+                    ComputePath::PersonMajor => {
+                        dense_batch = match dense_batch {
+                            DenseVariantBatch::Empty => {
+                                let mut data = Vec::with_capacity(dense_batch_capacity);
+                                data.extend_from_slice(&filled_buffer);
+                                DenseVariantBatch::Buffering(DenseVariantBatchData {
+                                    data,
+                                    reconciled_variant_indices: vec![reconciled_variant_index],
+                                })
+                            }
+                            DenseVariantBatch::Buffering(mut batch_data) => {
+                                batch_data.data.extend_from_slice(&filled_buffer);
+                                batch_data.reconciled_variant_indices.push(reconciled_variant_index);
+                                DenseVariantBatch::Buffering(batch_data)
+                            }
                         };
-                        DenseVariantBatch::Buffering(batch_data)
-                    }
-                    DenseVariantBatch::Buffering(mut batch_data) => {
-                        batch_data.data.extend_from_slice(&filled_buffer);
-                        batch_data
-                            .reconciled_variant_indices
-                            .push(reconciled_variant_index);
-                        DenseVariantBatch::Buffering(batch_data)
+                        // Give the permit back since we are just buffering and not dispatching yet.
+                        drop(permit);
                     }
                 };
 
-                // After adding, check if the batch is now full and needs to be dispatched.
+                // Symmetrical I/O Buffer Management: The I/O buffer is always returned.
+                if empty_buffer_tx.send(filled_buffer).await.is_err() {
+                    break;
+                }
+
+                // If a dense batch is now full, dispatch it.
                 if let DenseVariantBatch::Buffering(data) = &dense_batch {
                     if data.data.len() >= dense_batch_capacity {
-                        dense_batch = dispatch_work(dense_batch, context);
+                        let permit = semaphore.clone().acquire_owned().await.unwrap();
+                        let parcel = WorkParcel::Dense(std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty).into_data());
+                        let handle = dispatch_work(parcel, context, permit);
+                        in_flight_tasks.push(handle);
                     }
+                }
+
+                if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
+                    eprintln!( "> Processed {}/{} relevant variants...", required_indices_cursor, context.prep_result.num_reconciled_variants);
                 }
             }
         }
-
-        // Symmetrical I/O Buffer Management: In all cases, the data from the filled
-        // buffer has been handled (either cloned or copied). The buffer is now free
-        // to be immediately returned to the I/O producer to be filled again.
-        // This is the key to preventing the deadlock.
-        if empty_buffer_tx.send(filled_buffer).await.is_err() {
-            break 'orchestrator;
-        }
-
-        if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
-            eprintln!(
-                "> Processed {}/{} relevant variants...",
-                required_indices_cursor, context.prep_result.num_reconciled_variants
-            );
-        }
     }
 
-    // The I/O channel has closed. We must flush any final, partially-filled dense batch.
-    dispatch_work(dense_batch, context);
+    // After the I/O producer is done, flush any remaining dense batch.
+    if let DenseVariantBatch::Buffering(data) = dense_batch {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let parcel = WorkParcel::Dense(data);
+        let handle = dispatch_work(parcel, context, permit);
+        in_flight_tasks.push(handle);
+    }
 
-    // The I/O producer will terminate automatically when the `empty_buffer_tx`
-    // is dropped at the end of this function.
-
-    Ok(())
-}
-
-/// Awaits all in-flight compute tasks and aggregates their results.
-async fn aggregate_results(
-    context: &mut PipelineContext,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Take ownership of the handles, leaving an empty Vec in the context.
-    for handle in std::mem::take(&mut context.join_handles) {
-        // Await the task's completion, propagating JoinErrors (e.g., panics) with `?`.
-        let task_result = handle.await?;
-
-        // Now match on the business-logic `Result` returned by the task itself.
-        match task_result {
+    // Wait for all remaining in-flight tasks to complete.
+    while let Some(task_result) = in_flight_tasks.next().await {
+        match task_result? {
             Ok((scores, counts)) => {
-                // 1. Aggregate scores and counts into the master buffers.
-                // This `zip` iterator is highly performant and likely auto-vectorized.
                 for (master, &partial) in context.all_scores.iter_mut().zip(&scores) {
                     *master += partial;
                 }
@@ -347,66 +370,60 @@ async fn aggregate_results(
                 {
                     *master += partial;
                 }
-
-                // 2. Return the large partial result buffers to the shared pool for reuse.
                 context
                     .partial_result_pool
                     .push((scores, counts))
                     .unwrap();
-
-                // 3. I/O buffer recycling is no longer handled here. It is managed
-                //    synchronously by the orchestrator, preventing deadlocks.
             }
-            Err(e) => {
-                // A task returned a business-logic error. Propagate it immediately.
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
+
     Ok(())
 }
 
-/// A unified dispatcher that takes a `WorkParcel` or a `DenseVariantBatch`,
-/// spawns the appropriate compute task, and manages the lifecycle of the work.
+/// A unified dispatcher that takes a `WorkParcel`, spawns the appropriate compute
+/// task, and returns a `JoinHandle` to its result. The provided `SemaphorePermit`
+/// is consumed by the closure, ensuring it is not forgotten and is tied to the
+/// lifecycle of the spawned task.
 fn dispatch_work(
-    work: impl Into<Option<WorkParcel>>,
-    context: &mut PipelineContext,
-) -> DenseVariantBatch {
-    let maybe_parcel = work.into();
-    if maybe_parcel.is_none() {
-        return DenseVariantBatch::Empty;
-    }
-    let parcel = maybe_parcel.unwrap();
-
+    parcel: WorkParcel,
+    context: &PipelineContext,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> JoinHandle<Result<(DirtyScores, DirtyCounts), Box<dyn Error + Send + Sync>>> {
     // Clone the necessary Arcs for the spawned task. This is a cheap reference count bump.
     let prep_result = context.prep_result.clone();
     let partial_result_pool = context.partial_result_pool.clone();
+    let tile_pool = context.tile_pool.clone();
+    let sparse_index_pool = context.sparse_index_pool.clone();
+    let kernel_input_buffer_pool = context.kernel_input_buffer_pool.clone();
 
-    let handle = match parcel {
-        WorkParcel::Sparse {
-            data,
-            reconciled_variant_index,
-        } => task::spawn_blocking(move || {
-            let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
-            let mut clean_scores = dirty_scores.into_clean();
-            let mut clean_counts = dirty_counts.into_clean();
-            batch::run_variant_major_path(
-                &data,
-                &prep_result,
-                &mut clean_scores,
-                &mut clean_counts,
+    task::spawn_blocking(move || {
+        // This permit is held for the duration of the blocking task. When this
+        // closure finishes, the permit is dropped, effectively releasing it
+        // back to the semaphore. This happens even if the task panics.
+        let _permit = permit;
+
+        // Acquire a result buffer set. This will never panic because the semaphore
+        // guarantees that a permit could only be acquired if a buffer set was available.
+        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+        let mut clean_scores = dirty_scores.into_clean();
+        let mut clean_counts = dirty_counts.into_clean();
+
+        match parcel {
+            WorkParcel::Sparse {
+                data,
                 reconciled_variant_index,
-            )?;
-            Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
-        }),
-        WorkParcel::Dense(data) => {
-            let tile_pool = context.tile_pool.clone();
-            let sparse_index_pool = context.sparse_index_pool.clone();
-            let kernel_input_buffer_pool = context.kernel_input_buffer_pool.clone();
-            task::spawn_blocking(move || {
-                let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
-                let mut clean_scores = dirty_scores.into_clean();
-                let mut clean_counts = dirty_counts.into_clean();
+            } => {
+                batch::run_variant_major_path(
+                    &data,
+                    &prep_result,
+                    &mut clean_scores,
+                    &mut clean_counts,
+                    reconciled_variant_index,
+                )?;
+            }
+            WorkParcel::Dense(data) => {
                 batch::run_person_major_path(
                     &data.data,
                     &data.reconciled_variant_indices,
@@ -417,25 +434,10 @@ fn dispatch_work(
                     &sparse_index_pool,
                     &kernel_input_buffer_pool,
                 )?;
-                Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
-            })
+            }
         }
-    };
-
-    context.join_handles.push(handle);
-    // If we dispatched a dense batch, we return an empty one to reset the state.
-    // If we dispatched a sparse one, the original batch was already empty.
-    DenseVariantBatch::Empty
-}
-
-// Implement Into<Option<WorkParcel>> for DenseVariantBatch to use it in the dispatcher.
-impl From<DenseVariantBatch> for Option<WorkParcel> {
-    fn from(batch: DenseVariantBatch) -> Self {
-        match batch {
-            DenseVariantBatch::Empty => None,
-            DenseVariantBatch::Buffering(data) => Some(WorkParcel::Dense(data)),
-        }
-    }
+        Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
+    })
 }
 
 /// Calculates a target batch size for the person-major path based on L3 cache size.
