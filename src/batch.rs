@@ -221,12 +221,12 @@ fn process_block(
 fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
+    metadata: &[MatrixRowIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
-    snps_in_chunk: usize,
-    matrix_row_start_idx: MatrixRowIndex,
 ) {
+    let snps_in_chunk = metadata.len();
     let num_scores = prep_result.score_names.len();
     let num_people_in_block = if snps_in_chunk > 0 { tile.len() / snps_in_chunk } else { 0 };
     if num_people_in_block == 0 {
