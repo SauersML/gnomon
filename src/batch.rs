@@ -778,7 +778,7 @@ mod tests {
     fn test_transpose_layout_is_empirically_verified() {
         // This map from a logical variant index (0-7) to its physical byte position
         // in the transposed person-vector
-        const variant_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+        const VARIANT_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
         // 1. SETUP: Create a known 8x8 matrix of variant-major data.
         // We use unique, traceable values: `(person_idx+1)*10 + (variant_idx+1)`.
@@ -819,7 +819,7 @@ mod tests {
                 let expected_val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
                 
                 // Get the actual value from the shuffled location.
-                let val_from_shuffled_pos = person_row_actual[variant_TO_SHUFFLED_POS[variant_idx]];
+                let val_from_shuffled_pos = person_row_actual[VARIANT_TO_SHUFFLED_POS[variant_idx]];
                 
                 // Also get the value from the naive sequential position.
                 let val_from_naive_pos = person_row_actual[variant_idx];
@@ -828,10 +828,10 @@ mod tests {
                     all_tests_passed = false;
                     eprintln!(
                         "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
-                        person_idx, variant_idx, expected_val, variant_TO_SHUFFLED_POS[variant_idx], val_from_shuffled_pos
+                        person_idx, variant_idx, expected_val, VARIANT_TO_SHUFFLED_POS[variant_idx], val_from_shuffled_pos
                     );
                 }
-                if val_from_naive_pos == expected_val && variant_TO_SHUFFLED_POS[variant_idx] != variant_idx {
+                if val_from_naive_pos == expected_val && VARIANT_TO_SHUFFLED_POS[variant_idx] != variant_idx {
                      all_tests_passed = false;
                      eprintln!(
                         "    -> FAIL: Naive position [{}] unexpectedly held the correct value for S{}!",
