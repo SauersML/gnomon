@@ -69,7 +69,7 @@ jobs:
       - name: Generate custom report with getdoc
         if: always()
         run: |
-          ~/.cargo/bin/getdoc
+          ~/.cargo/bin/getdoc --features default
           cat report.md
 
       - name: Build Gnomon binaries (Release and Profiling)
