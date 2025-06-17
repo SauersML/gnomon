@@ -4,10 +4,10 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - 'proofs/**'            # Any file inside the proofs directory
-      - 'lakefile.lean'        # The Lean project configuration
-      - 'lean-toolchain'       # The Lean version file
-      - '.github/workflows/prover.yml' # The workflow file itself
+      - 'proofs/**'
+      - 'lakefile.lean'
+      - 'lean-toolchain'
+      - '.github/workflows/prover.yml'
   pull_request:
     branches: [ "main" ]
     paths:
@@ -20,7 +20,7 @@ on:
 jobs:
   prove:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # Prevent hanging builds
+    timeout-minutes: 60
     
     steps:
       - name: Check out repository
@@ -36,14 +36,19 @@ jobs:
         with:
           path: |
             ~/.elan
-            ./lake-packages
-          key: ${{ runner.os }}-lean-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}
+            .lake
+          key: ${{ runner.os }}-lean-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}
           restore-keys: |
+            ${{ runner.os }}-lean-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}
             ${{ runner.os }}-lean-
             
+      - name: Update dependencies
+        run: |
+          lake update
+          
       - name: Get mathlib cache
         run: |
-          lake exe cache get || echo "Cache failed, building from source"
+          lake exe cache get! || echo "Cache failed, building from source"
           
       - name: Build project
         run: |
@@ -51,5 +56,4 @@ jobs:
           
       - name: Check proofs
         run: |
-          # Verify all files compile without errors
           lake build Calibrator
