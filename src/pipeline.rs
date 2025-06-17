@@ -47,7 +47,6 @@ pub struct PipelineContext {
     // Sharable, thread-safe resource pools.
     pub tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
     pub sparse_index_pool: Arc<SparseIndexPool>,
-    pub kernel_input_buffer_pool: Arc<KernelInputBufferPool>,
     pub partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
 
     // The final destination for all computed data, accessible after the pipeline runs.
@@ -75,7 +74,6 @@ impl PipelineContext {
             prep_result,
             tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2)),
             sparse_index_pool: Arc::new(SparseIndexPool::new()),
-            kernel_input_buffer_pool: Arc::new(KernelInputBufferPool::new()),
             partial_result_pool,
             all_scores: vec![0.0f64; result_buffer_size],
             all_missing_counts: vec![0u32; result_buffer_size],
