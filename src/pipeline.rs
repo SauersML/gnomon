@@ -262,30 +262,60 @@ async fn run_orchestration_loop(
                 let path_decision = batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
 
                 if let ComputePath::VariantMajor = path_decision {
+                    // This is a sparse variant. First, we must flush any existing dense batch
+                    // to ensure that variants are processed in the correct order.
                     if let DenseVariantBatch::Buffering(data) = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty) {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
                         in_flight_tasks.push(handle);
                     }
 
+                    // Now, dispatch the sparse variant itself.
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
                     let handle = dispatch_work(parcel, context, permit);
                     in_flight_tasks.push(handle);
                 } else { // PersonMajor
+                    // This is a dense variant. It needs to be gathered and added to the dense batch.
                     dense_batch = match dense_batch {
                         DenseVariantBatch::Empty => {
-                            let mut data = Vec::with_capacity(dense_batch_capacity);
-                            data.extend_from_slice(&filled_buffer);
-                            DenseVariantBatch::Buffering(DenseVariantBatchData { data, reconciled_variant_indices: vec![reconciled_variant_index] })
+                            // The capacity for the genotype data buffer is calculated to align with a
+                            // target L3 cache size, amortizing the overhead of the pivot operation.
+                            let mut genotype_data = Vec::with_capacity(dense_batch_capacity);
+                            genotype_data.extend_from_slice(&filled_buffer);
+
+                            // Pre-calculate the capacity needed for the corresponding weights and flips.
+                            let padded_score_count = context.prep_result.padded_score_count();
+                            let num_variants_in_batch_capacity = dense_batch_capacity / (context.prep_result.bytes_per_variant as usize);
+                            let weights_flips_capacity = num_variants_in_batch_capacity * padded_score_count;
+
+                            let mut weights = Vec::with_capacity(weights_flips_capacity);
+                            let mut flips = Vec::with_capacity(weights_flips_capacity);
+
+                            // Gather the data for the first variant. This is the "gather-on-assemble" step.
+                            let (variant_weights, variant_flips) = &context.prep_result.variant_data[reconciled_variant_index.0 as usize];
+                            weights.extend_from_slice(variant_weights);
+                            flips.extend_from_slice(variant_flips);
+                            
+                            DenseVariantBatch::Buffering(DenseVariantBatchData {
+                                data: genotype_data,
+                                weights,
+                                flips,
+                                variant_count: 1,
+                            })
                         }
                         DenseVariantBatch::Buffering(mut batch_data) => {
+                            // Append the new variant's genotype, weight, and flip data to the existing batch buffers.
                             batch_data.data.extend_from_slice(&filled_buffer);
-                            batch_data.reconciled_variant_indices.push(reconciled_variant_index);
+                            let (weights, flips) = &context.prep_result.variant_data[reconciled_variant_index.0 as usize];
+                            batch_data.weights.extend_from_slice(weights);
+                            batch_data.flips.extend_from_slice(flips);
+                            batch_data.variant_count += 1;
                             DenseVariantBatch::Buffering(batch_data)
                         }
                     };
 
+                    // If the dense batch is now full, dispatch it for computation.
                     if let DenseVariantBatch::Buffering(data) = &dense_batch {
                         if data.data.len() >= dense_batch_capacity {
                            let permit = semaphore.clone().acquire_owned().await.unwrap();
