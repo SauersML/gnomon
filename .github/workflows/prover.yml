@@ -20,19 +20,72 @@ on:
 jobs:
   prove:
     runs-on: ubuntu-latest
-    container:
-      image: leanprovercommunity/mathlib:latest
-      options: --user root
-    timeout-minutes: 5
+    timeout-minutes: 10
     
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         
-      - name: Build and prove
+      - name: Install elan
         run: |
-          # Fix permissions for the lean user
-          chown -R 1000:1000 .
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
           
-          # Run as the lean user
-          su lean -c "lake build Calibrator --no-cache"
+      - name: Cache Lean toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
+          
+      - name: Cache mathlib (aggressive)
+        id: cache-mathlib
+        uses: actions/cache@v4
+        with:
+          path: |
+            .lake/packages/mathlib
+            .lake/packages/*/olean
+            .lake/packages/*/trace
+            .lake/build
+            lake-manifest.json
+          key: ${{ runner.os }}-mathlib-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-mathlib-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-
+            ${{ runner.os }}-mathlib-
+            
+      - name: Check cache validity
+        id: check-cache
+        run: |
+          if [ -d ".lake/packages/mathlib" ] && [ -f "lake-manifest.json" ]; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+            echo "✅ Mathlib cache found and valid"
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "❌ Mathlib cache missing or invalid"
+          fi
+          
+      - name: Update dependencies (only if no cache)
+        if: steps.check-cache.outputs.valid != 'true'
+        run: |
+          echo "📦 Updating dependencies..."
+          lake update
+          
+      - name: Download mathlib cache (only if needed)
+        if: steps.check-cache.outputs.valid != 'true'
+        run: |
+          echo "📥 Downloading mathlib cache (this is slow but only happens once)..."
+          lake exe cache get!
+          
+      - name: Build project
+        run: |
+          echo "🔨 Building Calibrator..."
+          lake build Calibrator
+          
+      - name: Save timing info
+        if: always()
+        run: |
+          echo "Build completed at: $(date)"
+          if [ "${{ steps.check-cache.outputs.valid }}" == "true" ]; then
+            echo "✨ This was a FAST cached build!"
+          else
+            echo "🐌 This was a SLOW first build (but next ones will be fast!)"
+          fi
