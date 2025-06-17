@@ -20,40 +20,16 @@ on:
 jobs:
   prove:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    container:
+      image: leanprovercommunity/mathlib:latest
+    timeout-minutes: 5
     
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         
-      - name: Install elan
+      - name: Build and prove
         run: |
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
-          echo "$HOME/.elan/bin" >> $GITHUB_PATH
-          
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.elan
-            .lake
-          key: ${{ runner.os }}-lean-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}
-          restore-keys: |
-            ${{ runner.os }}-lean-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}
-            ${{ runner.os }}-lean-
-            
-      - name: Update dependencies
-        run: |
-          lake update
-          
-      - name: Get mathlib cache
-        run: |
-          lake exe cache get! || echo "Cache failed, building from source"
-          
-      - name: Build project
-        run: |
-          lake build
-          
-      - name: Check proofs
-        run: |
-          lake build Calibrator
+          # Mathlib is already installed in the container!
+          # Just build our files
+          lake build Calibrator --no-cache
