@@ -312,26 +312,27 @@ async fn run_orchestration_loop(
 
     // Wait for all remaining in-flight tasks to complete.
     while let Some(task_result) = in_flight_tasks.next().await {
-        // This final loop must also use the same robust resource handling.
-        let (compute_result, scores, counts) = task_result??;
+        // Unpack the result, propagating panics.
+        let (compute_result, scores, counts) = task_result?;
+
+        // Check for compute errors.
+        if let Err(e) = compute_result {
+            // Even on error, we must return the buffers to the pool.
+            context.partial_result_pool.push((scores, counts)).unwrap();
+            return Err(e);
+        }
+
+        // On success, aggregate the final results.
+        for (master, &partial) in context.all_scores.iter_mut().zip(scores.deref()) {
+            *master += partial;
+        }
+        for (master, &partial) in context.all_missing_counts.iter_mut().zip(counts.deref()) {
+            *master += partial;
+        }
+
+        // And return the final buffers to the pool.
         context.partial_result_pool.push((scores, counts)).unwrap();
-        compute_result?; // Propagate any errors from the last tasks.
     }
-
-    // --- Final Aggregation ---
-    // At this point, all partial results have been returned to the pool. We need
-    // to aggregate the final chunks that were processed in the loops above.
-    let final_scores = &mut context.all_scores;
-    let final_counts = &mut context.all_missing_counts;
-
-    context.partial_result_pool.iter().for_each(|(scores, counts)| {
-        for (master, &partial) in final_scores.iter_mut().zip(scores.deref()) {
-            *master += partial;
-        }
-        for (master, &partial) in final_counts.iter_mut().zip(counts.deref()) {
-            *master += partial;
-        }
-    });
 
     Ok(())
 }
