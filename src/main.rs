@@ -426,6 +426,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 //                                  HELPER FUNCTIONS
 // ========================================================================================
 
+/// Represents a command sent from the main orchestrator to the I/O producer thread.
+/// Using an enum makes the control flow explicit and type-safe.
+enum IoCommand {
+    /// A command to read the next SNP into the provided buffer.
+    Read(Vec<u8>),
+    /// A command to gracefully shut down the I/O thread.
+    Shutdown,
+}
+
 /// Represents the concrete action the orchestrator must take for a given SNP.
 enum DispatchAction {
     /// The SNP is sparse and should be processed immediately.
