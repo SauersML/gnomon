@@ -132,13 +132,12 @@ pub fn run_person_major_path(
 fn process_people_iterator<'a, I>(
     iter: I,
     snp_major_data: &'a [u8],
+    metadata: &[MatrixRowIndex],
     prep_result: &'a PreparationResult,
     partial_scores: &'a mut [f64],
     partial_missing_counts: &'a mut [u32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &'a SparseIndexPool,
-    matrix_row_start_idx: MatrixRowIndex,
-    snps_in_chunk: usize,
 ) where
     I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
 {
