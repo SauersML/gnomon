@@ -518,7 +518,7 @@ fn dispatch_snp_major_path(
     matrix_row_index: MatrixRowIndex,
     prep_result: Arc<prepare::PreparationResult>,
     partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
-) -> task::JoinHandle<Result<ComputeResult, Box<dyn Error + Send + Sync>>> {
+) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
     task::spawn_blocking(move || {
         let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
         let mut clean_scores = dirty_scores.into_clean();
@@ -532,12 +532,14 @@ fn dispatch_snp_major_path(
             matrix_row_index,
         )?;
 
-        // The SNP buffer is passed back so it can be recycled.
-        let result = (clean_scores.into_dirty(), clean_counts.into_dirty(), Some(snp_buffer.0));
+        let result = ComputeTaskResult {
+            scores: clean_scores.into_dirty(),
+            counts: clean_counts.into_dirty(),
+            recycled_buffer: Some(snp_buffer.0), // The buffer is passed back for recycling.
+        };
         Ok(result)
     })
 }
-
 
 /// Intelligently resolves the user-provided input path to a PLINK prefix.
 fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
