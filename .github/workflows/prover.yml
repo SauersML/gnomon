@@ -189,10 +189,10 @@ jobs:
           echo "================================================="
           # This is the definitive check. If the .olean file exists,
           # the build was truly successful.
-          if [ -f ".lake/build/lib/Calibrator.olean" ]; then
-            echo "✅ SUCCESS: .lake/build/lib/Calibrator.olean was created."
+          if [ -f ".lake/build/lib/lean/Calibrator.olean" ]; then
+            echo "✅ SUCCESS: .lake/build/lib/lean/Calibrator.olean was created."
           else
-            echo "❌ FAILURE: .lake/build/lib/Calibrator.olean was NOT found."
+            echo "❌ FAILURE: .lake/build/lib/lean/Calibrator.olean was NOT found."
             exit 1
           fi
           echo "================================================="
