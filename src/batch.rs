@@ -235,11 +235,12 @@ fn process_block(
 fn process_tile(
     tile: &[EffectAlleleDosage],
     prep_result: &PreparationResult,
+    weights_for_batch: &[f32],
+    flips_for_batch: &[u8],
     reconciled_variant_indices: &[ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     sparse_index_pool: &SparseIndexPool,
-    kernel_input_buffer_pool: &KernelInputBufferPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices.len();
     let num_scores = prep_result.score_names.len();
@@ -255,9 +256,7 @@ fn process_tile(
     // homozygous-reference for all flipped variants in this chunk. This is a hot
     // loop and is optimized to be branch-free using SIMD masking.
     let mut chunk_baseline = vec![0.0f64; padded_score_count]; // Use f64 for high-precision baseline.
-    let variant_score_weights = prep_result.variant_score_weights();
-    let variant_score_flips = prep_result.variant_score_flips();
-
+    
     // Pre-load constants for the loop.
     let simd_lanes_f32 = std::mem::size_of::<f32x8>() / std::mem::size_of::<f32>();
     let num_simd_chunks = num_scores / simd_lanes_f32;
@@ -265,10 +264,9 @@ fn process_tile(
     let zeros_f32 = f32x8::splat(0.0);
 
     for variant_idx in 0..variants_in_chunk {
-        let global_matrix_row_idx = reconciled_variant_indices[variant_idx].0 as usize;
-        let row_offset = global_matrix_row_idx * padded_score_count;
-        let weight_row = &variant_score_weights[row_offset..row_offset + padded_score_count];
-        let flip_row = &variant_score_flips[row_offset..row_offset + padded_score_count];
+        let row_offset = variant_idx * padded_score_count;
+        let weight_row = &weights_for_batch[row_offset..row_offset + padded_score_count];
+        let flip_row = &flips_for_batch[row_offset..row_offset + padded_score_count];
 
         // Process full SIMD vectors
         for i in 0..num_simd_chunks {
@@ -379,27 +377,17 @@ fn process_tile(
             }
         }
 
-        // --- B. GATHER Kernel Input Data using the Reusable Pool ---
-        let thread_buffers = kernel_input_buffer_pool.get_or_default();
-        let (weights_chunk, flip_flags_chunk) = &mut *thread_buffers.borrow_mut();
+        // --- B. Create Kernel Input Views (Zero-Cost Slicing) ---
+        // This is now extremely fast. We just create views over the contiguous,
+        // pre-gathered data that was passed in for the entire batch.
+        let matrix_slice_start = variant_mini_batch_start * padded_score_count;
+        let matrix_slice_end = matrix_slice_start + (mini_batch_size * padded_score_count);
+        let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
+        let flip_flags_chunk = &flips_for_batch[matrix_slice_start..matrix_slice_end];
 
-        // Clear the buffers to reset their length to 0, but KEEP their memory.
-        weights_chunk.clear();
-        flip_flags_chunk.clear();
-
-        // This copy loop now fills the pre-allocated, thread-local buffers.
-        // It's just as fast as before, but without the allocation overhead.
-        for i in 0..mini_batch_size {
-            let variant_idx_in_chunk = variant_mini_batch_start + i;
-            let matrix_row_idx = reconciled_variant_indices[variant_idx_in_chunk].0 as usize;
-            let row_offset = matrix_row_idx * padded_score_count;
-            weights_chunk.extend_from_slice(&variant_score_weights[row_offset..row_offset + padded_score_count]);
-            flip_flags_chunk.extend_from_slice(&variant_score_flips[row_offset..row_offset + padded_score_count]);
-        }
-
-        let weights = kernel::PaddedInterleavedWeights::new(&weights_chunk, mini_batch_size, num_scores)
+        let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
             .expect("CRITICAL: Mini-batch weights matrix validation failed.");
-        let flip_flags = kernel::PaddedInterleavedFlags::new(&flip_flags_chunk, mini_batch_size, num_scores)
+        let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
             .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
 
         // --- C. Dispatch to Kernel and Accumulate Results ---
@@ -430,13 +418,13 @@ fn process_tile(
                         let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut current_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         current_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(&current_scores_low.to_array());
+                        scores_slice_low.copy_from_slice(¤t_scores_low.to_array());
 
                         let scores_slice_high =
                             &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
                         let mut current_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
                         current_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(&current_scores_high.to_array());
+                        scores_slice_high.copy_from_slice(¤t_scores_high.to_array());
                     } else {
                         let start = scores_offset;
                         let end = num_scores;
@@ -451,14 +439,18 @@ fn process_tile(
         // --- All Deferred Missing Events in a Batch ---
         // Now that the fast-path work is done, we process the slow-path work all at once.
         for &(person_idx, variant_idx_in_chunk) in missing_events.iter() {
+            // This is a rare, slow path for missing data. We use the index metadata
+            // to look up the global information needed.
             let global_matrix_row_idx = reconciled_variant_indices[variant_idx_in_chunk].0 as usize;
             let scores_for_this_variant =
                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
-            let weight_row_offset = global_matrix_row_idx * padded_score_count;
+            
+            // For the baseline correction, we use the pre-gathered batch data, which is fast.
+            let weight_row_offset = variant_idx_in_chunk * padded_score_count;
             let weight_row =
-                &variant_score_weights[weight_row_offset..weight_row_offset + num_scores];
+                &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
             let flip_row =
-                &variant_score_flips[weight_row_offset..weight_row_offset + num_scores];
+                &flips_for_batch[weight_row_offset..weight_row_offset + num_scores];
 
             let person_scores_slice = &mut block_scores_out
                 [person_idx * num_scores..(person_idx + 1) * num_scores];
@@ -683,9 +675,8 @@ pub fn run_variant_major_path(
     let dosages = decode_variant_genotypes(variant_data, prep_result.total_people_in_fam);
 
     // --- 2. Get pointers to the relevant weight/flip data for this variant ---
-    let weight_row_offset = reconciled_variant_index.0 as usize * padded_score_count;
-    let weight_row = &prep_result.variant_score_weights()[weight_row_offset..];
-    let flip_row = &prep_result.variant_score_flips()[weight_row_offset..];
+    // This lookup is efficient as it accesses a pre-packaged tuple of data.
+    let (weight_row, flip_row) = &prep_result.variant_data[reconciled_variant_index.0 as usize];
     let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
 
     // --- 3. First pass: Handle missingness and correct baselines ---
