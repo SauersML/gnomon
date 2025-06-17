@@ -13,6 +13,8 @@ use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use gnomon::batch::{self, SparseIndexPool};
 use gnomon::io::SnpReader;
+use gnomon::pipeline::{self, PipelineContext};
+use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::{
     BimRowIndex, ComputePath, DenseSnpBatch, DirtyCounts, DirtyScores, MatrixRowIndex, SnpDataBuffer,
