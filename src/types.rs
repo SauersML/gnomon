@@ -158,7 +158,7 @@ pub enum DenseVariantBatch {
 /// given unit of work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputePath {
-    SnpMajor,
+    VariantMajor,
     PersonMajor,
 }
 
