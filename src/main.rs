@@ -59,19 +59,113 @@ struct Args {
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
+/// Owns shared resource pools and final result buffers for the pipeline.
+///
+/// This struct acts as a state object for the main orchestrator thread. It holds
+/// sharable, read-only resources (`Arc`s) and the mutable state that is exclusively
+/// owned and modified by the orchestrator (e.g., the final result buffers and the
+/// list of spawned compute tasks).
+///
+/// Crucially, it does NOT own the communication channels, which are created and
+/// managed by the `run_pipeline` function to enforce a clear ownership model
+/// and data flow between asynchronous tasks.
+struct PipelineContext {
+    // Read-only configuration and resource pools, shared via Arc.
+    prep_result: Arc<prepare::PreparationResult>,
+    tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
+    sparse_index_pool: Arc<SparseIndexPool>,
+    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
+
+    // The final destination for all computed data, owned exclusively by the orchestrator.
+    all_scores: Vec<f64>,
+    all_missing_counts: Vec<u32>,
+
+    // A list of all in-flight compute tasks.
+    compute_handles: Vec<task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>>>,
+}
+
+impl PipelineContext {
+    /// Creates a new `PipelineContext` by performing all necessary resource allocations.
+    /// This function cleanly encapsulates the "Phase 3" setup logic from the original
+    /// monolithic `main` function.
+    fn new(prep_result: Arc<prepare::PreparationResult>) -> Self {
+        let num_scores = prep_result.score_names.len();
+        let result_buffer_size = prep_result.num_people_to_score * num_scores;
+
+        // The number of parallel compute tasks can be higher than the I/O depth.
+        // Size the pool to avoid deadlocks. It must be at least as large as the
+        // maximum number of tasks that can be running concurrently.
+        const MAX_IN_FLIGHT_TASKS: usize = 32;
+        let partial_result_pool = Arc::new(ArrayQueue::new(MAX_IN_FLIGHT_TASKS));
+        for _ in 0..MAX_IN_FLIGHT_TASKS {
+            partial_result_pool
+                .push((
+                    DirtyScores(vec![0.0f64; result_buffer_size]),
+                    DirtyCounts(vec![0u32; result_buffer_size]),
+                ))
+                .unwrap();
+        }
+
+        Self {
+            prep_result,
+            tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2)),
+            sparse_index_pool: Arc::new(SparseIndexPool::new()),
+            partial_result_pool,
+            all_scores: vec![0.0f64; result_buffer_size],
+            all_missing_counts: vec![0u32; result_buffer_size],
+            compute_handles: Vec::with_capacity(256),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let overall_start_time = Instant::now();
-
-    // --- Phase 1: Argument Parsing and Path Resolution ---
     let args = Args::parse();
     let plink_prefix = resolve_plink_prefix(&args.input_path)?;
+
+    // --- Phase 1: Preparation ---
+    // This phase is synchronous and CPU-bound. It parses all input files,
+    // reconciles variants, and produces a "computation blueprint".
+    let prep_result = run_preparation_phase(&plink_prefix, &args)?;
+
+    // --- Phase 2: Resource Allocation ---
+    // A new context is created, which allocates all necessary memory pools and
+    // final result buffers based on the blueprint from the preparation phase.
+    let mut context = PipelineContext::new(Arc::clone(&prep_result));
+    eprintln!("> Resource allocation complete.");
+
+    // --- Phase 3: Pipeline Execution ---
+    // This is the primary asynchronous phase. It spawns the I/O producer and
+    // orchestrator tasks, which run concurrently to maximize throughput.
+    let computation_start = Instant::now();
+    run_pipeline(&mut context, &plink_prefix).await?;
+    eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
+
+    // --- Phase 4: Finalization & Output ---
+    // After all computation is complete and results are aggregated, this
+    // synchronous phase writes the final scores to disk.
+    finalize_and_write_output(&plink_prefix, &context)?;
+    
+    eprintln!("\nSuccess! Total execution time: {:.2?}", overall_start_time.elapsed());
+    Ok(())
+}
+
+/// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
+///
+/// This function is synchronous and CPU-bound. It takes the raw user arguments,
+/// finds and normalizes all score files, and then calls the main preparation
+/// logic to produce a "computation blueprint" (`PreparationResult`). All user-facing
+/// console output for this phase is handled here.
+fn run_preparation_phase(
+    plink_prefix: &Path,
+    args: &Args,
+) -> Result<Arc<prepare::PreparationResult>, Box<dyn Error + Send + Sync>> {
     eprintln!("> Using PLINK prefix: {}", plink_prefix.display());
     let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
 
-    // --- Phase 2: The Preparation Phase ---
-    // This logic now supports providing a directory to the --score argument.
+    // --- Find and normalize all score files ---
     let score_files = if args.score.is_dir() {
         eprintln!("> Found directory for --score, locating all score files...");
         fs::read_dir(&args.score)?
@@ -87,33 +181,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("No score files found in the specified path.".into());
     }
 
-    eprintln!("> Normalizing and preparing {} score file(s)...", score_files.len());
+    eprintln!(
+        "> Normalizing and preparing {} score file(s)...",
+        score_files.len()
+    );
     let prep_phase_start = Instant::now();
 
     let mut native_score_files = Vec::with_capacity(score_files.len());
     for score_file_path in &score_files {
-        // First, check if the file is already in the correct format.
         match reformat::is_gnomon_native_format(score_file_path) {
             Ok(true) => {
-                // It's already native, so we can use it directly.
                 native_score_files.push(score_file_path.clone());
             }
             Ok(false) => {
-                // It's not in native format, so try to reformat it.
                 eprintln!(
                     "> Info: Score file '{}' is not in native format. Attempting conversion...",
                     score_file_path.display()
                 );
                 match reformat::reformat_pgs_file(score_file_path) {
                     Ok(new_path) => {
-                        eprintln!(
-                            "> Success: Converted to '{}'.",
-                            new_path.display()
-                        );
+                        eprintln!("> Success: Converted to '{}'.", new_path.display());
                         native_score_files.push(new_path);
                     }
                     Err(e) => {
-                        // Reformatting failed. This is a fatal error.
                         return Err(format!(
                             "Failed to auto-reformat '{}': {}. Please ensure it is a valid PGS Catalog file or convert it to the gnomon-native format manually.",
                             score_file_path.display(), e
@@ -122,7 +212,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
             }
             Err(e) => {
-                // An I/O error occurred while trying to check the file.
                 return Err(format!(
                     "Error reading score file '{}': {}",
                     score_file_path.display(), e
@@ -131,294 +220,114 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
-    // Now, run the preparation phase on the fully normalized list of files.
-    let prep = prepare::prepare_for_computation(&plink_prefix, &native_score_files, args.keep.as_deref())
-        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-    let prep_result = Arc::new(prep);
+    // --- Run the main preparation logic ---
+    let prep =
+        prepare::prepare_for_computation(plink_prefix, &native_score_files, args.keep.as_deref())
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     eprintln!(
         "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",
         prep_phase_start.elapsed(),
-        prep_result.num_people_to_score,
-        prep_result.num_reconciled_variants,
-        prep_result.score_names.len()
+        prep.num_people_to_score,
+        prep.num_reconciled_variants,
+        prep.score_names.len()
     );
 
-    // --- Phase 3: Dynamic Runtime Resource Allocation ---
-    let resource_alloc_start = Instant::now();
+    Ok(Arc::new(prep))
+}
 
-    let num_scores = prep_result.score_names.len();
-    let result_buffer_size = prep_result.num_people_to_score * num_scores;
-    let mut all_scores = vec![0.0f64; result_buffer_size];
-    let mut all_missing_counts = vec![0u32; result_buffer_size];
-
-    // These resource pools are shared across all compute tasks.
-    let tile_pool = Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 2));
-    let sparse_index_pool = Arc::new(SparseIndexPool::new());
-    
-    // --- Determine a Target Batch Size for the Person-Major Path ---
-    // The goal is to make batches large enough to amortize the high fixed cost of
-    // the pivot operation, while respecting L3 cache size to keep the tile hot.
-    const PERSON_BLOCK_SIZE: u64 = 4096; // Must match batch.rs
-    const MIN_DENSE_BATCH_SIZE: usize = 1 * 1024 * 1024; // 1 MB
-    const MAX_DENSE_BATCH_SIZE: usize = 256 * 1024 * 1024; // 256 MB
-
-    let dense_batch_target_size = {
-        let l3_cache_bytes = cache_size::l3_cache_size().unwrap_or(32 * 1024 * 1024);
-        let bytes_per_snp = prep_result.bytes_per_snp;
-
-        // Calculate the number of SNPs whose pivoted tile would fill the L3 cache.
-        // This is an ideal upper bound for the number of SNPs in a person-major batch.
-        let max_snps_for_l3 = (l3_cache_bytes as u64) / PERSON_BLOCK_SIZE;
-
-        // Convert that number of SNPs back into a raw data size.
-        (max_snps_for_l3 * bytes_per_snp) as usize
-    }
-    .clamp(MIN_DENSE_BATCH_SIZE, MAX_DENSE_BATCH_SIZE);
-    
-    // The pipeline depth determines how many I/O and compute tasks can run in parallel.
+/// **Helper 2:** The primary async orchestrator.
+///
+/// This function sets up and runs the entire concurrent pipeline. It owns the
+/// communication channels, delegating the correct ends to the I/O task and the
+/// main orchestration loop. It ensures all concurrent work is complete before
+/// returning.
+async fn run_pipeline(
+    context: &mut PipelineContext,
+    plink_prefix: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // The pipeline depth determines how many I/O requests can be in-flight.
     const PIPELINE_DEPTH: usize = 2;
 
-    // A pool of reusable buffers for partial results. This avoids re-allocating
-    // the large score/count vectors for every compute task.
-    let partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>> =
-        Arc::new(ArrayQueue::new(PIPELINE_DEPTH + 1));
-    for _ in 0..(PIPELINE_DEPTH + 1) {
-        partial_result_pool
-            .push((
-                DirtyScores(vec![0.0f64; result_buffer_size]),
-                DirtyCounts(vec![0u32; result_buffer_size]),
-            ))
-            .unwrap();
-    }
+    // Create the two channels that will connect the I/O producer and the main orchestrator.
+    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel(PIPELINE_DEPTH);
+    let (empty_buffer_tx, empty_buffer_rx) = mpsc::channel(PIPELINE_DEPTH);
 
-    // The pipeline now passes single-SNP data buffers between the I/O producer and
-    // the main consumer/orchestrator thread.
-    let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel::<SnpDataBuffer>(PIPELINE_DEPTH);
-    let (empty_buffer_tx, mut empty_buffer_rx) = mpsc::channel::<IoCommand>(PIPELINE_DEPTH);
-
-    eprintln!(
-        "> Resource allocation complete in {:.2?}. Dense batch target: {} MB. Pipeline depth: {}",
-        resource_alloc_start.elapsed(),
-        dense_batch_target_size / 1024 / 1024,
-        PIPELINE_DEPTH
-    );
-
-    // --- Phase 4: Adaptive Concurrent Pipeline Execution ---
-    // Pre-fill the pipeline with empty buffers for the I/O producer to use.
-    // Each buffer is sized to hold exactly one SNP's data.
-    let single_snp_buffer_size = prep_result.bytes_per_snp as usize;
+    // Pre-fill the pipeline with empty buffers. The I/O task will immediately
+    // receive these and begin reading from the file.
+    let single_snp_buffer_size = context.prep_result.bytes_per_snp as usize;
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
             .send(IoCommand::Read(vec![0u8; single_snp_buffer_size]))
             .await?;
     }
 
-    let bed_path = plink_prefix.with_extension("bed");
-    let reader = SnpReader::new(
-        &bed_path,
-        prep_result.bytes_per_snp,
-        prep_result.total_snps_in_bim,
-    )?;
+    // Spawn the I/O producer task, moving the channel ends it owns into the task.
+    let io_handle = spawn_io_producer_task(
+        context.prep_result.clone(),
+        plink_prefix.to_path_buf(),
+        full_buffer_tx,
+        empty_buffer_rx,
+    );
 
-    // --- I/O Producer Task ---
-    // This task reads SNPs from the .bed file and sends only the relevant ones
-    // to the main orchestrator thread for processing.
-    let prep_clone_for_io = Arc::clone(&prep_result);
-    let io_handle = tokio::spawn(async move {
-        let mut reader = reader;
-        let mut bed_row_cursor: u32 = 0;
-        let mut required_indices_cursor: usize = 0;
+    // Run the main orchestration loop, which receives data from the I/O task
+    // and spawns compute tasks.
+    run_orchestration_loop(context, &mut full_buffer_rx, &empty_buffer_tx).await?;
 
-        'producer: while let Some(command) = empty_buffer_rx.recv().await {
-            let mut buffer_vec = match command {
-                IoCommand::Read(buffer) => buffer,
-                IoCommand::Shutdown => break 'producer,
-            };
+    // After the orchestration loop finishes, await all spawned compute tasks
+    // and aggregate their results into the context's master buffers.
+    aggregate_results(context, &empty_buffer_tx).await?;
 
-            let snp_data_opt = match task::spawn_blocking(move || {
-                let snp_data_opt = reader.read_next_snp(&mut buffer_vec)?;
-                Ok::<_, io::Error>((reader, buffer_vec, snp_data_opt))
-            })
-            .await
-            {
-                Ok(Ok(res)) => res,
-                Ok(Err(e)) | Err(_) => {
-                    eprintln!("[I/O Task Error]: {}", e);
-                    break 'producer;
-                }
-            };
-            
-            reader = snp_data_opt.0;
-            let unused_buffer = snp_data_opt.1;
+    // Finally, await the I/O handle to ensure it has terminated cleanly and
+    // propagate any errors it may have encountered.
+    io_handle.await??;
+    Ok(())
+}
 
-            if let Some(filled_buffer) = snp_data_opt.2 {
-                // Check if the SNP we just read is one we actually need.
-                let is_relevant = prep_clone_for_io
-                    .required_bim_indices
-                    .get(required_indices_cursor)
-                    .map_or(false, |&req_idx| req_idx.0 == bed_row_cursor);
 
-                if is_relevant {
-                    required_indices_cursor += 1;
-                    if full_buffer_tx.send(SnpDataBuffer(filled_buffer)).await.is_err() {
-                        break 'producer'; // Consumer hung up.
-                    }
-                } else {
-                    // This SNP is not needed, so recycle its buffer immediately
-                    // by sending a new `Read` command.
-                    if empty_buffer_tx.send(IoCommand::Read(filled_buffer)).await.is_err() {
-                        break 'producer';
-                    }
-                }
-                bed_row_cursor += 1;
-            } else {
-                // EOF. Drop the unused buffer and terminate.
-                drop(unused_buffer);
-                break 'producer';
-            }
-        }
-    });
+/// **Helper:** Handles the final file writing.
+///
+/// This function is synchronous. It takes the final, aggregated results from the
+/// `PipelineContext` and writes them to a `.sscore` file. The output path is
+/// derived from the original PLINK prefix to ensure results are co-located with
+/// the input data.
+fn finalize_and_write_output(
+    plink_prefix: &Path,
+    context: &PipelineContext,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // The output directory should already exist from the preparation phase,
+    // but we ensure it's there for robustness.
+    let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_dir)?;
 
-    // --- Main Orchestrator Loop ---
-    // This loop receives a stream of *relevant* SNPs and dispatches them.
-    let mut required_indices_cursor: usize = 0;
-    let mut dense_batch = DenseSnpBatch::new_empty(dense_batch_target_size);
-    
-    let computation_start = Instant::now();
-    while let Some(snp_buffer) = full_buffer_rx.recv().await {
-        let matrix_row_index = prep_result.required_bim_indices[required_indices_cursor];
-        required_indices_cursor += 1;
-        
-        // This is a placeholder for the adaptive logic.
-        let path_decision = ComputePath::PersonMajor; 
-        
-        match path_decision {
-            ComputePath::SnpMajor => {
-                // To be implemented: dispatch sparse work.
-            }
-            ComputePath::PersonMajor => {
-                dense_batch.data.extend_from_slice(&snp_buffer.0);
-                dense_batch.metadata.push(matrix_row_index);
-
-                // Recycle the single-SNP buffer immediately.
-                if empty_buffer_tx.send(IoCommand::Read(snp_buffer.0)).await.is_err() {
-                    break;
-                }
-
-                // If the batch is now full, dispatch it for processing.
-                if dense_batch.data.len() >= dense_batch_target_size {
-                    let batch_to_process = std::mem::replace(
-                        &mut dense_batch,
-                        DenseSnpBatch::new_empty(dense_batch_target_size),
-                    );
-                    
-                    let prep_clone = Arc::clone(&prep_result);
-                    let tile_pool_clone = Arc::clone(&tile_pool);
-                    let partial_result_pool_clone = Arc::clone(&partial_result_pool);
-                    let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-                    let (dirty_scores, dirty_counts) = partial_result_pool_clone.pop().unwrap();
-                    
-                    let compute_handle = task::spawn_blocking(move || {
-                        let mut clean_scores = dirty_scores.into_clean();
-                        let mut clean_counts = dirty_counts.into_clean();
-
-                        // This will be renamed to `run_person_major_path`
-                        batch::run_chunk_computation(
-                            &batch_to_process.data,
-                            &prep_clone,
-                            &mut clean_scores,
-                            &mut clean_counts,
-                            &tile_pool_clone,
-                            &sparse_index_pool_clone,
-                            batch_to_process.start_matrix_row,
-                            batch_to_process.snp_count,
-                            0, // The chunk_bed_row_offset is no longer needed
-                        )?;
-                        
-                        let result = (clean_scores.into_dirty(), clean_counts.into_dirty());
-                        Ok::<_, Box<dyn Error + Send + Sync>>(result)
-                    });
-                    
-                    let (partial_scores, partial_missing_counts) = match compute_handle.await? {
-                        Ok(result) => result,
-                        Err(e) => return Err(e),
-                    };
-
-                    for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) { *master += partial; }
-                    for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) { *master += partial; }
-                    partial_result_pool_clone.push((partial_scores, partial_missing_counts)).unwrap();
-                }
-            }
-        }
-        
-        // Progress reporting
-        if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
-             eprintln!(
-                "> Processed {}/{} relevant variants...",
-                required_indices_cursor,
-                prep_result.num_reconciled_variants
-            );
-        }
-    }
-
-    // After the loop, process any final, non-full dense batch.
-    if !dense_batch.metadata.is_empty() {
-        // This is a simplified version of the dispatch logic inside the loop.
-        // In a full implementation, this would call the same dispatch helper.
-        // FIX LATER.
-        eprintln!("> Processing final batch of {} dense SNPs...", dense_batch.metadata.len());
-        let prep_clone = Arc::clone(&prep_result);
-        let tile_pool_clone = Arc::clone(&tile_pool);
-        let partial_result_pool_clone = Arc::clone(&partial_result_pool);
-        let sparse_index_pool_clone = Arc::clone(&sparse_index_pool);
-        let (dirty_scores, dirty_counts) = partial_result_pool_clone.pop().unwrap();
-        let compute_handle = task::spawn_blocking(move || {
-            let mut clean_scores = dirty_scores.into_clean();
-            let mut clean_counts = dirty_counts.into_clean();
-            batch::run_person_major_path(&dense_batch.data, &dense_batch.metadata, &prep_clone, &mut clean_scores, &mut clean_counts, &tile_pool_clone, &sparse_index_pool_clone)?;
-            let result = (clean_scores.into_dirty(), clean_counts.into_dirty());
-            Ok::<_, Box<dyn Error + Send + Sync>>(result)
-        });
-        let (partial_scores, partial_missing_counts) = compute_handle.await?.unwrap();
-        for (master, &partial) in all_scores.iter_mut().zip(&partial_scores) { *master += partial; }
-        for (master, &partial) in all_missing_counts.iter_mut().zip(&partial_missing_counts) { *master += partial; }
-        partial_result_pool_clone.push((partial_scores, partial_missing_counts)).unwrap();
-    }
-
-    io_handle.await?;
-    eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
-
-    // --- Phase 5: Finalization and Output ---
-    // The output filename is now robustly based on the PLINK prefix, not the score file path.
+    // Construct a self-describing output filename based on the input prefix.
     let out_filename = {
-        let mut s = plink_prefix.file_name().map_or_else(
-            || OsString::from("gnomon_results"),
-            OsString::from,
-        );
+        let mut s = plink_prefix
+            .file_name()
+            .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
         s.push(".sscore");
         s
     };
     let out_path = output_dir.join(&out_filename);
+
     eprintln!(
         "> Writing {} scores per person to {}",
-        prep_result.score_names.len(),
+        context.prep_result.score_names.len(),
         out_path.display()
     );
-
     let output_start = Instant::now();
+
+    // Delegate to the existing file writer, passing all data from the context.
     write_scores_to_file(
         &out_path,
-        &prep_result.final_person_iids,
-        &prep_result.score_names,
-        &prep_result.score_variant_counts,
-        &all_scores,
-        &all_missing_counts,
+        &context.prep_result.final_person_iids,
+        &context.prep_result.score_names,
+        &context.prep_result.score_variant_counts,
+        &context.all_scores,
+        &context.all_missing_counts,
     )?;
+
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
-
-    eprintln!("\nSuccess! Total execution time: {:.2?}", overall_start_time.elapsed());
-
     Ok(())
 }
 
