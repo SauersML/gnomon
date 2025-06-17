@@ -152,68 +152,6 @@ enum WorkParcel {
 //                        PRIVATE IMPLEMENTATION
 // ========================================================================================
 
-/// Spawns the I/O producer task in the background.
-fn spawn_io_producer_task(
-    prep_result: Arc<PreparationResult>,
-    plink_prefix: PathBuf,
-    full_buffer_tx: mpsc::Sender<Vec<u8>>,
-    mut empty_buffer_rx: mpsc::Receiver<Vec<u8>>,
-) -> JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-    tokio::spawn(async move {
-        let bed_path = plink_prefix.with_extension("bed");
-        let mut reader = match BedReader::new(
-            &bed_path,
-            prep_result.bytes_per_variant,
-            prep_result.total_variants_in_bim,
-        ) {
-            Ok(r) => r,
-            Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
-        };
-
-        let mut bed_row_cursor: u32 = 0;
-        let mut required_indices_cursor: usize = 0;
-
-        'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
-            'read_loop: loop {
-                let (new_reader, filled_buffer_opt) = match task::spawn_blocking(move || {
-                    let variant_data_opt = reader.read_next_variant(&mut buffer)?;
-                    Ok::<_, io::Error>((reader, variant_data_opt))
-                })
-                .await
-                {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(e)) => return Err(Box::new(e)),
-                    Err(e) => return Err(Box::new(e)),
-                };
-                reader = new_reader;
-
-                if let Some(filled_buffer) = filled_buffer_opt {
-                    buffer = filled_buffer;
-                    let is_relevant = prep_result
-                        .required_bim_indices
-                        .get(required_indices_cursor)
-                        .map_or(false, |&req_idx| req_idx.0 == bed_row_cursor);
-
-                    bed_row_cursor += 1;
-
-                    if is_relevant {
-                        required_indices_cursor += 1;
-                        if full_buffer_tx.send(buffer).await.is_err() {
-                            break 'producer;
-                        }
-                        break 'read_loop;
-                    } else {
-                        continue 'read_loop;
-                    }
-                } else {
-                    break 'producer;
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
 /// The core orchestration loop that receives, dispatches, and aggregates work.
 ///
 /// This function is the heart of the robust pipeline. It uses a `tokio::select!`
@@ -228,7 +166,13 @@ async fn run_orchestration_loop(
     full_buffer_rx: &mut mpsc::Receiver<Vec<u8>>,
     empty_buffer_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut required_indices_cursor: usize = 0;
+    // --- State for tracking progress through the .bed file and reconciled indices ---
+    // Tracks the current row index in the full .bed file (0-based).
+    let mut bed_row_cursor: u32 = 0;
+    // Tracks the current index in the `prep_result.required_bim_indices` slice.
+    let mut reconciled_variant_cursor: usize = 0;
+
+    // --- State for batching and concurrency control ---
     let dense_batch_capacity =
         calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
     let mut dense_batch = DenseVariantBatch::Empty;
@@ -237,104 +181,203 @@ async fn run_orchestration_loop(
 
     loop {
         tokio::select! {
+            // Biased selection prioritizes pulling completed work off the queue before
+            // starting new work, which helps keep the pipeline flowing.
             biased;
+
+            // --- Arm 1: Process results from completed compute tasks ---
             Some(task_result) = in_flight_tasks.next() => {
+                // First, release the semaphore permit. This happens regardless of task outcome.
                 semaphore.add_permits(1);
-                match task_result? {
-                    Ok((scores, counts)) => {
-                        for (master, &partial) in context.all_scores.iter_mut().zip(&scores) { *master += partial; }
-                        for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) { *master += partial; }
-                        context.partial_result_pool.push((scores, counts)).unwrap();
-                    }
-                    Err(e) => return Err(e),
+
+                // Then, unpack the result. This will propagate any JoinError.
+                let (compute_result, scores, counts) = task_result?;
+
+                // Always return the result buffers to the pool.
+                // This prevents resource leaks that would otherwise deadlock the application.
+                context.partial_result_pool.push((scores, counts)).unwrap();
+
+                // Finally, handle the actual outcome of the computation.
+                match compute_result {
+                    Ok(()) => { /* Task succeeded, do nothing more. */ }
+                    Err(e) => return Err(e), // Task failed, propagate the error and exit.
                 }
             },
 
+            // --- Arm 2: Receive new data from the I/O producer ---
             maybe_buffer = full_buffer_rx.recv() => {
-                let filled_buffer = match maybe_buffer {
+                let mut filled_buffer = match maybe_buffer {
                     Some(buffer) => buffer,
-                    None => break,
+                    None => break, // The I/O producer has finished.
                 };
 
-                let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
-                required_indices_cursor += 1;
+                // Check if we have processed all required variants. If so, all subsequent
+                // buffers from the I/O producer are irrelevant.
+                let is_relevant = if reconciled_variant_cursor < context.prep_result.required_bim_indices.len() {
+                    // Get the next required variant index from the pre-computed list.
+                    let next_required_bim_index = context.prep_result.required_bim_indices[reconciled_variant_cursor];
+                    // Since both the .bed file and our required list are sorted, we can just
+                    // check if the current .bed row is the one we're looking for.
+                    bed_row_cursor == next_required_bim_index.0
+                } else {
+                    false
+                };
 
-                let path_decision = batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
+                if is_relevant {
+                    // This variant is needed for the calculation.
+                    let reconciled_variant_index = ReconciledVariantIndex(reconciled_variant_cursor as u32);
+                    let path_decision = batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
 
-                if let ComputePath::VariantMajor = path_decision {
-                    // This is a sparse variant. First, we must flush any existing dense batch
-                    // to ensure that variants are processed in the correct order.
-                    if let DenseVariantBatch::Buffering(data) = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty) {
+                    if let ComputePath::VariantMajor = path_decision {
+                        // Sparse variant. First, flush any buffered dense batch to maintain order.
+                        if let DenseVariantBatch::Buffering(data) = std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty) {
+                            let permit = semaphore.clone().acquire_owned().await.unwrap();
+                            let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
+                            in_flight_tasks.push(handle);
+                        }
+
+                        // Now, dispatch the sparse variant.
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
+                        let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
+                        let handle = dispatch_work(parcel, context, permit);
                         in_flight_tasks.push(handle);
+
+                    } else { // PersonMajor
+                        // Dense variant. Add it to the current dense batch.
+                        dense_batch = match dense_batch {
+                            DenseVariantBatch::Empty => {
+                                let mut genotype_data = Vec::with_capacity(dense_batch_capacity);
+                                genotype_data.extend_from_slice(&filled_buffer);
+
+                                DenseVariantBatch::Buffering(DenseVariantBatchData {
+                                    data: genotype_data,
+                                    variant_count: 1,
+                                    reconciled_variant_indices: vec![reconciled_variant_index],
+                                })
+                            }
+                            DenseVariantBatch::Buffering(mut batch_data) => {
+                                batch_data.data.extend_from_slice(&filled_buffer);
+                                batch_data.reconciled_variant_indices.push(reconciled_variant_index);
+                                batch_data.variant_count += 1;
+                                DenseVariantBatch::Buffering(batch_data)
+                            }
+                        };
+
+                        // If the dense batch is now full, dispatch it.
+                        if let DenseVariantBatch::Buffering(data) = &dense_batch {
+                            if data.data.len() >= dense_batch_capacity {
+                               let permit = semaphore.clone().acquire_owned().await.unwrap();
+                               let parcel = WorkParcel::Dense(std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty).into_data());
+                               let handle = dispatch_work(parcel, context, permit);
+                               in_flight_tasks.push(handle);
+                            }
+                        }
                     }
 
-                    // Now, dispatch the sparse variant itself.
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
-                    let parcel = WorkParcel::Sparse { data: filled_buffer.clone(), reconciled_variant_index };
-                    let handle = dispatch_work(parcel, context, permit);
-                    in_flight_tasks.push(handle);
-                } else { // PersonMajor
-                    // This is a dense variant. Assemble the "recipe" for the batch.
-                    dense_batch = match dense_batch {
-                        DenseVariantBatch::Empty => {
-                            let mut genotype_data = Vec::with_capacity(dense_batch_capacity);
-                            genotype_data.extend_from_slice(&filled_buffer);
-                            
-                            DenseVariantBatch::Buffering(DenseVariantBatchData {
-                                data: genotype_data,
-                                variant_count: 1,
-                                reconciled_variant_indices: vec![reconciled_variant_index],
-                            })
-                        }
-                        DenseVariantBatch::Buffering(mut batch_data) => {
-                            // Append to the recipe. No gathering is done here.
-                            batch_data.data.extend_from_slice(&filled_buffer);
-                            batch_data.reconciled_variant_indices.push(reconciled_variant_index);
-                            batch_data.variant_count += 1;
-                            DenseVariantBatch::Buffering(batch_data)
-                        }
-                    };
-
-                    // If the dense batch is now full, dispatch it for computation.
-                    if let DenseVariantBatch::Buffering(data) = &dense_batch {
-                        if data.data.len() >= dense_batch_capacity {
-                           let permit = semaphore.clone().acquire_owned().await.unwrap();
-                           let parcel = WorkParcel::Dense(std::mem::replace(&mut dense_batch, DenseVariantBatch::Empty).into_data());
-                           let handle = dispatch_work(parcel, context, permit);
-                           in_flight_tasks.push(handle);
-                        }
+                    // We've processed this relevant variant, so advance the cursor.
+                    reconciled_variant_cursor += 1;
+                    if reconciled_variant_cursor > 0 && reconciled_variant_cursor % 10000 == 0 {
+                        eprintln!( "> Processed {}/{} relevant variants...", reconciled_variant_cursor, context.prep_result.num_reconciled_variants);
                     }
                 }
+                // If `is_relevant` was false, we do nothing with the buffer, effectively discarding it.
 
+                // In ALL cases (relevant or not), increment the global .bed file cursor.
+                bed_row_cursor += 1;
+
+                // And in ALL cases, we must immediately recycle the I/O buffer to prevent deadlock.
+                // We take the buffer, clear it to be polite, and send it back to the I/O producer.
+                filled_buffer.clear();
                 if empty_buffer_tx.send(filled_buffer).await.is_err() { break; }
-
-                if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
-                    eprintln!( "> Processed {}/{} relevant variants...", required_indices_cursor, context.prep_result.num_reconciled_variants);
-                }
             }
         }
     }
 
+    // --- Finalization: Flush any remaining work ---
+
+    // Flush the final dense batch if it's not empty.
     if let DenseVariantBatch::Buffering(data) = dense_batch {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let handle = dispatch_work(WorkParcel::Dense(data), context, permit);
         in_flight_tasks.push(handle);
     }
 
+    // Wait for all remaining in-flight tasks to complete.
     while let Some(task_result) = in_flight_tasks.next().await {
-        match task_result? {
-            Ok((scores, counts)) => {
-                for (master, &partial) in context.all_scores.iter_mut().zip(&scores) { *master += partial; }
-                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts) { *master += partial; }
-                context.partial_result_pool.push((scores, counts)).unwrap();
-            }
-            Err(e) => return Err(e),
-        }
+        // This final loop must also use the same robust resource handling.
+        let (compute_result, scores, counts) = task_result??;
+        context.partial_result_pool.push((scores, counts)).unwrap();
+        compute_result?; // Propagate any errors from the last tasks.
     }
 
+    // --- Final Aggregation ---
+    // At this point, all partial results have been returned to the pool. We need
+    // to aggregate the final chunks that were processed in the loops above.
+    let final_scores = &mut context.all_scores;
+    let final_counts = &mut context.all_missing_counts;
+
+    context.partial_result_pool.iter().for_each(|(scores, counts)| {
+        for (master, &partial) in final_scores.iter_mut().zip(scores.deref()) {
+            *master += partial;
+        }
+        for (master, &partial) in final_counts.iter_mut().zip(counts.deref()) {
+            *master += partial;
+        }
+    });
+
     Ok(())
+}
+
+/// Spawns the I/O producer task in the background.
+///
+/// This function is architected for maximum throughput. It spawns a single dedicated
+/// OS thread to handle all blocking file I/O, preventing the async runtime from
+/// being stalled. This producer's only responsibility is to read every variant from
+/// the .bed file sequentially and send the raw data downstream. It performs zero
+/// filtering or decision-making, ensuring a constant, predictable flow of data
+/// to the orchestrator and preventing pipeline deadlocks.
+fn spawn_io_producer_task(
+    prep_result: Arc<PreparationResult>,
+    plink_prefix: PathBuf,
+    full_buffer_tx: mpsc::Sender<Vec<u8>>,
+    mut empty_buffer_rx: mpsc::Receiver<Vec<u8>>,
+) -> JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
+    tokio::spawn(task::spawn_blocking(move || {
+        // --- Setup Phase (inside the dedicated blocking thread) ---
+        let bed_path = plink_prefix.with_extension("bed");
+        let mut reader = match BedReader::new(
+            &bed_path,
+            prep_result.bytes_per_variant,
+            prep_result.total_variants_in_bim,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+        };
+
+        // --- Producer Loop ---
+        // This loop will run until the orchestrator drops its receiver or we reach EOF.
+        // We use `blocking_recv` because we are in a synchronous context.
+        while let Some(mut buffer) = empty_buffer_rx.blocking_recv() {
+            // Read the very next variant row from the memory-mapped file.
+            let variant_data_opt = match reader.read_next_variant(&mut buffer) {
+                Ok(data) => data,
+                Err(e) => return Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+            };
+
+            if let Some(filled_buffer) = variant_data_opt {
+                // Immediately send the filled buffer to the orchestrator.
+                // If this fails, the orchestrator has shut down, so we can exit.
+                if full_buffer_tx.blocking_send(filled_buffer).is_err() {
+                    break;
+                }
+            } else {
+                // `None` signifies end-of-file. The producer's job is done.
+                break;
+            }
+        }
+
+        Ok(())
+    }))
 }
 
 
@@ -342,11 +385,19 @@ async fn run_orchestration_loop(
 /// task, and returns a `JoinHandle` to its result. The provided `SemaphorePermit`
 /// is consumed by the closure, ensuring it is not forgotten and is tied to the
 /// lifecycle of the spawned task.
+///
+/// The return type is carefully structured to decouple the result of the computation
+/// from the buffers used. This guarantees that buffers are always returned to the
+/// orchestrator for recycling, even if the computation fails, preventing resource leaks.
 fn dispatch_work(
     parcel: WorkParcel,
     context: &PipelineContext,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> JoinHandle<Result<(DirtyScores, DirtyCounts), Box<dyn Error + Send + Sync>>> {
+) -> JoinHandle<(
+    Result<(), Box<dyn Error + Send + Sync>>,
+    DirtyScores,
+    DirtyCounts,
+)> {
     // Clone the necessary Arcs for the spawned task. This is a cheap reference count bump.
     let prep_result = context.prep_result.clone();
     let partial_result_pool = context.partial_result_pool.clone();
@@ -365,35 +416,41 @@ fn dispatch_work(
         let mut clean_scores = dirty_scores.into_clean();
         let mut clean_counts = dirty_counts.into_clean();
 
-        match parcel {
+        // Perform the computation, capturing the result without using `?` so that
+        // we can guarantee the buffers are returned regardless of the outcome.
+        let compute_result = match parcel {
             WorkParcel::Sparse {
                 data,
                 reconciled_variant_index,
-            } => {
-                batch::run_variant_major_path(
-                    &data,
-                    &prep_result,
-                    &mut clean_scores,
-                    &mut clean_counts,
-                    reconciled_variant_index,
-                )?;
-            }
-            WorkParcel::Dense(data) => {
-                // The person-major path now receives the "recipe" and performs the gather internally.
-                batch::run_person_major_path(
-                    &data.data,
-                    &data.reconciled_variant_indices,
-                    &prep_result,
-                    &mut clean_scores,
-                    &mut clean_counts,
-                    &tile_pool,
-                    &sparse_index_pool,
-                )?;
-            }
-        }
-        Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
+            } => batch::run_variant_major_path(
+                &data,
+                &prep_result,
+                &mut clean_scores,
+                &mut clean_counts,
+                reconciled_variant_index,
+            ),
+            WorkParcel::Dense(data) => batch::run_person_major_path(
+                &data.data,
+                &data.reconciled_variant_indices,
+                &prep_result,
+                &mut clean_scores,
+                &mut clean_counts,
+                &tile_pool,
+                &sparse_index_pool,
+            ),
+        };
+
+        // Return a tuple containing the computation's result AND the buffers.
+        // The buffers are now considered "dirty" after being used.
+        (
+            compute_result,
+            clean_scores.into_dirty(),
+            clean_counts.into_dirty(),
+        )
     })
 }
+
+
 
 /// Calculates a target batch size for the person-major path based on L3 cache size.
 ///
