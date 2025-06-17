@@ -276,41 +276,21 @@ async fn run_orchestration_loop(
                     let handle = dispatch_work(parcel, context, permit);
                     in_flight_tasks.push(handle);
                 } else { // PersonMajor
-                    // This is a dense variant. It needs to be gathered and added to the dense batch.
+                    // This is a dense variant. Assemble the "recipe" for the batch.
                     dense_batch = match dense_batch {
                         DenseVariantBatch::Empty => {
-                            // The capacity for the genotype data buffer is calculated to align with a
-                            // target L3 cache size, amortizing the overhead of the pivot operation.
                             let mut genotype_data = Vec::with_capacity(dense_batch_capacity);
                             genotype_data.extend_from_slice(&filled_buffer);
-
-                            // Pre-calculate the capacity needed for the corresponding weights and flips.
-                            let padded_score_count = context.prep_result.padded_score_count;
-                            let num_variants_in_batch_capacity = dense_batch_capacity / (context.prep_result.bytes_per_variant as usize);
-                            let weights_flips_capacity = num_variants_in_batch_capacity * padded_score_count;
-
-                            let mut weights = Vec::with_capacity(weights_flips_capacity);
-                            let mut flips = Vec::with_capacity(weights_flips_capacity);
-
-                            // Gather the data for the first variant. This is the "gather-on-assemble" step.
-                            let (variant_weights, variant_flips) = &context.prep_result.variant_data[reconciled_variant_index.0 as usize];
-                            weights.extend_from_slice(variant_weights);
-                            flips.extend_from_slice(variant_flips);
                             
                             DenseVariantBatch::Buffering(DenseVariantBatchData {
                                 data: genotype_data,
-                                weights,
-                                flips,
                                 variant_count: 1,
                                 reconciled_variant_indices: vec![reconciled_variant_index],
                             })
                         }
                         DenseVariantBatch::Buffering(mut batch_data) => {
-                            // Append the new variant's genotype, weight, and flip data to the existing batch buffers.
+                            // Append to the recipe. No gathering is done here.
                             batch_data.data.extend_from_slice(&filled_buffer);
-                            let (weights, flips) = &context.prep_result.variant_data[reconciled_variant_index.0 as usize];
-                            batch_data.weights.extend_from_slice(weights);
-                            batch_data.flips.extend_from_slice(flips);
                             batch_data.reconciled_variant_indices.push(reconciled_variant_index);
                             batch_data.variant_count += 1;
                             DenseVariantBatch::Buffering(batch_data)
@@ -356,6 +336,7 @@ async fn run_orchestration_loop(
 
     Ok(())
 }
+
 
 /// A unified dispatcher that takes a `WorkParcel`, spawns the appropriate compute
 /// task, and returns a `JoinHandle` to its result. The provided `SemaphorePermit`
