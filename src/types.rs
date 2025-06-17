@@ -135,10 +135,6 @@ pub struct PackedVariantGenotypes(pub Vec<u8>);
 pub struct DenseVariantBatchData {
     /// A contiguous buffer of packed variant genotype data.
     pub data: Vec<u8>,
-    /// A contiguous buffer of pre-gathered, padded weights for the variants in this batch.
-    pub weights: Vec<f32>,
-    /// A contiguous buffer of pre-gathered, padded flips for the variants in this batch.
-    pub flips: Vec<u8>,
     /// The number of variants in this batch. This is the source of truth for the batch size.
     pub variant_count: usize,
     /// The reconciled variant indices for each corresponding variant in the batch.
@@ -146,7 +142,6 @@ pub struct DenseVariantBatchData {
     /// events like missingness handling.
     pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
 }
-
 /// A batch of raw variant data, curated to contain only "dense" variants
 /// suitable for the high-throughput person-major compute path.
 ///
@@ -202,18 +197,12 @@ pub enum PersonSubset {
 /// compute engine will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    // --- COMPILED DATA & METADATA ---
-    // The `variant_data` field stores weight/flip info per-variant, which is
-    // efficient for the gather-on-assemble strategy used by the pipeline.
-    // The fields are public to be read by downstream modules.
-
-    /// A vector where each element is a tuple containing the padded `(weights, flips)`
-    /// for a single reconciled variant. The index of this vector corresponds to the
-    /// `ReconciledVariantIndex`.
-    pub variant_data: Vec<(Vec<f32>, Vec<u8>)>,
-    /// The padded width of a single variant's score data, rounded up to the
-    /// nearest multiple of the SIMD vector width.
-    pub padded_score_count: usize,
+    // --- PRIVATE, COMPILED DATA MATRICES ---
+    // These fields are private to guarantee their invariants. They are created once
+    // by the `prepare` module and can only be read by downstream modules.
+    weights_matrix: Vec<f32>,
+    flip_mask_matrix: Vec<u8>,
+    stride: usize,
 
     // --- PUBLIC METADATA & LOOKUP TABLES ---
     /// The sorted list of original `.bim` row indices that are required for this
@@ -255,8 +244,9 @@ impl PreparationResult {
     /// Only the `prepare` module can construct this "proof token".
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        variant_data: Vec<(Vec<f32>, Vec<u8>)>,
-        padded_score_count: usize,
+        weights_matrix: Vec<f32>,
+        flip_mask_matrix: Vec<u8>,
+        stride: usize,
         required_bim_indices: Vec<BimRowIndex>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
@@ -271,8 +261,9 @@ impl PreparationResult {
         person_fam_to_output_idx: Vec<Option<u32>>,
     ) -> Self {
         Self {
-            variant_data,
-            padded_score_count,
+            weights_matrix,
+            flip_mask_matrix,
+            stride,
             required_bim_indices,
             score_names,
             score_variant_counts,
@@ -287,7 +278,25 @@ impl PreparationResult {
             person_fam_to_output_idx,
         }
     }
+
+    // --- Public Getters for Private Data ---
+
+    #[inline(always)]
+    pub fn weights_matrix(&self) -> &[f32] {
+        &self.weights_matrix
+    }
+
+    #[inline(always)]
+    pub fn flip_mask_matrix(&self) -> &[u8] {
+        &self.flip_mask_matrix
+    }
+
+    #[inline(always)]
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
 }
+
 
 // ========================================================================================
 //                            Primitive Type Definitions
