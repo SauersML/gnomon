@@ -470,11 +470,10 @@ fn pivot_tile(
     person_indices_in_block: &[OriginalPersonIndex],
     tile: &mut [EffectAlleleDosage],
     prep_result: &PreparationResult,
-    matrix_row_start_idx: MatrixRowIndex,
-    snps_in_chunk: usize,
 ) {
     let num_people_in_block = person_indices_in_block.len();
     let bytes_per_snp = prep_result.bytes_per_snp;
+    let snps_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
 
     // Maps a desired sequential SNP index (0-7) to its physical source location within
     // the shuffled vector produced by the `transpose_8x8_u8` function. This is used
@@ -488,7 +487,9 @@ fn pivot_tile(
         let person_indices = U64xN::from_array(core::array::from_fn(|i| {
             if i < current_lanes {
                 person_indices_in_block[person_chunk_start + i].0 as u64
-            } else { 0 }
+            } else {
+                0
+            }
         }));
         let person_byte_indices = person_indices / U64xN::splat(4);
         let bit_shifts = (person_indices % U64xN::splat(4)) * U64xN::splat(2);
@@ -500,9 +501,10 @@ fn pivot_tile(
             // --- 1. Decode a block of up to 8 SNPs using SIMD ---
             let mut dosage_vectors = [U8xN::default(); SIMD_LANES];
             for i in 0..current_snps {
-                let variant_idx_in_chunk = snp_chunk_start + i;
-                // Each SNP's data follows the last one directly.
-                let snp_byte_offset = variant_idx_in_chunk as u64 * bytes_per_snp;
+                let variant_idx_in_batch = snp_chunk_start + i;
+
+                // The offset is simply its index in the batch multiplied by the bytes per SNP.
+                let snp_byte_offset = variant_idx_in_batch as u64 * bytes_per_snp;
                 let source_byte_indices = U64xN::splat(snp_byte_offset) + person_byte_indices;
 
                 let packed_vals =
