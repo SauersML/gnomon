@@ -190,18 +190,26 @@ async fn run_orchestration_loop(
                 // First, release the semaphore permit. This happens regardless of task outcome.
                 semaphore.add_permits(1);
 
-                // Then, unpack the result. This will propagate any JoinError.
+                // Unpack the result from the JoinHandle, propagating a panic.
                 let (compute_result, scores, counts) = task_result?;
 
-                // Always return the result buffers to the pool.
-                // This prevents resource leaks that would otherwise deadlock the application.
-                context.partial_result_pool.push((scores, counts)).unwrap();
-
-                // Finally, handle the actual outcome of the computation.
-                match compute_result {
-                    Ok(()) => { /* Task succeeded, do nothing more. */ }
-                    Err(e) => return Err(e), // Task failed, propagate the error and exit.
+                // Check if the computation itself succeeded.
+                if let Err(e) = compute_result {
+                    // The task failed. Return the buffers to the pool before propagating the error.
+                    context.partial_result_pool.push((scores, counts)).unwrap();
+                    return Err(e);
                 }
+
+                // If we reach here, the task succeeded. Aggregate the results.
+                for (master, &partial) in context.all_scores.iter_mut().zip(scores.deref()) {
+                    *master += partial;
+                }
+                for (master, &partial) in context.all_missing_counts.iter_mut().zip(counts.deref()) {
+                    *master += partial;
+                }
+
+                // AFTER aggregation, return the buffers to the pool for reuse.
+                context.partial_result_pool.push((scores, counts)).unwrap();
             },
 
             // --- Arm 2: Receive new data from the I/O producer ---
