@@ -285,7 +285,7 @@ async fn run_orchestration_loop(
                             genotype_data.extend_from_slice(&filled_buffer);
 
                             // Pre-calculate the capacity needed for the corresponding weights and flips.
-                            let padded_score_count = context.prep_result.padded_score_count();
+                            let padded_score_count = context.prep_result.padded_score_count;
                             let num_variants_in_batch_capacity = dense_batch_capacity / (context.prep_result.bytes_per_variant as usize);
                             let weights_flips_capacity = num_variants_in_batch_capacity * padded_score_count;
 
