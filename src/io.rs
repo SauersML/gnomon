@@ -1,13 +1,13 @@
 // ========================================================================================
 //
-//          HIGH-PERFORMANCE, SYNCHRONOUS, SINGLE-SNP MEMORY-MAPPED READER
+//          HIGH-PERFORMANCE, SYNCHRONOUS, SINGLE-variant MEMORY-MAPPED READER
 //
 // ========================================================================================
 //
 // ### Purpose ###
 //
 // This module provides a high-performance, synchronous reader for moving raw,
-// sequential, single-SNP data rows from a memory-mapped .bed file. It operates
+// sequential, single-variant data rows from a memory-mapped .bed file. It operates
 // on a `mmap`'d region for zero-copy reads from the OS page cache, which is
 // ideal for the producer-consumer pipeline in the main orchestrator.
 
@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-/// A high-performance reader for moving raw, sequential, single-SNP data rows
+/// A high-performance reader for moving raw, sequential, single-variant data rows
 /// from a memory-mapped .bed file. It operates on a `mmap`'d region for zero-copy
 /// reads from the OS page cache.
 pub struct BedReader {
@@ -31,15 +31,13 @@ pub struct BedReader {
     /// The total size of the file in bytes, cached at creation time.
     file_size: u64,
 
-    /// The number of bytes per SNP, calculated once at construction. This is a
+    /// The number of bytes per variant, calculated once at construction. This is a
     /// critical piece of encapsulated state that prevents this logic from
     /// leaking into other modules.
     bytes_per_variant: u64,
 }
 
 impl BedReader {
-    /// Creates a new `SnpReader` after performing critical validation.
-    ///
     /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
     /// file exists, is a valid PLINK .bed file, and has a size consistent with the
     /// metadata from the `prepare` phase, using overflow-safe arithmetic.
@@ -56,12 +54,12 @@ impl BedReader {
         if mmap.get(0..3) != Some(&[0x6c, 0x1b, 0x01]) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Invalid .bed file magic number. The file may be corrupt or not a valid PLINK .bed file in SNP-major mode.",
+                "Invalid .bed file magic number. The file may be corrupt or not a valid PLINK .bed file in variant-major mode.",
             ));
         }
 
         // --- Validation Step 2: File Size (with checked arithmetic) ---
-        // bytes_per_snp is now passed as an argument
+        // bytes_per_variant is now passed as an argument
         let total_variant_bytes = (num_variants as u64).checked_mul(bytes_per_variant_arg)
             .ok_or_else(|| {
                 io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
@@ -91,10 +89,10 @@ impl BedReader {
         })
     }
 
-    /// Reads the data for the next single SNP.
+    /// Reads the data for the next single variant.
     ///
     /// This function is designed for high-throughput, sequential reading. It takes an
-    /// empty buffer from a pool, fills it with the data for exactly one SNP, and
+    /// empty buffer from a pool, fills it with the data for exactly one variant, and
     /// returns it. This allows the calling context to reuse buffer allocations.
     ///
     /// # Arguments
@@ -103,7 +101,7 @@ impl BedReader {
     ///          leaving an empty `Vec` in its place.
     ///
     /// # Returns
-    /// * `Ok(Some(Vec<u8>))`: On a successful read, returns the buffer now filled with SNP data.
+    /// * `Ok(Some(Vec<u8>))`: On a successful read, returns the buffer now filled with variant data.
     /// * `Ok(None)`: If the end of the file is reached.
     /// * `Err(e)`: On an I/O error.
     pub fn read_next_variant(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
@@ -113,9 +111,9 @@ impl BedReader {
 
         let bytes_per_variant = self.bytes_per_variant as usize;
 
-        // Make sure there is enough data left in the file for one full SNP.
+        // Make sure there is enough data left in the file for one full variant.
         if self.file_size - self.cursor < self.bytes_per_variant {
-            // This case handles trailing bytes in a file that are not a full SNP.
+            // This case handles trailing bytes in a file that are not a full variant.
             self.cursor = self.file_size;
             return Ok(None);
         }
