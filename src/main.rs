@@ -427,31 +427,73 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 // A type alias for the result of a compute task.
 type ComputeResult = (DirtyScores, DirtyCounts, Option<Vec<u8>>);
 
+/// The unified result returned by any compute task.
+struct ComputeTaskResult {
+    scores: DirtyScores,
+    counts: DirtyCounts,
+    // The buffer from a sparse SNP task, to be recycled. `None` for dense batches.
+    recycled_buffer: Option<Vec<u8>>,
+}
+
 /// Dispatches a batch of dense SNPs to the person-major compute path.
+///
+/// This function takes ownership of a `DenseSnpBatch` and all necessary shared
+/// resources as `Arc`s. It spawns a blocking task to run the CPU-bound computation
+/// without stalling the async runtime. The spawned task performs the following:
+///
+/// 1.  Pops a set of reusable, partial result buffers from a shared pool.
+/// 2.  Calls the high-throughput `run_person_major_path` kernel.
+/// 3.  Packages the computed partial scores and counts into a `ComputeTaskResult`.
+/// 4.  The `recycled_buffer` field of the result is `None`, as the large batch
+///     data buffer is consumed and dropped, not recycled.
+///
+/// # Arguments
+/// * `batch_to_process`: The `DenseSnpBatch` to be processed. The function takes
+///   this by value to move it into the spawned task.
+/// * `prep_result`: An `Arc` to the global `PreparationResult`.
+/// * `tile_pool`: An `Arc` to the pool of reusable person-major tile buffers.
+/// * `sparse_index_pool`: An `Arc` to the pool of thread-local sparse index buffers.
+/// * `partial_result_pool`: An `Arc` to the pool of reusable partial score/count buffers.
+///
+/// # Returns
+/// A `JoinHandle` to the spawned compute task. The handle resolves to a `Result`
+/// containing the `ComputeTaskResult` on success.
 fn dispatch_person_major_batch(
     batch_to_process: DenseSnpBatch,
     prep_result: Arc<prepare::PreparationResult>,
     tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
     sparse_index_pool: Arc<SparseIndexPool>,
     partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
-) -> task::JoinHandle<Result<ComputeResult, Box<dyn Error + Send + Sync>>> {
+) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
     task::spawn_blocking(move || {
+        // 1. Acquire a set of partial result buffers from the pool.
+        // This unwrap is safe; the pool is sized to prevent exhaustion.
         let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+
+        // 2. Transition the buffers to the "Clean" state, zeroing them.
         let mut clean_scores = dirty_scores.into_clean();
         let mut clean_counts = dirty_counts.into_clean();
 
+        // 3. Dispatch to the synchronous, CPU-bound compute function.
         batch::run_person_major_path(
             &batch_to_process.data,
+            &batch_to_process.metadata,
             &prep_result,
             &mut clean_scores,
             &mut clean_counts,
             &tile_pool,
             &sparse_index_pool,
-            batch_to_process.start_matrix_row,
-            batch_to_process.snp_count,
         )?;
-        
-        let result = (clean_scores.into_dirty(), clean_counts.into_dirty(), None);
+
+        // 4. Package the results into the unified result type.
+        let result = ComputeTaskResult {
+            scores: clean_scores.into_dirty(),
+            counts: clean_counts.into_dirty(),
+            // The large `data` buffer from `batch_to_process` is NOT recycled.
+            // It is dropped here when the task completes.
+            recycled_buffer: None,
+        };
+
         Ok(result)
     })
 }
