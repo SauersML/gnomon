@@ -367,6 +367,13 @@ fn process_tile(
         // --- B. Create Matrix Views for the Mini-Batch ---
         // Since the SNPs in the batch may not be contiguous in the original file,
         // we can no longer use a simple slice. Instead, we must gather the rows.
+
+        /*
+         * PERFORMANCE-CRITICAL PATH: The logic below creates new, heap-allocated vectors
+         * (`weights_chunk`, `flip_flags_chunk`) on every single iteration of this mini-batch
+         * loop. As this function is called in parallel for many dense chunks, this
+         * results in high-frequency allocations.
+         */
         let mut weights_chunk = Vec::with_capacity(mini_batch_size * stride);
         let mut flip_flags_chunk = Vec::with_capacity(mini_batch_size * stride);
 
