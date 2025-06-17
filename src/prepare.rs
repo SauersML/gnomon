@@ -82,7 +82,7 @@ pub fn prepare_for_computation(
     let num_people_to_score = final_person_iids.len();
     
     // Build the mapping from original .fam index to the final, compact output index.
-    // This is essential for the SNP-major compute path to work with subsets.
+    // This is essential for the variant-major compute path to work with subsets.
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
     for (output_idx, iid) in final_person_iids.iter().enumerate() {
         if let Some(&original_fam_idx) = iid_to_original_idx.get(iid) {
@@ -457,7 +457,7 @@ fn discover_required_bim_indices(
     let required_indices_results: Vec<_> = score_map
         .par_iter()
         .map(|(variant_id, score_lines)| {
-            let mut set_for_snp = BTreeSet::new();
+            let mut set_for_variant = BTreeSet::new();
             if let Some(bim_records) = bim_index.get(variant_id) {
                 for (effect_allele, other_allele, _weights) in score_lines {
                     // Call the single authoritative resolver to get the definitive list of matches.
@@ -467,7 +467,7 @@ fn discover_required_bim_indices(
                     // For each valid match returned by the resolver...
                     for (bim_record, bim_row_index) in winning_matches {
                         // Add its bim row index to the set of required indices.
-                        set_for_snp.insert(*bim_row_index);
+                        set_for_variant.insert(*bim_row_index);
 
                         // The existing ambiguity warning logic is still useful to inform the user
                         // about permissive matching, but now it acts on a definitively chosen match.
@@ -493,7 +493,7 @@ fn discover_required_bim_indices(
                     }
                 }
             }
-            Ok::<_, PrepError>(set_for_snp)
+            Ok::<_, PrepError>(set_for_variant)
         })
         .collect();
 
