@@ -385,9 +385,9 @@ fn process_tile(
             flip_flags_chunk.extend_from_slice(&flip_mask_matrix[row_offset..row_offset + stride]);
         }
 
-        let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
+        let weights = kernel::PaddedInterleavedWeights::new(&weights_chunk, mini_batch_size, num_scores)
             .expect("CRITICAL: Mini-batch weights matrix validation failed.");
-        let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
+        let flip_flags = kernel::PaddedInterleavedFlags::new(&flip_flags_chunk, mini_batch_size, num_scores)
             .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
 
         // --- C. Dispatch to Kernel and Accumulate Results ---
