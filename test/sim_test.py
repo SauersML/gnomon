@@ -291,7 +291,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         ]
         for i in range(50):
             pos = 10000 + i
-               score_data.append({'variant_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
+            score_data.append({'variant_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
         score_data.extend([
                {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
                {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
