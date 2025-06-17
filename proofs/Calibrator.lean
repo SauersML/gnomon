@@ -64,12 +64,12 @@ structure BasisFunctions (p : ℕ) where
 
 /-- Example: Linear basis with B_0(P) = 1, B_1(P) = P -/
 def linearBasis : BasisFunctions 1 where
-  B := fun m => 
+  B := fun m =>
     if m = 0 then fun _ => 1  -- B_0(P) = 1
     else fun p => p           -- B_1(P) = P
-  B_zero_is_one := by 
+  B_zero_is_one := by
     -- This proves B 0 = fun _ => 1
-    simp [Function.funext_iff]
+    simp [funext_iff]
 
 /-- Example: Quadratic basis with B_0(P) = 1, B_1(P) = P, B_2(P) = P² -/
 def quadraticBasis : BasisFunctions 2 where
@@ -77,7 +77,7 @@ def quadraticBasis : BasisFunctions 2 where
     if m.val = 0 then fun _ => 1      -- B_0(P) = 1
     else if m.val = 1 then fun p => p  -- B_1(P) = P
     else fun p => p^2                  -- B_2(P) = P²
-  B_zero_is_one := by simp [Function.funext_iff, Fin.val_zero]
+  B_zero_is_one := by simp [funext_iff, Fin.val_zero]
 
 /-!
 ### Model Parameters
@@ -99,7 +99,7 @@ These implement Equations (1) and (3) from the paper
 
 /-- Ancestry-dependent coefficient from Equation (1):
     α_m(PC_j) = γ_{m0} + Σ_{l=1}^k γ_{ml} PC_{jl}
-    
+
     Note the index handling:
     - γ m 0 gives γ_{m0} (the baseline)
     - For the sum, l : Fin k represents l ∈ {1,...,k} in the paper
@@ -109,7 +109,7 @@ def alpha (γ : GammaParams p k) (m : Fin (p + 1)) (pc : PC k) : ℝ :=
 
 /-- Linear predictor from Equation (3):
     η_j = Σ_{m=0}^p α_m(PC_j) B_m(P_j)
-    
+
     This computes the weighted sum of basis functions. -/
 def linearPredictor (γ : GammaParams p k) (B : BasisFunctions p) (pgs : PGS) (pc : PC k) : ℝ :=
   ∑ m : Fin (p + 1), alpha γ m pc * B.B m pgs
@@ -126,11 +126,11 @@ inductive LinkFunction
   | identity  -- For continuous outcomes: link(μ) = μ
 
 /-- Apply the link function to transform from mean to linear predictor space -/
-def applyLink : LinkFunction → ℝ → ℝ
+noncomputable def applyLink : LinkFunction → ℝ → ℝ
   | LinkFunction.logit, π => Real.log (π / (1 - π))
   | LinkFunction.identity, μ => μ
 
-/-- Apply inverse link to get predictions. 
+/-- Apply inverse link to get predictions.
     `noncomputable` because Real.exp cannot be computed exactly. -/
 noncomputable def applyInverseLink : LinkFunction → ℝ → ℝ
   | LinkFunction.logit, η => 1 / (1 + Real.exp (-η))  -- sigmoid function
@@ -228,7 +228,7 @@ structure Individual (k : ℕ) where
   /-- Principal components PC_j -/
   pc : PC k
 
-/-- Training dataset of n individuals. 
+/-- Training dataset of n individuals.
     This is a function from indices {0,...,n-1} to Individual records. -/
 def TrainingData (n k : ℕ) := Fin n → Individual k
 
