@@ -19,7 +19,7 @@ use crossbeam_queue::ArrayQueue;
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_cpus;
 use std::error::Error;
-use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
