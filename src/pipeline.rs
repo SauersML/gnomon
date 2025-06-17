@@ -1,19 +1,18 @@
 // ========================================================================================
 //
-//                          THE TACTICAL PIPELINE EXECUTOR
+//               THE TACTICAL PIPELINE EXECUTOR (ROBUST & DEADLOCK-PROOF)
 //
 // ========================================================================================
 //
-// This module contains the "how" of the concurrent pipeline. It takes a "computation
-// blueprint" from the `prepare` module and executes it, managing I/O, task dispatch,
-// and result aggregation. It is completely decoupled from the strategic-level logic
-// in `main.rs`.
+// This module contains the "how" of the concurrent pipeline. It is architected to
+// prevent resource-based deadlocks by enforcing a strict and symmetrical lifecycle for
+// all I/O buffers.
 
 use crate::batch::{self, KernelInputBufferPool, SparseIndexPool};
 use crate::io::BedReader;
 use crate::types::{
     ComputePath, DenseVariantBatch, DenseVariantBatchData, DirtyCounts, DirtyScores,
-    EffectAlleleDosage, PackedVariantGenotypes, PreparationResult, ReconciledVariantIndex,
+    EffectAlleleDosage, PreparationResult, ReconciledVariantIndex,
 };
 use cache_size;
 use crossbeam_queue::ArrayQueue;
@@ -49,7 +48,8 @@ pub struct PipelineContext {
     pub all_missing_counts: Vec<u32>,
 
     // A list of all in-flight compute tasks, private to this module.
-    compute_handles: Vec<task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>>>,
+    join_handles:
+        Vec<task::JoinHandle<Result<(DirtyScores, DirtyCounts), Box<dyn Error + Send + Sync>>>>,
 }
 
 impl PipelineContext {
@@ -81,7 +81,7 @@ impl PipelineContext {
             partial_result_pool,
             all_scores: vec![0.0f64; result_buffer_size],
             all_missing_counts: vec![0u32; result_buffer_size],
-            compute_handles: Vec::with_capacity(256),
+            join_handles: Vec::with_capacity(256),
         }
     }
 }
@@ -101,6 +101,7 @@ pub async fn run(
     const PIPELINE_DEPTH: usize = 2;
 
     // Create the two channels that will connect the I/O producer and the main orchestrator.
+    // The orchestrator sends empty buffers to the I/O task, which sends them back filled.
     let (full_buffer_tx, mut full_buffer_rx) = mpsc::channel(PIPELINE_DEPTH);
     let (empty_buffer_tx, empty_buffer_rx) = mpsc::channel(PIPELINE_DEPTH);
 
@@ -109,7 +110,7 @@ pub async fn run(
     let single_variant_buffer_size = context.prep_result.bytes_per_variant as usize;
     for _ in 0..PIPELINE_DEPTH {
         empty_buffer_tx
-            .send(IoCommand::Read(vec![0u8; single_variant_buffer_size]))
+            .send(vec![0u8; single_variant_buffer_size])
             .await?;
     }
 
@@ -127,7 +128,7 @@ pub async fn run(
 
     // After the orchestration loop finishes, await all spawned compute tasks
     // and aggregate their results into the context's master buffers.
-    aggregate_results(context, &empty_buffer_tx).await?;
+    aggregate_results(context).await?;
 
     // Finally, await the I/O handle to ensure it has terminated cleanly and
     // propagate any errors it may have encountered.
@@ -139,20 +140,20 @@ pub async fn run(
 //                             INTERNAL TYPES
 // ========================================================================================
 
-/// The unified result returned by any compute task, containing dirty buffers.
-struct ComputeTaskResult {
-    scores: DirtyScores,
-    counts: DirtyCounts,
-    // The I/O buffer from a sparse variant task, to be recycled. `None` for dense batches.
-    recycled_buffer: Option<Vec<u8>>,
-}
-
-/// A command sent from the orchestrator to the I/O producer thread.
-enum IoCommand {
-    /// A command to read the next variant into the provided buffer.
-    Read(Vec<u8>),
-    /// A command to gracefully shut down the I/O thread.
-    Shutdown,
+/// A self-contained, type-safe representation of a unit of computation.
+///
+/// This enum decouples the I/O transport mechanism (the buffer) from the compute
+/// payload. By taking ownership of the necessary data, it guarantees that a compute
+/// task has everything it needs and prevents I/O buffers from being accidentally
+/// captured and held by long-running tasks, which was the source of the deadlock.
+enum WorkParcel {
+    /// A single variant to be processed by the low-overhead variant-major path.
+    Sparse {
+        data: Vec<u8>,
+        reconciled_variant_index: ReconciledVariantIndex,
+    },
+    /// A batch of dense variants to be processed by the high-throughput person-major path.
+    Dense(DenseVariantBatchData),
 }
 
 // ========================================================================================
@@ -163,8 +164,8 @@ enum IoCommand {
 fn spawn_io_producer_task(
     prep_result: Arc<PreparationResult>,
     plink_prefix: PathBuf,
-    full_buffer_tx: mpsc::Sender<PackedVariantGenotypes>,
-    mut empty_buffer_rx: mpsc::Receiver<IoCommand>,
+    full_buffer_tx: mpsc::Sender<Vec<u8>>,
+    mut empty_buffer_rx: mpsc::Receiver<Vec<u8>>,
 ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
     tokio::spawn(async move {
         // --- One-time setup within the spawned task ---
@@ -182,17 +183,10 @@ fn spawn_io_producer_task(
         let mut required_indices_cursor: usize = 0;
 
         // --- Main I/O Producer Loop ---
-        // This loop is driven by the orchestrator sending `IoCommand`s, which provide
-        // a buffer to fill.
-        'producer: while let Some(command) = empty_buffer_rx.recv().await {
-            let mut buffer = match command {
-                IoCommand::Read(buffer) => buffer,
-                IoCommand::Shutdown => break 'producer,
-            };
-
+        // This loop is driven by the orchestrator sending an empty buffer to fill.
+        'producer: while let Some(mut buffer) = empty_buffer_rx.recv().await {
             // This inner loop ensures we hold onto the buffer until we find a relevant
-            // variant to send to the orchestrator. This prevents a deadlock where
-            // all buffers are discarded on non-relevant variants.
+            // variant to send to the orchestrator.
             'read_loop: loop {
                 let (new_reader, filled_buffer_opt) = match task::spawn_blocking(move || {
                     let variant_data_opt = reader.read_next_variant(&mut buffer)?;
@@ -221,12 +215,12 @@ fn spawn_io_producer_task(
 
                     if is_relevant {
                         required_indices_cursor += 1;
-                        if full_buffer_tx.send(PackedVariantGenotypes(buffer)).await.is_err() {
+                        if full_buffer_tx.send(buffer).await.is_err() {
                             // The orchestrator has hung up. Shut down.
                             break 'producer;
                         }
                         // We have successfully sent the buffer, so we must now break the
-                        // inner loop to await a new `IoCommand` with a new buffer.
+                        // inner loop to await a new empty buffer from the orchestrator.
                         break 'read_loop;
                     } else {
                         // This variant is not relevant. The loop continues, reusing the
@@ -244,55 +238,53 @@ fn spawn_io_producer_task(
 }
 
 /// The core orchestration loop that receives and dispatches variants.
-/// This function is responsible for managing the `DenseVariantBatch` state machine.
+/// This function is responsible for managing the `DenseVariantBatch` state machine
+/// and ensuring the I/O buffer pipeline remains full to prevent deadlocks.
 async fn run_orchestration_loop(
     context: &mut PipelineContext,
-    full_buffer_rx: &mut mpsc::Receiver<PackedVariantGenotypes>,
-    empty_buffer_tx: &mpsc::Sender<IoCommand>,
+    full_buffer_rx: &mut mpsc::Receiver<Vec<u8>>,
+    empty_buffer_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut required_indices_cursor: usize = 0;
     let dense_batch_capacity =
         calculate_dense_batch_capacity(context.prep_result.bytes_per_variant);
     let mut dense_batch = DenseVariantBatch::Empty;
 
-    'orchestrator: while let Some(packed_genotypes) = full_buffer_rx.recv().await {
+    'orchestrator: while let Some(filled_buffer) = full_buffer_rx.recv().await {
         let reconciled_variant_index = ReconciledVariantIndex(required_indices_cursor as u32);
         required_indices_cursor += 1;
 
         let path_decision =
-            batch::assess_path(&packed_genotypes.0, context.prep_result.total_people_in_fam);
-    
+            batch::assess_path(&filled_buffer, context.prep_result.total_people_in_fam);
+
         match path_decision {
             ComputePath::VariantMajor => {
-                // To preserve processing order, we must flush any pending dense batch
-                // before processing this sparse one.
-                dense_batch = dispatch_dense_batch(dense_batch, context);
+                // To preserve ordering, we must flush any pending dense batch first.
+                dense_batch = dispatch_work(dense_batch, context);
 
-                // Now, dispatch the sparse variant for immediate computation.
-                let handle = dispatch_variant_major_path(
-                    packed_genotypes,
+                // Create a work parcel by cloning the data from the I/O buffer.
+                // This is a small cost for the much less frequent sparse path,
+                // and it guarantees the I/O buffer can be immediately recycled.
+                let parcel = WorkParcel::Sparse {
+                    data: filled_buffer.clone(),
                     reconciled_variant_index,
-                    context.prep_result.clone(),
-                    context.partial_result_pool.clone(),
-                );
-                context.compute_handles.push(handle);
+                };
+                dispatch_work(parcel, context);
             }
             ComputePath::PersonMajor => {
-                // This match handles the state transitions for the batch.
+                // This match handles the state transitions for the dense batch.
                 dense_batch = match dense_batch {
-                    // If the batch was empty, create a new one with this variant.
                     DenseVariantBatch::Empty => {
                         let mut data = Vec::with_capacity(dense_batch_capacity);
-                        data.extend_from_slice(&packed_genotypes.0);
+                        data.extend_from_slice(&filled_buffer);
                         let batch_data = DenseVariantBatchData {
                             data,
                             reconciled_variant_indices: vec![reconciled_variant_index],
                         };
                         DenseVariantBatch::Buffering(batch_data)
                     }
-                    // If it was already buffering, add this variant to the existing data.
                     DenseVariantBatch::Buffering(mut batch_data) => {
-                        batch_data.data.extend_from_slice(&packed_genotypes.0);
+                        batch_data.data.extend_from_slice(&filled_buffer);
                         batch_data
                             .reconciled_variant_indices
                             .push(reconciled_variant_index);
@@ -300,23 +292,21 @@ async fn run_orchestration_loop(
                     }
                 };
 
-                // Immediately recycle the genotype buffer by sending a `Read`
-                // command back to the I/O producer, keeping the pipeline full.
-                if empty_buffer_tx
-                    .send(IoCommand::Read(packed_genotypes.0))
-                    .await
-                    .is_err()
-                {
-                    break 'orchestrator;
-                }
-
                 // After adding, check if the batch is now full and needs to be dispatched.
                 if let DenseVariantBatch::Buffering(data) = &dense_batch {
                     if data.data.len() >= dense_batch_capacity {
-                        dense_batch = dispatch_dense_batch(dense_batch, context);
+                        dense_batch = dispatch_work(dense_batch, context);
                     }
                 }
             }
+        }
+
+        // Symmetrical I/O Buffer Management: In all cases, the data from the filled
+        // buffer has been handled (either cloned or copied). The buffer is now free
+        // to be immediately returned to the I/O producer to be filled again.
+        // This is the key to preventing the deadlock.
+        if empty_buffer_tx.send(filled_buffer).await.is_err() {
+            break 'orchestrator;
         }
 
         if required_indices_cursor > 0 && required_indices_cursor % 10000 == 0 {
@@ -328,11 +318,10 @@ async fn run_orchestration_loop(
     }
 
     // The I/O channel has closed. We must flush any final, partially-filled dense batch.
-    dispatch_dense_batch(dense_batch, context);
+    dispatch_work(dense_batch, context);
 
-    // Tell the I/O producer to shut down gracefully.
-    // It may have already terminated, so we ignore any potential send error.
-    let _ = empty_buffer_tx.send(IoCommand::Shutdown).await;
+    // The I/O producer will terminate automatically when the `empty_buffer_tx`
+    // is dropped at the end of this function.
 
     Ok(())
 }
@@ -340,22 +329,21 @@ async fn run_orchestration_loop(
 /// Awaits all in-flight compute tasks and aggregates their results.
 async fn aggregate_results(
     context: &mut PipelineContext,
-    empty_buffer_tx: &mpsc::Sender<IoCommand>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Take ownership of the handles, leaving an empty Vec in the context.
-    for handle in std::mem::take(&mut context.compute_handles) {
+    for handle in std::mem::take(&mut context.join_handles) {
         // Await the task's completion, propagating JoinErrors (e.g., panics) with `?`.
         let task_result = handle.await?;
 
         // Now match on the business-logic `Result` returned by the task itself.
         match task_result {
-            Ok(result) => {
+            Ok((scores, counts)) => {
                 // 1. Aggregate scores and counts into the master buffers.
                 // This `zip` iterator is highly performant and likely auto-vectorized.
-                for (master, &partial) in context.all_scores.iter_mut().zip(&result.scores) {
+                for (master, &partial) in context.all_scores.iter_mut().zip(&scores) {
                     *master += partial;
                 }
-                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&result.counts)
+                for (master, &partial) in context.all_missing_counts.iter_mut().zip(&counts)
                 {
                     *master += partial;
                 }
@@ -363,16 +351,11 @@ async fn aggregate_results(
                 // 2. Return the large partial result buffers to the shared pool for reuse.
                 context
                     .partial_result_pool
-                    .push((result.scores, result.counts))
+                    .push((scores, counts))
                     .unwrap();
 
-                // 3. If the task was for a sparse variant, recycle its small I/O buffer.
-                if let Some(recycled_buffer) = result.recycled_buffer {
-                    // Use a non-blocking `try_send`. If the I/O task has already shut down,
-                    // the channel will be closed, and this will return an `Err`. We gracefully
-                    // ignore this error, as the buffer is no longer needed.
-                    let _ = empty_buffer_tx.try_send(IoCommand::Read(recycled_buffer));
-                }
+                // 3. I/O buffer recycling is no longer handled here. It is managed
+                //    synchronously by the orchestrator, preventing deadlocks.
             }
             Err(e) => {
                 // A task returned a business-logic error. Propagate it immediately.
@@ -383,98 +366,83 @@ async fn aggregate_results(
     Ok(())
 }
 
-/// Dispatches a dense batch if it is in a buffering state.
-/// This function consumes the batch and returns an `Empty` state, making it
-/// safe to use in the state machine of the orchestration loop.
-fn dispatch_dense_batch(
-    dense_batch: DenseVariantBatch,
+/// A unified dispatcher that takes a `WorkParcel` or a `DenseVariantBatch`,
+/// spawns the appropriate compute task, and manages the lifecycle of the work.
+fn dispatch_work(
+    work: impl Into<Option<WorkParcel>>,
     context: &mut PipelineContext,
 ) -> DenseVariantBatch {
-    if let DenseVariantBatch::Buffering(data) = dense_batch {
-        // We clone the Arcs from the context, which is a cheap reference count bump.
-        let handle = dispatch_person_major_batch(
-            data,
-            context.prep_result.clone(),
-            context.tile_pool.clone(),
-            context.sparse_index_pool.clone(),
-            context.kernel_input_buffer_pool.clone(),
-            context.partial_result_pool.clone(),
-        );
-        context.compute_handles.push(handle);
+    let maybe_parcel = work.into();
+    if maybe_parcel.is_none() {
+        return DenseVariantBatch::Empty;
     }
-    // Return an Empty batch, effectively resetting the state.
+    let parcel = maybe_parcel.unwrap();
+
+    // Clone the necessary Arcs for the spawned task. This is a cheap reference count bump.
+    let prep_result = context.prep_result.clone();
+    let partial_result_pool = context.partial_result_pool.clone();
+
+    let handle = match parcel {
+        WorkParcel::Sparse {
+            data,
+            reconciled_variant_index,
+        } => task::spawn_blocking(move || {
+            let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+            let mut clean_scores = dirty_scores.into_clean();
+            let mut clean_counts = dirty_counts.into_clean();
+            batch::run_variant_major_path(
+                &data,
+                &prep_result,
+                &mut clean_scores,
+                &mut clean_counts,
+                reconciled_variant_index,
+            )?;
+            Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
+        }),
+        WorkParcel::Dense(data) => {
+            let tile_pool = context.tile_pool.clone();
+            let sparse_index_pool = context.sparse_index_pool.clone();
+            let kernel_input_buffer_pool = context.kernel_input_buffer_pool.clone();
+            task::spawn_blocking(move || {
+                let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
+                let mut clean_scores = dirty_scores.into_clean();
+                let mut clean_counts = dirty_counts.into_clean();
+                batch::run_person_major_path(
+                    &data.data,
+                    &data.reconciled_variant_indices,
+                    &prep_result,
+                    &mut clean_scores,
+                    &mut clean_counts,
+                    &tile_pool,
+                    &sparse_index_pool,
+                    &kernel_input_buffer_pool,
+                )?;
+                Ok((clean_scores.into_dirty(), clean_counts.into_dirty()))
+            })
+        }
+    };
+
+    context.join_handles.push(handle);
+    // If we dispatched a dense batch, we return an empty one to reset the state.
+    // If we dispatched a sparse one, the original batch was already empty.
     DenseVariantBatch::Empty
 }
 
-/// Spawns a blocking task for the person-major path.
-fn dispatch_person_major_batch(
-    batch_data: DenseVariantBatchData,
-    prep_result: Arc<PreparationResult>,
-    tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
-    sparse_index_pool: Arc<SparseIndexPool>,
-    kernel_input_buffer_pool: Arc<KernelInputBufferPool>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
-) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
-    task::spawn_blocking(move || {
-        // Acquire a set of partial result buffers from the pool.
-        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
-
-        // Transition the buffers to the "Clean" state, zeroing them.
-        let mut clean_scores = dirty_scores.into_clean();
-        let mut clean_counts = dirty_counts.into_clean();
-
-        // Dispatch to the synchronous, CPU-bound compute function.
-        batch::run_person_major_path(
-            &batch_data.data,
-            &batch_data.reconciled_variant_indices,
-            &prep_result,
-            &mut clean_scores,
-            &mut clean_counts,
-            &tile_pool,
-            &sparse_index_pool,
-            &kernel_input_buffer_pool,
-        )?;
-
-        // Package the results into the unified result type. The large `data`
-        // buffer from `batch_data` is NOT recycled; it is dropped here.
-        let result = ComputeTaskResult {
-            scores: clean_scores.into_dirty(),
-            counts: clean_counts.into_dirty(),
-            recycled_buffer: None,
-        };
-
-        Ok(result)
-    })
+// Implement Into<Option<WorkParcel>> for DenseVariantBatch to use it in the dispatcher.
+impl From<DenseVariantBatch> for Option<WorkParcel> {
+    fn from(batch: DenseVariantBatch) -> Self {
+        match batch {
+            DenseVariantBatch::Empty => None,
+            DenseVariantBatch::Buffering(data) => Some(WorkParcel::Dense(data)),
+        }
+    }
 }
 
-/// Spawns a blocking task for the variant-major path.
-fn dispatch_variant_major_path(
-    packed_genotypes: PackedVariantGenotypes,
-    reconciled_variant_index: ReconciledVariantIndex,
-    prep_result: Arc<PreparationResult>,
-    partial_result_pool: Arc<ArrayQueue<(DirtyScores, DirtyCounts)>>,
-) -> task::JoinHandle<Result<ComputeTaskResult, Box<dyn Error + Send + Sync>>> {
-    task::spawn_blocking(move || {
-        let (dirty_scores, dirty_counts) = partial_result_pool.pop().unwrap();
-        let mut clean_scores = dirty_scores.into_clean();
-        let mut clean_counts = dirty_counts.into_clean();
-
-        batch::run_variant_major_path(
-            &packed_genotypes.0,
-            &prep_result,
-            &mut clean_scores,
-            &mut clean_counts,
-            reconciled_variant_index,
-        )?;
-
-        // The small I/O buffer is passed back for recycling.
-        let result = ComputeTaskResult {
-            scores: clean_scores.into_dirty(),
-            counts: clean_counts.into_dirty(),
-            recycled_buffer: Some(packed_genotypes.0),
-        };
-        Ok(result)
-    })
+// Implement for direct parcel dispatch as well.
+impl From<WorkParcel> for Option<WorkParcel> {
+    fn from(parcel: WorkParcel) -> Self {
+        Some(parcel)
+    }
 }
 
 /// Calculates a target batch size for the person-major path based on L3 cache size.
