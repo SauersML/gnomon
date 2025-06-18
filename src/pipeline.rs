@@ -187,19 +187,17 @@ async fn run_orchestration_loop(
 
             // --- Arm 1: Process results from completed compute tasks ---
             Some(task_result) = in_flight_tasks.next() => {
-                // First, release the semaphore permit. This happens regardless of task outcome.
-                semaphore.add_permits(1);
-
                 // Unpack the result from the JoinHandle, propagating a panic.
                 let (compute_result, scores, counts) = task_result?;
-
+    
                 // Check if the computation itself succeeded.
                 if let Err(e) = compute_result {
                     // The task failed. Return the buffers to the pool before propagating the error.
                     context.partial_result_pool.push((scores, counts)).unwrap();
+                    semaphore.add_permits(1);
                     return Err(e);
                 }
-
+    
                 // If we reach here, the task succeeded. Aggregate the results.
                 for (master, &partial) in context.all_scores.iter_mut().zip(scores.deref()) {
                     *master += partial;
@@ -207,9 +205,12 @@ async fn run_orchestration_loop(
                 for (master, &partial) in context.all_missing_counts.iter_mut().zip(counts.deref()) {
                     *master += partial;
                 }
-
-                // AFTER aggregation, return the buffers to the pool for reuse.
+    
+                // Return the buffers to the pool BEFORE releasing the permit
                 context.partial_result_pool.push((scores, counts)).unwrap();
+                
+                // NOW release the semaphore permit
+                semaphore.add_permits(1);
             },
 
             // --- Arm 2: Receive new data from the I/O producer ---
