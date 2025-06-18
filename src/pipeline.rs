@@ -262,7 +262,8 @@ fn process_dense_stream(
     // 1. The score buffer for this thread.
     // 2. The missingness count buffer for this thread.
     // 3. A reusable buffer for concatenating dense variant data, to avoid re-allocation for every batch.
-    type Accumulator = (Vec<f64>, Vec<u32>, Vec<u8>);
+    // type Accumulator = (Vec<f64>, Vec<u32>, Vec<u8>);
+    //  Not used... maybe use it?
 
     // STAGE 2: Process the Vec of batches in parallel using Rayon's fold/reduce.
     let final_result = batches
