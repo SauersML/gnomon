@@ -83,6 +83,34 @@ REALISTIC_DIMENSIONS = [
         ],
         "subset_pct": 0.03,
     },
+    {
+        "test_name": "Test_HighAF_6pct_SUBSET",
+        "n_individuals": 2_000,
+        "genome_variants": 800_000,
+        "target_variants": 400_000,
+        "af_profile": 'high_af',
+        "score_files": [
+            {
+                "name": "high_af_panel", "n_scores": 50, "gwas_source_variants": 200_000,
+                "overlap_pct": 0.90, "flip_pct": 0.10, "missing_weight_pct": 0.01, "score_sparsity": 0.8,
+            }
+        ],
+        "subset_pct": 0.05,
+    },
+    {
+        "test_name": "Test_LowAF_2pct_SUBSET",
+        "n_individuals": 2_000,
+        "genome_variants": 800_000,
+        "target_variants": 400_000,
+        "af_profile": 'low_af',
+        "score_files": [
+            {
+                "name": "low_af_panel", "n_scores": 50, "gwas_source_variants": 200_000,
+                "overlap_pct": 0.90, "flip_pct": 0.10, "missing_weight_pct": 0.01, "score_sparsity": 0.8,
+            }
+        ],
+        "subset_pct": 0.05,
+    },
 ]
 
 
@@ -173,7 +201,13 @@ class RealisticDataGenerator:
         af_profile = self.params.get('af_profile', 'standard')
         if af_profile == 'acaf':
             print("        (Using ACAF allele frequency profile: common variants only, MAF > 1%)")
+            af = np.random.uniform(0.01, 0.5, n_variants)
+        elif af_profile == 'high_af':
+            print("        (Using high allele frequency profile: MAF >= 6%)")
             af = np.random.uniform(0.06, 0.5, n_variants)
+        elif af_profile == 'low_af':
+            print("        (Using low allele frequency profile: MAF <= 2%)")
+            af = np.random.uniform(0.001, 0.02, n_variants)
         else: # 'standard'
             print("        (Using standard allele frequency profile: includes rare variants)")
             af = np.random.beta(0.2, 0.2, n_variants)
