@@ -23,6 +23,7 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, Simd, f32x8, u8x8};
 use thread_local::ThreadLocal;
+use num_cpus;
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -38,24 +39,57 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
-/// A thread-local pool for reusing the memory buffers required for storing
+use crossbeam_queue::ArrayQueue;
+use num_cpus;
+
+/// A thread-safe pool for reusing the large memory buffers required for storing
 /// sparse indices (`g1_indices`, `g2_indices`) and deferred missingness events.
-/// This is a critical performance optimization that avoids heap allocations in
-/// the hot compute path.
-#[derive(Default, Debug)]
+/// This implementation uses a lock-free queue, making it safe and efficient for
+/// use with Rayon's work-stealing scheduler.
+#[derive(Debug)]
 pub struct SparseIndexPool {
-    pool: ThreadLocal<RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)>>,
+    /// The lock-free queue holding the reusable buffer sets.
+    pool: ArrayQueue<(
+        Vec<Vec<usize>>,
+        Vec<Vec<usize>>,
+        Vec<(usize, usize)>,
+    )>,
 }
 
 impl SparseIndexPool {
+    /// Creates a new pool, pre-allocating a number of empty buffer sets
+    /// proportional to the number of CPU cores. This "primes the pump"
+    /// to avoid initial allocation stalls.
     pub fn new() -> Self {
-        Self::default()
+        let pool = ArrayQueue::new(num_cpus::get() * 2);
+        for _ in 0..num_cpus::get() * 2 {
+            // Pre-populate with empty, but allocated, buffer sets.
+            pool.push(Default::default()).unwrap();
+        }
+        Self { pool }
     }
 
-    /// Gets the thread-local buffer of sparse indices, creating it if it doesn't exist.
+    /// Pops a buffer set from the pool for use by a compute task.
+    /// If the pool is empty, it returns a new default allocation.
     #[inline(always)]
-    fn get_or_default(&self) -> &RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)> {
-        self.pool.get_or_default()
+    pub fn pop(&self) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>) {
+        self.pool.pop().unwrap_or_default()
+    }
+
+    /// Pushes a buffer set back into the pool after it has been used.
+    /// This allows its memory to be recycled by another task.
+    #[inline(always)]
+    pub fn push(
+        &self,
+        buffers: (
+            Vec<Vec<usize>>,
+            Vec<Vec<usize>>,
+            Vec<(usize, usize)>,
+        ),
+    ) {
+        // We don't care if the push fails (e.g., if the pool is full),
+        // as the buffer will simply be dropped, which is safe.
+        let _ = self.pool.push(buffers);
     }
 }
 
