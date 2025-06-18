@@ -173,7 +173,7 @@ class RealisticDataGenerator:
         af_profile = self.params.get('af_profile', 'standard')
         if af_profile == 'acaf':
             print("        (Using ACAF allele frequency profile: common variants only, MAF > 1%)")
-            af = np.random.uniform(0.01, 0.5, n_variants)
+            af = np.random.uniform(0.06, 0.5, n_variants)
         else: # 'standard'
             print("        (Using standard allele frequency profile: includes rare variants)")
             af = np.random.beta(0.2, 0.2, n_variants)
