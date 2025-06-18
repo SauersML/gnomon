@@ -13,8 +13,9 @@
 // consumers cannot keep up.
 
 use crate::batch;
+use crate::pipeline::PipelineError;
 use crate::types::{
-    ComputePath, PipelineError, PreparationResult, ReconciledVariantIndex, WorkItem,
+    ComputePath, PreparationResult, ReconciledVariantIndex, WorkItem,
 };
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
