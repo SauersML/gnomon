@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from bench import RealisticDataGenerator # Re-use the data generator
 import pandas as pd
+import re
 
 # --- Configuration ---
 WORKDIR = Path("./perf_workdir")
@@ -68,10 +69,12 @@ def print_header(title: str, char: str = "="):
     print(f"{char*4} {title} {char*(width - len(title) - 6)}", flush=True)
     print(char * width, flush=True)
 
-def run_command(cmd, title, **kwargs):
+def run_command(cmd, title, capture_output=False, **kwargs):
     """
     Runs a command, streams its output, and on failure, prints the last 20 lines
-    of output for easier debugging. Returns True on success, False on failure.
+    of output for easier debugging. 
+    Returns (success: bool, output_lines: list) if capture_output=True
+    Returns success: bool if capture_output=False
     """
     print_header(title, char="-")
     cmd_str_list = [str(c) for c in cmd]
@@ -95,13 +98,138 @@ def run_command(cmd, title, **kwargs):
             print("--- Last 20 lines of output for debugging ---", flush=True)
             for l in output_lines[-20:]:
                 print(f"  | {l.rstrip()}", flush=True)
-            return False
+            return (False, output_lines) if capture_output else False
 
         print("\n✅ Command successful.", flush=True)
-        return True
+        return (True, output_lines) if capture_output else True
     except Exception as e:
         print(f"❌ Failed to execute command: {e}", flush=True)
-        return False
+        return (False, output_lines) if capture_output else False
+
+def find_hot_worker_functions(perf_output, n=2):
+    """
+    Parses perf report output to find the top N hottest worker functions
+    in the gnomon:: namespace, excluding non-worker functions.
+    """
+    candidates = []
+    
+    # Patterns that indicate non-worker functions
+    skip_patterns = [
+        '::main', '::new', '::from', '::into', '::drop',
+        '::fmt', '::clone', '::default', '<impl', '::{{closure}}',
+        '::__rust', 'std::', 'core::', 'alloc::', '::lang_start'
+    ]
+    
+    for line in perf_output:
+        # Match lines with symbol info, looking for self percentage
+        # Format: "  98.44%     0.00%  command  object  [.] symbol"
+        # We want the self% (second percentage) not children% (first)
+        match = re.match(r'\s*(\d+\.\d+)%\s+(\d+\.\d+)%\s+\S+\s+\S+\s+\[.\]\s+(.+)', line)
+        if match:
+            children_pct, self_pct, symbol = match.groups()
+            self_pct = float(self_pct)
+            
+            # Only consider gnomon:: functions with meaningful self time
+            if 'gnomon::' in symbol and self_pct > 0.5:
+                # Skip non-worker functions
+                if not any(pat in symbol for pat in skip_patterns):
+                    candidates.append((self_pct, symbol.strip()))
+    
+    # Sort by self percentage and return top N
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    return [sym for pct, sym in candidates[:n]]
+
+def create_smart_annotation(raw_output, hot_threshold=0.5):
+    """
+    Filters annotation output to show only hot spots with context.
+    Returns a list of filtered lines with better formatting.
+    """
+    result = []
+    context_buffer = []
+    last_hot_line = -1
+    in_header = True
+    
+    for i, line in enumerate(raw_output):
+        # Keep header lines
+        if in_header:
+            if line.strip() and not line.strip().startswith(':') and not re.match(r'\s*\d+\.\d+\s*:', line):
+                result.append(line.rstrip())
+                continue
+            else:
+                in_header = False
+        
+        # Source code lines (format: ": line_num  source_code")
+        if match := re.match(r'\s*:\s*(\d+)\s+(.+)', line):
+            # Add spacing before source lines for readability
+            if result and not result[-1].strip().startswith(':'):
+                result.append("")
+            result.append(line.rstrip())
+            context_buffer = []  # Reset context after source
+            continue
+        
+        # Assembly lines with percentages
+        if match := re.match(r'\s*(\d+\.\d+)\s*:\s*([0-9a-f]+):\s*(.+)', line):
+            pct = float(match.group(1))
+            
+            if pct >= hot_threshold:
+                # Hot line - show with context
+                if last_hot_line >= 0 and i - last_hot_line > 5:
+                    result.append("        [... cold instructions omitted ...]")
+                
+                # Add up to 2 lines of context before if not already shown
+                start_context = max(0, len(context_buffer) - 2)
+                for ctx_line in context_buffer[start_context:]:
+                    if ctx_line not in result[-3:]:  # Avoid duplicates
+                        result.append(ctx_line.rstrip())
+                
+                # Highlight hot line
+                result.append(f">>> {line.rstrip()}")
+                last_hot_line = i
+                context_buffer = []
+            else:
+                # Cold line - just buffer it
+                context_buffer.append(line)
+                # Keep buffer size reasonable
+                if len(context_buffer) > 5:
+                    context_buffer.pop(0)
+        else:
+            # Other lines (empty lines, etc)
+            if line.strip():
+                context_buffer.append(line)
+
+    return result
+
+def analyze_hot_spots(annotation_lines):
+    """
+    Generates a summary of hot spots from annotation output.
+    """
+    hot_regions = []
+    current_region = {'lines': [], 'total_pct': 0.0, 'source': None}
+    
+    for line in annotation_lines:
+        # Source line
+        if match := re.match(r'\s*:\s*(\d+)\s+(.+)', line):
+            if current_region['total_pct'] > 1.0:
+                hot_regions.append(current_region)
+            current_region = {'lines': [match.group(1)], 'total_pct': 0.0, 
+                            'source': match.group(2).strip()[:50]}
+        # Hot assembly line
+        elif line.startswith('>>>'):
+            if match := re.match(r'>>>\s*(\d+\.\d+)', line):
+                current_region['total_pct'] += float(match.group(1))
+    
+    # Don't forget the last region
+    if current_region['total_pct'] > 1.0:
+        hot_regions.append(current_region)
+    
+    # Sort by total percentage
+    hot_regions.sort(key=lambda x: x['total_pct'], reverse=True)
+    
+    summary = ["\n=== HOT SPOT SUMMARY ==="]
+    for region in hot_regions[:5]:  # Top 5 hot regions
+        summary.append(f"  {region['total_pct']:.1f}% in line {region['lines'][0]}: {region['source']}")
+    
+    return summary
 
 def main():
     """
@@ -157,26 +285,69 @@ def main():
             sys.exit("Profiling run failed.")
 
         if perf_data_file.exists():
+            # First, show the normal perf report as before
             perf_report_cmd = [
                 "perf", "report", "--stdio", "--call-graph=graph",
                 "--percent-limit=2", "-i", str(perf_data_file)
             ]
             run_command(perf_report_cmd, title="Combined Granular Profile Report")
 
-            # --- FIX: Annotate the functions that actually do the work ---
-            hot_functions = [
-                "gnomon::batch::process_tile",
-                "gnomon::batch::pivot_tile"
+            # Now, get a cleaner report for parsing to find hot functions
+            perf_simple_report_cmd = [
+                "perf", "report", "--stdio", "--no-children",
+                "--sort=symbol,self", "--percent-limit=0.5",
+                "-i", str(perf_data_file)
             ]
-
-            for symbol in hot_functions:
-                perf_annotate_cmd = [
-                    "perf", "annotate", "--stdio", "-l",
-                    "-i", str(perf_data_file), "--symbol", symbol,
-                ]
-                # This command can still "succeed" with a zero exit code while
-                # printing the error, so we don't need to check its return value.
-                run_command(perf_annotate_cmd, title=f"Line-by-Line Annotation for: {symbol}")
+            success, output = run_command(perf_simple_report_cmd, 
+                                        title="Analyzing hot functions",
+                                        capture_output=True)
+            
+            if success:
+                # Automatically find the top 2 hot worker functions
+                hot_functions = find_hot_worker_functions(output, n=2)
+                
+                if hot_functions:
+                    print(f"\n🔥 Found top hot functions: {', '.join(hot_functions)}")
+                    
+                    for symbol in hot_functions:
+                        # Get annotation with full output
+                        perf_annotate_cmd = [
+                            "perf", "annotate", "--stdio", "-l",
+                            "-i", str(perf_data_file), "--symbol", symbol,
+                        ]
+                        
+                        print_header(f"Analyzing hot spots in: {symbol}", char="*")
+                        
+                        # Capture annotation output for filtering
+                        proc = subprocess.Popen(
+                            [str(c) for c in perf_annotate_cmd],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding='utf-8', errors='replace'
+                        )
+                        stdout, stderr = proc.communicate()
+                        
+                        if proc.returncode == 0 and stdout:
+                            # Filter and display smart annotation
+                            annotation_lines = stdout.split('\n')
+                            filtered_lines = create_smart_annotation(annotation_lines)
+                            
+                            # Print filtered annotation
+                            print("\n--- FILTERED ANNOTATION (showing hot spots only) ---")
+                            for line in filtered_lines:
+                                print(f"  > {line}")
+                            
+                            # Print summary
+                            summary = analyze_hot_spots(filtered_lines)
+                            for line in summary:
+                                print(line)
+                        else:
+                            print(f"⚠️  Could not annotate {symbol}")
+                            if stderr:
+                                print(f"   Error: {stderr.strip()}")
+                else:
+                    print("\n⚠️  No hot worker functions found in gnomon:: namespace")
+            else:
+                print("Failed to analyze hot functions")
 
         else:
             print(f"Combined perf data file not found at '{perf_data_file}'. Profiling may have failed.")
