@@ -1,139 +1,109 @@
 // ========================================================================================
 //
-//          HIGH-PERFORMANCE, SYNCHRONOUS, SINGLE-variant MEMORY-MAPPED READER
+//                       THE HIGH-PERFORMANCE DATA PRODUCER
 //
 // ========================================================================================
 //
 // ### Purpose ###
 //
-// This module provides a high-performance, synchronous reader for moving raw,
-// sequential, single-variant data rows from a memory-mapped .bed file. It operates
-// on a `mmap`'d region for zero-copy reads from the OS page cache, which is
-// ideal for the producer-consumer pipeline in the main orchestrator.
+// This module contains the producer logic for the gnomon compute pipeline. Its sole
+// responsibility is to read the required variant data from a memory-mapped .bed file
+// and send it downstream to the consumer threads for processing. It leverages a
+// shared buffer pool to minimize allocations and provides natural backpressure if
+// consumers cannot keep up.
 
+use crate::batch;
+use crate::types::{
+    ComputePath, PipelineError, PreparationResult, ReconciledVariantIndex, WorkItem,
+};
+use crossbeam_channel::Sender;
+use crossbeam_queue::ArrayQueue;
 use memmap2::Mmap;
-use std::fs::File;
-use std::io::{self, ErrorKind};
-use std::path::Path;
+use std::sync::Arc;
 
-/// A high-performance reader for moving raw, sequential, single-variant data rows
-/// from a memory-mapped .bed file. It operates on a `mmap`'d region for zero-copy
-/// reads from the OS page cache.
-pub struct BedReader {
-    /// A memory map of the entire .bed file. This provides a zero-cost "view" of
-    /// the file on disk, not data loaded into RAM.
-    mmap: Mmap,
+/// The entry point for the producer thread.
+///
+/// This function iterates through the list of variants required for the calculation,
+/// reads their corresponding genotype data from the memory-mapped file, assesses the
+/// optimal compute path (sparse vs. dense), and sends the resulting `WorkItem` down
+/// the appropriate channel for consumption by the `rayon` worker pool.
+///
+/// # Arguments
+/// * `mmap`: A shared, thread-safe handle to the memory-mapped .bed file.
+/// * `prep_result`: The "computation blueprint" that dictates which variants to read.
+/// * `sparse_tx`: The channel sender for variants destined for the sparse path.
+/// * `dense_tx`: The channel sender for variants destined for the dense path.
+/// * `buffer_pool`: A shared pool of reusable byte buffers to eliminate allocation overhead.
+pub fn producer_thread(
+    mmap: Arc<Mmap>,
+    prep_result: Arc<PreparationResult>,
+    sparse_tx: Sender<Result<WorkItem, PipelineError>>,
+    dense_tx: Sender<Result<WorkItem, PipelineError>>,
+    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+) {
+    let bytes_per_variant = prep_result.bytes_per_variant as usize;
 
-    /// The current read position (in bytes) within the memory map. It is initialized
-    /// to 3 to skip the PLINK magic number.
-    pub cursor: u64,
+    // We iterate over the pre-computed, sorted list of required variants.
+    // The iterator's index `i` becomes the `reconciled_variant_index`, which is
+    // the row index into the final conceptual weight/flip matrices.
+    // `bim_row_idx` is the original row index from the .bim file, used to
+    // calculate the byte offset into the .bed file.
+    for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
+        // 1. Acquire a buffer from the pool. This is a crucial performance optimization
+        //    and backpressure mechanism. If the consumers are slow to return buffers,
+        //    this call will block until one is available.
+        let mut buffer = buffer_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant));
 
-    /// The total size of the file in bytes, cached at creation time.
-    file_size: u64,
+        // 2. Calculate the exact byte offset for this variant in the .bed file.
+        //    The `+ 3` skips the PLINK magic number at the start of the file.
+        let offset = (3 + bim_row_idx.0 as u64 * bytes_per_variant as u64) as usize;
+        let end = offset + bytes_per_variant;
 
-    /// The number of bytes per variant, calculated once at construction. This is a
-    /// critical piece of encapsulated state that prevents this logic from
-    /// leaking into other modules.
-    bytes_per_variant: u64,
-}
-
-impl BedReader {
-    /// This constructor is the "airlock" for the raw .bed file. It guarantees that the
-    /// file exists, is a valid PLINK .bed file, and has a size consistent with the
-    /// metadata from the `prepare` phase, using overflow-safe arithmetic.
-    pub fn new(bed_path: &Path, bytes_per_variant_arg: u64, num_variants: usize) -> io::Result<Self> {
-        let bed_file = File::open(bed_path)?;
-        let metadata = bed_file.metadata()?;
-        let file_size = metadata.len();
-
-        // The only unsafe block, justified because we will immediately validate the
-        // mapped memory before it can be used.
-        let mmap = unsafe { Mmap::map(&bed_file)? };
-
-        // --- Validation Step 1: Magic Number (from the mmap itself) ---
-        if mmap.get(0..3) != Some(&[0x6c, 0x1b, 0x01]) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "Invalid .bed file magic number. The file may be corrupt or not a valid PLINK .bed file in variant-major mode.",
+        // 3. Perform a critical boundary check. If this fails, the .bim metadata
+        //    and the .bed file are inconsistent. We send an error down both channels
+        //    to ensure a clean shutdown of the entire pipeline.
+        if end > mmap.len() {
+            let err = PipelineError::Io(format!(
+                "Fatal: Attempted to read past the end of the .bed file for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
+                bim_row_idx.0
             ));
+            // We don't care if the send fails, as the pipeline is already broken.
+            let _ = sparse_tx.send(Err(err.clone()));
+            let _ = dense_tx.send(Err(err));
+            // Stop production immediately.
+            break;
         }
 
-        // --- Validation Step 2: File Size (with checked arithmetic) ---
-        // bytes_per_variant is now passed as an argument
-        let total_variant_bytes = (num_variants as u64).checked_mul(bytes_per_variant_arg)
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
-            })?;
+        // 4. Read the data. This is the primary "I/O" operation, which may trigger
+        //    a page fault if the data is not in the OS page cache.
+        buffer.extend_from_slice(&mmap[offset..end]);
 
-        let expected_size = 3u64.checked_add(total_variant_bytes)
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "Theoretical file size calculation overflowed (exceeds u64::MAX).")
-            })?;
+        // 5. Assess the compute path and create the final work item.
+        //    The ownership of the data buffer is moved into the `WorkItem`.
+        let path = batch::assess_path(&buffer, prep_result.total_people_in_fam);
+        let work_item = WorkItem {
+            data: buffer,
+            reconciled_variant_index: ReconciledVariantIndex(i as u32),
+        };
 
-        if file_size != expected_size {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "BED file size mismatch. Metadata implies {} bytes, but file is {} bytes.",
-                    expected_size, file_size
-                ),
-            ));
+        // 6. Send the work item to the appropriate consumer. If the send fails,
+        //    it means the consumer end of the channel has been dropped, so we
+        //    can gracefully terminate the producer thread.
+        let tx = if path == ComputePath::PersonMajor {
+            &dense_tx
+        } else {
+            &sparse_tx
+        };
+
+        if tx.send(Ok(work_item)).is_err() {
+            // Consumers have disconnected. This is not an error, but a signal to stop.
+            break;
         }
-
-        Ok(BedReader {
-            mmap,
-            cursor: 3, // Start reading after the 3-byte magic number.
-            file_size,
-            // Store the passed-in value.
-            bytes_per_variant: bytes_per_variant_arg,
-        })
     }
 
-    /// Reads the data for the next single variant.
-    ///
-    /// This function is designed for high-throughput, sequential reading. It takes an
-    /// empty buffer from a pool, fills it with the data for exactly one variant, and
-    /// returns it. This allows the calling context to reuse buffer allocations.
-    ///
-    /// # Arguments
-    /// * `buf`: A mutable `Vec` whose allocation will be used for the read. The
-    ///          method takes ownership of the buffer's memory via `std::mem::take`,
-    ///          leaving an empty `Vec` in its place.
-    ///
-    /// # Returns
-    /// * `Ok(Some(Vec<u8>))`: On a successful read, returns the buffer now filled with variant data.
-    /// * `Ok(None)`: If the end of the file is reached.
-    /// * `Err(e)`: On an I/O error.
-    pub fn read_next_variant(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-        if self.cursor >= self.file_size {
-            return Ok(None); // Graceful EOF
-        }
-
-        let bytes_per_variant = self.bytes_per_variant as usize;
-
-        // Make sure there is enough data left in the file for one full variant.
-        if self.file_size - self.cursor < self.bytes_per_variant {
-            // This case handles trailing bytes in a file that are not a full variant.
-            self.cursor = self.file_size;
-            return Ok(None);
-        }
-
-        // Take ownership of the buffer's allocation, leaving an empty vector behind.
-        let mut owned_buf = std::mem::take(buf);
-        // We are about to fill the buffer completely.
-        // We guarantee the length is correct before the copy.
-        // This is safe because we just checked that enough bytes remain.
-        unsafe {
-            owned_buf.set_len(bytes_per_variant);
-        }
-
-        let src_end = self.cursor as usize + bytes_per_variant;
-        let src_slice = &self.mmap[self.cursor as usize..src_end];
-
-        owned_buf.copy_from_slice(src_slice);
-
-        self.cursor += bytes_per_variant as u64;
-
-        Ok(Some(owned_buf))
-    }
+    // When this function returns, `sparse_tx` and `dense_tx` are dropped. This
+    // closes the channels, which signals to the consumers' iterators that there
+    // is no more work, allowing them to terminate cleanly.
 }
