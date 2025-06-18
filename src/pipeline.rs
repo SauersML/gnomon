@@ -33,7 +33,7 @@ use tokio::task::{self, JoinHandle};
 /// is also used to size the `partial_result_pool`, and it determines the number of
 /// permits in the `Semaphore` that gates task dispatch. It must be a value greater
 /// than `PIPELINE_DEPTH` to prevent deadlocks.
-const MAX_IN_FLIGHT_TASKS: usize = 32;
+const MAX_IN_FLIGHT_TASKS: usize = 4;
 
 /// Owns shared resource pools and the final result buffers for the pipeline.
 ///
