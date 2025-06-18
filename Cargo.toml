@@ -28,7 +28,7 @@ ryu = "1.0.20"
 nonmax = "0.5.5"
 futures = "0.3.31"
 itertools = "0.14.0"
-crossbeam_channel = "0.5.15"
+crossbeam-channel = "0.5.15"
 
 [profile.release]
 opt-level = 3
