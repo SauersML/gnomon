@@ -103,7 +103,38 @@ pub fn run(
             .unwrap();
     }
 
-    // --- 2. Orchestration: Use a scoped thread for safe producer/consumer execution ---
+    // --- 2. Pre-computation: Calculate the single, global baseline score ---
+    // This is the source of truth for the baseline. It is calculated once, up front,
+    // from all flipped variants across all scores. Both compute paths will now
+    // calculate adjustments relative to this baseline.
+    let prep_result = &context.prep_result;
+    let num_scores = prep_result.score_names.len();
+    let stride = prep_result.stride();
+    let master_baseline: Vec<f64> = (0..prep_result.num_reconciled_variants)
+        .into_par_iter()
+        .fold(
+            || vec![0.0f64; num_scores], // Thread-local accumulator
+            |mut local_baseline, i| {
+                let flip_row_offset = i * stride;
+                let flip_row = &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
+                let weight_row = &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                for k in 0..num_scores {
+                    if flip_row[k] == 1 {
+                        local_baseline[k] += 2.0 * weight_row[k] as f64;
+                    }
+                }
+                local_baseline
+            },
+        )
+        .reduce(
+            || vec![0.0f64; num_scores], // Identity for reduction
+            |mut a, b| {
+                a.par_iter_mut().zip(b).for_each(|(v_a, v_b)| *v_a += v_b);
+                a
+            },
+        );
+
+    // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
         let producer_handle = s.spawn({
             // Clone Arcs for the producer thread.
@@ -126,20 +157,25 @@ pub fn run(
             PipelineError::Producer("Producer thread panicked.".to_string())
         })?;
 
-        // --- 3. Aggregate final results from both consumer streams ---
-        let (mut final_scores, mut final_counts) = sparse_result?;
-        let (dense_scores, dense_counts) = dense_result?;
+        // --- 4. Aggregate final results from both consumer streams ---
+        let (sparse_adjustments, sparse_counts) = sparse_result?;
+        let (dense_adjustments, dense_counts) = dense_result?;
 
-        // Use a parallel zip to sum the dense results into the sparse results buffer.
-        // This is a highly efficient, cache-friendly final reduction.
-        final_scores
-            .par_iter_mut()
-            .zip(dense_scores)
-            .for_each(|(master, partial)| *master += partial);
-        final_counts
-            .par_iter_mut()
-            .zip(dense_counts)
-            .for_each(|(master, partial)| *master += partial);
+        // Initialize final scores by tiling the master_baseline for each person.
+        let num_people = prep_result.num_people_to_score;
+        let mut final_scores = Vec::with_capacity(num_people * num_scores);
+        for _ in 0..num_people {
+            final_scores.extend_from_slice(&master_baseline);
+        }
+
+        // Aggregate the counts (which start from zero).
+        let mut final_counts = vec![0u32; num_people * num_scores];
+        final_counts.par_iter_mut().zip(sparse_counts).for_each(|(m, p)| *m += p);
+        final_counts.par_iter_mut().zip(dense_counts).for_each(|(m, p)| *m += p);
+
+        // Add the calculated adjustments from both streams onto the baseline.
+        final_scores.par_iter_mut().zip(sparse_adjustments).for_each(|(m, p)| *m += p);
+        final_scores.par_iter_mut().zip(dense_adjustments).for_each(|(m, p)| *m += p);
 
         Ok((final_scores, final_counts))
     });
