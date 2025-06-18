@@ -266,6 +266,112 @@ This section will state and prove the core claims of the framework.
 **The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
 -/
 
+/-! ### Claim 1: Formalization of Scenarios
+
+**The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
+-/
+
+/-- Scenario 1: Real genetic differences in causal SNPs correlating with ancestry.
+    The true genetic effect varies with ancestry. -/
+def Scenario1DGP (k : ℕ) : DataGeneratingProcess k where
+  scenario := Scenario.RealGeneticDifferences
+  -- E[Y|P,PC] has a genuine P×PC interaction due to ancestry-specific genetic effects
+  trueExpectation := fun p pc =>
+    let baseEffect := p  -- Base genetic effect
+    let ancestryModulation := (∑ l : Fin k, 0.1 * pc l) * p  -- PC modulates genetic effect
+    baseEffect + ancestryModulation
+  -- P is shifted by ancestry due to different allele frequencies
+  pgsGivenPC := fun pc p =>
+    let mean := if h : k > 0 then 0.5 * pc ⟨0, h⟩ else 0  -- Mean PGS shifts with first PC
+    Real.exp (-(p - mean)^2 / 2)  -- Gaussian density (unnormalized)
+  -- No environmental confounding in pure Scenario 1
+  environmentalEffect := fun _ => 0
+
+/-- Scenario 2: Differential accuracy due to LD patterns.
+    PGS accuracy (not effect) varies by ancestry. -/
+def Scenario2DGP (k : ℕ) : DataGeneratingProcess k where
+  scenario := Scenario.DifferentialAccuracy
+  -- The relationship weakens with distance from training ancestry, creating a P×PC interaction
+  trueExpectation := fun p pc =>
+    let accuracy := Real.exp (-0.5 * (∑ l : Fin k, (pc l)^2))  -- Accuracy decays with PC distance
+    accuracy * p  -- P predicts Y but with ancestry-dependent accuracy
+  -- P distribution may be independent of PC in a pure accuracy scenario
+  pgsGivenPC := fun _ p =>
+    Real.exp (-p^2 / 2)  -- Standard normal (unnormalized)
+  -- No environmental effect
+  environmentalEffect := fun _ => 0
+
+/-- Scenario 3: Environmental factors correlating with ancestry.
+    PC correlates with environmental factors affecting Y. -/
+def Scenario3DGP (k : ℕ) : DataGeneratingProcess k where
+  scenario := Scenario.EnvironmentalCorrelation
+  -- True genetic effect is constant, but environment adds PC-correlated effect (additive model)
+  trueExpectation := fun p pc =>
+    p + if h : k > 0 then pc ⟨0, h⟩ else 0  -- Genetic effect + environmental effect
+  -- P may correlate with PC due to population structure
+  pgsGivenPC := fun pc p =>
+    let mean := if h : k > 0 then 0.3 * pc ⟨0, h⟩ else 0
+    Real.exp (-(p - mean)^2 / 2)
+  -- Environmental effect correlates with PC
+  environmentalEffect := fun pc => if h : k > 0 then pc ⟨0, h⟩ else 0
+
+/-- Scenario 4: Neutral differences due to population history.
+    P varies with PC but this variation is non-causal. -/
+def Scenario4DGP (k : ℕ) : DataGeneratingProcess k where
+  scenario := Scenario.NeutralDifferences
+  -- Y depends on a "true" PGS, which is the observed P minus the neutral PC shift
+  trueExpectation := fun p pc =>
+    let truePGS := p - if h : k > 0 then 0.8 * pc ⟨0, h⟩ else 0  -- Remove neutral shift
+    truePGS  -- Only true genetic component affects Y
+  -- P is shifted by PC due to neutral drift
+  pgsGivenPC := fun pc p =>
+    let mean := if h : k > 0 then 0.8 * pc ⟨0, h⟩ else 0  -- Neutral shift in mean
+    Real.exp (-(p - mean)^2 / 2)
+  -- No environmental effect
+  environmentalEffect := fun _ => 0
+
+/-!
+Key distinctions between scenarios:
+
+1. **Scenario 1**: Both P distribution AND P's effect on Y vary with PC
+2. **Scenario 2**: P's predictive accuracy varies with PC, also creating an interaction
+3. **Scenario 3**: PC affects Y through environment, creating confounding (no P×PC interaction)
+4. **Scenario 4**: P distribution varies with PC but this is non-causal drift (no P×PC interaction)
+
+These formalizations enable precise mathematical analysis rather than verbal descriptions.
+-/
+
+/-- Helper: Check if a DGP exhibits P×PC interaction in the true expectation -/
+def hasRealInteraction (dgp : DataGeneratingProcess k) : Prop :=
+  ∃ (p₁ p₂ : PGS) (pc₁ pc₂ : PC k),
+    (dgp.trueExpectation p₂ pc₁ - dgp.trueExpectation p₁ pc₁) ≠
+    (dgp.trueExpectation p₂ pc₂ - dgp.trueExpectation p₁ pc₂)
+
+/-- Helper: Check if P distribution depends on PC -/
+def hasPGSDependenceOnPC (dgp : DataGeneratingProcess k) : Prop :=
+  ∃ (p : PGS) (pc₁ pc₂ : PC k),
+    pc₁ ≠ pc₂ ∧ dgp.pgsGivenPC pc₁ p ≠ dgp.pgsGivenPC pc₂ p
+
+/-- Helper: Check for environmental confounding -/
+def hasEnvironmentalConfounding (dgp : DataGeneratingProcess k) : Prop :=
+  dgp.environmentalEffect ≠ (fun _ => 0)
+
+/-- Claim 1 Formalization: Each scenario has distinct mathematical properties -/
+theorem scenarios_are_distinct (k : ℕ) (h_k_pos : k > 0) :
+  let s1 := Scenario1DGP k
+  let s2 := Scenario2DGP k
+  let s3 := Scenario3DGP k
+  let s4 := Scenario4DGP k
+  -- Scenario 1 has a P×PC interaction (true genetic effect modulation)
+  (hasRealInteraction s1) ∧
+  -- Scenario 2 also has a P×PC interaction (differential accuracy)
+  (hasRealInteraction s2) ∧
+  -- Scenario 3 has environmental confounding but no P×PC interaction
+  (hasEnvironmentalConfounding s3 ∧ ¬hasRealInteraction s3) ∧
+  -- Scenario 4 has P-PC dependence but no interaction and no environmental confounding
+  (hasPGSDependenceOnPC s4 ∧ ¬hasRealInteraction s4 ∧ ¬hasEnvironmentalConfounding s4) := by
+  sorry  -- Proof would verify these properties hold
+
 /-! ### Claim 2: Necessity of Phenotype Data
 
 **Scenarios 1 and 4 can produce identical PGS distributions but require opposite signs for the optimal interaction coefficient.** Formally: ∃ two data-generating processes where P|PC has identical distributions, but optimal prediction requires γ₁ₗ > 0 in one case and γ₁ₗ < 0 in the other along the same PC axis—proving phenotype data is mathematically necessary.
