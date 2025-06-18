@@ -15,8 +15,7 @@
 use crate::kernel;
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
-    ReconciledVariantIndex,
-};
+    ReconciledVariantIndex};
 use crossbeam_queue::ArrayQueue;
 use num_cpus;
 use rayon::prelude::*;
