@@ -229,10 +229,12 @@ fn process_sparse_stream(
             },
         )?;
 
-    // `try_reduce` returns a `Result<Option<T>, E>`. The `?` unwraps the `Result`,
-    // leaving an `Option<T>` in `final_result`. We then handle the `None` case
-    // (for an empty stream) with `unwrap_or_else`.
-    Ok(final_result.unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
+    // `try_reduce` returns `Result<Option<(scores, counts)>, PipelineError>`.
+    // We use `map` to transform the successful `Ok` variant. Inside the map, we
+    // handle the `Option`: if it's `Some`, we take the value; if it's `None` (an
+    // empty stream), we provide a default, zeroed result. Any `Err` from the
+    // reduce operation is passed through automatically by `map`.
+    final_result.map(|opt| opt.unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
 }
 
 /// A contention-free consumer for the dense variant stream. It groups items from
@@ -322,10 +324,13 @@ fn process_dense_stream(
             },
         )?;
 
-    // `try_reduce` returns `Result<Option<Accumulator>, E>`. The `?` unwraps the `Result`,
-    // leaving `final_result` as an `Option<Accumulator>`.
-    // We then handle the `None` case and discard the temporary concatenation buffer.
-    Ok(final_result
-        .map(|(scores, counts, _reusable_buffer)| (scores, counts))
-        .unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
+    // `try_reduce` returns `Result<Option<Accumulator>, PipelineError>`.
+    // We use a chain of `map` calls to safely unwrap the nested types.
+    // 1. The first `map` operates on the `Result`, passing any `Err` through.
+    // 2. The second `map` operates on the `Option`, transforming the accumulator.
+    // 3. `unwrap_or_else` handles the `None` case for an empty stream.
+    final_result.map(|opt| {
+        opt.map(|(scores, counts, _reusable_buffer)| (scores, counts))
+            .unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size]))
+    })
 }
