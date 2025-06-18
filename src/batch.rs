@@ -350,6 +350,9 @@ fn process_tile<'a>(
     for person_scores in block_scores_out.chunks_exact_mut(num_scores) {
         person_scores[..num_scores].copy_from_slice(&chunk_baseline[..num_scores]);
     }
+    
+    // Acquire a buffer set ONCE before all mini-batch loops.
+    let mut buffers = sparse_index_pool.pop();
 
     // --- Part 2: Main Processing Loop (Mini-Batching) ---
     // Iterate over the tile in small, accuracy-preserving chunks.
@@ -359,11 +362,9 @@ fn process_tile<'a>(
         if mini_batch_size == 0 {
             continue;
         }
-
+        
         // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
-        // Pop a reusable buffer set from the thread-safe pool.
-        // This is an RAII-like pattern: the buffers will be returned at the end of the function.
-        let mut buffers = sparse_index_pool.pop();
+        // The buffer set is now local to this thread for the duration of the function.
         let (g1_indices, g2_indices, missing_events) = &mut buffers;
 
         // This logic ensures we only grow the vectors, then clear the relevant inner
@@ -504,13 +505,10 @@ fn process_tile<'a>(
                 }
             }
         }
-
-        // --- D. Return Resources to the Pool ---
-        // This is the crucial release step. By placing it at the end of the loop
-        // iteration, we guarantee that the buffers acquired at the start of the
-        // iteration are returned, preventing resource leaks.
-        sparse_index_pool.push(buffers);
     }
+    
+    // Return the buffers to the pool ONCE after all mini-batches are complete.
+    sparse_index_pool.push(buffers);
 }
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
