@@ -271,9 +271,14 @@ This section will state and prove the core claims of the framework.
 **The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
 -/
 
+/-! ### Claim 1: Formalization of Scenarios
+
+**The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
+-/
+
 /-- Scenario 1: Real genetic differences in causal SNPs correlating with ancestry.
     The true genetic effect varies with ancestry. -/
-def Scenario1DGP (k : ℕ) : DataGeneratingProcess k where
+noncomputable def Scenario1DGP (k : ℕ) : DataGeneratingProcess k where
   scenario := Scenario.RealGeneticDifferences
   -- E[Y|P,PC] has a genuine P×PC interaction due to ancestry-specific genetic effects
   trueExpectation := fun p pc =>
@@ -289,7 +294,7 @@ def Scenario1DGP (k : ℕ) : DataGeneratingProcess k where
 
 /-- Scenario 2: Differential accuracy due to LD patterns.
     PGS accuracy (not effect) varies by ancestry. -/
-def Scenario2DGP (k : ℕ) : DataGeneratingProcess k where
+noncomputable def Scenario2DGP (k : ℕ) : DataGeneratingProcess k where
   scenario := Scenario.DifferentialAccuracy
   -- The relationship weakens with distance from training ancestry, creating a P×PC interaction
   trueExpectation := fun p pc =>
@@ -303,7 +308,7 @@ def Scenario2DGP (k : ℕ) : DataGeneratingProcess k where
 
 /-- Scenario 3: Environmental factors correlating with ancestry.
     PC correlates with environmental factors affecting Y. -/
-def Scenario3DGP (k : ℕ) : DataGeneratingProcess k where
+noncomputable def Scenario3DGP (k : ℕ) : DataGeneratingProcess k where
   scenario := Scenario.EnvironmentalCorrelation
   -- True genetic effect is constant, but environment adds PC-correlated effect (additive model)
   trueExpectation := fun p pc =>
@@ -317,7 +322,7 @@ def Scenario3DGP (k : ℕ) : DataGeneratingProcess k where
 
 /-- Scenario 4: Neutral differences due to population history.
     P varies with PC but this variation is non-causal. -/
-def Scenario4DGP (k : ℕ) : DataGeneratingProcess k where
+noncomputable def Scenario4DGP (k : ℕ) : DataGeneratingProcess k where
   scenario := Scenario.NeutralDifferences
   -- Y depends on a "true" PGS, which is the observed P minus the neutral PC shift
   trueExpectation := fun p pc =>
