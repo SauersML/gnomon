@@ -229,12 +229,10 @@ fn process_sparse_stream(
             },
         )?;
 
-    // try_reduce returns a Result<Option<T>, E>. The first '?' handles the Result,
-    // leaving an Option<T> to represent the case of an empty stream.
-    let final_result_opt = final_result?;
-    
-    // Now, handle the Option for the empty stream case, providing a default value.
-    Ok(final_result_opt.unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
+    // `try_reduce` returns a `Result<Option<T>, E>`. The `?` unwraps the `Result`,
+    // leaving an `Option<T>` in `final_result`. We then handle the `None` case
+    // (for an empty stream) with `unwrap_or_else`.
+    Ok(final_result.unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
 }
 
 /// A contention-free consumer for the dense variant stream. It groups items from
@@ -324,8 +322,10 @@ fn process_dense_stream(
             },
         )?;
 
-    // Handle the case where the stream was empty and discard the temporary concat buffer.
+    // `try_reduce` returns `Result<Option<Accumulator>, E>`. The `?` unwraps the `Result`,
+    // leaving `final_result` as an `Option<Accumulator>`.
+    // We then handle the `None` case and discard the temporary concatenation buffer.
     Ok(final_result
-        .map(|(scores, counts, _)| (scores, counts))
+        .map(|(scores, counts, _reusable_buffer)| (scores, counts))
         .unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
 }
