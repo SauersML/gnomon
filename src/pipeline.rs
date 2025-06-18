@@ -151,6 +151,31 @@ pub fn run(
 //                        PIPELINE STAGE IMPLEMENTATIONS
 // ========================================================================================
 
+// ========================================================================================
+//                        PIPELINE STAGE IMPLEMENTATIONS
+// ========================================================================================
+
+/// A RAII guard that ensures a byte buffer is automatically returned to the shared
+/// buffer pool when it goes out of scope. This is critical for preventing resource
+// leaks in the consumer streams, especially when errors occur.
+struct BufferGuard<'a> {
+    /// The buffer being managed. Wrapped in an `Option` to allow ownership to be
+    /// taken in the `drop` implementation.
+    buffer: Option<Vec<u8>>,
+    /// A reference to the shared pool where the buffer will be returned.
+    pool: &'a ArrayQueue<Vec<u8>>,
+}
+
+impl<'a> Drop for BufferGuard<'a> {
+    fn drop(&mut self) {
+        // When the guard is dropped, it returns its buffer to the pool.
+        if let Some(mut buf) = self.buffer.take() {
+            buf.clear();
+            let _ = self.pool.push(buf);
+        }
+    }
+}
+
 type ConsumerResult = Result<(Vec<f64>, Vec<u32>), PipelineError>;
 
 /// A contention-free consumer for the sparse variant stream, using Rayon's
@@ -172,17 +197,25 @@ fn process_sparse_stream(
         .try_fold(
             || (vec![0.0f64; result_size], vec![0u32; result_size]), // Each thread gets its own accumulator.
             |mut acc, work_result| {
-                let mut work_item = work_result?;
-                batch::run_variant_major_path(
-                    &work_item.data,
-                    prep_result,
-                    &mut acc.0,
-                    &mut acc.1,
-                    work_item.reconciled_variant_index,
-                )?;
-                // After processing, the buffer is immediately returned to the shared pool.
-                work_item.data.clear();
-                let _ = buffer_pool.push(work_item.data);
+                // The work_item and its buffer are processed within this scope.
+                // The `_guard` ensures the buffer is returned to the pool when this
+                // scope ends, whether by success or by `?` propagating an error.
+                {
+                    let work_item = work_result?;
+                    let _guard = BufferGuard {
+                        buffer: Some(work_item.data),
+                        pool: &buffer_pool,
+                    };
+
+                    batch::run_variant_major_path(
+                        // The guard holds the buffer, so we borrow it from there.
+                        _guard.buffer.as_ref().unwrap(),
+                        prep_result,
+                        &mut acc.0,
+                        &mut acc.1,
+                        work_item.reconciled_variant_index,
+                    )?;
+                }
                 Ok(acc)
             },
         )
@@ -209,57 +242,79 @@ fn process_dense_stream(
 ) -> ConsumerResult {
     let prep_result = &context.prep_result;
     let result_size = prep_result.num_people_to_score * prep_result.score_names.len();
-    let bytes_per_variant = prep_result.bytes_per_variant as usize;
+
+    // The accumulator for the fold is a 3-tuple:
+    // 1. The score buffer for this thread.
+    // 2. The missingness count buffer for this thread.
+    // 3. A reusable buffer for concatenating dense variant data, to avoid re-allocation for every batch.
+    type Accumulator = (Vec<f64>, Vec<u32>, Vec<u8>);
 
     let final_result = rx
         .into_iter()
-        .chunks(DENSE_BATCH_SIZE) // From itertools: creates an iterator of batches.
+        .chunks(DENSE_BATCH_SIZE)
         .into_iter()
-        .map(|chunk| chunk.collect::<Result<Vec<_>, _>>()) // Collect each chunk into a Vec<WorkItem>.
-        .par_bridge() // Make the iterator of batches parallel.
+        .map(|chunk| chunk.collect::<Result<Vec<_>, _>>())
+        .par_bridge()
         .try_fold(
-            || (vec![0.0f64; result_size], vec![0u32; result_size]),
+            || {
+                (
+                    vec![0.0f64; result_size],
+                    vec![0u32; result_size],
+                    Vec::with_capacity(DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize)),
+                )
+            },
             |mut acc, batch_result| {
                 let batch = batch_result?;
                 if batch.is_empty() {
                     return Ok(acc);
                 }
 
-                // For cache-efficiency in the compute kernel, we perform one fast, bulk
-                // copy to make the variant data for this batch contiguous in memory.
-                let mut concatenated_data = Vec::with_capacity(batch.len() * bytes_per_variant);
-                let mut reconciled_indices = Vec::with_capacity(batch.len());
+                let reconciled_indices: Vec<ReconciledVariantIndex> =
+                    batch.iter().map(|wi| wi.reconciled_variant_index).collect();
+
+                // Reuse the accumulator's buffer for concatenated data.
+                let concatenated_data = &mut acc.2;
+                concatenated_data.clear();
                 for wi in &batch {
                     concatenated_data.extend_from_slice(&wi.data);
-                    reconciled_indices.push(wi.reconciled_variant_index);
                 }
 
-                batch::run_person_major_path(
-                    &concatenated_data,
+                // The compute call is now separate from buffer management.
+                let compute_result = batch::run_person_major_path(
+                    concatenated_data,
                     &reconciled_indices,
                     prep_result,
                     &mut acc.0,
                     &mut acc.1,
                     &context.tile_pool,
                     &context.sparse_index_pool,
-                )?;
+                );
 
-                // After processing the entire batch, we recycle all of its buffers.
+                // This block is GUARANTEED to run, ensuring buffers are always returned.
                 for mut work_item in batch {
                     work_item.data.clear();
                     let _ = buffer_pool.push(work_item.data);
                 }
+
+                // Now, we can safely propagate the error if computation failed.
+                compute_result?;
                 Ok(acc)
             },
         )
         .try_reduce(
-            || (vec![0.0f64; result_size], vec![0u32; result_size]),
+            || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
             |mut a, b| {
-                a.0.par_iter_mut().zip(b.0).for_each(|(v_a, v_b)| *v_a += v_b);
-                a.1.par_iter_mut().zip(b.1).for_each(|(v_a, v_b)| *v_a += v_b);
+                a.0.par_iter_mut()
+                    .zip(b.0)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
+                a.1.par_iter_mut()
+                    .zip(b.1)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
+                // The reusable buffer from `b` is discarded; we only need to keep `a`'s.
                 Ok(a)
             },
-        )?;
+        )?
+        .map(|(scores, counts, _)| (scores, counts)); // Discard the final reusable buffer.
 
     Ok(final_result.unwrap_or_else(|| (vec![0.0; result_size], vec![0; result_size])))
 }
