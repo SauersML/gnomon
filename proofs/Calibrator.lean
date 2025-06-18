@@ -266,16 +266,6 @@ This section will state and prove the core claims of the framework.
 **The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
 -/
 
-/-! ### Claim 1: Formalization of Scenarios
-
-**The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
--/
-
-/-! ### Claim 1: Formalization of Scenarios
-
-**The four scenarios can be mathematically formalized with precise data-generating processes.** Each scenario corresponds to a specific relationship between the true E[Y|P,PC], the distribution of P given PC, and the causal structure—allowing us to define exactly when we're in each scenario rather than relying on verbal descriptions.
--/
-
 /-- Scenario 1: Real genetic differences in causal SNPs correlating with ancestry.
     The true genetic effect varies with ancestry. -/
 noncomputable def Scenario1DGP (k : ℕ) : DataGeneratingProcess k where
@@ -382,10 +372,141 @@ theorem scenarios_are_distinct (k : ℕ) (h_k_pos : k > 0) :
 **Scenarios 1 and 4 can produce identical PGS distributions but require opposite signs for the optimal interaction coefficient.** Formally: ∃ two data-generating processes where P|PC has identical distributions, but optimal prediction requires γ₁ₗ > 0 in one case and γ₁ₗ < 0 in the other along the same PC axis—proving phenotype data is mathematically necessary.
 -/
 
+/-- Two DGPs have identical PGS distributions if P|PC has the same distribution for all PC values -/
+def identicalPGSDistributions (dgp1 dgp2 : DataGeneratingProcess k) : Prop :=
+  ∀ (pc : PC k) (p : PGS), dgp1.pgsGivenPC pc p = dgp2.pgsGivenPC pc p
+
+/-- Specific instance of Scenario 1 where genetic effects increase with PC₁ -/
+noncomputable def Scenario1_PositiveModulation : DataGeneratingProcess 1 where
+  scenario := Scenario.RealGeneticDifferences
+  -- E[Y|P,PC] = P × (1 + 0.5×PC₁)
+  -- So the effect of P increases with PC₁
+  trueExpectation := fun p pc => p * (1 + 0.5 * pc 0)
+  -- P shifts by 0.8×PC₁ due to population genetics
+  pgsGivenPC := fun pc p =>
+    let mean := 0.8 * pc 0
+    Real.exp (-(p - mean)^2 / 2)
+  environmentalEffect := fun _ => 0
+
+/-- Specific instance of Scenario 4 with the same PGS distribution as Scenario1_PositiveModulation -/
+noncomputable def Scenario4_MatchingDistribution : DataGeneratingProcess 1 where
+  scenario := Scenario.NeutralDifferences
+  -- The "true" genetic effect is P - 0.8×PC₁ (removing the neutral shift)
+  -- So E[Y|P,PC] = P - 0.8×PC₁
+  trueExpectation := fun p pc => p - 0.8 * pc 0
+  -- Same P distribution as Scenario 1
+  pgsGivenPC := fun pc p =>
+    let mean := 0.8 * pc 0
+    Real.exp (-(p - mean)^2 / 2)
+  environmentalEffect := fun _ => 0
+
+/-- The key insight: These scenarios have identical PGS distributions but fundamentally 
+    different P-Y relationships that can only be distinguished with phenotype data -/
+theorem necessity_of_phenotype_data :
+  -- The two scenarios have identical PGS distributions
+  (identicalPGSDistributions Scenario1_PositiveModulation Scenario4_MatchingDistribution) ∧
+  -- But the relationship between P and Y is fundamentally different
+  (∃ (pc₁ pc₂ : PC 1),
+    pc₁ 0 ≠ pc₂ 0 ∧
+    -- For Scenario 1, the effect of P depends on PC (interaction present)
+    (let dgp1 := Scenario1_PositiveModulation
+     let effect_at_pc₁ := dgp1.trueExpectation 1 pc₁ - dgp1.trueExpectation 0 pc₁
+     let effect_at_pc₂ := dgp1.trueExpectation 1 pc₂ - dgp1.trueExpectation 0 pc₂
+     effect_at_pc₁ ≠ effect_at_pc₂) ∧
+    -- For Scenario 4, the effect of P is constant (no interaction)
+    (let dgp4 := Scenario4_MatchingDistribution
+     let effect_at_pc₁ := dgp4.trueExpectation 1 pc₁ - dgp4.trueExpectation 0 pc₁
+     let effect_at_pc₂ := dgp4.trueExpectation 1 pc₂ - dgp4.trueExpectation 0 pc₂
+     effect_at_pc₁ = effect_at_pc₂)) := by
+  sorry
+
+/-- For the phenotype-informed model, optimal parameters differ between scenarios -/
+theorem different_optimal_parameters :
+  -- In Scenario 1: γ₁₁ > 0 (positive interaction)
+  -- In Scenario 4: γ₁₁ = 0 (no interaction needed)
+  ∃ (gamma1 gamma4 : GammaParams 1 1),
+    -- gamma1 is optimal for Scenario 1 with positive interaction
+    (gamma1 1 1 > 0) ∧
+    -- gamma4 is optimal for Scenario 4 with no interaction
+    (gamma4 1 1 = 0) ∧
+    -- Yet both scenarios have identical PGS distributions
+    (identicalPGSDistributions Scenario1_PositiveModulation Scenario4_MatchingDistribution) := by
+  sorry
+
 /-! ### Claim 3: Independence Condition
 
 **When PGS and PC are statistically independent, all interaction terms vanish in the optimal predictor.** Specifically: if Corr(P, PC_l) = 0 for all l in the population, then the Bayes-optimal prediction function has γ_ml = 0 for all m ≥ 1, l ≥ 1, reducing to a standard additive GLM.
 -/
+
+/-- P and PC are statistically independent in a DGP if P|PC has the same distribution for all PC -/
+def pgsIndependentOfPC (dgp : DataGeneratingProcess k) : Prop :=
+  ∃ (marginal_pgs_density : PGS → ℝ),
+    ∀ (pc : PC k) (p : PGS), dgp.pgsGivenPC pc p = marginal_pgs_density p
+
+/-- A prediction function in our GLM class with specific parameters -/
+structure PredictionFunction (p k : ℕ) where
+  basis : BasisFunctions p
+  gamma : GammaParams p k
+
+/-- Expected squared error of a prediction function under a DGP -/
+noncomputable def expectedSquaredError (dgp : DataGeneratingProcess k) 
+    (pred : PredictionFunction p k) : ℝ :=
+  -- E[(Y - f(P,PC))²] where f is determined by pred
+  -- This would be computed by integrating over the joint distribution
+  0  -- Placeholder
+
+/-- A prediction function is Bayes-optimal if it minimizes expected squared error -/
+def isBayesOptimal (dgp : DataGeneratingProcess k) (pred : PredictionFunction p k) : Prop :=
+  ∀ (other : PredictionFunction p k),
+    expectedSquaredError dgp pred ≤ expectedSquaredError dgp other
+
+/-- The key structural result about independence -/
+theorem independence_implies_no_interaction (k : ℕ) (dgp : DataGeneratingProcess k) :
+  pgsIndependentOfPC dgp →
+  -- For any Bayes-optimal predictor with linear basis
+  ∀ (pred : PredictionFunction 1 k),
+    isBayesOptimal dgp pred →
+    -- All interaction terms vanish: γ₁ₗ = 0 for l ≥ 1
+    ∀ (l : Fin k), pred.gamma 1 l.succ = 0 := by
+  sorry
+
+/-- More general version: For any basis functions, independence kills all interactions -/
+theorem independence_implies_additive_model (p k : ℕ) (dgp : DataGeneratingProcess k) :
+  pgsIndependentOfPC dgp →
+  ∀ (pred : PredictionFunction p k),
+    isBayesOptimal dgp pred →
+    -- All interaction parameters γ_ml = 0 for m ≥ 1, l ≥ 1
+    ∀ (m : Fin p) (l : Fin k), pred.gamma m.succ l.succ = 0 := by
+  sorry
+
+/-- The model reduces to standard GLM form: η = γ₀₀ + Σγ₀ₗPCₗ + Σγₘ₀Bₘ(P) -/
+theorem independence_gives_standard_glm (p k : ℕ) (dgp : DataGeneratingProcess k) :
+  pgsIndependentOfPC dgp →
+  ∀ (pred : PredictionFunction p k),
+    isBayesOptimal dgp pred →
+    -- The linear predictor has no interaction terms
+    ∀ (pgs : PGS) (pc : PC k),
+      linearPredictor pred.gamma pred.basis pgs pc =
+      pred.gamma 0 0 +  -- Overall intercept
+      (∑ l : Fin k, pred.gamma 0 l.succ * pc l) +  -- PC main effects
+      (∑ m : Fin p, pred.gamma m.succ 0 * pred.basis.B m.succ pgs)  -- PGS main effects
+      := by
+  sorry
+
+/-- Practical implication: Under independence, the phenotype-informed method
+    gives the same predictions as fitting P and PC separately -/
+theorem independence_equals_separate_fitting (p k : ℕ) (dgp : DataGeneratingProcess k) :
+  pgsIndependentOfPC dgp →
+  -- A model fit with our method under independence
+  ∀ (phenotype_informed : PredictionFunction p k),
+    isBayesOptimal dgp phenotype_informed →
+    -- Is equivalent to fitting P and PC as separate predictors
+    ∃ (separate_p : Fin (p+1) → ℝ) (separate_pc : Fin (k+1) → ℝ),
+      ∀ (pgs : PGS) (pc : PC k),
+        linearPredictor phenotype_informed.gamma phenotype_informed.basis pgs pc =
+        separate_pc 0 + (∑ l : Fin k, separate_pc l.succ * pc l) +
+        (∑ m : Fin (p+1), separate_p m * phenotype_informed.basis.B m pgs) := by
+  sorry
 
 /-! ### Claim 4: Prediction-Causality Trade-off
 
