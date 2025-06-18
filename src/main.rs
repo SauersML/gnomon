@@ -54,6 +54,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build_global()
+        .unwrap();
     let overall_start_time = Instant::now();
     let args = Args::parse();
     let plink_prefix = resolve_plink_prefix(&args.input_path)?;
