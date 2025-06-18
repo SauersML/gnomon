@@ -216,7 +216,7 @@ fn process_sparse_stream(
                         work_item.reconciled_variant_index,
                     )?;
                 }
-                Ok(acc)
+                Ok::<_, PipelineError>(acc)
             },
         )
         .try_reduce(
@@ -276,8 +276,8 @@ fn process_dense_stream(
                 )
             },
             |mut acc, batch| {
-                if batch.is_empty() { return Ok(acc); }
-
+                if batch.is_empty() { return Ok::<_, PipelineError>(acc); }
+    
                 // The logic for processing a batch is contained here. We use a Vec of BufferGuards
                 // to ensure all buffers are returned to the pool, even on error.
                 let reconciled_indices: Vec<ReconciledVariantIndex> =
@@ -310,7 +310,7 @@ fn process_dense_stream(
                 // Explicitly drop guards to return buffers to the pool before the next iteration.
                 drop(guards);
 
-                Ok(acc)
+                Ok::<_, PipelineError>(acc)
             },
         )
         .try_reduce(
