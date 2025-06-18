@@ -363,8 +363,10 @@ fn process_tile<'a>(
         }
 
         // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
-        let thread_indices = sparse_index_pool.get_or_default();
-        let (g1_indices, g2_indices, missing_events) = &mut *thread_indices.borrow_mut();
+        // Pop a reusable buffer set from the thread-safe pool.
+        // This is an RAII-like pattern: the buffers will be returned at the end of the function.
+        let mut buffers = sparse_index_pool.pop();
+        let (g1_indices, g2_indices, missing_events) = &mut buffers;
 
         // This logic ensures we only grow the vectors, then clear the relevant inner
         // vectors, preserving their allocated capacity. This prevents a "malloc storm"
@@ -504,6 +506,12 @@ fn process_tile<'a>(
                 }
             }
         }
+
+        // --- D. Return Resources to the Pool ---
+        // This is the crucial release step. By placing it at the end of the loop
+        // iteration, we guarantee that the buffers acquired at the start of the
+        // iteration are returned, preventing resource leaks.
+        sparse_index_pool.push(buffers);
     }
 }
 
@@ -771,28 +779,6 @@ pub fn run_variant_major_path(
     }
 
     Ok(())
-}
-
-
-/// Decodes a single variant's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
-#[inline]
-fn decode_variant_genotypes(variant_data: &[u8], num_people: usize) -> Vec<u8> {
-    let mut dosages = Vec::with_capacity(num_people);
-    for i in 0..num_people {
-        let byte_index = i / 4;
-        let bit_offset = (i % 4) * 2;
-        let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
-        
-        let dosage = match packed_val {
-            0b00 => 0, // Homozygous for first allele
-            0b01 => 3, // Corresponds to PLINK's missing value
-            0b10 => 1, // Heterozygous
-            0b11 => 2, // Homozygous for second allele
-            _ => unreachable!(),
-        };
-        dosages.push(dosage);
-    }
-    dosages
 }
 
 #[cfg(test)]
