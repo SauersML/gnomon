@@ -37,9 +37,6 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
-use crossbeam_queue::ArrayQueue;
-use num_cpus;
-
 /// A thread-safe pool for reusing the large memory buffers required for storing
 /// sparse indices (`g1_indices`, `g2_indices`) and deferred missingness events.
 /// This implementation uses a lock-free queue, making it safe and efficient for
