@@ -99,12 +99,15 @@ impl SparseIndexPool {
 
 /// Processes one dense, pre-filtered batch of variant-major data using the person-major
 /// (pivot) path. This path is efficient for batches with high variant density.
+/// This function now assumes that weight/flip data has been pre-gathered by the caller.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
+    weights_for_batch: &[f32],
+    flips_for_batch: &[u8],
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
-    partial_scores_out: &mut CleanScores,
-    partial_missing_counts_out: &mut CleanCounts,
+    partial_scores_out: &mut [f64],
+    partial_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
     sparse_index_pool: &SparseIndexPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -118,42 +121,19 @@ pub fn run_person_major_path(
         )));
     }
 
-    // === STAGE 1: SINGLE-THREADED GATHER (Eliminates Contention) ===
-    let stride = prep_result.stride();
-    let num_variants_in_batch = reconciled_variant_indices_for_batch.len();
-    let batch_matrix_size = num_variants_in_batch * stride;
-
-    let mut weights_for_batch = Vec::with_capacity(batch_matrix_size);
-    let mut flips_for_batch = Vec::with_capacity(batch_matrix_size);
-
-    // This is safe because we just allocated the capacity.
-    unsafe {
-        weights_for_batch.set_len(batch_matrix_size);
-        flips_for_batch.set_len(batch_matrix_size);
-    }
-
-    for (i, &reconciled_idx) in reconciled_variant_indices_for_batch.iter().enumerate() {
-        let dest_offset = i * stride;
-        let src_offset = reconciled_idx.0 as usize * stride;
-
-        weights_for_batch[dest_offset..dest_offset + stride]
-            .copy_from_slice(&prep_result.weights_matrix()[src_offset..src_offset + stride]);
-
-        flips_for_batch[dest_offset..dest_offset + stride]
-            .copy_from_slice(&prep_result.flip_mask_matrix()[src_offset..src_offset + stride]);
-    }
-
-    // === STAGE 2: MULTI-THREADED COMPUTE ===
+    // === MULTI-THREADED COMPUTE ===
     match &prep_result.person_subset {
         PersonSubset::All => {
+            // Create an iterator over all people in the original FAM file.
             let iter = (0..prep_result.total_people_in_fam as u32)
                 .into_par_iter()
                 .map(OriginalPersonIndex);
+                
             process_people_iterator(
                 iter,
                 variant_major_data,
-                &weights_for_batch,
-                &flips_for_batch,
+                weights_for_batch, // Use the pre-gathered data
+                flips_for_batch,   // Use the pre-gathered data
                 reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
@@ -163,12 +143,14 @@ pub fn run_person_major_path(
             );
         }
         PersonSubset::Indices(indices) => {
+            // Create an iterator over the subset of people specified in the keep file.
             let iter = indices.par_iter().copied().map(OriginalPersonIndex);
+            
             process_people_iterator(
                 iter,
                 variant_major_data,
-                &weights_for_batch,
-                &flips_for_batch,
+                weights_for_batch, // Use the pre-gathered data
+                flips_for_batch,   // Use the pre-gathered data
                 reconciled_variant_indices_for_batch,
                 prep_result,
                 partial_scores_out,
@@ -181,6 +163,7 @@ pub fn run_person_major_path(
 
     Ok(())
 }
+
 
 // ========================================================================================
 //                            PRIVATE IMPLEMENTATION
@@ -709,80 +692,87 @@ fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
 
 /// Processes a single sparse variant using a direct, pivot-free algorithm.
 ///
-/// This path is optimized for variants where most individuals have the
-/// homozygous-reference genotype. It avoids the high overhead of the pivot
-/// operation by iterating through individuals and only performing work for
-/// those with non-zero dosages.
+/// This path is optimized for variants where most individuals have the homozygous-
+/// reference genotype. It avoids the high overhead of the pivot operation by
+// iterating only over the individuals being scored and decoding their genotypes
+// on-the-fly, which is allocation-free in the hot path.
 pub fn run_variant_major_path(
     variant_data: &[u8],
     prep_result: &PreparationResult,
-    partial_scores_out: &mut CleanScores,
-    partial_missing_counts_out: &mut CleanCounts,
+    partial_scores_out: &mut [f64],
+    partial_missing_counts_out: &mut [u32],
     reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-
-    // --- 1. Decode this single variant for all people in the cohort ---
-    // This is a small, temporary allocation that fits on the stack for most cohorts.
-    let dosages = decode_variant_genotypes(variant_data, prep_result.total_people_in_fam);
-
-    // --- 2. Get pointers to the relevant weight/flip data for this variant ---
-    // This is an efficient calculation of the offset into the global contiguous matrices.
     let stride = prep_result.stride();
-    let row_offset = reconciled_variant_index.0 as usize * stride;
-    let weight_row = &prep_result.weights_matrix()[row_offset..row_offset + stride];
-    let flip_row = &prep_result.flip_mask_matrix()[row_offset..row_offset + stride];
+    
+    // Get pointers to the relevant weight/flip data for this variant. This is
+    // an efficient calculation of the offset into the global contiguous matrices.
+    let matrix_row_offset = reconciled_variant_index.0 as usize * stride;
+    let weight_row = &prep_result.weights_matrix()[matrix_row_offset..matrix_row_offset + stride];
+    let flip_row = &prep_result.flip_mask_matrix()[matrix_row_offset..matrix_row_offset + stride];
     let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
 
-    // --- 3. First pass: Handle missingness and correct baselines ---
-    // It is critical to correct the baseline score for missing individuals *before*
-    // applying adjustments for non-missing ones. This is especially important for
-    // flipped variants, where the baseline score is non-zero.
-    for (original_fam_idx, &dosage) in dosages.iter().enumerate() {
-        if dosage == 3 { // Missing Genotype
-            if let Some(output_idx) = prep_result.person_fam_to_output_idx[original_fam_idx] {
-                let scores_offset = output_idx as usize * num_scores;
+    // --- Main Compute Loop ---
+    // This single loop iterates only over the individuals we need to score.
+    // This is the core optimization that eliminates the massive allocation and
+    // redundant work of the previous implementation.
+    for out_idx in 0..prep_result.num_people_to_score {
+        // Use a pre-computed map to find the original .fam index for this output slot.
+        let original_fam_idx = prep_result.output_idx_to_fam_idx[out_idx] as usize;
+        
+        // --- On-the-fly Genotype Decoding ---
+        // This is extremely fast (a few bitwise operations) and allocation-free.
+        let byte_index = original_fam_idx / 4;
+        let bit_offset = (original_fam_idx % 4) * 2;
+        let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
+        
+        // The logic for all dosage states is handled in a single, efficient match.
+        match packed_val {
+            // Homozygous reference (0b00) or other unknown values. Do nothing.
+            // For sparse variants, this branch is highly predictable for the CPU.
+            0b00 => (), 
+            
+            // Missing genotype (0b01).
+            0b01 => {
+                let scores_offset = out_idx * num_scores;
                 for score_col_idx in affected_scores {
                     let col = score_col_idx.0;
-                    // If a variant was flipped, the baseline calculation assumes a score of
-                    // 2 * W. We must subtract this back out for missing individuals.
+                    partial_missing_counts_out[scores_offset + col] += 1;
+                    // If the variant was flipped, its contribution (2*W) was added to the
+                    // baseline. We must subtract it back out for missing individuals.
                     if flip_row[col] == 1 {
                         partial_scores_out[scores_offset + col] -= 2.0 * weight_row[col] as f64;
                     }
-                    partial_missing_counts_out[scores_offset + col] += 1;
                 }
             }
-        }
-    }
-
-    // --- 4. Main compute pass: Apply adjustments for non-zero dosages ---
-    for (original_fam_idx, &dosage) in dosages.iter().enumerate() {
-        // THE CORE OPTIMIZATION: For a sparse variant, this branch is highly predictable.
-        // We skip the vast majority of individuals who are homozygous-reference.
-        if dosage == 0 || dosage == 3 {
-            continue;
-        }
-
-        // Check if this person is in our output subset. This is an O(1) lookup.
-        if let Some(output_idx) = prep_result.person_fam_to_output_idx[original_fam_idx] {
-            let scores_offset = output_idx as usize * num_scores;
             
-            // This person has a non-zero dosage. Apply adjustments to all relevant scores.
-            for score_col_idx in affected_scores {
-                let col = score_col_idx.0;
-                let weight = weight_row[col] as f64;
-                let adjustment = if flip_row[col] == 1 {
-                    -weight * (dosage as f64)
-                } else {
-                    weight * (dosage as f64)
-                };
-                partial_scores_out[scores_offset + col] += adjustment;
+            // Heterozygous (0b10) or Homozygous alternate (0b11).
+            0b10 | 0b11 => {
+                let dosage = if packed_val == 0b10 { 1.0 } else { 2.0 };
+                let scores_offset = out_idx * num_scores;
+                for score_col_idx in affected_scores {
+                    let col = score_col_idx.0;
+                    let weight = weight_row[col] as f64;
+                    // The baseline score already assumes a dosage of 0 for non-flipped variants,
+                    // and 2 for flipped variants. This calculation applies the correct adjustment.
+                    let adjustment = if flip_row[col] == 1 {
+                        -weight * dosage
+                    } else {
+                        weight * dosage
+                    };
+                    partial_scores_out[scores_offset + col] += adjustment;
+                }
             }
+            
+            // Should not be reached with valid PLINK data.
+            _ => unreachable!(),
         }
     }
 
     Ok(())
 }
+
 
 /// Decodes a single variant's raw byte data into a vector of dosages (0, 1, 2, or 3 for missing).
 #[inline]
