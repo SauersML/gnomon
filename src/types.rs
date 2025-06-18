@@ -1,171 +1,15 @@
 // ========================================================================================
-//
-//                       CORE DATA TYPES FOR THE GNOMON ENGINE
-//
+//                             High-Level Data Contracts
 // ========================================================================================
-//
-// This module serves as the canonical dictionary for all data structures and types that
-// are shared across the major architectural boundaries of the application (e.g.,
-// `prepare`, `batch`, `main`).
-//
-// By centralizing these definitions, we create a single source of truth and enforce
-// a clean, one-way dependency graph where high-level modules can depend on these
-// core types, but not on each other's implementation details.
-//
+
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
-use std::ops::{Deref, DerefMut};
-
-// ========================================================================================
-//                             ZERO-COST BUFFER STATE TYPES
-// ========================================================================================
-
-// These wrapper types encode a buffer's state (Clean or Dirty) into the type system,
-// allowing the compiler to enforce correct usage at zero runtime cost. The `#[repr(transparent)]`
-// attribute ensures they are identical to a `Vec` in memory layout.
-/// A buffer that is guaranteed by the type system to have been zeroed.
+/// The payload sent from the I/O producer to the compute consumers. It contains
+/// the raw data for one variant and the necessary metadata to process it.
 #[derive(Debug)]
-#[repr(transparent)]
-pub struct CleanScores(pub Vec<f64>);
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct CleanCounts(pub Vec<u32>);
-
-/// A buffer that may contain non-zero data from a previous computation.
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct DirtyScores(pub Vec<f64>);
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct DirtyCounts(pub Vec<u32>);
-
-// --- State Transition & Ergonomics ---
-
-impl DirtyScores {
-    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
-    /// This is the ONLY way to transition from a Dirty to a Clean state.
-    pub fn into_clean(mut self) -> CleanScores {
-        self.0.fill(0.0);
-        CleanScores(self.0)
-    }
-}
-
-impl Deref for DirtyScores {
-    type Target = [f64];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl<'a> IntoIterator for &'a DirtyScores {
-    type Item = &'a f64;
-    type IntoIter = std::slice::Iter<'a, f64>;
-
-    /// Enables direct iteration over the wrapped data.
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl DirtyCounts {
-    /// Consumes a dirty buffer and returns a clean one after zeroing its contents.
-    pub fn into_clean(mut self) -> CleanCounts {
-        self.0.fill(0);
-        CleanCounts(self.0)
-    }
-}
-
-impl Deref for DirtyCounts {
-    type Target = [u32];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl<'a> IntoIterator for &'a DirtyCounts {
-    type Item = &'a u32;
-    type IntoIter = std::slice::Iter<'a, u32>;
-
-    /// Enables direct iteration over the wrapped data.
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl CleanScores {
-    /// Consumes a clean buffer, acknowledging it is now dirty after use.
-    /// This is a zero-cost type change.
-    pub fn into_dirty(self) -> DirtyScores {
-        DirtyScores(self.0)
-    }
-}
-impl Deref for CleanScores {
-    type Target = [f64];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-impl DerefMut for CleanScores {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
-}
-
-impl CleanCounts {
-    /// Consumes a clean buffer, acknowledging it is now dirty after use.
-    pub fn into_dirty(self) -> DirtyCounts {
-        DirtyCounts(self.0)
-    }
-}
-impl Deref for CleanCounts {
-    type Target = [u32];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-impl DerefMut for CleanCounts {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
-}
-
-// ========================================================================================
-//                            High-Level Data Contracts
-// ========================================================================================
-
-/// A buffer containing the raw, un-decoded genotype data for a single variant,
-/// matching the PLINK .bed file's variant-major layout.
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct PackedVariantGenotypes(pub Vec<u8>);
-
-/// The data payload of a non-empty `DenseVariantBatch`. This struct is public
-/// to allow the pipeline orchestrator to own and move the data out of a
-/// `DenseVariantBatch::Buffering` state. It contains all data required for the
-/// person-major path, pre-gathered into contiguous buffers.
-#[derive(Debug)]
-pub struct DenseVariantBatchData {
-    /// A contiguous buffer of packed variant genotype data.
+pub struct WorkItem {
     pub data: Vec<u8>,
-    /// The number of variants in this batch. This is the source of truth for the batch size.
-    pub variant_count: usize,
-    /// The reconciled variant indices for each corresponding variant in the batch.
-    /// This is used by the compute engine to look up global metadata for rare
-    /// events like missingness handling.
-    pub reconciled_variant_indices: Vec<ReconciledVariantIndex>,
-}
-/// A batch of raw variant data, curated to contain only "dense" variants
-/// suitable for the high-throughput person-major compute path.
-///
-/// This enum enforces a state machine at compile time: a batch is either
-/// `Empty` or it is `Buffering`. This makes it impossible to dispatch an empty
-/// batch or add data to a batch that has already been dispatched, preventing a
-/// class of logic errors.
-#[derive(Debug)]
-pub enum DenseVariantBatch {
-    /// Represents a batch that has no variants. This is the initial state.
-    Empty,
-    /// Represents a batch that is actively accumulating variants.
-    Buffering(DenseVariantBatchData),
-}
-
-impl DenseVariantBatch {
-    /// Consumes the batch and returns the inner data if it was buffering,
-    /// otherwise panics. This is used when a batch is known to be full.
-    pub fn into_data(self) -> DenseVariantBatchData {
-        match self {
-            DenseVariantBatch::Buffering(data) => data,
-            DenseVariantBatch::Empty => panic!("called `into_data()` on an `Empty` DenseVariantBatch"),
-        }
-    }
+    pub reconciled_variant_index: ReconciledVariantIndex,
 }
 
 /// Represents the dispatcher's decision for which compute path to use for a
@@ -210,8 +54,10 @@ pub struct PreparationResult {
     pub required_bim_indices: Vec<BimRowIndex>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
-    /// Essential for O(1) lookups in the variant-major path.
     pub person_fam_to_output_idx: Vec<Option<u32>>,
+    /// A map from the final, compact output index back to the original .fam file index.
+    /// This is a critical optimization for the variant-major path.
+    pub output_idx_to_fam_idx: Vec<u32>,
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
     /// A vector containing the total number of variants that contribute to each score.
@@ -259,6 +105,7 @@ impl PreparationResult {
         num_reconciled_variants: usize,
         bytes_per_variant: u64,
         person_fam_to_output_idx: Vec<Option<u32>>,
+        output_idx_to_fam_idx: Vec<u32>,
     ) -> Self {
         Self {
             weights_matrix,
@@ -276,6 +123,7 @@ impl PreparationResult {
             num_reconciled_variants,
             bytes_per_variant,
             person_fam_to_output_idx,
+            output_idx_to_fam_idx,
         }
     }
 
@@ -296,7 +144,6 @@ impl PreparationResult {
         self.stride
     }
 }
-
 
 // ========================================================================================
 //                            Primitive Type Definitions
