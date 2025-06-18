@@ -21,7 +21,7 @@ use crossbeam_queue::ArrayQueue;
 use num_cpus;
 use rayon::prelude::*;
 use std::error::Error;
-use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, f32x8, u8x8, Simd};
+use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, Simd};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
