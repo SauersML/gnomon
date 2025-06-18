@@ -213,12 +213,20 @@ pub fn prepare_for_computation(
     // Sort by matrix row and then column index. This groups any potential duplicate
     // definitions for the same (variant, score) cell right next to each other,
     // which allows for a fast linear scan to detect them.
-    work_items.par_sort_unstable_by_key(|item| (item.reconciled_variant_idx, item.col_idx));
+    // The (u32, usize) key is packed into a single u64 for faster sort comparisons.
+    // The row index gets the high bits, ensuring it's the primary sort key.
+    work_items.par_sort_unstable_by_key(|item| {
+        ((item.reconciled_variant_idx.0 as u64) << 32) | (item.col_idx.0 as u64)
+    });
 
     // After sorting, a single pass over adjacent items can efficiently detect duplicates.
     // This check ensures that every variant is defined only once per score.
     if let Some(w) = work_items.windows(2).find(|w| {
-        w[0].reconciled_variant_idx == w[1].reconciled_variant_idx && w[0].col_idx == w[1].col_idx
+        let key1 =
+            ((w[0].reconciled_variant_idx.0 as u64) << 32) | (w[0].col_idx.0 as u64);
+        let key2 =
+            ((w[1].reconciled_variant_idx.0 as u64) << 32) | (w[1].col_idx.0 as u64);
+        key1 == key2
     }) {
         let bad_item = &w[0];
         let score_name = &score_names[bad_item.col_idx.0];
