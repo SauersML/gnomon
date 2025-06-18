@@ -276,6 +276,16 @@ pub fn prepare_for_computation(
 
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
+
+    // Create the reverse mapping from a compact output index back to the original .fam index.
+    // This is an essential optimization for the high-performance variant-major path.
+    let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
+    for iid in &final_person_iids {
+        // This lookup is guaranteed to succeed because final_person_iids was derived from all_person_iids.
+        let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
+        output_idx_to_fam_idx.push(original_fam_idx);
+    }
+
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
@@ -292,9 +302,9 @@ pub fn prepare_for_computation(
         num_reconciled_variants,
         bytes_per_variant,
         person_fam_to_output_idx,
+        output_idx_to_fam_idx,
     ))
 }
-
 // ========================================================================================
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
