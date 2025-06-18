@@ -279,9 +279,34 @@ fn process_dense_stream(
                     concatenated_data.extend_from_slice(&wi.data);
                 }
 
+                // Pre-gather the weights and flips for this specific batch of dense variants.
+                // This is a fast, sequential copy that prepares the data for the SIMD kernel.
+                let stride = prep_result.stride();
+                let num_variants_in_batch = batch.len();
+                let batch_matrix_size = num_variants_in_batch * stride;
+
+                let mut weights_for_batch = Vec::with_capacity(batch_matrix_size);
+                let mut flips_for_batch = Vec::with_capacity(batch_matrix_size);
+
+                for (i, &reconciled_idx) in reconciled_indices.iter().enumerate() {
+                    let src_offset = reconciled_idx.0 as usize * stride;
+                    // This is safe because we are filling the Vec sequentially up to its capacity.
+                    unsafe {
+                        weights_for_batch.set_len(weights_for_batch.len() + stride);
+                        flips_for_batch.set_len(flips_for_batch.len() + stride);
+                    }
+                    let dest_offset = i * stride;
+                    weights_for_batch[dest_offset..dest_offset + stride]
+                        .copy_from_slice(&prep_result.weights_matrix()[src_offset..src_offset + stride]);
+                    flips_for_batch[dest_offset..dest_offset + stride]
+                        .copy_from_slice(&prep_result.flip_mask_matrix()[src_offset..src_offset + stride]);
+                }
+
                 // The compute call is now separate from buffer management.
                 let compute_result = batch::run_person_major_path(
                     concatenated_data,
+                    &weights_for_batch,
+                    &flips_for_batch,
                     &reconciled_indices,
                     prep_result,
                     &mut acc.0,
