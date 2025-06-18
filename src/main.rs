@@ -52,12 +52,13 @@ struct Args {
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Initialize the Rayon global thread pool to use all available cores.
+    // This is critical for the performance of the data-parallel compute pipeline.
     rayon::ThreadPoolBuilder::new()
-        .num_threads(3)
         .build_global()
         .unwrap();
+
     let overall_start_time = Instant::now();
     let args = Args::parse();
     let plink_prefix = resolve_plink_prefix(&args.input_path)?;
@@ -68,22 +69,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let prep_result = run_preparation_phase(&plink_prefix, &args)?;
 
     // --- Phase 2: Resource Allocation ---
-    // A new context is created, which allocates all necessary memory pools and
-    // final result buffers based on the blueprint from the preparation phase.
-    let mut context = PipelineContext::new(Arc::clone(&prep_result));
+    // A read-only context is created, which allocates all necessary memory pools
+    // for the pipeline to use.
+    let context = PipelineContext::new(Arc::clone(&prep_result));
     eprintln!("> Resource allocation complete.");
 
     // --- Phase 3: Pipeline Execution ---
-    // This is the primary asynchronous phase. It spawns the I/O producer and
-    // orchestrator tasks, which run concurrently to maximize throughput.
+    // This is the primary compute phase. It is a synchronous, blocking call that
+    // returns the final, aggregated results upon completion.
     let computation_start = Instant::now();
-    pipeline::run(&mut context, &plink_prefix).await?;
+    let (final_scores, final_counts) = pipeline::run(&context, &plink_prefix)?;
     eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
 
     // --- Phase 4: Finalization & Output ---
-    // After all computation is complete and results are aggregated, this
-    // synchronous phase writes the final scores to disk.
-    finalize_and_write_output(&plink_prefix, &context)?;
+    // After all computation is complete, this synchronous phase writes the
+    // final scores to disk, passing the results directly.
+    finalize_and_write_output(&plink_prefix, &prep_result, &final_scores, &final_counts)?;
     
     eprintln!("\nSuccess! Total execution time: {:.2?}", overall_start_time.elapsed());
     Ok(())
@@ -176,13 +177,13 @@ fn run_preparation_phase(
 
 /// **Helper:** Handles the final file writing.
 ///
-/// This function is synchronous. It takes the final, aggregated results from the
-/// `PipelineContext` and writes them to a `.sscore` file. The output path is
-/// derived from the original PLINK prefix to ensure results are co-located with
-/// the input data.
+/// This function is synchronous. It now takes the final results directly,
+/// making it a more focused and decoupled utility.
 fn finalize_and_write_output(
     plink_prefix: &Path,
-    context: &PipelineContext,
+    prep_result: &Arc<PreparationResult>,
+    final_scores: &[f64],
+    final_counts: &[u32],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // The output directory should already exist from the preparation phase,
     // but we ensure it's there for robustness.
@@ -201,19 +202,19 @@ fn finalize_and_write_output(
 
     eprintln!(
         "> Writing {} scores per person to {}",
-        context.prep_result.score_names.len(),
+        prep_result.score_names.len(),
         out_path.display()
     );
     let output_start = Instant::now();
 
-    // Delegate to the existing file writer, passing all data from the context.
+    // Delegate to the file writer, passing all necessary data.
     write_scores_to_file(
         &out_path,
-        &context.prep_result.final_person_iids,
-        &context.prep_result.score_names,
-        &context.prep_result.score_variant_counts,
-        &context.all_scores,
-        &context.all_missing_counts,
+        &prep_result.final_person_iids,
+        &prep_result.score_names,
+        &prep_result.score_variant_counts,
+        final_scores,
+        final_counts,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -260,7 +261,7 @@ fn write_scores_to_file(
     person_iids: &[String],
     score_names: &[String],
     score_variant_counts: &[u32],
-        sum_scores: &[f64],
+    sum_scores: &[f64],
     missing_counts: &[u32],
 ) -> io::Result<()> {
     let file = File::create(path)?;
