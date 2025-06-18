@@ -110,6 +110,7 @@ def find_hot_worker_functions(perf_output, n=2):
     """
     Parses perf report output to find the top N hottest worker functions
     in the gnomon:: namespace, excluding non-worker functions.
+    Updated to handle older perf versions that don't support 'self' sort key.
     """
     candidates = []
     
@@ -121,21 +122,31 @@ def find_hot_worker_functions(perf_output, n=2):
     ]
     
     for line in perf_output:
-        # Match lines with symbol info, looking for self percentage
-        # Format: "  98.44%     0.00%  command  object  [.] symbol"
-        # We want the self% (second percentage) not children% (first)
+        # Handle two possible formats:
+        # Newer format with children/self: "  98.44%     0.00%  command  object  [.] symbol"
+        # Older format with --no-children: "  98.44%  command  object  [.] symbol"
+        
+        # Try newer format first (two percentages)
         match = re.match(r'\s*(\d+\.\d+)%\s+(\d+\.\d+)%\s+\S+\s+\S+\s+\[.\]\s+(.+)', line)
         if match:
             children_pct, self_pct, symbol = match.groups()
-            self_pct = float(self_pct)
-            
-            # Only consider gnomon:: functions with meaningful self time
-            if 'gnomon::' in symbol and self_pct > 0.5:
-                # Skip non-worker functions
-                if not any(pat in symbol for pat in skip_patterns):
-                    candidates.append((self_pct, symbol.strip()))
+            pct = float(self_pct)
+        else:
+            # Try older format (single percentage, which is self-time with --no-children)
+            match = re.match(r'\s*(\d+\.\d+)%\s+\S+\s+\S+\s+\[.\]\s+(.+)', line)
+            if match:
+                pct = float(match.group(1))
+                symbol = match.group(2)
+            else:
+                continue
+        
+        # Only consider gnomon:: functions with meaningful time
+        if 'gnomon::' in symbol and pct > 0.5:
+            # Skip non-worker functions
+            if not any(pat in symbol for pat in skip_patterns):
+                candidates.append((pct, symbol.strip()))
     
-    # Sort by self percentage and return top N
+    # Sort by percentage and return top N
     candidates.sort(reverse=True, key=lambda x: x[0])
     return [sym for pct, sym in candidates[:n]]
 
@@ -293,9 +304,11 @@ def main():
             run_command(perf_report_cmd, title="Combined Granular Profile Report")
 
             # Now, get a cleaner report for parsing to find hot functions
+            # FIXED: Remove 'self' sort key for compatibility with older perf versions
+            # --no-children makes the overhead column show self-time instead of cumulative time
             perf_simple_report_cmd = [
                 "perf", "report", "--stdio", "--no-children",
-                "--sort=symbol,self", "--percent-limit=0.5",
+                "--sort=symbol", "--percent-limit=0.5",
                 "-i", str(perf_data_file)
             ]
             success, output = run_command(perf_simple_report_cmd, 
@@ -347,7 +360,27 @@ def main():
                 else:
                     print("\n⚠️  No hot worker functions found in gnomon:: namespace")
             else:
-                print("Failed to analyze hot functions")
+                # If the command failed, it might be due to version issues
+                # Try an even simpler approach
+                print("\n⚠️  Failed to analyze with standard options, trying fallback...")
+                
+                # Fallback: simplest possible report command
+                perf_fallback_cmd = [
+                    "perf", "report", "--stdio", "--no-children",
+                    "--percent-limit=0.5", "-i", str(perf_data_file)
+                ]
+                success, output = run_command(perf_fallback_cmd, 
+                                            title="Fallback analysis",
+                                            capture_output=True)
+                
+                if success:
+                    hot_functions = find_hot_worker_functions(output, n=2)
+                    if hot_functions:
+                        print(f"\n🔥 Found top hot functions: {', '.join(hot_functions)}")
+                    else:
+                        print("\n⚠️  No hot worker functions found in gnomon:: namespace")
+                else:
+                    print("Failed to analyze hot functions with fallback method")
 
         else:
             print(f"Combined perf data file not found at '{perf_data_file}'. Profiling may have failed.")
