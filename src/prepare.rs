@@ -10,7 +10,7 @@
 // multiple score files.
 
 use crate::types::{
-    BimRowIndex, ReconciledVariantIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
+    BimRowIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
 };
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
@@ -135,8 +135,8 @@ pub fn prepare_for_computation(
     // regroups the flat `unified_map` by variant to enable the final parallel pass.
     eprintln!("> Pass 4: Building final variant index and regrouping work...");
     let mut required_bim_indices: Vec<BimRowIndex> = unified_map
-        .par_keys()
-        .map(|(bim_row, _)| *bim_row)
+        .par_iter()
+        .map(|((bim_row, _), _)| *bim_row)
         .collect::<AHashSet<_>>()
         .into_iter()
         .collect();
@@ -410,7 +410,7 @@ pub fn parse_score_file_headers_only(
     // and the merging of results into a single, unique, sorted collection.
     let all_score_names: BTreeSet<String> = score_files
         .par_iter()
-        .try_flat_map(|path| -> Result<Vec<String>, PrepError> {
+        .map(|path| -> Result<Vec<String>, PrepError> {
             // This closure is executed in parallel for each score file.
             let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
             let mut reader = BufReader::new(file);
@@ -460,7 +460,10 @@ pub fn parse_score_file_headers_only(
 
             Ok(score_names)
         })
-        .collect::<Result<BTreeSet<String>, _>>()?;
+        .collect::<Result<Vec<Vec<String>>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Convert the final, sorted BTreeSet into a Vec.
     Ok(all_score_names.into_iter().collect())
