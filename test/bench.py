@@ -353,15 +353,27 @@ def run_and_monitor_process(tool_name: str, command: List[str], cwd: Path) -> Di
             except psutil.NoSuchProcess: break
             time.sleep(0.02)
 
+        # CAPTURE the output from the completed process
         stdout, stderr = process.communicate()
         wall_time = time.monotonic() - start_time
         returncode = process.returncode
         
+        # This section prints all the output that was captured from the tool.
+        print(f"\n    --- START {tool_name.upper()} OUTPUT ---")
+        if stdout and stdout.strip():
+            print("    [STDOUT]")
+            # Indent the output for clarity
+            for line in stdout.strip().split('\n'):
+                print(f"      | {line}")
+        if stderr and stderr.strip():
+            print("    [STDERR]")
+            # Indent the output for clarity
+            for line in stderr.strip().split('\n'):
+                print(f"      | {line}")
+        print(f"    --- END {tool_name.upper()} OUTPUT ---\n")
+        
         if returncode != 0:
             print(f"  > ❌ {tool_name} FAILED with exit code {returncode}.")
-            if stderr:
-                last_lines = "\n".join(stderr.strip().split('\n')[-10:])
-                print(f"      --- Stderr Tail ---\n{last_lines}\n      -------------------")
         else:
             print(f"  > ✅ {tool_name} finished in {wall_time:.2f}s. Peak Memory: {peak_rss_mb:.2f} MB")
     
