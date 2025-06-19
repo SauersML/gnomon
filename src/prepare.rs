@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
+use memchr::memchr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
