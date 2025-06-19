@@ -8,6 +8,8 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Any
+import threading
+import queue
 
 import numpy as np
 import pandas as pd
@@ -338,48 +340,104 @@ class RealisticDataGenerator:
 # ==============================================================================
 
 def run_and_monitor_process(tool_name: str, command: List[str], cwd: Path) -> Dict[str, Any]:
+    """
+    Executes a command, monitors its resource usage, and streams its output in
+    real-time, correctly formatted within a collapsible log section.
+    """
     print(f"  > Running {tool_name}...")
     cmd_str_list = [str(c) for c in command]
     print(f"    Command: {' '.join(cmd_str_list)}")
     start_time = time.monotonic()
     
+    # This queue will hold lines from stdout and stderr to be printed by the main thread.
+    output_queue = queue.Queue()
+
+    def stream_reader(stream, stream_name):
+        """Reads lines from a stream and puts them onto the queue."""
+        try:
+            for line in iter(stream.readline, ''):
+                output_queue.put((stream_name, line))
+        finally:
+            stream.close()
+
+    process = None
     try:
-        process = subprocess.Popen(cmd_str_list, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        process = subprocess.Popen(
+            cmd_str_list,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
         p = psutil.Process(process.pid)
+        
+        # Start threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, 'STDOUT'))
+        stderr_thread = threading.Thread(target=stream_reader, args=(process.stderr, 'STDERR'))
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+
         peak_rss_mb = 0
+        
+        # Print the header for the output section immediately
+        print(f"\n    --- START {tool_name.upper()} OUTPUT ---")
+        
+        # Main loop: Monitor process and print any available output
+        current_stream = None
         while process.poll() is None:
+            # Monitor memory
             try:
                 peak_rss_mb = max(peak_rss_mb, p.memory_info().rss / 1024 / 1024)
-            except psutil.NoSuchProcess: break
-            time.sleep(0.02)
+            except psutil.NoSuchProcess:
+                break
 
-        # CAPTURE the output from the completed process
-        stdout, stderr = process.communicate()
+            # Print queued output lines
+            try:
+                stream_name, line = output_queue.get_nowait()
+                if stream_name != current_stream:
+                    print(f"    [{stream_name}]", flush=True)
+                    current_stream = stream_name
+                print(f"      | {line.strip()}", flush=True)
+            except queue.Empty:
+                # No new output, sleep briefly to yield CPU
+                time.sleep(0.02)
+        
+        # Wait for reader threads to finish
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+
+        # Drain any remaining lines from the queue
+        while not output_queue.empty():
+            try:
+                stream_name, line = output_queue.get_nowait()
+                if stream_name != current_stream:
+                    print(f"    [{stream_name}]", flush=True)
+                    current_stream = stream_name
+                print(f"      | {line.strip()}", flush=True)
+            except queue.Empty:
+                break
+        
+        print(f"    --- END {tool_name.upper()} OUTPUT ---\n")
+
         wall_time = time.monotonic() - start_time
         returncode = process.returncode
-        
-        # This section prints all the output that was captured from the tool.
-        print(f"\n    --- START {tool_name.upper()} OUTPUT ---")
-        if stdout and stdout.strip():
-            print("    [STDOUT]")
-            # Indent the output for clarity
-            for line in stdout.strip().split('\n'):
-                print(f"      | {line}")
-        if stderr and stderr.strip():
-            print("    [STDERR]")
-            # Indent the output for clarity
-            for line in stderr.strip().split('\n'):
-                print(f"      | {line}")
-        print(f"    --- END {tool_name.upper()} OUTPUT ---\n")
         
         if returncode != 0:
             print(f"  > ❌ {tool_name} FAILED with exit code {returncode}.")
         else:
             print(f"  > ✅ {tool_name} finished in {wall_time:.2f}s. Peak Memory: {peak_rss_mb:.2f} MB")
-    
+
     except (FileNotFoundError, psutil.NoSuchProcess) as e:
         print(f"  > ❌ ERROR launching {tool_name}: {e}")
         wall_time, peak_rss_mb, returncode = -1, -1, -1
+    finally:
+        if process and process.poll() is None:
+            # Ensure process is terminated if something goes wrong
+            process.kill()
 
     return {"tool": tool_name, "time_sec": wall_time, "peak_mem_mb": peak_rss_mb, "success": returncode == 0}
 
