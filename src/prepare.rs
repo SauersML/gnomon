@@ -83,250 +83,144 @@ pub fn prepare_for_computation(
     score_files: &[PathBuf],
     keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
-    // --- STAGE 0: SEQUENTIAL SETUP ---
+    // --- STAGE 1: INITIAL SETUP ---
+    // This logic is fast and foundational: determine which people to score and index
+    // the genotype variants for fast lookups.
+    eprintln!("> Pass 1: Indexing genotype and subject data...");
     let fam_path = plink_prefix.with_extension("fam");
     let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
     let total_people_in_fam = all_person_iids.len();
+
     let (person_subset, final_person_iids) =
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
     let num_people_to_score = final_person_iids.len();
-    
-    // Build the mapping from original .fam index to the final, compact output index.
-    // This is essential for the variant-major compute path to work with subsets.
-    let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
-    for (output_idx, iid) in final_person_iids.iter().enumerate() {
-        if let Some(&original_fam_idx) = iid_to_original_idx.get(iid) {
-            person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
-        }
-    }
-    
-    // --- STAGE 1: PARALLEL PARSE & MERGE SCORE FILES ---
-    eprintln!(
-        "> Pass 1: Parsing and merging {} score file(s) in parallel...",
-        score_files.len()
-    );
-    let parse_start = Instant::now();
-    let parsed_data = score_files
-        .par_iter()
-        .map(|path| {
-            let file_start = Instant::now();
-            let result = parse_and_group_score_file(path);
-            let file_time = file_start.elapsed();
-            eprintln!("  > TIMING: Parsing '{}' took {:.2?}", path.display(), file_time);
-            result
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    eprintln!("> TIMING: Parallel parsing of all {} files took {:.2?}", score_files.len(), parse_start.elapsed());
 
-    let mut final_score_map: AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>> =
-        AHashMap::new();
-    let mut final_score_names = BTreeSet::new(); // BTreeSet gives a stable, sorted order.
-
-    for (mut score_map_part, score_names_part) in parsed_data {
-        for name in score_names_part {
-            final_score_names.insert(name);
-        }
-        for (variant_id, entries) in score_map_part.drain() {
-            final_score_map.entry(variant_id).or_default().extend(entries);
-        }
-    }
-    let score_names: Vec<String> = final_score_names.into_iter().collect();
-
-    // --- STAGE 2: SKELETON & MAP CONSTRUCTION ---
-    eprintln!("> Pass 2: Indexing genotype data...");
     let bim_path = plink_prefix.with_extension("bim");
-    let bim_start = Instant::now();
     let (bim_index, total_variants_in_bim) = index_bim_file(&bim_path)?;
-    eprintln!("> TIMING: BIM file indexing took {:.2?} for {} variants", bim_start.elapsed(), total_variants_in_bim);
-    // Create a reverse map from the original bim file row index to its variant_id string.
-    // This is used for fast, user-friendly error reporting if duplicates are found.
-    let bim_row_to_variant_id: AHashMap<BimRowIndex, &str> = bim_index
-        .iter()
-        .flat_map(|(variant_id, records)| {
-            records
-                .iter()
-                .map(move |(_, bim_row)| (*bim_row, variant_id.as_str()))
-        })
-        .collect();
 
-    // We need to know which BIM rows are used to build the dense matrix map.
-    let required_bim_indices_set = discover_required_bim_indices(&final_score_map, &bim_index)?;
-    if required_bim_indices_set.is_empty() {
-        return Err(PrepError::NoOverlappingVariants);
-    }
-
-                let mut required_bim_indices: Vec<BimRowIndex> =
-                    required_bim_indices_set.into_iter().collect();
-    required_bim_indices.sort_unstable();
-    let num_reconciled_variants = required_bim_indices.len();
-
-                // This map is an intermediate product that uses niche-optimization for memory efficiency.
-                // It maps from the original .bim row index to a dense matrix row index.
-    let bim_row_to_reconciled_variant_map =
-        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
-    let score_name_to_col_index: AHashMap<&str, ScoreColumnIndex> = score_names
+    // --- STAGE 2: GLOBAL METADATA DISCOVERY ---
+    // A fast parallel pass over just the headers of the score files to discover the
+    // complete set of score names. This determines the width of our final matrices.
+    eprintln!("> Pass 2: Discovering all score columns...");
+    let score_names = parse_score_file_headers_only(score_files)?;
+    let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()
-        .map(|(i, s)| (s.as_str(), ScoreColumnIndex(i)))
+        .map(|(i, s)| (s.clone(), ScoreColumnIndex(i)))
         .collect();
 
-    // --- STAGE 3: PARALLEL COMPILE (The O(N*K) heavy lifting) ---
-    eprintln!("> Pass 3: Reconciling variants and compiling work items...");
-    let reconcile_start = Instant::now();
-    let work_items_results: Vec<Result<Vec<WorkItem>, PrepError>> = final_score_map
-        .par_iter()
-        .map(|(variant_id, score_lines)| {
-            let mut work_for_position = Vec::new();
-            if let Some(bim_records) = bim_index.get(variant_id) {
-                for (effect_allele, other_allele, weights) in score_lines {
-                    // Call the single authoritative resolver to get the definitive list of matches.
-                    // This can now return a fatal error if ambiguity is detected.
-                    let winning_matches =
-                        resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
-
-                    // The `process_match` helper function is perfect for turning our definitive
-                    // matches into WorkItems. We just need to loop over the resolver's results.
-                    for (bim_record, bim_row_index) in winning_matches {
-                        process_match(
-                            bim_record,
-                            *bim_row_index,
-                            effect_allele,
-                            weights,
-                            &bim_row_to_reconciled_variant_map,
-                            &score_name_to_col_index,
-                            &mut work_for_position,
-                        );
+    // --- STAGE 3: PARALLEL COMPILATION & REDUCTION ---
+    // This is the heart of the new architecture. We process each score file in parallel,
+    // creating a map of its computations. Then, we merge (reduce) all of these maps
+    // into a single, unified map that represents the entire workload.
+    eprintln!(
+        "> Pass 3: Compiling and merging {} score file(s) in parallel...",
+        score_files.len()
+    );
+    let overall_start_time = Instant::now();
+    let unified_map: AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>> =
+        score_files
+            .par_iter()
+            .map(|path| {
+                compile_score_file_to_map(
+                    path,
+                    &bim_index,
+                    &score_name_to_col_index,
+                )
+            })
+            .try_reduce(AHashMap::new, |mut acc_map, file_map| {
+                // This reduce closure merges the map from one file into the accumulator map.
+                // It also serves as our cross-file duplicate detection system.
+                for (bim_row, local_inner_map) in file_map {
+                    let acc_inner_map = acc_map.entry(bim_row).or_default();
+                    for (score_col, value) in local_inner_map {
+                        // If the score column already exists for this variant, it's an
+                        // ambiguous definition across files.
+                        if acc_inner_map.insert(score_col, value).is_some() {
+                            return Err(PrepError::Parse(format!(
+                                "Ambiguous input: A variant is defined for the same score multiple times across different score files."
+                            )));
+                        }
                     }
                 }
-            }
-            Ok(work_for_position)
-        })
-        .collect();
+                Ok(acc_map)
+            })? // The first '?' handles errors within the reduce operation.
+            .map_err(|e| e)?; // The second '?' handles errors from the map operation.
 
-    let mut work_items: Vec<WorkItem> = Vec::new();
-    for result in work_items_results {
-        work_items.extend(result?);
+    if unified_map.is_empty() {
+        return Err(PrepError::NoOverlappingVariants);
     }
+    eprintln!("> TIMING: Pass 3 (Compilation & Merge) took {:.2?}", overall_start_time.elapsed());
+    
+    // --- STAGE 4: FINAL INDEXING ---
+    // With the unified map, we now have the definitive set of variants needed.
+    // We can now create the final, dense mapping from the original BIM index to
+    // our new compact matrix index.
+    eprintln!("> Pass 4: Building final variant index...");
+    let mut required_bim_indices: Vec<BimRowIndex> = unified_map.keys().copied().collect();
+    required_bim_indices.sort_unstable();
+    let num_reconciled_variants = required_bim_indices.len();
+    let bim_row_to_reconciled_variant_map =
+        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
 
-    // --- STAGE 4: COMPILE FINAL DATA STRUCTURES FROM WORK ITEMS ---
-    eprintln!("> Pass 4: Compiling final data structures for kernel...");
-
-    // To correctly count variants per score and build the missingness map, we need
-    // a unique set of (variant, score) pairings.
-    let mut unique_pairs: Vec<(ReconciledVariantIndex, ScoreColumnIndex)> = work_items
-        .par_iter()
-        .map(|item| (item.reconciled_variant_idx, item.col_idx))
-        .collect();
-    unique_pairs.par_sort_unstable();
-    unique_pairs.dedup();
-
-    // --- Calculate total variants per score ---
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-    for &(_, score_col) in &unique_pairs {
-        score_variant_counts[score_col.0] += 1;
-    }
-
-    // --- Build the variant_to_scores_map (missingness blueprint) ---
-    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
-        vec![Vec::new(); num_reconciled_variants];
-    // This is a sequential grouping operation on the sorted `unique_pairs`, which is fast.
-    for &(variant_row, score_col) in &unique_pairs {
-        // `variant_row.0` is guaranteed to be a valid index by construction.
-        variant_to_scores_map[variant_row.0 as usize].push(score_col);
-    }
-
-    // --- STAGE 5: PARALLEL SORT & VALIDATION ---
-    eprintln!("> Pass 5: Sorting and validating work items...");
-    eprintln!("> TIMING: Pass 3 reconciliation generated {} work items in {:.2?}", work_items.len(), reconcile_start.elapsed());
-    eprintln!("  > About to sort {} work items", work_items.len());
-    let sort_start = Instant::now();
-    // Sort by matrix row and then column index. This groups any potential duplicate
-    // definitions for the same (variant, score) cell right next to each other,
-    // which allows for a fast linear scan to detect them.
-    // The (u32, usize) key is packed into a single u64 for faster sort comparisons.
-    // The row index gets the high bits, ensuring it's the primary sort key.
-    work_items.par_sort_unstable_by_key(|item| {
-        ((item.reconciled_variant_idx.0 as u64) << 32) | (item.col_idx.0 as u64)
-    });
-    eprintln!("  > TIMING: Sort took {:.2?}", sort_start.elapsed());
-
-    // After sorting, a single pass over adjacent items can efficiently detect duplicates.
-    // This check ensures that every variant is defined only once per score.
-    if let Some(w) = work_items.windows(2).find(|w| {
-        let key1 =
-            ((w[0].reconciled_variant_idx.0 as u64) << 32) | (w[0].col_idx.0 as u64);
-        let key2 =
-            ((w[1].reconciled_variant_idx.0 as u64) << 32) | (w[1].col_idx.0 as u64);
-        key1 == key2
-    }) {
-        let bad_item = &w[0];
-        let score_name = &score_names[bad_item.col_idx.0];
-        // To find the human-readable variant_id, we map from our internal dense matrix row
-        // index back to the original .bim file row index, and then use the reverse
-        // map to find the variant_id string.
-                let bim_row = required_bim_indices[bad_item.reconciled_variant_idx.0 as usize];
-        let variant_id = bim_row_to_variant_id
-            .get(&bim_row)
-            .unwrap_or(&"unknown variant");
-
-        return Err(PrepError::Parse(format!(
-            "Ambiguous input: The score '{}' is defined more than once for variant '{}'. Each variant must have exactly one definition per score.",
-            score_name, variant_id
-        )));
-    }
-
-    // --- STAGE 6: POPULATE COMPUTE STRUCTURES ---
-    eprintln!("> Pass 6: Populating compute structures with maximum parallelism...");
-
-    // The `stride` is the padded row width for each variant's data, ensuring
-    // that each row can be processed with full SIMD vectors without scalar fallbacks.
+    // --- STAGE 5: FINAL MATRIX POPULATION (NEW DIRECT-WRITE) ---
+    // Allocate matrices to their exact final size and populate them in a single,
+    // highly parallel pass with no searching or indirection.
+    eprintln!("> Pass 5: Populating compute matrices...");
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let matrix_size = num_reconciled_variants * stride;
-
     let mut weights_matrix = vec![0.0f32; matrix_size];
     let mut flip_mask_matrix = vec![0u8; matrix_size];
 
-    // Use a parallel iterator over chunks to populate the matrices contention-free.
-    // Accessing disjoint row chunks via `par_chunks_mut` prevents data races.
-    let matrix_pop_start = Instant::now();
-    weights_matrix
-        .par_chunks_mut(stride)
-        .zip(flip_mask_matrix.par_chunks_mut(stride))
-        .enumerate()
-        .for_each(|(row_idx, (weight_row_slice, flip_row_slice))| {
-            let reconciled_variant_idx = ReconciledVariantIndex(row_idx as u32);
+    let weights_writer = MatrixWriter { ptr: weights_matrix.as_mut_ptr() };
+    let flip_writer = MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() };
 
-            // `partition_point` is used on the sorted `work_items` to efficiently find
-            // the slice of items corresponding to the current variant row. This is a key
-            // algorithmic optimization that avoids repeated linear scans.
-            let first_item_pos =
-                work_items.partition_point(|item| item.reconciled_variant_idx < reconciled_variant_idx);
-            let first_after_pos =
-                work_items.partition_point(|item| item.reconciled_variant_idx <= reconciled_variant_idx);
-            let items_for_this_row = &work_items[first_item_pos..first_after_pos];
+    unified_map.par_iter().for_each(|(bim_row, inner_score_map)| {
+        // This lookup is guaranteed to succeed because the unified_map's keys are a
+        // superset of the keys used to build the reconciled map.
+        let reconciled_variant_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get();
+        let row_offset = reconciled_variant_idx as usize * stride;
 
-            for item in items_for_this_row {
-                let col = item.col_idx.0;
-                weight_row_slice[col] = item.weight;
-                if item.is_flipped {
-                    flip_row_slice[col] = 1;
-                }
+        for (&score_col, &(weight, is_flipped)) in inner_score_map {
+            let final_offset = row_offset + score_col.0;
+            // SAFETY: This is a parallel random-access write. It is safe because the
+            // `unified_map` guarantees that each `(bim_row, score_col)` pair is unique.
+            // Therefore, no two threads can ever write to the same memory location.
+            unsafe {
+                *weights_writer.ptr.add(final_offset) = weight;
+                *flip_writer.ptr.add(final_offset) = if is_flipped { 1 } else { 0 };
             }
-        });
-    eprintln!("> TIMING: Pass 6 matrix population took {:.2?}", matrix_pop_start.elapsed());
+        }
+    });
 
+    // --- STAGE 6: FINAL METADATA ASSEMBLY ---
+    // Build the remaining metadata required by the compute pipeline.
+    eprintln!("> Pass 6: Assembling final metadata...");
+    let mut score_variant_counts = vec![0u32; score_names.len()];
+    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
+
+    for (bim_row, inner_score_map) in &unified_map {
+        let reconciled_variant_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get();
+        let variant_map_entry = &mut variant_to_scores_map[reconciled_variant_idx as usize];
+        for &score_col in inner_score_map.keys() {
+            score_variant_counts[score_col.0] += 1;
+            variant_map_entry.push(score_col);
+        }
+    }
+    // Sort the inner vectors for deterministic results in the missingness path.
+    variant_to_scores_map.par_iter_mut().for_each(|v| v.sort_unstable());
+    
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
-
-    // Create the reverse mapping from a compact output index back to the original .fam index.
-    // This is an essential optimization for the high-performance variant-major path.
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
-    for iid in &final_person_iids {
-        // This lookup is guaranteed to succeed because final_person_iids was derived from all_person_iids.
+    let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
+
+    for (output_idx, iid) in final_person_iids.iter().enumerate() {
         let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
         output_idx_to_fam_idx.push(original_fam_idx);
+        person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
-
+    
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
@@ -346,6 +240,7 @@ pub fn prepare_for_computation(
         output_idx_to_fam_idx,
     ))
 }
+
 // ========================================================================================
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
