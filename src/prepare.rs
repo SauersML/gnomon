@@ -771,40 +771,42 @@ pub fn parse_score_file_headers_only(
 ///
 /// This function is the core of the parallel processing pipeline. It uses memory-mapped
 /// I/O and parallel chunking to achieve high throughput with minimal memory allocations.
+/// The output is a map from the original `BimRowIndex` to an inner map containing all
+/// score data for that variant, which resolves the "chicken and egg" problem of needing
+/// a dense index before all variants are known.
 ///
 /// # Arguments
 ///
 /// * `score_path` - The path to the gnomon-native score file to process.
 /// * `bim_index` - A read-only reference to the pre-computed BIM file index.
-/// * `bim_row_to_reconciled_variant_map` - A map from original BIM row index to the dense matrix row index.
 /// * `score_name_to_col_index` - A map from score names to their global column index.
 ///
 /// # Returns
 ///
 /// A `Result` containing:
-/// - `Ok(AHashMap<u64, (f32, bool)>)`: A map where the key is a packed `(variant_row, score_col)`
-///   and the value is `(weight, is_flipped)`.
+/// - `Ok(AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>)`: A nested map.
+///   The outer key is the original `BimRowIndex`. The inner map's key is the `ScoreColumnIndex`
+///   and its value is the `(weight, is_flipped)` tuple for that specific computation.
 /// - `Err(PrepError)`: If any parsing, reconciliation, or ambiguity error occurs.
 fn compile_score_file_to_map(
     score_path: &Path,
     bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
-    bim_row_to_reconciled_variant_map: &[Option<NonMaxU32>],
     score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-) -> Result<AHashMap<u64, (f32, bool)>, PrepError> {
+) -> Result<AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>, PrepError> {
     // --- Phase 1: Memory Map and Header Parsing ---
     let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     // SAFETY: The file is read-only, which is safe for memory mapping.
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     mmap.advise(memmap2::Advice::Sequential)
         .map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
 
-    // Efficiently find the first non-comment line to identify the header.
+    // Efficiently find the first non-comment line to identify the header and the data start offset.
     let mut data_start_offset = 0;
     let header_line = {
         let mut first_line: Option<&[u8]> = None;
         for line in mmap.split(|&b| b == b'\n') {
             data_start_offset += line.len() + 1; // +1 for the newline character.
-            if !line.starts_with(b"#") && !line.is_empty() {
+            if !line.is_empty() && !line.starts_with(b"#") {
                 first_line = Some(line);
                 break;
             }
@@ -820,7 +822,7 @@ fn compile_score_file_to_map(
     let header_str = std::str::from_utf8(header_line)
         .map_err(|_| PrepError::Header("Header contains invalid UTF-8".to_string()))?;
     
-    // Create a map from this file's specific column index to the global score index.
+    // Create a map from this file's specific column index (0, 1, 2...) to the global `ScoreColumnIndex`.
     // This avoids repeated string-based lookups in the hot loop.
     let file_specific_column_map: Vec<ScoreColumnIndex> = header_str
         .trim()
@@ -838,22 +840,23 @@ fn compile_score_file_to_map(
     /// Helper to divide a byte slice into chunks ending at newlines. This ensures that
     /// each parallel task processes a set of complete lines.
     fn find_chunk_boundaries(data: &[u8], target_chunk_size: usize) -> Vec<&[u8]> {
-        if data.is_empty() {
-            return Vec::new();
-        }
+        if data.is_empty() { return Vec::new(); }
         let mut boundaries = Vec::new();
         let mut current_pos = 0;
         while current_pos < data.len() {
-            let end = (current_pos + target_chunk_size).min(data.len());
-            // If we're at the end of the file, the chunk is just the rest of the data.
-            if end == data.len() {
-                boundaries.push(&data[current_pos..end]);
+            let chunk_end = (current_pos + target_chunk_size).min(data.len());
+            if chunk_end == data.len() {
+                boundaries.push(&data[current_pos..]);
                 break;
             }
-            // Find the next newline *after* our target end point to ensure the chunk ends with a full line.
-            let next_newline = memchr(b'\n', &data[end..]).map_or(data.len(), |i| end + i);
+            // Find the next newline *at or after* our target end point.
+            // This guarantees the chunk ends cleanly.
+            let next_newline = match memchr(b'\n', &data[chunk_end..]) {
+                Some(pos) => chunk_end + pos,
+                None => data.len(), // If no newline, this is the last chunk.
+            };
             boundaries.push(&data[current_pos..next_newline]);
-            current_pos = next_newline + 1;
+            current_pos = next_newline + 1; // Start the next chunk after the newline.
         }
         boundaries
     }
@@ -863,17 +866,19 @@ fn compile_score_file_to_map(
 
     chunks
         .into_par_iter()
-        .map(|chunk| -> Result<AHashMap<u64, (f32, bool)>, PrepError> {
+        .map(|chunk| -> Result<AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>, PrepError> {
             let mut local_map = AHashMap::new();
 
             for line_bytes in chunk.split(|&b| b == b'\n') {
                 if line_bytes.is_empty() { continue; }
 
+                // This is a zero-allocation way to get the first three fields.
                 let mut fields = line_bytes.splitn(4, |&b| b == b'\t');
-                let variant_id_bytes = fields.next().unwrap_or_default();
-                let effect_allele_bytes = fields.next().unwrap_or_default();
-                let other_allele_bytes = fields.next().unwrap_or_default();
-                let weights_bytes = fields.next().unwrap_or_default();
+                let (variant_id_bytes, effect_allele_bytes, other_allele_bytes, weights_bytes) = 
+                    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                        (Some(v), Some(e), Some(o), Some(w)) => (v, e, o, w),
+                        _ => continue, // Skip malformed lines with fewer than 4 columns.
+                    };
                 
                 let variant_id = std::str::from_utf8(variant_id_bytes).map_err(|_| PrepError::Parse("Invalid UTF-8 in variant_id".to_string()))?;
                 
@@ -884,22 +889,18 @@ fn compile_score_file_to_map(
                     let winning_matches = resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
 
                     for (bim_record, bim_row_index) in winning_matches {
-                        if let Some(non_max_idx) = bim_row_to_reconciled_variant_map[bim_row_index.0 as usize] {
-                            let reconciled_variant_idx = non_max_idx.get();
-                            let is_flipped = effect_allele != &bim_record.allele2;
+                        let is_flipped = effect_allele != &bim_record.allele2;
+                        let inner_map = local_map.entry(*bim_row_index).or_default();
 
-                            for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
-                                if !weight_bytes.is_empty() {
-                                    if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
-                                        let score_col_idx = file_specific_column_map[i];
-                                        let key = ((reconciled_variant_idx as u64) << 32) | (score_col_idx.0 as u64);
-
-                                        if local_map.insert(key, (weight, is_flipped)).is_some() {
-                                            return Err(PrepError::Parse(format!(
-                                                "Ambiguous input: The score '{}' is defined more than once for variant '{}' within the same file '{}'.",
-                                                header_str.split('\t').nth(3 + i).unwrap_or("?"), variant_id, score_path.display()
-                                            )));
-                                        }
+                        for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
+                            if !weight_bytes.is_empty() {
+                                if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
+                                    let score_col_idx = file_specific_column_map[i];
+                                    if inner_map.insert(score_col_idx, (weight, is_flipped)).is_some() {
+                                        return Err(PrepError::Parse(format!(
+                                            "Ambiguous input: The score '{}' is defined more than once for variant '{}' within the same file '{}'.",
+                                            header_str.split('\t').nth(3 + i).unwrap_or("?"), variant_id, score_path.display()
+                                        )));
                                     }
                                 }
                             }
@@ -910,14 +911,15 @@ fn compile_score_file_to_map(
             Ok(local_map)
         })
         .try_reduce(AHashMap::new, |mut acc_map, local_map| {
-            for (key, value) in local_map {
-                if acc_map.insert(key, value).is_some() {
-                    // This error detects a duplicate across different parallel chunks, but
-                    // from the user's perspective, it's a single duplicate within one file.
-                    return Err(PrepError::Parse(format!(
-                        "Ambiguous input: A variant is defined for the same score multiple times in file '{}'.",
-                        score_path.display()
-                    )));
+            for (bim_row, local_inner_map) in local_map {
+                let acc_inner_map = acc_map.entry(bim_row).or_default();
+                for (score_col, value) in local_inner_map {
+                    if acc_inner_map.insert(score_col, value).is_some() {
+                        return Err(PrepError::Parse(format!(
+                            "Ambiguous input: A variant is defined for the same score multiple times in file '{}'.",
+                            score_path.display()
+                        )));
+                    }
                 }
             }
             Ok(acc_map)
