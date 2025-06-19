@@ -135,11 +135,12 @@ pub fn prepare_for_computation(
     // regroups the flat `unified_map` by variant to enable the final parallel pass.
     eprintln!("> Pass 4: Building final variant index and regrouping work...");
     let mut required_bim_indices: Vec<BimRowIndex> = unified_map
-        .par_iter()
-        .map(|((bim_row, _), _)| *bim_row)
+        .keys()
+        .map(|(bim_row, _)| *bim_row)
         .collect::<AHashSet<_>>()
         .into_iter()
         .collect();
+    
     // This sort is the one small, necessary sequential step in the pipeline.
     required_bim_indices.sort_unstable();
     let num_reconciled_variants = required_bim_indices.len();
