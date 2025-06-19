@@ -23,6 +23,7 @@ use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 // A flag to ensure we only print the allele-reconciliation warning once per run.
 static AMBIGUITY_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
@@ -95,10 +96,18 @@ pub fn prepare_for_computation(
         "> Pass 1: Parsing and merging {} score file(s) in parallel...",
         score_files.len()
     );
+    let parse_start = Instant::now();
     let parsed_data = score_files
         .par_iter()
-        .map(|path| parse_and_group_score_file(path))
+        .map(|path| {
+            let file_start = Instant::now();
+            let result = parse_and_group_score_file(path);
+            let file_time = file_start.elapsed();
+            eprintln!("  > TIMING: Parsing '{}' took {:.2?}", path.display(), file_time);
+            result
+        })
         .collect::<Result<Vec<_>, _>>()?;
+    eprintln!("> TIMING: Parallel parsing of all {} files took {:.2?}", score_files.len(), parse_start.elapsed());
 
     let mut final_score_map: AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>> =
         AHashMap::new();
@@ -396,8 +405,12 @@ fn parse_and_group_score_file(
     ),
     PrepError,
 > {
+    let io_start = Instant::now();
     let file =
         File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    eprintln!("    > File '{}' size: {} MB", score_path.display(), file_size / 1_000_000);
+    
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
 
@@ -433,10 +446,22 @@ fn parse_and_group_score_file(
     }
 
     let score_names: Vec<String> = header_parts[3..].iter().map(|s| s.to_string()).collect();
+    let n_score_columns = score_names.len();
+    eprintln!("    > Found {} score columns in file", n_score_columns);
+    
     let mut score_map: AHashMap<String, Vec<(String, String, AHashMap<String, f32>)>> =
         AHashMap::new();
 
+    let parse_start = Instant::now();
+    let mut line_count = 0;
+    let mut total_floats_parsed = 0;
+    
     for line_result in reader.lines() {
+        line_count += 1;
+        if line_count % 50000 == 0 {
+            eprintln!("      ... parsed {} lines", line_count);
+        }
+        
         let line = line_result.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
         if line.trim().is_empty() {
             continue;
@@ -463,6 +488,7 @@ fn parse_and_group_score_file(
                     ))
                 })?;
                 weights.insert(name.clone(), weight);
+                total_floats_parsed += 1;
             }
         }
         score_map
@@ -470,6 +496,14 @@ fn parse_and_group_score_file(
             .or_default()
             .push((effect_allele, other_allele, weights));
     }
+    
+    let io_time = io_start.elapsed();
+    let parse_time = parse_start.elapsed();
+    eprintln!("    > TIMING: File I/O setup took {:.2?}", io_time - parse_time);
+    eprintln!("    > TIMING: Parsing {} lines with {} floats took {:.2?}", 
+              line_count, total_floats_parsed, parse_time);
+    eprintln!("    > TIMING: Total file processing took {:.2?}", io_time);
+    
     Ok((score_map, score_names))
 }
 
