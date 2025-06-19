@@ -126,7 +126,9 @@ pub fn prepare_for_computation(
     // --- STAGE 2: SKELETON & MAP CONSTRUCTION ---
     eprintln!("> Pass 2: Indexing genotype data...");
     let bim_path = plink_prefix.with_extension("bim");
+    let bim_start = Instant::now();
     let (bim_index, total_variants_in_bim) = index_bim_file(&bim_path)?;
+    eprintln!("> TIMING: BIM file indexing took {:.2?} for {} variants", bim_start.elapsed(), total_variants_in_bim);
     // Create a reverse map from the original bim file row index to its variant_id string.
     // This is used for fast, user-friendly error reporting if duplicates are found.
     let bim_row_to_variant_id: AHashMap<BimRowIndex, &str> = bim_index
@@ -161,6 +163,7 @@ pub fn prepare_for_computation(
 
     // --- STAGE 3: PARALLEL COMPILE (The O(N*K) heavy lifting) ---
     eprintln!("> Pass 3: Reconciling variants and compiling work items...");
+    let reconcile_start = Instant::now();
     let mut work_items: Vec<WorkItem> = final_score_map
         .par_iter()
         .flat_map(|(variant_id, score_lines)| {
@@ -219,6 +222,9 @@ pub fn prepare_for_computation(
 
     // --- STAGE 5: PARALLEL SORT & VALIDATION ---
     eprintln!("> Pass 5: Sorting and validating work items...");
+    eprintln!("> TIMING: Pass 3 reconciliation generated {} work items in {:.2?}", work_items.len(), reconcile_start.elapsed());
+    eprintln!("  > About to sort {} work items", work_items.len());
+    let sort_start = Instant::now();
     // Sort by matrix row and then column index. This groups any potential duplicate
     // definitions for the same (variant, score) cell right next to each other,
     // which allows for a fast linear scan to detect them.
@@ -227,6 +233,7 @@ pub fn prepare_for_computation(
     work_items.par_sort_unstable_by_key(|item| {
         ((item.reconciled_variant_idx.0 as u64) << 32) | (item.col_idx.0 as u64)
     });
+    eprintln!("  > TIMING: Sort took {:.2?}", sort_start.elapsed());
 
     // After sorting, a single pass over adjacent items can efficiently detect duplicates.
     // This check ensures that every variant is defined only once per score.
@@ -266,6 +273,7 @@ pub fn prepare_for_computation(
 
     // Use a parallel iterator over chunks to populate the matrices contention-free.
     // Accessing disjoint row chunks via `par_chunks_mut` prevents data races.
+    let matrix_pop_start = Instant::now();
     weights_matrix
         .par_chunks_mut(stride)
         .zip(flip_mask_matrix.par_chunks_mut(stride))
@@ -290,6 +298,7 @@ pub fn prepare_for_computation(
                 }
             }
         });
+    eprintln!("> TIMING: Pass 6 matrix population took {:.2?}", matrix_pop_start.elapsed());
 
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
