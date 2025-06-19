@@ -160,9 +160,12 @@ fn run_preparation_phase(
     }
 
     // --- Run the main preparation logic ---
+    eprintln!("> Starting core preparation (parsing, reconciling, compiling)...");
+    let actual_prep_start = Instant::now();
     let prep =
         prepare::prepare_for_computation(plink_prefix, &native_score_files, args.keep.as_deref())
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    eprintln!("> TIMING: Core preparation logic took {:.2?}", actual_prep_start.elapsed());
 
     eprintln!(
         "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",
