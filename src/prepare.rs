@@ -23,7 +23,7 @@ use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use memchr::memchr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 // A flag to ensure we only print the allele-reconciliation warning once per run.
