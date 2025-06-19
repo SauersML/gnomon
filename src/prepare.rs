@@ -56,6 +56,13 @@ struct WorkItem {
     is_flipped: bool,
 }
 
+struct MatrixWriter<T> {
+    ptr: *mut T,
+}
+
+unsafe impl<T: Send> Send for MatrixWriter<T> {}
+unsafe impl<T: Send> Sync for MatrixWriter<T> {}
+
 // ========================================================================================
 //                                  PUBLIC API
 // ========================================================================================
