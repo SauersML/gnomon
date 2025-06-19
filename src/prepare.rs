@@ -144,8 +144,7 @@ pub fn prepare_for_computation(
                     }
                 }
                 Ok(acc_map)
-            })? // The first '?' handles errors within the reduce operation.
-            .map_err(|e| e)?; // The second '?' handles errors from the map operation.
+            })? // This single '?' propagates any error from the parallel map-reduce operation.
 
     if unified_map.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
