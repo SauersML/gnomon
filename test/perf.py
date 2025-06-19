@@ -122,9 +122,10 @@ def find_hot_worker_functions(perf_output, n=2):
     ]
     
     for line in perf_output:
-        # Handle two possible formats:
-        # Newer format with children/self: "  98.44%     0.00%  command  object  [.] symbol"
-        # Older format with --no-children: "  98.44%  command  object  [.] symbol"
+        # Handle multiple possible formats:
+        #  format with children/self: "  98.44%     0.00%  command  object  [.] symbol"
+        #  format with command/object: "  98.44%  command  object  [.] symbol"
+        # Minimal format: "  11.16%  [.] gnomon::batch::process_tile"
         
         # Try newer format first (two percentages)
         match = re.match(r'\s*(\d+\.\d+)%\s+(\d+\.\d+)%\s+\S+\s+\S+\s+\[.\]\s+(.+)', line)
@@ -132,13 +133,19 @@ def find_hot_worker_functions(perf_output, n=2):
             children_pct, self_pct, symbol = match.groups()
             pct = float(self_pct)
         else:
-            # Try older format (single percentage, which is self-time with --no-children)
+            # Try older format with command/object
             match = re.match(r'\s*(\d+\.\d+)%\s+\S+\s+\S+\s+\[.\]\s+(.+)', line)
             if match:
                 pct = float(match.group(1))
                 symbol = match.group(2)
             else:
-                continue
+                # Try minimal format (just percentage, [.], and symbol)
+                match = re.match(r'\s*(\d+\.\d+)%\s+\[.\]\s+(.+)', line)
+                if match:
+                    pct = float(match.group(1))
+                    symbol = match.group(2)
+                else:
+                    continue
         
         # Only consider gnomon:: functions with meaningful time
         if 'gnomon::' in symbol and pct > 0.5:
