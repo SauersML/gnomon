@@ -29,7 +29,7 @@ nonmax = "0.5.5"
 futures = "0.3.31"
 itertools = "0.14.0"
 crossbeam-channel = "0.5.15"
-lexical-core = "0.4.8"
+lexical-core = "1.0.5"
 memchr = "2.7.5"
 
 [profile.release]
