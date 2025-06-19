@@ -680,6 +680,84 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
     }
 }
 
+/// Parses only the headers of multiple score files to quickly build a complete,
+/// sorted, and unique list of all score columns across all files.
+///
+/// # Arguments
+///
+/// * `score_files`: A slice of paths to the gnomon-native score files.
+///
+/// # Returns
+///
+/// A `Result` containing a `Vec<String>` of all unique score names found,
+/// sorted alphabetically. If any file cannot be read or has an invalid
+/// header, a `PrepError` is returned.
+pub fn parse_score_file_headers_only(
+    score_files: &[PathBuf],
+) -> Result<Vec<String>, PrepError> {
+    // Use a parallel iterator over the input files.
+    // `try_flat_map` will process each file and flatten the resulting lists of
+    // score names into a single parallel iterator.
+    // `collect` into a Result<BTreeSet, ...> handles both error propagation
+    // and the merging of results into a single, unique, sorted collection.
+    let all_score_names: BTreeSet<String> = score_files
+        .par_iter()
+        .try_flat_map(|path| -> Result<Vec<String>, PrepError> {
+            // This closure is executed in parallel for each score file.
+            let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
+            let mut reader = BufReader::new(file);
+            let mut header_line = String::new();
+
+            // Scan past any metadata/comment lines at the beginning of the file.
+            loop {
+                header_line.clear();
+                // Check for I/O errors or an empty file.
+                if reader
+                    .read_line(&mut header_line)
+                    .map_err(|e| PrepError::Io(e, path.to_path_buf()))?
+                    == 0
+                {
+                    // If we reach EOF without finding a non-comment line, the file
+                    // is considered invalid as it lacks a header.
+                    return Err(PrepError::Header(format!(
+                        "Score file '{}' is empty or contains only metadata lines.",
+                        path.display()
+                    )));
+                }
+
+                // If the line is not a comment, we've found the header.
+                if !header_line.starts_with('#') {
+                    break;
+                }
+            }
+
+            // --- Validate the header structure ---
+            let header_parts: Vec<&str> = header_line.trim().split('\t').collect();
+            let expected_prefix = &["variant_id", "effect_allele", "other_allele"];
+
+            if header_parts.len() < 3 || &header_parts[0..3] != expected_prefix {
+                return Err(PrepError::Header(format!(
+                    "Invalid header in '{}': Must start with 'variant_id\\teffect_allele\\tother_allele'.",
+                    path.display()
+                )));
+            }
+
+            // --- Extract score names and return them ---
+            // The score names are all columns after the first three.
+            // Convert from &str to String for the final collection.
+            let score_names = header_parts[3..]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            Ok(score_names)
+        })
+        .collect::<Result<BTreeSet<String>, _>>()?;
+
+    // Convert the final, sorted BTreeSet into a Vec.
+    Ok(all_score_names.into_iter().collect())
+}
+
 /// The single, authoritative resolver for matching a score line to BIM records.
 ///
 /// This function implements the "smart" reconciliation logic with a "fail-fast" philosophy:
@@ -691,9 +769,7 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
 /// # Rationale for Failing Fast
 /// The original behavior was to silently discard a variant if its effect allele matched multiple different genotype records
 /// (e.g., effect allele 'A' matching both 'A/T' and 'A/C' records at the same position). This is dangerous because a sample
-/// that truly has the 'A' allele would be ignored, leading to an incomplete and potentially incorrect final score. By crashing,
-/// we force the user to resolve the ambiguity in their input data, ensuring the final calculation is based on a well-defined
-/// and consistent set of variants.
+/// that truly has the 'A' allele would be ignored, leading to an incomplete and potentially incorrect final score.
 ///
 /// # Arguments
 /// * `variant_id` - The `chr:pos` identifier for error reporting.
