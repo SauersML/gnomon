@@ -67,14 +67,14 @@ jobs:
           path: ~/.cargo/bin/getdoc
           key: ${{ runner.os }}-getdoc-v1
 
-      - name: Install getdoc
-        if: steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
-        run: cargo +nightly install getdoc --locked
-
       - name: Run Rust unit tests
         id: test_step
         run: cargo +nightly test
         continue-on-error: true
+
+      - name: Install getdoc
+        if: steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
+        run: cargo +nightly install getdoc --locked
 
       - name: Generate custom report with getdoc
         if: steps.test_step.outcome == 'failure'
