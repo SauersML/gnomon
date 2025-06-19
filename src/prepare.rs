@@ -187,7 +187,9 @@ pub fn prepare_for_computation(
         .par_iter_mut()
         .enumerate()
         .for_each_with(writer_tuple, |writers, (reconciled_idx, scores_for_variant)| {
-            let (weights_writer, flip_writer, vtsm_writer) = *writers;
+            // Destructure the mutable reference to the writers tuple. This creates
+            // mutable borrows of each writer, avoiding an illegal move.
+            let (weights_writer, flip_writer, vtsm_writer) = writers;
 
             if scores_for_variant.is_empty() { return; }
             let row_offset = reconciled_idx * stride;
