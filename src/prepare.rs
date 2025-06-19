@@ -460,7 +460,7 @@ pub fn parse_score_file_headers_only(
 
             Ok(score_names)
         })
-        .collect::<Result<Vec<Vec<String>>, _>>()?
+        .collect::<Result<Vec<Vec<String>>, PrepError>>()?
         .into_iter()
         .flatten()
         .collect();
