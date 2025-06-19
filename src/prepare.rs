@@ -101,104 +101,120 @@ pub fn prepare_for_computation(
         .collect();
 
     // --- STAGE 3: PARALLEL COMPILATION & REDUCTION ---
-    // This is the heart of the new architecture. We process each score file in parallel,
-    // creating a map of its computations. Then, we merge (reduce) all of these maps
-    // into a single, unified map that represents the entire workload.
+    // This stage uses a flat HashMap with a tuple key `(BimRowIndex, ScoreColumnIndex)`
+    // for a memory-efficient and cache-friendly structure. This avoids millions of
+    // small allocations associated with a nested map.
     eprintln!(
         "> Pass 3: Compiling and merging {} score file(s) in parallel...",
         score_files.len()
     );
     let overall_start_time = Instant::now();
-    let unified_map: AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>> =
-        score_files
-            .par_iter()
-            .map(|path| {
-                compile_score_file_to_map(
-                    path,
-                    &bim_index,
-                    &score_name_to_col_index,
-                )
-            })
-            .try_reduce(AHashMap::new, |mut acc_map, file_map| {
-                // This reduce closure merges the map from one file into the accumulator map.
-                // It also serves as our cross-file duplicate detection system.
-                for (bim_row, local_inner_map) in file_map {
-                    let acc_inner_map = acc_map.entry(bim_row).or_default();
-                    for (score_col, value) in local_inner_map {
-                        // If the score column already exists for this variant, it's an
-                        // ambiguous definition across files.
-                        if acc_inner_map.insert(score_col, value).is_some() {
-                            return Err(PrepError::Parse(format!(
-                                "Ambiguous input: A variant is defined for the same score multiple times across different score files."
-                            )));
-                        }
-                    }
+    let unified_map: AHashMap<(BimRowIndex, ScoreColumnIndex), (f32, bool)> = score_files
+        .par_iter()
+        .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
+        .try_reduce(AHashMap::new, |mut acc_map, file_map| {
+            for (key, value) in file_map {
+                if acc_map.insert(key, value).is_some() {
+                    return Err(PrepError::Parse(
+                        "Ambiguous input: A variant-score pair is defined in multiple score files."
+                            .to_string(),
+                    ));
                 }
-                Ok(acc_map)
-            })? // This single '?' propagates any error from the parallel map-reduce operation.
+            }
+            Ok(acc_map)
+        })?;
 
     if unified_map.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
     }
     eprintln!("> TIMING: Pass 3 (Compilation & Merge) took {:.2?}", overall_start_time.elapsed());
     
-    // --- STAGE 4: FINAL INDEXING ---
-    // With the unified map, we now have the definitive set of variants needed.
-    // We can now create the final, dense mapping from the original BIM index to
-    // our new compact matrix index.
-    eprintln!("> Pass 4: Building final variant index...");
-    let mut required_bim_indices: Vec<BimRowIndex> = unified_map.keys().copied().collect();
+    // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
+    // This stage finds the unique set of variants to be included, creates the final
+    // mapping from a variant's original BIM index to its new dense matrix index, and
+    // regroups the flat `unified_map` by variant to enable the final parallel pass.
+    eprintln!("> Pass 4: Building final variant index and regrouping work...");
+    let mut required_bim_indices: Vec<BimRowIndex> = unified_map
+        .par_keys()
+        .map(|(bim_row, _)| *bim_row)
+        .collect::<AHashSet<_>>()
+        .into_iter()
+        .collect();
+    // This sort is the one small, necessary sequential step in the pipeline.
     required_bim_indices.sort_unstable();
     let num_reconciled_variants = required_bim_indices.len();
     let bim_row_to_reconciled_variant_map =
         build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
 
-    // --- STAGE 5: FINAL MATRIX POPULATION (NEW DIRECT-WRITE) ---
-    // Allocate matrices to their exact final size and populate them in a single,
-    // highly parallel pass with no searching or indirection.
-    eprintln!("> Pass 5: Populating compute matrices...");
+    // Regroup the flat map into a structure optimized for the final parallel pass.
+    // This is a fast, sequential pass that prepares the data for parallel consumption.
+    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> = vec![Vec::new(); num_reconciled_variants];
+    for ((bim_row, score_col), (weight, is_flipped)) in unified_map {
+        // This lookup is guaranteed to succeed.
+        let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
+        work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
+    }
+    
+    // --- STAGE 5: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
+    // This is the final, heavy-lifting stage. It populates the compute matrices and
+    // assembles all necessary metadata in a single, unified parallel pass.
+    eprintln!("> Pass 5: Populating all compute structures in parallel...");
+    
+    // Allocate all final data structures to their exact size.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
-    let matrix_size = num_reconciled_variants * stride;
-    let mut weights_matrix = vec![0.0f32; matrix_size];
-    let mut flip_mask_matrix = vec![0u8; matrix_size];
-
+    let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
+    let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
+    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
+    
+    // Use atomics for safe, parallel counting.
+    let score_variant_counts: Vec<AtomicU32> = (0..score_names.len()).map(|_| AtomicU32::new(0)).collect();
+    
+    // These `MatrixWriter` wrappers allow us to safely share mutable pointers
+    // with Rayon, as we can guarantee no two threads will write to the same location.
     let weights_writer = MatrixWriter { ptr: weights_matrix.as_mut_ptr() };
     let flip_writer = MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() };
+    let vtsm_writer = MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() };
 
-    unified_map.par_iter().for_each(|(bim_row, inner_score_map)| {
-        // This lookup is guaranteed to succeed because the unified_map's keys are a
-        // superset of the keys used to build the reconciled map.
-        let reconciled_variant_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get();
-        let row_offset = reconciled_variant_idx as usize * stride;
+    // The final parallel pass over each variant's complete set of work.
+    work_by_reconciled_idx
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(reconciled_idx, scores_for_variant)| {
+            if scores_for_variant.is_empty() { return; }
+            let row_offset = reconciled_idx * stride;
 
-        for (&score_col, &(weight, is_flipped)) in inner_score_map {
-            let final_offset = row_offset + score_col.0;
-            // SAFETY: This is a parallel random-access write. It is safe because the
-            // `unified_map` guarantees that each `(bim_row, score_col)` pair is unique.
-            // Therefore, no two threads can ever write to the same memory location.
-            unsafe {
-                *weights_writer.ptr.add(final_offset) = weight;
-                *flip_writer.ptr.add(final_offset) = if is_flipped { 1 } else { 0 };
+            // Sort the scores for this variant for deterministic output in the missingness map.
+            scores_for_variant.sort_unstable_by_key(|(sc, _, _)| *sc);
+
+            let mut vtsm_entry = Vec::with_capacity(scores_for_variant.len());
+            for &(score_col, weight, is_flipped) in scores_for_variant.iter() {
+                // Task 1: Populate the compute matrices.
+                let final_offset = row_offset + score_col.0;
+                // SAFETY: Each thread processes a unique `reconciled_idx`, so all writes
+                // are to disjoint memory locations, preventing data races.
+                unsafe {
+                    *weights_writer.ptr.add(final_offset) = weight;
+                    *flip_writer.ptr.add(final_offset) = if is_flipped { 1 } else { 0 };
+                }
+
+                // Task 2: Prepare metadata for this variant.
+                vtsm_entry.push(score_col);
+                // Task 3: Atomically increment the global score counts.
+                score_variant_counts[score_col.0].fetch_add(1, Ordering::Relaxed);
             }
-        }
-    });
-
-    // --- STAGE 6: FINAL METADATA ASSEMBLY ---
-    // Build the remaining metadata required by the compute pipeline.
-    eprintln!("> Pass 6: Assembling final metadata...");
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
-
-    for (bim_row, inner_score_map) in &unified_map {
-        let reconciled_variant_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get();
-        let variant_map_entry = &mut variant_to_scores_map[reconciled_variant_idx as usize];
-        for &score_col in inner_score_map.keys() {
-            score_variant_counts[score_col.0] += 1;
-            variant_map_entry.push(score_col);
-        }
-    }
-    // Sort the inner vectors for deterministic results in the missingness path.
-    variant_to_scores_map.par_iter_mut().for_each(|v| v.sort_unstable());
+            
+            // Assign the sorted list of scores to the final map.
+            // SAFETY: Each thread writes to a unique index in the outer Vec.
+            unsafe {
+                *vtsm_writer.ptr.add(reconciled_idx) = vtsm_entry;
+            }
+        });
+    
+    // Final, fast, sequential conversion from atomic to regular u32.
+    let score_variant_counts: Vec<u32> = score_variant_counts
+        .into_iter()
+        .map(|a| a.into_inner())
+        .collect();
     
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
@@ -476,7 +492,7 @@ fn compile_score_file_to_map(
     score_path: &Path,
     bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
     score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-) -> Result<AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>, PrepError> {
+) -> Result<AHashMap<(BimRowIndex, ScoreColumnIndex), (f32, bool)>, PrepError> {
     // --- Phase 1: Memory Map and Header Parsing ---
     let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     // SAFETY: The file is read-only, which is safe for memory mapping.
@@ -505,7 +521,7 @@ fn compile_score_file_to_map(
 
     let header_str = std::str::from_utf8(header_line)
         .map_err(|_| PrepError::Header("Header contains invalid UTF-8".to_string()))?;
-    
+
     // Create a map from this file's specific column index (0, 1, 2...) to the global `ScoreColumnIndex`.
     // This avoids repeated string-based lookups in the hot loop.
     let file_specific_column_map: Vec<ScoreColumnIndex> = header_str
@@ -521,8 +537,8 @@ fn compile_score_file_to_map(
 
     // --- Phase 2: Parallel Chunk Processing ---
     
-    /// Helper to divide a byte slice into chunks ending at newlines. This ensures that
-    /// each parallel task processes a set of complete lines.
+    // Helper to divide a byte slice into chunks ending at newlines. This ensures that
+    // each parallel task processes a set of complete lines.
     fn find_chunk_boundaries(data: &[u8], target_chunk_size: usize) -> Vec<&[u8]> {
         if data.is_empty() { return Vec::new(); }
         let mut boundaries = Vec::new();
@@ -550,7 +566,7 @@ fn compile_score_file_to_map(
 
     chunks
         .into_par_iter()
-        .map(|chunk| -> Result<AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>, PrepError> {
+        .map(|chunk| -> Result<AHashMap<(BimRowIndex, ScoreColumnIndex), (f32, bool)>, PrepError> {
             let mut local_map = AHashMap::new();
 
             for line_bytes in chunk.split(|&b| b == b'\n') {
@@ -558,29 +574,30 @@ fn compile_score_file_to_map(
 
                 // This is a zero-allocation way to get the first three fields.
                 let mut fields = line_bytes.splitn(4, |&b| b == b'\t');
-                let (variant_id_bytes, effect_allele_bytes, other_allele_bytes, weights_bytes) = 
+                let (variant_id_bytes, effect_allele_bytes, other_allele_bytes, weights_bytes) =
                     match (fields.next(), fields.next(), fields.next(), fields.next()) {
                         (Some(v), Some(e), Some(o), Some(w)) => (v, e, o, w),
                         _ => continue, // Skip malformed lines with fewer than 4 columns.
                     };
-                
+
                 let variant_id = std::str::from_utf8(variant_id_bytes).map_err(|_| PrepError::Parse("Invalid UTF-8 in variant_id".to_string()))?;
-                
+
                 if let Some(bim_records) = bim_index.get(variant_id) {
                     let effect_allele = std::str::from_utf8(effect_allele_bytes).map_err(|_| PrepError::Parse("Invalid UTF-8 in effect_allele".to_string()))?;
                     let other_allele = std::str::from_utf8(other_allele_bytes).map_err(|_| PrepError::Parse("Invalid UTF-8 in other_allele".to_string()))?;
-                    
+
                     let winning_matches = resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
 
-                    for (bim_record, bim_row_index) in winning_matches {
-                        let is_flipped = effect_allele != &bim_record.allele2;
-                        let inner_map = local_map.entry(*bim_row_index).or_default();
+                    for (_bim_record, bim_row_index) in winning_matches {
+                        let is_flipped = effect_allele != &_bim_record.allele2;
 
                         for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
                             if !weight_bytes.is_empty() {
+                                // Using lexical_core for high-speed float parsing from bytes.
                                 if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
                                     let score_col_idx = file_specific_column_map[i];
-                                    if inner_map.insert(score_col_idx, (weight, is_flipped)).is_some() {
+                                    let key = (*bim_row_index, score_col_idx);
+                                    if local_map.insert(key, (weight, is_flipped)).is_some() {
                                         return Err(PrepError::Parse(format!(
                                             "Ambiguous input: The score '{}' is defined more than once for variant '{}' within the same file '{}'.",
                                             header_str.split('\t').nth(3 + i).unwrap_or("?"), variant_id, score_path.display()
@@ -595,15 +612,12 @@ fn compile_score_file_to_map(
             Ok(local_map)
         })
         .try_reduce(AHashMap::new, |mut acc_map, local_map| {
-            for (bim_row, local_inner_map) in local_map {
-                let acc_inner_map = acc_map.entry(bim_row).or_default();
-                for (score_col, value) in local_inner_map {
-                    if acc_inner_map.insert(score_col, value).is_some() {
-                        return Err(PrepError::Parse(format!(
-                            "Ambiguous input: A variant is defined for the same score multiple times in file '{}'.",
-                            score_path.display()
-                        )));
-                    }
+            for (key, value) in local_map {
+                if acc_map.insert(key, value).is_some() {
+                    return Err(PrepError::Parse(format!(
+                        "Ambiguous input: A variant-score pair is defined in multiple chunks of the same file '{}'. This should not happen with well-formed data.",
+                        score_path.display()
+                    )));
                 }
             }
             Ok(acc_map)
