@@ -22,7 +22,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
-use memchr::memchr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -104,12 +103,18 @@ pub fn prepare_for_computation(
     );
     let overall_start_time = Instant::now();
 
-    // Step 3a: Map each score file to a flat list of its variant-score records.
-    // `try_flat_map` efficiently collects the Vec<...> from each parallel task into one large Vec.
-    let mut flat_score_data: Vec<((BimRowIndex, ScoreColumnIndex), (f32, bool))> = score_files
+    // Step 3a: Run compilation for each file in parallel, collecting results.
+    // The `collect` will propagate any error encountered during the parallel map.
+    let list_of_vecs: Vec<_> = score_files
         .par_iter()
-        .try_flat_map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
+        .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
         .collect::<Result<_, _>>()?;
+
+    // This sequential step flattens the list of lists into a single flat list.
+    let mut flat_score_data: Vec<((BimRowIndex, ScoreColumnIndex), (f32, bool))> = list_of_vecs
+        .into_iter()
+        .flatten()
+        .collect();
 
     if flat_score_data.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
