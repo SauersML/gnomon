@@ -48,6 +48,7 @@ struct BimRecord {
     allele2: String,
 }
 
+#[derive(Clone, Copy)]
 struct MatrixWriter<T> {
     ptr: *mut T,
 }
@@ -170,17 +171,24 @@ pub fn prepare_for_computation(
     // Use atomics for safe, parallel counting.
     let score_variant_counts: Vec<AtomicU32> = (0..score_names.len()).map(|_| AtomicU32::new(0)).collect();
     
-    // These `MatrixWriter` wrappers allow us to safely share mutable pointers
-    // with Rayon, as we can guarantee no two threads will write to the same location.
-    let weights_writer = MatrixWriter { ptr: weights_matrix.as_mut_ptr() };
-    let flip_writer = MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() };
-    let vtsm_writer = MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() };
+    // These `MatrixWriter` wrappers allow us to safely use mutable pointers
+    // with Rayon. Because raw pointers are not `Sync`, we cannot use `for_each`
+    // which shares its environment. Instead, we use `for_each_with`, which gives
+    // each thread its own clone of the initial state (the writers). Since
+    // `MatrixWriter` is just a pointer, it is cheap to copy.
+    let writer_tuple = (
+        MatrixWriter { ptr: weights_matrix.as_mut_ptr() },
+        MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() },
+        MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() },
+    );
 
     // The final parallel pass over each variant's complete set of work.
     work_by_reconciled_idx
         .par_iter_mut()
         .enumerate()
-        .for_each(|(reconciled_idx, scores_for_variant)| {
+        .for_each_with(writer_tuple, |writers, (reconciled_idx, scores_for_variant)| {
+            let (weights_writer, flip_writer, vtsm_writer) = *writers;
+
             if scores_for_variant.is_empty() { return; }
             let row_offset = reconciled_idx * stride;
 
