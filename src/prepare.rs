@@ -67,6 +67,7 @@ pub enum PrepError {
     Header(String),
     InconsistentKeepId(String),
     NoOverlappingVariants,
+    AmbiguousReconciliation(String),
 }
 
 pub fn prepare_for_computation(
@@ -164,15 +165,16 @@ pub fn prepare_for_computation(
     // --- STAGE 3: PARALLEL COMPILE (The O(N*K) heavy lifting) ---
     eprintln!("> Pass 3: Reconciling variants and compiling work items...");
     let reconcile_start = Instant::now();
-    let mut work_items: Vec<WorkItem> = final_score_map
+    let work_items_results: Vec<Result<Vec<WorkItem>, PrepError>> = final_score_map
         .par_iter()
-        .flat_map(|(variant_id, score_lines)| {
+        .map(|(variant_id, score_lines)| {
             let mut work_for_position = Vec::new();
             if let Some(bim_records) = bim_index.get(variant_id) {
                 for (effect_allele, other_allele, weights) in score_lines {
                     // Call the single authoritative resolver to get the definitive list of matches.
+                    // This can now return a fatal error if ambiguity is detected.
                     let winning_matches =
-                        resolve_matches_for_score_line(effect_allele, other_allele, bim_records);
+                        resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
 
                     // The `process_match` helper function is perfect for turning our definitive
                     // matches into WorkItems. We just need to loop over the resolver's results.
@@ -189,9 +191,14 @@ pub fn prepare_for_computation(
                     }
                 }
             }
-            work_for_position
+            Ok(work_for_position)
         })
         .collect();
+
+    let mut work_items: Vec<WorkItem> = Vec::new();
+    for result in work_items_results {
+        work_items.extend(result?);
+    }
 
     // --- STAGE 4: COMPILE FINAL DATA STRUCTURES FROM WORK ITEMS ---
     eprintln!("> Pass 4: Compiling final data structures for kernel...");
@@ -529,7 +536,7 @@ fn discover_required_bim_indices(
                 for (effect_allele, other_allele, _weights) in score_lines {
                     // Call the single authoritative resolver to get the definitive list of matches.
                     let winning_matches =
-                        resolve_matches_for_score_line(effect_allele, other_allele, bim_records);
+                        resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
 
                     // For each valid match returned by the resolver...
                     for (bim_record, bim_row_index) in winning_matches {
@@ -675,24 +682,35 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
 
 /// The single, authoritative resolver for matching a score line to BIM records.
 ///
-/// This function implements the "smart" reconciliation logic:
-/// 1. Prioritizes perfect matches (both alleles match). It is non-greedy and returns all perfect matches.
-/// 2. If no perfect matches are found, it looks for a single, unambiguous permissive match (effect allele matches).
-/// 3. If multiple permissive matches are found (and no perfect matches exist), it's considered ambiguous and returns nothing.
+/// This function implements the "smart" reconciliation logic with a "fail-fast" philosophy:
+/// 1. Prioritizes perfect matches (both alleles match). It returns all perfect matches found.
+/// 2. If no perfect matches are found, it looks for a single, unambiguous permissive match (where only the effect allele matches).
+/// 3. If multiple permissive matches are found, the situation is considered a critical data ambiguity, and the program will
+///    terminate with a detailed error. This is a deliberate design choice to prevent silent data-dropping.
+///
+/// # Rationale for Failing Fast
+/// The original behavior was to silently discard a variant if its effect allele matched multiple different genotype records
+/// (e.g., effect allele 'A' matching both 'A/T' and 'A/C' records at the same position). This is dangerous because a sample
+/// that truly has the 'A' allele would be ignored, leading to an incomplete and potentially incorrect final score. By crashing,
+/// we force the user to resolve the ambiguity in their input data, ensuring the final calculation is based on a well-defined
+/// and consistent set of variants.
 ///
 /// # Arguments
+/// * `variant_id` - The `chr:pos` identifier for error reporting.
 /// * `effect_allele` - The effect allele from the score file.
 /// * `other_allele` - The other allele from the score file.
 /// * `bim_records_for_position` - A slice of all BIM records found at this chromosomal position.
 ///
 /// # Returns
-/// A `Vec` containing references to the winning `(BimRecord, BimRowIndex)` tuples. An empty
-/// vector signifies that the score line should be discarded for this position (either no match or ambiguous).
+/// A `Result` containing:
+/// - `Ok(Vec<...>)`: A vector of winning `(BimRecord, BimRowIndex)` tuples. An empty vector means no match was found.
+/// - `Err(PrepError::AmbiguousReconciliation)`: A fatal error if an unresolvable ambiguity is detected.
 fn resolve_matches_for_score_line<'a>(
+    variant_id: &str,
     effect_allele: &str,
     other_allele: &str,
     bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
-) -> Vec<&'a (BimRecord, BimRowIndex)> {
+) -> Result<Vec<&'a (BimRecord, BimRowIndex)>, PrepError> {
     // --- Pass 1: Greedily find all perfect matches. ---
     let perfect_matches: Vec<_> = bim_records_for_position
         .iter()
@@ -704,35 +722,47 @@ fn resolve_matches_for_score_line<'a>(
 
     // If we have any perfect matches, they are the winners. Return them immediately.
     if !perfect_matches.is_empty() {
-        return perfect_matches;
+        return Ok(perfect_matches);
     }
 
     // --- Pass 2: No perfect matches found. Evaluate permissive matches for ambiguity. ---
     let mut permissive_candidate: Option<&(BimRecord, BimRowIndex)> = None;
-    let mut is_ambiguous = false;
 
-    for bim_tuple in bim_records_for_position {
-        let (bim_record, _) = bim_tuple;
+    for current_match_tuple in bim_records_for_position {
+        let (current_bim_record, _) = current_match_tuple;
         // A permissive match is when the effect allele is one of the two alleles in the BIM file.
-        if bim_record.allele1 == effect_allele || bim_record.allele2 == effect_allele {
-            if permissive_candidate.is_some() {
-                // We have already found one permissive candidate. Finding another means it's ambiguous.
-                is_ambiguous = true;
-                break; // No need to check further; the ambiguity is confirmed.
+        if current_bim_record.allele1 == effect_allele || current_bim_record.allele2 == effect_allele {
+            if let Some(first_match_tuple) = permissive_candidate {
+                // FATAL AMBIGUITY DETECTED.
+                // We have already found one permissive candidate, and we just found another.
+                // This is an unresolvable situation. We must fail loudly.
+                let (first_bim_record, _) = first_match_tuple;
+                let error_message = format!(
+                    "Fatal Data Ambiguity: Could not reconcile variant '{}'.\n\
+                    > The score file defines an effect allele '{}' (with other_allele '{}').\n\
+                    > This effect allele was found in multiple, different genotype records, making it impossible to choose one:\n\
+                    - Match 1: Alleles are '{}' and '{}'.\n\
+                    - Match 2: Alleles are '{}' and '{}'.",
+                    variant_id,
+                    effect_allele,
+                    other_allele,
+                    first_bim_record.allele1, first_bim_record.allele2,
+                    current_bim_record.allele1, current_bim_record.allele2
+                );
+                return Err(PrepError::AmbiguousReconciliation(error_message));
             }
-            permissive_candidate = Some(bim_tuple);
+            // This is the first permissive match we've seen. Store it and continue.
+            permissive_candidate = Some(current_match_tuple);
         }
     }
 
-    // If it's not ambiguous and we found exactly one candidate, that's our winner.
-    if !is_ambiguous {
-        if let Some(candidate) = permissive_candidate {
-            return vec![candidate];
-        }
+    // If we get here, there was either one permissive match or zero.
+    if let Some(candidate) = permissive_candidate {
+        Ok(vec![candidate])
+    } else {
+        // No perfect matches, no permissive matches. The variant is simply not found.
+        Ok(Vec::new())
     }
-
-    // Otherwise (ambiguous or no matches found), return an empty Vec to signify "discard".
-    Vec::new()
 }
 
 // ========================================================================================
@@ -750,6 +780,7 @@ impl Display for PrepError {
                 f,
                 "No overlapping variants found between score file(s) and genotype data."
             ),
+            PrepError::AmbiguousReconciliation(s) => write!(f, "{}", s),
         }
     }
 }
