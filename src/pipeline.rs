@@ -415,100 +415,103 @@ fn get_packed_genotype(
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
 /// iterates through each person and resolves their score contributions for the small
-/// set of variants that could not be handled by the fast path. It is designed to be
-/// memory-efficient and parallel.
+/// set of variants that could not be handled by the fast path.
 fn resolve_complex_variants(
     prep_result: &Arc<PreparationResult>,
     final_scores: &mut [f64],
     final_missing_counts: &mut [u32],
     mmap: &Arc<Mmap>,
 ) -> Result<(), PipelineError> {
-    // This function is guaranteed to only be called if `complex_rules` is not empty.
     let num_scores = prep_result.score_names.len();
 
-    // --- Person-Centric Parallelism ---
-    // We iterate over people in parallel, which is highly efficient because each
-    // person's final score is independent of all others.
     final_scores
         .par_chunks_mut(num_scores)
         .zip(final_missing_counts.par_chunks_mut(num_scores))
         .enumerate()
-        .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-            // Get the person's original index, which is the key to reading their genotype data.
+        .try_for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
             let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
-            // --- Loop over each unique complex variant rule ---
             for group_rule in &prep_result.complex_rules {
-                // For each score that uses this complex variant...
-                for score_info in &group_rule.score_applications {
-                    let mut was_resolved_for_this_score = false;
+                // --- Step 1: Gather Evidence ---
+                // For this person, find ALL valid, non-missing genotypes for this variant
+                // across all possible contexts. Pre-allocate vector to avoid reallocations.
+                let mut valid_interpretations =
+                    Vec::with_capacity(group_rule.possible_contexts.len());
 
-                    // ...find the first valid context that can explain the person's genotype.
-                    for context in &group_rule.possible_contexts {
-                        let (bim_idx, context_a1, context_a2) = context;
+                for context in &group_rule.possible_contexts {
+                    let (bim_idx, ..) = context;
+                    let packed_geno = get_packed_genotype(
+                        mmap,
+                        prep_result.bytes_per_variant,
+                        *bim_idx,
+                        original_fam_idx,
+                    );
 
-                        // This context is only relevant if it actually contains the effect allele for THIS score.
-                        if &score_info.effect_allele != context_a1
-                            && &score_info.effect_allele != context_a2
-                        {
-                            continue;
-                        }
-
-                        let packed_geno = get_packed_genotype(
-                            mmap,
-                            prep_result.bytes_per_variant,
-                            *bim_idx,
-                            original_fam_idx,
-                        );
-
-                        // A packed value of `01` means the genotype is missing in the .bed file for this context.
-                        // If it's missing, this context is not valid for this person, so we try the next one.
-                        if packed_geno == 0b01 {
-                            continue;
-                        }
-
-                        // We found a valid, relevant, non-missing context. This is the "winning" interpretation
-                        // for this person for this specific score.
-
-                        // Decode the dosage of the effect allele directly. The PLINK .bed file encodes
-                        // genotypes relative to the (allele1, allele2) pair from the .bim file.
-                        // 0b00 = homozygous for allele1; 0b11 = homozygous for allele2.
-                        let dosage: f64 = if &score_info.effect_allele == context_a1 {
-                            // The effect allele for this score is the first allele in the BIM context.
-                            match packed_geno {
-                                0b00 => 2.0, // Homozygous for effect allele.
-                                0b10 => 1.0, // Heterozygous.
-                                0b11 => 0.0, // Homozygous for the other allele.
-                                _ => unreachable!(), // 0b01 (missing) was handled earlier.
-                            }
-                        } else {
-                            // The effect allele for this score is the second allele in the BIM context.
-                            match packed_geno {
-                                0b00 => 0.0, // Homozygous for the other allele.
-                                0b10 => 1.0, // Heterozygous.
-                                0b11 => 2.0, // Homozygous for effect allele.
-                                _ => unreachable!(),
-                            }
-                        };
-
-                        // Since complex variants are not part of the master_baseline, their
-                        // score contribution is calculated directly and added.
-                        let contribution = dosage * (score_info.weight as f64);
-                        person_scores_slice[score_info.score_column_index.0] += contribution;
-
-                        was_resolved_for_this_score = true;
-                        // We are done with this score_info; break the inner context-finding loop.
-                        break;
+                    // A packed value of `0b01` means the genotype is missing.
+                    if packed_geno != 0b01 {
+                        valid_interpretations.push((packed_geno, context));
                     }
+                }
 
-                    // If, after checking all relevant contexts, we couldn't resolve the score,
-                    // then this person's genotype is truly missing for this score entry.
-                    if !was_resolved_for_this_score {
-                        person_counts_slice[score_info.score_column_index.0] += 1;
+                // --- Step 2: Apply Decision Policy ---
+                // Now, make a decision based on the evidence we gathered.
+                match valid_interpretations.len() {
+                    0 => { // CASE: Truly Missing
+                        // The person's genotype was missing for this variant under all contexts.
+                        // Increment the missing count for every score this rule applies to.
+                        for score_info in &group_rule.score_applications {
+                            person_counts_slice[score_info.score_column_index.0] += 1;
+                        }
+                    }
+                    1 => { // CASE: Success - One Unambiguous Interpretation
+                        // The person had exactly one valid, non-missing genotype among all
+                        // possible contexts. This is the desired outcome.
+                        let (winning_geno, winning_context) = valid_interpretations[0];
+                        let (_bim_idx, winning_a1, winning_a2) = winning_context;
+
+                        for score_info in &group_rule.score_applications {
+                            let effect_allele = &score_info.effect_allele;
+
+                            // CRITICAL: The effect allele for this score must exist in the winning
+                            // context. If not, it's considered missing for this specific score.
+                            if effect_allele != winning_a1 && effect_allele != winning_a2 {
+                                person_counts_slice[score_info.score_column_index.0] += 1;
+                                continue;
+                            }
+
+                            // The PLINK .bed file encodes genotypes relative to (a1, a2).
+                            // 0b00=hom_a1, 0b10=het, 0b11=hom_a2.
+                            let dosage: f64 = if effect_allele == winning_a1 {
+                                match winning_geno {
+                                    0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!(),
+                                }
+                            } else { // effect_allele must be winning_a2
+                                match winning_geno {
+                                    0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!(),
+                                }
+                            };
+
+                            let contribution = dosage * (score_info.weight as f64);
+                            person_scores_slice[score_info.score_column_index.0] += contribution;
+                        }
+                    }
+                    _ => { // CASE: Fatal Error - Contradictory Data
+                        // The person has multiple, non-missing genotypes for the same variant
+                        // locus. This is a critical data integrity error.
+                        let iid = &prep_result.final_person_iids[person_output_idx];
+                        // The specific variant isn't easily nameable, but we can report the
+                        // first context's BIM index as a clue for debugging.
+                        let first_context_id = group_rule.possible_contexts[0].0 .0;
+
+                        return Err(PipelineError::Compute(format!(
+                            "Fatal data inconsistency for individual '{}'. Variant at location corresponding to BIM row index '{}' has conflicting, non-missing genotypes in the input .bed file.",
+                            iid, first_context_id
+                        )));
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
 
     Ok(())
 }
