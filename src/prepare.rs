@@ -10,12 +10,12 @@
 // multiple score files.
 
 use crate::types::{
-    BimRowIndex, ComplexVariantRule, PersonSubset, PreparationResult, ScoreColumnIndex,
+    BimRowIndex, GroupedComplexRule, PersonSubset, PreparationResult, ScoreColumnIndex, ScoreInfo,
 };
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -116,24 +116,45 @@ pub fn prepare_for_computation(
     );
     let overall_start_time = Instant::now();
 
-    // Step 3a: Run compilation for each file in parallel. The result is a list of tuples,
-    // where each tuple contains the fast-path and slow-path data for one score file.
-    let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<ComplexVariantRule>)> = score_files
-        .par_iter()
-        .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
-        .collect::<Result<_, _>>()?;
-
-    // Step 3b: Unzip the list of tuples into two separate collections, one for all simple
-    // mappings and one for all complex rules.
-    let (simple_mappings, complex_rules): (Vec<_>, Vec<_>) =
+// Step 3a: Run compilation for each file in parallel.
+let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = score_files
+    .par_iter()
+    .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
+    .collect::<Result<_, _>>()?;
+    
+    // Step 3b: Unzip the list of tuples into two separate collections.
+    let (simple_mappings, intermediate_complex_rules): (Vec<_>, Vec<_>) =
         list_of_tuples.into_iter().unzip();
-
+    
     // Flatten each collection into a single master list for each path.
     let mut flat_score_data: Vec<SimpleMapping> = simple_mappings.into_iter().flatten().collect();
-    let all_complex_rules: Vec<ComplexVariantRule> = complex_rules.into_iter().flatten().collect();
-
-    // Step 3c: Check for overlapping variants. Only fail if BOTH paths are empty.
-    if flat_score_data.is_empty() && all_complex_rules.is_empty() {
+    let flat_complex_rules: Vec<IntermediateComplexRule> = intermediate_complex_rules.into_iter().flatten().collect();
+    
+    // Step 3c: Group the flat list of complex rules into the final, efficient structure.
+    // We use a BTreeMap to group by the list of possible contexts.
+    let mut grouped_complex_map: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> =
+        BTreeMap::new();
+    for intermediate_rule in flat_complex_rules {
+        let score_info = ScoreInfo {
+            effect_allele: intermediate_rule.effect_allele,
+            weight: intermediate_rule.weight,
+            score_column_index: intermediate_rule.score_column_index,
+        };
+        grouped_complex_map
+            .entry(intermediate_rule.possible_contexts)
+            .or_default()
+            .push(score_info);
+    }
+    let final_complex_rules: Vec<GroupedComplexRule> = grouped_complex_map
+        .into_iter()
+        .map(|(contexts, scores)| GroupedComplexRule {
+            possible_contexts: contexts,
+            score_applications: scores,
+        })
+        .collect();
+    
+    // Step 3d: Check for overlapping variants. Only fail if BOTH paths are empty.
+    if flat_score_data.is_empty() && final_complex_rules.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
     }
 
@@ -231,27 +252,29 @@ pub fn prepare_for_computation(
     // --- FINAL STEP: Account for complex variants in total counts ---
     // This fast, sequential loop ensures the final denominators used for statistics
     // are correct by adding the counts from the slow-path variants.
-    for rule in &all_complex_rules {
-        score_variant_counts[rule.score_column_index.0] += 1;
+    for group_rule in &final_complex_rules {
+        for score_info in &group_rule.score_applications {
+            score_variant_counts[score_info.score_column_index.0] += 1;
+        }
     }
-
+    
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
-
+    
     for (output_idx, iid) in final_person_iids.iter().enumerate() {
         let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
         output_idx_to_fam_idx.push(original_fam_idx);
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
-
+    
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
         stride,
         required_bim_indices,
-        all_complex_rules,
+        final_complex_rules,
         score_names,
         score_variant_counts,
         variant_to_scores_map,
@@ -492,6 +515,15 @@ pub fn parse_score_file_headers_only(
 // This type alias makes the function signature much cleaner.
 type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
 
+/// An intermediate, flat representation of a complex rule before it is grouped.
+/// It contains the context information duplicated for each score.
+struct IntermediateComplexRule {
+    effect_allele: String,
+    weight: f32,
+    score_column_index: ScoreColumnIndex,
+    possible_contexts: Vec<(BimRowIndex, String, String)>,
+}
+
 /// Parses a single score file, reconciles its variants against the BIM index, and
 /// segregates the results into two distinct collections: one for the simple "fast
 /// path" and one for the complex "slow path".
@@ -499,7 +531,7 @@ fn compile_score_file_to_map(
     score_path: &Path,
     bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
     score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-) -> Result<(Vec<SimpleMapping>, Vec<ComplexVariantRule>), PrepError> {
+) -> Result<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>), PrepError> {
     // --- Phase 1: Memory Map and Header Parsing ---
     let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
@@ -588,7 +620,7 @@ fn compile_score_file_to_map(
                         if !weight_bytes.is_empty() {
                             if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
                                 if let Some(&score_col_idx) = file_specific_column_map.get(i) {
-                                    complex_rules.push(ComplexVariantRule {
+                                    complex_rules.push(IntermediateComplexRule {
                                         effect_allele: effect_allele.to_string(),
                                         weight,
                                         score_column_index: score_col_idx,
