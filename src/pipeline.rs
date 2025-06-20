@@ -1,6 +1,8 @@
 use crate::batch::{self, SparseIndexPool};
 use crate::io;
-use crate::types::{EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, WorkItem};
+use crate::types::{
+    BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, WorkItem,
+};
 use crossbeam_channel::{bounded, Receiver};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
