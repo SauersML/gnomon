@@ -20,6 +20,20 @@ pub enum ComputePath {
     PersonMajor,
 }
 
+// A self-contained unit of work for a variant that requires deferred, complex resolution.
+#[derive(Debug, Clone)]
+pub struct ComplexVariantRule {
+    /// The effect allele as defined in the score file.
+    pub effect_allele: String,
+    /// The effect weight for a specific score.
+    pub weight: f32,
+    /// The global column index for the score this rule applies to.
+    pub score_column_index: ScoreColumnIndex,
+    /// A list of all plausible BIM contexts (genotype definitions) that this
+    /// variant could be interpreted under.
+    pub possible_contexts: Vec<(BimRowIndex, String, String)>, // (BimRowIndex, allele1, allele2)
+}
+
 /// Defines the subset of individuals to be processed by the engine.
 ///
 /// This enum makes the program's control flow explicit and type-safe. It is
