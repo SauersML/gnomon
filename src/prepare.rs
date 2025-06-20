@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
+use std::str::Utf8Error;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -717,5 +718,11 @@ impl Error for PrepError {
 impl From<ParseFloatError> for PrepError {
     fn from(err: ParseFloatError) -> Self {
         PrepError::Parse(format!("Could not parse numeric value: {}", err))
+    }
+}
+
+impl From<Utf8Error> for PrepError {
+    fn from(err: Utf8Error) -> Self {
+        PrepError::Parse(format!("Invalid UTF-8 sequence in score file: {}", err))
     }
 }
