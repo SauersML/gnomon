@@ -52,6 +52,19 @@ struct MatrixWriter<T> {
     ptr: *mut T,
 }
 
+/// Enum to represent the outcome of reconciling one score file line.
+/// This is the core of the triage system that separates the fast and slow paths.
+enum ReconciliationOutcome<'a> {
+    /// For the fast path. Contains a list of one or more unambiguous matches.
+    /// This can include perfect matches or a single, unambiguous permissive match.
+    Simple(Vec<&'a (BimRecord, BimRowIndex)>),
+    /// For the slow path. Contains a list of multiple, different, plausible
+    /// permissive matches, indicating a resolvable multiallelic site.
+    Complex(Vec<&'a (BimRecord, BimRowIndex)>),
+    /// The variant was not found in the genotype data.
+    NotFound,
+}
+
 unsafe impl<T: Send> Send for MatrixWriter<T> {}
 unsafe impl<T: Send> Sync for MatrixWriter<T> {}
 
@@ -574,35 +587,17 @@ fn compile_score_file_to_map(
 }
 
 /// The single, authoritative resolver for matching a score line to BIM records.
-///
-/// This function implements the "smart" reconciliation logic with a "fail-fast" philosophy:
-/// 1. Prioritizes perfect matches (both alleles match). It returns all perfect matches found.
-/// 2. If no perfect matches are found, it looks for a single, unambiguous permissive match (where only the effect allele matches).
-/// 3. If multiple permissive matches are found, the situation is considered a critical data ambiguity, and the program will
-///    terminate with a detailed error. This is a deliberate design choice to prevent silent data-dropping.
-///
-/// # Rationale for Failing Fast
-/// The original behavior was to silently discard a variant if its effect allele matched multiple different genotype records
-/// (e.g., effect allele 'A' matching both 'A/T' and 'A/C' records at the same position). This is dangerous because a sample
-/// that truly has the 'A' allele would be ignored, leading to an incomplete and potentially incorrect final score.
-///
-/// # Arguments
-/// * `variant_id` - The `chr:pos` identifier for error reporting.
-/// * `effect_allele` - The effect allele from the score file.
-/// * `other_allele` - The other allele from the score file.
-/// * `bim_records_for_position` - A slice of all BIM records found at this chromosomal position.
-///
-/// # Returns
-/// A `Result` containing:
-/// - `Ok(Vec<...>)`: A vector of winning `(BimRecord, BimRowIndex)` tuples. An empty vector means no match was found.
-/// - `Err(PrepError::AmbiguousReconciliation)`: A fatal error if an unresolvable ambiguity is detected.
+/// This function acts as a TRIAGE system, classifying each match as either
+/// simple (for the fast path) or complex (for the deferred slow path).
 fn resolve_matches_for_score_line<'a>(
-    variant_id: &str,
+    _variant_id: &str, // Kept for potential future logging/error messages
     effect_allele: &str,
     other_allele: &str,
     bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
-) -> Result<Vec<&'a (BimRecord, BimRowIndex)>, PrepError> {
+) -> Result<ReconciliationOutcome<'a>, PrepError> {
     // --- Pass 1: Greedily find all perfect matches. ---
+    // A perfect match is where both alleles in the score file match the alleles
+    // in the BIM record, regardless of order.
     let perfect_matches: Vec<_> = bim_records_for_position
         .iter()
         .filter(|(bim_record, _)| {
@@ -611,51 +606,32 @@ fn resolve_matches_for_score_line<'a>(
         })
         .collect();
 
-    // If we have any perfect matches, they are the winners. Return them immediately.
+    // If we have any perfect matches, the decision is simple. This is the fast path.
+    // Even if there are multiple identical BIM entries, they are treated as one simple case.
     if !perfect_matches.is_empty() {
-        return Ok(perfect_matches);
+        return Ok(ReconciliationOutcome::Simple(perfect_matches));
     }
 
-    // --- Pass 2: No perfect matches found. Evaluate permissive matches for ambiguity. ---
-    let mut permissive_candidate: Option<&(BimRecord, BimRowIndex)> = None;
+    // --- Pass 2: No perfect matches found. Look for permissive matches. ---
+    // A permissive match is where the score file's effect allele is present in the
+    // BIM record, but the other_allele does not match.
+    let permissive_matches: Vec<_> = bim_records_for_position
+        .iter()
+        .filter(|(bim_record, _)| {
+            bim_record.allele1 == effect_allele || bim_record.allele2 == effect_allele
+        })
+        .collect();
 
-    for current_match_tuple in bim_records_for_position {
-        let (current_bim_record, _) = current_match_tuple;
-        // A permissive match is when the effect allele is one of the two alleles in the BIM file.
-        if current_bim_record.allele1 == effect_allele || current_bim_record.allele2 == effect_allele {
-            if let Some(first_match_tuple) = permissive_candidate {
-                // FATAL AMBIGUITY DETECTED.
-                // We have already found one permissive candidate, and we just found another.
-                // This is an unresolvable situation. We must fail loudly.
-                let (first_bim_record, _) = first_match_tuple;
-                let error_message = format!(
-                    "Fatal Data Ambiguity: Could not reconcile variant '{}'.\n\
-                    > The score file defines an effect allele '{}' (with other_allele '{}').\n\
-                    > This effect allele was found in multiple, different genotype records, making it impossible to choose one:\n\
-                    - Match 1: Alleles are '{}' and '{}'.\n\
-                    - Match 2: Alleles are '{}' and '{}'.",
-                    variant_id,
-                    effect_allele,
-                    other_allele,
-                    first_bim_record.allele1, first_bim_record.allele2,
-                    current_bim_record.allele1, current_bim_record.allele2
-                );
-                return Err(PrepError::AmbiguousReconciliation(error_message));
-            }
-            // This is the first permissive match we've seen. Store it and continue.
-            permissive_candidate = Some(current_match_tuple);
-        }
-    }
-
-    // If we get here, there was either one permissive match or zero.
-    if let Some(candidate) = permissive_candidate {
-        Ok(vec![candidate])
-    } else {
-        // No perfect matches, no permissive matches. The variant is simply not found.
-        Ok(Vec::new())
+    match permissive_matches.len() {
+        // No matches of any kind were found.
+        0 => Ok(ReconciliationOutcome::NotFound),
+        // Exactly one permissive match. This is an unambiguous flip. Send to fast path.
+        1 => Ok(ReconciliationOutcome::Simple(permissive_matches)),
+        // More than one permissive match. This is a resolvable multiallelic site.
+        // It is NOT an error. We send it to the deferred slow path for careful handling.
+        _ => Ok(ReconciliationOutcome::Complex(permissive_matches)),
     }
 }
-
 // ========================================================================================
 //                                    ERROR HANDLING
 // ========================================================================================
