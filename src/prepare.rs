@@ -224,8 +224,17 @@ pub fn prepare_for_computation(
             }
         });
     
-    let score_variant_counts: Vec<u32> = score_variant_counts.into_iter().map(|a| a.into_inner()).collect();
-    
+    // Convert the fast-path atomic counts to a mutable Vec.
+    let mut score_variant_counts: Vec<u32> =
+        score_variant_counts.into_iter().map(|a| a.into_inner()).collect();
+
+    // --- FINAL STEP: Account for complex variants in total counts ---
+    // This fast, sequential loop ensures the final denominators used for statistics
+    // are correct by adding the counts from the slow-path variants.
+    for rule in &all_complex_rules {
+        score_variant_counts[rule.score_column_index.0] += 1;
+    }
+
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
@@ -236,12 +245,13 @@ pub fn prepare_for_computation(
         output_idx_to_fam_idx.push(original_fam_idx);
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
-    
+
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
         stride,
         required_bim_indices,
+        all_complex_rules,
         score_names,
         score_variant_counts,
         variant_to_scores_map,
