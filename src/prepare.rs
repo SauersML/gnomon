@@ -10,7 +10,7 @@
 // multiple score files.
 
 use crate::types::{
-    BimRowIndex, PersonSubset, PreparationResult, ScoreColumnIndex,
+    BimRowIndex, ComplexVariantRule, PersonSubset, PreparationResult, ScoreColumnIndex,
 };
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
