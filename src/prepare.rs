@@ -644,48 +644,50 @@ fn compile_score_file_to_map(
 /// This function acts as a TRIAGE system, classifying each match as either
 /// simple (for the fast path) or complex (for the deferred slow path).
 fn resolve_matches_for_score_line<'a>(
-    _variant_id: &str, // Kept for potential future logging/error messages
+    _variant_id: &str, // DELETE or use.
     effect_allele: &str,
-    other_allele: &str,
+    _other_allele: &str, // DELETE. keeping this is a mistake.
     bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
 ) -> Result<ReconciliationOutcome<'a>, PrepError> {
-    // --- Pass 1: Greedily find all perfect matches. ---
-    // A perfect match is where both alleles in the score file match the alleles
-    // in the BIM record, regardless of order.
-    let perfect_matches: Vec<_> = bim_records_for_position
-        .iter()
-        .filter(|(bim_record, _)| {
-            (&bim_record.allele1 == effect_allele && &bim_record.allele2 == other_allele) ||
-            (&bim_record.allele1 == other_allele && &bim_record.allele2 == effect_allele)
-        })
-        .collect();
+    // A BTreeMap provides automatic de-duplication (by BIM row index) and a deterministic ordering
+    let mut all_possible_contexts: BTreeMap<BimRowIndex, &'a (BimRecord, BimRowIndex)> =
+        BTreeMap::new();
 
-    // If we have any perfect matches, the decision is simple. This is the fast path.
-    // Even if there are multiple identical BIM entries, they are treated as one simple case.
-    if !perfect_matches.is_empty() {
-        return Ok(ReconciliationOutcome::Simple(perfect_matches));
+    // A single pass is sufficient to find all plausible interpretations. A variant
+    // is a candidate if its effect allele is present in the BIM context. This
+    // single rule correctly covers both "perfect" and "permissive" matches,
+    // as a perfect match is just a specific type of permissive match.
+    for record_tuple in bim_records_for_position {
+        let (bim_record, bim_row_index) = record_tuple;
+
+        if &bim_record.allele1 == effect_allele || &bim_record.allele2 == effect_allele {
+            all_possible_contexts.insert(*bim_row_index, record_tuple);
+        }
     }
 
-    // --- Pass 2: No perfect matches found. Look for permissive matches. ---
-    // A permissive match is where the score file's effect allele is present in the
-    // BIM record, but the other_allele does not match.
-    let permissive_matches: Vec<_> = bim_records_for_position
-        .iter()
-        .filter(|(bim_record, _)| {
-            bim_record.allele1 == effect_allele || bim_record.allele2 == effect_allele
-        })
-        .collect();
-
-    match permissive_matches.len() {
-        // No matches of any kind were found.
-        0 => Ok(ReconciliationOutcome::NotFound),
-        // Exactly one permissive match. This is an unambiguous flip. Send to fast path.
-        1 => Ok(ReconciliationOutcome::Simple(permissive_matches)),
-        // More than one permissive match. This is a resolvable multiallelic site.
-        // It is NOT an error. We send it to the deferred slow path for careful handling.
-        _ => Ok(ReconciliationOutcome::Complex(permissive_matches)),
+    // Now, make the final triage decision based on how many unique, plausible
+    // interpretations were found.
+    match all_possible_contexts.len() {
+        0 => {
+            // No matches of any kind were found for this score file variant.
+            Ok(ReconciliationOutcome::NotFound)
+        }
+        1 => {
+            // Exactly ONE unique way to interpret this variant was found. This is
+            // TRULY SIMPLE. There is no ambiguity. Send to the fast path.
+            let simple_matches: Vec<_> = all_possible_contexts.values().copied().collect();
+            Ok(ReconciliationOutcome::Simple(simple_matches))
+        }
+        _ => {
+            // MORE THAN ONE unique way to interpret this variant exists. This variant
+            // is AMBIGUOUS and requires careful, person-by-person resolution.
+            // Send to the slow path.
+            let complex_matches: Vec<_> = all_possible_contexts.values().copied().collect();
+            Ok(ReconciliationOutcome::Complex(complex_matches))
+        }
     }
 }
+
 // ========================================================================================
 //                                    ERROR HANDLING
 // ========================================================================================
