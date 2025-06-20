@@ -470,25 +470,6 @@ fn resolve_complex_variants(
                         // We found a valid, relevant, non-missing context. This is the "winning" interpretation
                         // for this person for this specific score.
 
-                        // In PLINK, allele2 is the default effect allele. A match on allele1 means the
-                        // variant is "flipped" relative to the default orientation.
-                        let is_flipped = &score_info.effect_allele == context_a1;
-
-                        let dosage: f64 = match packed_geno {
-                            0b00 => if is_flipped { 2.0 } else { 0.0 }, // Homozygous for context_a1
-                            0b11 => if is_flipped { 0.0 } else { 2.0 }, // Homozygous for context_a2
-                            0b10 => 1.0,                               // Heterozygous
-                            _ => unreachable!(), // `0b01` was handled by the continue.
-                        };
-
-                        // Since complex variants are not in the master_baseline, we calculate their
-                        // absolute contribution directly.
-                        let contribution = if is_flipped {
-                            (2.0 - dosage) * (score_info.weight as f64)
-                        } else {
-                            dosage * (score_info.weight as f64)
-                        };
-
                         person_scores_slice[score_info.score_column_index.0] += contribution;
 
                         was_resolved_for_this_score = true;
