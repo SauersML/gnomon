@@ -476,51 +476,34 @@ pub fn parse_score_file_headers_only(
     Ok(all_score_names.into_iter().collect())
 }
 
+// This type alias makes the function signature much cleaner.
+type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
+
 /// Parses a single score file, reconciles its variants against the BIM index, and
-/// compiles the results into a compact hash map of unique computations.
-///
-/// # Arguments
-///
-/// * `score_path` - The path to the gnomon-native score file to process.
-/// * `bim_index` - A read-only reference to the pre-computed BIM file index.
-/// * `score_name_to_col_index` - A map from score names to their global column index.
-///
-/// # Returns
-///
-/// A `Result` containing:
-/// - `Ok(AHashMap<BimRowIndex, AHashMap<ScoreColumnIndex, (f32, bool)>>)`: A nested map.
-///   The outer key is the original `BimRowIndex`. The inner map's key is the `ScoreColumnIndex`
-///   and its value is the `(weight, is_flipped)` tuple for that specific computation.
-/// - `Err(PrepError)`: If any parsing, reconciliation, or ambiguity error occurs.
+/// segregates the results into two distinct collections: one for the simple "fast
+/// path" and one for the complex "slow path".
 fn compile_score_file_to_map(
     score_path: &Path,
     bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
     score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-) -> Result<Vec<((BimRowIndex, ScoreColumnIndex), (f32, bool))>, PrepError> {
+) -> Result<(Vec<SimpleMapping>, Vec<ComplexVariantRule>), PrepError> {
     // --- Phase 1: Memory Map and Header Parsing ---
     let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
-    // SAFETY: The file is read-only, which is safe for memory mapping.
     let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
     mmap.advise(memmap2::Advice::Sequential)
         .map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
 
-    // Efficiently find the first non-comment line to identify the header and the data start offset.
     let mut data_start_offset = 0;
     let header_line = {
         let mut first_line: Option<&[u8]> = None;
         for line in mmap.split(|&b| b == b'\n') {
-            data_start_offset += line.len() + 1; // +1 for the newline character.
+            data_start_offset += line.len() + 1;
             if !line.is_empty() && !line.starts_with(b"#") {
                 first_line = Some(line);
                 break;
             }
         }
-        first_line.ok_or_else(|| {
-            PrepError::Header(format!(
-                "Score file '{}' is empty or contains only metadata.",
-                score_path.display()
-            ))
-        })?
+        first_line.ok_or_else(|| PrepError::Header(format!("File is empty: '{}'", score_path.display())))?
     };
 
     let header_str = std::str::from_utf8(header_line)
@@ -529,24 +512,21 @@ fn compile_score_file_to_map(
     let file_specific_column_map: Vec<ScoreColumnIndex> = header_str
         .trim()
         .split('\t')
-        .skip(3) // Skip variant_id, effect_allele, other_allele
+        .skip(3)
         .map(|name| {
             score_name_to_col_index.get(name)
                 .copied()
-                .ok_or_else(|| PrepError::Header(format!("Score '{}' from file '{}' was not found in the global score list.", name, score_path.display())))
+                .ok_or_else(|| PrepError::Header(format!("Score '{}' from file '{}' not found in global score list.", name, score_path.display())))
         })
         .collect::<Result<_, _>>()?;
 
-    // --- Phase 2: Sequential Processing of a Single File ---
-    // This function is run in parallel on *different files*. The processing of
-    // a single file's content is done sequentially here to avoid nested parallelism overhead.
+    // --- Phase 2: Segregation Loop ---
     let data_slice = &mmap[data_start_offset..];
-    let mut all_records_for_file = Vec::new();
+    let mut simple_mappings = Vec::new();
+    let mut complex_rules = Vec::new();
 
     for line_bytes in data_slice.split(|&b| b == b'\n') {
-        if line_bytes.is_empty() {
-            continue;
-        }
+        if line_bytes.is_empty() { continue; }
 
         let mut fields = line_bytes.splitn(4, |&b| b == b'\t');
         let (variant_id_bytes, effect_allele_bytes, other_allele_bytes, weights_bytes) =
@@ -555,27 +535,54 @@ fn compile_score_file_to_map(
                 _ => continue, // Skip malformed lines.
             };
 
-        let variant_id = std::str::from_utf8(variant_id_bytes)
-            .map_err(|_| PrepError::Parse("Invalid UTF-8 in variant_id".to_string()))?;
-
+        let variant_id = std::str::from_utf8(variant_id_bytes)?;
         if let Some(bim_records) = bim_index.get(variant_id) {
-            let effect_allele = std::str::from_utf8(effect_allele_bytes)
-                .map_err(|_| PrepError::Parse("Invalid UTF-8 in effect_allele".to_string()))?;
-            let other_allele = std::str::from_utf8(other_allele_bytes)
-                .map_err(|_| PrepError::Parse("Invalid UTF-8 in other_allele".to_string()))?;
+            let effect_allele = std::str::from_utf8(effect_allele_bytes)?;
+            let other_allele = std::str::from_utf8(other_allele_bytes)?;
 
-            let winning_matches =
+            // Call the new triage engine.
+            let match_result =
                 resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
 
-            for (bim_record, bim_row_index) in winning_matches {
-                let is_flipped = effect_allele != &bim_record.allele2;
+            match match_result {
+                ReconciliationOutcome::NotFound => continue,
 
-                for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
-                    if !weight_bytes.is_empty() {
-                        if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
-                            if let Some(&score_col_idx) = file_specific_column_map.get(i) {
-                                let key = (*bim_row_index, score_col_idx);
-                                all_records_for_file.push((key, (weight, is_flipped)));
+                // --- FAST PATH ---
+                ReconciliationOutcome::Simple(matches) => {
+                    for (bim_record, bim_row_index) in matches {
+                        let is_flipped = effect_allele != &bim_record.allele2;
+                        for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
+                            if !weight_bytes.is_empty() {
+                                if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
+                                    if let Some(&score_col_idx) = file_specific_column_map.get(i) {
+                                        simple_mappings.push(((*bim_row_index, score_col_idx), (weight, is_flipped)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- SLOW PATH ---
+                ReconciliationOutcome::Complex(matches) => {
+                    // OPTIMIZATION: Construct the context list ONCE per variant line, not once per score.
+                    // This requires cloning the allele strings, which is necessary to own them.
+                    let possible_contexts: Vec<_> = matches.iter().map(|(rec, idx)| {
+                        (*idx, rec.allele1.clone(), rec.allele2.clone())
+                    }).collect();
+
+                    for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
+                        if !weight_bytes.is_empty() {
+                            if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
+                                if let Some(&score_col_idx) = file_specific_column_map.get(i) {
+                                    complex_rules.push(ComplexVariantRule {
+                                        effect_allele: effect_allele.to_string(),
+                                        weight,
+                                        score_column_index: score_col_idx,
+                                        // This is now a cheap Vec clone, not a deep rebuild.
+                                        possible_contexts: possible_contexts.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -583,7 +590,8 @@ fn compile_score_file_to_map(
             }
         }
     }
-    Ok(all_records_for_file)
+    // Return both segregated lists.
+    Ok((simple_mappings, complex_rules))
 }
 
 /// The single, authoritative resolver for matching a score line to BIM records.
