@@ -63,9 +63,14 @@ pub struct PreparationResult {
     stride: usize,
 
     // --- PUBLIC METADATA & LOOKUP TABLES ---
-    /// The sorted list of original `.bim` row indices that are required for this
-    /// calculation. This is used by the I/O producer to filter the `.bed` file.
+    /// The sorted list of original `.bim` row indices for the "fast path."
+    /// This is used by the I/O producer to filter the `.bed` file for all
+    /// simple, unambiguous variants.
     pub required_bim_indices: Vec<BimRowIndex>,
+    /// A list of self-contained rules for variants that require complex, deferred
+    /// resolution (the "slow path"). This is typically for multiallelic sites.
+    /// This list will be empty for the vast majority of runs.
+    pub complex_rules: Vec<ComplexVariantRule>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
     pub person_fam_to_output_idx: Vec<Option<u32>>,
