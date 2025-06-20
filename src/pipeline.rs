@@ -176,6 +176,18 @@ pub fn run(
         // Add the calculated adjustments from both streams onto the baseline.
         final_scores.par_iter_mut().zip(sparse_adjustments).for_each(|(m, p)| *m += p);
         final_scores.par_iter_mut().zip(dense_adjustments).for_each(|(m, p)| *m += p);
+        
+        // --- 5. Final Step: Resolve complex variants and apply their contributions ---
+        // This "slow path" runs after all high-performance streams are complete. It is
+        // only invoked if the preparation phase identified any complex, multiallelic
+        // variants that required deferred resolution.
+        if !prep_result.complex_rules.is_empty() {
+            eprintln!(
+                "> Resolving {} unique complex variant rule(s)...",
+                prep_result.complex_rules.len()
+            );
+            resolve_complex_variants(prep_result, &mut final_scores, &mut final_counts, &mmap)?;
+        }
 
         Ok((final_scores, final_counts))
     });
@@ -409,11 +421,7 @@ fn resolve_complex_variants(
     final_missing_counts: &mut [u32],
     mmap: &Arc<Mmap>,
 ) -> Result<(), PipelineError> {
-    // --- Early exit if there's no complex work to do (the common case) ---
-    if prep_result.complex_rules.is_empty() {
-        return Ok(());
-    }
-
+    // This function is guaranteed to only be called if `complex_rules` is not empty.
     let num_scores = prep_result.score_names.len();
 
     // --- Person-Centric Parallelism ---
@@ -436,11 +444,11 @@ fn resolve_complex_variants(
                     // ...find the first valid context that can explain the person's genotype.
                     for context in &group_rule.possible_contexts {
                         let (bim_idx, context_a1, context_a2) = context;
-                        let effect_a = &score_info.effect_allele;
 
                         // This context is only relevant if it actually contains the effect allele for THIS score.
-                        // This is a critical filter that makes the logic correct.
-                        if effect_a != context_a1 && effect_a != context_a2 {
+                        if &score_info.effect_allele != context_a1
+                            && &score_info.effect_allele != context_a2
+                        {
                             continue;
                         }
 
@@ -459,26 +467,27 @@ fn resolve_complex_variants(
 
                         // We found a valid, relevant, non-missing context. This is the "winning" interpretation
                         // for this person for this specific score.
-                        
-                        // Calculate the dosage of the score's specific effect allele based on
-                        // the packed genotype and the winning context's allele definitions.
+
+                        // In PLINK, allele2 is the default effect allele. A match on allele1 means the
+                        // variant is "flipped" relative to the default orientation.
+                        let is_flipped = &score_info.effect_allele == context_a1;
+
                         let dosage: f64 = match packed_geno {
-                            0b00 => { // Homozygous for context_a1
-                                if effect_a == context_a1 { 2.0 } else { 0.0 }
-                            },
-                            0b11 => { // Homozygous for context_a2
-                                if effect_a == context_a2 { 2.0 } else { 0.0 }
-                            },
-                            0b10 => { // Heterozygous for context_a1/context_a2
-                                // Because of the filter above, we know effect_a is one of these two.
-                                // In a heterozygote, the dosage of either is always 1.
-                                1.0
-                            },
+                            0b00 => if is_flipped { 2.0 } else { 0.0 }, // Homozygous for context_a1
+                            0b11 => if is_flipped { 0.0 } else { 2.0 }, // Homozygous for context_a2
+                            0b10 => 1.0,                               // Heterozygous
                             _ => unreachable!(), // `0b01` was handled by the continue.
                         };
 
-                        let adjustment = dosage * score_info.weight as f64;
-                        person_scores_slice[score_info.score_column_index.0] += adjustment;
+                        // Since complex variants are not in the master_baseline, we calculate their
+                        // absolute contribution directly.
+                        let contribution = if is_flipped {
+                            (2.0 - dosage) * (score_info.weight as f64)
+                        } else {
+                            dosage * (score_info.weight as f64)
+                        };
+
+                        person_scores_slice[score_info.score_column_index.0] += contribution;
 
                         was_resolved_for_this_score = true;
                         // We are done with this score_info; break the inner context-finding loop.
