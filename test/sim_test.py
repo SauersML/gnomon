@@ -256,7 +256,8 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
-    Runs the built-in comprehensive simple test case.
+    Runs a comprehensive, built-in test case to validate dosage calculations,
+    including complex multiallelic resolution and differential missingness.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -265,53 +266,75 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     print(f"Test files will be prefixed: {prefix}")
 
     def _generate_test_data():
+        """
+        Generates the in-memory data for the test case, including the new
+        individuals designed to test differential missingness.
+        """
         individuals = [
-            'id_hom_ref', 'id_het', 'id_hom_alt',
-            'id_new_person', 'id_special_case', 'id_multiallelic'
+            'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
+            'id_special_case', 'id_multiallelic', 'id_missing_AC', 'id_missing_AG'
         ]
+        
+        # Define all variants, including the multiallelic site at 1:50000
         bim_data = [
             {'chr':'1','id':'1:1000','cm':0,'pos':1000,'a1':'A','a2':'G'},
             {'chr':'1','id':'1:2000','cm':0,'pos':2000,'a1':'C','a2':'T'},
-            {'chr':'1','id':'1:3000','cm':0,'pos':3000,'a1':'A','a2':'T'}
-        ]
-        for i in range(50):
-            pos = 10000 + i
-            bim_data.append({'chr':'1','id':f'1:{pos}','cm':0,'pos':pos,'a1':'A','a2':'T'})
-        bim_data.extend([
-            {'chr':'1','id':'1:50000:A:C','cm':0,'pos':50000,'a1':'A','a2':'C'},
-            {'chr':'1','id':'1:50000:A:G','cm':0,'pos':50000,'a1':'A','a2':'G'},
+            {'chr':'1','id':'1:3000','cm':0,'pos':3000,'a1':'A','a2':'T'},
+            # A block of 50 variants for a more complex score
+            *[{'chr':'1','id':f'1:{10000+i}','cm':0,'pos':10000+i,'a1':'A','a2':'T'} for i in range(50)],
+            # The multiallelic site contexts
+            {'chr':'1','id':'1:50000:A:C','cm':0,'pos':50000,'a1':'A','a2':'C'}, # Context 1
+            {'chr':'1','id':'1:50000:A:G','cm':0,'pos':50000,'a1':'A','a2':'G'}, # Context 2
+            # A final variant to test multiallelic individuals
             {'chr':'1','id':'1:60000:T:C','cm':0,'pos':60000,'a1':'T','a2':'C'}
-        ])
+        ]
         bim_df = pd.DataFrame(bim_data)
 
+        # Define the score file. Note that 1:50000 is defined with an other_allele
+        # 'T' that does not perfectly match either BIM context, forcing permissive matching.
         score_data = [
-               {'variant_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
-               {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
-               {'variant_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7}
+            {'variant_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
+            {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
+            {'variant_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7},
+            *[{'variant_id':f'1:{10000+i}','effect_allele':'A','other_allele':'T','simple_score':0.1} for i in range(50)],
+            {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
+            {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
         ]
-        for i in range(50):
-            pos = 10000 + i
-            score_data.append({'variant_id':f'1:{pos}','effect_allele':'A','other_allele':'T','simple_score':0.1})
-        score_data.extend([
-               {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
-               {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
-        ])
         score_df = pd.DataFrame(score_data)
 
+        # Define all genotypes, initializing to missing (-1)
         genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-        genotypes_df.loc['1:1000','id_hom_ref'] = 0
-        genotypes_df.loc['1:2000','id_hom_ref'] = 0
-        genotypes_df.loc['1:1000','id_het'] = 1
-        genotypes_df.loc['1:1000','id_hom_alt'] = 2
-        genotypes_df.loc['1:2000','id_hom_alt'] = 2
-        genotypes_df.loc['1:3000','id_new_person'] = 1
-        special = [f'1:{10000+i}' for i in range(50)]
-        genotypes_df.loc[special[:10],'id_special_case'] = 0
-        genotypes_df.loc[special[10:40],'id_special_case'] = 1
-        genotypes_df.loc[special[40:],'id_special_case'] = 2
-        for m in ['1:50000:A:C','1:50000:A:G','1:60000:T:C']:
-            genotypes_df.loc[m,'id_multiallelic'] = 1
+        
+        # Standard cases
+        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
+        genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
+        genotypes_df.loc['1:1000', 'id_het'] = 1
+        genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
+        genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
+        genotypes_df.loc['1:3000', 'id_new_person'] = 1
 
+        # A mix of genotypes for id_special_case
+        special_variants = [f'1:{10000+i}' for i in range(50)]
+        genotypes_df.loc[special_variants[:10], 'id_special_case'] = 0
+        genotypes_df.loc[special_variants[10:40], 'id_special_case'] = 1
+        genotypes_df.loc[special_variants[40:], 'id_special_case'] = 2
+
+        # --- NEW & CRITICAL TEST CASES ---
+        # id_multiallelic: het for both contexts, forcing "first valid wins"
+        genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
+        genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
+        genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
+        
+        # id_missing_AC: missing for the A/C context, het for A/G
+        genotypes_df.loc['1:50000:A:C', 'id_missing_AC'] = -1
+        genotypes_df.loc['1:50000:A:G', 'id_missing_AC'] = 1
+        genotypes_df.loc['1:60000:T:C', 'id_missing_AC'] = 1
+        
+        # id_missing_AG: het for A/C context, missing for A/G
+        genotypes_df.loc['1:50000:A:C', 'id_missing_AG'] = 1
+        genotypes_df.loc['1:50000:A:G', 'id_missing_AG'] = -1
+        genotypes_df.loc['1:60000:T:C', 'id_missing_AG'] = 1
+        
         return bim_df, score_df, individuals, genotypes_df
 
     def _write_plink_files(prefix, bim_df, individuals, genotypes_df):
@@ -321,28 +344,48 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         bim_df[['chr','id','cm','pos','a1','a2']].to_csv(
             prefix.with_suffix(".bim"), sep='\t', header=False, index=False
         )
-        code_map = {0:0b00,1:0b10,2:0b11,-1:0b01}
+        code_map = {0:0b00, 1:0b10, 2:0b11, -1:0b01}
         n = len(individuals)
         with open(prefix.with_suffix(".bed"), 'wb') as f:
-            f.write(bytes([0x6c,0x1b,0x01]))
+            f.write(bytes([0x6c, 0x1b, 0x01]))
             for _, row in genotypes_df.iterrows():
                 for j in range(0, n, 4):
                     byte = 0
                     chunk = row.iloc[j:j+4]
                     for k, geno in enumerate(chunk):
                         byte |= (code_map[int(geno)] << (k*2))
-                    f.write(byte.to_bytes(1,'little'))
+                    f.write(byte.to_bytes(1, 'little'))
         print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
 
     def _write_score_file(filename, score_df):
         score_df.to_csv(filename, sep='\t', index=False)
         print(f"Programmatically wrote {filename}")
 
+    # Generate test data and calculate the corrected ground truth
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
-    truth_df = pd.DataFrame({'IID': individuals, 'SCORE_TRUTH': [0.0, 0.5, 0.3, -0.7, 0.1, 1.0]})
+
+    # --- Ground Truth Calculation ---
+    truth_sums = {
+        'id_hom_ref': (0*0.5) + (0*-0.2) + (0* -0.7),
+        'id_het': (1*0.5),
+        'id_hom_alt': (2*0.5) + (2*-0.2),
+        'id_new_person': (1*-0.7),
+        'id_special_case': (10*0*0.1) + (30*1*0.1) + (10*2*0.1),
+        'id_multiallelic': (1*10.0) + (1*1.0), # Finds A/C context, scores 10.0. Also scores 1:60000.
+        'id_missing_AC':   (1*10.0) + (1*1.0), # Skips A/C, finds A/G, scores 10.0. Also scores 1:60000.
+        'id_missing_AG':   (1*10.0) + (1*1.0), # Finds A/C, scores 10.0. Also scores 1:60000.
+    }
+    truth_counts = {
+        'id_hom_ref': 3, 'id_het': 1, 'id_hom_alt': 2, 'id_new_person': 1,
+        'id_special_case': 50, 'id_multiallelic': 2, 'id_missing_AC': 2, 'id_missing_AG': 2
+    }
+    truth_avg = {iid: truth_sums[iid] / truth_counts[iid] for iid in individuals}
+    truth_df = pd.DataFrame(list(truth_avg.items()), columns=['IID', 'SCORE_TRUTH'])
+
+    # Write files and run all tools
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(prefix.with_suffix(".score"), score_df)
-
+    
     # Run simple tests
     if not run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
                         "Simple Gnomon Test", cwd=workdir):
@@ -359,14 +402,21 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         return False
 
     print("\n--- Analyzing Simple Test Results ---")
-    gnomon_results = pd.read_csv(workdir / "simple_test.sscore", sep='\t')\
-                       .rename(columns={'#IID':'IID','simple_score_AVG':'SCORE_GNOMON'})[['IID','SCORE_GNOMON']]
+    gnomon_results_raw = pd.read_csv(workdir / "simple_test.sscore", sep='\t')
+    gnomon_results = gnomon_results_raw.rename(columns={
+        '#IID':'IID',
+        'simple_score_AVG':'SCORE_GNOMON',
+        'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'
+    })[['IID','SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
+
     plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep=r'\s+')\
                            .rename(columns={'#IID':'IID'})
     plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PLINK2']]
+    
     pylink_results_raw = pd.read_csv(workdir / "simple_pylink_results.sscore", sep='\t')\
                              .rename(columns={'#IID':'IID'})
     pylink_results = pylink_results_raw.assign(SCORE_PYLINK=pylink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PYLINK']]
+    
     merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left')\
                    .merge(plink_results, on='IID', how='left')\
                    .merge(pylink_results, on='IID', how='left')
@@ -374,27 +424,41 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     print("\n--- Comparison of Scores ---")
     print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
-    multiallelic_row = merged_df[merged_df['IID']=='id_multiallelic']
-    other_rows = merged_df[merged_df['IID']!='id_multiallelic']
+    # --- Enhanced Validation Logic ---
+    multiallelic_iids = ['id_multiallelic', 'id_missing_AC', 'id_missing_AG']
+    
+    # Validate Gnomon's scores and missing counts
+    gnomon_scores_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
+    gnomon_missing_ok = (merged_df['MISSING_PCT_GNOMON'] == 0.0).all()
+    is_gnomon_ok = gnomon_scores_ok and gnomon_missing_ok
 
-    is_gnomon_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_GNOMON'])\
-                   and np.allclose(multiallelic_row['SCORE_TRUTH'], multiallelic_row['SCORE_GNOMON'])
-    is_plink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PLINK2'])\
-                  and pd.isna(multiallelic_row['SCORE_PLINK2'].iloc[0])
-    is_pylink_ok = np.allclose(other_rows['SCORE_TRUTH'], other_rows['SCORE_PYLINK'])\
-                   and pd.isna(multiallelic_row['SCORE_PYLINK'].iloc[0])
+    # Validate PLINK2's behavior (correct on simple, fails on complex)
+    plink_simple_rows = merged_df[~merged_df['IID'].isin(multiallelic_iids)]
+    plink_complex_rows = merged_df[merged_df['IID'].isin(multiallelic_iids)]
+    plink_simple_ok = np.allclose(plink_simple_rows['SCORE_TRUTH'], plink_simple_rows['SCORE_PLINK2'])
+    plink_complex_ok = plink_complex_rows['SCORE_PLINK2'].isna().all()
+    is_plink_ok = plink_simple_ok and plink_complex_ok
 
+    # Validate PyLink's behavior (same as PLINK2)
+    pylink_simple_rows = merged_df[~merged_df['IID'].isin(multiallelic_iids)]
+    pylink_complex_rows = merged_df[merged_df['IID'].isin(multiallelic_iids)]
+    pylink_simple_ok = np.allclose(pylink_simple_rows['SCORE_TRUTH'], pylink_simple_rows['SCORE_PYLINK'])
+    pylink_complex_ok = pylink_complex_rows['SCORE_PYLINK'].isna().all()
+    is_pylink_ok = pylink_simple_ok and pylink_complex_ok
+    
     if is_gnomon_ok and is_plink_ok and is_pylink_ok:
         print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
         return True
     else:
         print("\n❌ Simple Dosage Test FAILED:")
-        if not is_gnomon_ok:
+        if not gnomon_scores_ok:
             print("  - Gnomon scores do not match ground truth.")
+        if not gnomon_missing_ok:
+            print("  - Gnomon missingness percentages are incorrect (should all be 0).")
         if not is_plink_ok:
-            print("  - PLINK2 scores/behavior do not match ground truth.")
+            print("  - PLINK2 scores/behavior do not match expected behavior.")
         if not is_pylink_ok:
-            print("  - PyLink scores/behavior do not match ground truth.")
+            print("  - PyLink scores/behavior do not match expected behavior.")
         return False
 
 def run_and_validate_tools(runtimes):
