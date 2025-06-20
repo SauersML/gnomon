@@ -116,37 +116,40 @@ pub fn prepare_for_computation(
     );
     let overall_start_time = Instant::now();
 
-    // Step 3a: Run compilation for each file in parallel, collecting results.
-    // The `collect` will propagate any error encountered during the parallel map.
-    let list_of_vecs: Vec<_> = score_files
+    // Step 3a: Run compilation for each file in parallel. The result is a list of tuples,
+    // where each tuple contains the fast-path and slow-path data for one score file.
+    let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<ComplexVariantRule>)> = score_files
         .par_iter()
         .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
         .collect::<Result<_, _>>()?;
 
-    // This sequential step flattens the list of lists into a single flat list.
-    let mut flat_score_data: Vec<((BimRowIndex, ScoreColumnIndex), (f32, bool))> = list_of_vecs
-        .into_iter()
-        .flatten()
-        .collect();
+    // Step 3b: Unzip the list of tuples into two separate collections, one for all simple
+    // mappings and one for all complex rules.
+    let (simple_mappings, complex_rules): (Vec<_>, Vec<_>) =
+        list_of_tuples.into_iter().unzip();
 
-    if flat_score_data.is_empty() {
+    // Flatten each collection into a single master list for each path.
+    let mut flat_score_data: Vec<SimpleMapping> = simple_mappings.into_iter().flatten().collect();
+    let all_complex_rules: Vec<ComplexVariantRule> = complex_rules.into_iter().flatten().collect();
+
+    // Step 3c: Check for overlapping variants. Only fail if BOTH paths are empty.
+    if flat_score_data.is_empty() && all_complex_rules.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
     }
 
-    // Step 3b: Perform a highly optimized parallel sort. This is the core of the strategy,
-    // grouping all identical `(BimRowIndex, ScoreColumnIndex)` keys adjacently.
+    // Step 3d: Perform a highly optimized parallel sort on the fast-path data. This
+    // groups all identical `(BimRowIndex, ScoreColumnIndex)` keys adjacently.
     flat_score_data.par_sort_unstable_by_key(|(key, _value)| *key);
 
-    // Step 3c: Perform a single, fast linear scan to detect duplicates. This is efficient
-    // because any duplicates are now guaranteed to be next to each other.
+    // Step 3e: Perform a single, fast linear scan to detect duplicates in the fast path.
     if let Some(windows) = flat_score_data.windows(2).find(|w| w[0].0 == w[1].0) {
         let duplicate_key = windows[0].0;
         return Err(PrepError::Parse(format!(
-            "Ambiguous input: The variant-score pair (BIM row {}, Score column {}) was defined more than once.",
+            "Ambiguous input: The variant-score pair (BIM row {}, Score column {}) was defined more than once in the simple path.",
             duplicate_key.0.0, duplicate_key.1.0
         )));
     }
-    eprintln!("> TIMING: Pass 3 (Compilation & Sort) took {:.2?}", overall_start_time.elapsed());
+    eprintln!("> TIMING: Pass 3 (Compilation & Segregation) took {:.2?}", overall_start_time.elapsed());
 
     // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
     eprintln!("> Pass 4: Building final variant index and regrouping work...");
