@@ -364,3 +364,135 @@ fn process_dense_stream(
     // We extract the scores and counts, discarding the reusable buffer.
     Ok((final_result.0, final_result.1))
 }
+
+
+/// A small, inlineable helper to read a 2-bit packed genotype from the memory-mapped
+/// .bed file. This encapsulates the complex byte and bit offset calculations.
+///
+/// # Arguments
+/// * `mmap`: A slice representing the entire memory-mapped .bed file.
+/// * `bytes_per_variant`: The number of bytes for each variant's data, pre-calculated.
+/// * `bim_row_index`: The 0-based row index of the variant in the original .bim file.
+/// * `fam_index`: The 0-based index of the person in the original .fam file.
+///
+/// # Returns
+/// A `u8` containing the 2-bit genotype (`00`, `01`, `10`, or `11`).
+#[inline(always)]
+fn get_packed_genotype(
+    mmap: &[u8],
+    bytes_per_variant: u64,
+    bim_row_index: BimRowIndex,
+    fam_index: u32,
+) -> u8 {
+    // The +3 skips the PLINK .bed file magic number (0x6c, 0x1b, 0x01).
+    let variant_start_offset = (3 + bim_row_index.0 as u64 * bytes_per_variant) as usize;
+    let person_byte_offset = (fam_index / 4) as usize;
+    let final_byte_offset = variant_start_offset + person_byte_offset;
+
+    // Each person's genotype is 2 bits. We find which 2-bit slot in the byte it is.
+    let bit_offset_in_byte = (fam_index % 4) * 2;
+
+    // This indexing is safe because the preparation phase guarantees all indices are valid.
+    let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
+    (packed_byte >> bit_offset_in_byte) & 0b11
+}
+
+/// The "slow path" resolver for complex, multiallelic variants.
+///
+/// This function runs *after* the main high-performance pipeline is complete. It
+/// iterates through each person and resolves their score contributions for the small
+/// set of variants that could not be handled by the fast path. It is designed to be
+/// memory-efficient and parallel.
+fn resolve_complex_variants(
+    prep_result: &Arc<PreparationResult>,
+    final_scores: &mut [f64],
+    final_missing_counts: &mut [u32],
+    mmap: &Arc<Mmap>,
+) -> Result<(), PipelineError> {
+    // --- Early exit if there's no complex work to do (the common case) ---
+    if prep_result.complex_rules.is_empty() {
+        return Ok(());
+    }
+
+    let num_scores = prep_result.score_names.len();
+
+    // --- Person-Centric Parallelism ---
+    // We iterate over people in parallel, which is highly efficient because each
+    // person's final score is independent of all others.
+    final_scores
+        .par_chunks_mut(num_scores)
+        .zip(final_missing_counts.par_chunks_mut(num_scores))
+        .enumerate()
+        .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+            // Get the person's original index, which is the key to reading their genotype data.
+            let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+
+            // --- Loop over each unique complex variant rule ---
+            for group_rule in &prep_result.complex_rules {
+                // For each score that uses this complex variant...
+                for score_info in &group_rule.score_applications {
+                    let mut was_resolved_for_this_score = false;
+
+                    // ...find the first valid context that can explain the person's genotype.
+                    for context in &group_rule.possible_contexts {
+                        let (bim_idx, context_a1, context_a2) = context;
+                        let effect_a = &score_info.effect_allele;
+
+                        // This context is only relevant if it actually contains the effect allele for THIS score.
+                        // This is a critical filter that makes the logic correct.
+                        if effect_a != context_a1 && effect_a != context_a2 {
+                            continue;
+                        }
+
+                        let packed_geno = get_packed_genotype(
+                            mmap,
+                            prep_result.bytes_per_variant,
+                            *bim_idx,
+                            original_fam_idx,
+                        );
+
+                        // A packed value of `01` means the genotype is missing in the .bed file for this context.
+                        // If it's missing, this context is not valid for this person, so we try the next one.
+                        if packed_geno == 0b01 {
+                            continue;
+                        }
+
+                        // We found a valid, relevant, non-missing context. This is the "winning" interpretation
+                        // for this person for this specific score.
+                        
+                        // Calculate the dosage of the score's specific effect allele based on
+                        // the packed genotype and the winning context's allele definitions.
+                        let dosage: f64 = match packed_geno {
+                            0b00 => { // Homozygous for context_a1
+                                if effect_a == context_a1 { 2.0 } else { 0.0 }
+                            },
+                            0b11 => { // Homozygous for context_a2
+                                if effect_a == context_a2 { 2.0 } else { 0.0 }
+                            },
+                            0b10 => { // Heterozygous for context_a1/context_a2
+                                // Because of the filter above, we know effect_a is one of these two.
+                                // In a heterozygote, the dosage of either is always 1.
+                                1.0
+                            },
+                            _ => unreachable!(), // `0b01` was handled by the continue.
+                        };
+
+                        let adjustment = dosage * score_info.weight as f64;
+                        person_scores_slice[score_info.score_column_index.0] += adjustment;
+
+                        was_resolved_for_this_score = true;
+                        // We are done with this score_info; break the inner context-finding loop.
+                        break;
+                    }
+
+                    // If, after checking all relevant contexts, we couldn't resolve the score,
+                    // then this person's genotype is truly missing for this score entry.
+                    if !was_resolved_for_this_score {
+                        person_counts_slice[score_info.score_column_index.0] += 1;
+                    }
+                }
+            }
+        });
+
+    Ok(())
+}
