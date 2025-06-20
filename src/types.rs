@@ -20,18 +20,29 @@ pub enum ComputePath {
     PersonMajor,
 }
 
-// A self-contained unit of work for a variant that requires deferred, complex resolution.
+/// Contains the score-specific information for a complex variant.
+/// This is the part of a rule that changes for each score file.
 #[derive(Debug, Clone)]
-pub struct ComplexVariantRule {
-    /// The effect allele as defined in the score file.
+pub struct ScoreInfo {
+    /// The effect allele as defined in the score file. This could theoretically
+    /// differ between scores for the same variant.
     pub effect_allele: String,
-    /// The effect weight for a specific score.
+    /// The effect weight for this specific score.
     pub weight: f32,
     /// The global column index for the score this rule applies to.
     pub score_column_index: ScoreColumnIndex,
-    /// A list of all plausible BIM contexts (genotype definitions) that this
-    /// variant could be interpreted under.
+}
+
+/// A self-contained, grouped unit of work for a single unique complex variant.
+/// This struct holds information that is shared across all scores that use this variant.
+#[derive(Debug, Clone)]
+pub struct GroupedComplexRule {
+    /// A list of all plausible BIM contexts (genotype definitions). This data is
+    /// now stored only once per complex variant, not duplicated for every score.
     pub possible_contexts: Vec<(BimRowIndex, String, String)>, // (BimRowIndex, allele1, allele2)
+
+    /// A list of all scores that apply to this set of contexts.
+    pub score_applications: Vec<ScoreInfo>,
 }
 
 /// Defines the subset of individuals to be processed by the engine.
@@ -67,10 +78,10 @@ pub struct PreparationResult {
     /// This is used by the I/O producer to filter the `.bed` file for all
     /// simple, unambiguous variants.
     pub required_bim_indices: Vec<BimRowIndex>,
-    /// A list of self-contained rules for variants that require complex, deferred
-    /// resolution (the "slow path"). This is typically for multiallelic sites.
-    /// This list will be empty for the vast majority of runs.
-    pub complex_rules: Vec<ComplexVariantRule>,
+    /// A list of self-contained, grouped rules for variants that require complex,
+    /// deferred resolution (the "slow path"). Each rule represents one unique
+    /// complex variant and all scores that use it.
+    pub complex_rules: Vec<GroupedComplexRule>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
     pub person_fam_to_output_idx: Vec<Option<u32>>,
@@ -113,7 +124,7 @@ impl PreparationResult {
         flip_mask_matrix: Vec<u8>,
         stride: usize,
         required_bim_indices: Vec<BimRowIndex>,
-        complex_rules: Vec<ComplexVariantRule>,
+        complex_rules: Vec<GroupedComplexRule>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
         variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
