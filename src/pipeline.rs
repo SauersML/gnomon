@@ -470,6 +470,30 @@ fn resolve_complex_variants(
                         // We found a valid, relevant, non-missing context. This is the "winning" interpretation
                         // for this person for this specific score.
 
+                        // Decode the dosage of the effect allele directly. The PLINK .bed file encodes
+                        // genotypes relative to the (allele1, allele2) pair from the .bim file.
+                        // 0b00 = homozygous for allele1; 0b11 = homozygous for allele2.
+                        let dosage: f64 = if &score_info.effect_allele == context_a1 {
+                            // The effect allele for this score is the first allele in the BIM context.
+                            match packed_geno {
+                                0b00 => 2.0, // Homozygous for effect allele.
+                                0b10 => 1.0, // Heterozygous.
+                                0b11 => 0.0, // Homozygous for the other allele.
+                                _ => unreachable!(), // 0b01 (missing) was handled earlier.
+                            }
+                        } else {
+                            // The effect allele for this score is the second allele in the BIM context.
+                            match packed_geno {
+                                0b00 => 0.0, // Homozygous for the other allele.
+                                0b10 => 1.0, // Heterozygous.
+                                0b11 => 2.0, // Homozygous for effect allele.
+                                _ => unreachable!(),
+                            }
+                        };
+
+                        // Since complex variants are not part of the master_baseline, their
+                        // score contribution is calculated directly and added.
+                        let contribution = dosage * (score_info.weight as f64);
                         person_scores_slice[score_info.score_column_index.0] += contribution;
 
                         was_resolved_for_this_score = true;
