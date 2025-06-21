@@ -187,7 +187,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         """Generates the in-memory data for the simple test case."""
         individuals = [
             'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
-            'id_special_case', 'id_multiallelic', 'id_missing_AC', 'id_missing_AG'
+            'id_special_case', 'id_multi_AC', 'id_multi_AG', 'id_multi_CG'
         ]
         bim_data = [
             {'chr':'1','id':'1:1000','cm':0,'pos':1000,'a1':'A','a2':'G'},
@@ -204,7 +204,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
             {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
             {'variant_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7},
             *[{'variant_id':f'1:{10000+i}','effect_allele':'A','other_allele':'T','simple_score':0.1} for i in range(50)],
-            {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
+            {'variant_id':'1:50000','effect_allele':'C','other_allele':'A','simple_score':10.0},
+            {'variant_id':'1:50000','effect_allele':'G','other_allele':'A','simple_score':-5.0},
             {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
         ]
         score_df = pd.DataFrame(score_data)
@@ -219,15 +220,21 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         genotypes_df.loc[special_variants[:10], 'id_special_case'] = 2
         genotypes_df.loc[special_variants[10:40], 'id_special_case'] = 1
         genotypes_df.loc[special_variants[40:], 'id_special_case'] = 0
-        genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:50000:A:C', 'id_missing_AC'] = -1
-        genotypes_df.loc['1:50000:A:G', 'id_missing_AC'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_missing_AC'] = 1
-        genotypes_df.loc['1:50000:A:C', 'id_missing_AG'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_missing_AG'] = -1
-        genotypes_df.loc['1:60000:T:C', 'id_missing_AG'] = 1
+        
+        # Test Case: Individual has A/C. Genotype for A/G is missing.
+        genotypes_df.loc['1:50000:A:C', 'id_multi_AC'] = 1
+        genotypes_df.loc['1:50000:A:G', 'id_multi_AC'] = -1
+        genotypes_df.loc['1:60000:T:C', 'id_multi_AC'] = 1
+        
+        # Test Case: Individual has A/G. Genotype for A/C is missing.
+        genotypes_df.loc['1:50000:A:C', 'id_multi_AG'] = -1
+        genotypes_df.loc['1:50000:A:G', 'id_multi_AG'] = 1
+        genotypes_df.loc['1:60000:T:C', 'id_multi_AG'] = 1
+
+        # Test Case: Individual has C/G.
+        genotypes_df.loc['1:50000:A:C', 'id_multi_CG'] = 1
+        genotypes_df.loc['1:50000:A:G', 'id_multi_CG'] = 1
+        genotypes_df.loc['1:60000:T:C', 'id_multi_CG'] = 1
         return bim_df, score_df, individuals, genotypes_df
 
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
@@ -235,45 +242,85 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         truth_sums = {iid: 0.0 for iid in individuals}
         variants_used = {iid: 0 for iid in individuals}
         variants_missing = {iid: 0 for iid in individuals}
+        # This test case should no longer produce errors.
         iids_expected_to_fail = set()
-        bim_lookup = bim_df.groupby(bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str))
+        
+        # Pre-process genotypes to resolve multiallelic sites into a single biological truth
+        resolved_genotypes = {}
+        bim_grouped_by_pos = bim_df.groupby(['chr', 'pos'])
+        for iid in individuals:
+            resolved_genotypes[iid] = {}
+            for (chrom, pos), group in bim_grouped_by_pos:
+                alleles = []
+                has_missing = False
+                # Check all .bim rows for this physical location
+                for _, bim_row in group.iterrows():
+                    genotype_val = genotypes_df.loc[bim_row['id'], iid]
+                    if genotype_val == -1:
+                        has_missing = True
+                        continue
+                    # Add alleles based on genotype (count of allele a2)
+                    alleles.extend([bim_row['a1']] * (2 - genotype_val))
+                    alleles.extend([bim_row['a2']] * genotype_val)
+                
+                # Consolidate alleles, removing the reference 'A's to find the true genotype
+                unique_alleles = [a for a in alleles if a != bim_row['a1']]
+                # Add back one reference allele if only one alt allele was found
+                if len(unique_alleles) == 1:
+                    unique_alleles.append(bim_row['a1'])
+                # If no alt alleles, it's homozygous reference
+                elif len(unique_alleles) == 0 and not has_missing:
+                    unique_alleles = [bim_row['a1'], bim_row['a1']]
+                
+                if len(unique_alleles) > 2:
+                    # This would be an error condition, but our test data is valid.
+                    iids_expected_to_fail.add(iid)
+                elif len(unique_alleles) > 0:
+                    resolved_genotypes[iid][(chrom, pos)] = tuple(sorted(unique_alleles))
+                # If completely missing, it remains unresolved.
 
+        # Calculate scores based on the resolved genotypes
         for iid in individuals:
             if iid in iids_expected_to_fail: continue
             for _, score_row in score_df.iterrows():
-                variant_id, effect_allele, weight = score_row['variant_id'], score_row['effect_allele'], score_row['simple_score']
-                try:
-                    possible_contexts = bim_lookup.get_group(variant_id)
-                except KeyError:
-                    variants_missing[iid] += 1
-                    continue
-                valid_interpretations = []
-                genotype_is_missing = True
-                for _, ctx in possible_contexts.iterrows():
-                    genotype = genotypes_df.loc[ctx['id'], iid]
-                    if genotype != -1:
-                        genotype_is_missing = False
-                        dosage = -1
-                        if effect_allele == ctx['a2']: dosage = float(genotype)
-                        elif effect_allele == ctx['a1']: dosage = 2.0 - float(genotype)
-                        if dosage != -1: valid_interpretations.append(dosage)
-                if genotype_is_missing:
-                    variants_missing[iid] += 1
-                elif len(valid_interpretations) == 1:
-                    truth_sums[iid] += valid_interpretations[0] * weight
+                chrom, pos_str = score_row['variant_id'].split(':')[:2]
+                pos = int(pos_str)
+                effect_allele = score_row['effect_allele']
+                weight = score_row['simple_score']
+
+                if (chrom, pos) in resolved_genotypes[iid]:
+                    genotype = resolved_genotypes[iid][(chrom, pos)]
+                    dosage = float(genotype.count(effect_allele))
+                    truth_sums[iid] += dosage * weight
                     variants_used[iid] += 1
-                elif len(valid_interpretations) > 1:
-                    iids_expected_to_fail.add(iid)
-                    break # This individual is invalid, stop processing them
+                else:
+                    variants_missing[iid] += 1
+        
+        # The logic for counting used variants must be adjusted for multiallelic sites
+        # A single locus (e.g. 1:50000) can have multiple score rules.
+        # We need to count loci, not score rows.
+        unique_score_loci = score_df['variant_id'].nunique()
+        for iid in individuals:
+            used_loci = set()
+            missing_loci = set()
+            for _, score_row in score_df.iterrows():
+                chrom, pos_str = score_row['variant_id'].split(':')[:2]
+                pos = int(pos_str)
+                if (chrom, int(pos)) in resolved_genotypes.get(iid, {}):
+                    used_loci.add(score_row['variant_id'])
+                else:
+                    missing_loci.add(score_row['variant_id'])
+            
+            variants_used[iid] = len(used_loci)
+            # A locus is only missing if it's not used.
+            variants_missing[iid] = len(missing_loci - used_loci)
+
         truth_data = []
-        total_vars = len(score_df)
         for iid in individuals:
             if iid in iids_expected_to_fail:
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
                 avg_score = truth_sums[iid] / variants_used[iid] if variants_used[iid] > 0 else 0.0
-                # Definition: (number of variants with missing genotype) / (number of variants used + number of variants with missing genotype)
-                # This matches gnomon's behavior. Variants that don't match alleles are just ignored.
                 denominator = variants_used[iid] + variants_missing[iid]
                 missing_pct = (variants_missing[iid] / denominator) * 100.0 if denominator > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
@@ -292,18 +339,12 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     if gnomon_result is None:
         print("❌ Gnomon test could not be run.")
     elif gnomon_result.returncode != 0:
-        found_expected_error = False
-        if iids_expected_to_fail:
-            for iid in iids_expected_to_fail:
-                if iid in gnomon_result.stderr and "inconsistent genotypes" in gnomon_result.stderr:
-                    print(f"✅ Gnomon correctly failed due to inconsistent data for IID '{iid}'.")
-                    found_expected_error = True
-                    is_gnomon_ok = True
-                    break
-        if not found_expected_error:
-            print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_result.stderr}")
+        # With the corrected biological data, Gnomon should no longer fail.
+        # Any failure is now unexpected.
+        print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_result.stderr}")
     else: # Gnomon succeeded (returncode == 0)
         if iids_expected_to_fail:
+            # This should not happen with the new test data.
             print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
         else:
             try:
