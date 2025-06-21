@@ -175,6 +175,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     Runs a comprehensive, built-in test case to validate dosage calculations,
     including complex multiallelic resolution, differential missingness, and
     detection of biologically inconsistent genotypes.
+    This test will fail the entire script if Gnomon's results cannot be verified.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -247,73 +248,90 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                     variants_missing[iid] += 1
                     continue
                 valid_interpretations = []
+                genotype_is_missing = True
                 for _, ctx in possible_contexts.iterrows():
                     genotype = genotypes_df.loc[ctx['id'], iid]
                     if genotype != -1:
+                        genotype_is_missing = False
                         dosage = -1
                         if effect_allele == ctx['a2']: dosage = float(genotype)
                         elif effect_allele == ctx['a1']: dosage = 2.0 - float(genotype)
                         if dosage != -1: valid_interpretations.append(dosage)
-                if len(valid_interpretations) == 0:
+                if genotype_is_missing:
                     variants_missing[iid] += 1
                 elif len(valid_interpretations) == 1:
                     truth_sums[iid] += valid_interpretations[0] * weight
                     variants_used[iid] += 1
-                else:
+                elif len(valid_interpretations) > 1:
                     iids_expected_to_fail.add(iid)
-                    break
+                    break # This individual is invalid, stop processing them
         truth_data = []
+        total_vars = len(score_df)
         for iid in individuals:
             if iid in iids_expected_to_fail:
-                truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': 100.0})
+                truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
-                total_vars = len(score_df)
                 avg_score = truth_sums[iid] / variants_used[iid] if variants_used[iid] > 0 else 0.0
-                missing_pct = (variants_missing[iid] / total_vars) * 100.0 if total_vars > 0 else 0.0
+                # Definition: (number of variants with missing genotype) / (number of variants used + number of variants with missing genotype)
+                # This matches gnomon's behavior. Variants that don't match alleles are just ignored.
+                denominator = variants_used[iid] + variants_missing[iid]
+                missing_pct = (variants_missing[iid] / denominator) * 100.0 if denominator > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
         return pd.DataFrame(truth_data), iids_expected_to_fail
 
+    # --- Main test logic ---
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
     truth_df, iids_expected_to_fail = _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df)
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(prefix.with_suffix(".score"), score_df)
 
     gnomon_result = run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name], "Simple Gnomon Test", workdir)
-    
     print("\n--- Analyzing Simple Test Results ---")
     is_gnomon_ok = False
+
     if gnomon_result is None:
         print("❌ Gnomon test could not be run.")
     elif gnomon_result.returncode != 0:
         found_expected_error = False
-        for iid in iids_expected_to_fail:
-            if iid in gnomon_result.stderr:
-                print(f"✅ Gnomon correctly failed due to inconsistent data for IID '{iid}'.")
-                found_expected_error = True
-                is_gnomon_ok = True
-                break
+        if iids_expected_to_fail:
+            for iid in iids_expected_to_fail:
+                if iid in gnomon_result.stderr and "inconsistent genotypes" in gnomon_result.stderr:
+                    print(f"✅ Gnomon correctly failed due to inconsistent data for IID '{iid}'.")
+                    found_expected_error = True
+                    is_gnomon_ok = True
+                    break
         if not found_expected_error:
             print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_result.stderr}")
-    else:
+    else: # Gnomon succeeded (returncode == 0)
         if iids_expected_to_fail:
             print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
         else:
             try:
-                gnomon_results_raw = pd.read_csv(workdir / "simple_test.sscore", sep='\t')
-                gnomon_results = gnomon_results_raw.rename(columns={'#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'})
-                merged = pd.merge(truth_df, gnomon_results, on='IID', how='inner')
+                gnomon_output_path = workdir / "simple_test.sscore"
+                if not gnomon_output_path.exists():
+                    raise FileNotFoundError("Gnomon ran successfully but did not produce the output .sscore file.")
+                gnomon_results_raw = pd.read_csv(gnomon_output_path, sep='\t')
+                gnomon_results = gnomon_results_raw.rename(columns={'#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'})[['IID', 'SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
+                merged = pd.merge(truth_df, gnomon_results, on='IID', how='outer')
+
+                print("\n--- Simple Dosage Test: Full Results Table ---")
+                print("WHO (what sample) got WHICH SCORE and by WHICH tool:")
+                print(merged[['IID', 'SCORE_TRUTH', 'SCORE_GNOMON', 'MISSING_PCT_TRUTH', 'MISSING_PCT_GNOMON']].to_markdown(index=False, floatfmt=".6f"))
+
                 scores_ok = np.allclose(merged['SCORE_TRUTH'], merged['SCORE_GNOMON'], equal_nan=True)
                 missing_ok = np.allclose(merged['MISSING_PCT_TRUTH'], merged['MISSING_PCT_GNOMON'], equal_nan=True)
+
                 if scores_ok and missing_ok:
-                    print("✅ Gnomon scores and missingness percentages are correct.")
+                    print("\n✅ Verification successful: Gnomon scores and missingness percentages match the ground truth.")
                     is_gnomon_ok = True
                 else:
-                    if not scores_ok: print("  - Gnomon scores do not match biologically accurate truth.")
-                    if not missing_ok: print("  - Gnomon missingness percentages do not match biologically accurate truth.")
-                    print("--- Comparison Table ---")
-                    print(merged.to_markdown(index=False, floatfmt=".6f"))
+                    print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
+                    if not scores_ok: print("  - Mismatch found in scores.")
+                    if not missing_ok: print("  - Mismatch found in missingness percentages.")
             except Exception as e:
                 print(f"❌ Failed to parse or validate Gnomon's output file: {e}")
+                import traceback
+                traceback.print_exc()
 
     if is_gnomon_ok:
         print("\n✅ Simple Dosage Test SUCCEEDED.")
@@ -362,7 +380,7 @@ def run_and_validate_tools(runtimes):
     def setup_tools():
         _print_header("Step A: Setting up tools")
         if not GNOMON_BINARY_PATH.exists():
-            print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'.")
+            print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'. Please build it first with 'cargo build --release'.")
             return False
         if not PLINK2_BINARY_PATH.exists():
             print(f"  > Downloading PLINK2 to '{PLINK2_BINARY_PATH}'...")
@@ -406,6 +424,8 @@ def run_and_validate_tools(runtimes):
             return False
 
     if not setup_tools(): return False
+    
+    # Run simple dosage test. If it fails, the entire script's success is compromised.
     if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
         overall_success = False
 
@@ -415,8 +435,10 @@ def run_and_validate_tools(runtimes):
     
     gnomon_res = run_command([GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX.name}.gnomon.score", OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR)
     if not (gnomon_res and gnomon_res.returncode == 0):
+        print("❌ Gnomon failed to run on the large-scale dataset.")
         overall_success = False
-
+    
+    # Only analyze if the run was successful and previous steps haven't failed.
     if overall_success and not analyze_large_scale_results():
         overall_success = False
 
@@ -452,8 +474,17 @@ def main():
         write_output_files(prs_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
         print("\n--- Simulation and File Writing Finished Successfully ---")
         if not run_and_validate_tools(runtimes):
+            print("\n" + "!"*80)
+            print("! OVERALL VALIDATION FAILED: Gnomon's results could not be verified.")
+            print("!"*80)
             exit_code = 1
+        else:
+            print("\n" + "✓"*80)
+            print("✓ OVERALL VALIDATION SUCCEEDED: All tests passed and results were verified.")
+            print("✓"*80)
+
     except Exception as e:
+        import traceback
         print(f"\n--- An unexpected error occurred: {e} ---", file=sys.stderr)
         traceback.print_exc()
         exit_code = 1
@@ -463,5 +494,4 @@ def main():
     sys.exit(exit_code)
 
 if __name__ == "__main__":
-    import traceback
     main()
