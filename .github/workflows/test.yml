@@ -29,7 +29,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Detect if any Rust-relevant files changed ------------------------------
+      - name: Detect Rust source changes
+        id: rust_changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/*.rs'
+
+      # -----------------------------------------------------------------------
+
       - name: Install Rust nightly
+        if: steps.rust_changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Generate cache keys
@@ -69,26 +83,28 @@ jobs:
 
       - name: Run Rust unit tests
         id: test_step
+        if: steps.rust_changes.outputs.rust == 'true'
         run: cargo +nightly test
         continue-on-error: true
 
       - name: Install getdoc
-        if: steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
+        if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
         run: cargo +nightly install getdoc --locked
 
       - name: Generate custom report with getdoc
-        if: steps.test_step.outcome == 'failure'
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
         run: |
           ~/.cargo/bin/getdoc --features default
           cat report.md
 
       - name: Build Gnomon binaries (Release and Profiling)
+        if: steps.rust_changes.outputs.rust == 'true'
         run: |
           cargo build --release
           cargo build --profile profiling --features no-inline-profiling
       
       - name: Fail job if unit tests failed
-        if: steps.test_step.outcome == 'failure'
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
         run: exit 1
 
       - name: Upload build artifacts for all downstream jobs
@@ -99,6 +115,7 @@ jobs:
             target
             report.md
           retention-days: 1
+          if-no-files-found: ignore   # safely handles “no rebuild” case
 
   python_test_integration:
     runs-on: ubuntu-latest
