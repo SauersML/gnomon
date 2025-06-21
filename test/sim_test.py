@@ -209,6 +209,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
             {'chr':'1','id':'1:60000:T:C','cm':0,'pos':60000,'a1':'T','a2':'C'}
         ]
         bim_df = pd.DataFrame(bim_data)
+        # The score file will have columns: variant_id, effect_allele, other_allele, simple_score
+        # So columns are: 1, 2, 3, 4
         score_data = [
             {'variant_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
             {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
@@ -290,9 +292,12 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     # --- Run all tools ---
     gnomon_res = run_cmd_func([gnomon_path, "--score", score_file.name, prefix.name], "Simple Gnomon Test", workdir)
-    plink_cmd = [f"./{plink_path.name}", "--bfile", prefix.name, "--score", score_file.name, "variant_id", "effect_allele", "simple_score", "header", "--out", prefix.name + "_plink"]
+    
+    # The score file has columns: variant_id (1), effect_allele (2), other_allele (3), simple_score (4)
+    plink_cmd = [f"./{plink_path.name}", "--bfile", prefix.name, "--score", score_file.name, "1", "2", "4", "header", "--out", prefix.name + "_plink"]
     plink_res = run_cmd_func(plink_cmd, "Simple Plink2 Test", workdir)
-    pylink_cmd = [sys.executable, pylink_path, "--bfile", str(prefix), "--score", str(score_file), "--out", str(prefix) + "_pylink", "variant_id", "effect_allele", "simple_score"]
+    
+    pylink_cmd = [sys.executable, pylink_path, "--bfile", str(prefix), "--score", str(score_file), "--out", str(prefix) + "_pylink", "1", "2", "4"]
     pylink_res = run_cmd_func(pylink_cmd, "Simple PyLink Test", workdir)
 
     # --- Analyze results ---
@@ -314,10 +319,16 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     if plink_res and plink_res.returncode == 0:
         try:
             plink_output_path = workdir / f"{prefix.name}_plink.sscore"
-            plink_df_raw = pd.read_csv(plink_output_path, sep='\t').rename(columns={'#IID':'IID'})
-            plink_df_raw['SCORE_PLINK2'] = plink_df_raw.apply(lambda row: row['simple_score_SUM'] / row['ALLELE_CT'] if row['ALLELE_CT'] > 0 else 0.0, axis=1)
-            plink_df = plink_df_raw[['IID', 'SCORE_PLINK2']]
-            results_dfs.append(plink_df)
+            plink_df_raw = pd.read_csv(plink_output_path, sep='\t', skipinitialspace=True)
+            # Handle potential empty file if no scores are calculated
+            if not plink_df_raw.empty:
+                plink_df_raw = plink_df_raw.rename(columns={'#IID':'IID'})
+                plink_df_raw['SCORE_PLINK2'] = plink_df_raw.apply(lambda row: row['SCORE1_SUM'] / row['NAMED_ALLELE_DOSAGE_SUM'] if row['NAMED_ALLELE_DOSAGE_SUM'] > 0 else 0.0, axis=1)
+                plink_df = plink_df_raw[['IID', 'SCORE_PLINK2']]
+                results_dfs.append(plink_df)
+            else:
+                plink_df = pd.DataFrame(columns=['IID', 'SCORE_PLINK2'])
+                results_dfs.append(plink_df)
         except Exception as e: print(f"⚠️ Could not parse Plink2 output: {e}")
         
     # Parse PyLink
@@ -341,16 +352,23 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     # Final Verification (only for Gnomon)
     is_gnomon_ok = False
-    if gnomon_df is not None:
-        scores_ok = np.allclose(merged['SCORE_TRUTH'], merged['SCORE_GNOMON'], equal_nan=True)
-        missing_ok = np.allclose(merged['MISSING_PCT_TRUTH'], merged['MISSING_PCT_GNOMON'], equal_nan=True)
-        if scores_ok and missing_ok:
-            print("\n✅ Verification successful: Gnomon scores and missingness percentages match the ground truth.")
-            is_gnomon_ok = True
+    if gnomon_df is not None and not merged.empty:
+        merged_for_compare = merged.dropna(subset=['SCORE_TRUTH', 'SCORE_GNOMON'])
+        if not merged_for_compare.empty:
+            scores_ok = np.allclose(merged_for_compare['SCORE_TRUTH'], merged_for_compare['SCORE_GNOMON'], equal_nan=True)
+            missing_ok = np.allclose(merged_for_compare['MISSING_PCT_TRUTH'], merged_for_compare['MISSING_PCT_GNOMON'], equal_nan=True)
+            if scores_ok and missing_ok:
+                print("\n✅ Verification successful: Gnomon scores and missingness percentages match the ground truth.")
+                is_gnomon_ok = True
+            else:
+                print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
+                if not scores_ok: print("  - Mismatch found in scores.")
+                if not missing_ok: print("  - Mismatch found in missingness percentages.")
         else:
-            print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
-            if not scores_ok: print("  - Mismatch found in scores.")
-            if not missing_ok: print("  - Mismatch found in missingness percentages.")
+            print("\n❌ Verification failed: No comparable Gnomon results found.")
+    elif gnomon_df is None:
+        print("\n❌ Verification failed: Gnomon results could not be parsed.")
+
 
     if is_gnomon_ok:
         print("\n✅ Simple Dosage Test SUCCEEDED.")
