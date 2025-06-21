@@ -432,7 +432,8 @@ def run_and_validate_tools(runtimes):
             return False
 
     if not setup_tools(): return False
-    if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, run_command):
+    PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
+    if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
         overall_success = False
 
     print("\n" + "="*80)
