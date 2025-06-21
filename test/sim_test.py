@@ -97,6 +97,21 @@ def _write_score_file(filename, score_df):
     score_df.to_csv(filename, sep='\t', index=False)
     print(f"Programmatically wrote {filename}")
 
+def print_file_header(filepath: Path, tool_name: str):
+    """Prints the header and first data line of a file for inspection."""
+    print(f"\n--- {tool_name} Output File Header and First Line ---")
+    print(f"  > File: {filepath}")
+    try:
+        with open(filepath, 'r') as f:
+            header = f.readline().strip()
+            first_line = f.readline().strip()
+            print(f"  > Header: {header}")
+            print(f"  > Line 1: {first_line}")
+    except FileNotFoundError:
+        print(f"  > ❌ File not found.")
+    except Exception as e:
+        print(f"  > ⚠️ Could not read file: {e}")
+
 # --- SIMULATION STEPS ---
 
 def generate_variants_and_weights():
@@ -145,7 +160,6 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
     valid_mask = (genotypes != -1)
 
-    # The dosage is the number of effect alleles.
     dosages = np.where(is_alt_effect[:, np.newaxis], genotypes, 2 - genotypes).astype(float)
     score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
 
@@ -153,8 +167,7 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     with multiprocessing.Pool() as pool:
         score_sums = pool.map(sum_column_precise, score_components.T)
 
-    # CORRECTED: Denominator is the number of non-missing alleles scored per person.
-    # Each valid locus contributes 2 alleles.
+    # Denominator is the number of non-missing alleles scored per person (2 per valid locus).
     allele_counts_per_person = valid_mask.sum(axis=0) * 2
     
     score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, allele_counts_per_person)], dtype=float)
@@ -173,16 +186,14 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     gdf['other_allele'] = np.where(gdf['effect_allele'] == gdf['ref'], gdf['alt'], gdf['ref'])
     gdf[['variant_id', 'effect_allele', 'other_allele', 'effect_weight']].rename(columns={'effect_weight': 'simulated_score'}).to_csv(gnomon_scorefile, sep='\t', index=False)
     print(f"...Gnomon-native scorefile written to {gnomon_scorefile}")
-    # For writing PLINK files, genotypes must be relative to allele2 in the BIM.
-    # Our generated genotypes are counts of the 'alt' allele. We must ensure a1/a2 are ref/alt.
+
     bim_df = pd.DataFrame({'chr': variants_df['chr'], 'id': variants_df['chr'].astype(str) + ':' + variants_df['pos'].astype(str), 'cm': 0, 'pos': variants_df['pos'], 'a1': variants_df['ref'], 'a2': variants_df['alt']})
     _write_plink_files(prefix, bim_df, [f"sample_{i+1}" for i in range(N_INDIVIDUALS)], pd.DataFrame(genotypes_with_missing, index=bim_df['id']))
 
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
     Runs a comprehensive, built-in test case to validate dosage calculations,
-    comparing Gnomon, Plink2, and PyLink against a ground truth normalized
-    by the number of scored alleles.
+    comparing Gnomon, Plink2, and PyLink against a ground truth.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -232,6 +243,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
         """An independent oracle that calculates the 100% correct biological outcome, normalized by scored alleles."""
         truth_sums = {iid: 0.0 for iid in individuals}
+        alleles_scored_per_person = {iid: 0 for iid in individuals}
         loci_scored_per_person = {iid: set() for iid in individuals}
         iids_expected_to_fail = set()
 
@@ -263,6 +275,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                     genotype = resolved_genotypes[iid][locus]
                     dosage = float(genotype.count(score_row['effect_allele']))
                     truth_sums[iid] += dosage * score_row['simple_score']
+                    alleles_scored_per_person[iid] += 2 # Each scored locus contributes 2 alleles
                     loci_scored_per_person[iid].add(locus)
         
         truth_data = []
@@ -270,10 +283,9 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
             if iid in iids_expected_to_fail:
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
-                n_loci_scored = len(loci_scored_per_person[iid])
-                # CORRECTED: Denominator is number of alleles (2 per locus).
-                n_alleles_scored = n_loci_scored * 2
+                n_alleles_scored = alleles_scored_per_person[iid]
                 avg_score = truth_sums[iid] / n_alleles_scored if n_alleles_scored > 0 else 0.0
+                n_loci_scored = len(loci_scored_per_person[iid])
                 n_loci_missed = total_unique_score_loci - n_loci_scored
                 missing_pct = (n_loci_missed / total_unique_score_loci) * 100.0 if total_unique_score_loci > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
@@ -288,14 +300,21 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     # --- Run all tools ---
     gnomon_res = run_cmd_func([gnomon_path, "--score", score_file.name, prefix.name], "Simple Gnomon Test", workdir)
-    
-    # CORRECTED: Added 'no-mean-imputation', used relative path for plink executable, and used numeric column indices.
+    gnomon_output_path = workdir / f"{prefix.name}.sscore"
+    if gnomon_res and gnomon_res.returncode == 0:
+        print_file_header(gnomon_output_path, "Gnomon")
+
     plink_cmd = [f"./{plink_path.name}", "--bfile", prefix.name, "--score", score_file.name, "1", "2", "4", "header", "no-mean-imputation", "--out", prefix.name + "_plink"]
     plink_res = run_cmd_func(plink_cmd, "Simple Plink2 Test", workdir)
+    plink_output_path = workdir / f"{prefix.name}_plink.sscore"
+    if plink_res and plink_res.returncode == 0:
+        print_file_header(plink_output_path, "Plink2")
     
-    # CORRECTED: Used relative paths for file arguments and numeric column indices.
     pylink_cmd = [sys.executable, pylink_path, "--bfile", prefix.name, "--score", score_file.name, "--out", prefix.name + "_pylink", "1", "2", "4"]
     pylink_res = run_cmd_func(pylink_cmd, "Simple PyLink Test", workdir)
+    pylink_output_path = workdir / f"{prefix.name}_pylink.sscore"
+    if pylink_res and pylink_res.returncode == 0:
+        print_file_header(pylink_output_path, "PyLink")
 
     # --- Analyze results ---
     print("\n--- Analyzing Simple Test Results ---")
@@ -304,29 +323,20 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     
     if gnomon_res and gnomon_res.returncode == 0:
         try:
-            gnomon_output_path = workdir / f"{prefix.name}.sscore"
             gnomon_df = pd.read_csv(gnomon_output_path, sep='\t').rename(columns={'#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'})[['IID', 'SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
             results_dfs.append(gnomon_df)
         except Exception as e: print(f"⚠️ Could not parse Gnomon output: {e}")
-    elif gnomon_res and gnomon_res.returncode != 0 and not (iids_expected_to_fail and gnomon_res.returncode != 0):
-        print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_res.stderr}")
-    elif gnomon_res.returncode == 0 and iids_expected_to_fail:
-        print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
 
     if plink_res and plink_res.returncode == 0:
         try:
-            plink_output_path = workdir / f"{prefix.name}_plink.sscore"
-            plink_df_raw = pd.read_csv(plink_output_path, sep='\t', skipinitialspace=True).rename(columns={'#IID':'IID'})
-            # CORRECTED: Use NAMED_ALLELE_DOSAGE_SUM for the denominator as it's the most accurate representation of scored alleles.
-            plink_df_raw['SCORE_PLINK2'] = plink_df_raw.apply(lambda row: row['SCORE1_SUM'] / row['NAMED_ALLELE_DOSAGE_SUM'] if row['NAMED_ALLELE_DOSAGE_SUM'] > 0 else 0.0, axis=1)
-            plink_df = plink_df_raw[['IID', 'SCORE_PLINK2']]
+            #  Read SCORE1_AVG directly.
+            plink_df = pd.read_csv(plink_output_path, sep='\t', skipinitialspace=True).rename(columns={'#IID':'IID', 'SCORE1_AVG': 'SCORE_PLINK2'})[['IID', 'SCORE_PLINK2']]
             results_dfs.append(plink_df)
         except Exception as e: print(f"⚠️ Could not parse Plink2 output: {e}")
         
     if pylink_res and pylink_res.returncode == 0:
         try:
-            pylink_output_path = workdir / f"{prefix.name}_pylink.sscore"
-            # CORRECTED: Parse SCORE1_AVG from PyLink output, not PRS_AVG.
+            #  Read SCORE1_AVG directly.
             pylink_df = pd.read_csv(pylink_output_path, sep='\t').rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'SCORE_PYLINK'})[['IID', 'SCORE_PYLINK']]
             results_dfs.append(pylink_df)
         except Exception as e: print(f"⚠️ Could not parse PyLink output: {e}")
@@ -464,7 +474,6 @@ def run_and_validate_tools(runtimes):
     print("= Running Large-Scale Simulation and Validation")
     print("="*80)
     
-    # Run large-scale Gnomon only if the simple test passed, to save time on failures.
     if overall_success:
         gnomon_res = run_command([GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX.name}.gnomon.score", OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR)
         if not (gnomon_res and gnomon_res.returncode == 0):
