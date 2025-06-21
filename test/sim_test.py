@@ -243,7 +243,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(prefix.with_suffix(".score"), score_df)
     
-    gnomon_result = run_cmd_func([gnomon_path, "--score", f"{prefix.name}.score", "--out", prefix.name, prefix.name], "Simple Gnomon Test", cwd=workdir)
+    gnomon_result = run_cmd_func([gnomon_path, "--score", f"{prefix.name}.score", prefix.name], "Simple Gnomon Test", cwd=workdir)
 
     if gnomon_result.returncode != 0:
         failed_iid = next((iid for iid in iids_expected_to_fail if iid in gnomon_result.stderr), None)
