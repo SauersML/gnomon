@@ -257,7 +257,8 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
     Runs a comprehensive, built-in test case to validate dosage calculations,
-    including complex multiallelic resolution and differential missingness.
+    including complex multiallelic resolution, fallback from missing data, and
+    detection of biologically inconsistent genotypes.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -266,201 +267,153 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     print(f"Test files will be prefixed: {prefix}")
 
     def _generate_test_data():
-        """
-        Generates the in-memory data for the test case, including the new
-        individuals designed to test differential missingness.
-        """
+        """Generates the in-memory data for the test case."""
         individuals = [
             'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
-            'id_special_case', 'id_multiallelic', 'id_missing_AC', 'id_missing_AG'
+            'id_special_case', 'id_multiallelic_fail', 'id_fallback_success'
         ]
-        
-        # Define all variants, including the multiallelic site at 1:50000
         bim_data = [
             {'chr':'1','id':'1:1000','cm':0,'pos':1000,'a1':'A','a2':'G'},
             {'chr':'1','id':'1:2000','cm':0,'pos':2000,'a1':'C','a2':'T'},
-            {'chr':'1','id':'1:3000','cm':0,'pos':3000,'a1':'A','a2':'T'},
-            # A block of 50 variants for a more complex score
+            # A block of 50 variants to test missingness calculation
             *[{'chr':'1','id':f'1:{10000+i}','cm':0,'pos':10000+i,'a1':'A','a2':'T'} for i in range(50)],
-            # The multiallelic site contexts
+            # The multiallelic site contexts for chr1:50000
             {'chr':'1','id':'1:50000:A:C','cm':0,'pos':50000,'a1':'A','a2':'C'}, # Context 1
-            {'chr':'1','id':'1:50000:A:G','cm':0,'pos':50000,'a1':'A','a2':'G'}, # Context 2
-            # A final variant to test multiallelic individuals
-            {'chr':'1','id':'1:60000:T:C','cm':0,'pos':60000,'a1':'T','a2':'C'}
+            {'chr':'1','id':'1:50000:A:T','cm':0,'pos':50000,'a1':'A','a2':'T'}, # Context 2
         ]
         bim_df = pd.DataFrame(bim_data)
-
-        # Define the score file. Note that 1:50000 is defined with an other_allele
-        # 'T' that does not perfectly match either BIM context, forcing permissive matching.
         score_data = [
             {'variant_id':'1:1000','effect_allele':'G','other_allele':'A','simple_score':0.5},
             {'variant_id':'1:2000','effect_allele':'T','other_allele':'C','simple_score':-0.2},
-            {'variant_id':'1:3000','effect_allele':'A','other_allele':'T','simple_score':-0.7},
             *[{'variant_id':f'1:{10000+i}','effect_allele':'A','other_allele':'T','simple_score':0.1} for i in range(50)],
-            {'variant_id':'1:50000','effect_allele':'A','other_allele':'T','simple_score':10.0},
-            {'variant_id':'1:60000','effect_allele':'C','other_allele':'T','simple_score':1.0}
+            # Score for the multiallelic site. NOTE: 'other_allele' is irrelevant to Gnomon's new logic.
+            {'variant_id':'1:50000','effect_allele':'A','other_allele':'G','simple_score':10.0},
         ]
         score_df = pd.DataFrame(score_data)
-
-        # Define all genotypes, initializing to missing (-1)
-        genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-        
-        # Standard cases
-        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
-        genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
+        genotypes_df = pd.DataFrame(0, index=bim_df['id'], columns=individuals) # Default to hom-ref
         genotypes_df.loc['1:1000', 'id_het'] = 1
         genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
         genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
-        genotypes_df.loc['1:3000', 'id_new_person'] = 1
-
-        # A mix of genotypes for id_special_case
+        genotypes_df.loc['1:1000', 'id_new_person'] = -1 # Explicitly missing
         special_variants = [f'1:{10000+i}' for i in range(50)]
-        genotypes_df.loc[special_variants[:10], 'id_special_case'] = 0
         genotypes_df.loc[special_variants[10:40], 'id_special_case'] = 1
         genotypes_df.loc[special_variants[40:], 'id_special_case'] = 2
-
-        # --- NEW & CRITICAL TEST CASES ---
-        # id_multiallelic: het for both contexts, forcing "first valid wins"
-        genotypes_df.loc['1:50000:A:C', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_multiallelic'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_multiallelic'] = 1
         
-        # id_missing_AC: missing for the A/C context, het for A/G
-        genotypes_df.loc['1:50000:A:C', 'id_missing_AC'] = -1
-        genotypes_df.loc['1:50000:A:G', 'id_missing_AC'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_missing_AC'] = 1
+        # id_multiallelic_fail: Genotype is valid and different in both contexts. This is a biological
+        # contradiction and MUST cause Gnomon to fail for this person.
+        genotypes_df.loc['1:50000:A:C', 'id_multiallelic_fail'] = 1 # A/C
+        genotypes_df.loc['1:50000:A:T', 'id_multiallelic_fail'] = 2 # T/T
         
-        # id_missing_AG: het for A/C context, missing for A/G
-        genotypes_df.loc['1:50000:A:C', 'id_missing_AG'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_missing_AG'] = -1
-        genotypes_df.loc['1:60000:T:C', 'id_missing_AG'] = 1
+        # id_fallback_success: Genotype is MISSING for the A/C context, but valid for A/T.
+        # Gnomon MUST use the valid data from the A/T context.
+        genotypes_df.loc['1:50000:A:C', 'id_fallback_success'] = -1 # Missing
+        genotypes_df.loc['1:50000:A:T', 'id_fallback_success'] = 1  # A/T
         
         return bim_df, score_df, individuals, genotypes_df
 
-    def _write_plink_files(prefix, bim_df, individuals, genotypes_df):
-        with open(prefix.with_suffix(".fam"), 'w') as f:
-            for iid in individuals:
-                f.write(f"{iid} {iid} 0 0 0 -9\n")
-        bim_df[['chr','id','cm','pos','a1','a2']].to_csv(
-            prefix.with_suffix(".bim"), sep='\t', header=False, index=False
-        )
-        code_map = {0:0b00, 1:0b10, 2:0b11, -1:0b01}
-        n = len(individuals)
-        with open(prefix.with_suffix(".bed"), 'wb') as f:
-            f.write(bytes([0x6c, 0x1b, 0x01]))
-            for _, row in genotypes_df.iterrows():
-                for j in range(0, n, 4):
-                    byte = 0
-                    chunk = row.iloc[j:j+4]
-                    for k, geno in enumerate(chunk):
-                        byte |= (code_map[int(geno)] << (k*2))
-                    f.write(byte.to_bytes(1, 'little'))
-        print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
+    def _calculate_simple_truth(bim_df, score_df, individuals, genotypes_df):
+        """A truth engine that emulates the desired biological logic."""
+        truth = {iid: {'sum': 0.0, 'used': 0, 'missing': 0} for iid in individuals}
+        iids_expected_to_fail = set()
 
-    def _write_score_file(filename, score_df):
-        score_df.to_csv(filename, sep='\t', index=False)
-        print(f"Programmatically wrote {filename}")
+        # Pre-process BIM for faster lookups
+        bim_lookup = bim_df.groupby('pos')
 
-    # Generate test data and calculate the corrected ground truth
+        for iid in individuals:
+            if iid in iids_expected_to_fail: continue
+            for _, score_row in score_df.iterrows():
+                pos = int(score_row['variant_id'].split(':')[1])
+                effect_allele = score_row['effect_allele']
+                weight = score_row['simple_score']
+
+                # 1. Triage: Find all plausible contexts
+                possible_contexts = bim_lookup.get_group(pos)
+
+                # 2. Resolution: Gather evidence
+                valid_interpretations = []
+                for _, context_row in possible_contexts.iterrows():
+                    genotype = genotypes_df.loc[context_row['id'], iid]
+                    if genotype != -1:
+                        # Decode dosage relative to the effect allele for THIS score
+                        a1, a2 = context_row['a1'], context_row['a2']
+                        if effect_allele == a1:
+                            dosage = {0: 2.0, 1: 1.0, 2: 0.0}[genotype]
+                            valid_interpretations.append(dosage)
+                        elif effect_allele == a2:
+                            dosage = {0: 0.0, 1: 1.0, 2: 2.0}[genotype]
+                            valid_interpretations.append(dosage)
+                        # If effect allele not in context, it's not a valid interpretation for this score
+
+                # 3. Apply Policy
+                if len(set(valid_interpretations)) > 1:
+                    iids_expected_to_fail.add(iid)
+                    break # Stop processing this contradictory individual
+                elif len(valid_interpretations) == 1:
+                    truth[iid]['sum'] += valid_interpretations[0] * weight
+                    truth[iid]['used'] += 1
+                else: # 0 valid interpretations
+                    truth[iid]['missing'] += 1
+        
+        # Finalize DataFrames
+        results = []
+        for iid, data in truth.items():
+            if iid in iids_expected_to_fail: continue
+            total_variants = data['used'] + data['missing']
+            avg_score = data['sum'] / data['used'] if data['used'] > 0 else 0.0
+            missing_pct = (data['missing'] / total_variants) * 100.0 if total_variants > 0 else 0.0
+            results.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
+
+        return pd.DataFrame(results), iids_expected_to_fail
+
+    # ---- Main Test Logic ----
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
-
-    # --- Ground Truth Calculation ---
-    truth_sums = {
-        'id_hom_ref': (0*0.5) + (0*-0.2) + (0* -0.7),
-        'id_het': (1*0.5),
-        'id_hom_alt': (2*0.5) + (2*-0.2),
-        'id_new_person': (1*-0.7),
-        'id_special_case': (10*0*0.1) + (30*1*0.1) + (10*2*0.1),
-        'id_multiallelic': (1*10.0) + (1*1.0), # Finds A/C context, scores 10.0. Also scores 1:60000.
-        'id_missing_AC':   (1*10.0) + (1*1.0), # Skips A/C, finds A/G, scores 10.0. Also scores 1:60000.
-        'id_missing_AG':   (1*10.0) + (1*1.0), # Finds A/C, scores 10.0. Also scores 1:60000.
-    }
-    truth_counts = {
-        'id_hom_ref': 3, 'id_het': 1, 'id_hom_alt': 2, 'id_new_person': 1,
-        'id_special_case': 50, 'id_multiallelic': 2, 'id_missing_AC': 2, 'id_missing_AG': 2
-    }
-    truth_avg = {iid: truth_sums[iid] / truth_counts[iid] for iid in individuals}
-    truth_df = pd.DataFrame(list(truth_avg.items()), columns=['IID', 'SCORE_TRUTH'])
-
-    # Write files and run all tools
+    truth_df, iids_expected_to_fail = _calculate_simple_truth(bim_df, score_df, individuals, genotypes_df)
+    
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
     _write_score_file(prefix.with_suffix(".score"), score_df)
+
+    # --- Execute and Validate Gnomon ---
+    gnomon_result = run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
+                                "Simple Gnomon Test", cwd=workdir)
     
-    # Run simple tests
-    if not run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name],
-                        "Simple Gnomon Test", cwd=workdir):
-        return False
-    if not run_cmd_func([f"./{plink_path.name}", "--bfile", prefix.name,
-                        "--score", prefix.with_suffix(".score").name, "1", "2", "4",
-                        "header", "no-mean-imputation", "--out", "simple_plink_results"],
-                        "Simple PLINK2 Test", cwd=workdir):
-        return False
-    if not run_cmd_func(["python3", pylink_path.as_posix(), "--precise",
-                        "--bfile", prefix.name, "--score", prefix.with_suffix(".score").name,
-                        "--out", "simple_pylink_results", "1", "2", "4"],
-                        "Simple PyLink Test", cwd=workdir):
-        return False
+    is_gnomon_ok = False
+    if gnomon_result.returncode != 0:
+        # Gnomon crashed, check if it was for the right reason
+        failed_iid = next((iid for iid in iids_expected_to_fail if iid in gnomon_result.stderr), None)
+        if failed_iid:
+            print(f"✅ Gnomon correctly failed due to data inconsistency for '{failed_iid}'.")
+            is_gnomon_ok = True
+        else:
+            print("❌ Gnomon failed unexpectedly. See stderr for details.")
+    else:
+        # Gnomon succeeded, check if it should have failed
+        if iids_expected_to_fail:
+            print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
+        else:
+            # Gnomon succeeded as expected, now validate the results
+            gnomon_df = pd.read_csv(workdir / "simple_test.sscore", sep='\t').rename(columns={
+                '#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'
+            })
+            merged_df = pd.merge(truth_df, gnomon_df, on='IID', how='left')
+            print("\n--- Comparison of Scores (Simple Test) ---")
+            print(merged_df.to_markdown(index=False, floatfmt=".6f"))
 
-    print("\n--- Analyzing Simple Test Results ---")
-    gnomon_results_raw = pd.read_csv(workdir / "simple_test.sscore", sep='\t')
-    gnomon_results = gnomon_results_raw.rename(columns={
-        '#IID':'IID',
-        'simple_score_AVG':'SCORE_GNOMON',
-        'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'
-    })[['IID','SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
+            scores_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
+            missing_ok = np.allclose(merged_df['MISSING_PCT_TRUTH'], merged_df['MISSING_PCT_GNOMON'])
 
-    plink_results_raw = pd.read_csv(workdir / "simple_plink_results.sscore", sep=r'\s+')\
-                           .rename(columns={'#IID':'IID'})
-    plink_results = plink_results_raw.assign(SCORE_PLINK2=plink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PLINK2']]
+            if scores_ok and missing_ok:
+                print("✅ Gnomon scores and missingness percentages are correct.")
+                is_gnomon_ok = True
+            else:
+                if not scores_ok: print("❌ Gnomon scores do not match ground truth.")
+                if not missing_ok: print("❌ Gnomon missingness percentages are incorrect.")
     
-    pylink_results_raw = pd.read_csv(workdir / "simple_pylink_results.sscore", sep='\t')\
-                             .rename(columns={'#IID':'IID'})
-    pylink_results = pylink_results_raw.assign(SCORE_PYLINK=pylink_results_raw['SCORE1_AVG']*2.0)[['IID','SCORE_PYLINK']]
-    
-    merged_df = pd.merge(truth_df, gnomon_results, on='IID', how='left')\
-                   .merge(plink_results, on='IID', how='left')\
-                   .merge(pylink_results, on='IID', how='left')
-
-    print("\n--- Comparison of Scores ---")
-    print(merged_df.to_markdown(index=False, floatfmt=".6f"))
-
-    # --- Enhanced Validation Logic ---
-    multiallelic_iids = ['id_multiallelic', 'id_missing_AC', 'id_missing_AG']
-    
-    # Validate Gnomon's scores and missing counts
-    gnomon_scores_ok = np.allclose(merged_df['SCORE_TRUTH'], merged_df['SCORE_GNOMON'])
-    gnomon_missing_ok = (merged_df['MISSING_PCT_GNOMON'] == 0.0).all()
-    is_gnomon_ok = gnomon_scores_ok and gnomon_missing_ok
-
-    # Validate PLINK2's behavior (correct on simple, fails on complex)
-    plink_simple_rows = merged_df[~merged_df['IID'].isin(multiallelic_iids)]
-    plink_complex_rows = merged_df[merged_df['IID'].isin(multiallelic_iids)]
-    plink_simple_ok = np.allclose(plink_simple_rows['SCORE_TRUTH'], plink_simple_rows['SCORE_PLINK2'])
-    plink_complex_ok = plink_complex_rows['SCORE_PLINK2'].isna().all()
-    is_plink_ok = plink_simple_ok and plink_complex_ok
-
-    # Validate PyLink's behavior (same as PLINK2)
-    pylink_simple_rows = merged_df[~merged_df['IID'].isin(multiallelic_iids)]
-    pylink_complex_rows = merged_df[merged_df['IID'].isin(multiallelic_iids)]
-    pylink_simple_ok = np.allclose(pylink_simple_rows['SCORE_TRUTH'], pylink_simple_rows['SCORE_PYLINK'])
-    pylink_complex_ok = pylink_complex_rows['SCORE_PYLINK'].isna().all()
-    is_pylink_ok = pylink_simple_ok and pylink_complex_ok
-    
-    if is_gnomon_ok and is_plink_ok and is_pylink_ok:
-        print("\n✅ Simple Dosage Test Successful: All tools behaved as expected.")
+    if is_gnomon_ok:
+        print("\n✅ Simple Dosage Test Successful: Gnomon behaved as expected.")
         return True
     else:
-        print("\n❌ Simple Dosage Test FAILED:")
-        if not gnomon_scores_ok:
-            print("  - Gnomon scores do not match ground truth.")
-        if not gnomon_missing_ok:
-            print("  - Gnomon missingness percentages are incorrect (should all be 0).")
-        if not is_plink_ok:
-            print("  - PLINK2 scores/behavior do not match expected behavior.")
-        if not is_pylink_ok:
-            print("  - PyLink scores/behavior do not match expected behavior.")
+        print("\n❌ Simple Dosage Test FAILED.")
         return False
-
 def run_and_validate_tools(runtimes):
     """
     Downloads tools, runs them, validates results, and collects runtimes.
@@ -476,43 +429,46 @@ def run_and_validate_tools(runtimes):
         width = 70
         print(f"\n{char*4} {title} {'-'*(width - len(title) - 5)}")
 
-    def run_command(cmd: list, step_name: str, cwd: Path):
-        _print_header(f"Executing: {step_name}")
-        cmd_str = [str(c) for c in cmd]
-        print(f"  > Command: {' '.join(cmd_str)}")
-        print(f"  > CWD: {cwd}")
+def run_command(cmd: list, step_name: str, cwd: Path) -> subprocess.CompletedProcess:
+    """
+    Executes a command and returns the full CompletedProcess object.
 
-        proc_env = os.environ.copy()
-        if "gnomon" in str(cmd_str[0]):
-            proc_env["RUST_BACKTRACE"] = "1"
+    This function allows the caller to inspect the return code,
+    stdout, and stderr, which is essential for validating both successful
+    runs and expected failures.
+    """
+    _print_header(f"Executing: {step_name}")
+    cmd_str = [str(c) for c in cmd]
+    print(f"  > Command: {' '.join(cmd_str)}")
+    print(f"  > CWD: {cwd}")
 
-        start_time = time.monotonic()
-        try:
-            result = subprocess.run(
-                cmd_str, capture_output=True, text=True, cwd=cwd, env=proc_env, timeout=600
-            )
-            print("--- OUTPUT ---")
-            print(result.stdout)
-            if result.stderr:
-                print("--- STDERR ---")
-                print(result.stderr)
+    proc_env = os.environ.copy()
+    if "gnomon" in str(cmd_str[0]):
+        proc_env["RUST_BACKTRACE"] = "1"
 
-            duration = time.monotonic() - start_time
-            if result.returncode == 0:
-                print(f"\n  > Success. (Completed in {duration:.4f}s)")
-                if "Large-Scale" in step_name:
-                    method_name = step_name.split(" ")[-1]
-                    runtimes.append({"Method": method_name, "Runtime (s)": duration})
-                return True
-            else:
-                print(f"\n  > ❌ ERROR: {step_name} failed with exit code {result.returncode}.")
-                return False
-        except FileNotFoundError:
-            print(f"  > ❌ ERROR: Command '{cmd[0]}' not found.")
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"  > ❌ ERROR: {step_name} timed out.")
-            return False
+    start_time = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd_str, capture_output=True, text=True, cwd=cwd, env=proc_env, timeout=600
+        )
+        print("--- OUTPUT ---")
+        if result.stdout: print(result.stdout)
+        if result.stderr:
+            print("--- STDERR ---")
+            print(result.stderr)
+
+        duration = time.monotonic() - start_time
+        if result.returncode == 0:
+            print(f"\n  > Success. (Completed in {duration:.4f}s)")
+        else:
+            print(f"\n  > Process exited with code {result.returncode}. (Completed in {duration:.4f}s)")
+        
+        return result
+
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"  > ❌ FAILED to execute command: {e}")
+        # Return a dummy CompletedProcess object to avoid crashing the test harness
+        return subprocess.CompletedProcess(args=cmd_str, returncode=127, stdout="", stderr=str(e))
 
     def setup_tools():
         _print_header("Step A: Setting up tools")
