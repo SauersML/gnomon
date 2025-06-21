@@ -295,25 +295,6 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                     variants_used[iid] += 1
                 else:
                     variants_missing[iid] += 1
-        
-        # The logic for counting used variants must be adjusted for multiallelic sites
-        # A single locus (e.g. 1:50000) can have multiple score rules.
-        # We need to count loci, not score rows.
-        unique_score_loci = score_df['variant_id'].nunique()
-        for iid in individuals:
-            used_loci = set()
-            missing_loci = set()
-            for _, score_row in score_df.iterrows():
-                chrom, pos_str = score_row['variant_id'].split(':')[:2]
-                pos = int(pos_str)
-                if (chrom, int(pos)) in resolved_genotypes.get(iid, {}):
-                    used_loci.add(score_row['variant_id'])
-                else:
-                    missing_loci.add(score_row['variant_id'])
-            
-            variants_used[iid] = len(used_loci)
-            # A locus is only missing if it's not used.
-            variants_missing[iid] = len(missing_loci - used_loci)
 
         truth_data = []
         for iid in individuals:
