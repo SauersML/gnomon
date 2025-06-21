@@ -362,7 +362,7 @@ def run_and_validate_tools(runtimes):
     print("= Running Large-Scale Simulation and Validation")
     print("="*80)
     
-    gnomon_res = run_command([GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX.name}.gnomon.score", "--out", "gnomon_results", OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR)
+    gnomon_res = run_command([GNOMON_BINARY_PATH, "--score", f"{OUTPUT_PREFIX.name}.gnomon.score", OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR)
     if gnomon_res.returncode == 0: runtimes.append({"Method": "Gnomon", "Runtime (s)": gnomon_res.duration})
     else: overall_success = False
 
