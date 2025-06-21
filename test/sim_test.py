@@ -290,8 +290,10 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     # --- Run all tools ---
     gnomon_res = run_cmd_func([gnomon_path, "--score", score_file.name, prefix.name], "Simple Gnomon Test", workdir)
-    plink_res = run_cmd_func([plink_path, "--bfile", prefix.name, "--score", score_file.name, "variant_id", "effect_allele", "simple_score", "header", "--out", prefix.name + "_plink"], "Simple Plink2 Test", workdir)
-    pylink_res = run_cmd_func([sys.executable, pylink_path, "--bfile", str(prefix), "--score", str(score_file), "--out", str(prefix) + "_pylink"], "Simple PyLink Test", workdir)
+    plink_cmd = [f"./{plink_path.name}", "--bfile", prefix.name, "--score", score_file.name, "variant_id", "effect_allele", "simple_score", "header", "--out", prefix.name + "_plink"]
+    plink_res = run_cmd_func(plink_cmd, "Simple Plink2 Test", workdir)
+    pylink_cmd = [sys.executable, pylink_path, "--bfile", str(prefix), "--score", str(score_file), "--out", str(prefix) + "_pylink", "variant_id", "effect_allele", "simple_score"]
+    pylink_res = run_cmd_func(pylink_cmd, "Simple PyLink Test", workdir)
 
     # --- Analyze results ---
     print("\n--- Analyzing Simple Test Results ---")
