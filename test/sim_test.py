@@ -11,6 +11,7 @@ import math
 import multiprocessing
 import gmpy2
 from pathlib import Path
+from functools import reduce
 
 # --- Configuration Parameters ---
 N_VARIANTS = 50000
@@ -136,22 +137,32 @@ def introduce_missingness(genotypes):
     return g.astype(int)
 
 def calculate_ground_truth_prs(genotypes, variants_df):
-    """Step 5: Calculate ground truth PRS with high precision for large-scale sim."""
-    print("Step 5: Calculating ground truth polygenic scores (ULTIMATE PRECISION, ACCELERATED)...")
+    """
+    Step 5: Calculate ground truth PRS, normalized by unique scored loci.
+    """
+    print("Step 5: Calculating ground truth polygenic scores (by unique loci)...")
     effect_weights = variants_df['effect_weight'].values
     is_alt_effect = (variants_df['effect_allele'] == variants_df['alt']).values
     valid_mask = (genotypes != -1)
+
     # The dosage is the number of effect alleles.
-    # If effect is 'alt', dosage = genotype (0, 1, or 2)
-    # If effect is 'ref' (not 'alt'), dosage = 2 - genotype
     dosages = np.where(is_alt_effect[:, np.newaxis], genotypes, 2 - genotypes).astype(float)
     score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
+
     print(f"    > Dispatching summations to {multiprocessing.cpu_count()} CPU cores...")
     with multiprocessing.Pool() as pool:
         score_sums = pool.map(sum_column_precise, score_components.T)
-    variant_counts = valid_mask.sum(axis=0)
-    score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, variant_counts)], dtype=float)
+
+    # NEW: Calculate the denominator by counting unique loci scored per person.
+    locus_ids = variants_df['pos'].values
+    loci_counts_per_person = np.array([
+        len(np.unique(locus_ids[valid_mask[:, i]]))
+        for i in range(genotypes.shape[1])
+    ])
+    
+    score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, loci_counts_per_person)], dtype=float)
     return pd.DataFrame({'FID': f'sample_{i+1}', 'IID': f'sample_{i+1}', 'PRS_AVG': score_avg[i]} for i in range(N_INDIVIDUALS))
+
 
 def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix: Path):
     """Step 6: Write all output files for the large-scale simulation."""
@@ -173,9 +184,8 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
     Runs a comprehensive, built-in test case to validate dosage calculations,
-    including complex multiallelic resolution, differential missingness, and
-    detection of biologically inconsistent genotypes.
-    This test will fail the entire script if Gnomon's results cannot be verified.
+    comparing Gnomon, Plink2, and PyLink against a ground truth normalized
+    by unique scored loci.
     """
     prefix = workdir / "simple_test"
     print("\n" + "="*80)
@@ -210,150 +220,135 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         ]
         score_df = pd.DataFrame(score_data)
         genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
-        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0
-        genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
-        genotypes_df.loc['1:1000', 'id_het'] = 1
-        genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
-        genotypes_df.loc['1:2000', 'id_hom_alt'] = 2
-        genotypes_df.loc['1:3000', 'id_new_person'] = 1
+        genotypes_df.loc['1:1000', 'id_hom_ref'] = 0; genotypes_df.loc['1:2000', 'id_hom_ref'] = 0
+        genotypes_df.loc['1:1000', 'id_het'] = 1; genotypes_df.loc['1:1000', 'id_hom_alt'] = 2
+        genotypes_df.loc['1:2000', 'id_hom_alt'] = 2; genotypes_df.loc['1:3000', 'id_new_person'] = 1
         special_variants = [f'1:{10000+i}' for i in range(50)]
         genotypes_df.loc[special_variants[:10], 'id_special_case'] = 2
         genotypes_df.loc[special_variants[10:40], 'id_special_case'] = 1
         genotypes_df.loc[special_variants[40:], 'id_special_case'] = 0
-        
-        # Test Case: Individual has A/C. Genotype for A/G is missing.
-        genotypes_df.loc['1:50000:A:C', 'id_multi_AC'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_multi_AC'] = -1
-        genotypes_df.loc['1:60000:T:C', 'id_multi_AC'] = 1
-        
-        # Test Case: Individual has A/G. Genotype for A/C is missing.
-        genotypes_df.loc['1:50000:A:C', 'id_multi_AG'] = -1
-        genotypes_df.loc['1:50000:A:G', 'id_multi_AG'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_multi_AG'] = 1
-
-        # Test Case: Individual has C/G.
-        genotypes_df.loc['1:50000:A:C', 'id_multi_CG'] = 1
-        genotypes_df.loc['1:50000:A:G', 'id_multi_CG'] = 1
-        genotypes_df.loc['1:60000:T:C', 'id_multi_CG'] = 1
+        genotypes_df.loc['1:50000:A:C', 'id_multi_AC'] = 1; genotypes_df.loc['1:50000:A:G', 'id_multi_AC'] = -1; genotypes_df.loc['1:60000:T:C', 'id_multi_AC'] = 1
+        genotypes_df.loc['1:50000:A:C', 'id_multi_AG'] = -1; genotypes_df.loc['1:50000:A:G', 'id_multi_AG'] = 1; genotypes_df.loc['1:60000:T:C', 'id_multi_AG'] = 1
+        genotypes_df.loc['1:50000:A:C', 'id_multi_CG'] = 1; genotypes_df.loc['1:50000:A:G', 'id_multi_CG'] = 1; genotypes_df.loc['1:60000:T:C', 'id_multi_CG'] = 1
         return bim_df, score_df, individuals, genotypes_df
 
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
-        """An independent oracle that calculates the 100% correct biological outcome."""
+        """An independent oracle that calculates the 100% correct biological outcome, normalized by unique loci."""
         truth_sums = {iid: 0.0 for iid in individuals}
-        variants_used = {iid: 0 for iid in individuals}
-        variants_missing = {iid: 0 for iid in individuals}
-        # This test case should no longer produce errors.
+        loci_scored_per_person = {iid: set() for iid in individuals}
         iids_expected_to_fail = set()
+
+        # Get total number of unique loci from the score file
+        temp_df = score_df['variant_id'].str.split(':', n=2, expand=True)
+        total_unique_score_loci = len(temp_df[[0, 1]].drop_duplicates())
         
-        # Pre-process genotypes to resolve multiallelic sites into a single biological truth
         resolved_genotypes = {}
         bim_grouped_by_pos = bim_df.groupby(['chr', 'pos'])
         for iid in individuals:
             resolved_genotypes[iid] = {}
             for (chrom, pos), group in bim_grouped_by_pos:
-                alleles = []
-                has_missing = False
-                # Check all .bim rows for this physical location
+                alleles = []; has_missing = False
                 for _, bim_row in group.iterrows():
                     genotype_val = genotypes_df.loc[bim_row['id'], iid]
-                    if genotype_val == -1:
-                        has_missing = True
-                        continue
-                    # Add alleles based on genotype (count of allele a2)
-                    alleles.extend([bim_row['a1']] * (2 - genotype_val))
-                    alleles.extend([bim_row['a2']] * genotype_val)
-                
-                # Consolidate alleles, removing the reference 'A's to find the true genotype
+                    if genotype_val == -1: has_missing = True; continue
+                    alleles.extend([bim_row['a1']] * (2 - genotype_val)); alleles.extend([bim_row['a2']] * genotype_val)
                 unique_alleles = [a for a in alleles if a != bim_row['a1']]
-                # Add back one reference allele if only one alt allele was found
-                if len(unique_alleles) == 1:
-                    unique_alleles.append(bim_row['a1'])
-                # If no alt alleles, it's homozygous reference
-                elif len(unique_alleles) == 0 and not has_missing:
-                    unique_alleles = [bim_row['a1'], bim_row['a1']]
-                
-                if len(unique_alleles) > 2:
-                    # This would be an error condition, but our test data is valid.
-                    iids_expected_to_fail.add(iid)
-                elif len(unique_alleles) > 0:
-                    resolved_genotypes[iid][(chrom, pos)] = tuple(sorted(unique_alleles))
-                # If completely missing, it remains unresolved.
+                if len(unique_alleles) == 1: unique_alleles.append(bim_row['a1'])
+                elif len(unique_alleles) == 0 and not has_missing: unique_alleles = [bim_row['a1'], bim_row['a1']]
+                if len(unique_alleles) > 2: iids_expected_to_fail.add(iid)
+                elif len(unique_alleles) > 0: resolved_genotypes[iid][(chrom, pos)] = tuple(sorted(unique_alleles))
 
-        # Calculate scores based on the resolved genotypes
         for iid in individuals:
             if iid in iids_expected_to_fail: continue
             for _, score_row in score_df.iterrows():
-                chrom, pos_str = score_row['variant_id'].split(':')[:2]
-                pos = int(pos_str)
-                effect_allele = score_row['effect_allele']
-                weight = score_row['simple_score']
-
-                if (chrom, pos) in resolved_genotypes[iid]:
-                    genotype = resolved_genotypes[iid][(chrom, pos)]
-                    dosage = float(genotype.count(effect_allele))
-                    truth_sums[iid] += dosage * weight
-                    variants_used[iid] += 1
-                else:
-                    variants_missing[iid] += 1
-
+                chrom, pos_str = score_row['variant_id'].split(':')[:2]; pos = int(pos_str)
+                locus = (chrom, pos)
+                if locus in resolved_genotypes[iid]:
+                    genotype = resolved_genotypes[iid][locus]
+                    dosage = float(genotype.count(score_row['effect_allele']))
+                    truth_sums[iid] += dosage * score_row['simple_score']
+                    loci_scored_per_person[iid].add(locus)
+        
         truth_data = []
         for iid in individuals:
             if iid in iids_expected_to_fail:
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
-                avg_score = truth_sums[iid] / variants_used[iid] if variants_used[iid] > 0 else 0.0
-                denominator = variants_used[iid] + variants_missing[iid]
-                missing_pct = (variants_missing[iid] / denominator) * 100.0 if denominator > 0 else 0.0
+                n_loci_scored = len(loci_scored_per_person[iid])
+                avg_score = truth_sums[iid] / n_loci_scored if n_loci_scored > 0 else 0.0
+                n_loci_missed = total_unique_score_loci - n_loci_scored
+                missing_pct = (n_loci_missed / total_unique_score_loci) * 100.0 if total_unique_score_loci > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
         return pd.DataFrame(truth_data), iids_expected_to_fail
 
     # --- Main test logic ---
     bim_df, score_df, individuals, genotypes_df = _generate_test_data()
     truth_df, iids_expected_to_fail = _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df)
+    score_file = prefix.with_suffix(".score")
     _write_plink_files(prefix, bim_df, individuals, genotypes_df)
-    _write_score_file(prefix.with_suffix(".score"), score_df)
+    _write_score_file(score_file, score_df)
 
-    gnomon_result = run_cmd_func([gnomon_path, "--score", prefix.with_suffix(".score").name, prefix.name], "Simple Gnomon Test", workdir)
+    # --- Run all tools ---
+    gnomon_res = run_cmd_func([gnomon_path, "--score", score_file.name, prefix.name], "Simple Gnomon Test", workdir)
+    plink_res = run_cmd_func([plink_path, "--bfile", prefix.name, "--score", score_file.name, "variant_id", "effect_allele", "simple_score", "header", "--out", prefix.name + "_plink"], "Simple Plink2 Test", workdir)
+    pylink_res = run_cmd_func([sys.executable, pylink_path, "--bfile", str(prefix), "--score", str(score_file), "--out", str(prefix) + "_pylink"], "Simple PyLink Test", workdir)
+
+    # --- Analyze results ---
     print("\n--- Analyzing Simple Test Results ---")
+    results_dfs = [truth_df]
+    gnomon_df = plink_df = pylink_df = None
+    
+    # Parse Gnomon
+    if gnomon_res and gnomon_res.returncode == 0 and not iids_expected_to_fail:
+        try:
+            gnomon_output_path = workdir / f"{prefix.name}.sscore"
+            gnomon_df = pd.read_csv(gnomon_output_path, sep='\t').rename(columns={'#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'})[['IID', 'SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
+            results_dfs.append(gnomon_df)
+        except Exception as e: print(f"⚠️ Could not parse Gnomon output: {e}")
+    elif gnomon_res and gnomon_res.returncode != 0: print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_res.stderr}")
+    elif iids_expected_to_fail: print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
+
+    # Parse Plink2
+    if plink_res and plink_res.returncode == 0:
+        try:
+            plink_output_path = workdir / f"{prefix.name}_plink.sscore"
+            plink_df_raw = pd.read_csv(plink_output_path, sep='\t').rename(columns={'#IID':'IID'})
+            plink_df_raw['SCORE_PLINK2'] = plink_df_raw.apply(lambda row: row['simple_score_SUM'] / row['ALLELE_CT'] if row['ALLELE_CT'] > 0 else 0.0, axis=1)
+            plink_df = plink_df_raw[['IID', 'SCORE_PLINK2']]
+            results_dfs.append(plink_df)
+        except Exception as e: print(f"⚠️ Could not parse Plink2 output: {e}")
+        
+    # Parse PyLink
+    if pylink_res and pylink_res.returncode == 0:
+        try:
+            pylink_output_path = workdir / f"{prefix.name}_pylink.sscore"
+            pylink_df = pd.read_csv(pylink_output_path, sep='\t').rename(columns={'#IID': 'IID', 'PRS_AVG': 'SCORE_PYLINK'})[['IID', 'SCORE_PYLINK']]
+            results_dfs.append(pylink_df)
+        except Exception as e: print(f"⚠️ Could not parse PyLink output: {e}")
+
+    # Merge and Display Results
+    merged = reduce(lambda left, right: pd.merge(left, right, on='IID', how='outer'), results_dfs)
+    display_cols = ['IID', 'SCORE_TRUTH', 'MISSING_PCT_TRUTH']
+    if gnomon_df is not None: display_cols.extend(['SCORE_GNOMON', 'MISSING_PCT_GNOMON'])
+    if plink_df is not None: display_cols.append('SCORE_PLINK2')
+    if pylink_df is not None: display_cols.append('SCORE_PYLINK')
+
+    print("\n--- Simple Dosage Test: Full Results Table ---")
+    print("WHO (what sample) got WHICH SCORE and by WHICH tool:")
+    print(merged[display_cols].to_markdown(index=False, floatfmt=".6f"))
+
+    # Final Verification (only for Gnomon)
     is_gnomon_ok = False
-
-    if gnomon_result is None:
-        print("❌ Gnomon test could not be run.")
-    elif gnomon_result.returncode != 0:
-        # With the corrected biological data, Gnomon should no longer fail.
-        # Any failure is now unexpected.
-        print(f"❌ Gnomon failed unexpectedly. Stderr:\n{gnomon_result.stderr}")
-    else: # Gnomon succeeded (returncode == 0)
-        if iids_expected_to_fail:
-            # This should not happen with the new test data.
-            print(f"❌ Gnomon SUCCEEDED when it should have FAILED for IIDs: {iids_expected_to_fail}")
+    if gnomon_df is not None:
+        scores_ok = np.allclose(merged['SCORE_TRUTH'], merged['SCORE_GNOMON'], equal_nan=True)
+        missing_ok = np.allclose(merged['MISSING_PCT_TRUTH'], merged['MISSING_PCT_GNOMON'], equal_nan=True)
+        if scores_ok and missing_ok:
+            print("\n✅ Verification successful: Gnomon scores and missingness percentages match the ground truth.")
+            is_gnomon_ok = True
         else:
-            try:
-                gnomon_output_path = workdir / "simple_test.sscore"
-                if not gnomon_output_path.exists():
-                    raise FileNotFoundError("Gnomon ran successfully but did not produce the output .sscore file.")
-                gnomon_results_raw = pd.read_csv(gnomon_output_path, sep='\t')
-                gnomon_results = gnomon_results_raw.rename(columns={'#IID':'IID', 'simple_score_AVG':'SCORE_GNOMON', 'simple_score_MISSING_PCT': 'MISSING_PCT_GNOMON'})[['IID', 'SCORE_GNOMON', 'MISSING_PCT_GNOMON']]
-                merged = pd.merge(truth_df, gnomon_results, on='IID', how='outer')
-
-                print("\n--- Simple Dosage Test: Full Results Table ---")
-                print("WHO (what sample) got WHICH SCORE and by WHICH tool:")
-                print(merged[['IID', 'SCORE_TRUTH', 'SCORE_GNOMON', 'MISSING_PCT_TRUTH', 'MISSING_PCT_GNOMON']].to_markdown(index=False, floatfmt=".6f"))
-
-                scores_ok = np.allclose(merged['SCORE_TRUTH'], merged['SCORE_GNOMON'], equal_nan=True)
-                missing_ok = np.allclose(merged['MISSING_PCT_TRUTH'], merged['MISSING_PCT_GNOMON'], equal_nan=True)
-
-                if scores_ok and missing_ok:
-                    print("\n✅ Verification successful: Gnomon scores and missingness percentages match the ground truth.")
-                    is_gnomon_ok = True
-                else:
-                    print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
-                    if not scores_ok: print("  - Mismatch found in scores.")
-                    if not missing_ok: print("  - Mismatch found in missingness percentages.")
-            except Exception as e:
-                print(f"❌ Failed to parse or validate Gnomon's output file: {e}")
-                import traceback
-                traceback.print_exc()
+            print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
+            if not scores_ok: print("  - Mismatch found in scores.")
+            if not missing_ok: print("  - Mismatch found in missingness percentages.")
 
     if is_gnomon_ok:
         print("\n✅ Simple Dosage Test SUCCEEDED.")
@@ -361,6 +356,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     else:
         print("\n❌ Simple Dosage Test FAILED.")
         return False
+
 
 def run_and_validate_tools(runtimes):
     """Downloads tools, runs them, validates results, and collects runtimes."""
@@ -418,6 +414,9 @@ def run_and_validate_tools(runtimes):
             except Exception as e:
                 print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
                 return False
+        if not PYLINK_SCRIPT_PATH.exists():
+            print(f"  > ⚠️ WARNING: PyLink script not found at '{PYLINK_SCRIPT_PATH}'. It will be skipped in the simple test.")
+
         return True
 
     def analyze_large_scale_results():
