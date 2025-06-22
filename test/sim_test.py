@@ -167,10 +167,10 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     with multiprocessing.Pool() as pool:
         score_sums = pool.map(sum_column_precise, score_components.T)
 
-    # Denominator is the number of non-missing alleles scored per person (2 per valid locus).
-    allele_counts_per_person = valid_mask.sum(axis=0) * 2
+    # Denominator is the number of non-missing variants (loci) scored per person.
+    variant_counts_per_person = valid_mask.sum(axis=0)
     
-    score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, allele_counts_per_person)], dtype=float)
+    score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, variant_counts_per_person)], dtype=float)
     return pd.DataFrame({'FID': f'sample_{i+1}', 'IID': f'sample_{i+1}', 'PRS_AVG': score_avg[i]} for i in range(N_INDIVIDUALS))
 
 
@@ -241,54 +241,91 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         return bim_df, score_df, individuals, genotypes_df
 
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
-        """An independent oracle that calculates the 100% correct biological outcome, normalized by scored alleles."""
-        truth_sums = {iid: 0.0 for iid in individuals}
-        alleles_scored_per_person = {iid: 0 for iid in individuals}
-        loci_scored_per_person = {iid: set() for iid in individuals}
-        iids_expected_to_fail = set()
-
-        temp_df = score_df['variant_id'].str.split(':', n=2, expand=True)
-        total_unique_score_loci = len(temp_df[[0, 1]].drop_duplicates())
+        """
+        An independent oracle that calculates the 100% correct biological outcome,
+        normalized by the number of scored loci. This logic is designed to mirror
+        a robust tool's handling of multiallelic and ambiguous sites.
+        """
+        # Group score rules by unique chromosomal locus for efficient lookup.
+        score_rules_by_locus = {}
+        score_df['locus'] = score_df['variant_id'].str.split(':').str[:2].str.join(':')
+        for locus, group in score_df.groupby('locus'):
+            score_rules_by_locus[locus] = group.to_dict('records')
         
-        resolved_genotypes = {}
-        bim_grouped_by_pos = bim_df.groupby(['chr', 'pos'])
-        for iid in individuals:
-            resolved_genotypes[iid] = {}
-            for (chrom, pos), group in bim_grouped_by_pos:
-                alleles = []; has_missing = False
-                for _, bim_row in group.iterrows():
-                    genotype_val = genotypes_df.loc[bim_row['id'], iid]
-                    if genotype_val == -1: has_missing = True; continue
-                    alleles.extend([bim_row['a1']] * (2 - genotype_val)); alleles.extend([bim_row['a2']] * genotype_val)
-                unique_alleles = [a for a in alleles if a != bim_row['a1']]
-                if len(unique_alleles) == 1: unique_alleles.append(bim_row['a1'])
-                elif len(unique_alleles) == 0 and not has_missing: unique_alleles = [bim_row['a1'], bim_row['a1']]
-                if len(unique_alleles) > 2: iids_expected_to_fail.add(iid)
-                elif len(unique_alleles) > 0: resolved_genotypes[iid][(chrom, pos)] = tuple(sorted(unique_alleles))
-
-        for iid in individuals:
-            if iid in iids_expected_to_fail: continue
-            for _, score_row in score_df.iterrows():
-                chrom, pos_str = score_row['variant_id'].split(':')[:2]; pos = int(pos_str)
-                locus = (chrom, pos)
-                if locus in resolved_genotypes[iid]:
-                    genotype = resolved_genotypes[iid][locus]
-                    dosage = float(genotype.count(score_row['effect_allele']))
-                    truth_sums[iid] += dosage * score_row['simple_score']
-                    alleles_scored_per_person[iid] += 2 # Each scored locus contributes 2 alleles
-                    loci_scored_per_person[iid].add(locus)
-        
+        total_unique_score_loci = len(score_rules_by_locus)
+    
+        # Group bim records by unique chromosomal locus.
+        bim_by_locus = {}
+        bim_df['locus'] = bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str)
+        for locus, group in bim_df.groupby('locus'):
+            bim_by_locus[locus] = group.to_dict('records')
+    
         truth_data = []
+        iids_expected_to_fail = set()
+    
         for iid in individuals:
-            if iid in iids_expected_to_fail:
+            sum_score = 0.0
+            loci_scored_count = 0
+            is_fatal_error = False
+    
+            for locus, rules in score_rules_by_locus.items():
+                # Find all non-missing genotype evidence for this person at this locus.
+                evidence = []
+                if locus in bim_by_locus:
+                    for bim_record in bim_by_locus[locus]:
+                        genotype_val = genotypes_df.loc[bim_record['id'], iid]
+                        if genotype_val != -1:
+                            evidence.append({'bim': bim_record, 'geno': genotype_val})
+                
+                # Policy-based resolution based on the collected evidence.
+                if not evidence:
+                    # Case 1: Truly missing. No evidence found. Locus is not scored.
+                    continue
+                
+                if len(evidence) > 1:
+                    # Case 2: Contradictory Data. Multiple non-missing genotypes found
+                    # for the same person at the same locus. This is a fatal data
+                    # integrity error that a robust tool should fail on.
+                    is_fatal_error = True
+                    iids_expected_to_fail.add(iid)
+                    break # Stop processing loci for this person.
+    
+                # Case 3: Success - One Unambiguous Interpretation.
+                winning_evidence = evidence[0]
+                winning_bim = winning_evidence['bim']
+                winning_geno = winning_evidence['geno']
+    
+                # Resolve the diploid genotype based on the winning BIM record.
+                # Genotype is encoded relative to (a1, a2) where 0=a1/a1, 1=a1/a2, 2=a2/a2.
+                if winning_geno == 0:
+                    resolved_genotype = (winning_bim['a1'], winning_bim['a1'])
+                elif winning_geno == 1:
+                    resolved_genotype = tuple(sorted((winning_bim['a1'], winning_bim['a2'])))
+                else: # winning_geno == 2
+                    resolved_genotype = (winning_bim['a2'], winning_bim['a2'])
+    
+                # A single locus is scored, even if multiple rules apply to it.
+                loci_scored_count += 1
+                
+                # Apply all score rules for this locus using the single resolved genotype.
+                for rule in rules:
+                    effect_allele = rule['effect_allele']
+                    weight = rule['simple_score']
+                    
+                    # The dosage is the count of the effect allele in the resolved genotype.
+                    dosage = float(resolved_genotype.count(effect_allele))
+                    sum_score += dosage * weight
+    
+            # Final aggregation for the person
+            if is_fatal_error:
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
-                n_alleles_scored = alleles_scored_per_person[iid]
-                avg_score = truth_sums[iid] / n_alleles_scored if n_alleles_scored > 0 else 0.0
-                n_loci_scored = len(loci_scored_per_person[iid])
-                n_loci_missed = total_unique_score_loci - n_loci_scored
-                missing_pct = (n_loci_missed / total_unique_score_loci) * 100.0 if total_unique_score_loci > 0 else 0.0
+                # Normalize score by the number of unique loci that were successfully scored.
+                avg_score = sum_score / loci_scored_count if loci_scored_count > 0 else 0.0
+                loci_missed_count = total_unique_score_loci - loci_scored_count
+                missing_pct = (loci_missed_count / total_unique_score_loci) * 100.0 if total_unique_score_loci > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
+    
         return pd.DataFrame(truth_data), iids_expected_to_fail
 
     # --- Main test logic ---
