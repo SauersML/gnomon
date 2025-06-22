@@ -16,12 +16,11 @@ use criterion::{
 use gnomon::batch;
 use gnomon::kernel;
 use gnomon::types::{
-    EffectAlleleDosage, PersonSubset, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
+    PersonSubset, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
 };
 
 use crossbeam_queue::ArrayQueue;
 use rand::seq::index;
-use rand::Rng;
 use std::sync::Arc;
 
 // --- Benchmark Tuning Parameters ---
