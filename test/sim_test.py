@@ -522,8 +522,13 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     ])
 
     # 2. Invocation
-    cmd = [gnomon_path, "--score", score_file_A.name, "--score", score_file_B.name, prefix.name]
+    scores_dir = workdir / "multi_score_test_scores"
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(score_file_A, scores_dir / score_file_A.name)
+    shutil.copy(score_file_B, scores_dir / score_file_B.name)
+    cmd = [gnomon_path, "--score", scores_dir, prefix]
     gnomon_res = run_cmd_func(cmd, "Multi-Score-File Test", workdir)
+
     
     # 3. Validation
     if not (gnomon_res and gnomon_res.returncode == 0):
