@@ -24,7 +24,6 @@ use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::time::Instant;
-use crate::types::ReconciledVariantIndex;
 
 // The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
 const LANE_COUNT: usize = 8;
@@ -583,10 +582,16 @@ fn compile_score_file_to_map(
         if line_bytes.is_empty() { continue; }
 
         let mut fields = line_bytes.splitn(4, |&b| b == b'\t');
-        let (variant_id_bytes, effect_allele_bytes, other_allele_bytes, weights_bytes) =
+        // Extract 4 consecutive fields from the iterator (likely a CSV/TSV row)
+        // We need: variant_id, effect_allele, other_allele (unused), weights
+        let (variant_id_bytes, effect_allele_bytes, _, weights_bytes) =
             match (fields.next(), fields.next(), fields.next(), fields.next()) {
-                (Some(v), Some(e), Some(o), Some(w)) => (v, e, o, w),
-                _ => continue, // Skip malformed lines.
+                // If all 4 fields are present, bind the ones we need and ignore the 3rd
+                (Some(variant_id), Some(effect_allele), Some(_), Some(weights)) => {
+                    (variant_id, effect_allele, (), weights)
+                },
+                // If any field is missing, skip this malformed line entirely
+                _ => continue,
             };
 
         let variant_id = std::str::from_utf8(variant_id_bytes)?;
