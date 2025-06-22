@@ -84,10 +84,6 @@ pub struct PreparationResult {
     /// deferred resolution (the "slow path"). Each rule represents one unique
     /// complex variant and all scores that use it.
     pub complex_rules: Vec<GroupedComplexRule>,
-    /// A map identifying multiallelic variants handled by the fast path that require
-    /// denominator correction. The key is the reconciled index of the variant, and
-    /// the value is a list of its sibling BIM row indices at the same locus.
-    pub multiallelic_fast_path_corrections: AHashMap<ReconciledVariantIndex, Vec<BimRowIndex>>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
     pub person_fam_to_output_idx: Vec<Option<u32>>,
@@ -131,7 +127,6 @@ impl PreparationResult {
         stride: usize,
         required_bim_indices: Vec<BimRowIndex>,
         complex_rules: Vec<GroupedComplexRule>,
-        multiallelic_fast_path_corrections: AHashMap<ReconciledVariantIndex, Vec<BimRowIndex>>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
         variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
@@ -151,7 +146,6 @@ impl PreparationResult {
             stride,
             required_bim_indices,
             complex_rules,
-            multiallelic_fast_path_corrections,
             score_names,
             score_variant_counts,
             variant_to_scores_map,
