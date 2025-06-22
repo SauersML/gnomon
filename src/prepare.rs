@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
+use crate::types::ReconciledVariantIndex;
 
 // A flag to ensure we only print the allele-reconciliation warning once per run.
 static AMBIGUITY_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
