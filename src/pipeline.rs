@@ -1,8 +1,10 @@
 use crate::batch::{self, SparseIndexPool};
 use crate::io;
 use crate::types::{
-    BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, WorkItem,
+    BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
+    WorkItem,
 };
+use ahash::AHashSet;
 use crossbeam_channel::{bounded, Receiver};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
@@ -430,7 +432,7 @@ fn resolve_complex_variants(
             for group_rule in &prep_result.complex_rules {
                 // --- Step 1: Gather Evidence ---
                 // For this person, find ALL valid, non-missing genotypes for this variant
-                // across all possible contexts. Pre-allocate vector to avoid reallocations.
+                // across all possible contexts.
                 let mut valid_interpretations =
                     Vec::with_capacity(group_rule.possible_contexts.len());
 
@@ -450,18 +452,20 @@ fn resolve_complex_variants(
                 }
 
                 // --- Step 2: Apply Decision Policy ---
-                // Now, make a decision based on the evidence we gathered.
                 match valid_interpretations.len() {
                     0 => { // CASE: Truly Missing
                         // The person's genotype was missing for this variant under all contexts.
-                        // Increment the missing count for every score this rule applies to.
+                        // BUG FIX: Use a HashSet to increment the missing count only ONCE per
+                        // score column, even if multiple rules for this locus affect the same score.
+                        let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                         for score_info in &group_rule.score_applications {
-                            person_counts_slice[score_info.score_column_index.0] += 1;
+                            counted_cols.insert(score_info.score_column_index);
+                        }
+                        for score_col in counted_cols {
+                            person_counts_slice[score_col.0] += 1;
                         }
                     }
                     1 => { // CASE: Success - One Unambiguous Interpretation
-                        // The person had exactly one valid, non-missing genotype among all
-                        // possible contexts. This is the desired outcome.
                         let (winning_geno, winning_context) = valid_interpretations[0];
                         let (_bim_idx, winning_a1, winning_a2) = winning_context;
 
@@ -470,10 +474,10 @@ fn resolve_complex_variants(
                             let score_col = score_info.score_column_index.0;
                             let weight = score_info.weight as f64;
 
-                            // CRITICAL: The effect allele for this score must exist in the winning
-                            // context. If not, it's considered missing for this specific score.
+                            // BUG FIX: If the locus is present, it is never counted as missing.
+                            // If the effect allele for this specific rule does not exist in the
+                            // winning genotype, its dosage is simply zero.
                             if effect_allele != winning_a1 && effect_allele != winning_a2 {
-                                person_counts_slice[score_col] += 1;
                                 continue;
                             }
 
@@ -489,35 +493,16 @@ fn resolve_complex_variants(
                                 }
                             };
                             
-                            // --- UNIFIED SCORING LOGIC ---
-                            // This logic makes the slow path compatible with the fast path's
-                            // "baseline-and-adjustment" model.
-
-                            // 1. Determine if this variant was "flipped". A variant is flipped if its
-                            //    effect allele is the reference allele (A1). The master_baseline
-                            //    calculation pre-adds the full effect (2 * weight) for all such variants.
-                            let is_flipped = effect_allele == winning_a1;
-                            
-                            // 2. If it was flipped, we must first REVERT the baseline's contribution.
-                            //    This neutralizes the score for this specific variant, allowing us
-                            //    to apply the correct contribution.
-                            if is_flipped {
-                                person_scores_slice[score_col] -= 2.0 * weight;
-                            }
-                            
-                            // 3. Apply the true contribution based on the actual dosage.
+                            // The slow path should not interact with the baseline.
+                            // Variants processed here were never part of the baseline calculation,
+                            // so we simply add their direct `dosage * weight` contribution.
                             let contribution = dosage * weight;
                             person_scores_slice[score_col] += contribution;
                         }
                     }
                     _ => { // CASE: Fatal Error - Contradictory Data
-                        // The person has multiple, non-missing genotypes for the same variant
-                        // locus. This is a critical data integrity error.
                         let iid = &prep_result.final_person_iids[person_output_idx];
-                        // The specific variant isn't easily nameable, but we can report the
-                        // first context's BIM index as a clue for debugging.
                         let first_context_id = group_rule.possible_contexts[0].0 .0;
-
                         return Err(PipelineError::Compute(format!(
                             "Fatal data inconsistency for individual '{}'. Variant at location corresponding to BIM row index '{}' has conflicting, non-missing genotypes in the input .bed file.",
                             iid, first_context_id
