@@ -415,6 +415,159 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         print("\n❌ Simple Dosage Test FAILED.")
         return False
 
+# --- NEW TEST: IMPOSSIBLE DIPLOID ---
+
+def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
+    """
+    Test Goal: Exercise the "fatal data inconsistency" branch by giving one
+    individual two non-missing genotypes at the same locus.
+    """
+    prefix = workdir / "impossible_diploid_test"
+    print("\n" + "="*80)
+    print("= Running Impossible Diploid Crash Test")
+    print("="*80)
+    print(f"Test files will be prefixed: {prefix}")
+
+    # 1. Test Data Generation
+    individuals = ['id_ok', 'id_bad', 'id_missing']
+    bim_df = pd.DataFrame([
+        {'chr': 1, 'id': '1:50000:A:C', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'C'},
+        {'chr': 1, 'id': '1:50000:A:G', 'cm': 0, 'pos': 50000, 'a1': 'A', 'a2': 'G'},
+    ])
+    score_df = pd.DataFrame([
+        {'variant_id': '1:50000', 'effect_allele': 'C', 'other_allele': 'A', 'crash_score': 1.0},
+        {'variant_id': '1:50000', 'effect_allele': 'G', 'other_allele': 'A', 'crash_score': 2.0},
+    ])
+    genotypes_df = pd.DataFrame(-1, index=bim_df['id'], columns=individuals)
+    # id_ok has one non-missing geno, should be fine.
+    genotypes_df.loc['1:50000:A:C', 'id_ok'] = 1
+    # id_bad has two non-missing genos for the same locus, this is the trigger.
+    genotypes_df.loc['1:50000:A:C', 'id_bad'] = 2
+    genotypes_df.loc['1:50000:A:G', 'id_bad'] = 1
+    # id_missing is missing both, should be fine.
+    
+    score_file = prefix.with_suffix(".score")
+    _write_plink_files(prefix, bim_df, individuals, genotypes_df)
+    _write_score_file(score_file, score_df)
+
+    # 2. Invocation
+    gnomon_res = run_cmd_func([gnomon_path, "--score", score_file, prefix], "Impossible Diploid Test", workdir)
+    
+    # 3. Validation
+    if gnomon_res is None:
+        print("❌ Test failed: Gnomon command could not be executed.")
+        return False
+        
+    expected_error_msg = "Fatal data inconsistency"
+    if gnomon_res.returncode != 0 and expected_error_msg in gnomon_res.stderr:
+        print("\n✅ Verification successful: Gnomon exited with a non-zero code and the expected error message.")
+        print(f"   > stderr contained: \"...{expected_error_msg}...\"")
+        print("\n✅ Impossible Diploid Test SUCCEEDED.")
+        return True
+    else:
+        print("\n❌ Verification failed: Gnomon did not crash as expected.")
+        print(f"   > Expected non-zero exit code, got: {gnomon_res.returncode}")
+        print(f"   > Expected stderr to contain '{expected_error_msg}', it did not.")
+        print("\n❌ Impossible Diploid Test FAILED.")
+        return False
+
+# --- NEW TEST: MULTIPLE SCORE FILES ---
+
+def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
+    """
+    Test Goal: Verify correct behavior when passing two separate --score files,
+    including overlapping and unique loci.
+    """
+    prefix = workdir / "multi_score_test"
+    print("\n" + "="*80)
+    print("= Running Multiple Score-Files Correctness Test")
+    print("="*80)
+    print(f"Test files will be prefixed: {prefix}")
+
+    # 1. Test Data Generation
+    individuals = ['p1', 'p2']
+    bim_df = pd.DataFrame([
+        {'chr': 1, 'id': '1:1000', 'cm': 0, 'pos': 1000, 'a1': 'A', 'a2': 'G'}, # Unique to A
+        {'chr': 1, 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'}, # Overlap
+        {'chr': 1, 'id': '1:3000', 'cm': 0, 'pos': 3000, 'a1': 'G', 'a2': 'T'}, # Unique to B
+        {'chr': 1, 'id': '1:4000', 'cm': 0, 'pos': 4000, 'a1': 'A', 'a2': 'C'}, # Unique to A
+        {'chr': 1, 'id': '1:5000', 'cm': 0, 'pos': 5000, 'a1': 'G', 'a2': 'C'}, # Unique to B
+    ])
+    scoreA_df = pd.DataFrame([
+        {'variant_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'scoreA': 1.0},
+        {'variant_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'scoreA': 2.0},
+        {'variant_id': '1:4000', 'effect_allele': 'A', 'other_allele': 'C', 'scoreA': 3.0},
+    ])
+    scoreB_df = pd.DataFrame([
+        {'variant_id': '1:2000', 'effect_allele': 'C', 'other_allele': 'T', 'scoreB': -4.0}, # Diff effect allele
+        {'variant_id': '1:3000', 'effect_allele': 'T', 'other_allele': 'G', 'scoreB': -5.0},
+        {'variant_id': '1:5000', 'effect_allele': 'C', 'other_allele': 'G', 'scoreB': -6.0},
+    ])
+    # Give everyone all genotypes so missingness is 0
+    genotypes_df = pd.DataFrame(1, index=bim_df['id'], columns=individuals)
+    
+    score_file_A = prefix.with_suffix(".scoreA.txt")
+    score_file_B = prefix.with_suffix(".scoreB.txt")
+    _write_plink_files(prefix, bim_df, individuals, genotypes_df)
+    _write_score_file(score_file_A, scoreA_df)
+    _write_score_file(score_file_B, scoreB_df)
+
+    # 2. Ground Truth Calculation
+    # Truth for p1 (all het, dosage=1 for all effect alleles)
+    # ScoreA: 1.0*1 (1:1000 G) + 2.0*1 (1:2000 T) + 3.0*1 (1:4000 A) = 6.0. Avg = 6.0/3 = 2.0
+    # ScoreB: -4.0*1 (1:2000 C) - 5.0*1 (1:3000 T) - 6.0*1 (1:5000 C) = -15.0. Avg = -15.0/3 = -5.0
+    truth_df = pd.DataFrame([
+        {'#IID': 'p1', 'scoreA_AVG_TRUTH': 2.0, 'scoreB_AVG_TRUTH': -5.0},
+        {'#IID': 'p2', 'scoreA_AVG_TRUTH': 2.0, 'scoreB_AVG_TRUTH': -5.0},
+    ])
+
+    # 2. Invocation
+    cmd = [gnomon_path, "--score", score_file_A, "--score", score_file_B, prefix]
+    gnomon_res = run_cmd_func(cmd, "Multi-Score-File Test", workdir)
+    
+    # 3. Validation
+    if not (gnomon_res and gnomon_res.returncode == 0):
+        print("❌ Test failed: Gnomon command failed to execute successfully.")
+        return False
+    
+    gnomon_output_path = workdir / f"{prefix.name}.sscore"
+    try:
+        result_df = pd.read_csv(gnomon_output_path, sep='\t')
+        print_file_header(gnomon_output_path, "Gnomon (Multi-Score Test)")
+        
+        merged = pd.merge(result_df, truth_df, on='#IID')
+        
+        # Check column names
+        expected_cols = {'#IID', 'scoreA_AVG', 'scoreA_MISSING_PCT', 'scoreB_AVG', 'scoreB_MISSING_PCT'}
+        if not expected_cols.issubset(result_df.columns):
+            print(f"❌ Verification failed: Output missing expected columns. Found: {result_df.columns.tolist()}")
+            return False
+
+        # Check values
+        a_ok = np.allclose(merged['scoreA_AVG'], merged['scoreA_AVG_TRUTH'])
+        b_ok = np.allclose(merged['scoreB_AVG'], merged['scoreB_AVG_TRUTH'])
+        missing_ok = (merged['scoreA_MISSING_PCT'] == 0).all() and (merged['scoreB_MISSING_PCT'] == 0).all()
+
+        print("\n--- Multi-Score Test: Results Table ---")
+        print(merged.to_markdown(index=False, floatfmt=".6f"))
+        
+        if a_ok and b_ok and missing_ok:
+            print("\n✅ Verification successful: All calculated scores and missingness percentages match ground truth.")
+            print("\n✅ Multiple Score-Files Test SUCCEEDED.")
+            return True
+        else:
+            print("\n❌ Verification failed: Mismatches found.")
+            if not a_ok: print("  - Mismatch in scoreA_AVG")
+            if not b_ok: print("  - Mismatch in scoreB_AVG")
+            if not missing_ok: print("  - Mismatch in missing percentages (expected 0)")
+            print("\n❌ Multiple Score-Files Test FAILED.")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Test failed: Could not parse or validate Gnomon output. Error: {e}")
+        return False
+
+# --- MAIN VALIDATION RUNNER ---
 
 def run_and_validate_tools(runtimes):
     """Downloads tools, runs them, validates results, and collects runtimes."""
@@ -504,8 +657,21 @@ def run_and_validate_tools(runtimes):
 
     if not setup_tools(): return False
     
+    # --- RUN ALL VALIDATION TESTS ---
     if not run_simple_dosage_test(WORKDIR, GNOMON_BINARY_PATH, PLINK2_BINARY_PATH, PYLINK_SCRIPT_PATH, run_command):
         overall_success = False
+
+    if overall_success:
+        if not run_impossible_diploid_test(WORKDIR, GNOMON_BINARY_PATH, run_command):
+            overall_success = False
+    else:
+        print("Skipping Impossible Diploid Test due to previous failure.")
+
+    if overall_success:
+        if not run_multi_score_file_test(WORKDIR, GNOMON_BINARY_PATH, run_command):
+            overall_success = False
+    else:
+        print("Skipping Multi-Score-File Test due to previous failure.")
 
     print("\n" + "="*80)
     print("= Running Large-Scale Simulation and Validation")
@@ -520,8 +686,7 @@ def run_and_validate_tools(runtimes):
         if overall_success and not analyze_large_scale_results():
             overall_success = False
     else:
-        print("Skipping Large-Scale Simulation due to failure in Simple Test.")
-
+        print("Skipping Large-Scale Simulation due to failure in a preceding test.")
 
     return overall_success
 
