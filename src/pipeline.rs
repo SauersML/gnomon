@@ -467,11 +467,13 @@ fn resolve_complex_variants(
 
                         for score_info in &group_rule.score_applications {
                             let effect_allele = &score_info.effect_allele;
+                            let score_col = score_info.score_column_index.0;
+                            let weight = score_info.weight as f64;
 
                             // CRITICAL: The effect allele for this score must exist in the winning
                             // context. If not, it's considered missing for this specific score.
                             if effect_allele != winning_a1 && effect_allele != winning_a2 {
-                                person_counts_slice[score_info.score_column_index.0] += 1;
+                                person_counts_slice[score_col] += 1;
                                 continue;
                             }
 
@@ -486,9 +488,26 @@ fn resolve_complex_variants(
                                     0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!(),
                                 }
                             };
+                            
+                            // --- UNIFIED SCORING LOGIC ---
+                            // This logic makes the slow path compatible with the fast path's
+                            // "baseline-and-adjustment" model.
 
-                            let contribution = dosage * (score_info.weight as f64);
-                            person_scores_slice[score_info.score_column_index.0] += contribution;
+                            // 1. Determine if this variant was "flipped". A variant is flipped if its
+                            //    effect allele is the reference allele (A1). The master_baseline
+                            //    calculation pre-adds the full effect (2 * weight) for all such variants.
+                            let is_flipped = effect_allele == winning_a1;
+                            
+                            // 2. If it was flipped, we must first REVERT the baseline's contribution.
+                            //    This neutralizes the score for this specific variant, allowing us
+                            //    to apply the correct contribution.
+                            if is_flipped {
+                                person_scores_slice[score_col] -= 2.0 * weight;
+                            }
+                            
+                            // 3. Apply the true contribution based on the actual dosage.
+                            let contribution = dosage * weight;
+                            person_scores_slice[score_col] += contribution;
                         }
                     }
                     _ => { // CASE: Fatal Error - Contradictory Data
