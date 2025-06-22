@@ -7,7 +7,6 @@ use crate::types::{
 use ahash::AHashSet;
 use crossbeam_channel::{bounded, Receiver};
 use crossbeam_queue::ArrayQueue;
-use itertools::Itertools;
 use memmap2::Mmap;
 use num_cpus;
 use rayon::prelude::*;
@@ -410,11 +409,11 @@ fn process_dense_stream(
             },
         )?;
 
-    // try_reduce returns an Option, so we handle the case of an empty stream.
-    match final_result {
-        Some((scores, counts, _)) => Ok((scores, counts)),
-        None => Ok((vec![0.0; result_size], vec![0; result_size])),
-    }
+    // The `?` operator unwrapped the `Result` from the reduction. If the stream was
+    // empty, `try_reduce` (on a `TryFold` iterator) returns the identity value, so
+    // `final_result` correctly contains the initial empty vectors. We just need to destructure the tuple.
+    let (scores, counts, _) = final_result;
+    Ok((scores, counts))
 }
 
 /// A small, inlineable helper to read a 2-bit packed genotype from the memory-mapped
