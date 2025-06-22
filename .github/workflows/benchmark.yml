@@ -1,0 +1,45 @@
+# ========================================================================================
+#
+#                         GNOMON PERFORMANCE BENCHMARK WORKFLOW
+#
+# ========================================================================================
+
+name: "Gnomon Performance Benchmark"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # The primary job to build and run the benchmark suite.
+  benchmark:
+    name: "Build & Run Benchmarks"
+    runs-on: ubuntu-latest # Use a standard, cost-effective runner.
+
+    steps:
+      - name: "➡️ Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Install Rust Nightly toolchain"
+        uses: dtolnay/rust-toolchain-action@nightly
+        with:
+          toolchain: nightly
+
+      - name: "🗄️ Cache Cargo dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: "🧱 Build benchmark target"
+        run: cargo build --release --bench path_benchmark
+
+      - name: "⚡ Run benchmark and print results"
+        run: cargo bench --bench path_benchmark -- --nocapture
