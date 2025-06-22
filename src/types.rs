@@ -4,8 +4,6 @@
 
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
-use ahash::AHashMap;
-
 /// The payload sent from the I/O producer to the compute consumers. It contains
 /// the raw data for one variant and the necessary metadata to process it.
 #[derive(Debug)]
