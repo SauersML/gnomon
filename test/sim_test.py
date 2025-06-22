@@ -451,7 +451,7 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     _write_score_file(score_file, score_df)
 
     # 2. Invocation
-    gnomon_res = run_cmd_func([gnomon_path, "--score", score_file, prefix], "Impossible Diploid Test", workdir)
+    gnomon_res = run_cmd_func([gnomon_path, "--score", score_file.name, prefix.name], "Impossible Diploid Test", workdir)
     
     # 3. Validation
     if gnomon_res is None:
@@ -522,7 +522,7 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     ])
 
     # 2. Invocation
-    cmd = [gnomon_path, "--score", score_file_A, "--score", score_file_B, prefix]
+    cmd = [gnomon_path, "--score", score_file_A.name, "--score", score_file_B.name, prefix.name]
     gnomon_res = run_cmd_func(cmd, "Multi-Score-File Test", workdir)
     
     # 3. Validation
