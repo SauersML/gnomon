@@ -415,7 +415,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         print("\n❌ Simple Dosage Test FAILED.")
         return False
 
-# --- NEW TEST: IMPOSSIBLE DIPLOID ---
+# --- TEST: IMPOSSIBLE DIPLOID ---
 
 def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     """
@@ -471,7 +471,7 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         print("\n❌ Impossible Diploid Test FAILED.")
         return False
 
-# --- NEW TEST: MULTIPLE SCORE FILES ---
+# --- TEST: MULTIPLE SCORE FILES ---
 
 def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     """
@@ -488,20 +488,23 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     individuals = ['p1', 'p2']
     bim_df = pd.DataFrame([
         {'chr': 1, 'id': '1:1000', 'cm': 0, 'pos': 1000, 'a1': 'A', 'a2': 'G'}, # Unique to A
-        {'chr': 1, 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'}, # Overlap
+        {'chr': 1, 'id': '1:2000', 'cm': 0, 'pos': 2000, 'a1': 'C', 'a2': 'T'}, # Overlap (different effect allele)
         {'chr': 1, 'id': '1:3000', 'cm': 0, 'pos': 3000, 'a1': 'G', 'a2': 'T'}, # Unique to B
         {'chr': 1, 'id': '1:4000', 'cm': 0, 'pos': 4000, 'a1': 'A', 'a2': 'C'}, # Unique to A
         {'chr': 1, 'id': '1:5000', 'cm': 0, 'pos': 5000, 'a1': 'G', 'a2': 'C'}, # Unique to B
+        {'chr': 1, 'id': '1:6000', 'cm': 0, 'pos': 6000, 'a1': 'A', 'a2': 'C'}, # Overlap (same effect allele)
     ])
     scoreA_df = pd.DataFrame([
         {'variant_id': '1:1000', 'effect_allele': 'G', 'other_allele': 'A', 'scoreA': 1.0},
         {'variant_id': '1:2000', 'effect_allele': 'T', 'other_allele': 'C', 'scoreA': 2.0},
         {'variant_id': '1:4000', 'effect_allele': 'A', 'other_allele': 'C', 'scoreA': 3.0},
+        {'variant_id': '1:6000', 'effect_allele': 'C', 'other_allele': 'A', 'scoreA': 10.0},
     ])
     scoreB_df = pd.DataFrame([
         {'variant_id': '1:2000', 'effect_allele': 'C', 'other_allele': 'T', 'scoreB': -4.0}, # Diff effect allele
         {'variant_id': '1:3000', 'effect_allele': 'T', 'other_allele': 'G', 'scoreB': -5.0},
         {'variant_id': '1:5000', 'effect_allele': 'C', 'other_allele': 'G', 'scoreB': -6.0},
+        {'variant_id': '1:6000', 'effect_allele': 'C', 'other_allele': 'A', 'scoreB': -20.0},
     ])
     # Give everyone all genotypes so missingness is 0
     genotypes_df = pd.DataFrame(1, index=bim_df['id'], columns=individuals)
@@ -514,11 +517,11 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
 
     # 2. Ground Truth Calculation
     # Truth for p1 (all het, dosage=1 for all effect alleles)
-    # ScoreA: 1.0*1 (1:1000 G) + 2.0*1 (1:2000 T) + 3.0*1 (1:4000 A) = 6.0. Avg = 6.0/3 = 2.0
-    # ScoreB: -4.0*1 (1:2000 C) - 5.0*1 (1:3000 T) - 6.0*1 (1:5000 C) = -15.0. Avg = -15.0/3 = -5.0
+    # ScoreA: (1.0*1 + 2.0*1 + 3.0*1 + 10.0*1) / 4 variants = 16.0 / 4 = 4.0
+    # ScoreB: (-4.0*1 - 5.0*1 - 6.0*1 - 20.0*1) / 4 variants = -35.0 / 4 = -8.75
     truth_df = pd.DataFrame([
-        {'#IID': 'p1', 'scoreA_AVG_TRUTH': 2.0, 'scoreB_AVG_TRUTH': -5.0},
-        {'#IID': 'p2', 'scoreA_AVG_TRUTH': 2.0, 'scoreB_AVG_TRUTH': -5.0},
+        {'#IID': 'p1', 'scoreA_AVG_TRUTH': 4.0, 'scoreB_AVG_TRUTH': -8.75},
+        {'#IID': 'p2', 'scoreA_AVG_TRUTH': 4.0, 'scoreB_AVG_TRUTH': -8.75},
     ])
 
     # 2. Invocation
@@ -571,7 +574,6 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     except Exception as e:
         print(f"❌ Test failed: Could not parse or validate Gnomon output. Error: {e}")
         return False
-
 # --- MAIN VALIDATION RUNNER ---
 
 def run_and_validate_tools(runtimes):
