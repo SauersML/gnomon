@@ -526,7 +526,7 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     scores_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(score_file_A, scores_dir / score_file_A.name)
     shutil.copy(score_file_B, scores_dir / score_file_B.name)
-    cmd = [gnomon_path, "--score", scores_dir, prefix]
+    cmd = [gnomon_path, "--score", str(scores_dir), prefix.name]
     gnomon_res = run_cmd_func(cmd, "Multi-Score-File Test", workdir)
 
     
