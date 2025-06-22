@@ -27,21 +27,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 use crate::types::ReconciledVariantIndex;
 
-// A flag to ensure we only print the allele-reconciliation warning once per run.
-static AMBIGUITY_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
-
 // The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
 const LANE_COUNT: usize = 8;
 
 // ========================================================================================
 //                     TYPE-DRIVEN DOMAIN MODEL
 // ========================================================================================
-
-#[derive(Debug, Clone, Copy)]
-enum Reconciliation {
-    Flip,
-    Identity,
-}
 
 #[derive(Clone)]
 struct BimRecord {
