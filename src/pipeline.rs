@@ -34,6 +34,61 @@ const BUFFER_POOL_SIZE: usize = 16384;
 //                          PUBLIC API, CONTEXT & ERROR HANDLING
 // ========================================================================================
 
+/// An iterator that pulls items from a channel and groups them into batches.
+///
+/// This is a `Send`-compatible replacement for `itertools::chunks` on a channel
+/// iterator, enabling true streaming processing with `rayon::par_bridge`. It is
+/// the key to enabling simultaneous I/O and computation for the dense path.
+struct ChannelBatcher<T> {
+    rx: Receiver<Result<T, PipelineError>>,
+    batch_size: usize,
+}
+
+impl<T> ChannelBatcher<T> {
+    fn new(rx: Receiver<Result<T, PipelineError>>, batch_size: usize) -> Self {
+        Self { rx, batch_size }
+    }
+}
+
+// The implementation of the `Iterator` trait is what allows this to be used in loops
+// and with adapters like `par_bridge`.
+impl<T: Send> Iterator for ChannelBatcher<T> {
+    // The iterator yields a `Result` containing either a `Vec` of items (a batch)
+    // or a `PipelineError` if one was sent by the producer.
+    type Item = Result<Vec<T>, PipelineError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // First, block waiting for one item. If the channel is empty and has been
+        // closed by the producer, `recv()` will return an error, and we'll return `None`,
+        // ending the iteration. This is the correct way to terminate the stream.
+        match self.rx.recv() {
+            // Happy path: We received a valid work item from the producer.
+            Ok(Ok(first_item)) => {
+                let mut batch = Vec::with_capacity(self.batch_size);
+                batch.push(first_item);
+
+                // Greedily pull more items from the channel *without blocking* until
+                // the batch is full or the channel is momentarily empty.
+                while batch.len() < self.batch_size {
+                    match self.rx.try_recv() {
+                        Ok(Ok(item)) => batch.push(item),
+                        // An error was sent down the channel. Stop and propagate it.
+                        Ok(Err(e)) => return Some(Err(e)),
+                        // The channel is empty or disconnected. The current batch is finished.
+                        Err(_) => break,
+                    }
+                }
+                // Return the completed (or partially-filled) batch.
+                Some(Ok(batch))
+            }
+            // An error was sent down the channel as the first item. Propagate it.
+            Ok(Err(e)) => Some(Err(e)),
+            // The producer has disconnected the channel. End the iteration.
+            Err(_) => None,
+        }
+    }
+}
+
 /// A specialized error type for the pipeline, allowing for robust, clonable error
 /// propagation from any concurrent stage.
 #[derive(Debug, Clone)]
@@ -283,8 +338,9 @@ fn process_sparse_stream(
     Ok(final_result)
 }
 
-/// A contention-free consumer for the dense variant stream. It groups items from
-/// the channel into batches, which are then processed in parallel by Rayon.
+/// A contention-free consumer for the dense variant stream. It uses a custom
+/// batching iterator to group items, which are then processed in parallel by Rayon.
+/// This implementation allows I/O and computation to run concurrently.
 fn process_dense_stream(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     context: &PipelineContext,
@@ -293,53 +349,38 @@ fn process_dense_stream(
     let prep_result = &context.prep_result;
     let result_size = prep_result.num_people_to_score * prep_result.score_names.len();
 
-    // STAGE 1: Sequentially collect work from the channel into a Vec of batches.
-    // This is necessary because the `itertools::chunks` iterator is not `Send` and
-    // cannot be used with `par_bridge`. This stage is very fast as it only moves
-    // pointers and respects the backpressure of the channel.
-    let batches: Vec<Vec<WorkItem>> = rx
-        .into_iter()
-        // Use a map to propagate the error from the Result into the main thread.
-        .map(|work_result| work_result.expect("Pipeline error propagated to dense stream"))
-        .chunks(DENSE_BATCH_SIZE)
-        .into_iter()
-        .map(|chunk| chunk.collect())
-        .collect();
+    // Instantiate our new Send-compatible batching iterator.
+    let batch_iterator = ChannelBatcher::new(rx, DENSE_BATCH_SIZE);
 
-    // The accumulator for the fold is a 3-tuple:
-    // 1. The score buffer for this thread.
-    // 2. The missingness count buffer for this thread.
-    // 3. A reusable buffer for concatenating dense variant data, to avoid re-allocation for every batch.
-    // type Accumulator = (Vec<f64>, Vec<u32>, Vec<u8>);
-    //  Not used... maybe use it?
-
-    // STAGE 2: Process the Vec of batches in parallel using Rayon's fold/reduce.
-    let final_result = batches
-        .into_par_iter()
+    // Use the exact same fold/reduce pattern as the sparse stream, but on batches.
+    let final_result = batch_iterator
+        .par_bridge() // This is now possible and correct.
         .try_fold(
-            || { // Initializer for each thread's accumulator.
+            || { // Per-thread accumulator initializer
                 (
                     vec![0.0f64; result_size],
                     vec![0u32; result_size],
                     Vec::with_capacity(DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize)),
                 )
             },
-            |mut acc, batch| {
-                if batch.is_empty() { return Ok::<_, PipelineError>(acc); }
-    
-                // The logic for processing a batch is contained here. We use a Vec of BufferGuards
-                // to ensure all buffers are returned to the pool, even on error.
+            |mut acc, batch_result| {
+                // The `?` operator handles propagating errors from the channel.
+                let batch = batch_result?;
+                if batch.is_empty() { return Ok(acc); }
+
                 let reconciled_indices: Vec<ReconciledVariantIndex> =
                     batch.iter().map(|wi| wi.reconciled_variant_index).collect();
 
                 let concatenated_data = &mut acc.2;
                 concatenated_data.clear();
+                
+                // BufferGuard ensures all variant data buffers are returned to the pool,
+                // even if an error occurs during computation.
                 let guards: Vec<_> = batch.into_iter().map(|wi| {
                     concatenated_data.extend_from_slice(&wi.data);
                     BufferGuard { buffer: Some(wi.data), pool: &buffer_pool }
                 }).collect();
 
-                // Pre-gather the weights and flips for this specific batch of dense variants.
                 let stride = prep_result.stride();
                 let mut weights_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
                 let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
@@ -349,34 +390,32 @@ fn process_dense_stream(
                     flips_for_batch.extend_from_slice(&prep_result.flip_mask_matrix()[src_offset..src_offset + stride]);
                 }
 
-                // Run the core computation for the batch.
                 batch::run_person_major_path(
                     concatenated_data, &weights_for_batch, &flips_for_batch,
                     &reconciled_indices, prep_result, &mut acc.0, &mut acc.1,
                     &context.tile_pool, &context.sparse_index_pool,
                 )?;
                 
-                // Explicitly drop guards to return buffers to the pool before the next iteration.
-                drop(guards);
+                drop(guards); // Explicitly drop to return buffers to the pool.
 
                 Ok::<_, PipelineError>(acc)
             },
         )
         .try_reduce(
-            || (vec![0.0; result_size], vec![0; result_size], Vec::new()), // Identity for the reduction.
-            |mut a, b| { // Parallel reduction of thread-local results.
+            || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
+            |mut a, b| {
                 a.0.par_iter_mut().zip(b.0).for_each(|(v_a, v_b)| *v_a += v_b);
                 a.1.par_iter_mut().zip(b.1).for_each(|(v_a, v_b)| *v_a += v_b);
                 Ok(a)
             },
         )?;
 
-    // `try_reduce` returns `Result<Accumulator, PipelineError>`.
-    // The `?` operator has already unwrapped the Result, leaving just the tuple.
-    // We extract the scores and counts, discarding the reusable buffer.
-    Ok((final_result.0, final_result.1))
+    // try_reduce returns an Option, so we handle the case of an empty stream.
+    match final_result {
+        Some((scores, counts, _)) => Ok((scores, counts)),
+        None => Ok((vec![0.0; result_size], vec![0; result_size])),
+    }
 }
-
 
 /// A small, inlineable helper to read a 2-bit packed genotype from the memory-mapped
 /// .bed file. This encapsulates the complex byte and bit offset calculations.
