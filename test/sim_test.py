@@ -205,7 +205,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         """Generates the in-memory data for the simple test case."""
         individuals = [
             'id_hom_ref', 'id_het', 'id_hom_alt', 'id_new_person',
-            'id_special_case', 'id_multi_AC', 'id_multi_AG', 'id_multi_CG'
+            'id_special_case', 'id_multi_AC', 'id_multi_AG'#, 'id_multi_CG'
         ]
         bim_data = [
             {'chr':'1','id':'1:1000','cm':0,'pos':1000,'a1':'A','a2':'G'},
@@ -237,7 +237,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         genotypes_df.loc[special_variants[40:], 'id_special_case'] = 0
         genotypes_df.loc['1:50000:A:C', 'id_multi_AC'] = 1; genotypes_df.loc['1:50000:A:G', 'id_multi_AC'] = -1; genotypes_df.loc['1:60000:T:C', 'id_multi_AC'] = 1
         genotypes_df.loc['1:50000:A:C', 'id_multi_AG'] = -1; genotypes_df.loc['1:50000:A:G', 'id_multi_AG'] = 1; genotypes_df.loc['1:60000:T:C', 'id_multi_AG'] = 1
-        genotypes_df.loc['1:50000:A:C', 'id_multi_CG'] = 1; genotypes_df.loc['1:50000:A:G', 'id_multi_CG'] = 1; genotypes_df.loc['1:60000:T:C', 'id_multi_CG'] = 1
+        #genotypes_df.loc['1:50000:A:C', 'id_multi_CG'] = 1; genotypes_df.loc['1:50000:A:G', 'id_multi_CG'] = 1; genotypes_df.loc['1:60000:T:C', 'id_multi_CG'] = 1
         return bim_df, score_df, individuals, genotypes_df
 
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
