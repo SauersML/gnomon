@@ -200,8 +200,42 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
     }
 
-    // --- STAGE 5: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
-    eprintln!("> Pass 5: Populating all compute structures in parallel...");
+    // --- STAGE 5: Build Correction Blueprint for Multiallelic Fast-Path Variants ---
+    let mut multiallelic_fast_path_corrections = AHashMap::new();
+    // To efficiently find siblings, we first create a reverse map from a BIM row index
+    // back to its `chr:pos` key. This avoids repeated, slow searches.
+    let mut bim_row_to_chr_pos_key: Vec<Option<&str>> = vec![None; total_variants_in_bim];
+    for (key, records) in &bim_index {
+        for (_, bim_row_idx) in records {
+            bim_row_to_chr_pos_key[bim_row_idx.0 as usize] = Some(key);
+        }
+    }
+
+    for &bim_row_idx in &required_bim_indices {
+        if let Some(chr_pos_key) = bim_row_to_chr_pos_key[bim_row_idx.0 as usize] {
+            // This lookup is guaranteed to succeed.
+            let all_records_at_locus = &bim_index[chr_pos_key];
+            if all_records_at_locus.len() > 1 {
+                // This is a multiallelic site handled by the fast path. It needs a correction rule.
+                let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row_idx.0 as usize].unwrap().get();
+                let siblings: Vec<BimRowIndex> = all_records_at_locus
+                    .iter()
+                    .map(|(_, sibling_idx)| *sibling_idx)
+                    .filter(|&sibling_idx| sibling_idx != bim_row_idx) // Exclude the variant itself
+                    .collect();
+
+                if !siblings.is_empty() {
+                    multiallelic_fast_path_corrections.insert(
+                        ReconciledVariantIndex(reconciled_idx),
+                        siblings,
+                    );
+                }
+            }
+        }
+    }
+
+    // --- STAGE 6: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
+    eprintln!("> Pass 6: Populating all compute structures in parallel...");
     
     // Allocate all final data structures to their exact size.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
@@ -276,6 +310,7 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         stride,
         required_bim_indices,
         final_complex_rules,
+        multiallelic_fast_path_corrections,
         score_names,
         score_variant_counts,
         variant_to_scores_map,
