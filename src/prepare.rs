@@ -658,41 +658,39 @@ fn resolve_matches_for_score_line<'a>(
     effect_allele: &str,
     bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
 ) -> Result<ReconciliationOutcome<'a>, PrepError> {
-    // First, perform the critical triage: is this a multiallelic site?
     // A site is multiallelic if the genotype file defines more than one
     // variant record for the same chromosomal position.
     let is_multiallelic_site = bim_records_for_position.len() > 1;
 
-    // Find all BIM records at this position where the effect allele is present.
-    // This correctly covers both "perfect" and "permissive" matches. A BTreeMap
-    // provides automatic de-duplication (by BIM row index) and a deterministic
-    // ordering of any potential matches.
-    let mut all_possible_contexts: BTreeMap<BimRowIndex, &'a (BimRecord, BimRowIndex)> =
+    // --- TRIAGE ---
+    // If a site is multiallelic, it is ALWAYS complex. To ensure correct locus
+    // counting, we must pass ALL available contexts for that position to the
+    // slow path, regardless of the effect allele for this specific rule. This
+    // guarantees that all rules for one locus are grouped under a single key.
+    if is_multiallelic_site {
+        let all_contexts_for_locus = bim_records_for_position.iter().collect();
+        return Ok(ReconciliationOutcome::Complex(all_contexts_for_locus));
+    }
+
+    // --- BIALLELIC (SIMPLE) PATH ---
+    // The site is not multiallelic, so we can safely process it on the fast path.
+    // We search for a single, unambiguous interpretation based on the effect allele.
+    // A BTreeMap provides automatic de-duplication (by BIM row index) and a
+    // deterministic ordering of any potential matches.
+    let mut simple_matches: BTreeMap<BimRowIndex, &'a (BimRecord, BimRowIndex)> =
         BTreeMap::new();
     for record_tuple in bim_records_for_position {
         let (bim_record, bim_row_index) = record_tuple;
         if &bim_record.allele1 == effect_allele || &bim_record.allele2 == effect_allele {
-            all_possible_contexts.insert(*bim_row_index, record_tuple);
+            simple_matches.insert(*bim_row_index, record_tuple);
         }
     }
 
-    // Now, make the final triage decision based on the number of potential matches.
-    if all_possible_contexts.is_empty() {
-        return Ok(ReconciliationOutcome::NotFound);
-    }
-    
-    if is_multiallelic_site {
-        // If we found any match at a multiallelic site, it is ALWAYS complex.
-        // This is the primary safeguard. The fast path cannot handle any
-        // variant from a multiallelic site, as its "per-rule" worldview
-        // is incompatible with the "per-locus" reality.
-        let complex_matches = all_possible_contexts.values().copied().collect();
-        Ok(ReconciliationOutcome::Complex(complex_matches))
+    if simple_matches.is_empty() {
+        Ok(ReconciliationOutcome::NotFound)
     } else {
-        // At this point, we know the site is not multiallelic. The fast path
-        // is safe to use.
-        let simple_matches = all_possible_contexts.values().copied().collect();
-        Ok(ReconciliationOutcome::Simple(simple_matches))
+        let matches_as_vec = simple_matches.values().copied().collect();
+        Ok(ReconciliationOutcome::Simple(matches_as_vec))
     }
 }
 
