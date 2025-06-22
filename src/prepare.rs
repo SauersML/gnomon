@@ -226,24 +226,51 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         }
     }
 
-    // --- STAGE 6: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
+    // --- STAGE 6: Correct Locus Counting & Parallel Matrix Population ---
     eprintln!("> Pass 6: Populating all compute structures in parallel...");
+
+    // First, correctly count the number of unique loci per score for the fast path.
+    // This is done by de-duplicating (locus, score) pairs in a HashSet. This new
+    // sequential step is extremely fast and ensures the primary denominator component
+    // is correct before the main parallel work begins.
+    let mut fast_path_locus_score_pairs: AHashSet<(&str, ScoreColumnIndex)> = AHashSet::new();
+    for (reconciled_idx, scores_for_variant) in work_by_reconciled_idx.iter().enumerate() {
+        let bim_row_idx = required_bim_indices[reconciled_idx];
+        // This lookup is guaranteed to succeed because required_bim_indices are from the bim_index.
+        let chr_pos_key = bim_row_to_chr_pos_key[bim_row_idx.0 as usize].unwrap();
+        for &(score_col, _, _) in scores_for_variant {
+            fast_path_locus_score_pairs.insert((chr_pos_key, score_col));
+        }
+    }
+
+    // Now aggregate the final, correct counts for the number of variants per score.
+    let mut score_variant_counts = vec![0u32; score_names.len()];
+    // Count the unique fast-path loci for each score from the de-duplicated set.
+    for &(_, score_col) in &fast_path_locus_score_pairs {
+        score_variant_counts[score_col.0] += 1;
+    }
+
+    // Then, add the counts from the slow path, which are already correctly locus-based.
+    for group_rule in &final_complex_rules {
+        for score_info in &group_rule.score_applications {
+            score_variant_counts[score_info.score_column_index.0] += 1;
+        }
+    }
     
-    // Allocate all final data structures to their exact size.
+    // Allocate all final data structures for parallel population.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
     
-    // Use atomics for safe, parallel counting.
-    let score_variant_counts: Vec<AtomicU32> = (0..score_names.len()).map(|_| AtomicU32::new(0)).collect();
-    
+    // Create unsafe writers to allow parallel, lock-free writes to disjoint memory regions.
     let writer_tuple = (
         MatrixWriter { ptr: weights_matrix.as_mut_ptr() },
         MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() },
         MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() },
     );
 
+    // This parallel loop now only populates the matrices and metadata maps. The counting is done.
     work_by_reconciled_idx
         .par_iter_mut()
         .enumerate()
@@ -262,28 +289,13 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
                     *weights_writer.ptr.add(final_offset) = weight;
                     *flip_writer.ptr.add(final_offset) = if is_flipped { 1 } else { 0 };
                 }
-
                 vtsm_entry.push(score_col);
-                score_variant_counts[score_col.0].fetch_add(1, Ordering::Relaxed);
             }
             
             unsafe {
                 *vtsm_writer.ptr.add(reconciled_idx) = vtsm_entry;
             }
         });
-    
-    // Convert the fast-path atomic counts to a mutable Vec.
-    let mut score_variant_counts: Vec<u32> =
-        score_variant_counts.into_iter().map(|a| a.into_inner()).collect();
-
-    // --- FINAL STEP: Account for complex variants in total counts ---
-    // This fast, sequential loop ensures the final denominators used for statistics
-    // are correct by adding the counts from the slow-path variants.
-    for group_rule in &final_complex_rules {
-        for score_info in &group_rule.score_applications {
-            score_variant_counts[score_info.score_column_index.0] += 1;
-        }
-    }
     
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
