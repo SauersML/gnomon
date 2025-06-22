@@ -179,20 +179,10 @@ pub fn run(
         final_scores.par_iter_mut().zip(sparse_adjustments).for_each(|(m, p)| *m += p);
         final_scores.par_iter_mut().zip(dense_adjustments).for_each(|(m, p)| *m += p);
         
-        // --- 5. Locus-Centric Correction for Multiallelic Variants on Fast Path ---
-        // This pass corrects the missingness counts for multiallelic variants that
-        // were handled by the primary compute path. It is essential for ensuring the
-        // final denominator in the score average is correct.
-        if !prep_result.multiallelic_fast_path_corrections.is_empty() {
-            eprintln!(
-                "> Correcting missingness counts for {} multiallelic fast-path loci...",
-                prep_result.multiallelic_fast_path_corrections.len()
-            );
-            correct_multiallelic_missingness_counts(prep_result, &mut final_counts, &mmap)?;
-        }
-        
-        // --- 6. Final Step: Resolve complex variants and apply their contributions ---
-        // This "slow path" runs after all high-performance streams are complete
+        // --- 5. Final Step: Resolve complex variants and apply their contributions ---
+        // This "slow path" runs after all high-performance streams are complete. It is
+        // only invoked if the preparation phase identified any complex, multiallelic
+        // variants that required deferred resolution.
         if !prep_result.complex_rules.is_empty() {
             eprintln!(
                 "> Resolving {} unique complex variant rule(s)...",
@@ -415,68 +405,6 @@ fn get_packed_genotype(
     // This indexing is safe because the preparation phase guarantees all indices are valid.
     let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
     (packed_byte >> bit_offset_in_byte) & 0b11
-}
-
-/// Corrects the missingness counts for multiallelic variants that were processed
-/// on the primary compute path.
-///
-/// This function implements a locus-centric correction model. For each multiallelic
-/// variant that was handled by the fast path, it launches a parallel operation over
-/// all individuals. If an individual was incorrectly marked as missing (because their
-/// valid genotype was in a sibling BIM record, not the primary one), this function
-/// reads the sibling records and decrements the person's missing count if a valid
-/// genotype is found. This ensures the final score normalization is correct.
-fn correct_multiallelic_missingness_counts(
-    prep_result: &Arc<PreparationResult>,
-    final_missing_counts: &mut [u32],
-    mmap: &Arc<Mmap>,
-) -> Result<(), PipelineError> {
-    let num_scores = prep_result.score_names.len();
-
-    // The outer loop is sequential and iterates over the small set of loci needing correction.
-    for (reconciled_idx, siblings) in &prep_result.multiallelic_fast_path_corrections {
-        let scores_affected = &prep_result.variant_to_scores_map[reconciled_idx.0 as usize];
-        if scores_affected.is_empty() {
-            continue;
-        }
-
-        // The inner operation is parallel across all people, ensuring memory access for this
-        // one locus is localized and cache-friendly.
-        final_missing_counts
-            .par_chunks_mut(num_scores)
-            .enumerate()
-            .for_each(|(person_output_idx, person_counts_slice)| {
-                // This check is a crucial optimization. We only proceed if the person was
-                // actually marked as missing for this variant's scores. We only need to
-                // check one of the affected scores, as they would all be marked missing together.
-                if person_counts_slice[scores_affected[0].0] > 0 {
-                    let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
-
-                    // Now, query the sibling records for a valid genotype.
-                    for &sibling_bim_idx in siblings {
-                        let packed_geno = get_packed_genotype(
-                            mmap,
-                            prep_result.bytes_per_variant,
-                            sibling_bim_idx,
-                            original_fam_idx,
-                        );
-
-                        // If a non-missing genotype is found in any sibling record, the person
-                        // was not truly missing.
-                        if packed_geno != 0b01 {
-                            // Decrement the count for all scores this variant contributes to.
-                            for score_col in scores_affected {
-                                person_counts_slice[score_col.0] -= 1;
-                            }
-                            // We found a valid genotype, so we can stop checking siblings for this person.
-                            break;
-                        }
-                    }
-                }
-            });
-    }
-
-    Ok(())
 }
 
 /// The "slow path" resolver for complex, multiallelic variants.
