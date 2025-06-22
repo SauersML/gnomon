@@ -192,68 +192,36 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
     }
 
-    // --- STAGE 5: Build Correction Blueprint for Multiallelic Fast-Path Variants ---
-    let mut multiallelic_fast_path_corrections = AHashMap::new();
-    // To efficiently find siblings, we first create a reverse map from a BIM row index
-    // back to its `chr:pos` key. This avoids repeated, slow searches.
-    let mut bim_row_to_chr_pos_key: Vec<Option<&str>> = vec![None; total_variants_in_bim];
-    for (key, records) in &bim_index {
-        for (_, bim_row_idx) in records {
-            bim_row_to_chr_pos_key[bim_row_idx.0 as usize] = Some(key);
-        }
-    }
+    // --- STAGE 5: Correct Locus Counting & Parallel Matrix Population ---
+    eprintln!("> Pass 5: Populating all compute structures in parallel...");
 
-    for &bim_row_idx in &required_bim_indices {
-        if let Some(chr_pos_key) = bim_row_to_chr_pos_key[bim_row_idx.0 as usize] {
-            // This lookup is guaranteed to succeed.
-            let all_records_at_locus = &bim_index[chr_pos_key];
-            if all_records_at_locus.len() > 1 {
-                // This is a multiallelic site handled by the fast path. It needs a correction rule.
-                let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row_idx.0 as usize].unwrap().get();
-                let siblings: Vec<BimRowIndex> = all_records_at_locus
-                    .iter()
-                    .map(|(_, sibling_idx)| *sibling_idx)
-                    .filter(|&sibling_idx| sibling_idx != bim_row_idx) // Exclude the variant itself
-                    .collect();
-
-                if !siblings.is_empty() {
-                    multiallelic_fast_path_corrections.insert(
-                        ReconciledVariantIndex(reconciled_idx),
-                        siblings,
-                    );
-                }
-            }
-        }
-    }
-
-    // --- STAGE 6: Correct Locus Counting & Parallel Matrix Population ---
-    eprintln!("> Pass 6: Populating all compute structures in parallel...");
-
-    // First, correctly count the number of unique loci per score for the fast path.
-    // This is done by de-duplicating (locus, score) pairs in a HashSet. This new
-    // sequential step is extremely fast and ensures the primary denominator component
-    // is correct before the main parallel work begins.
-    let mut fast_path_locus_score_pairs: AHashSet<(&str, ScoreColumnIndex)> = AHashSet::new();
-    for (reconciled_idx, scores_for_variant) in work_by_reconciled_idx.iter().enumerate() {
-        let bim_row_idx = required_bim_indices[reconciled_idx];
-        // This lookup is guaranteed to succeed because required_bim_indices are from the bim_index.
-        let chr_pos_key = bim_row_to_chr_pos_key[bim_row_idx.0 as usize].unwrap();
-        for &(score_col, _, _) in scores_for_variant {
-            fast_path_locus_score_pairs.insert((chr_pos_key, score_col));
-        }
-    }
-
-    // Now aggregate the final, correct counts for the number of variants per score.
+    // Correctly count the number of unique loci per score. This is essential for the
+    // final denominator calculation. This logic now correctly handles cases where
+    // multiple score file rules apply to the same genomic position, ensuring the
+    // position is only counted once per score.
     let mut score_variant_counts = vec![0u32; score_names.len()];
-    // Count the unique fast-path loci for each score from the de-duplicated set.
+
+    // To de-duplicate loci on the fast path, we use a HashSet of the (BimRowIndex, ScoreColumnIndex)
+    // pairs. Because the new triage ensures every BimRowIndex on the fast path corresponds to a
+    // unique biallelic locus, this is a fast and correct way to count unique (locus, score) contributions.
+    let mut fast_path_locus_score_pairs: AHashSet<(BimRowIndex, ScoreColumnIndex)> = AHashSet::new();
+    for ((bim_row_idx, score_col_idx), _) in &flat_score_data {
+        fast_path_locus_score_pairs.insert((*bim_row_idx, *score_col_idx));
+    }
     for &(_, score_col) in &fast_path_locus_score_pairs {
         score_variant_counts[score_col.0] += 1;
     }
 
     // Then, add the counts from the slow path, which are already correctly locus-based.
+    // Here we must also de-duplicate, in case multiple rules for the same score
+    // were sent to the slow path for the same locus.
     for group_rule in &final_complex_rules {
+        let mut slow_path_pairs_for_rule: AHashSet<ScoreColumnIndex> = AHashSet::new();
         for score_info in &group_rule.score_applications {
-            score_variant_counts[score_info.score_column_index.0] += 1;
+            slow_path_pairs_for_rule.insert(score_info.score_column_index);
+        }
+        for score_col in slow_path_pairs_for_rule {
+            score_variant_counts[score_col.0] += 1;
         }
     }
     
@@ -262,6 +230,9 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
+    
+    // Use atomics for safe, parallel counting for the variant_to_scores_map.
+    // The main score_variant_counts is now handled correctly above.
     
     // Create unsafe writers to allow parallel, lock-free writes to disjoint memory regions.
     let writer_tuple = (
@@ -314,7 +285,6 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         stride,
         required_bim_indices,
         final_complex_rules,
-        multiallelic_fast_path_corrections,
         score_names,
         score_variant_counts,
         variant_to_scores_map,
@@ -623,11 +593,14 @@ fn compile_score_file_to_map(
         let variant_id = std::str::from_utf8(variant_id_bytes)?;
         if let Some(bim_records) = bim_index.get(variant_id) {
             let effect_allele = std::str::from_utf8(effect_allele_bytes)?;
-            let other_allele = std::str::from_utf8(other_allele_bytes)?;
 
-            // Call the new triage engine.
+            // The `other_allele` from the score file is not used in the triage,
+            // as the decision is based on finding the `effect_allele` in the
+            // genotype data's contexts.
+
+            // Triage the variant to determine if it's simple or complex.
             let match_result =
-                resolve_matches_for_score_line(variant_id, effect_allele, other_allele, bim_records)?;
+                resolve_matches_for_score_line(effect_allele, bim_records)?;
 
             match match_result {
                 ReconciliationOutcome::NotFound => continue,
@@ -683,47 +656,44 @@ fn compile_score_file_to_map(
 /// This function acts as a TRIAGE system, classifying each match as either
 /// simple (for the fast path) or complex (for the deferred slow path).
 fn resolve_matches_for_score_line<'a>(
-    _variant_id: &str, // DELETE or use.
     effect_allele: &str,
-    _other_allele: &str, // DELETE. keeping this is a mistake.
     bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
 ) -> Result<ReconciliationOutcome<'a>, PrepError> {
-    // A BTreeMap provides automatic de-duplication (by BIM row index) and a deterministic ordering
+    // First, perform the critical triage: is this a multiallelic site?
+    // A site is multiallelic if the genotype file defines more than one
+    // variant record for the same chromosomal position.
+    let is_multiallelic_site = bim_records_for_position.len() > 1;
+
+    // Find all BIM records at this position where the effect allele is present.
+    // This correctly covers both "perfect" and "permissive" matches. A BTreeMap
+    // provides automatic de-duplication (by BIM row index) and a deterministic
+    // ordering of any potential matches.
     let mut all_possible_contexts: BTreeMap<BimRowIndex, &'a (BimRecord, BimRowIndex)> =
         BTreeMap::new();
-
-    // A single pass is sufficient to find all plausible interpretations. A variant
-    // is a candidate if its effect allele is present in the BIM context. This
-    // single rule correctly covers both "perfect" and "permissive" matches,
-    // as a perfect match is just a specific type of permissive match.
     for record_tuple in bim_records_for_position {
         let (bim_record, bim_row_index) = record_tuple;
-
         if &bim_record.allele1 == effect_allele || &bim_record.allele2 == effect_allele {
             all_possible_contexts.insert(*bim_row_index, record_tuple);
         }
     }
 
-    // Now, make the final triage decision based on how many unique, plausible
-    // interpretations were found.
-    match all_possible_contexts.len() {
-        0 => {
-            // No matches of any kind were found for this score file variant.
-            Ok(ReconciliationOutcome::NotFound)
-        }
-        1 => {
-            // Exactly ONE unique way to interpret this variant was found. This is
-            // TRULY SIMPLE. There is no ambiguity. Send to the fast path.
-            let simple_matches: Vec<_> = all_possible_contexts.values().copied().collect();
-            Ok(ReconciliationOutcome::Simple(simple_matches))
-        }
-        _ => {
-            // MORE THAN ONE unique way to interpret this variant exists. This variant
-            // is AMBIGUOUS and requires careful, person-by-person resolution.
-            // Send to the slow path.
-            let complex_matches: Vec<_> = all_possible_contexts.values().copied().collect();
-            Ok(ReconciliationOutcome::Complex(complex_matches))
-        }
+    // Now, make the final triage decision based on the number of potential matches.
+    if all_possible_contexts.is_empty() {
+        return Ok(ReconciliationOutcome::NotFound);
+    }
+    
+    if is_multiallelic_site {
+        // If we found any match at a multiallelic site, it is ALWAYS complex.
+        // This is the primary safeguard. The fast path cannot handle any
+        // variant from a multiallelic site, as its "per-rule" worldview
+        // is incompatible with the "per-locus" reality.
+        let complex_matches = all_possible_contexts.values().copied().collect();
+        Ok(ReconciliationOutcome::Complex(complex_matches))
+    } else {
+        // At this point, we know the site is not multiallelic. The fast path
+        // is safe to use.
+        let simple_matches = all_possible_contexts.values().copied().collect();
+        Ok(ReconciliationOutcome::Simple(simple_matches))
     }
 }
 
