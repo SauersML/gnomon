@@ -119,7 +119,7 @@ impl PreparationResult {
     /// The constructor is crate-private, enforcing the "Airlock" pattern.
     /// Only the `prepare` module can construct this "proof token".
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         weights_matrix: Vec<f32>,
         flip_mask_matrix: Vec<u8>,
         stride: usize,
