@@ -23,7 +23,6 @@ use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 use crate::types::ReconciledVariantIndex;
 
@@ -184,21 +183,12 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
     let bim_row_to_reconciled_variant_map =
         build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
 
-    // Regroup the flat list into a structure optimized for the final parallel pass.
-    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> = vec![Vec::new(); num_reconciled_variants];
-    for ((bim_row, score_col), (weight, is_flipped)) in flat_score_data {
-        // This lookup is guaranteed to succeed.
-        let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
-        work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
-    }
-
-    // --- STAGE 5: Correct Locus Counting & Parallel Matrix Population ---
-    eprintln!("> Pass 5: Populating all compute structures in parallel...");
-
-    // Correctly count the number of unique loci per score. This is essential for the
-    // final denominator calculation. This logic now correctly handles cases where
-    // multiple score file rules apply to the same genomic position, ensuring the
-    // position is only counted once per score.
+    // --- STAGE 4A: Correctly Count Loci per Score ---
+    // This is the correct, locus-aware counting mechanism. It is performed before
+    // `flat_score_data` is consumed, which fixes the ownership error from previous
+    // attempts. This logic correctly handles cases where multiple score file rules
+    // apply to the same genomic position, ensuring the position is only counted
+    // once per score for the final denominator.
     let mut score_variant_counts = vec![0u32; score_names.len()];
 
     // To de-duplicate loci on the fast path, we use a HashSet of the (BimRowIndex, ScoreColumnIndex)
@@ -224,15 +214,24 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
             score_variant_counts[score_col.0] += 1;
         }
     }
+
+    // --- STAGE 4B: Regroup Work for Parallel Processing ---
+    // This consumes `flat_score_data` now that all analysis on it is complete.
+    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> = vec![Vec::new(); num_reconciled_variants];
+    for ((bim_row, score_col), (weight, is_flipped)) in flat_score_data {
+        // This lookup is guaranteed to succeed.
+        let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
+        work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
+    }
+
+    // --- STAGE 5: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
+    eprintln!("> Pass 5: Populating all compute structures in parallel...");
     
     // Allocate all final data structures for parallel population.
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
-    
-    // Use atomics for safe, parallel counting for the variant_to_scores_map.
-    // The main score_variant_counts is now handled correctly above.
     
     // Create unsafe writers to allow parallel, lock-free writes to disjoint memory regions.
     let writer_tuple = (
