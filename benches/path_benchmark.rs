@@ -35,13 +35,13 @@ use std::time::Instant;
 // --- Benchmark Tuning Parameters ---
 
 /// The TOTAL cohort sizes (total people in the .fam) to test.
-const NUM_PEOPLE_TO_TEST: [usize; 2] = [1, 100, 1_000, 5_000, 10_000 40_000];
+const NUM_PEOPLE_TO_TEST: [usize; _] = [1, 100, 1_000, 5_000, 10_000 40_000];
 /// The number of score columns to simulate.
-const NUM_SCORES_TO_TEST: [usize; 2] = [1, 5, 50, 100];
+const NUM_SCORES_TO_TEST: [usize; _] = [1, 5, 50, 100];
 /// The percentages of the total cohort to score.
-const SUBSET_PERCENTAGES: [f32; 3] = [0.01, 0.05, 0.5, 1.0];
+const SUBSET_PERCENTAGES: [f32; _] = [0.01, 0.05, 0.5, 1.0];
 /// Allele frequencies to test (a sparse and a dense case).
-const ALLELE_FREQUENCIES_TO_TEST: [f32; 2] = [0.00001, 0.001, 0.02, 0.4];
+const ALLELE_FREQUENCIES_TO_TEST: [f32; _] = [0.00001, 0.001, 0.02, 0.4];
 
 /// The number of dense variants to process in a single person-major batch.
 const PIVOT_PATH_BATCH_SIZE: usize = 256;
