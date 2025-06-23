@@ -93,7 +93,7 @@ impl SparseIndexPool {
 
 /// Processes one dense, pre-filtered batch of variant-major data using the person-major
 /// (pivot) path. This path is efficient for batches with high variant density.
-/// This function now assumes that weight/flip data has been pre-gathered by the caller.
+/// This function assumes that weight/flip data has been pre-gathered by the caller.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
     weights_for_batch: &[f32],
@@ -294,7 +294,7 @@ fn process_tile<'a>(
         }
         
         // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
-        // The buffer set is now local to this thread for the duration of the function.
+        // The buffer set is local to this thread for the duration of the function.
         let (g1_indices, g2_indices, missing_events) = &mut buffers;
 
         // This logic ensures we only grow the vectors, then clear the relevant inner
@@ -345,7 +345,7 @@ fn process_tile<'a>(
         }
 
         // --- B. Create Kernel Input Views (Zero-Cost Slicing) ---
-        // This is now extremely fast. We just create views over the contiguous,
+        // This is fast. We just create views over the contiguous,
         // pre-gathered data that was passed in for the entire batch.
         let matrix_slice_start = variant_mini_batch_start * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
