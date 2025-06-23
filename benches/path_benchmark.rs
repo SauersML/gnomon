@@ -35,7 +35,7 @@ use std::time::Instant;
 // --- Benchmark Tuning Parameters ---
 
 /// The TOTAL cohort sizes (total people in the .fam) to test.
-const NUM_PEOPLE_TO_TEST: [usize; _] = [1, 100, 1_000, 5_000, 10_000 40_000];
+const NUM_PEOPLE_TO_TEST: [usize; _] = [1, 100, 1_000, 5_000, 10_000, 40_000];
 /// The number of score columns to simulate.
 const NUM_SCORES_TO_TEST: [usize; _] = [1, 5, 50, 100];
 /// The percentages of the total cohort to score.
