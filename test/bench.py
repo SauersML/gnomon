@@ -121,7 +121,7 @@ REALISTIC_DIMENSIONS = [
         "af_profile": 'standard',
         "score_files": [
             {
-                "name": "hugeN_smallK_panel", "n_scores": 3, "gwas_source_variants": 25_000,
+                "name": "hugeN_smallK_panel", "n_scores": 90, "gwas_source_variants": 25_000,
                 "overlap_pct": 0.90, "flip_pct": 0.10, "missing_weight_pct": 0.01, "score_sparsity": 0.5,
             }
         ],
