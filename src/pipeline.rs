@@ -178,7 +178,9 @@ pub fn run(
 
     // B. Call the meta-model ONCE to choose the global strategy.
     // let strategy = decide::choose_run_strategy(&run_ctx);
-    let strategy = decide::RunStrategy::UseComplexTree;     // --- FORCED FOR TESTING
+    // Benchmarks indicate UseComplexTree is usually but not always better.
+    // Indicates UseComplexTree choices in decide.rs is not optimal
+    let strategy = decide::RunStrategy::UseComplexTree;     // --- FORCED for now
     eprintln!("> Decision Engine Strategy: {:?}", strategy);
 
     // C. Calculate the single, global baseline score.
