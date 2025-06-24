@@ -232,6 +232,17 @@ fn benchmark_the_works(c: &mut Criterion) {
                                     )
                                     .unwrap();
                                 }
+                                // The `iter_custom` API contract expects this closure to return the total elapsed
+                                // time for all `iters` (i.e., `start.elapsed()`). Criterion would then divide
+                                // by `iters` to get the average time per batch.
+                                //
+                                // However, our model needs to compare the AMORTIZED PER-VARIANT cost. To achieve this,
+                                // we deliberately break the API contract and pre-divide the total time by the batch
+                                // size. The final number reported by Criterion will be:
+                                //
+                                //   (total_elapsed / PIVOT_PATH_BATCH_SIZE) / iters
+                                //
+                                // This gives the correct per-variant cost, making it comparable to the No-Pivot path.
                                 start.elapsed() / (PIVOT_PATH_BATCH_SIZE as u32)
                             });
                         },
