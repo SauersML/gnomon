@@ -286,15 +286,19 @@ def build_and_evaluate_decision_tree(
             name = feature_names[tree.feature[node]]
             threshold = tree.threshold[node]
             
-            # Un-log threshold if necessary for printing
+            # Determine the display name and threshold value, un-logging if necessary.
+            display_name = name
+            display_threshold = threshold
             if name in log_feature_map:
-                unlogged_threshold = np.exp(threshold)
-                print(f"{indent}if {log_feature_map[name]} <= {unlogged_threshold:,.4f}:")
-            else:
-                print(f"{indent}if {name} <= {threshold:,.4f}:")
-            
+                display_name = log_feature_map[name]
+                display_threshold = np.exp(threshold)
+
+            # Print the 'if' condition for the current split.
+            print(f"{indent}if {display_name} <= {display_threshold:,.4f}:")
             recurse(tree.children_left[node], depth + 1)
-            print(f"{indent}else:  # > {unlogged_threshold:,.4f} if logged")
+            
+            # Print the 'else' condition and recurse into the right child.
+            print(f"{indent}else:  # > {display_threshold:,.4f}")
             recurse(tree.children_right[node], depth + 1)
         else:  # Is a leaf
             class_values = tree.value[node][0]
