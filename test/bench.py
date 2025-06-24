@@ -115,13 +115,13 @@ REALISTIC_DIMENSIONS = [
     },
     {
         "test_name": "HugeN_50kVars_75pct_SUBSET",
-        "n_individuals": 400_000,
+        "n_individuals": 200_000,
         "genome_variants": 100_000,
         "target_variants": 50_000,
         "af_profile": 'standard',
         "score_files": [
             {
-                "name": "hugeN_smallK_panel", "n_scores": 20, "gwas_source_variants": 60_000,
+                "name": "hugeN_smallK_panel", "n_scores": 20, "gwas_source_variants": 25_000,
                 "overlap_pct": 0.90, "flip_pct": 0.10, "missing_weight_pct": 0.01, "score_sparsity": 0.5,
             }
         ],
