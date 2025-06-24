@@ -566,37 +566,14 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
 //                     ADAPTIVE DISPATCHER & variant-MAJOR PATH
 // ========================================================================================
 
-use crate::types::ComputePath;
-
-// This threshold is used by the dispatcher. If the estimated non-reference allele
-// frequency for a variant is above this value, it's considered "dense" and sent
-// to the high-throughput person-major path. Otherwise, it's "sparse" and sent to
-// the low-overhead variant-major path. This value can be tuned based on profiling.
-const VARIANT_DENSITY_THRESHOLD: f32 = 0.05;
-
-/// Assesses a single variant's data and determines the optimal compute path.
-///
-/// This is the "brain" of the adaptive engine. It uses a fast, hardware-accelerated
-/// heuristic to decide if a variant's data is sparse or dense.
-#[inline]
-pub fn assess_path(variant_data: &[u8], total_people: usize) -> ComputePath {
-    let non_ref_allele_freq = assess_variant_density(variant_data, total_people);
-
-    if non_ref_allele_freq > VARIANT_DENSITY_THRESHOLD {
-        ComputePath::PersonMajor
-    } else {
-        ComputePath::VariantMajor
-    }
-}
-
 /// Calculates a fast proxy for non-reference allele frequency using `popcnt`.
 ///
 /// This function is a key performance enabler. It leverages the `popcnt` (population
 /// count) CPU instruction, which is extremely fast. By viewing the byte slice as
 /// `u64` chunks, it minimizes loop iterations and lets the hardware do the heavy
-// lifting of counting set bits, which is a strong proxy for data density.
+// lifting of counting set bits.
 #[inline]
-fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
+pub fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
     if total_people == 0 {
         return 0.0;
     }
@@ -617,7 +594,7 @@ fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
     for &byte in remainder {
         set_bits += byte.count_ones();
     }
-    
+
     // Normalize by the number of people to get a comparable frequency.
     // The homozygous-reference genotype (0b00) has a popcnt of 0. All others
     // have a popcnt > 0. This gives a reliable, self-contained metric.
