@@ -1,4 +1,4 @@
-use crate::batch;
+use crate::batch::{self, SparseIndexPool};
 use crate::decide::{self, ComputePath, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
