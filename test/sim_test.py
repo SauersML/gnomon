@@ -15,7 +15,7 @@ from functools import reduce
 
 # --- Configuration Parameters ---
 N_VARIANTS = 50000
-N_INDIVIDUALS = 100
+N_INDIVIDUALS = 400_000
 CHR = '22'
 CHR_LENGTH = 39_005_000
 ALT_EFFECT_PROB = 0.3
