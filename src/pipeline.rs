@@ -1,5 +1,5 @@
 use crate::batch::{self, SparseIndexPool};
-use crate::decide::{self, ComputePath, DecisionContext, RunStrategy};
+use crate::decide::{self, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
     BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
