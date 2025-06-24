@@ -325,7 +325,7 @@ def build_and_evaluate_decision_tree(
 # =======================================================================================
 
 if __name__ == "__main__":
-    LOG_FILE_PATH = 'bench.py'
+    LOG_FILE_PATH = 'bench.txt'
 
     try:
         print(f"--- Loading and Parsing Log File: {LOG_FILE_PATH} ---")
