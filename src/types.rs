@@ -12,14 +12,6 @@ pub struct WorkItem {
     pub reconciled_variant_index: ReconciledVariantIndex,
 }
 
-/// Represents the dispatcher's decision for which compute path to use for a
-/// given unit of work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComputePath {
-    VariantMajor,
-    PersonMajor,
-}
-
 /// Contains the score-specific information for a complex variant.
 /// This is the part of a rule that changes for each score file.
 #[derive(Debug, Clone)]
