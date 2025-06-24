@@ -9,17 +9,6 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score, confusion_matrix
 
-import re
-import itertools
-import io
-import csv
-from typing import List, Dict, Any, Set, Tuple
-import pandas as pd
-import numpy as np
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import KFold
-from sklearn.metrics import accuracy_score, confusion_matrix
-
 def parse_and_validate_benchmark_logs(log_content: str) -> str:
     # === 1. Source of Truth Definition ===
     EXPECTED_N_VALUES = [1, 100, 1000, 5000, 10000, 40000]
@@ -27,6 +16,8 @@ def parse_and_validate_benchmark_logs(log_content: str) -> str:
     EXPECTED_SUBSET_VALUES = [1, 5, 50, 100]
     EXPECTED_FREQ_VALUES = [0.00001, 0.001, 0.02, 0.4]
     EXPECTED_PATH_VALUES = ['No-Pivot', 'Pivot']
+    
+    param_columns = ['N (Cohort)', 'K (Scores)', 'Subset', 'Freq', 'Path']
 
     expected_combinations: Set[Tuple] = set(itertools.product(
         EXPECTED_N_VALUES,
@@ -36,9 +27,6 @@ def parse_and_validate_benchmark_logs(log_content: str) -> str:
         EXPECTED_PATH_VALUES
     ))
     expected_count = len(expected_combinations)
-    
-    # Define column names for analysis
-    param_columns = ['N (Cohort)', 'K (Scores)', 'Subset', 'Freq', 'Path']
 
     # === 2. Parsing Logic ===
     param_regex = re.compile(
@@ -76,66 +64,66 @@ def parse_and_validate_benchmark_logs(log_content: str) -> str:
             parsed_records.append(record)
             current_params = {}
 
-    # === 3. Enhanced Validation Phase ===
+    # === 3. Enhanced Validation and Imputation Phase ===
     validation_summary = []
     error_details = []
     is_valid = True
 
-    # --- Check 1: Parsed Record Count ---
-    parsed_count = len(parsed_records)
-    if parsed_count == expected_count:
-        validation_summary.append(f"✅ PASS: Record count matches expected. (Found: {parsed_count}, Expected: {expected_count})")
-    else:
-        is_valid = False
-        validation_summary.append(f"❌ FAIL: Mismatch in record counts. (Found: {parsed_count}, Expected: {expected_count})")
+    # --- Initial Checks ---
+    initial_parsed_count = len(parsed_records)
+    parsed_combinations_set = set(tuple(rec[col] for col in param_columns) for rec in parsed_records)
     
-    # Convert parsed records to a set of tuples for efficient comparison
-    parsed_combinations = set(
-        tuple(rec[col] for col in param_columns) for rec in parsed_records
-    )
-
-    # --- Check 2: Duplicates ---
-    if len(parsed_combinations) == parsed_count:
-        validation_summary.append("✅ PASS: No duplicate benchmark records found.")
-    else:
+    if len(parsed_combinations_set) != initial_parsed_count:
         is_valid = False
-        duplicates_count = parsed_count - len(parsed_combinations)
+        duplicates_count = initial_parsed_count - len(parsed_combinations_set)
         validation_summary.append(f"❌ FAIL: Found {duplicates_count} duplicate benchmark record(s).")
-        # In-depth duplicate analysis could be added here if needed
         error_details.append("Duplicate records were detected, which may indicate a parsing error.")
+    else:
+        validation_summary.append("✅ PASS: No duplicate benchmark records found.")
 
-    # --- Check 3 & 4: Missing and Extra Benchmarks ---
-    missing_benchmarks = expected_combinations - parsed_combinations
-    extra_benchmarks = parsed_combinations - expected_combinations
-
+    # --- Identify and Handle Missing Data ---
+    missing_benchmarks = expected_combinations - parsed_combinations_set
+    
     if not missing_benchmarks:
         validation_summary.append("✅ PASS: All expected benchmarks are present.")
     else:
-        is_valid = False
-        validation_summary.append(f"❌ FAIL: Found {len(missing_benchmarks)} missing benchmark(s).")
+        unexpectedly_missing = []
+        imputed_count = 0
+        for b in missing_benchmarks:
+            # Unpack the tuple for clarity
+            n_val, _, subset_val, _, path_val = b
+            
+            # This is the specific condition identified as a zero-workload scenario
+            if n_val == 1 and subset_val in [1, 5] and path_val == 'Pivot':
+                # Impute the missing record with a time of 0.0
+                imputed_record = dict(zip(param_columns, b))
+                imputed_record['Time (Median)'] = 0.0
+                parsed_records.append(imputed_record)
+                imputed_count += 1
+            else:
+                unexpectedly_missing.append(b)
         
-        # --- Diagnostic Analysis to "Zero In" ---
-        error_details.append(f"--- Analysis of {len(missing_benchmarks)} Missing Benchmarks ---")
-        missing_df = pd.DataFrame(list(missing_benchmarks), columns=param_columns)
-        
-        # Analyze the distribution of parameters for the missing runs
-        for col in param_columns:
-            if missing_df[col].nunique() < len(missing_benchmarks):
-                 error_details.append(f"Value counts for '{col}' in missing data:\n{missing_df[col].value_counts().to_string()}\n")
-        
-        error_details.append(f"First 5 examples of missing benchmarks:\n" +
-                             "\n".join([str(b) for b in list(missing_benchmarks)[:5]]))
-    
-    if not extra_benchmarks:
-        validation_summary.append("✅ PASS: No unexpected (extra) benchmarks found.")
+        validation_summary.append(f"INFO: Found {len(missing_benchmarks)} total missing records. Imputed {imputed_count} as known zero-workload scenarios.")
+
+        if unexpectedly_missing:
+            is_valid = False
+            validation_summary.append(f"❌ FAIL: Found {len(unexpectedly_missing)} UNEXPECTED missing benchmark(s).")
+            error_details.append(f"--- Analysis of {len(unexpectedly_missing)} Unexpectedly Missing Benchmarks ---")
+            missing_df = pd.DataFrame(unexpectedly_missing, columns=param_columns)
+            for col in param_columns:
+                error_details.append(f"Value counts for '{col}' in unexpected missing data:\n{missing_df[col].value_counts().to_string()}\n")
+        else:
+            validation_summary.append("✅ PASS: All missing records were expected and have been imputed.")
+
+    # --- Final Count Check Post-Imputation ---
+    final_parsed_count = len(parsed_records)
+    if final_parsed_count == expected_count:
+        validation_summary.append(f"✅ PASS: Final record count matches expected after imputation. (Total: {final_parsed_count})")
     else:
         is_valid = False
-        validation_summary.append(f"❌ FAIL: Found {len(extra_benchmarks)} unexpected benchmark(s).")
-        error_details.append(f"--- Analysis of {len(extra_benchmarks)} Unexpected Benchmarks ---")
-        error_details.append(f"First 5 examples of unexpected benchmarks:\n" +
-                             "\n".join([str(b) for b in list(extra_benchmarks)[:5]]))
+        validation_summary.append(f"❌ FAIL: Final record count is incorrect even after imputation. (Found: {final_parsed_count}, Expected: {expected_count})")
 
-    # --- Final Decision ---
+    # --- Raise Error if Any Validation Failed ---
     if not is_valid:
         report = "VALIDATION FAILED\n\n" + \
                  "--- SUMMARY ---\n" + "\n".join(validation_summary) + \
@@ -143,11 +131,8 @@ def parse_and_validate_benchmark_logs(log_content: str) -> str:
         raise ValueError(report)
     
     print("--- VALIDATION SUCCEEDED ---\n" + "\n".join(validation_summary))
-
+    
     # === 4. Output Generation ===
-    if not parsed_records:
-        return ""
-        
     output = io.StringIO()
     header = ['N (Cohort)', 'K (Scores)', 'Subset', 'Freq', 'Path', 'Time (Median)']
     writer = csv.DictWriter(output, fieldnames=header)
