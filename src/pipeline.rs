@@ -1,4 +1,5 @@
-use crate::batch::{self, SparseIndexPool};
+use crate::batch;
+use crate::decide::{self, ComputePath, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
     BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
@@ -161,11 +162,25 @@ pub fn run(
             .unwrap();
     }
 
-    // --- 2. Pre-computation: Calculate the single, global baseline score ---
-    // This is the source of truth for the baseline. It is calculated once, up front,
-    // from all flipped variants across all scores. Both compute paths will now
-    // calculate adjustments relative to this baseline.
+    // --- 2. Pre-computation & STRATEGY SELECTION ---
+    // This is the core of the high-performance design. All decisions are made once, up front.
     let prep_result = &context.prep_result;
+
+    // A. Create the single, `f32`-based context for the decision engine.
+    // This performs the type casts ONCE per run, not millions of times per variant.
+    let run_ctx = DecisionContext {
+        n_cohort: prep_result.total_people_in_fam as f32,
+        k_scores: prep_result.score_names.len() as f32,
+        subset_frac: prep_result.num_people_to_score as f32
+            / prep_result.total_people_in_fam as f32,
+        freq: 0.0, // Dummy value, not used by the meta-model
+    };
+
+    // B. Call the meta-model ONCE to choose the global strategy.
+    let strategy = decide::choose_run_strategy(&run_ctx);
+    eprintln!("> Decision Engine Strategy: {:?}", strategy);
+
+    // C. Calculate the single, global baseline score.
     let num_scores = prep_result.score_names.len();
     let stride = prep_result.stride();
     let master_baseline: Vec<f64> = (0..prep_result.num_reconciled_variants)
@@ -194,23 +209,46 @@ pub fn run(
 
     // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        let producer_handle = s.spawn({
-            // Clone Arcs for the producer thread.
+        // The producer's logic is constructed here, before the thread is spawned.
+        // This closure captures all necessary resources to be moved into the thread.
+        let producer_logic = {
             let mmap = Arc::clone(&mmap);
             let prep_result = Arc::clone(&context.prep_result);
             let buffer_pool = Arc::clone(&buffer_pool);
-            move || io::producer_thread(mmap, prep_result, sparse_tx, dense_tx, buffer_pool)
-        });
+
+            move || match strategy {
+                RunStrategy::UseSimpleTree => {
+                    // TIER 2 DECISION: The global path is determined ONCE.
+                    let global_path = decide::decide_path_without_freq(&run_ctx);
+                    eprintln!("> Global path determined for all variants: {:?}", global_path);
+                    // Create a trivial closure that captures the constant path.
+                    let path_decider = |_variant_data: &[u8]| global_path;
+                    // Call the generic producer with the specialized, trivial closure.
+                    io::producer_thread(mmap, prep_result, sparse_tx, dense_tx, buffer_pool, path_decider);
+                }
+                RunStrategy::UseComplexTree => {
+                    eprintln!("> Path will be determined per-variant using frequency.");
+                    // Create a closure that performs the real per-variant work.
+                    let path_decider = |variant_data: &[u8]| {
+                        let current_freq = batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
+                        let variant_ctx = DecisionContext { freq: current_freq, ..run_ctx };
+                        decide::decide_path_with_freq(&variant_ctx)
+                    };
+                    // Call the generic producer with the specialized, complex closure.
+                    io::producer_thread(mmap, prep_result, sparse_tx, dense_tx, buffer_pool, path_decider);
+                }
+            }
+        };
+
+        let producer_handle = s.spawn(producer_logic);
 
         // Run both consumer streams in parallel on the Rayon thread pool.
-        // The buffer pool is cloned again for each consumer to use for recycling.
         let (sparse_result, dense_result) = rayon::join(
             || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
             || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
         );
 
         // This join is critical for propagating panics from the producer.
-        // It ensures we don't proceed with a partial pipeline.
         producer_handle.join().map_err(|_| {
             PipelineError::Producer("Producer thread panicked.".to_string())
         })?;
@@ -219,26 +257,20 @@ pub fn run(
         let (sparse_adjustments, sparse_counts) = sparse_result?;
         let (dense_adjustments, dense_counts) = dense_result?;
 
-        // Initialize final scores by tiling the master_baseline for each person.
         let num_people = prep_result.num_people_to_score;
         let mut final_scores = Vec::with_capacity(num_people * num_scores);
         for _ in 0..num_people {
             final_scores.extend_from_slice(&master_baseline);
         }
 
-        // Aggregate the counts (which start from zero).
         let mut final_counts = vec![0u32; num_people * num_scores];
         final_counts.par_iter_mut().zip(sparse_counts).for_each(|(m, p)| *m += p);
         final_counts.par_iter_mut().zip(dense_counts).for_each(|(m, p)| *m += p);
 
-        // Add the calculated adjustments from both streams onto the baseline.
         final_scores.par_iter_mut().zip(sparse_adjustments).for_each(|(m, p)| *m += p);
         final_scores.par_iter_mut().zip(dense_adjustments).for_each(|(m, p)| *m += p);
         
         // --- 5. Final Step: Resolve complex variants and apply their contributions ---
-        // This "slow path" runs after all high-performance streams are complete. It is
-        // only invoked if the preparation phase identified any complex, multiallelic
-        // variants that required deferred resolution.
         if !prep_result.complex_rules.is_empty() {
             eprintln!(
                 "> Resolving {} unique complex variant rule(s)...",
