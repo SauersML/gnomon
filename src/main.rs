@@ -14,6 +14,7 @@ use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::PreparationResult;
+use natord::compare;
 use ryu;
 use std::error::Error;
 use std::ffi::OsString;
@@ -55,18 +56,16 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize the Rayon global thread pool to use all available cores.
     // This is critical for the performance of the data-parallel compute pipeline.
-    rayon::ThreadPoolBuilder::new()
-        .build_global()
-        .unwrap();
+    rayon::ThreadPoolBuilder::new().build_global().unwrap();
 
     let overall_start_time = Instant::now();
     let args = Args::parse();
-    let plink_prefix = resolve_plink_prefix(&args.input_path)?;
+    let fileset_prefixes = resolve_filesets(&args.input_path)?;
 
     // --- Phase 1: Preparation ---
     // This phase is synchronous and CPU-bound. It parses all input files,
     // reconciles variants, and produces a "computation blueprint".
-    let prep_result = run_preparation_phase(&plink_prefix, &args)?;
+    let prep_result = run_preparation_phase(&fileset_prefixes, &args)?;
 
     // --- Phase 2: Resource Allocation ---
     // A read-only context is created, which allocates all necessary memory pools
@@ -78,15 +77,26 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // This is the primary compute phase. It is a synchronous, blocking call that
     // returns the final, aggregated results upon completion.
     let computation_start = Instant::now();
-    let (final_scores, final_counts) = pipeline::run(&context, &plink_prefix)?;
-    eprintln!("> Computation finished. Total pipeline time: {:.2?}", computation_start.elapsed());
+    let (final_scores, final_counts) = pipeline::run(&context)?;
+    eprintln!(
+        "> Computation finished. Total pipeline time: {:.2?}",
+        computation_start.elapsed()
+    );
 
     // --- Phase 4: Finalization & Output ---
     // After all computation is complete, this synchronous phase writes the
-    // final scores to disk, passing the results directly.
-    finalize_and_write_output(&plink_prefix, &prep_result, &final_scores, &final_counts)?;
-    
-    eprintln!("\nSuccess! Total execution time: {:.2?}", overall_start_time.elapsed());
+    // final scores to disk. The first fileset's prefix determines the output name.
+    finalize_and_write_output(
+        &fileset_prefixes[0],
+        &prep_result,
+        &final_scores,
+        &final_counts,
+    )?;
+
+    eprintln!(
+        "\nSuccess! Total execution time: {:.2?}",
+        overall_start_time.elapsed()
+    );
     Ok(())
 }
 
@@ -97,11 +107,23 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 /// logic to produce a "computation blueprint" (`PreparationResult`). All user-facing
 /// console output for this phase is handled here.
 fn run_preparation_phase(
-    plink_prefix: &Path,
+    fileset_prefixes: &[PathBuf],
     args: &Args,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
-    eprintln!("> Using PLINK prefix: {}", plink_prefix.display());
-    let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
+    if fileset_prefixes.len() > 1 {
+        eprintln!(
+            "> Found {} PLINK filesets, starting with: {}",
+            fileset_prefixes.len(),
+            fileset_prefixes[0].display()
+        );
+    } else {
+        eprintln!("> Using PLINK prefix: {}", fileset_prefixes[0].display());
+    }
+
+    // The first fileset is used to determine the output directory for converted score files.
+    let output_dir = fileset_prefixes[0]
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
 
     // --- Find and normalize all score files ---
@@ -160,11 +182,12 @@ fn run_preparation_phase(
     }
 
     // --- Run the main preparation logic ---
-    // The `prepare_for_computation` function now contains its own detailed
-    // internal timing and progress messages, so we no longer need a separate timer here.
-    let prep =
-        prepare::prepare_for_computation(plink_prefix, &native_score_files, args.keep.as_deref())
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    let prep = prepare::prepare_for_computation(
+        fileset_prefixes,
+        &native_score_files,
+        args.keep.as_deref(),
+    )
+    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     eprintln!(
         "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",
@@ -179,22 +202,19 @@ fn run_preparation_phase(
 
 /// **Helper:** Handles the final file writing.
 ///
-/// This function is synchronous. It now takes the final results directly,
-/// making it a more focused and decoupled utility.
+/// This function is synchronous and takes the final results directly.
 fn finalize_and_write_output(
-    plink_prefix: &Path,
+    output_prefix: &Path,
     prep_result: &Arc<PreparationResult>,
     final_scores: &[f64],
     final_counts: &[u32],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // The output directory should already exist from the preparation phase,
-    // but we ensure it's there for robustness.
-    let output_dir = plink_prefix.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = output_prefix.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
 
-    // Construct a self-describing output filename based on the input prefix.
+    // Construct a self-describing output filename based on the primary input prefix.
     let out_filename = {
-        let mut s = plink_prefix
+        let mut s = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
         s.push(".sscore");
@@ -209,7 +229,6 @@ fn finalize_and_write_output(
     );
     let output_start = Instant::now();
 
-    // Delegate to the file writer, passing all necessary data.
     write_scores_to_file(
         &out_path,
         &prep_result.final_person_iids,
@@ -227,33 +246,62 @@ fn finalize_and_write_output(
 //                                  HELPER FUNCTIONS
 // ========================================================================================
 
-/// Intelligently resolves the user-provided input path to a PLINK prefix.
-fn resolve_plink_prefix(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
-    if path.is_dir() {
-        let bed_files: Vec<PathBuf> = fs::read_dir(path)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "bed"))
-            .collect();
-        match bed_files.len() {
-            0 => Err(format!("No .bed file found in the directory '{}'.", path.display()).into()),
-            1 => Ok(bed_files[0].with_extension("")),
-            _ => Err(format!("Ambiguous input: multiple .bed files found in directory '{}'.", path.display()).into()),
-        }
-    } else if path.is_file() {
-        if path.extension().map_or(false, |ext| ext == "bed") {
-            Ok(path.with_extension(""))
+/// Discovers and validates all PLINK filesets from a given path.
+///
+/// Handles three cases:
+/// 1. Path is a prefix (`/path/to/data` -> `data.bed`, `data.bim`, `data.fam`).
+/// 2. Path is a single `.bed` file (`/path/to/data.bed`).
+/// 3. Path is a directory containing one or more complete filesets.
+fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    if !path.is_dir() {
+        // --- SINGLE-FILESET PATH: Treat as a prefix, validate, and wrap in a Vec ---
+        // This handles both --input-path my_file.bed and --input-path my_file
+        let prefix = if path.extension().is_some() {
+            path.with_extension("")
         } else {
-            Err(format!("Input file '{}' must have a .bed extension.", path.display()).into())
+            path.to_path_buf()
+        };
+
+        if !prefix.with_extension("bed").is_file()
+            || !prefix.with_extension("bim").is_file()
+            || !prefix.with_extension("fam").is_file()
+        {
+            return Err(format!(
+                "Input prefix '{}' does not correspond to a complete PLINK fileset (.bed, .bim, .fam).",
+                prefix.display()
+            )
+            .into());
         }
-    } else {
-        let bed_path_from_prefix = path.with_extension("bed");
-        if bed_path_from_prefix.is_file() {
-            Ok(path.to_path_buf())
-        } else {
-            Err(format!("Input '{}' is not a valid directory, .bed file, or PLINK prefix.", path.display()).into())
-        }
+        return Ok(vec![prefix]);
     }
+
+    // --- MULTI-FILESET PATH: Scan, sort, and validate directory ---
+    let mut bed_files: Vec<PathBuf> = fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "bed"))
+        .collect();
+
+    if bed_files.is_empty() {
+        return Err(format!("No .bed files found in directory '{}'.", path.display()).into());
+    }
+
+    // Natural sort ensures chr2 comes before chr10. Critical for correctness.
+    bed_files.sort_by(|a, b| compare(&a.to_string_lossy(), &b.to_string_lossy()));
+
+    let mut prefixes = Vec::with_capacity(bed_files.len());
+    for bed_path in bed_files {
+        let prefix = bed_path.with_extension("");
+        if !prefix.with_extension("bim").is_file() || !prefix.with_extension("fam").is_file() {
+            return Err(format!(
+                "Incomplete fileset for prefix '{}'. All .bed files in a directory must have corresponding .bim and .fam files.",
+                prefix.display()
+            )
+            .into());
+        }
+        prefixes.push(prefix);
+    }
+    Ok(prefixes)
 }
 
 /// Writes the final calculated scores to a self-describing, tab-separated file.

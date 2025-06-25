@@ -2,7 +2,13 @@
 //                             High-Level Data Contracts
 // ========================================================================================
 
+// ========================================================================================
+//                             High-Level Data Contracts
+// ========================================================================================
+
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
+
+use std::path::PathBuf;
 
 /// The payload sent from the I/O producer to the compute consumers. It contains
 /// the raw data for one variant and the necessary metadata to process it.
@@ -10,6 +16,25 @@
 pub struct WorkItem {
     pub data: Vec<u8>,
     pub reconciled_variant_index: ReconciledVariantIndex,
+}
+
+/// A boundary marker for a single fileset within a virtually-merged collection.
+/// It contains the path to the .bed file and the starting global index for its variants.
+#[derive(Debug, Clone)]
+pub struct FilesetBoundary {
+    pub bed_path: PathBuf,
+    pub starting_global_index: u64,
+}
+
+/// This enum makes the pipeline choice a type-safe property of the computation.
+/// At compile time, the program knows whether it's dealing with one file or many,
+/// making it impossible to call the wrong I/O logic.
+#[derive(Debug)]
+pub enum PipelineKind {
+    /// The simple case: one fileset, one .bed file to mmap.
+    SingleFile(PathBuf),
+    /// The multi-file case: a "virtual" fileset composed of multiple physical files.
+    MultiFile(Vec<FilesetBoundary>),
 }
 
 /// Contains the score-specific information for a complex variant.
@@ -68,7 +93,7 @@ pub struct PreparationResult {
     // --- PUBLIC METADATA & LOOKUP TABLES ---
     /// The sorted list of original `.bim` row indices for the "fast path."
     /// This is used by the I/O producer to filter the `.bed` file for all
-    /// simple, unambiguous variants.
+    /// simple, unambiguous variants. The indices are global across all filesets.
     pub required_bim_indices: Vec<BimRowIndex>,
     /// A list of self-contained, grouped rules for variants that require complex,
     /// deferred resolution (the "slow path"). Each rule represents one unique
@@ -98,13 +123,15 @@ pub struct PreparationResult {
     pub num_people_to_score: usize,
     /// The total number of individuals found in the original .fam file.
     pub total_people_in_fam: usize,
-    /// The total number of variants found in the original .bim file.
-    pub total_variants_in_bim: usize,
+    /// The total number of variants found across all original .bim files.
+    pub total_variants_in_bim: u64,
     /// The number of variants successfully reconciled and included in the matrices.
     /// This corresponds to the number of rows in the compiled matrices.
     pub num_reconciled_variants: usize,
     /// The number of bytes per variant in the .bed file, calculated as CEIL(total_people_in_fam / 4).
     pub bytes_per_variant: u64,
+    /// The type-safe representation of the I/O pipeline strategy.
+    pub pipeline_kind: PipelineKind,
 }
 
 impl PreparationResult {
@@ -124,11 +151,12 @@ impl PreparationResult {
         final_person_iids: Vec<String>,
         num_people_to_score: usize,
         total_people_in_fam: usize,
-        total_variants_in_bim: usize,
+        total_variants_in_bim: u64,
         num_reconciled_variants: usize,
         bytes_per_variant: u64,
         person_fam_to_output_idx: Vec<Option<u32>>,
         output_idx_to_fam_idx: Vec<u32>,
+        pipeline_kind: PipelineKind,
     ) -> Self {
         Self {
             weights_matrix,
@@ -148,6 +176,7 @@ impl PreparationResult {
             bytes_per_variant,
             person_fam_to_output_idx,
             output_idx_to_fam_idx,
+            pipeline_kind,
         }
     }
 
@@ -182,11 +211,11 @@ impl PreparationResult {
 pub struct OriginalPersonIndex(pub u32);
 
 /// An index into the original, full .bim file.
-/// This wraps a u32, which is sufficient for >4 billion variants and halves the
-/// memory usage of index vectors on 64-bit systems compared to usize.
+/// This wraps a u64, which is sufficient for a virtually unlimited number of
+/// variants when merging filesets. This is a zero-cost abstraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct BimRowIndex(pub u32);
+pub struct BimRowIndex(pub u64);
 
 /// An index into the dense, reconciled matrices (`weights_matrix`, `flip_mask_matrix`).
 /// This wraps a u32, which is sufficient for >4 billion variants.
