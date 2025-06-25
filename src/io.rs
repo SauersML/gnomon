@@ -14,10 +14,11 @@
 
 use crate::decide::ComputePath;
 use crate::pipeline::PipelineError;
-use crate::types::{PreparationResult, ReconciledVariantIndex, WorkItem};
+use crate::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
 use memmap2::Mmap;
+use std::fs::File;
 use std::sync::Arc;
 
 /// The generic entry point for the producer thread.
@@ -51,7 +52,8 @@ pub fn producer_thread<F>(
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant));
 
-        let offset = (3 + bim_row_idx.0 as u64 * bytes_per_variant as u64) as usize;
+        // The bim_row_idx is now a u64, so the cast is no longer needed.
+        let offset = (3 + bim_row_idx.0 * bytes_per_variant as u64) as usize;
         let end = offset + bytes_per_variant;
 
         if end > mmap.len() {
@@ -84,6 +86,103 @@ pub fn producer_thread<F>(
         if tx.send(Ok(work_item)).is_err() {
             // Consumers have disconnected. This is not an error, but a signal to stop.
             break;
+        }
+    }
+}
+
+/// The producer for the multi-file pipeline. It seamlessly switches between memory-mapped
+/// files as it iterates through the globally-indexed list of required variants.
+pub fn multi_file_producer_thread<F>(
+    prep_result: Arc<PreparationResult>,
+    boundaries: &[FilesetBoundary],
+    sparse_tx: Sender<Result<WorkItem, PipelineError>>,
+    dense_tx: Sender<Result<WorkItem, PipelineError>>,
+    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    path_decider: F,
+) where
+    F: Fn(&[u8]) -> ComputePath,
+{
+    // --- Initial State ---
+    let mut current_fileset_idx: usize = 0;
+    let bytes_per_variant = prep_result.bytes_per_variant;
+
+    // Open and mmap the first file.
+    let mut mmap = match File::open(&boundaries[0].bed_path)
+        .map_err(|e| PipelineError::Io(e.to_string()))
+        .and_then(|file| unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string())) })
+    {
+        Ok(map) => map,
+        Err(e) => {
+            let _ = sparse_tx.send(Err(e.clone()));
+            let _ = dense_tx.send(Err(e));
+            return;
+        }
+    };
+
+    // Determine the start index of the *next* file boundary.
+    let mut next_boundary_start_idx = if boundaries.len() > 1 {
+        boundaries[1].starting_global_index
+    } else {
+        u64::MAX // No next boundary.
+    };
+
+    // --- Main Loop ---
+    for (i, &global_bim_row_index) in prep_result.required_bim_indices.iter().enumerate() {
+        // Hot loop check: do we need to switch to the next file? This is an O(1) comparison.
+        if global_bim_row_index.0 >= next_boundary_start_idx {
+            current_fileset_idx += 1;
+
+            // Unmap the old file (implicitly done by dropping `mmap`) and map the new one.
+            mmap = match File::open(&boundaries[current_fileset_idx].bed_path)
+                .map_err(|e| PipelineError::Io(e.to_string()))
+                .and_then(|file| unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string())) })
+            {
+                Ok(map) => map,
+                Err(e) => {
+                    let _ = sparse_tx.send(Err(e.clone()));
+                    let _ = dense_tx.send(Err(e));
+                    return; // Stop production on error.
+                }
+            };
+
+            // Update the next boundary index.
+            next_boundary_start_idx = if boundaries.len() > current_fileset_idx + 1 {
+                boundaries[current_fileset_idx + 1].starting_global_index
+            } else {
+                u64::MAX
+            };
+        }
+
+        // Translate the global index to a local, file-specific index.
+        let local_index = global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
+        let offset = (3 + local_index * bytes_per_variant) as usize;
+        let end = offset + bytes_per_variant as usize;
+
+        if end > mmap.len() {
+            let err = PipelineError::Io(format!(
+                "Fatal: Read past end of .bed file '{}' for variant with global index {}. File may be corrupt.",
+                boundaries[current_fileset_idx].bed_path.display(), global_bim_row_index.0
+            ));
+            let _ = sparse_tx.send(Err(err.clone()));
+            let _ = dense_tx.send(Err(err));
+            return;
+        }
+
+        // The rest of this is identical to the original producer thread.
+        let mut buffer = buffer_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant as usize));
+        buffer.extend_from_slice(&mmap[offset..end]);
+
+        let path = path_decider(&buffer);
+        let work_item = WorkItem {
+            data: buffer,
+            reconciled_variant_index: ReconciledVariantIndex(i as u32),
+        };
+
+        let tx = if path == ComputePath::Pivot { &dense_tx } else { &sparse_tx };
+        if tx.send(Ok(work_item)).is_err() {
+            break; // Consumers disconnected.
         }
     }
 }

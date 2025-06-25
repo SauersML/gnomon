@@ -2,8 +2,8 @@ use crate::batch::{self, SparseIndexPool};
 use crate::decide::{self, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
-    BimRowIndex, EffectAlleleDosage, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
-    WorkItem,
+    BimRowIndex, EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
+    ReconciledVariantIndex, ScoreColumnIndex, WorkItem,
 };
 use ahash::AHashSet;
 use crossbeam_channel::{bounded, Receiver};
@@ -13,7 +13,7 @@ use num_cpus;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -29,6 +29,88 @@ const DENSE_CHANNEL_BOUND: usize = 4096;
 const DENSE_BATCH_SIZE: usize = 256;
 /// The number of reusable memory buffers for variant data.
 const BUFFER_POOL_SIZE: usize = 16384;
+
+/// A performant, read-only resolver for fetching complex variant genotypes.
+///
+/// This enum is initialized ONCE at the start of the pipeline run. It holds
+/// either a single memory map or a collection of them, avoiding the massive
+/// performance penalty of re-opening and re-mapping files inside a parallel loop.
+enum ComplexVariantResolver {
+    SingleFile(Arc<Mmap>),
+    MultiFile {
+        // A vector of all memory maps for the multi-file case.
+        mmaps: Vec<Mmap>,
+        // A copy of the boundaries to map a global index to the correct mmap.
+        boundaries: Vec<FilesetBoundary>,
+    },
+}
+
+impl ComplexVariantResolver {
+    /// Creates a new resolver based on the pipeline strategy.
+    fn new(prep_result: &PreparationResult) -> Result<Self, PipelineError> {
+        match &prep_result.pipeline_kind {
+            PipelineKind::SingleFile(bed_path) => {
+                let file = File::open(bed_path).map_err(|e| {
+                    PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e))
+                })?;
+                let mmap = Arc::new(unsafe {
+                    Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))?
+                });
+                Ok(Self::SingleFile(mmap))
+            }
+            PipelineKind::MultiFile(boundaries) => {
+                let mmaps = boundaries
+                    .iter()
+                    .map(|b| {
+                        let file = File::open(&b.bed_path).map_err(|e| {
+                            PipelineError::Io(format!("Opening {}: {}", b.bed_path.display(), e))
+                        })?;
+                        unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string())) }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::MultiFile {
+                    mmaps,
+                    boundaries: boundaries.clone(),
+                })
+            }
+        }
+    }
+
+    /// Fetches a packed genotype for a given person and global variant index.
+    /// This is the fast, central lookup method used by the parallel resolver.
+    #[inline(always)]
+    fn get_packed_genotype(
+        &self,
+        bytes_per_variant: u64,
+        bim_row_index: BimRowIndex,
+        fam_index: u32,
+    ) -> u8 {
+        let (mmap, local_bim_index) = match self {
+            ComplexVariantResolver::SingleFile(mmap) => (mmap.as_ref(), bim_row_index.0),
+            ComplexVariantResolver::MultiFile { mmaps, boundaries } => {
+                // Find which fileset contains this global index using a fast binary search.
+                let fileset_idx =
+                    boundaries.partition_point(|b| b.starting_global_index <= bim_row_index.0) - 1;
+                let boundary = &boundaries[fileset_idx];
+                let local_index = bim_row_index.0 - boundary.starting_global_index;
+                // This unsafe is acceptable because the number of mmaps is tied to the
+                // number of boundaries, and the index is derived from it.
+                (unsafe { mmaps.get_unchecked(fileset_idx) }, local_index)
+            }
+        };
+
+        // The +3 skips the PLINK .bed file magic number (0x6c, 0x1b, 0x01).
+        let variant_start_offset = 3 + local_bim_index * bytes_per_variant;
+        let person_byte_offset = fam_index as u64 / 4;
+        let final_byte_offset = (variant_start_offset + person_byte_offset) as usize;
+
+        let bit_offset_in_byte = (fam_index % 4) * 2;
+
+        // This indexing is safe because the preparation phase guarantees all indices are valid.
+        let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
+        (packed_byte >> bit_offset_in_byte) & 0b11
+    }
+}
 
 // ========================================================================================
 //                          PUBLIC API, CONTEXT & ERROR HANDLING
@@ -138,15 +220,33 @@ impl PipelineContext {
 ///
 /// This is the primary public entry point. It is synchronous and returns the
 /// final aggregated scores and counts upon successful completion.
-pub fn run(
+pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    // This match is a zero-cost abstraction. The compiler generates a simple jump
+    // to the correct function based on the enum variant, and it's impossible
+    // to call the wrong pipeline logic for a given configuration.
+    match &context.prep_result.pipeline_kind {
+        PipelineKind::SingleFile(bed_path) => run_single_file_pipeline(context, bed_path),
+        PipelineKind::MultiFile(boundaries) => run_multi_file_pipeline(context, boundaries),
+    }
+}
+
+// ========================================================================================
+//                        PIPELINE STAGE IMPLEMENTATIONS
+// ========================================================================================
+
+/// The pipeline implementation for the common single-fileset case.
+/// This function's body is effectively the same as the original `pipeline::run` function,
+/// guaranteeing zero performance regression.
+fn run_single_file_pipeline(
     context: &PipelineContext,
-    plink_prefix: &Path,
+    bed_path: &Path,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
-    let bed_path = plink_prefix.with_extension("bed");
-    let bed_file =
-        File::open(&bed_path).map_err(|e| PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e)))?;
-    let mmap = Arc::new(unsafe { Mmap::map(&bed_file).map_err(|e| PipelineError::Io(e.to_string()))? });
+    let bed_file = File::open(bed_path)
+        .map_err(|e| PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e)))?;
+    let mmap = Arc::new(
+        unsafe { Mmap::map(&bed_file).map_err(|e| PipelineError::Io(e.to_string()))? },
+    );
     mmap.advise(memmap2::Advice::Sequential)
         .map_err(|e| PipelineError::Io(e.to_string()))?;
 
@@ -163,37 +263,29 @@ pub fn run(
     }
 
     // --- 2. Pre-computation & STRATEGY SELECTION ---
-    // This is the core of the high-performance design. All decisions are made once, up front.
     let prep_result = &context.prep_result;
-
-    // A. Create the single, `f32`-based context for the decision engine.
-    // This performs the type casts ONCE per run, not millions of times per variant.
     let run_ctx = DecisionContext {
         n_cohort: prep_result.total_people_in_fam as f32,
         k_scores: prep_result.score_names.len() as f32,
         subset_frac: prep_result.num_people_to_score as f32
             / prep_result.total_people_in_fam as f32,
-        freq: 0.0, // Dummy value, not used by the meta-model
+        freq: 0.0,
     };
-
-    // B. Call the meta-model ONCE to choose the global strategy.
-    // let strategy = decide::choose_run_strategy(&run_ctx);
-    // Benchmarks indicate UseComplexTree is usually but not always better.
-    // Indicates UseComplexTree choices in decide.rs is not optimal
-    let strategy = decide::RunStrategy::UseComplexTree;     // --- FORCED for now
+    let strategy = decide::RunStrategy::UseComplexTree;
     eprintln!("> Decision Engine Strategy: {:?}", strategy);
 
-    // C. Calculate the single, global baseline score.
     let num_scores = prep_result.score_names.len();
     let stride = prep_result.stride();
     let master_baseline: Vec<f64> = (0..prep_result.num_reconciled_variants)
         .into_par_iter()
         .fold(
-            || vec![0.0f64; num_scores], // Thread-local accumulator
+            || vec![0.0f64; num_scores],
             |mut local_baseline, i| {
                 let flip_row_offset = i * stride;
-                let flip_row = &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
-                let weight_row = &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                let flip_row =
+                    &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
+                let weight_row =
+                    &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
                 for k in 0..num_scores {
                     if flip_row[k] == 1 {
                         local_baseline[k] += 2.0 * weight_row[k] as f64;
@@ -203,7 +295,7 @@ pub fn run(
             },
         )
         .reduce(
-            || vec![0.0f64; num_scores], // Identity for reduction
+            || vec![0.0f64; num_scores],
             |mut a, b| {
                 a.par_iter_mut().zip(b).for_each(|(v_a, v_b)| *v_a += v_b);
                 a
@@ -212,8 +304,6 @@ pub fn run(
 
     // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        // The producer's logic is constructed here, before the thread is spawned.
-        // This closure captures all necessary resources to be moved into the thread.
         let producer_logic = {
             let mmap = Arc::clone(&mmap);
             let prep_result = Arc::clone(&context.prep_result);
@@ -221,76 +311,247 @@ pub fn run(
 
             move || match strategy {
                 RunStrategy::UseSimpleTree => {
-                    // TIER 2 DECISION: The global path is determined ONCE.
                     let global_path = decide::decide_path_without_freq(&run_ctx);
-                    eprintln!("> Global path determined for all variants: {:?}", global_path);
-                    // Create a trivial closure that captures the constant path.
                     let path_decider = |_variant_data: &[u8]| global_path;
-                    // Call the generic producer with the specialized, trivial closure.
-                    io::producer_thread(mmap, prep_result, sparse_tx, dense_tx, buffer_pool, path_decider);
+                    io::producer_thread(
+                        mmap,
+                        prep_result,
+                        sparse_tx,
+                        dense_tx,
+                        buffer_pool,
+                        path_decider,
+                    );
                 }
                 RunStrategy::UseComplexTree => {
-                    eprintln!("> Path will be determined per-variant using frequency.");
-                    // Create a closure that performs the real per-variant work.
                     let path_decider = |variant_data: &[u8]| {
-                        let current_freq = batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
-                        let variant_ctx = DecisionContext { freq: current_freq, ..run_ctx };
+                        let current_freq =
+                            batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
+                        let variant_ctx = DecisionContext {
+                            freq: current_freq,
+                            ..run_ctx
+                        };
                         decide::decide_path_with_freq(&variant_ctx)
                     };
-                    // Call the generic producer with the specialized, complex closure.
-                    io::producer_thread(mmap, prep_result, sparse_tx, dense_tx, buffer_pool, path_decider);
+                    io::producer_thread(
+                        mmap,
+                        prep_result,
+                        sparse_tx,
+                        dense_tx,
+                        buffer_pool,
+                        path_decider,
+                    );
                 }
             }
         };
 
         let producer_handle = s.spawn(producer_logic);
-
-        // Run both consumer streams in parallel on the Rayon thread pool.
         let (sparse_result, dense_result) = rayon::join(
             || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
             || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
         );
+        producer_handle
+            .join()
+            .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))?;
 
-        // This join is critical for propagating panics from the producer.
-        producer_handle.join().map_err(|_| {
-            PipelineError::Producer("Producer thread panicked.".to_string())
-        })?;
-
-        // --- 4. Aggregate final results from both consumer streams ---
+        // --- 4. Aggregate final results ---
         let (sparse_adjustments, sparse_counts) = sparse_result?;
         let (dense_adjustments, dense_counts) = dense_result?;
-
         let num_people = prep_result.num_people_to_score;
         let mut final_scores = Vec::with_capacity(num_people * num_scores);
         for _ in 0..num_people {
             final_scores.extend_from_slice(&master_baseline);
         }
-
         let mut final_counts = vec![0u32; num_people * num_scores];
-        final_counts.par_iter_mut().zip(sparse_counts).for_each(|(m, p)| *m += p);
-        final_counts.par_iter_mut().zip(dense_counts).for_each(|(m, p)| *m += p);
+        final_counts
+            .par_iter_mut()
+            .zip(sparse_counts)
+            .for_each(|(m, p)| *m += p);
+        final_counts
+            .par_iter_mut()
+            .zip(dense_counts)
+            .for_each(|(m, p)| *m += p);
+        final_scores
+            .par_iter_mut()
+            .zip(sparse_adjustments)
+            .for_each(|(m, p)| *m += p);
+        final_scores
+            .par_iter_mut()
+            .zip(dense_adjustments)
+            .for_each(|(m, p)| *m += p);
 
-        final_scores.par_iter_mut().zip(sparse_adjustments).for_each(|(m, p)| *m += p);
-        final_scores.par_iter_mut().zip(dense_adjustments).for_each(|(m, p)| *m += p);
-        
-        // --- 5. Final Step: Resolve complex variants and apply their contributions ---
+        // --- 5. Resolve complex variants ---
         if !prep_result.complex_rules.is_empty() {
             eprintln!(
                 "> Resolving {} unique complex variant rule(s)...",
                 prep_result.complex_rules.len()
             );
-            resolve_complex_variants(prep_result, &mut final_scores, &mut final_counts, &mmap)?;
+            // The resolver is created once with the single mmap.
+            let resolver = ComplexVariantResolver::SingleFile(Arc::clone(&mmap));
+            resolve_complex_variants(
+                &resolver,
+                prep_result,
+                &mut final_scores,
+                &mut final_counts,
+            )?;
         }
-
         Ok((final_scores, final_counts))
     });
-
     final_result
 }
 
-// ========================================================================================
-//                        PIPELINE STAGE IMPLEMENTATIONS
-// ========================================================================================
+/// The pipeline implementation for the multi-fileset case.
+fn run_multi_file_pipeline(
+    context: &PipelineContext,
+    boundaries: &[FilesetBoundary],
+) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    // --- 1. Setup: No mmap here. Producer manages its own. ---
+    let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(SPARSE_CHANNEL_BOUND);
+    let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(DENSE_CHANNEL_BOUND);
+    let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_SIZE));
+    for _ in 0..BUFFER_POOL_SIZE {
+        buffer_pool
+            .push(Vec::with_capacity(
+                context.prep_result.bytes_per_variant as usize,
+            ))
+            .unwrap();
+    }
+
+    // --- 2. Pre-computation (same as single-file) ---
+    let prep_result = &context.prep_result;
+    let run_ctx = DecisionContext {
+        n_cohort: prep_result.total_people_in_fam as f32,
+        k_scores: prep_result.score_names.len() as f32,
+        subset_frac: prep_result.num_people_to_score as f32
+            / prep_result.total_people_in_fam as f32,
+        freq: 0.0,
+    };
+    let strategy = decide::RunStrategy::UseComplexTree;
+    eprintln!("> Decision Engine Strategy: {:?}", strategy);
+    let master_baseline = {
+        let num_scores = prep_result.score_names.len();
+        let stride = prep_result.stride();
+        (0..prep_result.num_reconciled_variants)
+            .into_par_iter()
+            .fold(
+                || vec![0.0f64; num_scores],
+                |mut local_baseline, i| {
+                    let flip_row_offset = i * stride;
+                    let flip_row =
+                        &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
+                    let weight_row =
+                        &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                    for k in 0..num_scores {
+                        if flip_row[k] == 1 {
+                            local_baseline[k] += 2.0 * weight_row[k] as f64;
+                        }
+                    }
+                    local_baseline
+                },
+            )
+            .reduce(
+                || vec![0.0f64; num_scores],
+                |mut a, b| {
+                    a.par_iter_mut().zip(b).for_each(|(v_a, v_b)| *v_a += v_b);
+                    a
+                },
+            )
+    };
+
+    // --- 3. Orchestration with multi-file producer ---
+    let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
+        let producer_logic = {
+            let prep_result = Arc::clone(&context.prep_result);
+            let buffer_pool = Arc::clone(&buffer_pool);
+            move || match strategy {
+                RunStrategy::UseSimpleTree => {
+                    let global_path = decide::decide_path_without_freq(&run_ctx);
+                    let path_decider = |_variant_data: &[u8]| global_path;
+                    io::multi_file_producer_thread(
+                        prep_result,
+                        boundaries,
+                        sparse_tx,
+                        dense_tx,
+                        buffer_pool,
+                        path_decider,
+                    );
+                }
+                RunStrategy::UseComplexTree => {
+                    let path_decider = |variant_data: &[u8]| {
+                        let current_freq =
+                            batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
+                        let variant_ctx = DecisionContext {
+                            freq: current_freq,
+                            ..run_ctx
+                        };
+                        decide::decide_path_with_freq(&variant_ctx)
+                    };
+                    io::multi_file_producer_thread(
+                        prep_result,
+                        boundaries,
+                        sparse_tx,
+                        dense_tx,
+                        buffer_pool,
+                        path_decider,
+                    );
+                }
+            }
+        };
+
+        let producer_handle = s.spawn(producer_logic);
+        let (sparse_result, dense_result) = rayon::join(
+            || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
+            || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
+        );
+        producer_handle
+            .join()
+            .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))?;
+
+        // --- 4. Aggregate final results (same as single-file) ---
+        let (sparse_adjustments, sparse_counts) = sparse_result?;
+        let (dense_adjustments, dense_counts) = dense_result?;
+        let num_people = prep_result.num_people_to_score;
+        let num_scores = prep_result.score_names.len();
+        let mut final_scores = Vec::with_capacity(num_people * num_scores);
+        for _ in 0..num_people {
+            final_scores.extend_from_slice(&master_baseline);
+        }
+        let mut final_counts = vec![0u32; num_people * num_scores];
+        final_counts
+            .par_iter_mut()
+            .zip(sparse_counts)
+            .for_each(|(m, p)| *m += p);
+        final_counts
+            .par_iter_mut()
+            .zip(dense_counts)
+            .for_each(|(m, p)| *m += p);
+        final_scores
+            .par_iter_mut()
+            .zip(sparse_adjustments)
+            .for_each(|(m, p)| *m += p);
+        final_scores
+            .par_iter_mut()
+            .zip(dense_adjustments)
+            .for_each(|(m, p)| *m += p);
+
+        // --- 5. Resolve complex variants ---
+        if !prep_result.complex_rules.is_empty() {
+            eprintln!(
+                "> Resolving {} unique complex variant rule(s)...",
+                prep_result.complex_rules.len()
+            );
+            // The resolver is created once with all necessary mmaps.
+            let resolver = ComplexVariantResolver::new(prep_result)?;
+            resolve_complex_variants(
+                &resolver,
+                prep_result,
+                &mut final_scores,
+                &mut final_counts,
+            )?;
+        }
+        Ok((final_scores, final_counts))
+    });
+    final_result
+}
 
 /// A RAII guard that ensures a byte buffer is automatically returned to the shared
 /// buffer pool when it goes out of scope. This is critical for preventing resource
@@ -451,47 +712,17 @@ fn process_dense_stream(
     Ok((scores, counts))
 }
 
-/// A small, inlineable helper to read a 2-bit packed genotype from the memory-mapped
-/// .bed file. This encapsulates the complex byte and bit offset calculations.
-///
-/// # Arguments
-/// * `mmap`: A slice representing the entire memory-mapped .bed file.
-/// * `bytes_per_variant`: The number of bytes for each variant's data, pre-calculated.
-/// * `bim_row_index`: The 0-based row index of the variant in the original .bim file.
-/// * `fam_index`: The 0-based index of the person in the original .fam file.
-///
-/// # Returns
-/// A `u8` containing the 2-bit genotype (`00`, `01`, `10`, or `11`).
-#[inline(always)]
-fn get_packed_genotype(
-    mmap: &[u8],
-    bytes_per_variant: u64,
-    bim_row_index: BimRowIndex,
-    fam_index: u32,
-) -> u8 {
-    // The +3 skips the PLINK .bed file magic number (0x6c, 0x1b, 0x01).
-    let variant_start_offset = (3 + bim_row_index.0 as u64 * bytes_per_variant) as usize;
-    let person_byte_offset = (fam_index / 4) as usize;
-    let final_byte_offset = variant_start_offset + person_byte_offset;
-
-    // Each person's genotype is 2 bits. We find which 2-bit slot in the byte it is.
-    let bit_offset_in_byte = (fam_index % 4) * 2;
-
-    // This indexing is safe because the preparation phase guarantees all indices are valid.
-    let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
-    (packed_byte >> bit_offset_in_byte) & 0b11
-}
-
 /// The "slow path" resolver for complex, multiallelic variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
 /// iterates through each person and resolves their score contributions for the small
-/// set of variants that could not be handled by the fast path.
+/// set of variants that could not be handled by the fast path. It uses the pre-built
+/// `ComplexVariantResolver` for performant, parallel-safe data access.
 fn resolve_complex_variants(
+    resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
     final_scores: &mut [f64],
     final_missing_counts: &mut [u32],
-    mmap: &Arc<Mmap>,
 ) -> Result<(), PipelineError> {
     let num_scores = prep_result.score_names.len();
 
@@ -504,21 +735,17 @@ fn resolve_complex_variants(
 
             for group_rule in &prep_result.complex_rules {
                 // --- Step 1: Gather Evidence ---
-                // For this person, find ALL valid, non-missing genotypes for this variant
-                // across all possible contexts.
                 let mut valid_interpretations =
                     Vec::with_capacity(group_rule.possible_contexts.len());
 
                 for context in &group_rule.possible_contexts {
                     let (bim_idx, ..) = context;
-                    let packed_geno = get_packed_genotype(
-                        mmap,
+                    let packed_geno = resolver.get_packed_genotype(
                         prep_result.bytes_per_variant,
                         *bim_idx,
                         original_fam_idx,
                     );
 
-                    // A packed value of `0b01` means the genotype is missing.
                     if packed_geno != 0b01 {
                         valid_interpretations.push((packed_geno, context));
                     }
@@ -526,10 +753,7 @@ fn resolve_complex_variants(
 
                 // --- Step 2: Apply Decision Policy ---
                 match valid_interpretations.len() {
-                    0 => { // CASE: Truly Missing
-                        // The person's genotype was missing for this variant under all contexts.
-                        // BUG FIX: Use a HashSet to increment the missing count only ONCE per
-                        // score column, even if multiple rules for this locus affect the same score.
+                    0 => {
                         let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                         for score_info in &group_rule.score_applications {
                             counted_cols.insert(score_info.score_column_index);
@@ -538,7 +762,7 @@ fn resolve_complex_variants(
                             person_counts_slice[score_col.0] += 1;
                         }
                     }
-                    1 => { // CASE: Success - One Unambiguous Interpretation
+                    1 => {
                         let (winning_geno, winning_context) = valid_interpretations[0];
                         let (_bim_idx, winning_a1, winning_a2) = winning_context;
 
@@ -547,33 +771,22 @@ fn resolve_complex_variants(
                             let score_col = score_info.score_column_index.0;
                             let weight = score_info.weight as f64;
 
-                            // BUG FIX: If the locus is present, it is never counted as missing.
-                            // If the effect allele for this specific rule does not exist in the
-                            // winning genotype, its dosage is simply zero.
                             if effect_allele != winning_a1 && effect_allele != winning_a2 {
                                 continue;
                             }
-
-                            // The PLINK .bed file encodes genotypes relative to (a1, a2).
-                            // 0b00=hom_a1, 0b10=het, 0b11=hom_a2.
                             let dosage: f64 = if effect_allele == winning_a1 {
                                 match winning_geno {
                                     0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!(),
                                 }
-                            } else { // effect_allele must be winning_a2
+                            } else {
                                 match winning_geno {
                                     0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!(),
                                 }
                             };
-                            
-                            // The slow path should not interact with the baseline.
-                            // Variants processed here were never part of the baseline calculation,
-                            // so we simply add their direct `dosage * weight` contribution.
-                            let contribution = dosage * weight;
-                            person_scores_slice[score_col] += contribution;
+                            person_scores_slice[score_col] += dosage * weight;
                         }
                     }
-                    _ => { // CASE: Fatal Error - Contradictory Data
+                    _ => {
                         let iid = &prep_result.final_person_iids[person_output_idx];
                         let first_context_id = group_rule.possible_contexts[0].0 .0;
                         return Err(PipelineError::Compute(format!(

@@ -10,7 +10,8 @@
 // multiple score files.
 
 use crate::types::{
-    BimRowIndex, GroupedComplexRule, PersonSubset, PreparationResult, ScoreColumnIndex, ScoreInfo,
+    BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
+    PreparationResult, ScoreColumnIndex, ScoreInfo,
 };
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
@@ -74,13 +75,14 @@ pub enum PrepError {
 }
 
 pub fn prepare_for_computation(
-    plink_prefix: &Path,
+    fileset_prefixes: &[PathBuf],
     score_files: &[PathBuf],
     keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
-    // --- STAGE 1: INITIAL SETUP ---
+    // --- STAGE 1: INITIAL SETUP & VIRTUAL MERGE ---
     eprintln!("> Pass 1: Indexing genotype and subject data...");
-    let fam_path = plink_prefix.with_extension("fam");
+    // The FAM file from the first fileset is considered authoritative for the cohort definition.
+    let fam_path = fileset_prefixes[0].with_extension("fam");
     let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
     let total_people_in_fam = all_person_iids.len();
 
@@ -88,8 +90,32 @@ pub fn prepare_for_computation(
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
     let num_people_to_score = final_person_iids.len();
 
-    let bim_path = plink_prefix.with_extension("bim");
-    let (bim_index, total_variants_in_bim) = index_bim_file(&bim_path)?;
+    // This loop performs the "virtual merge" by creating a single, master variant index
+    // with globally unique, contiguous indices.
+    let mut global_variant_offset: u64 = 0;
+    let mut master_bim_index = AHashMap::new();
+    let mut fileset_boundaries = Vec::with_capacity(fileset_prefixes.len());
+    let mut total_variants_in_bim: u64 = 0;
+
+    for prefix in fileset_prefixes {
+        fileset_boundaries.push(FilesetBoundary {
+            bed_path: prefix.with_extension("bed"),
+            starting_global_index: global_variant_offset,
+        });
+
+        let bim_path = prefix.with_extension("bim");
+        let variant_count_in_file =
+            index_bim_file(&bim_path, global_variant_offset, &mut master_bim_index)?;
+        global_variant_offset += variant_count_in_file;
+        total_variants_in_bim += variant_count_in_file;
+    }
+    let bim_index = master_bim_index;
+    let total_variants_in_bim_usize = usize::try_from(total_variants_in_bim).map_err(|_| {
+        PrepError::Parse(
+            "Total number of variants across all files exceeds system's addressable memory."
+                .to_string(),
+        )
+    })?;
 
     // --- STAGE 2: GLOBAL METADATA DISCOVERY ---
     eprintln!("> Pass 2: Discovering all score columns...");
@@ -107,22 +133,22 @@ pub fn prepare_for_computation(
     );
     let overall_start_time = Instant::now();
 
-// Step 3a: Run compilation for each file in parallel.
-let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = score_files
-    .par_iter()
-    .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
-    .collect::<Result<_, _>>()?;
-    
+    // Step 3a: Run compilation for each file in parallel.
+    let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = score_files
+        .par_iter()
+        .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
+        .collect::<Result<_, _>>()?;
+
     // Step 3b: Unzip the list of tuples into two separate collections.
     let (simple_mappings, intermediate_complex_rules): (Vec<_>, Vec<_>) =
         list_of_tuples.into_iter().unzip();
-    
+
     // Flatten each collection into a single master list for each path.
     let mut flat_score_data: Vec<SimpleMapping> = simple_mappings.into_iter().flatten().collect();
-    let flat_complex_rules: Vec<IntermediateComplexRule> = intermediate_complex_rules.into_iter().flatten().collect();
-    
+    let flat_complex_rules: Vec<IntermediateComplexRule> =
+        intermediate_complex_rules.into_iter().flatten().collect();
+
     // Step 3c: Group the flat list of complex rules into the final, efficient structure.
-    // We use a BTreeMap to group by the list of possible contexts.
     let mut grouped_complex_map: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> =
         BTreeMap::new();
     for intermediate_rule in flat_complex_rules {
@@ -143,17 +169,13 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
             score_applications: scores,
         })
         .collect();
-    
-    // Step 3d: Check for overlapping variants. Only fail if BOTH paths are empty.
+
     if flat_score_data.is_empty() && final_complex_rules.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
     }
 
-    // Step 3d: Perform a highly optimized parallel sort on the fast-path data. This
-    // groups all identical `(BimRowIndex, ScoreColumnIndex)` keys adjacently.
     flat_score_data.par_sort_unstable_by_key(|(key, _value)| *key);
 
-    // Step 3e: Perform a single, fast linear scan to detect duplicates in the fast path.
     if let Some(windows) = flat_score_data.windows(2).find(|w| w[0].0 == w[1].0) {
         let duplicate_key = windows[0].0;
         return Err(PrepError::Parse(format!(
@@ -161,39 +183,32 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
             duplicate_key.0.0, duplicate_key.1.0
         )));
     }
-    eprintln!("> TIMING: Pass 3 (Compilation & Segregation) took {:.2?}", overall_start_time.elapsed());
+    eprintln!(
+        "> TIMING: Pass 3 (Compilation & Segregation) took {:.2?}",
+        overall_start_time.elapsed()
+    );
 
     // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
     eprintln!("> Pass 4: Building final variant index and regrouping work...");
 
-    // Create the list of unique BIM indices required for the computation. This single pass
-    // over the sorted data is highly memory-efficient as it avoids a large intermediate allocation.
     let mut required_bim_indices = Vec::new();
     if let Some(first) = flat_score_data.first() {
-        required_bim_indices.push(first.0.0);
+        required_bim_indices.push(first.0 .0);
         for item in flat_score_data.iter() {
-            if item.0.0 != *required_bim_indices.last().unwrap() {
-                required_bim_indices.push(item.0.0);
+            if item.0 .0 != *required_bim_indices.last().unwrap() {
+                required_bim_indices.push(item.0 .0);
             }
         }
     }
 
     let num_reconciled_variants = required_bim_indices.len();
     let bim_row_to_reconciled_variant_map =
-        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim);
+        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
 
-    // --- STAGE 4A: Correctly Count Loci per Score ---
-    // This is the correct, locus-aware counting mechanism. It is performed before
-    // `flat_score_data` is consumed, which fixes the ownership error from previous
-    // attempts. This logic correctly handles cases where multiple score file rules
-    // apply to the same genomic position, ensuring the position is only counted
-    // once per score for the final denominator.
     let mut score_variant_counts = vec![0u32; score_names.len()];
 
-    // To de-duplicate loci on the fast path, we use a HashSet of the (BimRowIndex, ScoreColumnIndex)
-    // pairs. Because the new triage ensures every BimRowIndex on the fast path corresponds to a
-    // unique biallelic locus, this is a fast and correct way to count unique (locus, score) contributions.
-    let mut fast_path_locus_score_pairs: AHashSet<(BimRowIndex, ScoreColumnIndex)> = AHashSet::new();
+    let mut fast_path_locus_score_pairs: AHashSet<(BimRowIndex, ScoreColumnIndex)> =
+        AHashSet::new();
     for ((bim_row_idx, score_col_idx), _) in &flat_score_data {
         fast_path_locus_score_pairs.insert((*bim_row_idx, *score_col_idx));
     }
@@ -201,9 +216,6 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         score_variant_counts[score_col.0] += 1;
     }
 
-    // Then, add the counts from the slow path, which are already correctly locus-based.
-    // Here we must also de-duplicate, in case multiple rules for the same score
-    // were sent to the slow path for the same locus.
     for group_rule in &final_complex_rules {
         let mut slow_path_pairs_for_rule: AHashSet<ScoreColumnIndex> = AHashSet::new();
         for score_info in &group_rule.score_applications {
@@ -214,43 +226,37 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         }
     }
 
-    // --- STAGE 4B: Regroup Work for Parallel Processing ---
-    // This consumes `flat_score_data` now that all analysis on it is complete.
-    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> = vec![Vec::new(); num_reconciled_variants];
+    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> =
+        vec![Vec::new(); num_reconciled_variants];
     for ((bim_row, score_col), (weight, is_flipped)) in flat_score_data {
-        // This lookup is guaranteed to succeed.
-        let reconciled_idx = bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
+        let reconciled_idx =
+            bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
         work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
     }
 
     // --- STAGE 5: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
     eprintln!("> Pass 5: Populating all compute structures in parallel...");
-    
-    // Allocate all final data structures for parallel population.
+
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
-    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> = vec![Vec::new(); num_reconciled_variants];
-    
-    // Create unsafe writers to allow parallel, lock-free writes to disjoint memory regions.
+    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
+        vec![Vec::new(); num_reconciled_variants];
+
     let writer_tuple = (
         MatrixWriter { ptr: weights_matrix.as_mut_ptr() },
         MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() },
         MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() },
     );
 
-    // This parallel loop now only populates the matrices and metadata maps. The counting is done.
     work_by_reconciled_idx
         .par_iter_mut()
         .enumerate()
         .for_each_with(writer_tuple, |writers, (reconciled_idx, scores_for_variant)| {
             let (weights_writer, flip_writer, vtsm_writer) = writers;
-
             if scores_for_variant.is_empty() { return; }
             let row_offset = reconciled_idx * stride;
-
             scores_for_variant.sort_unstable_by_key(|(sc, _, _)| *sc);
-
             let mut vtsm_entry = Vec::with_capacity(scores_for_variant.len());
             for &(score_col, weight, is_flipped) in scores_for_variant.iter() {
                 let final_offset = row_offset + score_col.0;
@@ -260,23 +266,29 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
                 }
                 vtsm_entry.push(score_col);
             }
-            
             unsafe {
                 *vtsm_writer.ptr.add(reconciled_idx) = vtsm_entry;
             }
         });
-    
+
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
-    
+
     for (output_idx, iid) in final_person_iids.iter().enumerate() {
         let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
         output_idx_to_fam_idx.push(original_fam_idx);
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
     
+    // At the end, create the explicit pipeline kind.
+    let pipeline_kind = if fileset_prefixes.len() <= 1 {
+        PipelineKind::SingleFile(fileset_prefixes[0].with_extension("bed"))
+    } else {
+        PipelineKind::MultiFile(fileset_boundaries)
+    };
+
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
@@ -295,6 +307,7 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
+        pipeline_kind,
     ))
 }
 
@@ -303,19 +316,21 @@ let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = sc
 // ========================================================================================
 
 
+/// Indexes a single BIM file, adding its variants to a master index with a global offset.
 fn index_bim_file(
     bim_path: &Path,
-) -> Result<(AHashMap<String, Vec<(BimRecord, BimRowIndex)>>, usize), PrepError> {
+    global_offset: u64,
+    master_index: &mut AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
+) -> Result<u64, PrepError> {
     let file = File::open(bim_path).map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
     let reader = BufReader::new(file);
-    let mut bim_index = AHashMap::new();
-    let mut total_lines = 0;
+    let mut line_count: u64 = 0;
     for (i, line_result) in reader.lines().enumerate() {
-        total_lines += 1;
+        line_count = (i + 1) as u64;
         let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
         let mut parts = line.split_whitespace();
         let chr = parts.next();
-        let _id = parts.next(); // rsID is ignored
+        let _id = parts.next();
         let _cm = parts.next();
         let pos = parts.next();
         let a1 = parts.next();
@@ -327,13 +342,15 @@ fn index_bim_file(
                 allele1: a1.to_string(),
                 allele2: a2.to_string(),
             };
-            bim_index
+            // This is the core of the virtual merge: each variant gets a unique global index.
+            let global_index = i as u64 + global_offset;
+            master_index
                 .entry(key)
-                .or_insert_with(Vec::new)
-                        .push((record, BimRowIndex(i as u32)));
+                .or_default()
+                .push((record, BimRowIndex(global_index)));
         }
     }
-    Ok((bim_index, total_lines))
+    Ok(line_count)
 }
 
 
@@ -343,9 +360,9 @@ fn build_bim_to_reconciled_variant_map(
 ) -> Vec<Option<NonMaxU32>> {
     let mut bim_row_to_reconciled_variant_map = vec![None; total_variants_in_bim];
     for (reconciled_variant_idx, &bim_row) in required_bim_indices.iter().enumerate() {
+        // The `as usize` cast is safe because we have already validated that
+        // `total_variants_in_bim` (a u64) fits within a usize.
         if (bim_row.0 as usize) < total_variants_in_bim {
-            // Create a NonMaxU32, which is guaranteed not to be u32::MAX. This is safe as
-            // the number of variants will not approach this limit.
             let non_max_index = NonMaxU32::new(reconciled_variant_idx as u32).unwrap();
             bim_row_to_reconciled_variant_map[bim_row.0 as usize] = Some(non_max_index);
         }
