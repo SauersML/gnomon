@@ -13,7 +13,7 @@ use num_cpus;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
