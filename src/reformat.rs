@@ -104,6 +104,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         .lines()
         .filter_map(Result::ok)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .par_bridge()
         .map(|line| mapping.create_sortable_line(&line))
         .collect::<Result<_, _>>()?;
 

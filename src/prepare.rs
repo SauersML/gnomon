@@ -70,7 +70,6 @@ impl Eq for KeyedScoreRecord {}
 #[derive(Debug)]
 struct HeapItem {
     key: VariantKey,
-    record: KeyedScoreRecord,
     file_idx: usize,
 }
 
@@ -191,9 +190,10 @@ pub fn prepare_for_computation(
     let mut score_iter =
         KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
 
-    type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
-    let mut simple_mappings: Vec<SimpleMapping> = Vec::new();
-    let mut intermediate_complex_rules: AHashMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> = AHashMap::new();
+    
+    let mut intermediate_complex_rules: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> = BTreeMap::new();
+    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
+    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
         let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
@@ -234,17 +234,14 @@ pub fn prepare_for_computation(
                     match outcome {
                         ReconciliationOutcome::Simple(matches) => {
                             for bim_rec in matches {
-                                let is_flipped = score_record.effect_allele != bim_rec.allele1;
-                                simple_mappings.push((
-                                    (bim_rec.bim_row_index, score_record.score_column_index),
-                                    (score_record.weight, is_flipped),
-                                ));
+                                all_required_indices.insert(bim_rec.bim_row_index);
                             }
                         }
                         ReconciliationOutcome::Complex(matches) => {
                             let possible_contexts: Vec<_> = matches
                                 .iter()
                                 .map(|rec| {
+                                    all_required_indices.insert(rec.bim_row_index);
                                     (rec.bim_row_index, rec.allele1.clone(), rec.allele2.clone())
                                 })
                                 .collect();
@@ -272,23 +269,71 @@ pub fn prepare_for_computation(
     // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
     eprintln!("> Stage 4: Building final variant index and populating matrices...");
 
-    // Sort mappings by BIM index to group them for the uniqueness check.
-    simple_mappings.par_sort_unstable_by_key(|((bim_row, _), _)| *bim_row);
+    
 
-    // Now, find the unique, sorted BIM indices required for the calculation.
-    let mut required_bim_indices = Vec::new();
-    if let Some(((first_bim_row, _), _)) = simple_mappings.first() {
-        required_bim_indices.push(*first_bim_row);
-    }
-    for ((bim_row, _), _) in &simple_mappings {
-        if bim_row.0 != required_bim_indices.last().unwrap().0 {
-            required_bim_indices.push(*bim_row);
-        }
-    }
-
+    """    let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
     let num_reconciled_variants = required_bim_indices.len();
     let bim_row_to_reconciled_variant_map =
         build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
+
+    type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
+    let mut work_by_reconciled_idx: BTreeMap<usize, Vec<SimpleMapping>> = BTreeMap::new();
+
+    let mut bim_iter = BimIterator::new(fileset_prefixes)?.peekable();
+    let mut score_iter =
+        KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
+
+    while bim_iter.peek().is_some() && score_iter.peek().is_some() {
+        let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
+        let score_key = score_iter.peek().unwrap().as_ref().unwrap().key;
+
+        match bim_key.cmp(&score_key) {
+            Ordering::Less => {
+                bim_iter.next();
+            }
+            Ordering::Greater => {
+                score_iter.next();
+            }
+            Ordering::Equal => {
+                let key = bim_key;
+                let mut bim_group = Vec::new();
+                while let Some(Ok(peek_item)) = bim_iter.peek() {
+                    if peek_item.key == key {
+                        bim_group.push(bim_iter.next().unwrap()?);
+                    } else {
+                        break;
+                    }
+                }
+
+                let mut score_group = Vec::new();
+                while let Some(Ok(peek_item)) = score_iter.peek() {
+                    if peek_item.key == key {
+                        score_group.push(score_iter.next().unwrap()?);
+                    } else {
+                        break;
+                    }
+                }
+
+                for score_record in score_group {
+                    let outcome = resolve_matches_for_score_line(
+                        &score_record.effect_allele,
+                        &bim_group,
+                    )?;
+                    if let ReconciliationOutcome::Simple(matches) = outcome {
+                        for bim_rec in matches {
+                            let is_flipped = score_record.effect_allele != bim_rec.allele1;
+                            if let Some(Some(reconciled_idx_nonmax)) = bim_row_to_reconciled_variant_map.get(bim_rec.bim_row_index.0 as usize) {
+                                work_by_reconciled_idx.entry(reconciled_idx_nonmax.get() as usize).or_default().push((
+                                    (bim_rec.bim_row_index, score_record.score_column_index),
+                                    (score_record.weight, is_flipped),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
@@ -297,17 +342,20 @@ pub fn prepare_for_computation(
         vec![Vec::new(); num_reconciled_variants];
     let mut score_variant_counts = vec![0u32; score_names.len()];
 
-    for ((bim_row, score_col), (weight, is_flipped)) in simple_mappings {
-        if let Some(Some(reconciled_idx_nonmax)) =
-            bim_row_to_reconciled_variant_map.get(bim_row.0 as usize)
-        {
-            let reconciled_idx = reconciled_idx_nonmax.get() as usize;
-            let final_offset = reconciled_idx * stride + score_col.0;
-            weights_matrix[final_offset] = weight;
-            flip_mask_matrix[final_offset] = if is_flipped { 1 } else { 0 };
-            variant_to_scores_map[reconciled_idx].push(score_col);
-        }
-    }
+    weights_matrix
+        .par_chunks_mut(stride)
+        .zip(flip_mask_matrix.par_chunks_mut(stride))
+        .zip(variant_to_scores_map.par_iter_mut())
+        .enumerate()
+        .for_each(|(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
+            if let Some(work_group) = work_by_reconciled_idx.get(&reconciled_idx) {
+                for &((_, score_col), (weight, is_flipped)) in work_group {
+                    weights_chunk[score_col.0] = weight;
+                    flip_chunk[score_col.0] = if is_flipped { 1 } else { 0 };
+                    vtsm_entry.push(score_col);
+                }
+            }
+        });
 
     // Process complex rules
     let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
@@ -416,9 +464,9 @@ fn parse_key(variant_id: &str) -> Result<(u8, u32), PrepError> {
         "X" | "x" => 23,
         "Y" | "y" => 24,
         "MT" | "mt" => 25,
-        _ => chr_str.parse().map_err(|e| PrepError::Parse(format!("Invalid chromosome '{}': {}", chr_str, e)))?,
+        _ => chr_str.parse().map_err(|e| PrepError::Parse(format!("Invalid chromosome {}: {}", chr_str, e)))?,
     };
-    let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+    let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position {}: {}", pos_str, e)))?;
     Ok((chr_num, pos_num))
 }
 
@@ -552,7 +600,7 @@ impl<'a> KWayMergeIterator<'a> {
                     .map(|name| {
                         score_name_to_col_index.get(name).copied().ok_or_else(|| {
                             PrepError::Header(format!(
-                                "Score '{}' from file '{}' not found in global score list.",
+                                "Score {0} from file {1} not found in global score list.",
                                 name,
                                 path.display()
                             ))
@@ -566,7 +614,7 @@ impl<'a> KWayMergeIterator<'a> {
     /// Advances a single file stream. If the line buffer is empty, it reads the
     /// next line from the file, parses it, and populates the buffer. Then, it
     /// takes the next available item from the buffer and pushes it onto the heap.
-    fn advance_stream(
+    """    '''    fn advance_stream(
         stream: &mut FileStream,
         file_idx: usize,
         heap: &mut BinaryHeap<HeapItem>,
@@ -576,7 +624,7 @@ impl<'a> KWayMergeIterator<'a> {
         if stream.line_buffer.is_empty() {
             stream.current_line_info = None; // Clear previous line info
             if let Some(Ok(line)) = stream.reader.next() {
-                let mut parts = line.splitn(4, ' ');
+                let mut parts = line.splitn(4, '    ');
                 let variant_id = parts.next().unwrap_or("");
                 let effect_allele = parts.next().unwrap_or("");
                 let _other_allele = parts.next(); // Consumed but not used here
@@ -590,7 +638,7 @@ impl<'a> KWayMergeIterator<'a> {
                 stream.current_line_info = Some((key, effect_allele.to_string()));
 
                 // Populate the buffer with all scores from this line.
-                for (i, weight_str) in weights_str.split(' ').enumerate() {
+                for (i, weight_str) in weights_str.split('    ').enumerate() {
                     if let Ok(weight) = weight_str.parse::<f32>() {
                         if let Some(&score_column_index) = column_map.get(i) {
                             stream.line_buffer.push_back((weight, score_column_index));
@@ -602,15 +650,9 @@ impl<'a> KWayMergeIterator<'a> {
 
         // If, after attempting to read a new line, the buffer has an item,
         // create a HeapItem and push it.
-        if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
-            if let Some((key, effect_allele)) = &stream.current_line_info {
-                let record = KeyedScoreRecord {
-                    key: *key,
-                    effect_allele: effect_allele.clone(),
-                    score_column_index,
-                    weight,
-                };
-                heap.push(HeapItem { key: *key, record, file_idx });
+        if !stream.line_buffer.is_empty() {
+            if let Some((key, _)) = &stream.current_line_info {
+                heap.push(HeapItem { key: *key, file_idx });
             }
         }
 
@@ -618,27 +660,45 @@ impl<'a> KWayMergeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for KWayMergeIterator<'a> {
+"""impl<'a> Iterator for KWayMergeIterator<'a> {
     type Item = Result<KeyedScoreRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Pop the smallest item from the heap.
-        let heap_item = self.heap.pop()?;
-        let file_idx = heap_item.file_idx;
+        // Peek at the top of the heap to see which file to process.
+        let file_idx = if let Some(heap_item) = self.heap.peek() {
+            heap_item.file_idx
+        } else {
+            return None; // Heap is empty, we're done.
+        };
 
-        // The stream that this item came from needs to be advanced.
+        // Get the stream for this file.
         let stream = &mut self.streams[file_idx];
-        let column_map = self.file_column_maps[file_idx].as_slice();
 
-        // Advance the stream, which will push its next item to the heap.
-        if let Err(e) = Self::advance_stream(stream, file_idx, &mut self.heap, column_map) {
-            return Some(Err(e));
+        // Pop the next score from the line buffer.
+        let (weight, score_column_index) = stream.line_buffer.pop_front().unwrap();
+        let (key, effect_allele) = stream.current_line_info.as_ref().unwrap().clone();
+
+        let record = KeyedScoreRecord {
+            key,
+            effect_allele,
+            score_column_index,
+            weight,
+        };
+
+        // If the line buffer is now empty, we need to read the next line from the file.
+        if stream.line_buffer.is_empty() {
+            // We must pop the old item from the heap *before* advancing the stream,
+            // because advancing will push a new item.
+            self.heap.pop();
+            let column_map = self.file_column_maps[file_idx].as_slice();
+            if let Err(e) = Self::advance_stream(stream, file_idx, &mut self.heap, column_map) {
+                return Some(Err(e));
+            }
         }
 
-        // Return the record from the item we popped.
-        Some(Ok(heap_item.record))
+        Some(Ok(record))
     }
-}
+}""''""
 
 
 fn build_bim_to_reconciled_variant_map(
@@ -761,7 +821,7 @@ pub fn parse_score_file_headers_only(
                     == 0
                 {
                     return Err(PrepError::Header(format!(
-                        "Score file '{}' is empty or contains only metadata lines.",
+                        "Score file \"{}\" is empty or contains only metadata lines.",
                         path.display()
                     )));
                 }
@@ -775,7 +835,7 @@ pub fn parse_score_file_headers_only(
 
             if header_parts.len() < 3 || &header_parts[0..3] != expected_prefix {
                 return Err(PrepError::Header(format!(
-                    "Invalid header in '{}': Must start with 'variant_id\teffect_allele\tother_allele'.",
+                    "Invalid header in \"{}\": Must start with 'variant_id\teffect_allele\tother_allele'.",
                     path.display()
                 )));
             }
@@ -830,7 +890,7 @@ fn resolve_matches_for_score_line<'a>(
 impl Display for PrepError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            PrepError::Io(e, path) => write!(f, "I/O Error for file '{}': {}", path.display(), e),
+            PrepError::Io(e, path) => write!(f, "I/O Error for file {}: {}", path.display(), e),
             PrepError::Parse(s) => write!(f, "Parse Error: {}", s),
             PrepError::Header(s) => write!(f, "Invalid Header: {}", s),
             PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {}", s),
