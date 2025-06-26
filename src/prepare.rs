@@ -182,7 +182,7 @@ impl MergeDiagnosticInfo {
 }
 
 #[derive(Debug)]
-pub enum PrepError {pub enum PrepError {
+pub enum PrepError {
     Io(io::Error, PathBuf),
     Parse(String),
     Header(String),
