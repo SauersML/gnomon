@@ -97,7 +97,7 @@ impl Ord for HeapItem {
 
 /// Manages the state of a single file reader in the KWayMergeIterator.
 struct FileStream {
-    reader: Lines<BufReader<File>>,
+    reader: BufReader<File>,
     /// A buffer for weights and column indices from the current line being processed.
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
     /// The key and effect allele for the currently buffered line.
@@ -106,10 +106,10 @@ struct FileStream {
 
 /// An iterator that merges multiple, sorted score files on the fly. It correctly
 /// handles multi-score lines, yielding one `KeyedScoreRecord` per score.
-struct KWayMergeIterator<'a> {
+struct KWayMergeIterator {
     streams: Vec<FileStream>,
     heap: BinaryHeap<HeapItem>,
-    file_column_maps: &'a [Vec<ScoreColumnIndex>],
+    file_column_maps: Vec<Vec<ScoreColumnIndex>>,
     // Holds a terminal error. If Some, iteration will stop after yielding the error.
     next_error: Option<PrepError>,
 }
@@ -185,8 +185,6 @@ pub fn prepare_for_computation(
         .enumerate()
         .map(|(i, s)| (s.clone(), ScoreColumnIndex(i)))
         .collect();
-    let file_column_maps =
-        KWayMergeIterator::parse_file_headers(sorted_score_files, &score_name_to_col_index)?;
 
     // --- STAGE 3: SINGLE-PASS DATA COLLECTION ---
     // This is the core of the new architecture. We perform a single, group-aware
@@ -198,7 +196,8 @@ pub fn prepare_for_computation(
 
     let mut bim_iterator = BimIterator::new(fileset_prefixes)?;
     let mut bim_iter = bim_iterator.by_ref().peekable();
-    let mut score_iterator = KWayMergeIterator::new(sorted_score_files, &file_column_maps)?;
+    let mut score_iterator =
+        KWayMergeIterator::new(sorted_score_files, &score_name_to_col_index)?;
     let mut score_iter = score_iterator.by_ref().peekable();
 
     // This nested map structure is the core of the optimization.
@@ -575,16 +574,63 @@ impl<'a> Iterator for BimIterator<'a> {
     }
 }
 
-impl<'a> KWayMergeIterator<'a> {
+impl KWayMergeIterator {
+    /// Creates a new K-way merge iterator. This constructor is responsible for
+    /// opening all score files, parsing their headers to build column mappings,
+    /// and positioning the readers to be ready for data streaming. This combined
+    /// approach ensures headers are read exactly once, preventing them from being
+    /// misinterpreted as data.
     fn new(
-        file_paths: &'a [PathBuf],
-        file_column_maps: &'a [Vec<ScoreColumnIndex>],
+        file_paths: &[PathBuf],
+        score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
     ) -> Result<Self, PrepError> {
         let mut streams = Vec::with_capacity(file_paths.len());
+        let mut file_column_maps = Vec::with_capacity(file_paths.len());
+
         for path in file_paths {
             let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
+            let mut reader = BufReader::new(file);
+            let mut header_line = String::new();
+
+            // Read past any metadata lines (starting with ##) to find the header.
+            // The underlying `parse_score_file_headers_only` has already validated
+            // that a valid, non-metadata header line exists.
+            loop {
+                header_line.clear();
+                if reader
+                    .read_line(&mut header_line)
+                    .map_err(|e| PrepError::Io(e, path.clone()))?
+                    == 0
+                {
+                    break;
+                }
+                if !header_line.starts_with("##") {
+                    break; // Found the header line.
+                }
+            }
+
+            // The reader's position is now correctly after the header.
+
+            let column_map: Vec<ScoreColumnIndex> = header_line
+                .trim()
+                .split('\t')
+                .skip(3) // Skip variant_id, effect_allele, other_allele
+                .map(|name| {
+                    score_name_to_col_index.get(name).copied().ok_or_else(|| {
+                        PrepError::Header(format!(
+                            "Score '{name}' from file '{path}' not found in global score list.",
+                            name = name,
+                            path = path.display()
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            file_column_maps.push(column_map);
+
+            // Store the stream with the reader positioned ready for data.
             streams.push(FileStream {
-                reader: BufReader::new(file).lines(),
+                reader,
                 line_buffer: std::collections::VecDeque::new(),
                 current_line_info: None,
             });
@@ -597,56 +643,14 @@ impl<'a> KWayMergeIterator<'a> {
             next_error: None,
         };
 
-        // Prime the iterator by loading the first item from each file.
+        // Prime the iterator by loading the first data line from each file.
         for i in 0..iter.streams.len() {
-            // This will read the first line and push the first score from it onto the heap.
             if let Err(e) = iter.replenish_from_stream(i) {
-                // If priming fails for any file, the whole operation fails.
                 return Err(e);
             }
         }
 
         Ok(iter)
-    }
-
-    /// Parses the header of each score file to map local column order to the global order.
-    fn parse_file_headers(
-        score_files: &[PathBuf],
-        score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-    ) -> Result<Vec<Vec<ScoreColumnIndex>>, PrepError> {
-        score_files
-            .iter()
-            .map(|path| {
-                let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
-                let mut reader = BufReader::new(file);
-                let mut header_line = String::new();
-                // Skip metadata lines, which start with ##
-                loop {
-                    header_line.clear();
-                    if reader.read_line(&mut header_line).map_err(|e| PrepError::Io(e, path.clone()))? == 0 {
-                        break; // End of file
-                    }
-                    if !header_line.starts_with("##") {
-                        break; // Found the header
-                    }
-                }
-
-                header_line
-                    .trim()
-                    .split('\t')
-                    .skip(3) // Skip variant_id, effect_allele, other_allele
-                    .map(|name| {
-                        score_name_to_col_index.get(name).copied().ok_or_else(|| {
-                            PrepError::Header(format!(
-                                "Score {0} from file {1} not found in global score list.",
-                                name,
-                                path.display()
-                            ))
-                        })
-                    })
-                    .collect()
-            })
-            .collect()
     }
 
     /// Attempts to replenish the heap with the next available score record from a given file stream.
@@ -672,7 +676,7 @@ impl<'a> KWayMergeIterator<'a> {
 
         // If the buffer is empty, we must read a new line from the file.
         // The `?` operator will propagate any I/O or parsing errors.
-        let column_map = self.file_column_maps[file_idx].as_slice();
+        let column_map = &self.file_column_maps[file_idx];
         if Self::read_line_into_buffer(stream, column_map)? {
             // A new line was read successfully and contained scores.
             // Push the first score record onto the heap to represent this stream.
@@ -693,39 +697,53 @@ impl<'a> KWayMergeIterator<'a> {
         stream.line_buffer.clear();
         stream.current_line_info = None;
 
-        if let Some(line_result) = stream.reader.next() {
-            // The path is not available here, but the error will be contextualized by the caller.
-            let line = line_result.map_err(|e| PrepError::Io(e, PathBuf::new()))?;
+        let mut line = String::new();
 
-            // Recursively skip empty lines or metadata/comment lines.
-            if line.trim().is_empty() || line.starts_with('#') {
-                return Self::read_line_into_buffer(stream, column_map);
+        // This loop robustly handles files with empty lines or comments interspersed
+        // with data, without using recursion.
+        loop {
+            line.clear();
+            let bytes_read = stream
+                .reader
+                .read_line(&mut line)
+                // The file path is not available here, so we pass an empty one. The
+                // error will be contextualized by a higher-level caller.
+                .map_err(|e| PrepError::Io(e, PathBuf::new()))?;
+
+            if bytes_read == 0 {
+                return Ok(false); // Clean end-of-file.
             }
 
-            let mut parts = line.split('\t');
-            let (variant_id, effect_allele) = match (parts.next(), parts.next()) {
-                (Some(v), Some(e)) if !v.is_empty() && !e.is_empty() => (v, e),
-                _ => return Ok(false), // Skip malformed line that lacks required columns.
-            };
-            let _other_allele = parts.next(); // Consume but do not use.
+            // Skip lines that are empty or are comments.
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
 
-            let key = parse_key(variant_id)?;
-            stream.current_line_info = Some((key, effect_allele.to_string()));
+            // If we reach here, we have a line that is presumed to be data.
+            break;
+        }
 
-            // Populate the buffer with all scores from this line.
-            for (i, weight_str) in parts.enumerate() {
-                if let Ok(weight) = weight_str.parse::<f32>() {
-                    // Use the pre-parsed column map to get the global index.
-                    if let Some(&score_column_index) = column_map.get(i) {
-                        stream.line_buffer.push_back((weight, score_column_index));
-                    }
+        let mut parts = line.split('\t');
+        let (variant_id, effect_allele) = match (parts.next(), parts.next()) {
+            (Some(v), Some(e)) if !v.is_empty() && !e.is_empty() => (v, e),
+            _ => return Ok(false), // Skip malformed line that lacks required columns.
+        };
+        let _other_allele = parts.next(); // Consume but do not use.
+
+        let key = parse_key(variant_id)?;
+        stream.current_line_info = Some((key, effect_allele.to_string()));
+
+        // Populate the buffer with all scores from this line.
+        for (i, weight_str) in parts.enumerate() {
+            if let Ok(weight) = weight_str.parse::<f32>() {
+                // Use the pre-parsed column map to get the global index.
+                if let Some(&score_column_index) = column_map.get(i) {
+                    stream.line_buffer.push_back((weight, score_column_index));
                 }
             }
-            // Return true only if we actually buffered one or more valid scores.
-            Ok(!stream.line_buffer.is_empty())
-        } else {
-            Ok(false) // End of file.
         }
+        // Return true only if we actually buffered one or more valid scores.
+        Ok(!stream.line_buffer.is_empty())
     }
 
     /// Creates a `KeyedScoreRecord` from the next item in a stream's buffer and
@@ -749,7 +767,7 @@ impl<'a> KWayMergeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for KWayMergeIterator<'a> {
+impl Iterator for KWayMergeIterator {
     type Item = Result<KeyedScoreRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
