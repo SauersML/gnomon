@@ -266,26 +266,47 @@ impl HeaderMapping {
 
     #[inline]
     fn create_sortable_line(&self, row: &str) -> Result<SortableLine, ReformatError> {
-        let fields: Vec<&str> = row.split('\t').collect();
-        let get_field = |idx: usize| fields.get(idx).copied().filter(|s| !s.is_empty());
+        // This function is on the hot path for reformatting. It avoids heap allocations
+        // by iterating over the split string once, instead of collecting to a Vec.
+        let mut chr: Option<&str> = None;
+        let mut pos: Option<&str> = None;
+        let mut ea: Option<&str> = None;
+        let mut oa: Option<&str> = None;
+        let mut weight: Option<&str> = None;
 
-        let (chr, pos) = match self.pos_cols {
-            PosColumns::Harmonized { chr: ci, pos: pi } => (get_field(ci), get_field(pi)),
-            PosColumns::Author { chr: ci, pos: pi } => (get_field(ci), get_field(pi)),
+        let (chr_idx, pos_idx) = match self.pos_cols {
+            PosColumns::Harmonized { chr, pos } => (chr, pos),
+            PosColumns::Author { chr, pos } => (chr, pos),
         };
 
-        let chr = chr.ok_or(ReformatError::Parse("Missing chromosome".to_string()))?;
-        let pos = pos.ok_or(ReformatError::Parse("Missing position".to_string()))?;
+        for (i, field) in row.split('\t').enumerate() {
+            if i == chr_idx {
+                chr = Some(field);
+            } else if i == pos_idx {
+                pos = Some(field);
+            } else if i == self.effect_allele {
+                ea = Some(field);
+            } else if i == self.other_allele {
+                oa = Some(field);
+            } else if i == self.effect_weight {
+                weight = Some(field);
+            }
+        }
 
-        let ea = get_field(self.effect_allele).ok_or(ReformatError::MissingColumns("effect_allele"))?;
-        let oa = get_field(self.other_allele).ok_or(ReformatError::MissingColumns("other_allele"))?;
+        // Check that all required fields were found and are not empty.
+        let chr_str = chr.filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::Parse("Missing chromosome field in row".to_string()))?;
+        let pos_str = pos.filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::Parse("Missing position field in row".to_string()))?;
+        let ea_str = ea.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("effect_allele"))?;
+        let oa_str = oa.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("other_allele"))?;
+        let weight_str = weight.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("effect_weight"))?;
 
-        let variant_id = format!("{}:{}", chr, pos);
+        // Construct the variant_id and parse the sort key.
+        let variant_id = format!("{}:{}", chr_str, pos_str);
         let key = parse_key(&variant_id)?;
-        
-        let weights_slice = &fields[self.effect_weight..];
-        let weights_str = weights_slice.join("\t");
-        let line_data = format!("{}\t{}\t{}\t{}", variant_id, ea, oa, weights_str);
+
+        // Reconstruct the line in the gnomon-native format.
+        // This now correctly uses only the single effect weight.
+        let line_data = format!("{}\t{}\t{}\t{}", variant_id, ea_str, oa_str, weight_str);
 
         Ok(SortableLine { key, line_data })
     }
