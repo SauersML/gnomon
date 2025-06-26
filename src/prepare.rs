@@ -454,13 +454,38 @@ fn parse_key(variant_id: &str) -> Result<(u8, u32), PrepError> {
     let chr_str = parts.next().unwrap_or("");
     let pos_str = parts.next().unwrap_or("0");
 
-    let chr_num = match chr_str {
-        "X" | "x" => 23,
-        "Y" | "y" => 24,
-        "MT" | "mt" => 25,
-        _ => chr_str.parse().map_err(|e| PrepError::Parse(format!("Invalid chromosome {}: {}", chr_str, e)))?,
+    // First, check for special, non-numeric chromosome names in a case-insensitive way.
+    if chr_str.eq_ignore_ascii_case("X") {
+        let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+        return Ok((23, pos_num));
+    }
+    if chr_str.eq_ignore_ascii_case("Y") {
+        let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+        return Ok((24, pos_num));
+    }
+    if chr_str.eq_ignore_ascii_case("MT") {
+        let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+        return Ok((25, pos_num));
+    }
+
+    // Next, handle numeric chromosomes, stripping a potential "chr" prefix case-insensitively.
+    // This is an allocation-free way to get the part of the string to parse.
+    let number_part = if chr_str.len() >= 3 && chr_str[..3].eq_ignore_ascii_case("chr") {
+        &chr_str[3..]
+    } else {
+        chr_str
     };
-    let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position {}: {}", pos_str, e)))?;
+
+    // Now, parse the remaining part.
+    let chr_num: u8 = number_part.parse().map_err(|_| {
+        PrepError::Parse(format!(
+            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
+            chr_str
+        ))
+    })?;
+
+    let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+    
     Ok((chr_num, pos_num))
 }
 
