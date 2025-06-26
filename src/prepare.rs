@@ -159,6 +159,7 @@ pub fn prepare_for_computation(
     keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
     // --- STAGE 1: INITIAL SETUP ---
+    // This pre-computation is fast and necessary before streaming begins.
     eprintln!("> Stage 1: Indexing subject data...");
     let fam_path = fileset_prefixes[0].with_extension("fam");
     let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
@@ -172,6 +173,7 @@ pub fn prepare_for_computation(
         .map_err(|_| PrepError::Parse("Total variants exceeds addressable memory.".to_string()))?;
 
     // --- STAGE 2: GLOBAL METADATA DISCOVERY ---
+    // We must know all possible score columns ahead of time to build a global mapping.
     eprintln!("> Stage 2: Discovering all score columns...");
     let score_names = parse_score_file_headers_only(sorted_score_files)?;
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
@@ -182,20 +184,30 @@ pub fn prepare_for_computation(
     let file_column_maps =
         KWayMergeIterator::parse_file_headers(sorted_score_files, &score_name_to_col_index)?;
 
-    // --- STAGE 3: SINGLE-PASS STREAMING MERGE-JOIN ---
-    eprintln!("> Stage 3: Streaming and merging data from genotype and score files...");
+    // --- STAGE 3: SINGLE-PASS DATA COLLECTION ---
+    // This is the core of the new architecture. We perform a single, group-aware
+    // merge-join over all input files, collecting all reconciled data into memory.
+    // All file I/O for the preparation phase happens here and only here.
+    eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
     let mut bim_iter = BimIterator::new(fileset_prefixes)?.peekable();
     let mut score_iter =
         KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
 
-    
-    let mut intermediate_complex_rules: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> = BTreeMap::new();
-    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
+    // Define a temporary struct to hold the collected data for the simple path.
+    struct SimpleMatch {
+        bim_row_index: BimRowIndex,
+        score_column_index: ScoreColumnIndex,
+        weight: f32,
+        is_flipped: bool,
+    }
+    let mut simple_path_work: Vec<SimpleMatch> = Vec::new();
+    let mut intermediate_complex_rules: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> =
+        BTreeMap::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
+        // This is safe because we just checked that the iterators are not empty.
         let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
         let score_key = score_iter.peek().unwrap().as_ref().unwrap().key;
 
@@ -208,6 +220,8 @@ pub fn prepare_for_computation(
             }
             Ordering::Equal => {
                 let key = bim_key;
+                // A variant can be defined multiple times at the same position (multiallelic).
+                // Collect all BIM records for this specific locus.
                 let mut bim_group = Vec::new();
                 while let Some(Ok(peek_item)) = bim_iter.peek() {
                     if peek_item.key == key {
@@ -217,6 +231,8 @@ pub fn prepare_for_computation(
                     }
                 }
 
+                // A variant can appear in multiple score files.
+                // Collect all score records for this specific locus.
                 let mut score_group = Vec::new();
                 while let Some(Ok(peek_item)) = score_iter.peek() {
                     if peek_item.key == key {
@@ -226,27 +242,32 @@ pub fn prepare_for_computation(
                     }
                 }
 
+                // Process the complete group for this locus.
                 for score_record in score_group {
-                    let outcome = resolve_matches_for_score_line(
-                        &score_record.effect_allele,
-                        &bim_group,
-                    )?;
+                    let outcome =
+                        resolve_matches_for_score_line(&score_record.effect_allele, &bim_group)?;
+
                     match outcome {
                         ReconciliationOutcome::Simple(matches) => {
                             for bim_rec in matches {
-                                all_required_indices.insert(bim_rec.bim_row_index);
+                                let is_flipped = score_record.effect_allele != bim_rec.allele1;
+                                simple_path_work.push(SimpleMatch {
+                                    bim_row_index: bim_rec.bim_row_index,
+                                    score_column_index: score_record.score_column_index,
+                                    weight: score_record.weight,
+                                    is_flipped,
+                                });
                             }
                         }
                         ReconciliationOutcome::Complex(matches) => {
                             let possible_contexts: Vec<_> = matches
                                 .iter()
                                 .map(|rec| {
-                                    all_required_indices.insert(rec.bim_row_index);
                                     (rec.bim_row_index, rec.allele1.clone(), rec.allele2.clone())
                                 })
                                 .collect();
                             let score_info = ScoreInfo {
-                                effect_allele: score_record.effect_allele.clone(),
+                                effect_allele: score_record.effect_allele,
                                 weight: score_record.weight,
                                 score_column_index: score_record.score_column_index,
                             };
@@ -262,102 +283,29 @@ pub fn prepare_for_computation(
         }
     }
     eprintln!(
-        "> TIMING: Stage 3 (Streaming Merge) took {:.2?}",
+        "> TIMING: Stage 3 (Data Collection) took {:.2?}",
         overall_start_time.elapsed()
     );
 
-    // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
-    eprintln!("> Stage 4: Building final variant index and populating matrices...");
+    // --- STAGE 4: IN-MEMORY PROCESSING AND MATRIX CONSTRUCTION ---
+    // All file I/O is complete. The following stages are CPU-bound and operate
+    // on the data collected in Stage 3.
+    eprintln!("> Stage 4: Verifying data and building final matrices...");
 
-    
-
-    """    let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
-    let num_reconciled_variants = required_bim_indices.len();
-    let bim_row_to_reconciled_variant_map =
-        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
-
-    type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
-    let mut work_by_reconciled_idx: BTreeMap<usize, Vec<SimpleMapping>> = BTreeMap::new();
-
-    let mut bim_iter = BimIterator::new(fileset_prefixes)?.peekable();
-    let mut score_iter =
-        KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
-
-    while bim_iter.peek().is_some() && score_iter.peek().is_some() {
-        let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
-        let score_key = score_iter.peek().unwrap().as_ref().unwrap().key;
-
-        match bim_key.cmp(&score_key) {
-            Ordering::Less => {
-                bim_iter.next();
-            }
-            Ordering::Greater => {
-                score_iter.next();
-            }
-            Ordering::Equal => {
-                let key = bim_key;
-                let mut bim_group = Vec::new();
-                while let Some(Ok(peek_item)) = bim_iter.peek() {
-                    if peek_item.key == key {
-                        bim_group.push(bim_iter.next().unwrap()?);
-                    } else {
-                        break;
-                    }
-                }
-
-                let mut score_group = Vec::new();
-                while let Some(Ok(peek_item)) = score_iter.peek() {
-                    if peek_item.key == key {
-                        score_group.push(score_iter.next().unwrap()?);
-                    } else {
-                        break;
-                    }
-                }
-
-                for score_record in score_group {
-                    let outcome = resolve_matches_for_score_line(
-                        &score_record.effect_allele,
-                        &bim_group,
-                    )?;
-                    if let ReconciliationOutcome::Simple(matches) = outcome {
-                        for bim_rec in matches {
-                            let is_flipped = score_record.effect_allele != bim_rec.allele1;
-                            if let Some(Some(reconciled_idx_nonmax)) = bim_row_to_reconciled_variant_map.get(bim_rec.bim_row_index.0 as usize) {
-                                work_by_reconciled_idx.entry(reconciled_idx_nonmax.get() as usize).or_default().push((
-                                    (bim_rec.bim_row_index, score_record.score_column_index),
-                                    (score_record.weight, is_flipped),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // CRITICAL: Before processing, check for ambiguous simple-path definitions.
+    // This is a correctness guarantee. We sort by the composite key of (variant, score)
+    // and then check for adjacent duplicates.
+    simple_path_work.par_sort_unstable_by_key(|w| (w.bim_row_index, w.score_column_index));
+    if let Some(window) = simple_path_work.windows(2).find(|w| {
+        w[0].bim_row_index == w[1].bim_row_index
+            && w[0].score_column_index == w[1].score_column_index
+    }) {
+        return Err(PrepError::AmbiguousReconciliation(format!(
+            "Ambiguous input: The same variant-score pair is defined with different weights across input files. Variant BIM index: {}, Score: {}",
+            window[0].bim_row_index.0, score_names[window[0].score_column_index.0]
+        )));
     }
 
-    let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
-    let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
-    let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
-    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
-        vec![Vec::new(); num_reconciled_variants];
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-
-    weights_matrix
-        .par_chunks_mut(stride)
-        .zip(flip_mask_matrix.par_chunks_mut(stride))
-        .zip(variant_to_scores_map.par_iter_mut())
-        .enumerate()
-        .for_each(|(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
-            if let Some(work_group) = work_by_reconciled_idx.get(&reconciled_idx) {
-                for &((_, score_col), (weight, is_flipped)) in work_group {
-                    weights_chunk[score_col.0] = weight;
-                    flip_chunk[score_col.0] = if is_flipped { 1 } else { 0 };
-                    vtsm_entry.push(score_col);
-                }
-            }
-        });
-
-    // Process complex rules
     let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
         .into_iter()
         .map(|(contexts, scores)| GroupedComplexRule {
@@ -366,24 +314,83 @@ pub fn prepare_for_computation(
         })
         .collect();
 
-    if required_bim_indices.is_empty() && final_complex_rules.is_empty() {
+    // Build the definitive set of all variants that will be included in the computation.
+    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
+    for work in &simple_path_work {
+        all_required_indices.insert(work.bim_row_index);
+    }
+    for rule in &final_complex_rules {
+        for (bim_idx, _, _) in &rule.possible_contexts {
+            all_required_indices.insert(*bim_idx);
+        }
+    }
+
+    if all_required_indices.is_empty() {
         return Err(PrepError::NoOverlappingVariants);
     }
 
-    // Deduplicate and sort the score maps in parallel
-    variant_to_scores_map.par_iter_mut().for_each(|v| {
-        v.sort_unstable();
-        v.dedup();
-    });
+    let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
+    let num_reconciled_variants = required_bim_indices.len();
+    let bim_row_to_reconciled_variant_map =
+        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
 
-    // Count variants per score from the final populated structures
-    for (_reconciled_idx, scores) in variant_to_scores_map.iter().enumerate() {
+    // Group all simple path work by its final dense matrix index for efficient parallel processing.
+    let mut work_by_reconciled_idx: BTreeMap<usize, Vec<&SimpleMatch>> = BTreeMap::new();
+    for work in &simple_path_work {
+        if let Some(Some(reconciled_idx_nonmax)) =
+            bim_row_to_reconciled_variant_map.get(work.bim_row_index.0 as usize)
+        {
+            let reconciled_idx = reconciled_idx_nonmax.get() as usize;
+            work_by_reconciled_idx.entry(reconciled_idx).or_default().push(work);
+        }
+    }
+
+    let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
+    let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
+    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
+        vec![Vec::new(); num_reconciled_variants];
+
+    // This parallel loop populates the final matrices. Each thread works on a disjoint
+    // set of rows, looking up its work in the pre-grouped BTreeMap.
+    weights_matrix
+        .par_chunks_mut(stride)
+        .zip(flip_mask_matrix.par_chunks_mut(stride))
+        .zip(variant_to_scores_map.par_iter_mut())
+        .enumerate()
+        .for_each(|(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
+            if let Some(work_group) = work_by_reconciled_idx.get(&reconciled_idx) {
+                for &work_item in work_group {
+                    weights_chunk[work_item.score_column_index.0] = work_item.weight;
+                    flip_chunk[work_item.score_column_index.0] = if work_item.is_flipped { 1 } else { 0 };
+                }
+                // Deduplicate and sort score indices for this variant row.
+                let mut scores: Vec<_> = work_group.iter().map(|w| w.score_column_index).collect();
+                scores.sort_unstable();
+                scores.dedup();
+                *vtsm_entry = scores;
+            }
+        });
+
+    // Calculate the final count of variants contributing to each score.
+    let mut score_variant_counts = vec![0u32; score_names.len()];
+    for scores in &variant_to_scores_map {
         for score_col in scores {
             score_variant_counts[score_col.0] += 1;
         }
     }
+    for rule in &final_complex_rules {
+        let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
+        for score_info in &rule.score_applications {
+            counted_cols.insert(score_info.score_column_index);
+        }
+        for score_col in counted_cols {
+            score_variant_counts[score_col.0] += 1;
+        }
+    }
 
-    // --- FINAL CONSTRUCTION ---
+    // --- STAGE 5: FINAL ASSEMBLY ---
+    // All data is prepared; construct the final PreparationResult object.
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
