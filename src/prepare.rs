@@ -186,8 +186,9 @@ pub fn prepare_for_computation(
 
     // --- STAGE 3: SINGLE-PASS DATA COLLECTION ---
     // This is the core of the new architecture. We perform a single, group-aware
-    // merge-join over all input files, collecting all reconciled data into memory.
-    // All file I/O for the preparation phase happens here and only here.
+    // merge-join over all input files. Data is processed and stored in an efficient,
+    // structured map, and ambiguity is checked on-the-fly, eliminating the need
+    // for a large intermediate vector and a costly sort.
     eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
@@ -195,14 +196,13 @@ pub fn prepare_for_computation(
     let mut score_iter =
         KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
 
-    // Define a temporary struct to hold the collected data for the simple path.
-    struct SimpleMatch {
-        bim_row_index: BimRowIndex,
-        score_column_index: ScoreColumnIndex,
-        weight: f32,
-        is_flipped: bool,
-    }
-    let mut simple_path_work: Vec<SimpleMatch> = Vec::new();
+    // This nested map structure is the core of the optimization.
+    // It stores all simple-path data, grouped by variant, and allows for an
+    // efficient, inline ambiguity check.
+    // Key: BimRowIndex (a unique variant)
+    // Value: Map<ScoreColumnIndex, (weight: f32, is_flipped: bool)>
+    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, (f32, bool)>> =
+        BTreeMap::new();
     let mut intermediate_complex_rules: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> =
         BTreeMap::new();
 
@@ -251,12 +251,25 @@ pub fn prepare_for_computation(
                         ReconciliationOutcome::Simple(matches) => {
                             for bim_rec in matches {
                                 let is_flipped = score_record.effect_allele != bim_rec.allele1;
-                                simple_path_work.push(SimpleMatch {
-                                    bim_row_index: bim_rec.bim_row_index,
-                                    score_column_index: score_record.score_column_index,
-                                    weight: score_record.weight,
-                                    is_flipped,
-                                });
+                                let score_map =
+                                    simple_path_data.entry(bim_rec.bim_row_index).or_default();
+
+                                // Attempt to insert the score. If the key (ScoreColumnIndex)
+                                // already exists, `insert` returns Some(old_value),
+                                // indicating a duplicate definition. This is the new,
+                                // efficient, streaming ambiguity check.
+                                if score_map
+                                    .insert(
+                                        score_record.score_column_index,
+                                        (score_record.weight, is_flipped),
+                                    )
+                                    .is_some()
+                                {
+                                    return Err(PrepError::AmbiguousReconciliation(format!(
+                                        "Ambiguous input: The same variant-score pair is defined with different weights across input files. Variant BIM index: {}, Score: {}",
+                                        bim_rec.bim_row_index.0, score_names[score_record.score_column_index.0]
+                                    )));
+                                }
                             }
                         }
                         ReconciliationOutcome::Complex(matches) => {
@@ -292,19 +305,8 @@ pub fn prepare_for_computation(
     // on the data collected in Stage 3.
     eprintln!("> Stage 4: Verifying data and building final matrices...");
 
-    // CRITICAL: Before processing, check for ambiguous simple-path definitions.
-    // This is a correctness guarantee. We sort by the composite key of (variant, score)
-    // and then check for adjacent duplicates.
-    simple_path_work.par_sort_unstable_by_key(|w| (w.bim_row_index, w.score_column_index));
-    if let Some(window) = simple_path_work.windows(2).find(|w| {
-        w[0].bim_row_index == w[1].bim_row_index
-            && w[0].score_column_index == w[1].score_column_index
-    }) {
-        return Err(PrepError::AmbiguousReconciliation(format!(
-            "Ambiguous input: The same variant-score pair is defined with different weights across input files. Variant BIM index: {}, Score: {}",
-            window[0].bim_row_index.0, score_names[window[0].score_column_index.0]
-        )));
-    }
+    // The ambiguity check was already performed during the streaming stage.
+    // We can now proceed directly to matrix construction.
 
     let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
         .into_iter()
@@ -316,8 +318,8 @@ pub fn prepare_for_computation(
 
     // Build the definitive set of all variants that will be included in the computation.
     let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-    for work in &simple_path_work {
-        all_required_indices.insert(work.bim_row_index);
+    for bim_row_index in simple_path_data.keys() {
+        all_required_indices.insert(*bim_row_index);
     }
     for rule in &final_complex_rules {
         for (bim_idx, _, _) in &rule.possible_contexts {
@@ -331,19 +333,6 @@ pub fn prepare_for_computation(
 
     let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
     let num_reconciled_variants = required_bim_indices.len();
-    let bim_row_to_reconciled_variant_map =
-        build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
-
-    // Group all simple path work by its final dense matrix index for efficient parallel processing.
-    let mut work_by_reconciled_idx: BTreeMap<usize, Vec<&SimpleMatch>> = BTreeMap::new();
-    for work in &simple_path_work {
-        if let Some(Some(reconciled_idx_nonmax)) =
-            bim_row_to_reconciled_variant_map.get(work.bim_row_index.0 as usize)
-        {
-            let reconciled_idx = reconciled_idx_nonmax.get() as usize;
-            work_by_reconciled_idx.entry(reconciled_idx).or_default().push(work);
-        }
-    }
 
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
@@ -352,23 +341,26 @@ pub fn prepare_for_computation(
         vec![Vec::new(); num_reconciled_variants];
 
     // This parallel loop populates the final matrices. Each thread works on a disjoint
-    // set of rows, looking up its work in the pre-grouped BTreeMap.
+    // set of rows, looking up its work directly in the structured `simple_path_data` map.
     weights_matrix
         .par_chunks_mut(stride)
         .zip(flip_mask_matrix.par_chunks_mut(stride))
         .zip(variant_to_scores_map.par_iter_mut())
         .enumerate()
         .for_each(|(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
-            if let Some(work_group) = work_by_reconciled_idx.get(&reconciled_idx) {
-                for &work_item in work_group {
-                    weights_chunk[work_item.score_column_index.0] = work_item.weight;
-                    flip_chunk[work_item.score_column_index.0] = if work_item.is_flipped { 1 } else { 0 };
+            // Find which original BIM row corresponds to this matrix row.
+            let bim_row_index = required_bim_indices[reconciled_idx];
+
+            // Look up the prepared data for that BIM row.
+            if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
+                for (&score_col_idx, &(weight, is_flipped)) in score_data_map.iter() {
+                    weights_chunk[score_col_idx.0] = weight;
+                    flip_chunk[score_col_idx.0] = if is_flipped { 1 } else { 0 };
                 }
-                // Deduplicate and sort score indices for this variant row.
-                let mut scores: Vec<_> = work_group.iter().map(|w| w.score_column_index).collect();
-                scores.sort_unstable();
-                scores.dedup();
-                *vtsm_entry = scores;
+
+                // Collect the score indices for this variant row. The keys of a BTreeMap are
+                // already sorted, so we can collect them directly.
+                *vtsm_entry = score_data_map.keys().copied().collect();
             }
         });
 
