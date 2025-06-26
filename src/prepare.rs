@@ -196,9 +196,10 @@ pub fn prepare_for_computation(
     eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
-    let mut bim_iter = BimIterator::new(fileset_prefixes)?.peekable();
-    let mut score_iter =
-        KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
+    let mut bim_iterator = BimIterator::new(fileset_prefixes)?;
+    let mut bim_iter = bim_iterator.by_ref().peekable();
+    let mut score_iterator = KWayMergeIterator::new(sorted_score_files, &file_column_maps)?;
+    let mut score_iter = score_iterator.by_ref().peekable();
 
     // This nested map structure is the core of the optimization.
     // It stores all simple-path data, grouped by variant, and allows for an
@@ -397,16 +398,13 @@ pub fn prepare_for_computation(
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
 
-    // Consume the iterator wrapper to get the inner `BimIterator`, which now
-    // contains the file boundaries collected during the single streaming pass.
-    let bim_iterator_inner = bim_iter.into_inner();
-
+    // The `bim_iterator` variable is used to retrieve the boundaries that were
+    // collected efficiently during the single-pass merge-join. This eliminates
+    // the redundant I/O of re-reading every .bim file.
     let pipeline_kind = if fileset_prefixes.len() <= 1 {
         PipelineKind::SingleFile(fileset_prefixes[0].with_extension("bed"))
     } else {
-        // Use the boundaries collected efficiently during the single-pass merge-join,
-        // eliminating the redundant I/O of re-reading every .bim file.
-        PipelineKind::MultiFile(bim_iterator_inner.boundaries)
+        PipelineKind::MultiFile(bim_iterator.boundaries)
     };
 
     Ok(PreparationResult::new(
