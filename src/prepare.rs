@@ -122,6 +122,8 @@ struct BimIterator<'a> {
     global_offset: u64,
     local_line_num: u64,
     current_path: PathBuf,
+    // A list of the file boundaries, collected on-the-fly during the single iteration pass.
+    boundaries: Vec<FilesetBoundary>,
 }
 
 #[derive(Clone, Copy)]
@@ -395,23 +397,16 @@ pub fn prepare_for_computation(
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
 
+    // Consume the iterator wrapper to get the inner `BimIterator`, which now
+    // contains the file boundaries collected during the single streaming pass.
+    let bim_iterator_inner = bim_iter.into_inner();
+
     let pipeline_kind = if fileset_prefixes.len() <= 1 {
         PipelineKind::SingleFile(fileset_prefixes[0].with_extension("bed"))
     } else {
-        let boundaries = fileset_prefixes
-            .iter()
-            .scan(0, |offset, prefix| {
-                let path = prefix.with_extension("bim");
-                let count = count_lines(&path).unwrap_or(0);
-                let boundary = FilesetBoundary {
-                    bed_path: prefix.with_extension("bed"),
-                    starting_global_index: *offset,
-                };
-                *offset += count;
-                Some(boundary)
-            })
-            .collect();
-        PipelineKind::MultiFile(boundaries)
+        // Use the boundaries collected efficiently during the single-pass merge-join,
+        // eliminating the redundant I/O of re-reading every .bim file.
+        PipelineKind::MultiFile(bim_iterator_inner.boundaries)
     };
 
     Ok(PreparationResult::new(
@@ -479,15 +474,26 @@ impl<'a> BimIterator<'a> {
             global_offset: 0,
             local_line_num: 0,
             current_path: PathBuf::new(),
+            boundaries: Vec::with_capacity(fileset_prefixes.len()),
         };
         iter.next_file()?;
         Ok(iter)
     }
 
     fn next_file(&mut self) -> Result<bool, PrepError> {
+        // Before moving to the next file, add the line count of the *previous* file
+        // (stored in local_line_num) to the global offset.
+        self.global_offset += self.local_line_num;
+        self.local_line_num = 0;
+
         if let Some(prefix) = self.fileset_prefixes.next() {
-            self.global_offset += self.local_line_num;
-            self.local_line_num = 0;
+            // Record the boundary for the new file. Its starting index is the current
+            // global offset, which we just calculated.
+            self.boundaries.push(FilesetBoundary {
+                bed_path: prefix.with_extension("bed"),
+                starting_global_index: self.global_offset,
+            });
+
             let bim_path = prefix.with_extension("bim");
             self.current_path = bim_path.clone();
             let file = File::open(&bim_path).map_err(|e| PrepError::Io(e, bim_path))?;
