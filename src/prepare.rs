@@ -66,16 +66,16 @@ impl PartialEq for KeyedScoreRecord {
 impl Eq for KeyedScoreRecord {}
 
 
-/// A self-contained item for the merge heap.
+/// A self-contained item for the merge heap, holding a single score record.
 #[derive(Debug)]
 struct HeapItem {
-    key: VariantKey,
+    record: KeyedScoreRecord,
     file_idx: usize,
 }
 
 impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.record.key == other.record.key
     }
 }
 
@@ -91,7 +91,7 @@ impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // We want a min-heap, so we reverse the comparison on the key.
         // Tie-break by file_idx to ensure deterministic order.
-        other.key.cmp(&self.key).then_with(|| other.file_idx.cmp(&self.file_idx))
+        other.record.key.cmp(&self.record.key).then_with(|| other.file_idx.cmp(&self.file_idx))
     }
 }
 
@@ -110,6 +110,8 @@ struct KWayMergeIterator<'a> {
     streams: Vec<FileStream>,
     heap: BinaryHeap<HeapItem>,
     file_column_maps: &'a [Vec<ScoreColumnIndex>],
+    // Holds a terminal error. If Some, iteration will stop after yielding the error.
+    next_error: Option<PrepError>,
 }
 
 /// An iterator that streams over one or more `.bim` files, creating a single
@@ -559,15 +561,23 @@ impl<'a> KWayMergeIterator<'a> {
             });
         }
 
-        let mut heap = BinaryHeap::new();
-        for (i, stream) in streams.iter_mut().enumerate() {
-            // Prime the iterator by loading the first item from each file.
-            if let Err(e) = Self::advance_stream(stream, i, &mut heap, file_column_maps[i].as_slice()) {
+        let mut iter = Self {
+            streams,
+            heap: BinaryHeap::new(),
+            file_column_maps,
+            next_error: None,
+        };
+
+        // Prime the iterator by loading the first item from each file.
+        for i in 0..iter.streams.len() {
+            // This will read the first line and push the first score from it onto the heap.
+            if let Err(e) = iter.replenish_from_stream(i) {
+                // If priming fails for any file, the whole operation fails.
                 return Err(e);
             }
         }
 
-        Ok(Self { streams, heap, file_column_maps })
+        Ok(iter)
     }
 
     /// Parses the header of each score file to map local column order to the global order.
@@ -610,94 +620,135 @@ impl<'a> KWayMergeIterator<'a> {
             .collect()
     }
 
-    /// Advances a single file stream. If the line buffer is empty, it reads the
-    /// next line from the file, parses it, and populates the buffer. Then, it
-    /// takes the next available item from the buffer and pushes it onto the heap.
-    """    '''    fn advance_stream(
+    /// Attempts to replenish the heap with the next available score record from a given file stream.
+    ///
+    /// This function orchestrates the reading process for a single stream.
+    /// If the stream's line buffer is not empty, it pushes the next score from it.
+    /// If the buffer is empty, it triggers a read of the next line from the file.
+    /// If a new line is successfully read and parsed, it pushes the *first* new score
+    /// onto the heap. This ensures that each active stream is represented by exactly
+    /// one item in the heap.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success (or if the stream is simply exhausted).
+    /// - `Err(PrepError)` if a file I/O or parsing error occurs.
+    fn replenish_from_stream(&mut self, file_idx: usize) -> Result<(), PrepError> {
+        let stream = &mut self.streams[file_idx];
+
+        // If the buffer for the current line is not empty, just push the next item.
+        if !stream.line_buffer.is_empty() {
+            Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+            return Ok(());
+        }
+
+        // If the buffer is empty, we must read a new line from the file.
+        // The `?` operator will propagate any I/O or parsing errors.
+        let column_map = self.file_column_maps[file_idx].as_slice();
+        if Self::read_line_into_buffer(stream, column_map)? {
+            // A new line was read successfully and contained scores.
+            // Push the first score record onto the heap to represent this stream.
+            Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+        }
+
+        // If read_line_into_buffer returned `Ok(false)`, the stream is exhausted,
+        // so we do nothing, and it will no longer be represented on the heap.
+        Ok(())
+    }
+
+    /// Reads the next valid data line from a file stream and populates its internal buffer.
+    /// This is a low-level helper called by `replenish_from_stream`.
+    fn read_line_into_buffer(
         stream: &mut FileStream,
-        file_idx: usize,
-        heap: &mut BinaryHeap<HeapItem>,
         column_map: &[ScoreColumnIndex],
-    ) -> Result<(), PrepError> {
-        // If the buffer is empty, read a new line from the underlying file.
-        if stream.line_buffer.is_empty() {
-            stream.current_line_info = None; // Clear previous line info
-            if let Some(Ok(line)) = stream.reader.next() {
-                let mut parts = line.splitn(4, '    ');
-                let variant_id = parts.next().unwrap_or("");
-                let effect_allele = parts.next().unwrap_or("");
-                let _other_allele = parts.next(); // Consumed but not used here
-                let weights_str = parts.next().unwrap_or("");
+    ) -> Result<bool, PrepError> {
+        stream.line_buffer.clear();
+        stream.current_line_info = None;
 
-                if variant_id.is_empty() || effect_allele.is_empty() {
-                    return Ok(()); // Skip malformed or empty lines
-                }
+        if let Some(line_result) = stream.reader.next() {
+            // The path is not available here, but the error will be contextualized by the caller.
+            let line = line_result.map_err(|e| PrepError::Io(e, PathBuf::new()))?;
 
-                let key = parse_key(variant_id)?;
-                stream.current_line_info = Some((key, effect_allele.to_string()));
+            // Recursively skip empty lines or metadata/comment lines.
+            if line.trim().is_empty() || line.starts_with('#') {
+                return Self::read_line_into_buffer(stream, column_map);
+            }
 
-                // Populate the buffer with all scores from this line.
-                for (i, weight_str) in weights_str.split('    ').enumerate() {
-                    if let Ok(weight) = weight_str.parse::<f32>() {
-                        if let Some(&score_column_index) = column_map.get(i) {
-                            stream.line_buffer.push_back((weight, score_column_index));
-                        }
+            let mut parts = line.split('\t');
+            let (variant_id, effect_allele) = match (parts.next(), parts.next()) {
+                (Some(v), Some(e)) if !v.is_empty() && !e.is_empty() => (v, e),
+                _ => return Ok(false), // Skip malformed line that lacks required columns.
+            };
+            let _other_allele = parts.next(); // Consume but do not use.
+
+            let key = parse_key(variant_id)?;
+            stream.current_line_info = Some((key, effect_allele.to_string()));
+
+            // Populate the buffer with all scores from this line.
+            for (i, weight_str) in parts.enumerate() {
+                if let Ok(weight) = weight_str.parse::<f32>() {
+                    // Use the pre-parsed column map to get the global index.
+                    if let Some(&score_column_index) = column_map.get(i) {
+                        stream.line_buffer.push_back((weight, score_column_index));
                     }
                 }
             }
+            // Return true only if we actually buffered one or more valid scores.
+            Ok(!stream.line_buffer.is_empty())
+        } else {
+            Ok(false) // End of file.
         }
+    }
 
-        // If, after attempting to read a new line, the buffer has an item,
-        // create a HeapItem and push it.
-        if !stream.line_buffer.is_empty() {
-            if let Some((key, _)) = &stream.current_line_info {
-                heap.push(HeapItem { key: *key, file_idx });
-            }
+    /// Creates a `KeyedScoreRecord` from the next item in a stream's buffer and
+    /// pushes a corresponding `HeapItem` onto the heap.
+    fn push_next_from_buffer_to_heap(
+        stream: &mut FileStream,
+        file_idx: usize,
+        heap: &mut BinaryHeap<HeapItem>,
+    ) {
+        if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
+            // This unwrap is safe because line_buffer is only populated if current_line_info is Some.
+            let (key, effect_allele) = stream.current_line_info.as_ref().unwrap().clone();
+            let record = KeyedScoreRecord {
+                key,
+                effect_allele,
+                score_column_index,
+                weight,
+            };
+            heap.push(HeapItem { record, file_idx });
         }
-
-        Ok(())
     }
 }
 
-"""impl<'a> Iterator for KWayMergeIterator<'a> {
+impl<'a> Iterator for KWayMergeIterator<'a> {
     type Item = Result<KeyedScoreRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Peek at the top of the heap to see which file to process.
-        let file_idx = if let Some(heap_item) = self.heap.peek() {
-            heap_item.file_idx
-        } else {
-            return None; // Heap is empty, we're done.
-        };
-
-        // Get the stream for this file.
-        let stream = &mut self.streams[file_idx];
-
-        // Pop the next score from the line buffer.
-        let (weight, score_column_index) = stream.line_buffer.pop_front().unwrap();
-        let (key, effect_allele) = stream.current_line_info.as_ref().unwrap().clone();
-
-        let record = KeyedScoreRecord {
-            key,
-            effect_allele,
-            score_column_index,
-            weight,
-        };
-
-        // If the line buffer is now empty, we need to read the next line from the file.
-        if stream.line_buffer.is_empty() {
-            // We must pop the old item from the heap *before* advancing the stream,
-            // because advancing will push a new item.
-            self.heap.pop();
-            let column_map = self.file_column_maps[file_idx].as_slice();
-            if let Err(e) = Self::advance_stream(stream, file_idx, &mut self.heap, column_map) {
-                return Some(Err(e));
-            }
+        // If a terminal error occurred in the previous call, return it now and stop.
+        if let Some(e) = self.next_error.take() {
+            return Some(Err(e));
         }
 
-        Some(Ok(record))
+        // Pop the smallest element. If heap is empty, we're done.
+        let top_item = match self.heap.pop() {
+            Some(item) => item,
+            None => return None,
+        };
+
+        let record_to_return = top_item.record;
+        let file_idx = top_item.file_idx;
+
+        // Try to replenish the heap from the stream we just took from.
+        if let Err(e) = self.replenish_from_stream(file_idx) {
+            // An error occurred. Store it to be returned on the *next* call to `next()`.
+            // This ensures we don't lose the record we just popped.
+            self.next_error = Some(e);
+        }
+
+        // Return the valid record we popped.
+        Some(Ok(record_to_return))
     }
-}""''""
+}
 
 
 fn build_bim_to_reconciled_variant_map(
