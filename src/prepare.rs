@@ -254,14 +254,19 @@ pub fn prepare_for_computation(
                     match outcome {
                         ReconciliationOutcome::Simple(matches) => {
                             for bim_rec in matches {
-                                let is_flipped = score_record.effect_allele != bim_rec.allele1;
+                                // The compute kernel receives the dosage of `allele2` (the alternate allele)
+                                // from the BIM file.
+                                // - If a variant is NOT flipped, its contribution is `Weight * DosageOfAllele2`.
+                                // - If a variant IS flipped, its contribution is `Weight * DosageOfAllele1`.
+                                // Therefore, we must set `is_flipped` to `true` if the score's effect
+                                // allele matches `allele1`.
+                                let is_flipped = score_record.effect_allele == bim_rec.allele1;
                                 let score_map =
                                     simple_path_data.entry(bim_rec.bim_row_index).or_default();
 
                                 // Attempt to insert the score. If the key (ScoreColumnIndex)
                                 // already exists, `insert` returns Some(old_value),
-                                // indicating a duplicate definition. This is the new,
-                                // efficient, streaming ambiguity check.
+                                // indicating a duplicate definition.
                                 if score_map
                                     .insert(
                                         score_record.score_column_index,
