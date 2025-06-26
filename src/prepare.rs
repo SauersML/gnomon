@@ -5,9 +5,8 @@
 // ========================================================================================
 //
 // This module transforms raw user inputs into an optimized "computation
-// blueprint." It functions as a multi-stage, parallel compiler designed for
-// maximum throughput on many-core systems. It correctly handles and merges
-// multiple score files.
+// blueprint." It now uses a low-memory, high-throughput streaming merge-join
+// algorithm to handle genome-scale data.
 
 use crate::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
@@ -16,11 +15,15 @@ use crate::types::{
 use ahash::{AHashMap, AHashSet};
 use nonmax::NonMaxU32;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Lines};
+use std::iter::Peekable;
+
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
@@ -30,13 +33,94 @@ use std::time::Instant;
 const LANE_COUNT: usize = 8;
 
 // ========================================================================================
-//                     TYPE-DRIVEN DOMAIN MODEL
+//              TYPE-DRIVEN DOMAIN MODEL FOR STREAMING
 // ========================================================================================
 
-#[derive(Clone)]
-struct BimRecord {
+/// The primitive, sortable key used for all merge-join operations.
+type VariantKey = (u8, u32);
+
+/// A parsed record from a `.bim` file, tagged with its sort key and global index.
+#[derive(Debug)]
+struct KeyedBimRecord {
+    key: VariantKey,
+    bim_row_index: BimRowIndex,
     allele1: String,
     allele2: String,
+}
+
+/// A parsed record from a score file, representing one variant-score pair.
+#[derive(Debug, Clone)]
+struct KeyedScoreRecord {
+    key: VariantKey,
+    effect_allele: String,
+    score_column_index: ScoreColumnIndex,
+    weight: f32,
+}
+
+// Manual implementation to handle f32 comparison correctly.
+impl PartialEq for KeyedScoreRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.weight.to_bits() == other.weight.to_bits()
+    }
+}
+impl Eq for KeyedScoreRecord {}
+
+
+/// A self-contained item for the merge heap.
+#[derive(Debug)]
+struct HeapItem {
+    key: VariantKey,
+    record: KeyedScoreRecord,
+    file_idx: usize,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for HeapItem {}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // We want a min-heap, so we reverse the comparison on the key.
+        // Tie-break by file_idx to ensure deterministic order.
+        other.key.cmp(&self.key).then_with(|| other.file_idx.cmp(&self.file_idx))
+    }
+}
+
+/// Manages the state of a single file reader in the KWayMergeIterator.
+struct FileStream {
+    reader: Lines<BufReader<File>>,
+    /// A buffer for weights and column indices from the current line being processed.
+    line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
+    /// The key and effect allele for the currently buffered line.
+    current_line_info: Option<(VariantKey, String)>,
+}
+
+/// An iterator that merges multiple, sorted score files on the fly. It correctly
+/// handles multi-score lines, yielding one `KeyedScoreRecord` per score.
+struct KWayMergeIterator<'a> {
+    streams: Vec<FileStream>,
+    heap: BinaryHeap<HeapItem>,
+    file_column_maps: &'a [Vec<ScoreColumnIndex>],
+}
+
+/// An iterator that streams over one or more `.bim` files, creating a single
+/// virtually merged and sorted stream of records.
+struct BimIterator<'a> {
+    fileset_prefixes: std::slice::Iter<'a, PathBuf>,
+    current_reader: Option<Lines<BufReader<File>>>,
+    global_offset: u64,
+    local_line_num: u64,
+    current_path: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -45,15 +129,11 @@ struct MatrixWriter<T> {
 }
 
 /// Enum to represent the outcome of reconciling one score file line.
-/// This is the core of the triage system that separates the fast and slow paths.
+/// The lifetime parameter `'a` ensures that we are borrowing from the group
+/// collected in the merge-join, avoiding allocations.
 enum ReconciliationOutcome<'a> {
-    /// For the fast path. Contains a list of one or more unambiguous matches.
-    /// This can include perfect matches or a single, unambiguous permissive match.
-    Simple(Vec<&'a (BimRecord, BimRowIndex)>),
-    /// For the slow path. Contains a list of multiple, different, plausible
-    /// permissive matches, indicating a resolvable multiallelic site.
-    Complex(Vec<&'a (BimRecord, BimRowIndex)>),
-    /// The variant was not found in the genotype data.
+    Simple(Vec<&'a KeyedBimRecord>),
+    Complex(Vec<&'a KeyedBimRecord>),
     NotFound,
 }
 
@@ -76,12 +156,11 @@ pub enum PrepError {
 
 pub fn prepare_for_computation(
     fileset_prefixes: &[PathBuf],
-    score_files: &[PathBuf],
+    sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
-    // --- STAGE 1: INITIAL SETUP & VIRTUAL MERGE ---
-    eprintln!("> Pass 1: Indexing genotype and subject data...");
-    // The FAM file from the first fileset is considered authoritative for the cohort definition.
+    // --- STAGE 1: INITIAL SETUP ---
+    eprintln!("> Stage 1: Indexing subject data...");
     let fam_path = fileset_prefixes[0].with_extension("fam");
     let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
     let total_people_in_fam = all_person_iids.len();
@@ -89,115 +168,121 @@ pub fn prepare_for_computation(
     let (person_subset, final_person_iids) =
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
     let num_people_to_score = final_person_iids.len();
-
-    // This loop performs the "virtual merge" by creating a single, master variant index
-    // with globally unique, contiguous indices.
-    let mut global_variant_offset: u64 = 0;
-    let mut master_bim_index = AHashMap::new();
-    let mut fileset_boundaries = Vec::with_capacity(fileset_prefixes.len());
-    let mut total_variants_in_bim: u64 = 0;
-
-    for prefix in fileset_prefixes {
-        fileset_boundaries.push(FilesetBoundary {
-            bed_path: prefix.with_extension("bed"),
-            starting_global_index: global_variant_offset,
-        });
-
-        let bim_path = prefix.with_extension("bim");
-        let variant_count_in_file =
-            index_bim_file(&bim_path, global_variant_offset, &mut master_bim_index)?;
-        global_variant_offset += variant_count_in_file;
-        total_variants_in_bim += variant_count_in_file;
-    }
-    let bim_index = master_bim_index;
-    let total_variants_in_bim_usize = usize::try_from(total_variants_in_bim).map_err(|_| {
-        PrepError::Parse(
-            "Total number of variants across all files exceeds system's addressable memory."
-                .to_string(),
-        )
-    })?;
+    let total_variants_in_bim = count_total_variants(fileset_prefixes)?;
+    let total_variants_in_bim_usize = usize::try_from(total_variants_in_bim)
+        .map_err(|_| PrepError::Parse("Total variants exceeds addressable memory.".to_string()))?;
 
     // --- STAGE 2: GLOBAL METADATA DISCOVERY ---
-    eprintln!("> Pass 2: Discovering all score columns...");
-    let score_names = parse_score_file_headers_only(score_files)?;
+    eprintln!("> Stage 2: Discovering all score columns...");
+    let score_names = parse_score_file_headers_only(sorted_score_files)?;
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()
         .map(|(i, s)| (s.clone(), ScoreColumnIndex(i)))
         .collect();
+    let file_column_maps =
+        KWayMergeIterator::parse_file_headers(sorted_score_files, &score_name_to_col_index)?;
 
-    // --- STAGE 3: PARALLEL COMPILATION, SORTING, & MERGING ---
-    eprintln!(
-        "> Pass 3: Compiling and sorting data from {} score file(s) in parallel...",
-        score_files.len()
-    );
+    // --- STAGE 3: SINGLE-PASS STREAMING MERGE-JOIN ---
+    eprintln!("> Stage 3: Streaming and merging data from genotype and score files...");
     let overall_start_time = Instant::now();
 
-    // Step 3a: Run compilation for each file in parallel.
-    let list_of_tuples: Vec<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>)> = score_files
-        .par_iter()
-        .map(|path| compile_score_file_to_map(path, &bim_index, &score_name_to_col_index))
-        .collect::<Result<_, _>>()?;
+    let mut bim_iter = BimIterator::new(fileset_prefixes)?.peekable();
+    let mut score_iter =
+        KWayMergeIterator::new(sorted_score_files, &file_column_maps)?.peekable();
 
-    // Step 3b: Unzip the list of tuples into two separate collections.
-    let (simple_mappings, intermediate_complex_rules): (Vec<_>, Vec<_>) =
-        list_of_tuples.into_iter().unzip();
+    type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
+    let mut simple_mappings: Vec<SimpleMapping> = Vec::new();
+    let mut intermediate_complex_rules: AHashMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> = AHashMap::new();
 
-    // Flatten each collection into a single master list for each path.
-    let mut flat_score_data: Vec<SimpleMapping> = simple_mappings.into_iter().flatten().collect();
-    let flat_complex_rules: Vec<IntermediateComplexRule> =
-        intermediate_complex_rules.into_iter().flatten().collect();
+    while bim_iter.peek().is_some() && score_iter.peek().is_some() {
+        let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
+        let score_key = score_iter.peek().unwrap().as_ref().unwrap().key;
 
-    // Step 3c: Group the flat list of complex rules into the final, efficient structure.
-    let mut grouped_complex_map: BTreeMap<Vec<(BimRowIndex, String, String)>, Vec<ScoreInfo>> =
-        BTreeMap::new();
-    for intermediate_rule in flat_complex_rules {
-        let score_info = ScoreInfo {
-            effect_allele: intermediate_rule.effect_allele,
-            weight: intermediate_rule.weight,
-            score_column_index: intermediate_rule.score_column_index,
-        };
-        grouped_complex_map
-            .entry(intermediate_rule.possible_contexts)
-            .or_default()
-            .push(score_info);
-    }
-    let final_complex_rules: Vec<GroupedComplexRule> = grouped_complex_map
-        .into_iter()
-        .map(|(contexts, scores)| GroupedComplexRule {
-            possible_contexts: contexts,
-            score_applications: scores,
-        })
-        .collect();
+        match bim_key.cmp(&score_key) {
+            Ordering::Less => {
+                bim_iter.next();
+            }
+            Ordering::Greater => {
+                score_iter.next();
+            }
+            Ordering::Equal => {
+                let key = bim_key;
+                let mut bim_group = Vec::new();
+                while let Some(Ok(peek_item)) = bim_iter.peek() {
+                    if peek_item.key == key {
+                        bim_group.push(bim_iter.next().unwrap()?);
+                    } else {
+                        break;
+                    }
+                }
 
-    if flat_score_data.is_empty() && final_complex_rules.is_empty() {
-        return Err(PrepError::NoOverlappingVariants);
-    }
+                let mut score_group = Vec::new();
+                while let Some(Ok(peek_item)) = score_iter.peek() {
+                    if peek_item.key == key {
+                        score_group.push(score_iter.next().unwrap()?);
+                    } else {
+                        break;
+                    }
+                }
 
-    flat_score_data.par_sort_unstable_by_key(|(key, _value)| *key);
-
-    if let Some(windows) = flat_score_data.windows(2).find(|w| w[0].0 == w[1].0) {
-        let duplicate_key = windows[0].0;
-        return Err(PrepError::Parse(format!(
-            "Ambiguous input: The variant-score pair (BIM row {}, Score column {}) was defined more than once in the simple path.",
-            duplicate_key.0.0, duplicate_key.1.0
-        )));
+                for score_record in score_group {
+                    let outcome = resolve_matches_for_score_line(
+                        &score_record.effect_allele,
+                        &bim_group,
+                    )?;
+                    match outcome {
+                        ReconciliationOutcome::Simple(matches) => {
+                            for bim_rec in matches {
+                                let is_flipped = score_record.effect_allele != bim_rec.allele1;
+                                simple_mappings.push((
+                                    (bim_rec.bim_row_index, score_record.score_column_index),
+                                    (score_record.weight, is_flipped),
+                                ));
+                            }
+                        }
+                        ReconciliationOutcome::Complex(matches) => {
+                            let possible_contexts: Vec<_> = matches
+                                .iter()
+                                .map(|rec| {
+                                    (rec.bim_row_index, rec.allele1.clone(), rec.allele2.clone())
+                                })
+                                .collect();
+                            let score_info = ScoreInfo {
+                                effect_allele: score_record.effect_allele.clone(),
+                                weight: score_record.weight,
+                                score_column_index: score_record.score_column_index,
+                            };
+                            intermediate_complex_rules
+                                .entry(possible_contexts)
+                                .or_default()
+                                .push(score_info);
+                        }
+                        ReconciliationOutcome::NotFound => {}
+                    }
+                }
+            }
+        }
     }
     eprintln!(
-        "> TIMING: Pass 3 (Compilation & Segregation) took {:.2?}",
+        "> TIMING: Stage 3 (Streaming Merge) took {:.2?}",
         overall_start_time.elapsed()
     );
 
     // --- STAGE 4: FINAL INDEXING & DATA PREPARATION ---
-    eprintln!("> Pass 4: Building final variant index and regrouping work...");
+    eprintln!("> Stage 4: Building final variant index and populating matrices...");
 
+    // Sort mappings by BIM index to group them for the uniqueness check.
+    simple_mappings.par_sort_unstable_by_key(|((bim_row, _), _)| *bim_row);
+
+    // Now, find the unique, sorted BIM indices required for the calculation.
     let mut required_bim_indices = Vec::new();
-    if let Some(first) = flat_score_data.first() {
-        required_bim_indices.push(first.0 .0);
-        for item in flat_score_data.iter() {
-            if item.0 .0 != *required_bim_indices.last().unwrap() {
-                required_bim_indices.push(item.0 .0);
-            }
+    if let Some(((first_bim_row, _), _)) = simple_mappings.first() {
+        required_bim_indices.push(*first_bim_row);
+    }
+    for ((bim_row, _), _) in &simple_mappings {
+        if bim_row.0 != required_bim_indices.last().unwrap().0 {
+            required_bim_indices.push(*bim_row);
         }
     }
 
@@ -205,71 +290,50 @@ pub fn prepare_for_computation(
     let bim_row_to_reconciled_variant_map =
         build_bim_to_reconciled_variant_map(&required_bim_indices, total_variants_in_bim_usize);
 
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-
-    let mut fast_path_locus_score_pairs: AHashSet<(BimRowIndex, ScoreColumnIndex)> =
-        AHashSet::new();
-    for ((bim_row_idx, score_col_idx), _) in &flat_score_data {
-        fast_path_locus_score_pairs.insert((*bim_row_idx, *score_col_idx));
-    }
-    for &(_, score_col) in &fast_path_locus_score_pairs {
-        score_variant_counts[score_col.0] += 1;
-    }
-
-    for group_rule in &final_complex_rules {
-        let mut slow_path_pairs_for_rule: AHashSet<ScoreColumnIndex> = AHashSet::new();
-        for score_info in &group_rule.score_applications {
-            slow_path_pairs_for_rule.insert(score_info.score_column_index);
-        }
-        for score_col in slow_path_pairs_for_rule {
-            score_variant_counts[score_col.0] += 1;
-        }
-    }
-
-    let mut work_by_reconciled_idx: Vec<Vec<(ScoreColumnIndex, f32, bool)>> =
-        vec![Vec::new(); num_reconciled_variants];
-    for ((bim_row, score_col), (weight, is_flipped)) in flat_score_data {
-        let reconciled_idx =
-            bim_row_to_reconciled_variant_map[bim_row.0 as usize].unwrap().get() as usize;
-        work_by_reconciled_idx[reconciled_idx].push((score_col, weight, is_flipped));
-    }
-
-    // --- STAGE 5: COMBINED PARALLEL MATRIX & METADATA POPULATION ---
-    eprintln!("> Pass 5: Populating all compute structures in parallel...");
-
     let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
         vec![Vec::new(); num_reconciled_variants];
+    let mut score_variant_counts = vec![0u32; score_names.len()];
 
-    let writer_tuple = (
-        MatrixWriter { ptr: weights_matrix.as_mut_ptr() },
-        MatrixWriter { ptr: flip_mask_matrix.as_mut_ptr() },
-        MatrixWriter { ptr: variant_to_scores_map.as_mut_ptr() },
-    );
+    for ((bim_row, score_col), (weight, is_flipped)) in simple_mappings {
+        if let Some(Some(reconciled_idx_nonmax)) =
+            bim_row_to_reconciled_variant_map.get(bim_row.0 as usize)
+        {
+            let reconciled_idx = reconciled_idx_nonmax.get() as usize;
+            let final_offset = reconciled_idx * stride + score_col.0;
+            weights_matrix[final_offset] = weight;
+            flip_mask_matrix[final_offset] = if is_flipped { 1 } else { 0 };
+            variant_to_scores_map[reconciled_idx].push(score_col);
+        }
+    }
 
-    work_by_reconciled_idx
-        .par_iter_mut()
-        .enumerate()
-        .for_each_with(writer_tuple, |writers, (reconciled_idx, scores_for_variant)| {
-            let (weights_writer, flip_writer, vtsm_writer) = writers;
-            if scores_for_variant.is_empty() { return; }
-            let row_offset = reconciled_idx * stride;
-            scores_for_variant.sort_unstable_by_key(|(sc, _, _)| *sc);
-            let mut vtsm_entry = Vec::with_capacity(scores_for_variant.len());
-            for &(score_col, weight, is_flipped) in scores_for_variant.iter() {
-                let final_offset = row_offset + score_col.0;
-                unsafe {
-                    *weights_writer.ptr.add(final_offset) = weight;
-                    *flip_writer.ptr.add(final_offset) = if is_flipped { 1 } else { 0 };
-                }
-                vtsm_entry.push(score_col);
-            }
-            unsafe {
-                *vtsm_writer.ptr.add(reconciled_idx) = vtsm_entry;
-            }
-        });
+    // Process complex rules
+    let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
+        .into_iter()
+        .map(|(contexts, scores)| GroupedComplexRule {
+            possible_contexts: contexts,
+            score_applications: scores,
+        })
+        .collect();
+
+    if required_bim_indices.is_empty() && final_complex_rules.is_empty() {
+        return Err(PrepError::NoOverlappingVariants);
+    }
+
+    // Deduplicate and sort the score maps in parallel
+    variant_to_scores_map.par_iter_mut().for_each(|v| {
+        v.sort_unstable();
+        v.dedup();
+    });
+
+    // Count variants per score from the final populated structures
+    for (_reconciled_idx, scores) in variant_to_scores_map.iter().enumerate() {
+        for score_col in scores {
+            score_variant_counts[score_col.0] += 1;
+        }
+    }
 
     // --- FINAL CONSTRUCTION ---
     let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
@@ -281,12 +345,24 @@ pub fn prepare_for_computation(
         output_idx_to_fam_idx.push(original_fam_idx);
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
-    
-    // At the end, create the explicit pipeline kind.
+
     let pipeline_kind = if fileset_prefixes.len() <= 1 {
         PipelineKind::SingleFile(fileset_prefixes[0].with_extension("bed"))
     } else {
-        PipelineKind::MultiFile(fileset_boundaries)
+        let boundaries = fileset_prefixes
+            .iter()
+            .scan(0, |offset, prefix| {
+                let path = prefix.with_extension("bim");
+                let count = count_lines(&path).unwrap_or(0);
+                let boundary = FilesetBoundary {
+                    bed_path: prefix.with_extension("bed"),
+                    starting_global_index: *offset,
+                };
+                *offset += count;
+                Some(boundary)
+            })
+            .collect();
+        PipelineKind::MultiFile(boundaries)
     };
 
     Ok(PreparationResult::new(
@@ -315,42 +391,253 @@ pub fn prepare_for_computation(
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
 
-
-/// Indexes a single BIM file, adding its variants to a master index with a global offset.
-fn index_bim_file(
-    bim_path: &Path,
-    global_offset: u64,
-    master_index: &mut AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
-) -> Result<u64, PrepError> {
-    let file = File::open(bim_path).map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
+fn count_lines(path: &Path) -> io::Result<u64> {
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut line_count: u64 = 0;
-    for (i, line_result) in reader.lines().enumerate() {
-        line_count = (i + 1) as u64;
-        let line = line_result.map_err(|e| PrepError::Io(e, bim_path.to_path_buf()))?;
-        let mut parts = line.split_whitespace();
-        let chr = parts.next();
-        let _id = parts.next();
-        let _cm = parts.next();
-        let pos = parts.next();
-        let a1 = parts.next();
-        let a2 = parts.next();
+    Ok(reader.lines().count() as u64)
+}
 
-        if let (Some(chr), Some(pos), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
-            let key = format!("{}:{}", chr, pos);
-            let record = BimRecord {
-                allele1: a1.to_string(),
-                allele2: a2.to_string(),
-            };
-            // This is the core of the virtual merge: each variant gets a unique global index.
-            let global_index = i as u64 + global_offset;
-            master_index
-                .entry(key)
-                .or_default()
-                .push((record, BimRowIndex(global_index)));
+fn count_total_variants(fileset_prefixes: &[PathBuf]) -> Result<u64, PrepError> {
+    fileset_prefixes
+        .par_iter()
+        .map(|prefix| {
+            let bim_path = prefix.with_extension("bim");
+            count_lines(&bim_path).map_err(|e| PrepError::Io(e, bim_path.clone()))
+        })
+        .try_reduce(|| 0, |a, b| Ok(a + b))
+}
+
+fn parse_key(variant_id: &str) -> Result<(u8, u32), PrepError> {
+    let mut parts = variant_id.splitn(2, ':');
+    let chr_str = parts.next().unwrap_or("");
+    let pos_str = parts.next().unwrap_or("0");
+
+    let chr_num = match chr_str {
+        "X" | "x" => 23,
+        "Y" | "y" => 24,
+        "MT" | "mt" => 25,
+        _ => chr_str.parse().map_err(|e| PrepError::Parse(format!("Invalid chromosome '{}': {}", chr_str, e)))?,
+    };
+    let pos_num: u32 = pos_str.parse().map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+    Ok((chr_num, pos_num))
+}
+
+impl<'a> BimIterator<'a> {
+    fn new(fileset_prefixes: &'a [PathBuf]) -> Result<Self, PrepError> {
+        let mut iter = Self {
+            fileset_prefixes: fileset_prefixes.iter(),
+            current_reader: None,
+            global_offset: 0,
+            local_line_num: 0,
+            current_path: PathBuf::new(),
+        };
+        iter.next_file()?;
+        Ok(iter)
+    }
+
+    fn next_file(&mut self) -> Result<bool, PrepError> {
+        if let Some(prefix) = self.fileset_prefixes.next() {
+            self.global_offset += self.local_line_num;
+            self.local_line_num = 0;
+            let bim_path = prefix.with_extension("bim");
+            self.current_path = bim_path.clone();
+            let file = File::open(&bim_path).map_err(|e| PrepError::Io(e, bim_path))?;
+            self.current_reader = Some(BufReader::new(file).lines());
+            Ok(true)
+        } else {
+            self.current_reader = None;
+            Ok(false)
         }
     }
-    Ok(line_count)
+}
+
+impl<'a> Iterator for BimIterator<'a> {
+    type Item = Result<KeyedBimRecord, PrepError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.current_reader.as_mut() {
+                Some(reader) => {
+                    match reader.next() {
+                        Some(Ok(line)) => {
+                            self.local_line_num += 1;
+                            let mut parts = line.split_whitespace();
+                            let chr = parts.next();
+                            let _id = parts.next();
+                            let _cm = parts.next();
+                            let pos = parts.next();
+                            let a1 = parts.next();
+                            let a2 = parts.next();
+
+                            if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
+                                match parse_key(&format!("{}:{}", chr_str, pos_str)) {
+                                    Ok(key) => {
+                                        return Some(Ok(KeyedBimRecord {
+                                            key,
+                                            bim_row_index: BimRowIndex(self.global_offset + self.local_line_num - 1),
+                                            allele1: a1.to_string(),
+                                            allele2: a2.to_string(),
+                                        }));
+                                    }
+                                    Err(e) => return Some(Err(e)),
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Some(Err(PrepError::Io(e, self.current_path.clone()))),
+                        None => {
+                            if let Ok(false) = self.next_file() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+}
+
+impl<'a> KWayMergeIterator<'a> {
+    fn new(
+        file_paths: &'a [PathBuf],
+        file_column_maps: &'a [Vec<ScoreColumnIndex>],
+    ) -> Result<Self, PrepError> {
+        let mut streams = Vec::with_capacity(file_paths.len());
+        for path in file_paths {
+            let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
+            streams.push(FileStream {
+                reader: BufReader::new(file).lines(),
+                line_buffer: std::collections::VecDeque::new(),
+                current_line_info: None,
+            });
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (i, stream) in streams.iter_mut().enumerate() {
+            // Prime the iterator by loading the first item from each file.
+            if let Err(e) = Self::advance_stream(stream, i, &mut heap, file_column_maps[i].as_slice()) {
+                return Err(e);
+            }
+        }
+
+        Ok(Self { streams, heap, file_column_maps })
+    }
+
+    /// Parses the header of each score file to map local column order to the global order.
+    fn parse_file_headers(
+        score_files: &[PathBuf],
+        score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
+    ) -> Result<Vec<Vec<ScoreColumnIndex>>, PrepError> {
+        score_files
+            .iter()
+            .map(|path| {
+                let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
+                let mut reader = BufReader::new(file);
+                let mut header_line = String::new();
+                // Skip metadata lines, which start with ##
+                loop {
+                    header_line.clear();
+                    if reader.read_line(&mut header_line).map_err(|e| PrepError::Io(e, path.clone()))? == 0 {
+                        break; // End of file
+                    }
+                    if !header_line.starts_with("##") {
+                        break; // Found the header
+                    }
+                }
+
+                header_line
+                    .trim()
+                    .split('\t')
+                    .skip(3) // Skip variant_id, effect_allele, other_allele
+                    .map(|name| {
+                        score_name_to_col_index.get(name).copied().ok_or_else(|| {
+                            PrepError::Header(format!(
+                                "Score '{}' from file '{}' not found in global score list.",
+                                name,
+                                path.display()
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Advances a single file stream. If the line buffer is empty, it reads the
+    /// next line from the file, parses it, and populates the buffer. Then, it
+    /// takes the next available item from the buffer and pushes it onto the heap.
+    fn advance_stream(
+        stream: &mut FileStream,
+        file_idx: usize,
+        heap: &mut BinaryHeap<HeapItem>,
+        column_map: &[ScoreColumnIndex],
+    ) -> Result<(), PrepError> {
+        // If the buffer is empty, read a new line from the underlying file.
+        if stream.line_buffer.is_empty() {
+            stream.current_line_info = None; // Clear previous line info
+            if let Some(Ok(line)) = stream.reader.next() {
+                let mut parts = line.splitn(4, ' ');
+                let variant_id = parts.next().unwrap_or("");
+                let effect_allele = parts.next().unwrap_or("");
+                let _other_allele = parts.next(); // Consumed but not used here
+                let weights_str = parts.next().unwrap_or("");
+
+                if variant_id.is_empty() || effect_allele.is_empty() {
+                    return Ok(()); // Skip malformed or empty lines
+                }
+
+                let key = parse_key(variant_id)?;
+                stream.current_line_info = Some((key, effect_allele.to_string()));
+
+                // Populate the buffer with all scores from this line.
+                for (i, weight_str) in weights_str.split(' ').enumerate() {
+                    if let Ok(weight) = weight_str.parse::<f32>() {
+                        if let Some(&score_column_index) = column_map.get(i) {
+                            stream.line_buffer.push_back((weight, score_column_index));
+                        }
+                    }
+                }
+            }
+        }
+
+        // If, after attempting to read a new line, the buffer has an item,
+        // create a HeapItem and push it.
+        if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
+            if let Some((key, effect_allele)) = &stream.current_line_info {
+                let record = KeyedScoreRecord {
+                    key: *key,
+                    effect_allele: effect_allele.clone(),
+                    score_column_index,
+                    weight,
+                };
+                heap.push(HeapItem { key: *key, record, file_idx });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for KWayMergeIterator<'a> {
+    type Item = Result<KeyedScoreRecord, PrepError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Pop the smallest item from the heap.
+        let heap_item = self.heap.pop()?;
+        let file_idx = heap_item.file_idx;
+
+        // The stream that this item came from needs to be advanced.
+        let stream = &mut self.streams[file_idx];
+        let column_map = self.file_column_maps[file_idx].as_slice();
+
+        // Advance the stream, which will push its next item to the heap.
+        if let Err(e) = Self::advance_stream(stream, file_idx, &mut self.heap, column_map) {
+            return Some(Err(e));
+        }
+
+        // Return the record from the item we popped.
+        Some(Ok(heap_item.record))
+    }
 }
 
 
@@ -360,8 +647,6 @@ fn build_bim_to_reconciled_variant_map(
 ) -> Vec<Option<NonMaxU32>> {
     let mut bim_row_to_reconciled_variant_map = vec![None; total_variants_in_bim];
     for (reconciled_variant_idx, &bim_row) in required_bim_indices.iter().enumerate() {
-        // The `as usize` cast is safe because we have already validated that
-        // `total_variants_in_bim` (a u64) fits within a usize.
         if (bim_row.0 as usize) < total_variants_in_bim {
             let non_max_index = NonMaxU32::new(reconciled_variant_idx as u32).unwrap();
             bim_row_to_reconciled_variant_map[bim_row.0 as usize] = Some(non_max_index);
@@ -458,69 +743,43 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
 
 /// Parses only the headers of multiple score files to quickly build a complete,
 /// sorted, and unique list of all score columns across all files.
-///
-/// # Arguments
-///
-/// * `score_files`: A slice of paths to the gnomon-native score files.
-///
-/// # Returns
-///
-/// A `Result` containing a `Vec<String>` of all unique score names found,
-/// sorted alphabetically. If any file cannot be read or has an invalid
-/// header, a `PrepError` is returned.
 pub fn parse_score_file_headers_only(
     score_files: &[PathBuf],
 ) -> Result<Vec<String>, PrepError> {
-    // Use a parallel iterator over the input files.
-    // `try_flat_map` will process each file and flatten the resulting lists of
-    // score names into a single parallel iterator.
-    // `collect` into a Result<BTreeSet, ...> handles both error propagation
-    // and the merging of results into a single, unique, sorted collection.
     let all_score_names: BTreeSet<String> = score_files
         .par_iter()
         .map(|path| -> Result<Vec<String>, PrepError> {
-            // This closure is executed in parallel for each score file.
             let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
             let mut reader = BufReader::new(file);
             let mut header_line = String::new();
 
-            // Scan past any metadata/comment lines at the beginning of the file.
             loop {
                 header_line.clear();
-                // Check for I/O errors or an empty file.
                 if reader
                     .read_line(&mut header_line)
                     .map_err(|e| PrepError::Io(e, path.to_path_buf()))?
                     == 0
                 {
-                    // If we reach EOF without finding a non-comment line, the file
-                    // is considered invalid as it lacks a header.
                     return Err(PrepError::Header(format!(
                         "Score file '{}' is empty or contains only metadata lines.",
                         path.display()
                     )));
                 }
-
-                // If the line is not a comment, we've found the header.
                 if !header_line.starts_with('#') {
                     break;
                 }
             }
 
-            // --- Validate the header structure ---
             let header_parts: Vec<&str> = header_line.trim().split('\t').collect();
             let expected_prefix = &["variant_id", "effect_allele", "other_allele"];
 
             if header_parts.len() < 3 || &header_parts[0..3] != expected_prefix {
                 return Err(PrepError::Header(format!(
-                    "Invalid header in '{}': Must start with 'variant_id\\teffect_allele\\tother_allele'.",
+                    "Invalid header in '{}': Must start with 'variant_id\teffect_allele\tother_allele'.",
                     path.display()
                 )));
             }
 
-            // --- Extract score names and return them ---
-            // The score names are all columns after the first three.
-            // Convert from &str to String for the final collection.
             let score_names = header_parts[3..]
                 .iter()
                 .map(|s| s.to_string())
@@ -533,178 +792,26 @@ pub fn parse_score_file_headers_only(
         .flatten()
         .collect();
 
-    // Convert the final, sorted BTreeSet into a Vec.
     Ok(all_score_names.into_iter().collect())
 }
 
-// This type alias makes the function signature much cleaner.
-type SimpleMapping = ((BimRowIndex, ScoreColumnIndex), (f32, bool));
-
-/// An intermediate, flat representation of a complex rule before it is grouped.
-/// It contains the context information duplicated for each score.
-struct IntermediateComplexRule {
-    effect_allele: String,
-    weight: f32,
-    score_column_index: ScoreColumnIndex,
-    possible_contexts: Vec<(BimRowIndex, String, String)>,
-}
-
-/// Parses a single score file, reconciles its variants against the BIM index, and
-/// segregates the results into two distinct collections: one for the simple "fast
-/// path" and one for the complex "slow path".
-fn compile_score_file_to_map(
-    score_path: &Path,
-    bim_index: &AHashMap<String, Vec<(BimRecord, BimRowIndex)>>,
-    score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
-) -> Result<(Vec<SimpleMapping>, Vec<IntermediateComplexRule>), PrepError> {
-    // --- Phase 1: Memory Map and Header Parsing ---
-    let file = File::open(score_path).map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
-    mmap.advise(memmap2::Advice::Sequential)
-        .map_err(|e| PrepError::Io(e, score_path.to_path_buf()))?;
-
-    let mut data_start_offset = 0;
-    let header_line = {
-        let mut first_line: Option<&[u8]> = None;
-        for line in mmap.split(|&b| b == b'\n') {
-            data_start_offset += line.len() + 1;
-            if !line.is_empty() && !line.starts_with(b"#") {
-                first_line = Some(line);
-                break;
-            }
-        }
-        first_line.ok_or_else(|| PrepError::Header(format!("File is empty: '{}'", score_path.display())))?
-    };
-
-    let header_str = std::str::from_utf8(header_line)
-        .map_err(|_| PrepError::Header("Header contains invalid UTF-8".to_string()))?;
-
-    let file_specific_column_map: Vec<ScoreColumnIndex> = header_str
-        .trim()
-        .split('\t')
-        .skip(3)
-        .map(|name| {
-            score_name_to_col_index.get(name)
-                .copied()
-                .ok_or_else(|| PrepError::Header(format!("Score '{}' from file '{}' not found in global score list.", name, score_path.display())))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // --- Phase 2: Segregation Loop ---
-    let data_slice = &mmap[data_start_offset..];
-    let mut simple_mappings = Vec::new();
-    let mut complex_rules = Vec::new();
-
-    for line_bytes in data_slice.split(|&b| b == b'\n') {
-        if line_bytes.is_empty() { continue; }
-
-        let mut fields = line_bytes.splitn(4, |&b| b == b'\t');
-        // Extract 4 consecutive fields from the iterator (likely a CSV/TSV row)
-        // We need: variant_id, effect_allele, other_allele (unused), weights
-        let (variant_id_bytes, effect_allele_bytes, _, weights_bytes) =
-            match (fields.next(), fields.next(), fields.next(), fields.next()) {
-                // If all 4 fields are present, bind the ones we need and ignore the 3rd
-                (Some(variant_id), Some(effect_allele), Some(_), Some(weights)) => {
-                    (variant_id, effect_allele, (), weights)
-                },
-                // If any field is missing, skip this malformed line entirely
-                _ => continue,
-            };
-
-        let variant_id = std::str::from_utf8(variant_id_bytes)?;
-        if let Some(bim_records) = bim_index.get(variant_id) {
-            let effect_allele = std::str::from_utf8(effect_allele_bytes)?;
-
-            // The `other_allele` from the score file is not used in the triage,
-            // as the decision is based on finding the `effect_allele` in the
-            // genotype data's contexts.
-
-            // Triage the variant to determine if it's simple or complex.
-            let match_result =
-                resolve_matches_for_score_line(effect_allele, bim_records)?;
-
-            match match_result {
-                ReconciliationOutcome::NotFound => continue,
-
-                // --- FAST PATH ---
-                ReconciliationOutcome::Simple(matches) => {
-                    for (bim_record, bim_row_index) in matches {
-                        let is_flipped = effect_allele != &bim_record.allele2;
-                        for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
-                            if !weight_bytes.is_empty() {
-                                if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
-                                    if let Some(&score_col_idx) = file_specific_column_map.get(i) {
-                                        simple_mappings.push(((*bim_row_index, score_col_idx), (weight, is_flipped)));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // --- SLOW PATH ---
-                ReconciliationOutcome::Complex(matches) => {
-                    // OPTIMIZATION: Construct the context list ONCE per variant line, not once per score.
-                    // This requires cloning the allele strings, which is necessary to own them.
-                    let possible_contexts: Vec<_> = matches.iter().map(|(rec, idx)| {
-                        (*idx, rec.allele1.clone(), rec.allele2.clone())
-                    }).collect();
-
-                    for (i, weight_bytes) in weights_bytes.split(|&b| b == b'\t').enumerate() {
-                        if !weight_bytes.is_empty() {
-                            if let Ok(weight) = lexical_core::parse::<f32>(weight_bytes) {
-                                if let Some(&score_col_idx) = file_specific_column_map.get(i) {
-                                    complex_rules.push(IntermediateComplexRule {
-                                        effect_allele: effect_allele.to_string(),
-                                        weight,
-                                        score_column_index: score_col_idx,
-                                        // This is now a cheap Vec clone, not a deep rebuild.
-                                        possible_contexts: possible_contexts.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Return both segregated lists.
-    Ok((simple_mappings, complex_rules))
-}
-
 /// The single, authoritative resolver for matching a score line to BIM records.
-/// This function acts as a TRIAGE system, classifying each match as either
-/// simple (for the fast path) or complex (for the deferred slow path).
 fn resolve_matches_for_score_line<'a>(
     effect_allele: &str,
-    bim_records_for_position: &'a [(BimRecord, BimRowIndex)],
+    bim_records_for_position: &'a [KeyedBimRecord],
 ) -> Result<ReconciliationOutcome<'a>, PrepError> {
-    // A site is multiallelic if the genotype file defines more than one
-    // variant record for the same chromosomal position.
     let is_multiallelic_site = bim_records_for_position.len() > 1;
 
-    // --- TRIAGE ---
-    // If a site is multiallelic, it is ALWAYS complex. To ensure correct locus
-    // counting, we must pass ALL available contexts for that position to the
-    // slow path, regardless of the effect allele for this specific rule. This
-    // guarantees that all rules for one locus are grouped under a single key.
     if is_multiallelic_site {
         let all_contexts_for_locus = bim_records_for_position.iter().collect();
         return Ok(ReconciliationOutcome::Complex(all_contexts_for_locus));
     }
 
-    // --- BIALLELIC (SIMPLE) PATH ---
-    // The site is not multiallelic, so we can safely process it on the fast path.
-    // We search for a single, unambiguous interpretation based on the effect allele.
-    // A BTreeMap provides automatic de-duplication (by BIM row index) and a
-    // deterministic ordering of any potential matches.
-    let mut simple_matches: BTreeMap<BimRowIndex, &'a (BimRecord, BimRowIndex)> =
+    let mut simple_matches: BTreeMap<BimRowIndex, &'a KeyedBimRecord> =
         BTreeMap::new();
     for record_tuple in bim_records_for_position {
-        let (bim_record, bim_row_index) = record_tuple;
-        if &bim_record.allele1 == effect_allele || &bim_record.allele2 == effect_allele {
-            simple_matches.insert(*bim_row_index, record_tuple);
+        if &record_tuple.allele1 == effect_allele || &record_tuple.allele2 == effect_allele {
+            simple_matches.insert(record_tuple.bim_row_index, record_tuple);
         }
     }
 

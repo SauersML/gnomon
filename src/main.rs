@@ -159,8 +159,9 @@ fn run_preparation_phase(
                     "> Info: Score file '{}' is not in native format. Attempting conversion...",
                     score_file_path.display()
                 );
-                match reformat::reformat_pgs_file(score_file_path) {
-                    Ok(new_path) => {
+                let new_path = score_file_path.with_extension("gnomon.tsv");
+                match reformat::reformat_pgs_file(score_file_path, &new_path) {
+                    Ok(_) => {
                         eprintln!("> Success: Converted to '{}'.", new_path.display());
                         native_score_files.push(new_path);
                     }
