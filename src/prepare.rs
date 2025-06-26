@@ -147,13 +147,49 @@ unsafe impl<T: Send> Sync for MatrixWriter<T> {}
 //                                  PUBLIC API
 // ========================================================================================
 
+/// A struct to hold all necessary information to debug a merge-join failure where
+/// no overlapping variants are found. It provides a snapshot of the state of both
+/// data streams at the point of failure.
+#[derive(Debug, Default)]
+struct MergeDiagnosticInfo {
+    total_bim_variants_processed: u64,
+    total_score_records_processed: u64,
+    // Store the last few keys we saw from each stream to spot formatting differences.
+    last_bim_keys_seen: std::collections::VecDeque<String>,
+    last_score_keys_seen: std::collections::VecDeque<String>,
+}
+
+/// The number of recent keys to store for diagnostic reporting.
+const DIAGNOSTIC_BUFFER_SIZE: usize = 10;
+
+impl MergeDiagnosticInfo {
+    /// Helper to add a key to our circular buffer, which stores the most recently
+    /// processed keys for diagnostic reporting.
+    fn add_bim_key(&mut self, key: (u8, u32)) {
+        if self.last_bim_keys_seen.len() == DIAGNOSTIC_BUFFER_SIZE {
+            self.last_bim_keys_seen.pop_front();
+        }
+        self.last_bim_keys_seen.push_back(format!("{}:{}", key.0, key.1));
+    }
+
+    /// Helper to add a key to our circular buffer for score file keys.
+    fn add_score_key(&mut self, key: (u8, u32)) {
+        if self.last_score_keys_seen.len() == DIAGNOSTIC_BUFFER_SIZE {
+            self.last_score_keys_seen.pop_front();
+        }
+        self.last_score_keys_seen.push_back(format!("{}:{}", key.0, key.1));
+    }
+}
+
 #[derive(Debug)]
-pub enum PrepError {
+pub enum PrepError {pub enum PrepError {
     Io(io::Error, PathBuf),
     Parse(String),
     Header(String),
     InconsistentKeepId(String),
-    NoOverlappingVariants,
+    /// An error indicating that no variants from the score files could be matched
+    /// to variants in the genotype data.
+    NoOverlappingVariants(MergeDiagnosticInfo),
     AmbiguousReconciliation(String),
 }
 
@@ -194,6 +230,10 @@ pub fn prepare_for_computation(
     eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
+    // This diagnostic struct will be populated during the merge-join to provide
+    // rich error reporting if no overlaps are found.
+    let mut diagnostics = MergeDiagnosticInfo::default();
+
     let mut bim_iterator = BimIterator::new(fileset_prefixes)?;
     let mut bim_iter = bim_iterator.by_ref().peekable();
     let mut score_iterator =
@@ -217,10 +257,14 @@ pub fn prepare_for_computation(
 
         match bim_key.cmp(&score_key) {
             Ordering::Less => {
-                bim_iter.next();
+                diagnostics.total_bim_variants_processed += 1;
+                diagnostics.add_bim_key(bim_key);
+                bim_iter.next(); // Discard BIM variant, as it has no match in the score files.
             }
             Ordering::Greater => {
-                score_iter.next();
+                diagnostics.total_score_records_processed += 1;
+                diagnostics.add_score_key(score_key);
+                score_iter.next(); // Discard score variant, as it has no match in the BIM files.
             }
             Ordering::Equal => {
                 let key = bim_key;
@@ -229,6 +273,8 @@ pub fn prepare_for_computation(
                 let mut bim_group = Vec::new();
                 while let Some(Ok(peek_item)) = bim_iter.peek() {
                     if peek_item.key == key {
+                        diagnostics.total_bim_variants_processed += 1;
+                        diagnostics.add_bim_key(key);
                         bim_group.push(bim_iter.next().unwrap()?);
                     } else {
                         break;
@@ -240,6 +286,8 @@ pub fn prepare_for_computation(
                 let mut score_group = Vec::new();
                 while let Some(Ok(peek_item)) = score_iter.peek() {
                     if peek_item.key == key {
+                        diagnostics.total_score_records_processed += 1;
+                        diagnostics.add_score_key(key);
                         score_group.push(score_iter.next().unwrap()?);
                     } else {
                         break;
@@ -337,7 +385,9 @@ pub fn prepare_for_computation(
     }
 
     if all_required_indices.is_empty() {
-        return Err(PrepError::NoOverlappingVariants);
+        // We have streamed through all files and found no variants that match
+        // between the genotype data and the score files.
+        return Err(PrepError::NoOverlappingVariants(diagnostics));
     }
 
     let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
@@ -996,10 +1046,28 @@ impl Display for PrepError {
             PrepError::Parse(s) => write!(f, "Parse Error: {}", s),
             PrepError::Header(s) => write!(f, "Invalid Header: {}", s),
             PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {}", s),
-            PrepError::NoOverlappingVariants => write!(
-                f,
-                "No overlapping variants found between score file(s) and genotype data."
-            ),
+            PrepError::NoOverlappingVariants(diag) => {
+                writeln!(f, "No overlapping variants found between genotype data and score files.")?;
+                writeln!(f, "This likely means no variant keys (chr:pos) were identical in both sets of files.")?;
+                writeln!(f, "\n--- DIAGNOSTIC INFORMATION ---")?;
+                writeln!(f, "Total variants processed from BIM files: {}", diag.total_bim_variants_processed)?;
+                writeln!(f, "Total score records processed from Score files: {}", diag.total_score_records_processed)?;
+
+                if !diag.last_bim_keys_seen.is_empty() {
+                    writeln!(f, "\nLast {} keys seen from BIM files:", diag.last_bim_keys_seen.len())?;
+                    for key in &diag.last_bim_keys_seen {
+                        writeln!(f, "  - {}", key)?;
+                    }
+                }
+
+                if !diag.last_score_keys_seen.is_empty() {
+                    writeln!(f, "\nLast {} keys seen from Score files (does the format match the BIM files?):", diag.last_score_keys_seen.len())?;
+                    for key in &diag.last_score_keys_seen {
+                        writeln!(f, "  - {}", key)?;
+                    }
+                }
+                writeln!(f, "\nTIP: Please check for inconsistencies between your files.")
+            }
             PrepError::AmbiguousReconciliation(s) => write!(f, "{}", s),
         }
     }
