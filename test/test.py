@@ -146,15 +146,37 @@ def create_synchronized_genotype_files(original_prefix: Path, final_prefix: Path
     print(f"[SCRIPT] Successfully created synchronized fileset at: {final_prefix}", flush=True)
 
 def create_unified_scorefile(score_file: Path) -> pd.DataFrame:
-    """Creates a unified scorefile dataframe where the variant ID is 'chr:pos'."""
+    """Creates a unified, sorted scorefile dataframe where the variant ID is 'chr:pos'."""
     pgs_id = score_file.name.split('_')[0]
     print_header(f"CREATING UNIFIED SCORE FILE FOR {pgs_id}", char='.')
     df = pd.read_csv(score_file, sep='\t', comment='#', usecols=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele', 'effect_weight'], dtype=str, low_memory=False)
     df.dropna(inplace=True)
     df['effect_weight'] = pd.to_numeric(df['effect_weight'], errors='coerce')
     df.dropna(inplace=True)
+
+    # Create numeric columns for sorting that correctly handle chromosome names.
+    # This logic is designed to match the sorting behavior of gnomon's Rust backend,
+    # which is a precondition for its streaming merge-join algorithm.
+    df['sort_chr'] = df['hm_chr'].str.upper().replace({'X': '23', 'Y': '24', 'MT': '25'})
+    # Strip any 'CHR' prefix before attempting numeric conversion.
+    df['sort_chr'] = pd.to_numeric(df['sort_chr'].str.replace('CHR', ''), errors='coerce')
+    df['sort_pos'] = pd.to_numeric(df['hm_pos'], errors='coerce')
+
+    # Drop rows where sorting keys could not be created (e.g., from unparsable chromosome names).
+    df.dropna(subset=['sort_chr', 'sort_pos'], inplace=True)
+
+    # Cast the sorting keys to integer types for a clean, unambiguous sort.
+    df['sort_chr'] = df['sort_chr'].astype(int)
+    df['sort_pos'] = df['sort_pos'].astype(int)
+    
+    # Sort the dataframe by chromosome and then by position.
+    df.sort_values(by=['sort_chr', 'sort_pos'], inplace=True)
+
     df['chr_pos_id'] = df['hm_chr'] + ':' + df['hm_pos']
+    # After sorting, we can safely drop duplicates.
     df.drop_duplicates(subset=['chr_pos_id'], keep='first', inplace=True)
+    
+    # Select and rename the final columns for the output file.
     final_df = df[['chr_pos_id', 'effect_allele', 'other_allele', 'effect_weight']].copy()
     final_df.columns = ['variant_id', 'effect_allele', 'other_allele', 'effect_weight']
     
