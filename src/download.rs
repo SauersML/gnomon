@@ -12,7 +12,7 @@ use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::File;
+use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::ParseIntError;
 use std::path::Path;
