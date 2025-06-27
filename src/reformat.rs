@@ -88,21 +88,38 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let mut saw_signature = false;
     let mut score_name: Option<String> = None;
 
-    while reader.read_line(&mut line)? > 0 {
-        if line.starts_with("###PGS CATALOG SCORING FILE") {
-            saw_signature = true;
-        }
-        if let Some(id) = line.strip_prefix("#pgs_id=") {
-            score_name = Some(id.trim().to_string());
-        }
-        if !line.starts_with("##") {
-            break;
-        }
-        line.clear();
-    }
-    if !saw_signature {
-        return Err(ReformatError::NotPgsFormat);
-    }
+    // A buffer to hold the contents of the line being processed, stripped of metadata characters.
+	let mut line_content = String::with_capacity(line.capacity());
+
+	// Loop through all metadata lines (those starting with '#').
+	while reader.read_line(&mut line)? > 0 {
+		// The first non-metadata line is the header.
+		if !line.starts_with('#') {
+			break;
+		}
+
+		// Trim leading '#' and whitespace to inspect the metadata content.
+		line_content.clear();
+		line_content.push_str(line.trim_start_matches('#').trim());
+
+		// Check for the mandatory PGS Catalog signature, allowing for variable '#' prefixes.
+		if line_content.starts_with("PGS CATALOG SCORING FILE") {
+			saw_signature = true;
+		}
+
+		// Extract the PGS ID to use as the score name.
+		if let Some(id) = line_content.strip_prefix("pgs_id=") {
+			score_name = Some(id.trim().to_string());
+		}
+
+		// Clear the main buffer for the next line read.
+		line.clear();
+	}
+
+	// After processing all metadata, verify that the signature was found.
+	if !saw_signature {
+		return Err(ReformatError::NotPgsFormat);
+	}
     let header_line = line.trim_end();
 
     let cols: Vec<&str> = header_line.split('\t').collect();
