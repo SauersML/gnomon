@@ -242,8 +242,8 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 			let line_data = format!("{}:{}\t{}\t{}\t{}", chr_str, pos_str, ea_str, oa_str, weight_str);
 			Ok(Some(SortableLine { key, line_data }))
 		})
-		.filter_map(|result| result.transpose()) // Transpose Result<Option<T>> to Option<Result<T>> and filter Nones.
-		.collect::<Result<Vec<_>, _>>()?;
+		.filter_map(|result: Result<Option<SortableLine>, ReformatError>| result.transpose())
+		.collect::<Result<Vec<_>, ReformatError>>()?;
 
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
