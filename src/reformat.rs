@@ -228,23 +228,21 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
 			let fields: Vec<&str> = line.split('\t').collect();
 
-			// For each line, try to get harmonized coordinates first. If they are absent or empty,
-			// fall back to the original coordinates. This is more robust to partially complete data.
-			let (chr_str, pos_str) = hm_chr_idx
-				// Attempt to get the harmonized chromosome and position fields.
-				.and_then(|c_idx| fields.get(c_idx).zip(hm_pos_idx.and_then(|p_idx| fields.get(p_idx))))
-				// The retrieved fields are not empty strings. The `&(*c, *p)` pattern correctly
-				// handles the reference passed by `filter`.
-				.filter(|&(*c, *p)| !c.is_empty() && !p.is_empty())
-				// If the harmonized fields failed (were not present or were empty),
-				// try the same logic with the original chromosome and position columns.
-				.or_else(|| {
-					orig_chr_idx
-						.and_then(|c_idx| fields.get(c_idx).zip(orig_pos_idx.and_then(|p_idx| fields.get(p_idx))))
-						.filter(|&(*c, *p)| !c.is_empty() && !p.is_empty())
-				})
-				// If both attempts failed, this line is truly missing coordinate data.
-				.map(|(c, p)| (*c, *p)) // Dereference the `&&str` to `&str`.
+			let get_coords = |c_idx: Option<usize>, p_idx: Option<usize>| {
+				c_idx.and_then(|c| fields.get(c))
+					.zip(p_idx.and_then(|p| fields.get(p)))
+					// The closure here takes `(&&str, &&str)`. The compiler's automatic
+					// dereferencing handles this correctly for the `is_empty()` check.
+					.filter(|(c_str, p_str)| !c_str.is_empty() && !p_str.is_empty())
+			};
+
+			// Execute the fallback logic: try harmonized columns first, then original columns.
+			let (chr_str, pos_str) = get_coords(hm_chr_idx, hm_pos_idx)
+				.or_else(|| get_coords(orig_chr_idx, orig_pos_idx))
+				// The resulting Option contains a tuple of double references `(&&str, &&str)`.
+				// We map this to a tuple of single references `(&str, &str)` for use.
+				.map(|(c, p)| (*c, *p))
+				// If both attempts returned None, this line is truly missing coordinate data.
 				.ok_or_else(|| ReformatError::MissingColumns {
 					path: input_path.to_path_buf(),
 					line_number,
