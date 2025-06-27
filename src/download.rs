@@ -219,11 +219,10 @@ fn download_missing_files(
 
         // Use a progress bar style that does not require the total file size.
         let style = ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bytes}] {msg}",
+            "{spinner:.green} [{elapsed_precise}] {msg}",
         )
         .unwrap()
-        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-        .on_finish(indicatif::ProgressFinish::AndClear);
+        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
         let configured_downloader = downloader
             .with_style(style)
             .with_max_concurrent_downloads(12)
