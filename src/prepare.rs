@@ -234,6 +234,10 @@ pub fn prepare_for_computation(
     // rich error reporting if no overlaps are found.
     let mut diagnostics = MergeDiagnosticInfo::default();
 
+    // Track unique unparsable chromosome names to avoid spamming warnings to the console.
+    let mut seen_invalid_bim_chrs: AHashSet<String> = AHashSet::new();
+    let mut seen_invalid_score_chrs: AHashSet<String> = AHashSet::new();
+
     let mut bim_iterator = BimIterator::new(fileset_prefixes)?;
     let mut bim_iter = bim_iterator.by_ref().peekable();
     let mut score_iterator =
@@ -268,29 +272,64 @@ pub fn prepare_for_computation(
             }
             Ordering::Equal => {
                 let key = bim_key;
-                // A variant can be defined multiple times at the same position (multiallelic).
-                // Collect all BIM records for this specific locus.
+
+                // Collect all BIM records for this specific locus, handling parse errors.
                 let mut bim_group = Vec::new();
-                while let Some(Ok(peek_item)) = bim_iter.peek() {
-                    if peek_item.key == key {
-                        diagnostics.total_bim_variants_processed += 1;
-                        diagnostics.add_bim_key(key);
-                        bim_group.push(bim_iter.next().unwrap()?);
-                    } else {
-                        break;
+                'bim_group_loop: while bim_iter.peek().is_some() {
+                    // Check if the next item is part of the current group.
+                    if let Some(Ok(peek_item)) = bim_iter.peek() {
+                        if peek_item.key != key {
+                            break 'bim_group_loop;
+                        }
+                    }
+
+                    // Consume the item. The unwrap is safe because we peeked.
+                    match bim_iter.next().unwrap() {
+                        Ok(item) => {
+                            diagnostics.total_bim_variants_processed += 1;
+                            diagnostics.add_bim_key(item.key);
+                            bim_group.push(item);
+                        }
+                        Err(PrepError::Parse(msg)) => {
+                            // A parsing error occurred. Warn once per unique chromosome name.
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
+                                if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
+                                    eprintln!("Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.", chr_name);
+                                }
+                            }
+                        }
+                        // Propagate other, fatal errors (like I/O).
+                        Err(e) => return Err(e),
                     }
                 }
 
-                // A variant can appear in multiple score files.
-                // Collect all score records for this specific locus.
+                // Collect all score records for this specific locus, handling parse errors.
                 let mut score_group = Vec::new();
-                while let Some(Ok(peek_item)) = score_iter.peek() {
-                    if peek_item.key == key {
-                        diagnostics.total_score_records_processed += 1;
-                        diagnostics.add_score_key(key);
-                        score_group.push(score_iter.next().unwrap()?);
-                    } else {
-                        break;
+                'score_group_loop: while score_iter.peek().is_some() {
+                    // Check if the next item is part of the current group.
+                    if let Some(Ok(peek_item)) = score_iter.peek() {
+                        if peek_item.key != key {
+                            break 'score_group_loop;
+                        }
+                    }
+
+                    // Consume the item. The unwrap is safe because we peeked.
+                    match score_iter.next().unwrap() {
+                        Ok(item) => {
+                            diagnostics.total_score_records_processed += 1;
+                            diagnostics.add_score_key(item.key);
+                            score_group.push(item);
+                        }
+                        Err(PrepError::Parse(msg)) => {
+                            // A parsing error occurred. Warn once per unique chromosome name.
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
+                                if seen_invalid_score_chrs.insert(chr_name.to_string()) {
+                                    eprintln!("Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.", chr_name);
+                                }
+                            }
+                        }
+                        // Propagate other, fatal errors (like I/O).
+                        Err(e) => return Err(e),
                     }
                 }
 
