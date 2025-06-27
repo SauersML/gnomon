@@ -14,7 +14,6 @@ use crate::types::{
 };
 use ahash::{AHashMap, AHashSet};
 use bumpalo::Bump;
-use nonmax::NonMaxU32;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -153,7 +152,7 @@ enum ReconciliationOutcome<'a, 'arena> {
 /// A struct to hold all necessary information to debug a merge-join failure.
 /// It is virtually zero-cost in the success case.
 #[derive(Debug, Default)]
-struct MergeDiagnosticInfo {
+pub struct MergeDiagnosticInfo {
     total_bim_variants_processed: u64,
     total_score_records_processed: u64,
     // Store the last few raw keys we saw from each stream. Formatting is deferred.
@@ -282,10 +281,14 @@ pub fn prepare_for_computation(
         match bim_key.cmp(&score_key) {
             Ordering::Less => {
                 diagnostics.add_bim_key(bim_key);
+                // Add this line to count the discarded BIM record
+                diagnostics.total_bim_variants_processed += 1;
                 bim_iter.next();
             }
             Ordering::Greater => {
                 diagnostics.add_score_key(score_key);
+                // Add this line to count the discarded score record
+                diagnostics.total_score_records_processed += 1;
                 score_iter.next();
             }
             Ordering::Equal => {
@@ -527,12 +530,10 @@ fn count_total_variants(fileset_prefixes: &[PathBuf]) -> Result<u64, PrepError> 
         .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
-fn parse_key(variant_id: &str) -> Result<(u8, u32), PrepError> {
-    let mut parts = variant_id.splitn(2, ':');
-    let chr_str = parts.next().unwrap_or("");
-    let pos_str = parts.next().unwrap_or("0");
-
-    // First, check for special, non-numeric chromosome names in a case-insensitive way.
+// NEW SIGNATURE & IMPLEMENTATION:
+fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
+    // The body of the function remains identical, as it already used chr_str and pos_str.
+    // First, check for special, non-numeric chromosome names...
     if chr_str.eq_ignore_ascii_case("X") {
         let pos_num: u32 = pos_str
             .parse()
@@ -637,7 +638,7 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
                             if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
                                 (chr, pos, a1, a2)
                             {
-                                match parse_key(&format!("{}:{}", chr_str, pos_str)) {
+                                match parse_key(chr_str, pos_str) {
                                     Ok(key) => {
                                         return Some(Ok(KeyedBimRecord {
                                             key,
@@ -798,7 +799,10 @@ impl<'arena> KWayMergeIterator<'arena> {
         };
         let _other_allele = parts.next();
 
-        let key = parse_key(variant_id)?;
+        let mut key_parts = variant_id.splitn(2, ':');
+        let chr_str = key_parts.next().unwrap_or("");
+        let pos_str = key_parts.next().unwrap_or("");
+        let key = parse_key(chr_str, pos_str)?;
         stream.current_line_info = Some((key, effect_allele));
 
         for (i, weight_str) in parts.enumerate() {
@@ -875,20 +879,6 @@ fn resolve_matches_for_score_line<'a, 'arena>(
         let matches_as_vec = simple_matches.values().copied().collect();
         Ok(ReconciliationOutcome::Simple(matches_as_vec))
     }
-}
-
-fn build_bim_to_reconciled_variant_map(
-    required_bim_indices: &[BimRowIndex],
-    total_variants_in_bim: usize,
-) -> Vec<Option<NonMaxU32>> {
-    let mut bim_row_to_reconciled_variant_map = vec![None; total_variants_in_bim];
-    for (reconciled_variant_idx, &bim_row) in required_bim_indices.iter().enumerate() {
-        if (bim_row.0 as usize) < total_variants_in_bim {
-            let non_max_index = NonMaxU32::new(reconciled_variant_idx as u32).unwrap();
-            bim_row_to_reconciled_variant_map[bim_row.0 as usize] = Some(non_max_index);
-        }
-    }
-    bim_row_to_reconciled_variant_map
 }
 
 fn resolve_person_subset(

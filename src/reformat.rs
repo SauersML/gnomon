@@ -141,7 +141,12 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
         .filter_map(Result::ok)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let key = parse_key(line.split('\t').next().unwrap_or(""))?;
+            let mut parts = line.splitn(2, '\t');
+            let variant_id_part = parts.next().unwrap_or("");
+            let mut key_parts = variant_id_part.splitn(2, ':');
+            let chr_str = key_parts.next().unwrap_or("");
+            let pos_str = key_parts.next().unwrap_or("");
+            let key = parse_key(chr_str, pos_str)?;
             Ok(SortableLine { key, line_data: line })
         })
         .collect::<Result<_, ReformatError>>()?;
@@ -167,11 +172,7 @@ struct SortableLine {
     line_data: String,
 }
 
-fn parse_key(variant_id: &str) -> Result<(u8, u32), ReformatError> {
-    let mut parts = variant_id.splitn(2, ':');
-    let chr_str = parts.next().unwrap_or("");
-    let pos_str = parts.next().unwrap_or("0");
-
+fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), ReformatError> {
     // First, check for special, non-numeric chromosome names case-insensitively.
     if chr_str.eq_ignore_ascii_case("X") {
         let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
@@ -301,12 +302,11 @@ impl HeaderMapping {
         let weight_str = weight.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("effect_weight"))?;
 
         // Construct the variant_id and parse the sort key.
-        let variant_id = format!("{}:{}", chr_str, pos_str);
-        let key = parse_key(&variant_id)?;
+        let key = parse_key(chr_str, pos_str)?;
 
         // Reconstruct the line in the gnomon-native format.
         // This now correctly uses only the single effect weight.
-        let line_data = format!("{}\t{}\t{}\t{}", variant_id, ea_str, oa_str, weight_str);
+        let line_data = format!("{}:{}\t{}\t{}\t{}", chr_str, pos_str, ea_str, oa_str, weight_str);
 
         Ok(SortableLine { key, line_data })
     }
