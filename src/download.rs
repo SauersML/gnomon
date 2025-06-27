@@ -206,13 +206,13 @@ fn download_missing_files(
             paths_to_reformat.push((temp_gz_path, final_native_path));
         }
 
-        // Use a progress bar style that does not require the total file size
+        // Use a progress bar style that does not require the total file size.
         let style = ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bytes}] {msg}",
         )
         .unwrap()
-        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-
+        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .on_finish(indicatif::ProgressFinish::AndClear);
         let configured_downloader = downloader
             .with_style(style)
             .with_max_concurrent_downloads(12)
