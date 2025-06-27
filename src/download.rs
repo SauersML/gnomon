@@ -204,8 +204,8 @@ fn download_missing_files(
         }
 
         let configured_downloader = downloader
-            .with_max_concurrent_downloads(8) // Lowered slightly for public web servers.
-            .with_max_redirects(5);
+            .with_max_concurrent_downloads(12)
+            .with_max_redirections(5);
 
         if let Err(e) = configured_downloader.start().await {
             // On failure, attempt to clean up any partially downloaded .gz files.
