@@ -526,6 +526,16 @@ pub fn prepare_for_computation(
 //                             PRIVATE IMPLEMENTATION HELPERS
 // ========================================================================================
 
+/// Extracts the malformed chromosome name from a `PrepError::Parse` message.
+fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
+    if let Some(rest) = msg.strip_prefix("Invalid chromosome format '") {
+        if let Some(end_pos) = rest.find('\'') {
+            return Some(&rest[..end_pos]);
+        }
+    }
+    None
+}
+
 fn count_lines(path: &Path) -> io::Result<u64> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
