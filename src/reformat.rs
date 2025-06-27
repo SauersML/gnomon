@@ -74,7 +74,15 @@ impl From<io::Error> for ReformatError {
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
 pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
     let file = File::open(input_path)?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+
+    // Create a reader that can dynamically handle both plain text and gzipped files.
+    // This is done by using a "trait object" which can hold any type that implements `io::Read`.
+    let a_reader: Box<dyn Read> = if input_path.extension().map_or(false, |ext| ext == "gz") {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut reader = BufReader::with_capacity(1 << 20, a_reader);
     let mut line = String::new();
     let mut saw_signature = false;
     let mut score_name: Option<String> = None;
