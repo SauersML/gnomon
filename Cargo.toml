@@ -32,6 +32,7 @@ crossbeam-channel = "0.5.15"
 lexical-core = "1.0.5"
 memchr = "2.7.5"
 natord = "1.0.9"
+bumpalo = "3.19.0"
 
 [profile.release]
 opt-level = 3
