@@ -126,31 +126,39 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let mut saw_signature = false;
     let mut score_name: Option<String> = None;
 
-    // A buffer to hold the contents of the line being processed, stripped of metadata characters.
-	let mut line_content = String::with_capacity(line.capacity());
-
-	// Loop through all metadata lines (those starting with '#').
+	// Loop through all metadata lines (those starting with '#'), robustly handling blank lines.
 	while reader.read_line(&mut line)? > 0 {
-		// The first non-metadata line is the header.
-		if !line.starts_with('#') {
+		// Trim both leading/trailing whitespace and newlines to get the actual content.
+		let trimmed_line = line.trim();
+
+		// If the line is completely blank after trimming, we clear the buffer and
+		// continue to the next line, skipping any further processing for this line.
+		if trimmed_line.is_empty() {
+			line.clear();
+			continue;
+		}
+
+		// If the line's content does not start with a '#', we have found the header.
+		// We break the loop, leaving the original `line` buffer intact for parsing.
+		if !trimmed_line.starts_with('#') {
 			break;
 		}
 
-		// Trim leading '#' and whitespace to inspect the metadata content.
-		line_content.clear();
-		line_content.push_str(line.trim_start_matches('#').trim());
+		// --- Process Metadata Line ---
+		// The line is a comment. Process its content by removing the leading '#' characters.
+		let metadata_content = trimmed_line.trim_start_matches('#').trim();
 
-		// Check for the mandatory PGS Catalog signature, allowing for variable '#' prefixes.
-		if line_content.starts_with("PGS CATALOG SCORING FILE") {
+		// Check for the mandatory PGS Catalog signature.
+		if metadata_content.starts_with("PGS CATALOG SCORING FILE") {
 			saw_signature = true;
 		}
 
 		// Extract the PGS ID to use as the score name.
-		if let Some(id) = line_content.strip_prefix("pgs_id=") {
+		if let Some(id) = metadata_content.strip_prefix("pgs_id=") {
 			score_name = Some(id.trim().to_string());
 		}
 
-		// Clear the main buffer for the next line read.
+		// Clear the main buffer to prepare for reading the next line.
 		line.clear();
 	}
 
