@@ -77,7 +77,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
     // Create a reader that can dynamically handle both plain text and gzipped files.
     // This is done by using a "trait object" which can hold any type that implements `io::Read`.
-    let a_reader: Box<dyn Read> = if input_path.extension().map_or(false, |ext| ext == "gz") {
+    let a_reader: Box<dyn Read + Send> = if input_path.extension().map_or(false, |ext| ext == "gz") {
         Box::new(GzDecoder::new(file))
     } else {
         Box::new(file)
