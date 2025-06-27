@@ -229,21 +229,22 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 			let fields: Vec<&str> = line.split('\t').collect();
 
 			// For each line, try to get harmonized coordinates first. If they are absent or empty,
-			// fall back to the original coordinates.
+			// fall back to the original coordinates. This is more robust to partially complete data.
 			let (chr_str, pos_str) = hm_chr_idx
 				// Attempt to get the harmonized chromosome and position fields.
 				.and_then(|c_idx| fields.get(c_idx).zip(hm_pos_idx.and_then(|p_idx| fields.get(p_idx))))
-				// The retrieved fields are not empty strings.
-				.filter(|(&c, &p)| !c.is_empty() && !p.is_empty())
+				// The retrieved fields are not empty strings. The `&(*c, *p)` pattern correctly
+				// handles the reference passed by `filter`.
+				.filter(|&(*c, *p)| !c.is_empty() && !p.is_empty())
 				// If the harmonized fields failed (were not present or were empty),
 				// try the same logic with the original chromosome and position columns.
 				.or_else(|| {
 					orig_chr_idx
 						.and_then(|c_idx| fields.get(c_idx).zip(orig_pos_idx.and_then(|p_idx| fields.get(p_idx))))
-						.filter(|(&c, &p)| !c.is_empty() && !p.is_empty())
+						.filter(|&(*c, *p)| !c.is_empty() && !p.is_empty())
 				})
 				// If both attempts failed, this line is truly missing coordinate data.
-				.map(|(&c, &p)| (c, p)) // Dereference the `&&str` to `&str`.
+				.map(|(c, p)| (*c, *p)) // Dereference the `&&str` to `&str`.
 				.ok_or_else(|| ReformatError::MissingColumns {
 					path: input_path.to_path_buf(),
 					line_number,
@@ -255,6 +256,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 			let ea_str = fields.get(ea_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
 				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_allele".to_string()
 			})?;
+			
 			let weight_str = fields.get(ew_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
 				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_weight".to_string()
 			})?;
