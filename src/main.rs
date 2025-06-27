@@ -14,6 +14,7 @@ use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::PreparationResult;
+use gnomon::download;
 use natord::compare;
 use ryu;
 use std::error::Error;
