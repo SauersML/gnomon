@@ -7,4 +7,4 @@ pub mod types;
 pub mod reformat;
 pub mod pipeline;
 pub mod decide;
-mod download;
+pub mod download;
