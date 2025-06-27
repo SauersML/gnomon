@@ -89,7 +89,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let mut score_name: Option<String> = None;
 
     while reader.read_line(&mut line)? > 0 {
-        if line.starts_with("##PGS CATALOG SCORING FILE") {
+        if line.starts_with("###PGS CATALOG SCORING FILE") {
             saw_signature = true;
         }
         if let Some(id) = line.strip_prefix("#pgs_id=") {
