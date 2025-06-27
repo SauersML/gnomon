@@ -146,21 +146,21 @@ pub enum DownloadError {
 }
 
 impl Display for DownloadError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            DownloadError::Io(e, path) => {
-                write!(f, "I/O error for '{}': {}", path.display(), e)
-            }
-            DownloadError::Network(s) => write!(f, "Network download failed: {}", s),
-            DownloadError::InvalidId(s) => write!(
-                f,
-                "Invalid ID format for '{}'. All IDs must start with 'PGS'.",
-                s
-            ),
-            DownloadError::Reformat(e) => write!(f, "Failed to reformat score file: {}", e),
-            DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {}", e),
-        }
-    }
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		match self {
+			DownloadError::Io(e, path) => {
+				write!(f, "I/O error for '{}': {}", path.display(), e)
+			}
+			DownloadError::Network(s) => write!(f, "Network download failed: {}", s),
+			DownloadError::InvalidId(s) => write!(
+				f,
+				"Invalid ID format for '{}'. All IDs must start with 'PGS'.",
+				s
+			),
+			DownloadError::Reformat(e) => write!(f, "{}", e),
+			DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {}", e),
+		}
+	}
 }
 
 impl Error for DownloadError {
