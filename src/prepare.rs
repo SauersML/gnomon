@@ -739,24 +739,31 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 
     fn replenish_from_stream(&mut self, file_idx: usize) -> Result<(), PrepError> {
-        let stream = &mut self.streams[file_idx];
-
-        if !stream.line_buffer.is_empty() {
+        // We scope the mutable borrow of the stream to check its buffer.
+        if !self.streams[file_idx].line_buffer.is_empty() {
+            let stream = &mut self.streams[file_idx];
             Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
             return Ok(());
         }
 
+        // The line buffer is empty, so we must read a new line from the file.
+        // Get the data we need from `self` before we mutably borrow a part of it.
         let column_map = &self.file_column_maps[file_idx];
-        if self.read_line_into_buffer(stream, column_map)? {
+        let bump = self.bump; // `&'arena Bump` is `Copy`, so this is a cheap reference copy.
+
+        // Now, get the mutable borrow of the stream.
+        let stream = &mut self.streams[file_idx];
+        
+        // Call the static helper function using the correct syntax.
+        // This avoids the borrow checker conflict.
+        if Self::read_line_into_buffer(stream, column_map, bump)? {
             Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
         }
+
         Ok(())
     }
 
-    /// Reads the next valid data line from a file stream and populates its internal buffer.
-    /// This is a low-level helper called by `replenish_from_stream`. This is a static
-    /// method to avoid borrow-checker conflicts with `self`.
-    fn read_line_into_buffer<'arena>(
+    fn read_line_into_buffer(
         stream: &mut FileStream<'arena>,
         column_map: &[ScoreColumnIndex],
         bump: &'arena Bump,
@@ -781,7 +788,8 @@ impl<'arena> KWayMergeIterator<'arena> {
                 break;
             }
         }
-        let line_in_arena = self.bump.alloc_str(&stream.line_string_buffer);
+        // Use the `bump` argument, not `self.bump`.
+        let line_in_arena = bump.alloc_str(&stream.line_string_buffer);
 
         let mut parts = line_in_arena.split('\t');
         let (variant_id, effect_allele) = match (parts.next(), parts.next()) {
