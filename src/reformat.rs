@@ -259,45 +259,71 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
 /// Sorts a gnomon-native file that is not guaranteed to be sorted.
 pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
-    let file = File::open(input_path)?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+	let file = File::open(input_path)?;
+	let reader = BufReader::new(file);
+	
+	// Separate header lines from data lines to correctly track data line numbers.
+	let mut header_lines: Vec<String> = vec![];
+	let mut data_lines: Vec<String> = vec![];
 
-    let mut header = String::new();
-    while let Some(Ok(line)) = lines.next() {
-        if !line.starts_with('#') {
-            header = line;
-            break;
-        }
-    }
-    if header.is_empty() {
-        return Ok(());
-    }
+	for line_result in reader.lines() {
+		let line = line_result.map_err(ReformatError::Io)?;
+		if !line.starts_with('#') {
+			data_lines.push(line);
+		} else {
+			header_lines.push(line);
+		}
+	}
 
-    let mut lines_to_sort: Vec<SortableLine> = lines
-        .filter_map(Result::ok)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let variant_id_part = parts.next().unwrap_or("");
-            let mut key_parts = variant_id_part.splitn(2, ':');
-            let chr_str = key_parts.next().unwrap_or("");
-            let pos_str = key_parts.next().unwrap_or("");
-            let key = parse_key(chr_str, pos_str)?;
-            Ok(SortableLine { key, line_data: line })
-        })
-        .collect::<Result<_, ReformatError>>()?;
+	if data_lines.is_empty() {
+		return Ok(());
+	}
+	// The gnomon-native header is the first data line.
+	let header = data_lines.remove(0);
 
-    lines_to_sort.par_sort_unstable_by_key(|item| item.key);
+	let mut lines_to_sort: Vec<SortableLine> = data_lines
+		.into_par_iter()
+		.enumerate()
+		.map(|(i, line)| {
+			// The line number is relative to the start of the data section.
+			let line_number = i + 2; 
+			if line.is_empty() {
+				return Ok(None);
+			}
 
-    let out_file = File::create(output_path)?;
-    let mut writer = BufWriter::new(out_file);
-    writeln!(writer, "{}", header)?;
-    for item in lines_to_sort {
-        writeln!(writer, "{}", item.line_data)?;
-    }
-    writer.flush()?;
-    Ok(())
+			let mut parts = line.splitn(2, '\t');
+			let variant_id_part = parts.next().unwrap_or("");
+			let mut key_parts = variant_id_part.splitn(2, ':');
+			let chr_str = key_parts.next().unwrap_or("");
+			let pos_str = key_parts.next().unwrap_or("");
+			
+			// Call the decoupled parse_key function and map its simple error to our rich error type.
+			let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
+				path: input_path.to_path_buf(),
+				line_number,
+				line_content: line.clone(),
+				details,
+			})?;
+			
+			Ok(Some(SortableLine { key, line_data: line }))
+		})
+		.filter_map(|result| result.transpose())
+		.collect::<Result<_, ReformatError>>()?;
+
+	lines_to_sort.par_sort_unstable_by_key(|item| item.key);
+
+	let out_file = File::create(output_path)?;
+	let mut writer = BufWriter::new(out_file);
+	// Write back any metadata lines that were present.
+	for meta_line in header_lines {
+		writeln!(writer, "{}", meta_line)?;
+	}
+	writeln!(writer, "{}", header)?;
+	for item in lines_to_sort {
+		writeln!(writer, "{}", item.line_data)?;
+	}
+	writer.flush()?;
+	Ok(())
 }
 
 // ========================================================================================
@@ -309,37 +335,37 @@ struct SortableLine {
     line_data: String,
 }
 
-fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), ReformatError> {
-    // First, check for special, non-numeric chromosome names case-insensitively.
-    if chr_str.eq_ignore_ascii_case("X") {
-        let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
-        return Ok((23, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("Y") {
-        let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
-        return Ok((24, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("MT") {
-        let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
-        return Ok((25, pos_num));
-    }
-
-    // Next, handle numeric chromosomes, stripping a potential "chr" prefix case-insensitively.
-    let number_part = if chr_str.len() >= 3 && chr_str[..3].eq_ignore_ascii_case("chr") {
-        &chr_str[3..]
-    } else {
-        chr_str
-    };
-
-    // Now, parse the remaining part.
-    let chr_num: u8 = number_part.parse().map_err(|_| {
-        ReformatError::Parse(format!(
-            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
-            chr_str
-        ))
-    })?;
-
-    let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
-    
-    Ok((chr_num, pos_num))
+fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
+	// First, check for special, non-numeric chromosome names case-insensitively.
+	if chr_str.eq_ignore_ascii_case("X") {
+		let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+		return Ok((23, pos_num));
+	}
+	if chr_str.eq_ignore_ascii_case("Y") {
+		let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+		return Ok((24, pos_num));
+	}
+	if chr_str.eq_ignore_ascii_case("MT") {
+		let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+		return Ok((25, pos_num));
+	}
+	
+	// Next, handle numeric chromosomes, stripping a potential "chr" prefix case-insensitively.
+	let number_part = if chr_str.len() >= 3 && chr_str[..3].eq_ignore_ascii_case("chr") {
+		&chr_str[3..]
+	} else {
+		chr_str
+	};
+	
+	// Now, parse the remaining part.
+	let chr_num: u8 = number_part.parse().map_err(|_| {
+		format!(
+			"Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
+			chr_str
+		)
+	})?;
+	
+	let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+	
+	Ok((chr_num, pos_num))
 }
