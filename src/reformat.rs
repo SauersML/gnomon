@@ -4,7 +4,7 @@
 //
 // ========================================================================================
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -114,13 +114,14 @@ impl From<io::Error> for ReformatError {
 pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
     let file = File::open(input_path)?;
 
-    // Create a reader that can dynamically handle both plain text and gzipped files.
-    // This is done by using a "trait object" which can hold any type that implements `io::Read`.
-    let a_reader: Box<dyn Read + Send> = if input_path.extension().map_or(false, |ext| ext == "gz") {
-        Box::new(GzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
+	// Create a reader that can dynamically handle both plain text and gzipped files.
+    // This is done by using a "trait object" which can hold any type that implements `io::Read`.
+    let a_reader: Box<dyn Read + Send> = if input_path.extension().map_or(false, |ext| ext == "gz") {
+        // Use MultiGzDecoder to correctly read gzip files that may be multi-member
+        Box::new(MultiGzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
     let mut reader = BufReader::with_capacity(1 << 20, a_reader);
     let mut line = String::new();
     let mut saw_signature = false;
