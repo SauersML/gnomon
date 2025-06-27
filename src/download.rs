@@ -187,8 +187,8 @@ fn download_missing_files(
         for id in pgs_ids {
             // Use the reliable HTTPS endpoint for downloads.
             let url = format!(
-                "https://www.pgs-catalog.org/scores/{}/download/{}.txt.gz",
-                id, id
+                "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{id}/ScoringFiles/Harmonized/{id}_hmPOS_GRCh38.txt.gz",
+                id = id
             );
             // The compressed file is an intermediate artifact.
             let temp_gz_path = target_dir.join(format!("{}.txt.gz", id));
