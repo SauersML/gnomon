@@ -11,7 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::ParseIntError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ========================================================================================
 //                                   PUBLIC API
@@ -37,24 +37,62 @@ pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
     Ok(header.starts_with("variant_id\teffect_allele\tother_allele\t"))
 }
 
-/// Errors that can occur during PGS-to-gnomon reformatting.
+/// A structured error type for the reformatting process, designed for useful diagnostics.
 #[derive(Debug)]
 pub enum ReformatError {
-    Io(io::Error),
-    NotPgsFormat,
-    MissingColumns(&'static str),
-    Parse(String),
+	/// An underlying I/O error.
+	Io(io::Error),
+	/// The file does not contain the expected PGS Catalog signature.
+	NotPgsFormat { path: PathBuf },
+	/// The header or a data row is missing a required column.
+	MissingColumns {
+		path: PathBuf,
+		line_number: usize,
+		line_content: String,
+		missing_column_name: String,
+	},
+	/// A value in the file could not be parsed correctly.
+	Parse {
+		path: PathBuf,
+		line_number: usize,
+		line_content: String,
+		details: String,
+	},
 }
 
 impl Display for ReformatError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            ReformatError::Io(e) => write!(f, "I/O error: {}", e),
-            ReformatError::NotPgsFormat => write!(f, "Not a PGS Catalog scoring file."),
-            ReformatError::MissingColumns(s) => write!(f, "Missing column(s): {}", s),
-            ReformatError::Parse(s) => write!(f, "Parse error: {}", s),
-        }
-    }
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		// This implementation provides a detailed, multi-line diagnostic report to the user.
+		writeln!(f, "Failed to reformat PGS Catalog score file.")?;
+		writeln!(f, "\n-- Diagnostic Details ----------------------------------------------------")?;
+
+		match self {
+			ReformatError::Io(e) => {
+				writeln!(f, "Reason:       An I/O error occurred.")?;
+				writeln!(f, "Details:      {}", e)?;
+			}
+			ReformatError::NotPgsFormat { path } => {
+				writeln!(f, "File:         {}", path.display())?;
+				writeln!(f, "Reason:       The file is not a valid PGS Catalog scoring file.")?;
+				writeln!(f, "Details:      The required signature ('###PGS CATALOG SCORING FILE') was not found in the file's metadata header.")?;
+			}
+			ReformatError::MissingColumns { path, line_number, line_content, missing_column_name } => {
+				writeln!(f, "File:         {}", path.display())?;
+				writeln!(f, "Line Number:  {}", line_number)?;
+				writeln!(f, "Line Content: \"{}\"", line_content.trim())?;
+				writeln!(f, "Reason:       A required column or its data is missing.")?;
+				writeln!(f, "Details:      Expected to find column '{}', but it was not found in the header or data for this line.", missing_column_name)?;
+			}
+			ReformatError::Parse { path, line_number, line_content, details } => {
+				writeln!(f, "File:         {}", path.display())?;
+				writeln!(f, "Line Number:  {}", line_number)?;
+				writeln!(f, "Line Content: \"{}\"", line_content.trim())?;
+				writeln!(f, "Reason:       A value in the line could not be parsed correctly.")?;
+				writeln!(f, "Details:      {}", details)?;
+			}
+		}
+		write!(f, "--------------------------------------------------------------------------")
+	}
 }
 
 impl Error for ReformatError {
@@ -116,23 +154,96 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 		line.clear();
 	}
 
-	// After processing all metadata, verify that the signature was found.
+// After processing all metadata, verify that the signature was found.
 	if !saw_signature {
-		return Err(ReformatError::NotPgsFormat);
+		return Err(ReformatError::NotPgsFormat { path: input_path.to_path_buf() });
 	}
-    let header_line = line.trim_end();
+	let header_line = line.trim_end().to_string();
+	let score_label = score_name.unwrap_or_else(|| "PGS_SCORE".into());
 
-    let cols: Vec<&str> = header_line.split('\t').collect();
-    let mapping = HeaderMapping::from_columns(&cols)?;
-    let score_label = score_name.unwrap_or_else(|| "PGS_SCORE".into());
+	// --- Robust Header Parsing ---
+	// Create a map from column names to their index for robust, order-independent access.
+	let header_map: std::collections::HashMap<&str, usize> = header_line
+		.split_whitespace()
+		.enumerate()
+		.map(|(i, name)| (name, i))
+		.collect();
 
-    let mut lines_to_sort: Vec<SortableLine> = reader
-        .lines()
-        .filter_map(Result::ok)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .par_bridge()
-        .map(|line| mapping.create_sortable_line(&line))
-        .collect::<Result<_, _>>()?;
+	// Get indices for all potentially required columns, prioritizing harmonized `hm_` columns.
+	let chr_idx = *header_map.get("hm_chr").or_else(|| header_map.get("chr_name"))
+		.ok_or_else(|| ReformatError::MissingColumns {
+			path: input_path.to_path_buf(),
+			line_number: 1, // Header is effectively line 1 of the data.
+			line_content: header_line.clone(),
+			missing_column_name: "(hm_chr or chr_name)".to_string(),
+		})?;
+	let pos_idx = *header_map.get("hm_pos").or_else(|| header_map.get("chr_position"))
+		.ok_or_else(|| ReformatError::MissingColumns {
+			path: input_path.to_path_buf(),
+			line_number: 1,
+			line_content: header_line.clone(),
+			missing_column_name: "(hm_pos or chr_position)".to_string(),
+		})?;
+	let ea_idx = *header_map.get("effect_allele")
+		.ok_or_else(|| ReformatError::MissingColumns {
+			path: input_path.to_path_buf(),
+			line_number: 1,
+			line_content: header_line.clone(),
+			missing_column_name: "effect_allele".to_string(),
+		})?;
+	let ew_idx = *header_map.get("effect_weight")
+		.ok_or_else(|| ReformatError::MissingColumns {
+			path: input_path.to_path_buf(),
+			line_number: 1,
+			line_content: header_line.clone(),
+			missing_column_name: "effect_weight".to_string(),
+		})?;
+	// The "other allele" is optional; we check for both names and store the index if found.
+	let oa_idx = header_map.get("other_allele").or_else(|| header_map.get("hm_inferOtherAllele")).copied();
+
+	// --- Robust Data Row Parsing ---
+	// The header has been skipped; subsequent lines are data.
+	let mut lines_to_sort: Vec<SortableLine> = reader
+		.lines()
+		.enumerate()
+		.par_bridge()
+		.map(|(i, line_result)| {
+			// The current line number in the file (add 2 to account for 0-based index and header).
+			let line_number = i + 2;
+			let line = line_result.map_err(ReformatError::Io)?;
+
+			if line.is_empty() || line.starts_with('#') {
+				return Ok(None);
+			}
+
+			let fields: Vec<&str> = line.split('\t').collect();
+
+			// Safely get data from fields by index. If a field is missing, `get` returns `None`.
+			let chr_str = fields.get(chr_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
+				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "chromosome".to_string()
+			})?;
+			let pos_str = fields.get(pos_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
+				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "position".to_string()
+			})?;
+			let ea_str = fields.get(ea_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
+				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_allele".to_string()
+			})?;
+			let weight_str = fields.get(ew_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
+				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_weight".to_string()
+			})?;
+
+			// The "other allele" is not strictly required; use a placeholder 'N' if absent.
+			let oa_str = oa_idx.and_then(|i| fields.get(i)).map_or("N", |s| if s.is_empty() { "N" } else { s });
+
+			let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
+				path: input_path.to_path_buf(), line_number, line_content: line.clone(), details
+			})?;
+
+			let line_data = format!("{}:{}\t{}\t{}\t{}", chr_str, pos_str, ea_str, oa_str, weight_str);
+			Ok(Some(SortableLine { key, line_data }))
+		})
+		.filter_map(|result| result.transpose()) // Transpose Result<Option<T>> to Option<Result<T>> and filter Nones.
+		.collect::<Result<Vec<_>, _>>()?;
 
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
@@ -231,109 +342,4 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), ReformatError> {
     let pos_num: u32 = pos_str.parse().map_err(|e: ParseIntError| ReformatError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
     
     Ok((chr_num, pos_num))
-}
-
-#[derive(Debug, Copy, Clone)]
-enum PosColumns {
-    Harmonized { chr: usize, pos: usize },
-    Author { chr: usize, pos: usize },
-}
-
-#[derive(Debug, Copy, Clone)]
-struct HeaderMapping {
-    effect_allele: usize,
-    other_allele: usize,
-    effect_weight: usize,
-    pos_cols: PosColumns,
-}
-
-impl HeaderMapping {
-    fn from_columns(cols: &[&str]) -> Result<Self, ReformatError> {
-        let mut ea = None;
-        let mut oa = None;
-        let mut ew = None;
-        let mut hm_chr = None;
-        let mut hm_pos = None;
-        let mut cn = None;
-        let mut cp = None;
-
-        for (i, &name) in cols.iter().enumerate() {
-            match name {
-                "effect_allele" => ea = Some(i),
-                "hm_inferOtherAllele" if oa.is_none() => oa = Some(i),
-                "other_allele" if oa.is_none() => oa = Some(i),
-                "effect_weight" => ew = Some(i),
-                "hm_chr" => hm_chr = Some(i),
-                "hm_pos" => hm_pos = Some(i),
-                "chr_name" => cn = Some(i),
-                "chr_position" => cp = Some(i),
-                _ => {}
-            }
-        }
-
-        let effect_allele = ea.ok_or(ReformatError::MissingColumns("effect_allele"))?;
-        let other_allele = oa.ok_or(ReformatError::MissingColumns("other_allele or hm_inferOtherAllele"))?;
-        let effect_weight = ew.ok_or(ReformatError::MissingColumns("effect_weight"))?;
-
-        let pos_cols = if let (Some(chr), Some(pos)) = (hm_chr, hm_pos) {
-            PosColumns::Harmonized { chr, pos }
-        } else if let (Some(chr), Some(pos)) = (cn, cp) {
-            PosColumns::Author { chr, pos }
-        } else {
-            return Err(ReformatError::MissingColumns("(chr_name & chr_position) or (hm_chr & hm_pos)"));
-        };
-
-        Ok(HeaderMapping {
-            effect_allele,
-            other_allele,
-            effect_weight,
-            pos_cols,
-        })
-    }
-
-    #[inline]
-    fn create_sortable_line(&self, row: &str) -> Result<SortableLine, ReformatError> {
-        // This function is on the hot path for reformatting. It avoids heap allocations
-        // by iterating over the split string once, instead of collecting to a Vec.
-        let mut chr: Option<&str> = None;
-        let mut pos: Option<&str> = None;
-        let mut ea: Option<&str> = None;
-        let mut oa: Option<&str> = None;
-        let mut weight: Option<&str> = None;
-
-        let (chr_idx, pos_idx) = match self.pos_cols {
-            PosColumns::Harmonized { chr, pos } => (chr, pos),
-            PosColumns::Author { chr, pos } => (chr, pos),
-        };
-
-        for (i, field) in row.split('\t').enumerate() {
-            if i == chr_idx {
-                chr = Some(field);
-            } else if i == pos_idx {
-                pos = Some(field);
-            } else if i == self.effect_allele {
-                ea = Some(field);
-            } else if i == self.other_allele {
-                oa = Some(field);
-            } else if i == self.effect_weight {
-                weight = Some(field);
-            }
-        }
-
-        // Check that all required fields were found and are not empty.
-        let chr_str = chr.filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::Parse("Missing chromosome field in row".to_string()))?;
-        let pos_str = pos.filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::Parse("Missing position field in row".to_string()))?;
-        let ea_str = ea.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("effect_allele"))?;
-        let oa_str = oa.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("other_allele"))?;
-        let weight_str = weight.filter(|s| !s.is_empty()).ok_or(ReformatError::MissingColumns("effect_weight"))?;
-
-        // Construct the variant_id and parse the sort key.
-        let key = parse_key(chr_str, pos_str)?;
-
-        // Reconstruct the line in the gnomon-native format.
-        // This now correctly uses only the single effect weight.
-        let line_data = format!("{}:{}\t{}\t{}\t{}", chr_str, pos_str, ea_str, oa_str, weight_str);
-
-        Ok(SortableLine { key, line_data })
-    }
 }
