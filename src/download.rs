@@ -8,14 +8,13 @@
 use crate::reformat;
 use dwldutil::{Downloader, DLFile};
 use indicatif::ProgressStyle;
-use flate2::read::GzDecoder;
 use rayon::prelude::*;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::num::ParseIntError;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 // ========================================================================================
 //                              PUBLIC API
