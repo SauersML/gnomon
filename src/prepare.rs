@@ -753,10 +753,13 @@ impl<'arena> KWayMergeIterator<'arena> {
         Ok(())
     }
 
-    fn read_line_into_buffer(
-        &mut self,
+    /// Reads the next valid data line from a file stream and populates its internal buffer.
+    /// This is a low-level helper called by `replenish_from_stream`. This is a static
+    /// method to avoid borrow-checker conflicts with `self`.
+    fn read_line_into_buffer<'arena>(
         stream: &mut FileStream<'arena>,
         column_map: &[ScoreColumnIndex],
+        bump: &'arena Bump,
     ) -> Result<bool, PrepError> {
         stream.line_buffer.clear();
         stream.current_line_info = None;
