@@ -281,13 +281,11 @@ pub fn prepare_for_computation(
         match bim_key.cmp(&score_key) {
             Ordering::Less => {
                 diagnostics.add_bim_key(bim_key);
-                // Add this line to count the discarded BIM record
                 diagnostics.total_bim_variants_processed += 1;
                 bim_iter.next();
             }
             Ordering::Greater => {
                 diagnostics.add_score_key(score_key);
-                // Add this line to count the discarded score record
                 diagnostics.total_score_records_processed += 1;
                 score_iter.next();
             }
@@ -530,10 +528,8 @@ fn count_total_variants(fileset_prefixes: &[PathBuf]) -> Result<u64, PrepError> 
         .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
-// NEW SIGNATURE & IMPLEMENTATION:
 fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
-    // The body of the function remains identical, as it already used chr_str and pos_str.
-    // First, check for special, non-numeric chromosome names...
+    // First, check for special, non-numeric chromosome names
     if chr_str.eq_ignore_ascii_case("X") {
         let pos_num: u32 = pos_str
             .parse()
