@@ -178,21 +178,23 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 		.map(|(i, name)| (name, i))
 		.collect();
 
-	// Get indices for all potentially required columns, prioritizing harmonized `hm_` columns.
-	let chr_idx = *header_map.get("hm_chr").or_else(|| header_map.get("chr_name"))
-		.ok_or_else(|| ReformatError::MissingColumns {
+	// Find all potential column indices once. This avoids repeated string lookups in the hot loop.
+	let hm_chr_idx = header_map.get("hm_chr").copied();
+	let hm_pos_idx = header_map.get("hm_pos").copied();
+	let orig_chr_idx = header_map.get("chr_name").copied();
+	let orig_pos_idx = header_map.get("chr_position").copied();
+
+	// Validate that we have at least one usable pair of chr/pos columns in the header.
+	if !((hm_chr_idx.is_some() && hm_pos_idx.is_some()) || (orig_chr_idx.is_some() && orig_pos_idx.is_some())) {
+		return Err(ReformatError::MissingColumns {
 			path: input_path.to_path_buf(),
-			line_number: 1, // Header is effectively line 1 of the data.
+			line_number: 1, // Header line
 			line_content: header_line.clone(),
-			missing_column_name: "(hm_chr or chr_name)".to_string(),
-		})?;
-	let pos_idx = *header_map.get("hm_pos").or_else(|| header_map.get("chr_position"))
-		.ok_or_else(|| ReformatError::MissingColumns {
-			path: input_path.to_path_buf(),
-			line_number: 1,
-			line_content: header_line.clone(),
-			missing_column_name: "(hm_pos or chr_position)".to_string(),
-		})?;
+			missing_column_name: "A valid chromosome/position column pair (hm_chr/hm_pos or chr_name/chr_position)".to_string(),
+		});
+	}
+
+	// Get indices for other mandatory columns.
 	let ea_idx = *header_map.get("effect_allele")
 		.ok_or_else(|| ReformatError::MissingColumns {
 			path: input_path.to_path_buf(),
@@ -210,7 +212,6 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 	// The "other allele" is optional; we check for both names and store the index if found.
 	let oa_idx = header_map.get("other_allele").or_else(|| header_map.get("hm_inferOtherAllele")).copied();
 
-	// --- Robust Data Row Parsing ---
 	// The header has been skipped; subsequent lines are data.
 	let mut lines_to_sort: Vec<SortableLine> = reader
 		.lines()
@@ -227,13 +228,30 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
 			let fields: Vec<&str> = line.split('\t').collect();
 
-			// Safely get data from fields by index. If a field is missing, `get` returns `None`.
-			let chr_str = fields.get(chr_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
-				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "chromosome".to_string()
-			})?;
-			let pos_str = fields.get(pos_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
-				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "position".to_string()
-			})?;
+			// For each line, try to get harmonized coordinates first. If they are absent or empty,
+			// fall back to the original coordinates.
+			let (chr_str, pos_str) = hm_chr_idx
+				// Attempt to get the harmonized chromosome and position fields.
+				.and_then(|c_idx| fields.get(c_idx).zip(hm_pos_idx.and_then(|p_idx| fields.get(p_idx))))
+				// The retrieved fields are not empty strings.
+				.filter(|(&c, &p)| !c.is_empty() && !p.is_empty())
+				// If the harmonized fields failed (were not present or were empty),
+				// try the same logic with the original chromosome and position columns.
+				.or_else(|| {
+					orig_chr_idx
+						.and_then(|c_idx| fields.get(c_idx).zip(orig_pos_idx.and_then(|p_idx| fields.get(p_idx))))
+						.filter(|(&c, &p)| !c.is_empty() && !p.is_empty())
+				})
+				// If both attempts failed, this line is truly missing coordinate data.
+				.map(|(&c, &p)| (c, p)) // Dereference the `&&str` to `&str`.
+				.ok_or_else(|| ReformatError::MissingColumns {
+					path: input_path.to_path_buf(),
+					line_number,
+					line_content: line.clone(),
+					missing_column_name: "a valid, non-empty chromosome/position pair".to_string(),
+				})?;
+			
+			// Safely get data for other required fields.
 			let ea_str = fields.get(ea_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
 				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_allele".to_string()
 			})?;
