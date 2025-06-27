@@ -22,8 +22,6 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Lines};
-use std::iter::Peekable;
-use std::marker::PhantomData;
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
