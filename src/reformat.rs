@@ -164,7 +164,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 	// --- Robust Header Parsing ---
 	// Create a map from column names to their index for robust, order-independent access.
 	let header_map: std::collections::HashMap<&str, usize> = header_line
-		.split_whitespace()
+		 .split('\t')
 		.enumerate()
 		.map(|(i, name)| (name, i))
 		.collect();
