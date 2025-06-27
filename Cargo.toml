@@ -34,6 +34,7 @@ memchr = "2.7.5"
 natord = "1.0.9"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 dwldutil = "2.0.4"
+indicatif = "0.17.11"
 
 [profile.release]
 opt-level = 3
