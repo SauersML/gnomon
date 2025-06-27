@@ -62,10 +62,46 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
     let fileset_prefixes = resolve_filesets(&args.input_path)?;
 
-    // --- Phase 1: Preparation ---
+    // --- Phase 1a: Score File Resolution ---
+    // This block resolves the --score argument into a definitive list of files.
+    let resolved_score_files: Vec<PathBuf> = {
+        let score_arg_str = args.score.to_string_lossy();
+
+        // HEURISTIC: If the path doesn't exist AND it contains "PGS",
+        // assume it's a list of IDs to download. This avoids accidentally
+        // triggering a download for a simple typo in a file path.
+        if !args.score.exists() && score_arg_str.contains("PGS") {
+            // Define the permanent cache directory. Placing it relative to the
+            // output is a good strategy, keeping all generated files together.
+            let output_parent_dir = fileset_prefixes[0].parent().unwrap_or_else(|| Path::new("."));
+            let scores_cache_dir = output_parent_dir.join("gnomon_score_cache");
+
+            download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?
+        } else {
+            // --- This is the original, local file handling logic ---
+            // The path exists locally, so we handle it as a file or directory.
+            if args.score.is_dir() {
+                fs::read_dir(&args.score)?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|p| p.is_file())
+                    .collect()
+            } else {
+                // It's a single file.
+                vec![args.score.clone()]
+            }
+        }
+    };
+
+    if resolved_score_files.is_empty() {
+        return Err("No score files were found or resolved.".into());
+    }
+
+    // --- Phase 1b: Preparation ---
     // This phase is synchronous and CPU-bound. It parses all input files,
     // reconciles variants, and produces a "computation blueprint".
-    let prep_result = run_preparation_phase(&fileset_prefixes, &args)?;
+    let prep_result =
+        run_preparation_phase(&fileset_prefixes, &resolved_score_files, args.keep.as_deref())?;
 
     // --- Phase 2: Resource Allocation ---
     // A read-only context is created, which allocates all necessary memory pools
@@ -102,13 +138,14 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
 ///
-/// This function is synchronous and CPU-bound. It takes the raw user arguments,
-/// finds and normalizes all score files, and then calls the main preparation
+/// This function is synchronous and CPU-bound. It takes a definitive list of
+/// resolved score files, normalizes them, and then calls the main preparation
 /// logic to produce a "computation blueprint" (`PreparationResult`). All user-facing
 /// console output for this phase is handled here.
 fn run_preparation_phase(
     fileset_prefixes: &[PathBuf],
-    args: &Args,
+    score_files: &[PathBuf],
+    keep: Option<&Path>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     if fileset_prefixes.len() > 1 {
         eprintln!(
@@ -120,28 +157,6 @@ fn run_preparation_phase(
         eprintln!("> Using PLINK prefix: {}", fileset_prefixes[0].display());
     }
 
-    // The first fileset is used to determine the output directory for converted score files.
-    let output_dir = fileset_prefixes[0]
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-
-    // --- Find and normalize all score files ---
-    let score_files = if args.score.is_dir() {
-        eprintln!("> Found directory for --score, locating all score files...");
-        fs::read_dir(&args.score)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|p| p.is_file())
-            .collect()
-    } else {
-        vec![args.score.clone()]
-    };
-
-    if score_files.is_empty() {
-        return Err("No score files found in the specified path.".into());
-    }
-
     eprintln!(
         "> Normalizing and preparing {} score file(s)...",
         score_files.len()
@@ -149,12 +164,17 @@ fn run_preparation_phase(
     let prep_phase_start = Instant::now();
 
     let mut native_score_files = Vec::with_capacity(score_files.len());
-    for score_file_path in &score_files {
+    for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
             Ok(true) => {
                 native_score_files.push(score_file_path.clone());
             }
             Ok(false) => {
+                // Determine the output path for the converted file. It should be
+                // placed in the same directory as the original.
+                let output_dir = score_file_path.parent().unwrap_or_else(|| Path::new("."));
+                fs::create_dir_all(output_dir)?;
+
                 eprintln!(
                     "> Info: Score file '{}' is not in native format. Attempting conversion...",
                     score_file_path.display()
@@ -169,26 +189,25 @@ fn run_preparation_phase(
                         return Err(format!(
                             "Failed to auto-reformat '{}': {}. Please ensure it is a valid PGS Catalog file or convert it to the gnomon-native format manually.",
                             score_file_path.display(), e
-                        ).into());
+                        )
+                        .into());
                     }
                 }
             }
             Err(e) => {
                 return Err(format!(
                     "Error reading score file '{}': {}",
-                    score_file_path.display(), e
-                ).into());
+                    score_file_path.display(),
+                    e
+                )
+                .into());
             }
         }
     }
 
     // --- Run the main preparation logic ---
-    let prep = prepare::prepare_for_computation(
-        fileset_prefixes,
-        &native_score_files,
-        args.keep.as_deref(),
-    )
-    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    let prep = prepare::prepare_for_computation(fileset_prefixes, &native_score_files, keep)
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     eprintln!(
         "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",
