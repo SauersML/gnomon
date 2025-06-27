@@ -255,9 +255,47 @@ pub fn prepare_for_computation(
         BTreeMap::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
-        // This is safe because we just checked that the iterators are not empty.
-        let bim_key = bim_iter.peek().unwrap().as_ref().unwrap().key;
-        let score_key = score_iter.peek().unwrap().as_ref().unwrap().key;
+        // Peek at the BIM iterator. If a parsing error is present, we must handle it
+        // before we can proceed with the merge-join logic. This prevents a panic from
+        // unwrapping an `Err` variant.
+        let bim_key = match bim_iter.peek().unwrap() {
+            Ok(rec) => rec.key,
+            Err(_) => {
+                // An error was found. Consume it from the iterator to handle it.
+                match bim_iter.next().unwrap().unwrap_err() {
+                    // For parse errors, we issue a warning and skip the variant.
+                    PrepError::Parse(msg) => {
+                        if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
+                            if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
+                                eprintln!("Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.", chr_name);
+                            }
+                        }
+                        continue; // Continue to the next loop iteration.
+                    }
+                    // For other errors (like I/O), we propagate them as they are fatal.
+                    e => return Err(e),
+                }
+            }
+        };
+
+        // Similarly, peek at the score iterator and handle any errors.
+        let score_key = match score_iter.peek().unwrap() {
+            Ok(rec) => rec.key,
+            Err(_) => {
+                // An error was found. Consume it from the iterator.
+                match score_iter.next().unwrap().unwrap_err() {
+                    PrepError::Parse(msg) => {
+                        if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
+                            if seen_invalid_score_chrs.insert(chr_name.to_string()) {
+                                eprintln!("Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.", chr_name);
+                            }
+                        }
+                        continue;
+                    }
+                    e => return Err(e),
+                }
+            }
+        };
 
         match bim_key.cmp(&score_key) {
             Ordering::Less => {
