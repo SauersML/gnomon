@@ -207,13 +207,7 @@ fn download_missing_files(
             .with_max_concurrent_downloads(12)
             .with_max_redirections(5);
 
-        if let Err(e) = configured_downloader.start().await {
-            // On failure, attempt to clean up any partially downloaded .gz files.
-            for (gz_path, _) in &paths_to_reformat {
-                let _ = fs::remove_file(gz_path);
-            }
-            return Err(DownloadError::Network(e.to_string()));
-        }
+        configured_downloader.start();
 
         Ok(paths_to_reformat)
     })
