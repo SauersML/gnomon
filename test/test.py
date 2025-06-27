@@ -163,13 +163,34 @@ def create_unified_scorefile(score_file: Path) -> pd.DataFrame:
     print(f"[SCRIPT] Writing {len(final_df)} variants to unified score file: {out_path.name}", flush=True)
     return final_df
 
+def _extract_variants_processed(log_text: str, tool_name: str) -> int:
+    """Parses tool logs to find the number of variants used in scoring."""
+    tool_name_key = tool_name.split('_')[0]
+    if 'gnomon' in tool_name_key:
+        # Gnomon log example: > Preparation complete in ... Found 64 individuals to score and 15880 overlapping variants
+        match = re.search(r'Found \d+ individuals to score and (\d+) overlapping variants', log_text)
+    elif 'plink2' in tool_name_key:
+        # PLINK2 log example: --score: 15880 variants processed.
+        match = re.search(r'--score: (\d+) variants processed', log_text)
+    elif 'pylink' in tool_name_key:
+        # PyLink log example: > Processed 15880 variants found in score file.
+        match = re.search(r'> Processed (\d+) variants found in score file', log_text)
+    else:
+        return 0
+    return int(match.group(1)) if match else 0
+
 def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
-    """Analyzes and compares results from multiple tool runs for a single PGS."""
+    """
+    Analyzes and compares results from multiple tool runs for a single PGS.
+    This includes calculating score correlations and summarizing missingness.
+    """
     summary = {'pgs_id': pgs_id, 'success': False}
-    data_frames = []
-    
+    all_dfs = []
+
     for res in pgs_run_results:
-        if not res['success']: continue
+        if not res['success']:
+            continue
+        
         tool_name = res['tool'].split('_')[0]
         
         # Determine the correct output file path based on the tool
@@ -182,35 +203,67 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
         else:
             continue
 
-        if not path.exists(): continue
-        
+        if not path.exists():
+            continue
+
         try:
+            # Read the raw output file, handling variable whitespace
             df_raw = pd.read_csv(path, sep=r'\s+')
-            id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
-            score_col = next((c for c in df_raw.columns if '_AVG' in c), None)
-            if not score_col: raise KeyError(f"{tool_name.upper()} _AVG score column not found")
             
-            df = df_raw[[id_col, score_col]].rename(columns={id_col: 'IID', score_col: f'SCORE_{tool_name}'})
-            df[f'SCORE_{tool_name}'] = pd.to_numeric(df[f'SCORE_{tool_name}'], errors='coerce')
-            data_frames.append(df)
+            # Standardize the individual ID column name
+            id_col = '#IID' if '#IID' in df_raw.columns else 'IID'
+            df_proc = df_raw[[id_col]].rename(columns={id_col: 'IID'})
+
+            # --- Process Score Column ---
+            score_col_name = next((c for c in df_raw.columns if '_AVG' in c), None)
+            if not score_col_name:
+                raise KeyError(f"{tool_name.upper()} _AVG score column not found")
+            
+            df_proc[f'SCORE_{tool_name}'] = pd.to_numeric(df_raw[score_col_name], errors='coerce')
+
+            # --- Process Missingness Information ---
+            if tool_name == 'gnomon':
+                # Gnomon provides a direct missingness percentage column
+                missing_col_name = next((c for c in df_raw.columns if '_MISSING_PCT' in c), None)
+                if not missing_col_name:
+                    raise KeyError(f"Gnomon _MISSING_PCT column not found")
+                df_proc[f'MISSING_PCT_{tool_name}'] = pd.to_numeric(df_raw[missing_col_name], errors='coerce')
+            else:
+                # For plink2/pylink, calculate missingness from ALLELE_CT and total variants from logs
+                total_variants = _extract_variants_processed(res['stdout'], res['tool'])
+                if total_variants > 0 and 'ALLELE_CT' in df_raw.columns:
+                    # Missingness % = (1 - (variants_observed / variants_total)) * 100
+                    # variants_observed = ALLELE_CT / 2 (since ALLELE_CT is count of alleles, not loci)
+                    df_proc[f'MISSING_PCT_{tool_name}'] = (1 - (pd.to_numeric(df_raw['ALLELE_CT'], errors='coerce') / 2) / total_variants) * 100.0
+                else:
+                    # If information is not available, fill with Not a Number
+                    df_proc[f'MISSING_PCT_{tool_name}'] = np.nan
+            
+            all_dfs.append(df_proc)
+
         except Exception as e:
             print(f"  > [ANALYSIS_ERROR] Failed to parse {tool_name} for {pgs_id}: {e}", flush=True)
 
-    if len(data_frames) < 2: return summary
+    # Return early if not enough data could be processed for a comparison
+    if len(all_dfs) < 2:
+        return summary
     
-    merged_df = data_frames[0]
-    for df_to_merge in data_frames[1:]:
-        merged_df = pd.merge(merged_df, df_to_merge, on='IID', how='inner')
+    # Merge all processed dataframes into a single report
+    from functools import reduce
+    merged_df = reduce(lambda left, right: pd.merge(left, right, on='IID', how='inner'), all_dfs)
     
+    # Clean up and prepare for summary
     score_cols = sorted([c for c in merged_df.columns if c.startswith('SCORE_')])
     merged_df.dropna(subset=score_cols, inplace=True)
     
-    if len(score_cols) < 2 or merged_df.empty: return summary
+    if len(score_cols) < 2 or merged_df.empty:
+        return summary
     
+    # Populate the summary dictionary
+    summary['report_df'] = merged_df
     summary['correlation_matrix'] = merged_df[score_cols].corr()
     summary['success'] = True
     return summary
-
 def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
     """Helper for the bisection algorithm. Runs Gnomon & PLINK2 on a variant subset and returns their correlation."""
     temp_score_path = CI_WORKDIR / f"_temp_score_{iteration_name}.tsv"
@@ -408,15 +461,35 @@ def print_final_summary(summary_data: list):
         pgs_id = pgs_summary['pgs_id']
         print_header(f"Analysis for {pgs_id}", "=")
         if not pgs_summary.get('success', False):
-            print(f"❌ Analysis for {pgs_id} could not be completed.")
+            print(f"❌ Analysis for {pgs_id} could not be completed due to lack of successful tool runs.")
             continue
         
+        report_df = pgs_summary.get('report_df')
+        if report_df is None or report_df.empty:
+            print(f"❌ Analysis for {pgs_id} could not be completed due to empty results after processing.")
+            continue
+        
+        # --- Correlation Report ---
         corr_matrix = pgs_summary.get('correlation_matrix')
         if corr_matrix is not None:
             num_tools = corr_matrix.shape[0]
             print(f"✅ Concordance established using {num_tools} tools.")
             print_debug_header("Score Correlation Matrix")
             print(corr_matrix.to_markdown(floatfmt=".8f"))
+        
+        # --- Missingness Report ---
+        missing_cols = sorted([c for c in report_df.columns if c.startswith('MISSING_PCT_')])
+        if missing_cols:
+            missing_stats = []
+            for col in missing_cols:
+                tool_name = col.replace('MISSING_PCT_', '')
+                # Calculate mean, handling potential NaN values gracefully
+                avg_missing = report_df[col].mean()
+                missing_stats.append({'Tool': tool_name, 'Average Missingness (%)': avg_missing})
+            
+            if missing_stats:
+                print_debug_header("Missingness Report (Average across all individuals)")
+                print(pd.DataFrame(missing_stats).to_markdown(index=False, floatfmt=".4f"))
 
 if __name__ == '__main__':
     main()
