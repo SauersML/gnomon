@@ -790,7 +790,9 @@ impl KWayMergeIterator {
 
         // Populate the buffer with all scores from this line.
         for (i, weight_str) in parts.enumerate() {
-            if let Ok(weight) = weight_str.parse::<f32>() {
+            // Trim whitespace from the string before parsing. This is critical because the
+            // last field on a line read by `read_line` will include the trailing newline
+            if let Ok(weight) = weight_str.trim().parse::<f32>() {
                 // Use the pre-parsed column map to get the global index.
                 if let Some(&score_column_index) = column_map.get(i) {
                     stream.line_buffer.push_back((weight, score_column_index));
