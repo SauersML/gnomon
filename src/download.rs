@@ -51,7 +51,6 @@ pub fn resolve_and_download_scores(
         scores_dir.display()
     );
 
-    // Use a BTreeSet to get a unique, sorted list of IDs automatically.
     let requested_pgs_ids: BTreeSet<String> = score_arg
         .split(',')
         .map(|s| s.trim().to_string())
@@ -62,7 +61,6 @@ pub fn resolve_and_download_scores(
         return Err("No valid PGS IDs provided in --score argument.".into());
     }
 
-    // Validate IDs before doing any work.
     for id in &requested_pgs_ids {
         if !id.starts_with("PGS") {
             return Err(Box::new(DownloadError::InvalidId(id.clone())));
@@ -70,53 +68,65 @@ pub fn resolve_and_download_scores(
     }
 
     let mut existing_native_paths = Vec::new();
+    let mut files_to_reformat = Vec::new();
     let mut ids_to_download = Vec::new();
 
+    // Check for existing files: final .gnomon.tsv or intermediate .txt.gz
     for id in &requested_pgs_ids {
         let native_path = scores_dir.join(format!("{}.gnomon.tsv", id));
+        let temp_gz_path = scores_dir.join(format!("{}.txt.gz", id));
+
         if native_path.exists() {
             existing_native_paths.push(native_path);
+        } else if temp_gz_path.exists() {
+            eprintln!("> Found existing downloaded file for {}. Skipping download.", id);
+            files_to_reformat.push((temp_gz_path, native_path));
         } else {
             ids_to_download.push(id.clone());
         }
     }
 
     eprintln!(
-        "> Found {} existing score files. Need to download {}.",
+        "> Found {} existing reformatted score files. Found {} existing downloaded files. Need to download {}.",
         existing_native_paths.len(),
+        files_to_reformat.len(),
         ids_to_download.len()
     );
 
-    // --- Stage 2: Conditional Download & Reformat ---
-    if ids_to_download.is_empty() {
-        eprintln!("> All required score files are already present.");
+    // --- Stage 2: Conditional Download ---
+    if !ids_to_download.is_empty() {
+        let newly_downloaded = download_missing_files(&ids_to_download, scores_dir)?;
+        files_to_reformat.extend(newly_downloaded);
+    }
+
+    // --- Stage 3: Conditional Reformatting ---
+    if files_to_reformat.is_empty() {
+        eprintln!("> All required score files are already present and converted.");
         return Ok(existing_native_paths);
     }
 
-    let downloaded_files = download_missing_files(&ids_to_download, scores_dir)?;
-
     eprintln!(
-        "> Reformatting {} downloaded files into gnomon-native format...",
-        downloaded_files.len()
+        "> Reformatting {} score files into gnomon-native format...",
+        files_to_reformat.len()
     );
 
-    let new_native_paths = downloaded_files
+    let new_native_paths = files_to_reformat
         .into_par_iter()
-        .map(|(temp_gz_path, final_native_path)| -> Result<PathBuf, DownloadError> {
-            reformat::reformat_pgs_file(&temp_gz_path, &final_native_path)
+        .map(|(input_path, final_native_path)| -> Result<PathBuf, DownloadError> {
+            reformat::reformat_pgs_file(&input_path, &final_native_path)
                 .map_err(DownloadError::Reformat)?;
 
-            // Clean up the compressed file immediately after successful reformatting.
-            fs::remove_file(&temp_gz_path)
-                .map_err(|e| DownloadError::Io(e, temp_gz_path.clone()))?;
+            // Clean up the original downloaded file immediately after successful reformatting.
+            fs::remove_file(&input_path)
+                .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
 
             Ok(final_native_path)
         })
         .collect::<Result<Vec<PathBuf>, _>>()?;
 
-    eprintln!("> Download and reformatting complete.");
+    eprintln!("> Reformatting complete.");
 
-    // --- Stage 3: Final Aggregation ---
+    // --- Stage 4: Final Aggregation ---
     existing_native_paths.extend(new_native_paths);
     Ok(existing_native_paths)
 }
