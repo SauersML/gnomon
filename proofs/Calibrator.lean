@@ -1,16 +1,16 @@
-
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
-import Mathlib.Analysis.SpecialFunctions.Log.Real
+import Mathlib.Analysis.SpecialFunctions.Log.Basic
 import Mathlib.Data.Fin.Basic
-import Mathlib.LinearAlgebra.Matrix.General -- For Matrix.rank
+import Mathlib.Data.Matrix.Rank          -- For Matrix.rank
+import Mathlib.Data.Matrix.Basic         -- Basic matrix operations
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
-import Mathlib.MeasureTheory.Measure.Pi
+import Mathlib.MeasureTheory.Constructions.Pi
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
-import Mathlib.Probability.Distributions.Gaussian -- For Measure.gaussian
+import Mathlib.Probability.Distributions.Gaussian  -- For Measure.gaussian
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Probability.Integration
 import Mathlib.Probability.Moments.Variance
