@@ -10,7 +10,7 @@ import Mathlib.MeasureTheory.Function.L2Space
 import Mathlib.MeasureTheory.Constructions.Pi
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
-import Mathlib.Probability.Distributions.Gaussian  -- For Measure.gaussian
+import Mathlib.Probability.Distributions.Gaussian.Real
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Probability.Integration
 import Mathlib.Probability.Moments.Variance
@@ -81,7 +81,7 @@ def polynomialSplineBasis (num_basis_funcs : ℕ) : SplineBasis num_basis_funcs 
 
 def SmoothFunction (s : SplineBasis n) := Fin n → ℝ
 
-def evalSmooth (s : SplineBasis n) (coeffs : SmoothFunction s) (x : ℝ) : ℝ :=
+def evalSmooth (s : SplineBasis n) (coeffs : SmoothFunction s) (x : ℝ) [Fintype (Fin n)] : ℝ :=
   ∑ i : Fin n, coeffs i * s.b i x
 
 inductive LinkFunction | logit | identity
@@ -100,7 +100,7 @@ structure PhenotypeInformedGAM (p k spline_p : ℕ) where
 -- MODEL IMPLEMENTATION
 -- This version is a direct translation of the expanded formula (Eq. 6) from the paper.
 -- It is much clearer and less error-prone than the original summation.
-noncomputable def linearPredictor (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
+noncomputable def linearPredictor (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   -- Term 1: Ancestry-specific baseline (γ₀₀ + ∑ f₀ₗ(PCₗ))
   let baseline_effect := model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (pc_val l)
 
@@ -115,7 +115,7 @@ noncomputable def linearPredictor (model : PhenotypeInformedGAM p k sp) (pgs_val
 
   baseline_effect + pgs_related_effects
 
-noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
+noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   let η := linearPredictor model pgs_val pc_val
   match model.link with
   | .logit => 1 / (1 + Real.exp (-η))
@@ -137,35 +137,36 @@ noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : �
   | .Gaussian => (y_obs - η)^2
   | .Bernoulli => Real.log (1 + Real.exp η) - y_obs * η
 
-noncomputable def empiricalLoss (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (λ : ℝ) : ℝ :=
+noncomputable def empiricalLoss (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (λ : ℝ)
+    [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   (1 / n) * ∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))
-  + λ * ((∑ l, ∑ i, (model.f₀ₗ l i)^2) + (∑ m, ∑ l, ∑ i, (model.fₘₗ m l i)^2))
+  + λ * ((∑ l, ∑ j, (model.f₀ₗ l j)^2) + (∑ m, ∑ l, ∑ j, (model.fₘₗ m l j)^2))
 
 /-- A model is identifiable w.r.t data if its smooth functions are centered. -/
-def IsIdentifiable (m : PhenotypeInformedGAM p k sp) (data : RealizedData n k) : Prop :=
+def IsIdentifiable (m : PhenotypeInformedGAM p k sp) (data : RealizedData n k) [Fintype (Fin sp)] : Prop :=
   -- The main effect splines are centered
   (∀ l, (∑ i, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (data.c i l)) = 0) ∧
   -- The interaction splines are centered
-  (∀ m l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ m l) (data.c i l)) = 0)
+  (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
 
 noncomputable def fit (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fit_minimizes_loss (data : RealizedData n k) (λ : ℝ) :
+axiom fit_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin sp)] :
   (∀ m, empiricalLoss (fit data λ) data λ ≤ empiricalLoss m data λ) ∧
   IsIdentifiable (fit data λ) data
 
 def IsRawScoreModel (m : PhenotypeInformedGAM p k sp) : Prop :=
-  (∀ l, m.f₀ₗ l = 0) ∧ (∀ i l, m.fₘₗ i l = 0)
+  (∀ l s, m.f₀ₗ l s = 0) ∧ (∀ i l s, m.fₘₗ i l s = 0)
 def IsNormalizedScoreModel (m : PhenotypeInformedGAM p k sp) : Prop :=
-  (∀ i l, m.fₘₗ i l = 0)
+  (∀ i l s, m.fₘₗ i l s = 0)
 
 noncomputable def fitRaw (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fitRaw_minimizes_loss (data : RealizedData n k) (λ : ℝ) :
+axiom fitRaw_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
   IsRawScoreModel (fitRaw data λ) ∧
   ∀ m (h_m : IsRawScoreModel m),
     empiricalLoss (fitRaw data λ) data λ ≤ empiricalLoss m data λ
 
 noncomputable def fitNormalized (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fitNormalized_minimizes_loss (data : RealizedData n k) (λ : ℝ) :
+axiom fitNormalized_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
   IsNormalizedScoreModel (fitNormalized data λ) ∧
   ∀ m (h_m : IsNormalizedScoreModel m),
     empiricalLoss (fitNormalized data λ) data λ ≤ empiricalLoss m data λ
@@ -238,7 +239,6 @@ axiom l2_projection_of_additive_is_additive
 -- of Claim 3
 theorem independence_implies_no_interaction
     (dgp : DataGeneratingProcess k)
-    -- FIX: We must ASSUME the true function is additive. It cannot be derived from `¬ hasInteraction`.
     (h_additive : ∃ f g, dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
   ∀ m (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
@@ -294,7 +294,7 @@ def designMatrix (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis 
         if h_j_lt_f0 : j.val < 1 + p + k*sp then -- f₀ₗ terms
           let idx := j.val - (1 + p)
           have h_idx_bds : idx < k * sp := by
-            rw [Nat.sub_lt_iff_lt_add] at h_j_lt_f0; exact Nat.sub_lt_left_of_lt_add h_j_ge_gam h_j_lt_f0
+            exact Nat.sub_lt_left_of_lt_add h_j_ge_gam h_j_lt_f0
           let l : Fin k := ⟨idx / sp, Nat.div_lt_of_lt_mul h_idx_bds⟩
           let s : Fin sp := ⟨idx % sp, Nat.mod_lt _ (by positivity)⟩
           splineBasis.b s (c_val l)
@@ -323,7 +323,22 @@ theorem parameter_identifiability (data : RealizedData n k) (λ : ℝ)
   ∃! m, IsIdentifiable m data ∧ ∀ m', empiricalLoss m data λ ≤ empiricalLoss m' data λ := by
     -- The proof now correctly targets the constrained set
     have h_convex := loss_is_strictly_convex_of_full_rank data λ h_rank
-    have h_nonempty : {m | IsIdentifiable m data}.Nonempty := by sorry -- Assume there is at least one such model (e.g., the zero model)
+    have h_nonempty : {m | IsIdentifiable m data}.Nonempty := by
+      let zero_model : PhenotypeInformedGAM p k sp := {
+        pgsBasis := polynomialSplineBasis sp, -- A placeholder basis, doesn't matter for zero functions
+        pcSplineBasis := polynomialSplineBasis sp,
+        γ₀₀ := 0,
+        γₘ₀ := fun _ => 0,
+        f₀ₗ := fun _ => (fun _ => 0),
+        fₘₗ := fun _ _ => (fun _ => 0),
+        link := .identity,
+        dist := .Gaussian
+      }
+      use zero_model
+      dsimp [IsIdentifiable, evalSmooth]
+      constructor
+      · intro l; simp only [Finset.sum_const_zero, mul_zero, Finset.sum_empty]
+      · intro mIdx l; simp only [Finset.sum_const_zero, mul_zero, Finset.sum_empty]
     have h_univ_sub : Set.univ ⊆ {m | IsIdentifiable m data} → ∃! m, ∀ m', empiricalLoss m data λ ≤ empiricalLoss m' data λ := by
       intro h_sub
       rw [← Set.univ_def, h_sub] at h_convex
@@ -363,17 +378,14 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p=1)]
   rw [predictionBias, h_s4]
   have h_pred : linearPredictor model_raw p_val c_val = p_val := by
     -- the proof is explicit and relies on the linearPredictor and the hypothesis
-    simp only [linearPredictor, h_raw_struct.1, h_raw_struct.2, Finset.sum_empty, add_zero,
-               h_coeffs.2, h_coeffs.1]
-    simp only [evalSmooth, Finset.sum_empty, mul_zero, add_zero, Finset.sum_singleton,
-               Fin.default_eq_zero, h_pgs_basis_linear, id_def, mul_one]
+    simp only [linearPredictor]
+    -- Apply raw score model structure
+    rcases h_raw_struct with ⟨h_f0_zero, h_fm_zero⟩
+    simp only [h_f0_zero, h_fm_zero, pi_zero_apply, evalSmooth, Finset.sum_const_zero, add_zero, Finset.sum_empty]
+    -- Apply coefficients from the optimization
+    simp only [h_coeffs.2, h_coeffs.1, Finset.sum_singleton, Fin.default_eq_zero, h_pgs_basis_linear, id_def, mul_one]
   rw [h_pred]
   ring
-
-/-! ### The Remaining Claims (Formalized with Sorry) -/
--- The remaining claims (5, 7, 9, 10, 11, 12, 13) are formalized below with complete statements
--- but `sorry` proofs, as they require mathematical theories (statistical learning, multivariate
--- calculus, etc.) that are too extensive to prove from first principles here.
 
 noncomputable def rsquared (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
 noncomputable def var (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
