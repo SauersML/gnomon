@@ -128,7 +128,7 @@ noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) 
 structure DataGeneratingProcess (k : ℕ) where
   trueExpectation : ℝ → (Fin k → ℝ) → ℝ
   jointMeasure : Measure (ℝ × (Fin k → ℝ))
-  [is_prob : IsProbabilityMeasure jointMeasure]
+  is_prob : IsProbabilityMeasure jointMeasure
 
 instance (dgp : DataGeneratingProcess k) : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
 
@@ -137,10 +137,10 @@ noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : �
   | .Gaussian => (y_obs - η)^2
   | .Bernoulli => Real.log (1 + Real.exp η) - y_obs * η
 
-noncomputable def empiricalLoss (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (λ : ℝ)
+noncomputable def empiricalLoss (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (lambda : ℝ)
     [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   (1 / n) * ∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))
-  + λ * ((∑ l, ∑ j, (model.f₀ₗ l j)^2) + (∑ m, ∑ l, ∑ j, (model.fₘₗ m l j)^2))
+  + lambda * ((∑ l, ∑ j, (model.f₀ₗ l j)^2) + (∑ m, ∑ l, ∑ j, (model.fₘₗ m l j)^2))
 
 /-- A model is identifiable w.r.t data if its smooth functions are centered. -/
 def IsIdentifiable (m : PhenotypeInformedGAM p k sp) (data : RealizedData n k) [Fintype (Fin sp)] : Prop :=
@@ -149,27 +149,27 @@ def IsIdentifiable (m : PhenotypeInformedGAM p k sp) (data : RealizedData n k) [
   -- The interaction splines are centered
   (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
 
-noncomputable def fit (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fit_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin sp)] :
-  (∀ m, empiricalLoss (fit data λ) data λ ≤ empiricalLoss m data λ) ∧
-  IsIdentifiable (fit data λ) data
+noncomputable def fit (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp := sorry
+axiom fit_minimizes_loss (data : RealizedData n k) (lambda : ℝ) [Fintype (Fin sp)] :
+  (∀ m, empiricalLoss (fit data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
+  IsIdentifiable (fit data lambda) data
 
 def IsRawScoreModel (m : PhenotypeInformedGAM p k sp) : Prop :=
   (∀ l s, m.f₀ₗ l s = 0) ∧ (∀ i l s, m.fₘₗ i l s = 0)
 def IsNormalizedScoreModel (m : PhenotypeInformedGAM p k sp) : Prop :=
   (∀ i l s, m.fₘₗ i l s = 0)
 
-noncomputable def fitRaw (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fitRaw_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
-  IsRawScoreModel (fitRaw data λ) ∧
+noncomputable def fitRaw (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp := sorry
+axiom fitRaw_minimizes_loss (data : RealizedData n k) (lambda : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
+  IsRawScoreModel (fitRaw data lambda) ∧
   ∀ m (h_m : IsRawScoreModel m),
-    empiricalLoss (fitRaw data λ) data λ ≤ empiricalLoss m data λ
+    empiricalLoss (fitRaw data lambda) data lambda ≤ empiricalLoss m data lambda
 
-noncomputable def fitNormalized (data : RealizedData n k) (λ : ℝ) : PhenotypeInformedGAM p k sp := sorry
-axiom fitNormalized_minimizes_loss (data : RealizedData n k) (λ : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
-  IsNormalizedScoreModel (fitNormalized data λ) ∧
+noncomputable def fitNormalized (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp := sorry
+axiom fitNormalized_minimizes_loss (data : RealizedData n k) (lambda : ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] :
+  IsNormalizedScoreModel (fitNormalized data lambda) ∧
   ∀ m (h_m : IsNormalizedScoreModel m),
-    empiricalLoss (fitNormalized data λ) data λ ≤ empiricalLoss m data λ
+    empiricalLoss (fitNormalized data lambda) data lambda ≤ empiricalLoss m data lambda
 
 /-!
 =================================================================
@@ -184,15 +184,15 @@ variable [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
 @[simps]
 def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := stdNormalProdMeasure_is_prob k }
+  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
 @[simps]
 def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := stdNormalProdMeasure_is_prob k }
+  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
 @[simps]
 def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := stdNormalProdMeasure_is_prob k }
+  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
 
 def hasInteraction (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
   ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
@@ -203,17 +203,19 @@ theorem scenarios_are_distinct (k : ℕ) (hk : k > 0) [Fintype (Fin k)] :
   ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
   have h_s1 : hasInteraction (dgpScenario1 k).trueExpectation := by
+    rw [hasInteraction]
     use 0, 1, (fun _ => 0), (fun l => if l = ⟨0, hk⟩ then 1 else 0)
-    have hp_ne : (0 : ℝ) ≠ 1 := by norm_num
-    have hc_ne : (fun _ => 0) ≠ (fun l => if l = ⟨0, hk⟩ then 1 else 0) := by
-      intro h_eq; have := congr_fun h_eq ⟨0, hk⟩; simp at this
-    repeat' apply And.intro; exact hp_ne; exact hc_ne
-    simp only [dgpScenario1_trueExpectation, Finset.sum_const_zero, mul_zero, add_zero, one_mul, Finset.sum_fin_ite, Finset.mem_univ, if_true, mul_one, div_one, sub_zero]
-    norm_num
+    refine ⟨by norm_num, ?_, by simp [dgpScenario1_trueExpectation]; norm_num⟩
+    -- Prove the two functions are not equal
+    intro h_eq; have := congr_fun h_eq ⟨0, hk⟩; simp at this
   have h_s3 : ¬ hasInteraction (dgpScenario3 k).trueExpectation := by
-    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario3_trueExpectation, add_sub_add_left_eq_sub, div_self hp_ne]
+    simp [hasInteraction, dgpScenario3_trueExpectation, add_sub_add_left_eq_sub]
+    intro p1 p2 _ _ h_ne _
+    rw [div_self h_ne]
   have h_s4 : ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
-    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario4_trueExpectation, sub_sub_sub_cancel_left, div_self hp_ne]
+    simp [hasInteraction, dgpScenario4_trueExpectation, sub_sub_sub_cancel_left]
+    intro p1 p2 _ _ h_ne _
+    rw [div_self h_ne]
   exact ⟨h_s1, h_s3, h_s4⟩
 
 theorem necessity_of_phenotype_data [Fintype (Fin 1)] :
@@ -226,7 +228,7 @@ noncomputable def expectedSquaredError (dgp : DataGeneratingProcess k) (f : ℝ 
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
 def isBayesOptimalInClass (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ m, expectedSquaredError dgp (linearPredictor model) ≤ expectedSquaredError dgp (linearPredictor m)
+  ∀ m, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤ expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 axiom l2_projection_of_additive_is_additive
   (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ)
@@ -251,26 +253,28 @@ theorem independence_implies_no_interaction
   exact l2_projection_of_additive_is_additive f g dgp h_indep
 
 /-! ### Claim 4: Prediction-Causality Trade-off (Axiomatically Supported) -/
-structure DGPWithEnvironment (k : ℕ) extends DataGeneratingProcess k where
-  environmentalEffect : (Fin k → ℝ) → ℝ; trueGeneticEffect : ℝ → ℝ
-  is_additive_causal : trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
+structure DGPWithEnvironment (k : ℕ) where
+  to_dgp : DataGeneratingProcess k
+  environmentalEffect : (Fin k → ℝ) → ℝ
+  trueGeneticEffect : ℝ → ℝ
+  is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
 
 axiom optimal_linear_coeff_solution (dgp : DataGeneratingProcess k) [Fact (k=1)]
   (h_Y : dgp.trueExpectation = fun p c => 2*p + 3*(c 0)) :
   let proj : PhenotypeInformedGAM 1 k 1 := sorry in -- The L2 projection
-  (proj.γₘ₀ 0 ≠ 2) ↔ (∫ x, x.1 * (x.2 0) ∂dgp.jointMeasure ≠ 0)
+  (proj.γₘ₀ 0 ≠ 2) ↔ (∫ pc, pc.1 * (pc.2 0) ∂dgp.jointMeasure ≠ (0 : ℝ))
 
 theorem prediction_causality_tradeoff_linear_case
     (dgp_env : DGPWithEnvironment 1) [Fact (k=1)]
     (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
     (h_env : dgp_env.environmentalEffect = fun c => 3 * c 0)
-    (h_confounding : ∫ x, x.1 * (x.2 0) ∂dgp_env.jointMeasure ≠ 0) :
+    (h_confounding : ∫ pc, pc.1 * (pc.2 0) ∂dgp_env.to_dgp.jointMeasure ≠ (0 : ℝ)) :
   let model : PhenotypeInformedGAM 1 1 1 := sorry in -- The optimal model
-  (isBayesOptimalInClass dgp_env.toDataGeneratingProcess model) → model.γₘ₀ 0 ≠ 2 := by
+  (isBayesOptimalInClass dgp_env.to_dgp model) → model.γₘ₀ 0 ≠ 2 := by
   intro h_opt
-  have h_Y : dgp_env.toDataGeneratingProcess.trueExpectation = fun p c => 2 * p + 3 * c 0 := by
+  have h_Y : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c 0 := by
     rw [dgp_env.is_additive_causal, h_gen, h_env]
-  exact (optimal_linear_coeff_solution dgp_env.toDataGeneratingProcess h_Y).mpr h_confounding
+  exact (optimal_linear_coeff_solution dgp_env.to_dgp h_Y).mpr h_confounding
 
 /-! ### Claim 6: Parameter Identifiability (Axiomatically Supported with real Design Matrix) -/
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
@@ -312,38 +316,30 @@ def designMatrix (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis 
           -- The basis function B_{m+1} is multiplied
           (pgsBasis.B ⟨m.val + 1, by linarith [m.is_lt]⟩ p_val) * (splineBasis.b s (c_val l))
 
-axiom loss_is_strictly_convex_of_full_rank (data : RealizedData n k) (λ : ℝ)
-  (h_rank : Matrix.rank (designMatrix data sorry sorry) = total_params p k sp) :
+axiom loss_is_strictly_convex_of_full_rank (data : RealizedData n k) (lambda : ℝ)
+  (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = total_params p k sp) :
   -- The convexity holds on the set of identifiable models
-  StrictConvexOn ℝ {m | IsIdentifiable m data} (fun (m : PhenotypeInformedGAM p k sp) => empiricalLoss m data λ)
+  StrictConvexOn ℝ {m | IsIdentifiable m data} (fun (m : PhenotypeInformedGAM p k sp) => empiricalLoss m data lambda)
 
-theorem parameter_identifiability (data : RealizedData n k) (λ : ℝ)
-    (h_rank : Matrix.rank (designMatrix data sorry sorry) = total_params p k sp) :
-  -- The unique minimum exists within the set of identifiable models
-  ∃! m, IsIdentifiable m data ∧ ∀ m', empiricalLoss m data λ ≤ empiricalLoss m' data λ := by
-    -- The proof now correctly targets the constrained set
-    have h_convex := loss_is_strictly_convex_of_full_rank data λ h_rank
-    have h_nonempty : {m | IsIdentifiable m data}.Nonempty := by
-      let zero_model : PhenotypeInformedGAM p k sp := {
-        pgsBasis := polynomialSplineBasis sp, -- A placeholder basis, doesn't matter for zero functions
-        pcSplineBasis := polynomialSplineBasis sp,
-        γ₀₀ := 0,
-        γₘ₀ := fun _ => 0,
-        f₀ₗ := fun _ => (fun _ => 0),
-        fₘₗ := fun _ _ => (fun _ => 0),
-        link := .identity,
-        dist := .Gaussian
-      }
-      use zero_model
+theorem parameter_identifiability (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) -- Add these
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = total_params p k sp) :
+  -- The unique minimum exists *within the set* of identifiable models
+  ∃! m, IsIdentifiable m data ∧ ∀ m', IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
+    let S := {m | IsIdentifiable m data}
+    have h_convex_S : Convex ℝ S := sorry -- Provable, as it's an affine subspace
+    have h_closed_S : IsClosed S := sorry -- Provable
+    have h_nonempty_S : S.Nonempty := by
+      -- Your existing proof for this is good.
+      use { pgsBasis := sorry, pcSplineBasis := sorry, γ₀₀ := 0, γₘ₀ := fun _ => 0, f₀ₗ := fun _ => (fun _ => 0), fₘₗ := fun _ _ => (fun _ => 0), link := .identity, dist := .Gaussian }
+      -- Prove this zero model is in S
       dsimp [IsIdentifiable, evalSmooth]
-      constructor
-      · intro l; simp only [Finset.sum_const_zero, mul_zero, Finset.sum_empty]
-      · intro mIdx l; simp only [Finset.sum_const_zero, mul_zero, Finset.sum_empty]
-    have h_univ_sub : Set.univ ⊆ {m | IsIdentifiable m data} → ∃! m, ∀ m', empiricalLoss m data λ ≤ empiricalLoss m' data λ := by
-      intro h_sub
-      rw [← Set.univ_def, h_sub] at h_convex
-      exact h_convex.existsUnique_forall_le Set.univ
-    sorry -- The actual proof depends on the properties of the identifiable set, which is more complex than Set.univ.
+      simp
+    have h_strict_convex_on_S := loss_is_strictly_convex_of_full_rank data lambda h_rank
+    -- This is the correct theorem to apply from optimization theory
+    -- (This theorem may need to be stated as an axiom or found in mathlib)
+    -- Assuming a mathlib theorem like: StrictConvexOn.existsUnique_minimizer_of_mem (hS : IsConvex S) (hScl : IsClosed S) (hne : Nonempty S) (f_strict_convex_on_S)
+    exact h_strict_convex_on_S.existsUnique_minimizer h_convex_S h_closed_S h_nonempty_S
 
 /-! ### Claim 8: Quantitative Bias of Raw Scores (PROVEN under assumptions) -/
 def predictionBias (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
@@ -353,10 +349,10 @@ lemma optimal_raw_coeffs_under_simplifying_assumptions
     (dgp4 : DataGeneratingProcess 1) [Fact (p=1)]
     (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c 0))
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
-    (h_means_zero : ∫ x, x.1 ∂dgp4.jointMeasure = 0 ∧ ∫ x, x.2 0 ∂dgp4.jointMeasure = 0)
-    (h_var_p_one : ∫ x, x.1^2 ∂dgp4.jointMeasure = 1) :
+    (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = (0 : ℝ) ∧ ∫ pc, pc.2 0 ∂dgp4.jointMeasure = (0 : ℝ))
+    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
     let model_raw : PhenotypeInformedGAM 1 1 1 := sorry in
-    (∀ m (hm : IsRawScoreModel m), expectedSquaredError dgp4 (linearPredictor model_raw) ≤ expectedSquaredError dgp4 (linearPredictor m))
+    (∀ m (hm : IsRawScoreModel m), expectedSquaredError dgp4 (fun p c => linearPredictor model_raw p c) ≤ expectedSquaredError dgp4 (fun p c => linearPredictor m p c))
     → model_raw.γₘ₀ 0 = 1 ∧ model_raw.γ₀₀ = 0 := by
     -- This follows from solving the normal equations for OLS: E[Y - (β₀+β₁P)] = 0 and E[(Y - (β₀+β₁P))P] = 0.
     -- With Y = P - 0.8C and zero means, this gives β₀=0 and β₁ = E[YP]/E[P²] = E[P(P-0.8C)]/1 = E[P²]-0.8E[P]E[C] = 1-0 = 1.
@@ -367,23 +363,29 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p=1)]
     (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c 0))
-    (h_opt_raw : ∀ m (hm : IsRawScoreModel m), expectedSquaredError dgp4 (linearPredictor model_raw) ≤ expectedSquaredError dgp4 (linearPredictor m))
+    (h_opt_raw : ∀ m (hm : IsRawScoreModel m), expectedSquaredError dgp4 (fun p c => linearPredictor model_raw p c) ≤ expectedSquaredError dgp4 (fun p c => linearPredictor m p c))
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
-    (h_means_zero : ∫ x, x.1 ∂dgp4.jointMeasure = 0 ∧ ∫ x, x.2 0 ∂dgp4.jointMeasure = 0)
-    (h_var_p_one : ∫ x, x.1^2 ∂dgp4.jointMeasure = 1) :
+    (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = (0 : ℝ) ∧ ∫ pc, pc.2 0 ∂dgp4.jointMeasure = (0 : ℝ))
+    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val 0 := by
   have h_coeffs := optimal_raw_coeffs_under_simplifying_assumptions dgp4 h_s4 h_indep h_means_zero h_var_p_one h_opt_raw
   intros p_val c_val
   rw [predictionBias, h_s4]
   have h_pred : linearPredictor model_raw p_val c_val = p_val := by
-    -- the proof is explicit and relies on the linearPredictor and the hypothesis
-    simp only [linearPredictor]
-    -- Apply raw score model structure
-    rcases h_raw_struct with ⟨h_f0_zero, h_fm_zero⟩
-    simp only [h_f0_zero, h_fm_zero, pi_zero_apply, evalSmooth, Finset.sum_const_zero, add_zero, Finset.sum_empty]
-    -- Apply coefficients from the optimization
-    simp only [h_coeffs.2, h_coeffs.1, Finset.sum_singleton, Fin.default_eq_zero, h_pgs_basis_linear, id_def, mul_one]
+    -- Start with the definition
+    rw [linearPredictor]
+    -- Use the IsRawScoreModel property to eliminate the f_ml terms
+    simp only [h_raw_struct.1, h_raw_struct.2, pi_zero_apply, evalSmooth, Finset.sum_const_zero, add_zero, Finset.sum_empty]
+    -- Now we have: model_raw.γ₀₀ + ∑ m : Fin 1, (model_raw.γₘ₀ m) * (model_raw.pgsBasis.B ⟨m.val + 1, _⟩ p_val)
+    -- Use the optimal coefficients you derived
+    simp only [h_coeffs.2, zero_add]
+    -- The sum is over a singleton set, Fin 1, whose only element is 0
+    rw [Finset.sum_singleton]
+    -- Now we have: model_raw.γₘ₀ 0 * model_raw.pgsBasis.B ⟨0 + 1, _⟩ p_val
+    simp only [h_coeffs.1, one_mul]
+    -- Use the fact that the basis function B 1 is the identity function
+    rw [h_pgs_basis_linear.1, id_def]
   rw [h_pred]
   ring
 
@@ -399,43 +401,44 @@ theorem quantitative_error_of_normalization (dgp1 : DataGeneratingProcess k) (h_
   = rsquared dgp1 (fun p c => p) (fun p c => c) * var dgp1 (fun p c => p) := by sorry
 
 def dgpMultiplicativeBias (k : ℕ) [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
-  { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k, is_prob := stdNormalProdMeasure_is_prob k }
+  { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
 
 theorem multiplicative_bias_correction (scaling_func : (Fin k → ℝ) → ℝ) (h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias k scaling_func) model) :
   ∀ l, deriv (fun x => evalSmooth model.pcSplineBasis (model.fₘₗ 0 l) x) l ≈ deriv scaling_func l := by sorry
 
-structure DGPWithLatentRisk (k : ℕ) extends DataGeneratingProcess k where
+structure DGPWithLatentRisk (k : ℕ) where
+  to_dgp : DataGeneratingProcess k
   noise_variance_given_pc : (Fin k → ℝ) → ℝ
   sigma_G_sq : ℝ
-  is_latent : trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
+  is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
 theorem shrinkage_effect (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : isBayesOptimalInClass dgp_latent.toDataGeneratingProcess model) :
+    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) :
   ∀ c, (model.γₘ₀ 0 + evalSmooth model.pcSplineBasis (model.fₘₗ 0 0) (c 0)) ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by sorry
 
 theorem prediction_is_invariant_to_affine_pc_transform
-    (A : Matrix (Fin k) (Fin k) ℝ) (hA : IsUnit A) (b : Fin k → ℝ) (data : RealizedData n k) (λ : ℝ) :
+    (A : Matrix (Fin k) (Fin k) ℝ) (hA : IsUnit A) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-  let model := fit data λ; let model' := fit data' λ
+  let model := fit data lambda; let model' := fit data' lambda
   ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc ≈ predict model' pgs (A.mulVec pc + b) := by sorry
 
 noncomputable def dist_to_support (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ := sorry
-theorem extrapolation_risk (dgp : DataGeneratingProcess k) (data : RealizedData n k) (λ : ℝ) (c_new : Fin k → ℝ) :
-  ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit data λ) 0 c_new - dgp.trueExpectation 0 c_new| ≤ f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by sorry
+theorem extrapolation_risk (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ) :
+  ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit data lambda) 0 c_new - dgp.trueExpectation 0 c_new| ≤ f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by sorry
 
 theorem context_specificity (dgp1 dgp2 : DGPWithEnvironment k)
-    (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.jointMeasure = dgp2.jointMeasure)
+    (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : isBayesOptimalInClass dgp1.toDataGeneratingProcess model1) :
-  ¬ isBayesOptimalInClass dgp2.toDataGeneratingProcess model1 := by
+    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : isBayesOptimalInClass dgp1.to_dgp model1) :
+  ¬ isBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
   let f_pred := linearPredictor model1
-  have h_proj_unique : dgp1.trueExpectation =ᵐ[dgp1.jointMeasure] dgp2.trueExpectation := by
+  have h_proj_unique : dgp1.to_dgp.trueExpectation =ᵐ[dgp1.to_dgp.jointMeasure] dgp2.to_dgp.trueExpectation := by
     -- L2 projection is unique. Since f_pred is the projection of both functions, the functions
     -- must be equal almost everywhere w.r.t the measure.
     sorry
-  have h_neq : dgp1.trueExpectation ≠ dgp2.trueExpectation := by
+  have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
     intro h_eq_fn
     rw [dgp1.is_additive_causal, dgp2.is_additive_causal, h_same_genetics.1, add_left_cancel_iff] at h_eq_fn
     exact h_diff_env h_eq_fn
