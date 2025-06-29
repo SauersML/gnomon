@@ -217,23 +217,16 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let resolver = move |line: &str| -> Result<Option<SortableLine>, ReformatError> {
         let fields: Vec<&str> = line.split('\t').collect();
 
-        // This helper closure safely extracts and parses coordinates from a given
-        // pair of column indices. It returns `None` if the columns don't exist,
-        // are empty, or fail to parse into a valid key.
-        let get_key = |c_idx, p_idx| {
-            if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
-                // The `fields.get()` call returns an `Option<&&str>`. We bind the inner `&&str`
-                // to a variable (e.g., `chr_str_ref`). To call `.is_empty()`, which is a method
-                // on `str`, we must explicitly dereference the `&&str` to a `&str` using the
-                // `*` operator. This resolves the type ambiguity for the compiler.
-                if let (Some(chr_str_ref), Some(pos_str_ref)) = (fields.get(chr_idx), fields.get(pos_idx)) {
-                    if !(**chr_str_ref).is_empty() && !(**pos_str_ref).is_empty() {
-                        return parse_key(chr_str_ref, pos_str_ref).ok();
-                    }
-                }
-            }
-            None
-        };
+	let get_key = |c_idx: Option<usize>, p_idx: Option<usize>| -> Option<(u8, u32)> {
+	    if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
+	        if let (Some(&chr), Some(&pos)) = (fields.get(chr_idx), fields.get(pos_idx)) {
+	            if !chr.is_empty() && !pos.is_empty() {
+	                return parse_key(chr, pos).ok();
+	            }
+	        }
+	    }
+	    None
+	};
 
         // This is the core logic, applying the pre-determined strategy.
         let key = match strategy {
