@@ -15,11 +15,12 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::sync::Mutex;
+use dashmap::DashSet;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -787,21 +788,31 @@ fn resolve_complex_variants(
 ) -> Result<(), PipelineError> {
     let num_scores = prep_result.score_names.len();
 
-    // A thread-safe set to track which (person, locus) pairs have already been warned about,
-    // preventing console spam. The key is a tuple of the person's output index and the
-    // first BIM row index of the complex locus, which serves as a stable ID for the locus.
-    let warned_pairs = Mutex::new(AHashSet::<(usize, BimRowIndex)>::new());
+    // Use a high-performance concurrent DashSet. This uses fine-grained
+    // locking internally to obliterate contention when printing warnings.
+    let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
+
+    // Use a lock-free atomic flag for the hot path check,
+    // and a Mutex only for storing the *first* error encountered.
+    let fatal_error_occurred = AtomicBool::new(false);
+    let fatal_error_storage = Mutex::new(None::<PipelineError>);
 
     final_scores
         .par_chunks_mut(num_scores)
         .zip(final_missing_counts.par_chunks_mut(num_scores))
         .enumerate()
-        .try_for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+        // Use `for_each` to prevent the deadlock caused by combining a lock with `try_for_each`.
+        .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+            // FAST PATH: This is a single, lock-free atomic read. If another thread
+            // has failed, we exit this iteration immediately without any blocking.
+            if fatal_error_occurred.load(Ordering::Relaxed) {
+                return;
+            }
+
             let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
             for group_rule in &prep_result.complex_rules {
                 // --- Step 1: Gather Evidence ---
-                // Find all non-missing genotype interpretations for this person at this complex locus.
                 let mut valid_interpretations =
                     Vec::with_capacity(group_rule.possible_contexts.len());
 
@@ -813,16 +824,14 @@ fn resolve_complex_variants(
                         original_fam_idx,
                     );
 
-                    // A genotype of `0b01` is defined as missing in the PLINK spec.
-                    if packed_geno != 0b01 {
+                    if packed_geno != 0b01 { // 0b01 is the PLINK "missing" code
                         valid_interpretations.push((packed_geno, context));
                     }
                 }
 
                 // --- Step 2: Apply Decision Policy ---
                 match valid_interpretations.len() {
-                    // Case A: No valid genotypes found for this locus. The person is missing data here.
-                    0 => {
+                    0 => { // Case A: No valid genotypes found for this locus.
                         let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                         for score_info in &group_rule.score_applications {
                             counted_cols.insert(score_info.score_column_index);
@@ -831,8 +840,7 @@ fn resolve_complex_variants(
                             person_counts_slice[score_col.0] += 1;
                         }
                     }
-                    // Case B: Exactly one valid genotype found. This is the unambiguous, happy path.
-                    1 => {
+                    1 => { // Case B: Exactly one valid genotype found. Unambiguous happy path.
                         let (winning_geno, winning_context) = valid_interpretations[0];
                         let (_bim_idx, winning_a1, winning_a2) = winning_context;
 
@@ -845,20 +853,14 @@ fn resolve_complex_variants(
                                 continue;
                             }
                             let dosage: f64 = if effect_allele == winning_a1 {
-                                match winning_geno {
-                                    0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!(),
-                                }
+                                match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
                             } else {
-                                match winning_geno {
-                                    0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!(),
-                                }
+                                match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
                             };
                             person_scores_slice[score_col] += dosage * weight;
                         }
                     }
-                    // Case C: A data conflict was detected (multiple non-missing genotypes).
-                    // Apply a tie-breaking heuristic for each score individually.
-                    _ => {
+                    _ => { // Case C: A data conflict was detected.
                         for score_info in &group_rule.score_applications {
                             let matching_interpretations: Vec<_> = valid_interpretations
                                 .iter()
@@ -869,17 +871,12 @@ fn resolve_complex_variants(
                                 .collect();
 
                             match matching_interpretations.len() {
-                                1 => {
-                                    // Heuristic Success: Exactly one of the conflicting genotypes matches the
-                                    // alleles required by this specific score.
-                                    // We destructure to get references to the data, avoiding illegal moves.
+                                1 => { // Heuristic Success
                                     let (winning_geno, winning_context) = matching_interpretations[0];
                                     let (locus_id, winning_a1, winning_a2) = &**winning_context;
-
-                                    // Issue a one-time warning for this person/locus pair.
-                                    // We dereference the `&BimRowIndex` to get a `BimRowIndex` for the key
                                     let warning_key = (person_output_idx, *locus_id);
-                                    if warned_pairs.lock().unwrap().insert(warning_key) {
+                                    
+                                    if warned_pairs.insert(warning_key) {
                                         eprintln!(
                                             "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
                                             prep_result.final_person_iids[person_output_idx],
@@ -889,11 +886,8 @@ fn resolve_complex_variants(
                                             winning_a2
                                         );
                                     }
-
-                                    // Proceed with calculation using the resolved genotype.
                                     let score_col = score_info.score_column_index.0;
                                     let weight = score_info.weight as f64;
-                                    // Now we compare a `String` with a `&String`, which Rust handles correctly.
                                     let dosage: f64 = if &score_info.effect_allele == winning_a1 {
                                         match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
                                     } else {
@@ -901,27 +895,46 @@ fn resolve_complex_variants(
                                     };
                                     person_scores_slice[score_col] += dosage * weight;
                                 }
-                                0 => {
-                                    // None of the conflicting genotypes matched this score's alleles. Do nothing.
-                                }
-                                _ => {
-                                    // Heuristic Failure: The ambiguity is unresolvable because multiple conflicting
-                                    // genotypes all match the score's alleles. Retain safety and fail.
+                                0 => {} // None of the conflicting genotypes matched this score's alleles.
+                                _ => { // Heuristic Failure: Unresolvable ambiguity.
+                                    // COLD PATH: A fatal error occurred.
                                     let iid = &prep_result.final_person_iids[person_output_idx];
                                     let first_context_id = group_rule.possible_contexts[0].0.0;
                                     let score_name = &prep_result.score_names[score_info.score_column_index.0];
-                                    return Err(PipelineError::Compute(format!(
+                                    let error = PipelineError::Compute(format!(
                                         "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
                                         iid, first_context_id, score_name
-                                    )));
+                                    ));
+                                    
+                                    // Use compare_exchange to ensure only the FIRST thread to fail
+                                    // stores its error and sets the flag. This is the key to being lock-free on the hot path.
+                                    if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                        *fatal_error_storage.lock().unwrap() = Some(error);
+                                    }
+                                    
+                                    // Exit the closure for this person. This acts like a `continue` for the parallel loop.
+                                    return;
                                 }
                             }
                         }
                     }
                 }
             }
-            Ok(())
-        })?;
+        });
+
+    // After parallel execution, check if the flag was set.
+    if fatal_error_occurred.load(Ordering::Relaxed) {
+        // Attempt to take the lock and then the value from the Option. This is panic-safe.
+        if let Ok(mut guard) = fatal_error_storage.lock() {
+            if let Some(err) = guard.take() {
+                return Err(err);
+            }
+        }
+        // Fallback in the unlikely event the lock is poisoned but the flag was set.
+        return Err(PipelineError::Compute(
+            "A fatal, unspecified error occurred in a parallel task.".to_string(),
+        ));
+    }
 
     Ok(())
 }
