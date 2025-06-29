@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::sync::Mutex;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -786,6 +787,11 @@ fn resolve_complex_variants(
 ) -> Result<(), PipelineError> {
     let num_scores = prep_result.score_names.len();
 
+    // A thread-safe set to track which (person, locus) pairs have already been warned about,
+    // preventing console spam. The key is a tuple of the person's output index and the
+    // first BIM row index of the complex locus, which serves as a stable ID for the locus.
+    let warned_pairs = Mutex::new(AHashSet::<(usize, BimRowIndex)>::new());
+
     final_scores
         .par_chunks_mut(num_scores)
         .zip(final_missing_counts.par_chunks_mut(num_scores))
@@ -795,6 +801,7 @@ fn resolve_complex_variants(
 
             for group_rule in &prep_result.complex_rules {
                 // --- Step 1: Gather Evidence ---
+                // Find all non-missing genotype interpretations for this person at this complex locus.
                 let mut valid_interpretations =
                     Vec::with_capacity(group_rule.possible_contexts.len());
 
@@ -806,6 +813,7 @@ fn resolve_complex_variants(
                         original_fam_idx,
                     );
 
+                    // A genotype of `0b01` is defined as missing in the PLINK spec.
                     if packed_geno != 0b01 {
                         valid_interpretations.push((packed_geno, context));
                     }
@@ -813,6 +821,7 @@ fn resolve_complex_variants(
 
                 // --- Step 2: Apply Decision Policy ---
                 match valid_interpretations.len() {
+                    // Case A: No valid genotypes found for this locus. The person is missing data here.
                     0 => {
                         let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                         for score_info in &group_rule.score_applications {
@@ -822,6 +831,7 @@ fn resolve_complex_variants(
                             person_counts_slice[score_col.0] += 1;
                         }
                     }
+                    // Case B: Exactly one valid genotype found. This is the unambiguous, happy path.
                     1 => {
                         let (winning_geno, winning_context) = valid_interpretations[0];
                         let (_bim_idx, winning_a1, winning_a2) = winning_context;
@@ -846,13 +856,64 @@ fn resolve_complex_variants(
                             person_scores_slice[score_col] += dosage * weight;
                         }
                     }
+                    // Case C: A data conflict was detected (multiple non-missing genotypes).
+                    // Apply a tie-breaking heuristic for each score individually.
                     _ => {
-                        let iid = &prep_result.final_person_iids[person_output_idx];
-                        let first_context_id = group_rule.possible_contexts[0].0 .0;
-                        return Err(PipelineError::Compute(format!(
-                            "Fatal data inconsistency for individual '{}'. Variant at location corresponding to BIM row index '{}' has conflicting, non-missing genotypes in the input .bed file.",
-                            iid, first_context_id
-                        )));
+                        for score_info in &group_rule.score_applications {
+                            let matching_interpretations: Vec<_> = valid_interpretations
+                                .iter()
+                                .filter(|&&(_, context)| {
+                                    let (_, a1, a2) = context;
+                                    &score_info.effect_allele == a1 || &score_info.effect_allele == a2
+                                })
+                                .collect();
+
+                            match matching_interpretations.len() {
+                                1 => {
+                                    // Heuristic Success: Exactly one of the conflicting genotypes matches the
+                                    // alleles required by this specific score.
+                                    let (winning_geno, winning_context) = matching_interpretations[0];
+                                    let (locus_id, winning_a1, winning_a2) = *winning_context;
+
+                                    // Issue a one-time warning for this person/locus pair.
+                                    let warning_key = (person_output_idx, locus_id);
+                                    if warned_pairs.lock().unwrap().insert(warning_key) {
+                                        eprintln!(
+                                            "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
+                                            prep_result.final_person_iids[person_output_idx],
+                                            locus_id.0,
+                                            prep_result.score_names[score_info.score_column_index.0],
+                                            winning_a1,
+                                            winning_a2
+                                        );
+                                    }
+
+                                    // Proceed with calculation using the resolved genotype.
+                                    let score_col = score_info.score_column_index.0;
+                                    let weight = score_info.weight as f64;
+                                    let dosage: f64 = if &score_info.effect_allele == winning_a1 {
+                                        match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                                    } else {
+                                        match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                                    };
+                                    person_scores_slice[score_col] += dosage * weight;
+                                }
+                                0 => {
+                                    // None of the conflicting genotypes matched this score's alleles. Do nothing.
+                                }
+                                _ => {
+                                    // Heuristic Failure: The ambiguity is unresolvable because multiple conflicting
+                                    // genotypes all match the score's alleles.
+                                    let iid = &prep_result.final_person_iids[person_output_idx];
+                                    let first_context_id = group_rule.possible_contexts[0].0.0;
+                                    let score_name = &prep_result.score_names[score_info.score_column_index.0];
+                                    return Err(PipelineError::Compute(format!(
+                                        "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
+                                        iid, first_context_id, score_name
+                                    )));
+                                }
+                            }
+                        }
                     }
                 }
             }
