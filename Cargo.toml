@@ -36,6 +36,7 @@ bumpalo = { version = "3.19.0", features = ["collections"] }
 dwldutil = "2.0.4"
 indicatif = "0.17.11"
 flate2 = "1.1.2"
+dashmap = "6.1.0"
 
 [profile.release]
 opt-level = 3
