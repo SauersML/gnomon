@@ -140,9 +140,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
 ///
 /// This function is synchronous and CPU-bound. It takes a definitive list of
-/// resolved score files, normalizes them, and then calls the main preparation
-/// logic to produce a "computation blueprint" (`PreparationResult`). All user-facing
-/// console output for this phase is handled here.
+/// resolved score files, normalizes them into a consistent, sorted, gnomon-native
+/// format, and then calls the main preparation logic to produce a "computation
+// blueprint" (`PreparationResult`). All user-facing console output for this phase
+// is handled here.
 fn run_preparation_phase(
     fileset_prefixes: &[PathBuf],
     score_files: &[PathBuf],
@@ -168,11 +169,13 @@ fn run_preparation_phase(
     for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
             Ok(true) => {
+                // If a file is already in the native format, we assume it is correctly
+                // sorted and ready for processing.
                 native_score_files.push(score_file_path.clone());
             }
             Ok(false) => {
-                // Determine the output path for the converted file. It should be
-                // placed in the same directory as the original.
+                // The file is not in native format, so we must convert it.
+                // The reformatting function is intelligent and will produce a sorted file.
                 let output_dir = score_file_path.parent().unwrap_or_else(|| Path::new("."));
                 fs::create_dir_all(output_dir)?;
 
@@ -181,21 +184,22 @@ fn run_preparation_phase(
                     score_file_path.display()
                 );
                 let new_path = score_file_path.with_extension("gnomon.tsv");
+
                 match reformat::reformat_pgs_file(score_file_path, &new_path) {
                     Ok(_) => {
                         eprintln!("> Success: Converted to '{}'.", new_path.display());
                         native_score_files.push(new_path);
                     }
                     Err(e) => {
-                        return Err(format!(
-                            "Failed to auto-reformat '{}': {}. Please ensure it is a valid PGS Catalog file or convert it to the gnomon-native format manually.",
-                            score_file_path.display(), e
-                        )
-                        .into());
+                        // The reformatting failed. The `ReformatError` type now
+                        // contains a rich, detailed diagnostic message. We can
+                        // simply convert it into a boxed error and return it.
+                        return Err(Box::new(e));
                     }
                 }
             }
             Err(e) => {
+                // This is a lower-level I/O error from just trying to open the file.
                 return Err(format!(
                     "Error reading score file '{}': {}",
                     score_file_path.display(),
@@ -206,7 +210,7 @@ fn run_preparation_phase(
         }
     }
 
-    // --- Run the main preparation logic ---
+    // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(fileset_prefixes, &native_score_files, keep)
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
