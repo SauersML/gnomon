@@ -216,9 +216,14 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let resolver = move |line: &str| -> Result<Option<SortableLine>, ReformatError> {
         let fields: Vec<&str> = line.split('\t').collect();
 
+        // This helper closure safely extracts and parses coordinates from a given
+        // pair of column indices. It returns `None` if the columns don't exist,
+        // are empty, or fail to parse into a valid key.
         let get_key = |c_idx, p_idx| {
             if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
-                if let (Some(chr_str), Some(pos_str)) = (fields.get(chr_idx), fields.get(pos_idx)) {
+                // By using `get()` and `copied()`, we get an Option<&str>, which is easier
+                // for the compiler to reason about than Option<&&str>.
+                if let (Some(chr_str), Some(pos_str)) = (fields.get(chr_idx).copied(), fields.get(pos_idx).copied()) {
                     if !chr_str.is_empty() && !pos_str.is_empty() {
                         return parse_key(chr_str, pos_str).ok();
                     }
