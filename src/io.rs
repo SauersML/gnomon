@@ -19,7 +19,12 @@ use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
 use memmap2::Mmap;
 use std::fs::File;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// The number of variants to process locally before updating the global atomic counter.
+/// A power of 2 is often efficient.
+const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 /// The generic entry point for the producer thread.
 ///
@@ -41,11 +46,13 @@ pub fn producer_thread<F>(
     sparse_tx: Sender<Result<WorkItem, PipelineError>>,
     dense_tx: Sender<Result<WorkItem, PipelineError>>,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
 ) where
     F: Fn(&[u8]) -> ComputePath,
 {
     let bytes_per_variant = prep_result.bytes_per_variant as usize;
+    let mut local_variants_processed: u64 = 0;
 
     for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
         let mut buffer = buffer_pool
@@ -87,6 +94,16 @@ pub fn producer_thread<F>(
             // Consumers have disconnected. This is not an error, but a signal to stop.
             break;
         }
+
+        local_variants_processed += 1;
+        if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
+            variants_processed_count.fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
+            local_variants_processed = 0;
+        }
+    }
+
+    if local_variants_processed > 0 {
+        variants_processed_count.fetch_add(local_variants_processed, Ordering::Relaxed);
     }
 }
 
@@ -98,6 +115,7 @@ pub fn multi_file_producer_thread<F>(
     sparse_tx: Sender<Result<WorkItem, PipelineError>>,
     dense_tx: Sender<Result<WorkItem, PipelineError>>,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
 ) where
     F: Fn(&[u8]) -> ComputePath,
@@ -105,6 +123,7 @@ pub fn multi_file_producer_thread<F>(
     // --- Initial State ---
     let mut current_fileset_idx: usize = 0;
     let bytes_per_variant = prep_result.bytes_per_variant;
+    let mut local_variants_processed: u64 = 0;
 
     // Open and mmap the first file.
     let mut mmap = match File::open(&boundaries[0].bed_path)
@@ -184,5 +203,15 @@ pub fn multi_file_producer_thread<F>(
         if tx.send(Ok(work_item)).is_err() {
             break; // Consumers disconnected.
         }
+
+        local_variants_processed += 1;
+        if local_variants_processed == PROGRESS_UPDATE_BATCH_SIZE {
+            variants_processed_count.fetch_add(PROGRESS_UPDATE_BATCH_SIZE, Ordering::Relaxed);
+            local_variants_processed = 0;
+        }
+    }
+
+    if local_variants_processed > 0 {
+        variants_processed_count.fetch_add(local_variants_processed, Ordering::Relaxed);
     }
 }
