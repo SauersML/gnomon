@@ -8,14 +8,17 @@ use crate::types::{
 use ahash::AHashSet;
 use crossbeam_channel::{bounded, Receiver};
 use crossbeam_queue::ArrayQueue;
+use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use num_cpus;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -262,6 +265,19 @@ fn run_single_file_pipeline(
             .unwrap();
     }
 
+    // Progress Reporting Setup
+    let variants_to_process = context.prep_result.num_reconciled_variants as u64;
+    let variants_processed_count = Arc::new(AtomicU64::new(0));
+    let pb = ProgressBar::new(variants_to_process);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.set_message("Computing scores...");
+
     // --- 2. Pre-computation & STRATEGY SELECTION ---
     let prep_result = &context.prep_result;
     let run_ctx = DecisionContext {
@@ -304,10 +320,22 @@ fn run_single_file_pipeline(
 
     // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
+        // Spawn the UI updater thread
+        let updater_thread_count = Arc::clone(&variants_processed_count);
+        let updater_pb = pb.clone();
+        s.spawn(move || {
+            while !updater_pb.is_finished() {
+                let processed = updater_thread_count.load(Ordering::Relaxed);
+                updater_pb.set_position(processed);
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
         let producer_logic = {
             let mmap = Arc::clone(&mmap);
             let prep_result = Arc::clone(&context.prep_result);
             let buffer_pool = Arc::clone(&buffer_pool);
+            let producer_thread_count = Arc::clone(&variants_processed_count);
 
             move || match strategy {
                 RunStrategy::UseSimpleTree => {
@@ -319,6 +347,7 @@ fn run_single_file_pipeline(
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
+                        producer_thread_count,
                         path_decider,
                     );
                 }
@@ -338,6 +367,7 @@ fn run_single_file_pipeline(
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
+                        producer_thread_count,
                         path_decider,
                     );
                 }
@@ -394,6 +424,7 @@ fn run_single_file_pipeline(
                 &mut final_counts,
             )?;
         }
+        pb.finish_with_message("Computation complete.");
         Ok((final_scores, final_counts))
     });
     final_result
@@ -415,6 +446,19 @@ fn run_multi_file_pipeline(
             ))
             .unwrap();
     }
+
+    // Progress Reporting Setup
+    let variants_to_process = context.prep_result.num_reconciled_variants as u64;
+    let variants_processed_count = Arc::new(AtomicU64::new(0));
+    let pb = ProgressBar::new(variants_to_process);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.set_message("Computing scores...");
 
     // --- 2. Pre-computation (same as single-file) ---
     let prep_result = &context.prep_result;
@@ -459,9 +503,22 @@ fn run_multi_file_pipeline(
 
     // --- 3. Orchestration with multi-file producer ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
+        // Spawn the UI updater thread
+        let updater_thread_count = Arc::clone(&variants_processed_count);
+        let updater_pb = pb.clone();
+        s.spawn(move || {
+            while !updater_pb.is_finished() {
+                let processed = updater_thread_count.load(Ordering::Relaxed);
+                updater_pb.set_position(processed);
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
         let producer_logic = {
             let prep_result = Arc::clone(&context.prep_result);
             let buffer_pool = Arc::clone(&buffer_pool);
+            let producer_thread_count = Arc::clone(&variants_processed_count);
+
             move || match strategy {
                 RunStrategy::UseSimpleTree => {
                     let global_path = decide::decide_path_without_freq(&run_ctx);
@@ -472,6 +529,7 @@ fn run_multi_file_pipeline(
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
+                        producer_thread_count,
                         path_decider,
                     );
                 }
@@ -491,6 +549,7 @@ fn run_multi_file_pipeline(
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
+                        producer_thread_count,
                         path_decider,
                     );
                 }
@@ -548,6 +607,7 @@ fn run_multi_file_pipeline(
                 &mut final_counts,
             )?;
         }
+        pb.finish_with_message("Computation complete.");
         Ok((final_scores, final_counts))
     });
     final_result
