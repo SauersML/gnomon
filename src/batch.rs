@@ -18,7 +18,6 @@ use crate::types::{
     ReconciledVariantIndex};
 use crossbeam_queue::ArrayQueue;
 use num_cpus;
-use rayon::prelude::*;
 use std::error::Error;
 use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, Simd};
 
