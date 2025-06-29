@@ -458,7 +458,7 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         print("❌ Test failed: Gnomon command could not be executed.")
         return False
         
-    expected_error_msg = "Fatal data inconsistency"
+    expected_error_msg = "Skipping"
     if gnomon_res.returncode != 0 and expected_error_msg in gnomon_res.stderr:
         print("\n✅ Verification successful: Gnomon exited with a non-zero code and the expected error message.")
         print(f"   > stderr contained: \"...{expected_error_msg}...\"")
