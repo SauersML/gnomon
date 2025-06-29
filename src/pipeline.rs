@@ -873,10 +873,12 @@ fn resolve_complex_variants(
                                     // Heuristic Success: Exactly one of the conflicting genotypes matches the
                                     // alleles required by this specific score.
                                     let (winning_geno, winning_context) = matching_interpretations[0];
-                                    let (locus_id, winning_a1, winning_a2) = *winning_context;
-
+                                    let (locus_id, winning_a1, winning_a2) = **winning_context;
+                                
                                     // Issue a one-time warning for this person/locus pair.
-                                    let warning_key = (person_output_idx, locus_id);
+                                    // We must dereference `locus_id` because it's a `&BimRowIndex` from the
+                                    // destructuring bind, but the HashSet stores owned `BimRowIndex` values.
+                                    let warning_key = (person_output_idx, *locus_id);
                                     if warned_pairs.lock().unwrap().insert(warning_key) {
                                         eprintln!(
                                             "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
@@ -887,14 +889,15 @@ fn resolve_complex_variants(
                                             winning_a2
                                         );
                                     }
-
+                                
                                     // Proceed with calculation using the resolved genotype.
                                     let score_col = score_info.score_column_index.0;
                                     let weight = score_info.weight as f64;
+                                    // We explicitly dereference `winning_geno` (a `&u8`) to match on the `u8` value directly.
                                     let dosage: f64 = if &score_info.effect_allele == winning_a1 {
-                                        match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                                        match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
                                     } else {
-                                        match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                                        match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
                                     };
                                     person_scores_slice[score_col] += dosage * weight;
                                 }
