@@ -221,10 +221,10 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         // are empty, or fail to parse into a valid key.
         let get_key = |c_idx, p_idx| {
             if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
-                // The `&` in the pattern match `Some(&chr_str)` is crucial. It dereferences
-                // the `&&str` from `fields.get()` to a `&str`, which is what `parse_key` expects
-                // and what `.is_empty()` can be called on without ambiguity.
-                if let (Some(&chr_str), Some(&pos_str)) = (fields.get(chr_idx), fields.get(pos_idx)) {
+                // The `cloned()` method is used here to solve a type ambiguity.
+                // `fields.get()` returns an `Option<&&str>`. `cloned()` converts this
+                // into an `Option<&str>`, which can be destructured and used without error.
+                if let (Some(chr_str), Some(pos_str)) = (fields.get(chr_idx).cloned(), fields.get(pos_idx).cloned()) {
                     if !chr_str.is_empty() && !pos_str.is_empty() {
                         return parse_key(chr_str, pos_str).ok();
                     }
