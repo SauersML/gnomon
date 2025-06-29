@@ -198,7 +198,8 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         pos: header_map.get("chr_position").copied(),
         hm_chr: header_map.get("hm_chr").copied(),
         hm_pos: header_map.get("hm_pos").copied(),
-        ea: *header_map.get("effect_allele").ok_or_else(|| ReformatError::MissingColumns {
+        ea: *header_map.get("effect_allele").ok_or_else(|| ReformatError// This helper closure safely extracts and parses coordinates from a given
+::MissingColumns {
             path: input_path.to_path_buf(), line_number: 0, line_content: header_line.to_string(), missing_column_name: "effect_allele".to_string()
         })?,
         ew: *header_map.get("effect_weight").ok_or_else(|| ReformatError::MissingColumns {
@@ -221,12 +222,13 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         // are empty, or fail to parse into a valid key.
         let get_key = |c_idx, p_idx| {
             if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
-                // The `cloned()` method is used here to solve a type ambiguity.
-                // `fields.get()` returns an `Option<&&str>`. `cloned()` converts this
-                // into an `Option<&str>`, which can be destructured and used without error.
-                if let (Some(chr_str), Some(pos_str)) = (fields.get(chr_idx).cloned(), fields.get(pos_idx).cloned()) {
-                    if !chr_str.is_empty() && !pos_str.is_empty() {
-                        return parse_key(chr_str, pos_str).ok();
+                // The `fields.get()` call returns an `Option<&&str>`. We bind the inner `&&str`
+                // to a variable (e.g., `chr_str_ref`). To call `.is_empty()`, which is a method
+                // on `str`, we must explicitly dereference the `&&str` to a `&str` using the
+                // `*` operator. This resolves the type ambiguity for the compiler.
+                if let (Some(chr_str_ref), Some(pos_str_ref)) = (fields.get(chr_idx), fields.get(pos_idx)) {
+                    if !(**chr_str_ref).is_empty() && !(**pos_str_ref).is_empty() {
+                        return parse_key(chr_str_ref, pos_str_ref).ok();
                     }
                 }
             }
