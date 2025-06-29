@@ -183,3 +183,168 @@
 //
 ====================================================================================================
 */
+
+/*
+====================================================================================================
+                                 VCF EXECUTION ENGINE
+                             DESIGN & IMPLEMENTATION GUIDE
+====================================================================================================
+
+1. EXECUTIVE SUMMARY & DESIGN PHILOSOPHY
+----------------------------------------------------------------------------------------------------
+
+This document outlines the definitive, high-performance strategy for integrating single-sample,
+unindexed, bgzip-compressed VCF genotype data. The architecture is founded on three core
+principles to achieve the theoretical maximum throughput for streaming input.
+
+1.  **Single I/O Pass:** The VCF, as the largest input file, represents the primary I/O
+    bottleneck. The design mandates that this file is read from disk in a single,
+    forward-only pass. Multi-pass algorithms are definitionally suboptimal and are rejected.
+
+2.  **Optimized Stream Parsing:** The VCF parsing component will be specialized for the
+    expected input format. It will operate directly on byte buffers and be optimized to extract
+    only the essential fields required for score calculation (e.g., `CHROM`, `POS`, `REF`, `ALT`,
+    and the sample's dosage information), minimizing allocations and parsing overhead.
+
+3.  **Zero Intermediate State:** The engine will operate without building large, intermediate
+    data structures, such as a full hash map of required variants. The memory footprint will
+    remain constant and minimal, determined by the number of concurrent score files, not the
+    number of variants. All data is processed and discarded on the fly.
+
+This is a monolithic, fused-process design. The clean separation of a "prepare" stage and a
+"run" stage is intentionally sacrificed for a unified engine that provides the highest
+possible throughput by combining data reconciliation and computation into a single pass.
+
+
+2. HIGH-LEVEL ARCHITECTURE & DATAFLOW
+----------------------------------------------------------------------------------------------------
+
+The entire VCF workflow will be managed by a new, self-contained `vcf_engine` module. Its
+operation is a single, continuous process dispatched directly by the `main.rs` orchestrator.
+
+The process is a live, three-way merge-join between three conceptual data streams:
+
+1.  **The VCF Data Stream:** Produced by the high-performance VCF parser.
+2.  **The Score Rule Stream:** Produced by the `KWayMergeIterator`, which reads from all
+    score files simultaneously.
+3.  **The Final Accumulator State:** Represented by the `final_scores` and `missing_counts`
+    vectors, which are mutated in place throughout the process.
+
+Execution proceeds in a well-defined sequence:
+
+1.  **Pre-Flight:** A minimal, one-time setup phase in `main.rs` parses only the headers of
+    the score files to establish the dimensions of the final output. It allocates the final
+    accumulator state vectors.
+
+2.  **Dispatch:** `main.rs` invokes the `vcf_engine::run` function, passing it the necessary
+    file paths and mutable references to the final accumulator state.
+
+3.  **Unified Stream Processing:** The `vcf_engine` instantiates the two input iterators
+    (VCF and Score Rules) and begins the main merge-join loop. It continuously compares the
+    variant keys at the head of each stream. On a match, it calculates the score adjustment
+    on-the-fly and applies it directly to the final accumulator state.
+
+4.  **Finalization:** The `vcf_engine` completes its single pass. Control returns to `main.rs`,
+    which then writes the fully populated accumulators to the output file.
+
+
+3. DETAILED IMPLEMENTATION PLAN
+----------------------------------------------------------------------------------------------------
+
+#### PHASE 1: PRE-FLIGHT OPERATIONS
+
+This logic is executed once when a VCF input is detected, before the main engine is called.
+
+1.  **Parse Score Headers:** Concurrently read the headers from all specified score files to
+    build a global, sorted, and unique list of all score names.
+
+2.  **Establish Global Score Metadata:** From the complete list of names, construct the global
+    `score_name_to_col_index: AHashMap<String, ScoreColumnIndex>` lookup map. This is a critical
+    pre-computation that enables a lookup-free hot path in the main engine.
+
+3.  **Allocate Final State:** Initialize the `final_scores: Vec<f64>` and
+    `missing_counts: Vec<u32>` vectors to zero, sized for one sample and the total number of
+    unique scores discovered in the previous step.
+
+4.  **Dispatch:** Invoke `vcf_engine::run`, passing all necessary context, including file paths
+    and mutable references to the allocated state vectors.
+
+#### PHASE 2: THE VCF STREAM PARSER
+
+This is a private component within the `vcf_engine` module.
+
+1.  **Iterator Definition:** The parser will be implemented as an iterator that wraps a `bgzip`
+    decoder stream and is compatible with `peekable()`.
+
+2.  **Zero-Allocation Parsing Model:** The iterator will own a single, reusable line buffer. On
+    each call to `next()`, it will read a line into this buffer. It will then perform optimized,
+    byte-slice-based parsing to find and extract only the necessary fields.
+
+3.  **Yielded Item Definition:** The iterator's `Item` will be a temporary struct or tuple
+    containing slices that borrow from the iterator's internal buffer (e.g.,
+    `(VariantKey, &'buf [u8], &'buf [u8], f64)` for key, ref, alt, and dosage). This design
+    avoids heap allocations for every variant record.
+
+#### PHASE 3: THE UNIFIED STREAMING ENGINE (in `vcf_engine.rs`)
+
+This is the core implementation of the VCF processing logic.
+
+1.  **Iterator Instantiation:** Create a `peekable()` instance of the new VCF parser and a
+    `peekable()` instance of the `KWayMergeIterator` for the score files.
+
+2.  **Main Merge-Join Loop:** Implement the primary `while` loop that `peek()`s at the head of
+    both iterators and compares their `VariantKey`s.
+    *   **If VCF key < Score key:** The VCF contains a variant not required by any score.
+        Consume and discard the VCF record.
+    *   **If Score key < VCF key:** A required variant is missing from the VCF. Consume the
+        score rule, identify its `ScoreColumnIndex`, and increment the corresponding
+        `missing_counts` accumulator.
+    *   **If keys are equal:** A match is found. This triggers the hot path logic.
+
+#### PHASE 4: THE HOT PATH (MATCHED VARIANT PROCESSING)
+
+This logic is executed within the `Ordering::Equal` branch of the main loop.
+
+1.  **Consume VCF Record:** Consume the single matched record from the VCF iterator. Its
+    parsed data (dosage, ref/alt alleles) is now available.
+
+2.  **Handle Missing Genotype:** If the parsed dosage indicates a missing genotype (`./.`),
+    the logic will consume the entire group of matching score rules, incrementing the
+    `missing_counts` for each, then return to the main loop.
+
+3.  **Process Score Rule Group:** Loop to consume all score rules from the `KWayMergeIterator`
+    that share the same variant key. For each score rule:
+    *   **Complex Locus Detection:** Check a flag from the `KWayMergeIterator` to determine if
+      this is a simple (one rule per locus) or complex (multiple rules per locus) variant.
+    *   **Simple Variant Path:**
+        1.  Verify the score's effect allele matches either the VCF REF or ALT allele. If not,
+            this rule is inapplicable; continue.
+        2.  Determine the flip status by comparing the effect allele to the VCF REF allele.
+        3.  Calculate the baseline dosage (2.0 for flipped variants, 0.0 for non-flipped).
+        4.  Calculate the final score adjustment using scalar `f64` math:
+            `weight * (observed_dosage - baseline_dosage)`.
+        5.  Add the adjustment directly to the `final_scores` accumulator at the `ScoreColumnIndex`
+            (which is a `usize`) provided by the score rule.
+    *   **Complex Variant Path:** If a complex locus is detected, switch to a dedicated handler.
+        This handler will buffer the single VCF record's data and gather all subsequent
+        score rules for that locus. Once the group is collected, it will perform resolution
+        logic to apply only the rules compatible with the observed VCF alleles.
+
+#### PHASE 5: CORRECTNESS GUARANTEES & SCENARIO HANDLING
+
+The architecture is designed for correctness across all required genetic use cases.
+
+*   **Effect Allele as Reference:** Handled by the explicit "flip status" and "baseline dosage"
+    calculation in the hot path.
+*   **Multiple Scores at one Position:** Handled by the `KWayMergeIterator` and the logic that
+    processes the entire group of matching score rules for a given position.
+*   **Different Effect Alleles Across Scores:** Handled because each score rule is evaluated
+    independently against the single observed VCF genotype.
+*   **Indels and Complex Alleles:** Handled correctly as the allele matching logic relies on
+    byte-wise equality, which is agnostic to allele length.
+*   **Multiallelic Sites:** Handled robustly by the "Complex Variant Path". By collecting all
+    rules for a site and comparing them against the single, true genotype from the VCF, the
+    engine correctly applies only the scores relevant to the alleles the individual actually
+    possesses.
+
+*/
