@@ -112,166 +112,170 @@ impl From<io::Error> for ReformatError {
 
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
 pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
-    let file = File::open(input_path)?;
+    // --- Define helper types within the function scope ---
+    #[derive(Clone, Copy)]
+    enum ParsingStrategy {
+        OriginalOnly,    // Use chr_name/chr_position, fail if unmappable.
+        HarmonizedOnly,  // Use hm_chr/hm_pos, fail if unmappable.
+        SafeFallback,    // Try hm_chr/hm_pos, fall back to orig on parse failure.
+    }
 
-	// Create a reader that can dynamically handle both plain text and gzipped files.
-    // This is done by using a "trait object" which can hold any type that implements `io::Read`.
+    struct ColumnIndices {
+        chr: Option<usize>,
+        pos: Option<usize>,
+        hm_chr: Option<usize>,
+        hm_pos: Option<usize>,
+        ea: usize, // effect_allele is mandatory
+        ew: usize, // effect_weight is mandatory
+        oa: Option<usize>, // other_allele is optional
+    }
+
+    // --- Open file and handle potential GZIP compression ---
+    let file = File::open(input_path)?;
     let a_reader: Box<dyn Read + Send> = if input_path.extension().map_or(false, |ext| ext == "gz") {
-        // Use MultiGzDecoder to correctly read gzip files that may be multi-member
         Box::new(MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
-    let mut reader = BufReader::with_capacity(1 << 20, a_reader);
-    let mut line = String::new();
-    let mut saw_signature = false;
-    let mut score_name: Option<String> = None;
+    let mut reader = BufReader::new(a_reader);
+    let mut line_buffer = String::new();
 
-	// Loop through all metadata lines (those starting with '#'), robustly handling blank lines.
-	while reader.read_line(&mut line)? > 0 {
-		// Trim both leading/trailing whitespace and newlines to get the actual content.
-		let trimmed_line = line.trim();
+    // --- Read and analyze all metadata headers ---
+    let mut orig_build_norm: Option<u8> = None;
+    let mut hm_build_norm: Option<u8> = None;
+    let mut score_id: Option<String> = None;
 
-		// If the line is completely blank after trimming, we clear the buffer and
-		// continue to the next line, skipping any further processing for this line.
-		if trimmed_line.is_empty() {
-			line.clear();
-			continue;
-		}
+    let normalize_build = |build_str: &str| -> Option<u8> {
+        match build_str.trim().to_lowercase().as_str() {
+            "grch37" | "hg19" | "37" => Some(37),
+            "grch38" | "hg38" | "38" => Some(38),
+            _ => None,
+        }
+    };
 
-		// If the line's content does not start with a '#', we have found the header.
-		// We break the loop, leaving the original `line` buffer intact for parsing.
-		if !trimmed_line.starts_with('#') {
-			break;
-		}
+    loop {
+        line_buffer.clear();
+        if reader.read_line(&mut line_buffer)? == 0 {
+            // Reached EOF before finding the data header
+            return Err(ReformatError::NotPgsFormat { path: input_path.to_path_buf() });
+        }
+        if !line_buffer.starts_with('#') {
+            break; // Found the data header line
+        }
 
-		// --- Process Metadata Line ---
-		// The line is a comment. Process its content by removing the leading '#' characters.
-		let metadata_content = trimmed_line.trim_start_matches('#').trim();
+        let metadata = line_buffer.trim_start_matches('#').trim();
+        if let Some(val) = metadata.strip_prefix("genome_build=") {
+            orig_build_norm = normalize_build(val);
+        } else if let Some(val) = metadata.strip_prefix("HmPOS_build=") {
+            hm_build_norm = normalize_build(val);
+        } else if let Some(val) = metadata.strip_prefix("pgs_id=") {
+            score_id = Some(val.to_string());
+        }
+    }
 
-		// Check for the mandatory PGS Catalog signature.
-		if metadata_content.starts_with("PGS CATALOG SCORING FILE") {
-			saw_signature = true;
-		}
+    // --- Determine the one, true, safe parsing strategy ---
+    let strategy = match (orig_build_norm, hm_build_norm) {
+        // Same build (e.g., 38 -> 38) OR unknown builds (can't prove they are different)
+        (Some(o), Some(h)) if o == h => ParsingStrategy::SafeFallback,
+        (None, None) => ParsingStrategy::SafeFallback, // Can't prove different, assume safe
+        (Some(_), None) => ParsingStrategy::OriginalOnly, // Harmonized doesn't exist
+        (None, Some(_)) => ParsingStrategy::HarmonizedOnly, // Original doesn't exist
 
-		// Extract the PGS ID to use as the score name.
-		if let Some(id) = metadata_content.strip_prefix("pgs_id=") {
-			score_name = Some(id.trim().to_string());
-		}
+        // Builds are provably different (e.g., 37 -> 38). Liftover occurred.
+        (Some(_), Some(_)) => ParsingStrategy::HarmonizedOnly,
+    };
 
-		// Clear the main buffer to prepare for reading the next line.
-		line.clear();
-	}
+    // --- Map header columns to indices for robust, order-independent access ---
+    let header_line = line_buffer.trim();
+    let header_map: std::collections::HashMap<&str, usize> = header_line
+        .split('\t')
+        .enumerate()
+        .map(|(i, name)| (name, i))
+        .collect();
 
-// After processing all metadata, verify that the signature was found.
-	if !saw_signature {
-		return Err(ReformatError::NotPgsFormat { path: input_path.to_path_buf() });
-	}
-	let header_line = line.trim_end().to_string();
-	let score_label = score_name.unwrap_or_else(|| "PGS_SCORE".into());
+    let column_indices = ColumnIndices {
+        chr: header_map.get("chr_name").copied(),
+        pos: header_map.get("chr_position").copied(),
+        hm_chr: header_map.get("hm_chr").copied(),
+        hm_pos: header_map.get("hm_pos").copied(),
+        ea: *header_map.get("effect_allele").ok_or_else(|| ReformatError::MissingColumns {
+            path: input_path.to_path_buf(), line_number: 0, line_content: header_line.to_string(), missing_column_name: "effect_allele".to_string()
+        })?,
+        ew: *header_map.get("effect_weight").ok_or_else(|| ReformatError::MissingColumns {
+            path: input_path.to_path_buf(), line_number: 0, line_content: header_line.to_string(), missing_column_name: "effect_weight".to_string()
+        })?,
+        oa: header_map.get("other_allele").or_else(|| header_map.get("hm_inferOtherAllele")).copied(),
+    };
 
-	// --- Robust Header Parsing ---
-	// Create a map from column names to their index for robust, order-independent access.
-	let header_map: std::collections::HashMap<&str, usize> = header_line
-		 .split('\t')
-		.enumerate()
-		.map(|(i, name)| (name, i))
-		.collect();
+    // This is the "hot path". We use the pre-selected strategy and indices to
+    // process all data lines in parallel with minimal branching or overhead.
+    let score_label = score_id.unwrap_or_else(|| "PGS_SCORE".to_string());
 
-	// Find all potential column indices once. This avoids repeated string lookups in the hot loop.
-	let hm_chr_idx = header_map.get("hm_chr").copied();
-	let hm_pos_idx = header_map.get("hm_pos").copied();
-	let orig_chr_idx = header_map.get("chr_name").copied();
-	let orig_pos_idx = header_map.get("chr_position").copied();
+    // --- Define the resolver closure based on the chosen strategy ---
+    // The `move` keyword captures the `column_indices` struct by value.
+    let resolver = move |line: &str| -> Result<Option<SortableLine>, ReformatError> {
+        let fields: Vec<&str> = line.split('\t').collect();
 
-	// Validate that we have at least one usable pair of chr/pos columns in the header.
-	if !((hm_chr_idx.is_some() && hm_pos_idx.is_some()) || (orig_chr_idx.is_some() && orig_pos_idx.is_some())) {
-		return Err(ReformatError::MissingColumns {
-			path: input_path.to_path_buf(),
-			line_number: 1, // Header line
-			line_content: header_line.clone(),
-			missing_column_name: "A valid chromosome/position column pair (hm_chr/hm_pos or chr_name/chr_position)".to_string(),
-		});
-	}
+        let get_key = |c_idx, p_idx| {
+            if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
+                if let (Some(chr_str), Some(pos_str)) = (fields.get(chr_idx), fields.get(pos_idx)) {
+                    if !chr_str.is_empty() && !pos_str.is_empty() {
+                        return parse_key(chr_str, pos_str).ok();
+                    }
+                }
+            }
+            None
+        };
 
-	// Get indices for other mandatory columns.
-	let ea_idx = *header_map.get("effect_allele")
-		.ok_or_else(|| ReformatError::MissingColumns {
-			path: input_path.to_path_buf(),
-			line_number: 1,
-			line_content: header_line.clone(),
-			missing_column_name: "effect_allele".to_string(),
-		})?;
-	let ew_idx = *header_map.get("effect_weight")
-		.ok_or_else(|| ReformatError::MissingColumns {
-			path: input_path.to_path_buf(),
-			line_number: 1,
-			line_content: header_line.clone(),
-			missing_column_name: "effect_weight".to_string(),
-		})?;
-	// The "other allele" is optional; we check for both names and store the index if found.
-	let oa_idx = header_map.get("other_allele").or_else(|| header_map.get("hm_inferOtherAllele")).copied();
+        // This is the core logic, applying the pre-determined strategy.
+        let key = match strategy {
+            ParsingStrategy::SafeFallback => {
+                get_key(column_indices.hm_chr, column_indices.hm_pos)
+                    .or_else(|| get_key(column_indices.chr, column_indices.pos))
+            }
+            ParsingStrategy::HarmonizedOnly => get_key(column_indices.hm_chr, column_indices.hm_pos),
+            ParsingStrategy::OriginalOnly => get_key(column_indices.chr, column_indices.pos),
+        };
 
-	// The header has been skipped; subsequent lines are data.
-	let mut lines_to_sort: Vec<SortableLine> = reader
-		.lines()
-		.enumerate()
-		.par_bridge()
-		.map(|(i, line_result)| {
-			// The current line number in the file (add 2 to account for 0-based index and header).
-			let line_number = i + 2;
-			let line = line_result.map_err(ReformatError::Io)?;
+        // If no valid key could be derived, skip this line by returning Ok(None).
+        let Some(key) = key else { return Ok(None) };
 
-			if line.is_empty() || line.starts_with('#') {
-				return Ok(None);
-			}
+        // Safely extract other mandatory fields.
+        let Some(ea_str) = fields.get(column_indices.ea).map(|s| *s) else { return Ok(None) };
+        let Some(weight_str) = fields.get(column_indices.ew).map(|s| *s) else { return Ok(None) };
+        let oa_str = column_indices.oa.and_then(|i| fields.get(i)).map_or("N", |s| if s.is_empty() { "N" } else { *s });
 
-			let fields: Vec<&str> = line.split('\t').collect();
+        let variant_id = format!("{}:{}", key.0, key.1);
+        let line_data = format!("{}\t{}\t{}\t{}", variant_id, ea_str, oa_str, weight_str);
 
-			let get_coords = |c_idx: Option<usize>, p_idx: Option<usize>| {
-				c_idx.and_then(|c| fields.get(c))
-					.zip(p_idx.and_then(|p| fields.get(p)))
-					// The closure here takes `(&&str, &&str)`. The compiler's automatic
-					// dereferencing handles this correctly for the `is_empty()` check.
-					.filter(|(c_str, p_str)| !c_str.is_empty() && !p_str.is_empty())
-			};
+        Ok(Some(SortableLine { key, line_data }))
+    };
 
-			// Execute the fallback logic: try harmonized columns first, then original columns.
-			let (chr_str, pos_str) = get_coords(hm_chr_idx, hm_pos_idx)
-				.or_else(|| get_coords(orig_chr_idx, orig_pos_idx))
-				// The resulting Option contains a tuple of double references `(&&str, &&str)`.
-				// We map this to a tuple of single references `(&str, &str)` for use.
-				.map(|(c, p)| (*c, *p))
-				// If both attempts returned None, this line is truly missing coordinate data.
-				.ok_or_else(|| ReformatError::MissingColumns {
-					path: input_path.to_path_buf(),
-					line_number,
-					line_content: line.clone(),
-					missing_column_name: "a valid, non-empty chromosome/position pair".to_string(),
-				})?;
-			
-			// Safely get data for other required fields.
-			let ea_str = fields.get(ea_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
-				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_allele".to_string()
-			})?;
-			
-			let weight_str = fields.get(ew_idx).filter(|s| !s.is_empty()).ok_or_else(|| ReformatError::MissingColumns {
-				path: input_path.to_path_buf(), line_number, line_content: line.clone(), missing_column_name: "effect_weight".to_string()
-			})?;
+    // --- Read all data lines and process them in parallel ---
+    let data_lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+    let skipped_count = std::sync::atomic::AtomicUsize::new(0);
 
-			// The "other allele" is not strictly required; use a placeholder 'N' if absent.
-			let oa_str = oa_idx.and_then(|i| fields.get(i)).map_or("N", |s| if s.is_empty() { "N" } else { s });
+    let mut lines_to_sort = data_lines
+        .into_par_iter()
+        .filter_map(|line| {
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            match resolver(&line) {
+                Ok(Some(sortable_line)) => Some(Ok(sortable_line)),
+                Ok(None) => {
+                    // This is a safe skip for an unmappable variant. Count it.
+                    skipped_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+                Err(e) => Some(Err(e)), // This is a fatal error.
+            }
+        })
+        .collect::<Result<Vec<_>, ReformatError>>()?;
 
-			let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
-				path: input_path.to_path_buf(), line_number, line_content: line.clone(), details
-			})?;
 
-			let line_data = format!("{}:{}\t{}\t{}\t{}", chr_str, pos_str, ea_str, oa_str, weight_str);
-			Ok(Some(SortableLine { key, line_data }))
-		})
-		.filter_map(|result: Result<Option<SortableLine>, ReformatError>| result.transpose())
-		.collect::<Result<Vec<_>, ReformatError>>()?;
 
+    // Sort the resolved data and write it to the gnomon-native file.
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
     let out_file = File::create(output_path)?;
@@ -281,6 +285,17 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         writeln!(writer, "{}", item.line_data)?;
     }
     writer.flush()?;
+
+    // --- Report any non-fatal issues to the user ---
+    let final_skipped_count = skipped_count.into_inner();
+    if final_skipped_count > 0 {
+        eprintln!(
+            "> Warning: Skipped {} variant(s) from '{}' due to unmappable or incomplete coordinates.",
+            final_skipped_count,
+            input_path.display()
+        );
+    }
+
     Ok(())
 }
 
