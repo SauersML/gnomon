@@ -92,8 +92,9 @@ impl SparseIndexPool {
 // ========================================================================================
 
 /// Processes one dense, pre-filtered batch of variant-major data using the person-major
-/// (pivot) path. This path is efficient for batches with high variant density.
-/// This function assumes that weight/flip data has been pre-gathered by the caller.
+/// (pivot) path. This function is called from a parallel context (e.g., Rayon's
+/// `par_bridge`), and all of its internal logic is sequential to prevent nested
+/// parallelism deadlocks and maximize cache efficiency.
 pub fn run_person_major_path(
     variant_major_data: &[u8],
     weights_for_batch: &[f32],
@@ -115,45 +116,63 @@ pub fn run_person_major_path(
         )));
     }
 
-    // === MULTI-THREADED COMPUTE ===
-    match &prep_result.person_subset {
-        PersonSubset::All => {
-            // Create an iterator over all people in the original FAM file.
-            let iter = (0..prep_result.total_people_in_fam as u32)
-                .into_par_iter()
-                .map(OriginalPersonIndex);
-                
-            process_people_iterator(
-                iter,
-                variant_major_data,
-                weights_for_batch, // Use the pre-gathered data
-                flips_for_batch,   // Use the pre-gathered data
-                reconciled_variant_indices_for_batch,
-                prep_result,
-                partial_scores_out,
-                partial_missing_counts_out,
-                tile_pool,
-                sparse_index_pool,
-            );
-        }
-        PersonSubset::Indices(indices) => {
-            // Create an iterator over the subset of people specified in the keep file.
-            let iter = indices.par_iter().copied().map(OriginalPersonIndex);
-            
-            process_people_iterator(
-                iter,
-                variant_major_data,
-                weights_for_batch, // Use the pre-gathered data
-                flips_for_batch,   // Use the pre-gathered data
-                reconciled_variant_indices_for_batch,
-                prep_result,
-                partial_scores_out,
-                partial_missing_counts_out,
-                tile_pool,
-                sparse_index_pool,
-            );
-        }
+    // === SEQUENTIAL COMPUTE WITHIN A SINGLE PARALLEL TASK ===
+    // This main loop is intentionally sequential. The outer pipeline (in pipeline.rs)
+    // is responsible for parallelism by calling this function for different batches
+    // on different threads. This avoids thread pool exhaustion and is highly
+    // cache-friendly, as each thread works on its own disjoint data blocks.
+    let num_scores = prep_result.score_names.len();
+    let items_per_block = PERSON_BLOCK_SIZE * num_scores;
+
+    let person_indices_to_process = match &prep_result.person_subset {
+        PersonSubset::All => None, // Will generate ranges on the fly.
+        PersonSubset::Indices(indices) => Some(indices),
     };
+
+    partial_scores_out
+        .chunks_mut(items_per_block)
+        .zip(partial_missing_counts_out.chunks_mut(items_per_block))
+        .enumerate()
+        .for_each(|(block_idx, (block_scores_out, block_missing_counts_out))| {
+            let person_output_start_idx = block_idx * PERSON_BLOCK_SIZE;
+            let person_output_end_idx = (person_output_start_idx + PERSON_BLOCK_SIZE)
+                .min(prep_result.num_people_to_score);
+
+            if person_output_start_idx >= person_output_end_idx {
+                return;
+            }
+
+            // This temporary Vec holds the original FAM indices for only the people
+            // in the current block. This is a small, fast allocation.
+            let person_indices_in_block: Vec<OriginalPersonIndex> =
+                if let Some(indices) = person_indices_to_process {
+                    // Case 1: Using a '--keep' file. We take a slice of the pre-sorted
+                    // FAM indices that correspond to our current output block.
+                    indices[person_output_start_idx..person_output_end_idx]
+                        .iter()
+                        .map(|&fam_idx| OriginalPersonIndex(fam_idx))
+                        .collect()
+                } else {
+                    // Case 2: Scoring all people. The FAM index is the same as the
+                    // output index. We can generate this range on the fly.
+                    (person_output_start_idx as u32..person_output_end_idx as u32)
+                        .map(OriginalPersonIndex)
+                        .collect()
+                };
+
+            process_block(
+                &person_indices_in_block,
+                prep_result,
+                variant_major_data,
+                weights_for_batch,
+                flips_for_batch,
+                reconciled_variant_indices_for_batch,
+                block_scores_out,
+                block_missing_counts_out,
+                tile_pool,
+                sparse_index_pool,
+            );
+        });
 
     Ok(())
 }
@@ -162,56 +181,6 @@ pub fn run_person_major_path(
 // ========================================================================================
 //                            PRIVATE IMPLEMENTATION
 // ========================================================================================
-
-/// Contains the main parallel processing logic, using an idiomatic Rayon structure
-/// for high-performance, in-place mutation.
-fn process_people_iterator<'a, I>(
-    iter: I,
-    variant_major_data: &'a [u8],
-    weights: &'a [f32],
-    flips: &'a [u8],
-    reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
-    prep_result: &'a PreparationResult,
-    partial_scores: &'a mut [f64],
-    partial_missing_counts: &'a mut [u32],
-    tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
-    sparse_index_pool: &'a SparseIndexPool,
-) where
-    I: IndexedParallelIterator<Item = OriginalPersonIndex> + Send,
-{
-    let num_scores = prep_result.score_names.len();
-    let all_person_indices: Vec<_> = iter.collect();
-    let items_per_block = PERSON_BLOCK_SIZE * num_scores;
-
-    // The main parallel loop iterates over the OUTPUT buffers in disjoint chunks.
-    partial_scores
-        .par_chunks_mut(items_per_block)
-        .zip(partial_missing_counts.par_chunks_mut(items_per_block))
-        .enumerate()
-        .for_each(|(block_idx, (block_scores_out, block_missing_counts_out))| {
-            let person_start_idx = block_idx * PERSON_BLOCK_SIZE;
-            let person_end_idx =
-                (person_start_idx + PERSON_BLOCK_SIZE).min(all_person_indices.len());
-            let person_indices_in_block = &all_person_indices[person_start_idx..person_end_idx];
-
-            if person_indices_in_block.is_empty() {
-                return;
-            }
-
-            process_block(
-                person_indices_in_block,
-                prep_result,
-                variant_major_data,
-                weights,
-                flips,
-                reconciled_variant_indices_for_batch,
-                block_scores_out,
-                block_missing_counts_out,
-                tile_pool,
-                sparse_index_pool,
-            );
-        });
-}
 
 /// Processes a single block of individuals.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
