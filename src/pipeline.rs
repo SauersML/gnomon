@@ -787,32 +787,54 @@ fn resolve_complex_variants(
     final_missing_counts: &mut [u32],
 ) -> Result<(), PipelineError> {
     let num_scores = prep_result.score_names.len();
+    let num_rules = prep_result.complex_rules.len();
 
-    // Use a high-performance concurrent DashSet. This uses fine-grained
-    // locking internally to obliterate contention when printing warnings.
+    // Do nothing if there are no rules to process.
+    if num_rules == 0 {
+        return Ok(());
+    }
+
+    eprintln!("> Resolving {} complex variant rules...", num_rules);
+
+    // Use a high-performance concurrent DashSet for warnings.
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
-
-    // Use a lock-free atomic flag for the hot path check,
-    // and a Mutex only for storing the *first* error encountered.
+    // Use a lock-free atomic flag for fast error checking and a Mutex for storing the error itself.
     let fatal_error_occurred = AtomicBool::new(false);
     let fatal_error_storage = Mutex::new(None::<PipelineError>);
 
-    final_scores
-        .par_chunks_mut(num_scores)
-        .zip(final_missing_counts.par_chunks_mut(num_scores))
-        .enumerate()
-        // Use `for_each` to prevent the deadlock caused by combining a lock with `try_for_each`.
-        .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-            // FAST PATH: This is a single, lock-free atomic read. If another thread
-            // has failed, we exit this iteration immediately without any blocking.
-            if fatal_error_occurred.load(Ordering::Relaxed) {
-                return;
-            }
+    // Iterate through rules on the outside (Rule-Major).
+    for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
+        // If an error was found in a previous rule's processing, stop before starting new work.
+        if fatal_error_occurred.load(Ordering::Relaxed) {
+            break;
+        }
 
-            let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+        // Create a new progress bar for each rule.
+        let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
+        let progress_style = ProgressStyle::with_template(&format!(
+            ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
+            rule_idx + 1,
+            num_rules
+        ))
+        .expect("Internal Error: Invalid progress bar template string.");
 
-            for group_rule in &prep_result.complex_rules {
-                // --- Step 1: Gather Evidence ---
+        pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏  "));
+
+        // Inner loop is parallel over people, which is now fast because the outer
+        // loop context (the rule data) is consistent and cacheable.
+        final_scores
+            .par_chunks_mut(num_scores)
+            .zip(final_missing_counts.par_chunks_mut(num_scores))
+            .enumerate()
+            .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+                // Fast, lock-free check to bail out of the closure early.
+                if fatal_error_occurred.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+
+                // --- Step 1: Gather Evidence for this person and this specific rule ---
                 let mut valid_interpretations =
                     Vec::with_capacity(group_rule.possible_contexts.len());
 
@@ -831,7 +853,7 @@ fn resolve_complex_variants(
 
                 // --- Step 2: Apply Decision Policy ---
                 match valid_interpretations.len() {
-                    0 => { // Case A: No valid genotypes found for this locus.
+                    0 => {
                         let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                         for score_info in &group_rule.score_applications {
                             counted_cols.insert(score_info.score_column_index);
@@ -840,7 +862,7 @@ fn resolve_complex_variants(
                             person_counts_slice[score_col.0] += 1;
                         }
                     }
-                    1 => { // Case B: Exactly one valid genotype found. Unambiguous happy path.
+                    1 => {
                         let (winning_geno, winning_context) = valid_interpretations[0];
                         let (_bim_idx, winning_a1, winning_a2) = winning_context;
 
@@ -860,7 +882,7 @@ fn resolve_complex_variants(
                             person_scores_slice[score_col] += dosage * weight;
                         }
                     }
-                    _ => { // Case C: A data conflict was detected.
+                    _ => {
                         for score_info in &group_rule.score_applications {
                             let matching_interpretations: Vec<_> = valid_interpretations
                                 .iter()
@@ -871,7 +893,7 @@ fn resolve_complex_variants(
                                 .collect();
 
                             match matching_interpretations.len() {
-                                1 => { // Heuristic Success
+                                1 => {
                                     let (winning_geno, winning_context) = matching_interpretations[0];
                                     let (locus_id, winning_a1, winning_a2) = &**winning_context;
                                     let warning_key = (person_output_idx, *locus_id);
@@ -895,9 +917,8 @@ fn resolve_complex_variants(
                                     };
                                     person_scores_slice[score_col] += dosage * weight;
                                 }
-                                0 => {} // None of the conflicting genotypes matched this score's alleles.
-                                _ => { // Heuristic Failure: Unresolvable ambiguity.
-                                    // COLD PATH: A fatal error occurred.
+                                0 => {}
+                                _ => {
                                     let iid = &prep_result.final_person_iids[person_output_idx];
                                     let first_context_id = group_rule.possible_contexts[0].0.0;
                                     let score_name = &prep_result.score_names[score_info.score_column_index.0];
@@ -905,36 +926,33 @@ fn resolve_complex_variants(
                                         "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
                                         iid, first_context_id, score_name
                                     ));
-                                    
-                                    // Use compare_exchange to ensure only the FIRST thread to fail
-                                    // stores its error and sets the flag. This is the key to being lock-free on the hot path.
                                     if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                                         *fatal_error_storage.lock().unwrap() = Some(error);
                                     }
-                                    
-                                    // Exit the closure for this person. This acts like a `continue` for the parallel loop.
                                     return;
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
+                // Update the progress bar for every person processed.
+                pb.inc(1);
+            });
 
-    // After parallel execution, check if the flag was set.
+        // Clean up the progress bar for the finished rule.
+        pb.finish_with_message("Done.");
+    }
+
+    // Check for a captured error after all rules are processed (or one has failed).
     if fatal_error_occurred.load(Ordering::Relaxed) {
-        // Attempt to take the lock and then the value from the Option. This is panic-safe.
         if let Ok(mut guard) = fatal_error_storage.lock() {
             if let Some(err) = guard.take() {
                 return Err(err);
             }
         }
-        // Fallback in the unlikely event the lock is poisoned but the flag was set.
-        return Err(PipelineError::Compute(
-            "A fatal, unspecified error occurred in a parallel task.".to_string(),
-        ));
+        return Err(PipelineError::Compute("A fatal, unspecified error occurred in a parallel task.".to_string()));
     }
-
+    
+    eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
