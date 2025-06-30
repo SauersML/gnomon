@@ -1095,6 +1095,3 @@ fn resolve_complex_variants(
     eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
-    eprintln!("> Complex variant resolution complete.");
-    Ok(())
-}
