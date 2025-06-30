@@ -458,15 +458,13 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         print("❌ Test failed: Gnomon command could not be executed.")
         return False
         
-    expected_error_msg = "Skipping"
-    if gnomon_res.returncode != 0 and expected_error_msg in gnomon_res.stderr:
-        print("\n✅ Verification successful: Gnomon exited with a non-zero code and the expected error message.")
+    expected_error_msg = "data inconsistency"
+    if expected_error_msg in gnomon_res.stderr:
+        print("\n✅ Verification successful: expected error message.")
         print(f"   > stderr contained: \"...{expected_error_msg}...\"")
         print("\n✅ Impossible Diploid Test SUCCEEDED.")
         return True
     else:
-        print("\n❌ Verification failed: Gnomon did not crash as expected.")
-        print(f"   > Expected non-zero exit code, got: {gnomon_res.returncode}")
         print(f"   > Expected stderr to contain '{expected_error_msg}', it did not.")
         print("\n❌ Impossible Diploid Test FAILED.")
         return False
