@@ -242,9 +242,11 @@ pub fn prepare_for_computation(
     // Allele strings borrowed from the arena are stored here temporarily.
     let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, (f32, bool)>> =
         BTreeMap::new();
+    // For complex rules, the key is the set of BIM contexts. The value is a tuple
+    // containing the canonical chr:pos key for the locus and all score applications.
     let mut intermediate_complex_rules: BTreeMap<
         Vec<(BimRowIndex, &str, &str)>,
-        Vec<(ScoreColumnIndex, f32, &str)>,
+        (VariantKey, Vec<(ScoreColumnIndex, f32, &str)>),
     > = BTreeMap::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
@@ -366,10 +368,16 @@ pub fn prepare_for_computation(
                                 score_record.weight,
                                 score_record.effect_allele,
                             );
-                            intermediate_complex_rules
+
+                            // The key for the map is the set of BIM contexts. On first
+                            // encounter, we store the canonical chr:pos key. Then we
+                            // append the score application.
+                            let entry = intermediate_complex_rules
                                 .entry(possible_contexts)
-                                .or_default()
-                                .push(score_info);
+                                .or_insert_with(|| (key, Vec::new()));
+
+                            // The value is a tuple: (key, scores_vec), so we push to entry.1
+                            entry.1.push(score_info);
                         }
                         ReconciliationOutcome::NotFound => {}
                     }
@@ -390,19 +398,30 @@ pub fn prepare_for_computation(
     // we perform bulk copies of the allele strings we collected.
     let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
         .into_iter()
-        .map(|(contexts, scores)| GroupedComplexRule {
-            possible_contexts: contexts
-                .into_iter()
-                .map(|(idx, a1, a2)| (idx, a1.to_string(), a2.to_string()))
-                .collect(),
-            score_applications: scores
-                .into_iter()
-                .map(|(sc_idx, weight, ea)| ScoreInfo {
-                    effect_allele: ea.to_string(),
-                    weight,
-                    score_column_index: sc_idx,
-                })
-                .collect(),
+        .map(|(contexts, (variant_key, scores))| {
+            // Convert the numeric chromosome key back into a string representation.
+            let chr_str = match variant_key.0 {
+                23 => "X".to_string(),
+                24 => "Y".to_string(),
+                25 => "MT".to_string(),
+                n => n.to_string(),
+            };
+
+            GroupedComplexRule {
+                locus_chr_pos: (chr_str, variant_key.1),
+                possible_contexts: contexts
+                    .into_iter()
+                    .map(|(idx, a1, a2)| (idx, a1.to_string(), a2.to_string()))
+                    .collect(),
+                score_applications: scores
+                    .into_iter()
+                    .map(|(sc_idx, weight, ea)| ScoreInfo {
+                        effect_allele: ea.to_string(),
+                        weight,
+                        score_column_index: sc_idx,
+                    })
+                    .collect(),
+            }
         })
         .collect();
 
