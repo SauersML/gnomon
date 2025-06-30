@@ -1019,8 +1019,7 @@ fn resolve_complex_variants(
                         .enumerate()
                         .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
                             // This guard ensures the progress counter is always incremented
-                            // when the closure for a person finishes, regardless of how it
-                            // exits. This is the definitive fix for the hang.
+                            // when the closure for a person finishes, regardless of how it exits
                             let _progress_guard = ScopeGuard::new(|| {
                                 progress_counter.fetch_add(1, Ordering::Relaxed);
                             });
