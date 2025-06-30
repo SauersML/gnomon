@@ -1012,14 +1012,15 @@ fn resolve_complex_variants(
             {
                 let error_flag_for_workers = Arc::clone(&fatal_error_occurred);
 
-                s.spawn(|| {
+                s.spawn(move || {
                     final_scores
                         .par_chunks_mut(prep_result.score_names.len())
                         .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
                         .enumerate()
                         .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
                             // This guard ensures the progress counter is always incremented
-                            // when the closure for a person finishes, regardless of how it exits
+                            // when the closure for a person finishes, regardless of how it
+                            // exits. This is the definitive fix for the hang.
                             let _progress_guard = ScopeGuard::new(|| {
                                 progress_counter.fetch_add(1, Ordering::Relaxed);
                             });
