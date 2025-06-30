@@ -648,6 +648,45 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
+/// A general-purpose RAII guard that executes a closure when it goes out of scope.
+///
+/// This utility is crucial for ensuring that a specific action, such as releasing a
+/// resource or signaling completion, is performed regardless of how a scope is exited
+/// (e.g., normal completion, early return, or panic). It holds an optional closure,
+/// which is taken and executed in the `drop` implementation, guaranteeing the
+/// action runs exactly once.
+struct ScopeGuard<F: FnOnce()> {
+    /// The closure to execute on drop. `Option` is used to allow the closure
+    /// to be taken and called, preventing multiple executions.
+    action: Option<F>,
+}
+
+impl<F: FnOnce()> ScopeGuard<F> {
+    /// Creates a new `ScopeGuard` with the given action.
+    ///
+    /// The action will be executed when the returned guard is dropped.
+    #[inline(always)]
+    fn new(action: F) -> Self {
+        Self {
+            action: Some(action),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for ScopeGuard<F> {
+    /// Executes the stored action when the guard goes out of scope.
+    ///
+    /// This method is called automatically by the Rust compiler. It takes the
+    /// action out of the `Option`, ensuring it can only be run once, and then
+    /// executes it.
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Some(action) = self.action.take() {
+            action();
+        }
+    }
+}
+
 type ConsumerResult = Result<(Vec<f64>, Vec<u32>), PipelineError>;
 
 /// A contention-free consumer for the sparse variant stream, using Rayon's
@@ -919,7 +958,9 @@ fn resolve_complex_variants(
 
     eprintln!("> Resolving {} complex variant rules...", num_rules);
 
-    let fatal_error_occurred = AtomicBool::new(false);
+    // This flag is shared across all threads to signal when a fatal, unrecoverable
+    // error has occurred, allowing for a coordinated, clean shutdown of all tasks.
+    let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<PipelineError>);
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
 
@@ -934,79 +975,93 @@ fn resolve_complex_variants(
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
             rule_idx + 1, num_rules
         )).expect("Internal Error: Invalid progress bar template string.");
-        pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏  "));
+        pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
 
-        // Use an atomic counter for lock-free progress updates from worker threads.
         let progress_counter = Arc::new(AtomicU64::new(0));
-        // Collect raw warning data into a mutex-protected Vec to avoid heap allocations in the hot loop.
         let warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
 
-        // Use a rayon::scope to run the workers and the progress bar updater concurrently.
+        // Use a scoped thread block to ensure the main thread waits for both the
+        // workers and the progress updater to finish before proceeding.
         thread::scope(|s| {
             // Spawner #1: The dedicated progress bar updater thread.
-            // This thread is the ONLY one that touches the progress bar I/O.
-            let pb_updater = pb.clone();
-            let counter_for_updater = Arc::clone(&progress_counter);
-            let total_people = prep_result.num_people_to_score as u64;
-            s.spawn(move || {
-                // This loop terminates when the number of processed items reaches the
-                // total, ensuring this thread finishes before the scope ends
-                while counter_for_updater.load(Ordering::Relaxed) < total_people {
-                    let processed = counter_for_updater.load(Ordering::Relaxed);
-                    pb_updater.set_position(processed);
-                    thread::sleep(Duration::from_millis(200));
-                }
-                // Perform one final update to ensure the bar shows 100% completion.
-                pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
-            });
+            {
+                let pb_updater = pb.clone();
+                let counter_for_updater = Arc::clone(&progress_counter);
+                let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
+                let total_people = prep_result.num_people_to_score as u64;
 
-            // Spawner #2: The worker threads.
-            s.spawn(|| {
-                final_scores
-                    .par_chunks_mut(prep_result.score_names.len())
-                    .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
-                    .enumerate()
-                    .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                        if fatal_error_occurred.load(Ordering::Relaxed) {
-                            return;
-                        }
+                s.spawn(move || {
+                    // This loop terminates under two conditions:
+                    // 1. All work is complete (counter reaches total).
+                    // 2. A fatal error has been signaled by a worker thread.
+                    // This prevents the updater from hanging if workers stop early.
+                    while counter_for_updater.load(Ordering::Relaxed) < total_people
+                        && !error_flag_for_updater.load(Ordering::Relaxed)
+                    {
+                        pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    // Perform one final update to show the terminal state. If an error
+                    // occurred, this accurately reflects how many items were processed
+                    // before the operation was aborted.
+                    pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+                });
+            }
 
-                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+            // Spawner #2: The worker threads (managed by Rayon).
+            {
+                let error_flag_for_workers = Arc::clone(&fatal_error_occurred);
 
-                        // Call the pure logic function.
-                        let outcome = process_person_for_rule(
-                            resolver, prep_result, group_rule, person_output_idx,
-                            original_fam_idx, person_scores_slice, person_counts_slice,
-                        );
+                s.spawn(|| {
+                    final_scores
+                        .par_chunks_mut(prep_result.score_names.len())
+                        .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
+                        .enumerate()
+                        .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+                            // This guard ensures the progress counter is always incremented
+                            // when the closure for a person finishes, regardless of how it exits
+                            let _progress_guard = ScopeGuard::new(|| {
+                                progress_counter.fetch_add(1, Ordering::Relaxed);
+                            });
 
-                        // Handle the outcome with appropriate side-effects.
-                        match outcome {
-                            ResolutionOutcome::Success => {}
-                            ResolutionOutcome::Warning(info) => {
-                                // Check if warning is a duplicate. This is fast and thread-safe.
-                                if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
-                                    // Lock, push raw data, unlock. No `format!`.
-                                    warnings_to_print.lock().unwrap().push(info);
+                            // This check provides a fast-fail mechanism, preventing new work
+                            // from being done after a fatal error has been detected.
+                            if error_flag_for_workers.load(Ordering::Relaxed) {
+                                return;
+                            }
+
+                            let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+
+                            let outcome = process_person_for_rule(
+                                resolver, prep_result, group_rule, person_output_idx,
+                                original_fam_idx, person_scores_slice, person_counts_slice,
+                            );
+
+                            match outcome {
+                                ResolutionOutcome::Success => {}
+                                ResolutionOutcome::Warning(info) => {
+                                    if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
+                                        warnings_to_print.lock().unwrap().push(info);
+                                    }
+                                }
+                                ResolutionOutcome::Fatal(error) => {
+                                    // Use compare_exchange to ensure only the FIRST fatal error
+                                    // is stored. This prevents race conditions where multiple
+                                    // threads fail simultaneously.
+                                    if error_flag_for_workers.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                        *fatal_error_storage.lock().unwrap() = Some(error);
+                                    }
+                                    return;
                                 }
                             }
-                            ResolutionOutcome::Fatal(error) => {
-                                if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                    *fatal_error_storage.lock().unwrap() = Some(error);
-                                }
-                                return; // Stop this thread's work.
-                            }
-                        }
+                        });
+                });
+            }
+        }); // Scope ends, all spawned threads are joined.
 
-                        // A single, lock-free atomic increment.
-                        progress_counter.fetch_add(1, Ordering::Relaxed);
-                    });
-            });
-        }); // Scope ends, threads are joined.
-
-        // Now, on the main thread, handle all I/O for the completed rule.
         pb.finish_with_message("Done.");
 
-        // Drain and print all collected warnings.
+        // Drain and print all collected warnings on the main thread.
         let collected_warnings = std::mem::take(&mut *warnings_to_print.lock().unwrap());
         for info in collected_warnings {
             let iid = &prep_result.final_person_iids[info.person_output_idx];
@@ -1018,17 +1073,20 @@ fn resolve_complex_variants(
         }
     }
 
+    // After all rules are processed, check if a fatal error was ever stored.
+    // If so, retrieve it from the mutex and propagate it as the function's result.
     if fatal_error_occurred.load(Ordering::Relaxed) {
         if let Ok(mut guard) = fatal_error_storage.lock() {
             if let Some(err) = guard.take() {
                 return Err(err);
             }
         }
+        // As a fallback, return a generic error if the specific one can't be retrieved.
         return Err(PipelineError::Compute(
             "A fatal, unspecified error occurred in a parallel task.".to_string(),
         ));
     }
-    
+
     eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
