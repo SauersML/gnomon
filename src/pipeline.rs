@@ -774,12 +774,13 @@ fn process_dense_stream(
     Ok((scores, counts))
 }
 
+
 /// The "slow path" resolver for complex, multiallelic variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
 /// iterates through each person and resolves their score contributions for the small
-/// set of variants that could not be handled by the fast path. It uses the pre-built
-/// `ComplexVariantResolver` for performant, parallel-safe data access.
+/// set of variants that could not be handled by the fast path. It uses a rule-major
+/// outer loop with a person-major parallel inner loop to provide granular progress.
 fn resolve_complex_variants(
     resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
@@ -796,15 +797,15 @@ fn resolve_complex_variants(
 
     eprintln!("> Resolving {} complex variant rules...", num_rules);
 
-    // Use a high-performance concurrent DashSet for warnings.
+    // Use a high-performance concurrent DashSet for de-duplicating warnings.
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
     // Use a lock-free atomic flag for fast error checking and a Mutex for storing the error itself.
     let fatal_error_occurred = AtomicBool::new(false);
     let fatal_error_storage = Mutex::new(None::<PipelineError>);
 
-    // Iterate through rules on the outside (Rule-Major).
+    // Iterate through rules one by one to provide clear, sequential progress to the user.
     for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
-        // If an error was found in a previous rule's processing, stop before starting new work.
+        // If a fatal error was found in a previous rule's processing, stop immediately.
         if fatal_error_occurred.load(Ordering::Relaxed) {
             break;
         }
@@ -812,130 +813,128 @@ fn resolve_complex_variants(
         // Create a new progress bar for each rule.
         let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
         let progress_style = ProgressStyle::with_template(&format!(
+            // Style the progress bar to show which rule is being processed.
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
             rule_idx + 1,
             num_rules
         ))
         .expect("Internal Error: Invalid progress bar template string.");
-
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏  "));
 
-        // Inner loop is parallel over people, which is now fast because the outer
-        // loop context (the rule data) is consistent and cacheable.
+        // The inner loop is parallel over all people for the current rule.
         final_scores
             .par_chunks_mut(num_scores)
             .zip(final_missing_counts.par_chunks_mut(num_scores))
             .enumerate()
             .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                // Fast, lock-free check to bail out of the closure early.
+                // Fast, lock-free check to bail out of this closure early if another thread has failed.
                 if fatal_error_occurred.load(Ordering::Relaxed) {
                     return;
                 }
 
+                // All I/O is deferred until the end of the closure.
+                // These local variables will hold the *decision* to print, not the I/O action itself.
+                let mut warning_to_print: Option<String> = None;
+                let mut fatal_error_to_set: Option<PipelineError> = None;
+
                 let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
-                // --- Step 1: Gather Evidence for this person and this specific rule ---
-                let mut valid_interpretations =
-                    Vec::with_capacity(group_rule.possible_contexts.len());
-
-                for context in &group_rule.possible_contexts {
-                    let (bim_idx, ..) = context;
-                    let packed_geno = resolver.get_packed_genotype(
-                        prep_result.bytes_per_variant,
-                        *bim_idx,
-                        original_fam_idx,
-                    );
-
-                    if packed_geno != 0b01 { // 0b01 is the PLINK "missing" code
-                        valid_interpretations.push((packed_geno, context));
-                    }
-                }
-
-                // --- Step 2: Apply Decision Policy ---
-                match valid_interpretations.len() {
-                    0 => {
-                        let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
-                        for score_info in &group_rule.score_applications {
-                            counted_cols.insert(score_info.score_column_index);
-                        }
-                        for score_col in counted_cols {
-                            person_counts_slice[score_col.0] += 1;
+                // === STAGE 1 (in-closure): LOGIC & COMPUTATION (NO I/O) ===
+                'score_loop: {
+                    let mut valid_interpretations = Vec::with_capacity(group_rule.possible_contexts.len());
+                    for context in &group_rule.possible_contexts {
+                        let (bim_idx, ..) = context;
+                        let packed_geno = resolver.get_packed_genotype(
+                            prep_result.bytes_per_variant, *bim_idx, original_fam_idx,
+                        );
+                        if packed_geno != 0b01 {
+                            valid_interpretations.push((packed_geno, context));
                         }
                     }
-                    1 => {
-                        let (winning_geno, winning_context) = valid_interpretations[0];
-                        let (_bim_idx, winning_a1, winning_a2) = winning_context;
 
-                        for score_info in &group_rule.score_applications {
-                            let effect_allele = &score_info.effect_allele;
-                            let score_col = score_info.score_column_index.0;
-                            let weight = score_info.weight as f64;
-
-                            if effect_allele != winning_a1 && effect_allele != winning_a2 {
-                                continue;
+                    match valid_interpretations.len() {
+                        0 => {
+                            let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
+                            for score_info in &group_rule.score_applications {
+                                counted_cols.insert(score_info.score_column_index);
                             }
-                            let dosage: f64 = if effect_allele == winning_a1 {
-                                match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
-                            } else {
-                                match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
-                            };
-                            person_scores_slice[score_col] += dosage * weight;
+                            for score_col in counted_cols {
+                                person_counts_slice[score_col.0] += 1;
+                            }
                         }
-                    }
-                    _ => {
-                        for score_info in &group_rule.score_applications {
-                            let matching_interpretations: Vec<_> = valid_interpretations
-                                .iter()
-                                .filter(|&&(_, context)| {
-                                    let (_, a1, a2) = context;
-                                    &score_info.effect_allele == a1 || &score_info.effect_allele == a2
-                                })
-                                .collect();
-
-                            match matching_interpretations.len() {
-                                1 => {
-                                    let (winning_geno, winning_context) = matching_interpretations[0];
-                                    let (locus_id, winning_a1, winning_a2) = &**winning_context;
-                                    let warning_key = (person_output_idx, *locus_id);
-                                    
-                                    if warned_pairs.insert(warning_key) {
-                                        eprintln!(
-                                            "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
-                                            prep_result.final_person_iids[person_output_idx],
-                                            locus_id.0,
-                                            prep_result.score_names[score_info.score_column_index.0],
-                                            winning_a1,
-                                            winning_a2
-                                        );
-                                    }
-                                    let score_col = score_info.score_column_index.0;
-                                    let weight = score_info.weight as f64;
-                                    let dosage: f64 = if &score_info.effect_allele == winning_a1 {
-                                        match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
-                                    } else {
-                                        match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
-                                    };
-                                    person_scores_slice[score_col] += dosage * weight;
+                        1 => {
+                            let (winning_geno, winning_context) = valid_interpretations[0];
+                            let (_bim_idx, winning_a1, winning_a2) = winning_context;
+                            for score_info in &group_rule.score_applications {
+                                let effect_allele = &score_info.effect_allele;
+                                if effect_allele != winning_a1 && effect_allele != winning_a2 {
+                                    continue;
                                 }
-                                0 => {}
-                                _ => {
-                                    let iid = &prep_result.final_person_iids[person_output_idx];
-                                    let first_context_id = group_rule.possible_contexts[0].0.0;
-                                    let score_name = &prep_result.score_names[score_info.score_column_index.0];
-                                    let error = PipelineError::Compute(format!(
-                                        "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
-                                        iid, first_context_id, score_name
-                                    ));
-                                    if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                        *fatal_error_storage.lock().unwrap() = Some(error);
+                                let dosage: f64 = if effect_allele == winning_a1 {
+                                    match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                                } else {
+                                    match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                                };
+                                person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                            }
+                        }
+                        _ => {
+                            for score_info in &group_rule.score_applications {
+                                let matching = valid_interpretations.iter().filter(|&&(_, c)| &score_info.effect_allele == c.1 || &score_info.effect_allele == c.2).collect::<Vec<_>>();
+                                match matching.len() {
+                                    1 => {
+                                        let (winning_geno, winning_context) = matching[0];
+                                        let (locus_id, winning_a1, winning_a2) = &**winning_context;
+                                        // Decide if a warning is needed. This acquires a lock.
+                                        if warned_pairs.insert((person_output_idx, *locus_id)) {
+                                            // DECOUPLE: Prepare the message, but do not print it yet.
+                                            warning_to_print = Some(format!(
+                                                "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
+                                                prep_result.final_person_iids[person_output_idx], locus_id.0,
+                                                prep_result.score_names[score_info.score_column_index.0], winning_a1, winning_a2
+                                            ));
+                                        }
+                                        let dosage: f64 = if &score_info.effect_allele == winning_a1 {
+                                            match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                                        } else {
+                                            match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                                        };
+                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
                                     }
-                                    return;
+                                    0 => {}
+                                    _ => {
+                                        // Prepare the error, but do not return or store it globally yet.
+                                        fatal_error_to_set = Some(PipelineError::Compute(format!(
+                                            "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
+                                            prep_result.final_person_iids[person_output_idx], group_rule.possible_contexts[0].0.0,
+                                            prep_result.score_names[score_info.score_column_index.0]
+                                        )));
+                                        // Break the inner loop over score applications; no more work needed for this person.
+                                        break 'score_loop;
+                                    }
                                 }
                             }
                         }
                     }
+                } // End of 'score_loop block
+
+                // === STAGE 2 (in-closure): ERROR HANDLING & I/O (LOCKS DECOUPLED) ===
+
+                // First, handle fatal errors to stop other threads as fast as possible.
+                if let Some(error) = fatal_error_to_set {
+                    if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        *fatal_error_storage.lock().unwrap() = Some(error);
+                    }
+                    return; // Exit this closure; this thread's work is done.
                 }
-                // Update the progress bar for every person processed.
+
+                // Then, print any prepared warning messages. This is now safe.
+                if let Some(msg) = warning_to_print {
+                    // Use pb.println to print messages without scrambling the progress bar.
+                    pb.println(msg);
+                }
+
+                // Finally, update the progress bar.
                 pb.inc(1);
             });
 
@@ -943,16 +942,19 @@ fn resolve_complex_variants(
         pb.finish_with_message("Done.");
     }
 
-    // Check for a captured error after all rules are processed (or one has failed).
+    // After all rules are processed (or one has failed), check for a captured error.
     if fatal_error_occurred.load(Ordering::Relaxed) {
         if let Ok(mut guard) = fatal_error_storage.lock() {
             if let Some(err) = guard.take() {
                 return Err(err);
             }
         }
-        return Err(PipelineError::Compute("A fatal, unspecified error occurred in a parallel task.".to_string()));
+        // Fallback in the unlikely event the lock is poisoned but the flag was set.
+        return Err(PipelineError::Compute(
+            "A fatal, unspecified error occurred in a parallel task.".to_string(),
+        ));
     }
-    
+
     eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
