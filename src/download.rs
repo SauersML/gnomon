@@ -4,9 +4,8 @@
 //
 // ========================================================================================
 
-
 use crate::reformat;
-use dwldutil::{Downloader, DLFile};
+use dwldutil::{DLFile, Downloader};
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -79,7 +78,10 @@ pub fn resolve_and_download_scores(
         if native_path.exists() {
             existing_native_paths.push(native_path);
         } else if temp_gz_path.exists() {
-            eprintln!("> Found existing downloaded file for {}. Skipping download.", id);
+            eprintln!(
+                "> Found existing downloaded file for {}. Skipping download.",
+                id
+            );
             files_to_reformat.push((temp_gz_path, native_path));
         } else {
             ids_to_download.push(id.clone());
@@ -112,16 +114,18 @@ pub fn resolve_and_download_scores(
 
     let new_native_paths = files_to_reformat
         .into_par_iter()
-        .map(|(input_path, final_native_path)| -> Result<PathBuf, DownloadError> {
-            reformat::reformat_pgs_file(&input_path, &final_native_path)
-                .map_err(DownloadError::Reformat)?;
+        .map(
+            |(input_path, final_native_path)| -> Result<PathBuf, DownloadError> {
+                reformat::reformat_pgs_file(&input_path, &final_native_path)
+                    .map_err(DownloadError::Reformat)?;
 
-            // Clean up the original downloaded file immediately after successful reformatting.
-            fs::remove_file(&input_path)
-                .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
+                // Clean up the original downloaded file immediately after successful reformatting.
+                fs::remove_file(&input_path)
+                    .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
 
-            Ok(final_native_path)
-        })
+                Ok(final_native_path)
+            },
+        )
         .collect::<Result<Vec<PathBuf>, _>>()?;
 
     eprintln!("> Reformatting complete.");
@@ -146,21 +150,21 @@ pub enum DownloadError {
 }
 
 impl Display for DownloadError {
-	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-		match self {
-			DownloadError::Io(e, path) => {
-				write!(f, "I/O error for '{}': {}", path.display(), e)
-			}
-			DownloadError::Network(s) => write!(f, "Network download failed: {}", s),
-			DownloadError::InvalidId(s) => write!(
-				f,
-				"Invalid ID format for '{}'. All IDs must start with 'PGS'.",
-				s
-			),
-			DownloadError::Reformat(e) => write!(f, "{}", e),
-			DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {}", e),
-		}
-	}
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            DownloadError::Io(e, path) => {
+                write!(f, "I/O error for '{}': {}", path.display(), e)
+            }
+            DownloadError::Network(s) => write!(f, "Network download failed: {}", s),
+            DownloadError::InvalidId(s) => write!(
+                f,
+                "Invalid ID format for '{}'. All IDs must start with 'PGS'.",
+                s
+            ),
+            DownloadError::Reformat(e) => write!(f, "{}", e),
+            DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {}", e),
+        }
+    }
 }
 
 impl Error for DownloadError {

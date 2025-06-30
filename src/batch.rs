@@ -15,11 +15,16 @@
 use crate::kernel;
 use crate::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
-    ReconciledVariantIndex};
+    ReconciledVariantIndex,
+};
 use crossbeam_queue::ArrayQueue;
 use num_cpus;
 use std::error::Error;
-use std::simd::{cmp::SimdPartialEq, num::{SimdFloat, SimdUint}, Simd};
+use std::simd::{
+    Simd,
+    cmp::SimdPartialEq,
+    num::{SimdFloat, SimdUint},
+};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -42,11 +47,7 @@ const KERNEL_MINI_BATCH_SIZE: usize = 256;
 #[derive(Debug)]
 pub struct SparseIndexPool {
     /// The lock-free queue holding the reusable buffer sets.
-    pool: ArrayQueue<(
-        Vec<Vec<usize>>,
-        Vec<Vec<usize>>,
-        Vec<(usize, usize)>,
-    )>,
+    pool: ArrayQueue<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)>,
 }
 
 impl SparseIndexPool {
@@ -72,14 +73,7 @@ impl SparseIndexPool {
     /// Pushes a buffer set back into the pool after it has been used.
     /// This allows its memory to be recycled by another task.
     #[inline(always)]
-    pub fn push(
-        &self,
-        buffers: (
-            Vec<Vec<usize>>,
-            Vec<Vec<usize>>,
-            Vec<(usize, usize)>,
-        ),
-    ) {
+    pub fn push(&self, buffers: (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)) {
         // We don't care if the push fails (e.g., if the pool is full),
         // as the buffer will simply be dropped, which is safe.
         let _ = self.pool.push(buffers);
@@ -132,50 +126,51 @@ pub fn run_person_major_path(
         .chunks_mut(items_per_block)
         .zip(partial_missing_counts_out.chunks_mut(items_per_block))
         .enumerate()
-        .for_each(|(block_idx, (block_scores_out, block_missing_counts_out))| {
-            let person_output_start_idx = block_idx * PERSON_BLOCK_SIZE;
-            let person_output_end_idx = (person_output_start_idx + PERSON_BLOCK_SIZE)
-                .min(prep_result.num_people_to_score);
+        .for_each(
+            |(block_idx, (block_scores_out, block_missing_counts_out))| {
+                let person_output_start_idx = block_idx * PERSON_BLOCK_SIZE;
+                let person_output_end_idx = (person_output_start_idx + PERSON_BLOCK_SIZE)
+                    .min(prep_result.num_people_to_score);
 
-            if person_output_start_idx >= person_output_end_idx {
-                return;
-            }
+                if person_output_start_idx >= person_output_end_idx {
+                    return;
+                }
 
-            // This temporary Vec holds the original FAM indices for only the people
-            // in the current block. This is a small, fast allocation.
-            let person_indices_in_block: Vec<OriginalPersonIndex> =
-                if let Some(indices) = person_indices_to_process {
-                    // Case 1: Using a '--keep' file. We take a slice of the pre-sorted
-                    // FAM indices that correspond to our current output block.
-                    indices[person_output_start_idx..person_output_end_idx]
-                        .iter()
-                        .map(|&fam_idx| OriginalPersonIndex(fam_idx))
-                        .collect()
-                } else {
-                    // Case 2: Scoring all people. The FAM index is the same as the
-                    // output index. We can generate this range on the fly.
-                    (person_output_start_idx as u32..person_output_end_idx as u32)
-                        .map(OriginalPersonIndex)
-                        .collect()
-                };
+                // This temporary Vec holds the original FAM indices for only the people
+                // in the current block. This is a small, fast allocation.
+                let person_indices_in_block: Vec<OriginalPersonIndex> =
+                    if let Some(indices) = person_indices_to_process {
+                        // Case 1: Using a '--keep' file. We take a slice of the pre-sorted
+                        // FAM indices that correspond to our current output block.
+                        indices[person_output_start_idx..person_output_end_idx]
+                            .iter()
+                            .map(|&fam_idx| OriginalPersonIndex(fam_idx))
+                            .collect()
+                    } else {
+                        // Case 2: Scoring all people. The FAM index is the same as the
+                        // output index. We can generate this range on the fly.
+                        (person_output_start_idx as u32..person_output_end_idx as u32)
+                            .map(OriginalPersonIndex)
+                            .collect()
+                    };
 
-            process_block(
-                &person_indices_in_block,
-                prep_result,
-                variant_major_data,
-                weights_for_batch,
-                flips_for_batch,
-                reconciled_variant_indices_for_batch,
-                block_scores_out,
-                block_missing_counts_out,
-                tile_pool,
-                sparse_index_pool,
-            );
-        });
+                process_block(
+                    &person_indices_in_block,
+                    prep_result,
+                    variant_major_data,
+                    weights_for_batch,
+                    flips_for_batch,
+                    reconciled_variant_indices_for_batch,
+                    block_scores_out,
+                    block_missing_counts_out,
+                    tile_pool,
+                    sparse_index_pool,
+                );
+            },
+        );
 
     Ok(())
 }
-
 
 // ========================================================================================
 //                            PRIVATE IMPLEMENTATION
@@ -242,13 +237,17 @@ fn process_tile<'a>(
 ) {
     let variants_in_chunk = reconciled_variant_indices_for_batch.len();
     let num_scores = prep_result.score_names.len();
-    let num_people_in_block = if variants_in_chunk > 0 { tile.len() / variants_in_chunk } else { 0 };
+    let num_people_in_block = if variants_in_chunk > 0 {
+        tile.len() / variants_in_chunk
+    } else {
+        0
+    };
     if num_people_in_block == 0 {
         return;
     }
     let stride = prep_result.stride();
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
-    
+
     // Acquire a buffer set ONCE before all mini-batch loops.
     let mut buffers = sparse_index_pool.pop();
 
@@ -260,7 +259,7 @@ fn process_tile<'a>(
         if mini_batch_size == 0 {
             continue;
         }
-        
+
         // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
         // The buffer set is local to this thread for the duration of the function.
         let (g1_indices, g2_indices, missing_events) = &mut buffers;
@@ -272,12 +271,18 @@ fn process_tile<'a>(
         if g1_indices.len() < num_people_in_block {
             g1_indices.resize_with(num_people_in_block, Default::default);
         }
-        g1_indices.iter_mut().take(num_people_in_block).for_each(|v| v.clear());
+        g1_indices
+            .iter_mut()
+            .take(num_people_in_block)
+            .for_each(|v| v.clear());
 
         if g2_indices.len() < num_people_in_block {
             g2_indices.resize_with(num_people_in_block, Default::default);
         }
-        g2_indices.iter_mut().take(num_people_in_block).for_each(|v| v.clear());
+        g2_indices
+            .iter_mut()
+            .take(num_people_in_block)
+            .for_each(|v| v.clear());
         missing_events.clear();
 
         for person_idx in 0..num_people_in_block {
@@ -304,7 +309,8 @@ fn process_tile<'a>(
                         // Defer the expensive work.
                         // Instead of doing the lookups and calculations now,
                         // just record the event and move on. This is extremely fast.
-                        let variant_idx_in_chunk = variant_mini_batch_start + variant_idx_in_mini_batch;
+                        let variant_idx_in_chunk =
+                            variant_mini_batch_start + variant_idx_in_mini_batch;
                         missing_events.push((person_idx, variant_idx_in_chunk));
                     }
                     _ => (),
@@ -320,10 +326,12 @@ fn process_tile<'a>(
         let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
         let flip_flags_chunk = &flips_for_batch[matrix_slice_start..matrix_slice_end];
 
-        let weights = kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
-            .expect("CRITICAL: Mini-batch weights matrix validation failed.");
-        let flip_flags = kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
-            .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
+        let weights =
+            kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
+                .expect("CRITICAL: Mini-batch weights matrix validation failed.");
+        let flip_flags =
+            kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
+                .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
 
         // --- C. Dispatch to Kernel and Accumulate Results ---
         block_scores_out
@@ -350,7 +358,8 @@ fn process_tile<'a>(
                         let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
                         let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-                        let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
+                        let scores_slice_low =
+                            &mut scores_out_slice[scores_offset..scores_offset + 4];
                         let mut present_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
                         present_scores_low += adj_low_f64x4;
                         scores_slice_low.copy_from_slice(&present_scores_low.to_array());
@@ -376,19 +385,17 @@ fn process_tile<'a>(
         for &(person_idx, variant_idx_in_chunk) in missing_events.iter() {
             // This is a rare, slow path for missing data. We use the index metadata
             // to look up the global information needed.
-            let global_matrix_row_idx = reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
-            let scores_for_this_variant =
-                &prep_result.variant_to_scores_map[global_matrix_row_idx];
-            
+            let global_matrix_row_idx =
+                reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
+            let scores_for_this_variant = &prep_result.variant_to_scores_map[global_matrix_row_idx];
+
             // For the baseline correction, we use the pre-gathered batch data, which is fast.
             let weight_row_offset = variant_idx_in_chunk * stride;
-            let weight_row =
-                &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
-            let flip_row =
-                &flips_for_batch[weight_row_offset..weight_row_offset + num_scores];
+            let weight_row = &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
+            let flip_row = &flips_for_batch[weight_row_offset..weight_row_offset + num_scores];
 
-            let person_scores_slice = &mut block_scores_out
-                [person_idx * num_scores..(person_idx + 1) * num_scores];
+            let person_scores_slice =
+                &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
             let person_missing_counts_slice = &mut block_missing_counts_out
                 [person_idx * num_scores..(person_idx + 1) * num_scores];
 
@@ -404,7 +411,7 @@ fn process_tile<'a>(
             }
         }
     }
-    
+
     // Return the buffers to the pool ONCE after all mini-batches are complete.
     sparse_index_pool.push(buffers);
 }
@@ -422,7 +429,11 @@ fn pivot_tile(
 ) {
     let num_people_in_block = person_indices_in_block.len();
     let bytes_per_variant = prep_result.bytes_per_variant;
-    let variants_in_chunk = if num_people_in_block > 0 { tile.len() / num_people_in_block } else { 0 };
+    let variants_in_chunk = if num_people_in_block > 0 {
+        tile.len() / num_people_in_block
+    } else {
+        0
+    };
 
     // Maps a desired sequential variant index (0-7) to its physical source location within
     // the shuffled vector produced by the `transpose_8x8_u8` function. This is used
@@ -478,22 +489,22 @@ fn pivot_tile(
                 let dest_offset = person_idx_in_block * variants_in_chunk + variant_chunk_start;
                 let shuffled_person_row = person_data_vectors[i].to_array();
 
-                        // OPTIMIZATION: Assemble the final row on the stack, then do a single bulk copy.
-                        // This removes the previous `unsafe` block, replacing it with a safe,
-                        // bounds-checked copy that is often optimized to a single instruction.
+                // OPTIMIZATION: Assemble the final row on the stack, then do a single bulk copy.
+                // This removes the previous `unsafe` block, replacing it with a safe,
+                // bounds-checked copy that is often optimized to a single instruction.
 
-                        // 1. Create a small, stack-allocated buffer for the unshuffled row.
-                        let mut temp_row = [EffectAlleleDosage::default(); SIMD_LANES];
+                // 1. Create a small, stack-allocated buffer for the unshuffled row.
+                let mut temp_row = [EffectAlleleDosage::default(); SIMD_LANES];
 
-                        // 2. Un-shuffle the transposed vector into the temporary buffer.
-                            for j in 0..present_variants {
-                            let dosage_value = shuffled_person_row[UNSHUFFLE_MAP[j]];
-                            temp_row[j] = EffectAlleleDosage(dosage_value);
-                            }
+                // 2. Un-shuffle the transposed vector into the temporary buffer.
+                for j in 0..present_variants {
+                    let dosage_value = shuffled_person_row[UNSHUFFLE_MAP[j]];
+                    temp_row[j] = EffectAlleleDosage(dosage_value);
+                }
 
-                        // 3. Perform a single, bulk copy into the main tile.
-                        tile[dest_offset..dest_offset + present_variants]
-                            .copy_from_slice(&temp_row[..present_variants]);
+                // 3. Perform a single, bulk copy into the main tile.
+                tile[dest_offset..dest_offset + present_variants]
+                    .copy_from_slice(&temp_row[..present_variants]);
             }
         }
     }
@@ -524,11 +535,16 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
     let (r6, r7) = s3.cast::<u32>().interleave(s7.cast::<u32>());
 
     [
-        r0.cast(), r1.cast(), r2.cast(), r3.cast(),
-        r4.cast(), r5.cast(), r6.cast(), r7.cast(),
+        r0.cast(),
+        r1.cast(),
+        r2.cast(),
+        r3.cast(),
+        r4.cast(),
+        r5.cast(),
+        r6.cast(),
+        r7.cast(),
     ]
 }
-
 
 // ========================================================================================
 //                     ADAPTIVE DISPATCHER & variant-MAJOR PATH
@@ -584,7 +600,7 @@ pub fn run_variant_major_path(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
     let stride = prep_result.stride();
-    
+
     // Get pointers to the relevant weight/flip data for this variant. This is
     // an efficient calculation of the offset into the global contiguous matrices.
     let matrix_row_offset = reconciled_variant_index.0 as usize * stride;
@@ -599,19 +615,19 @@ pub fn run_variant_major_path(
     for out_idx in 0..prep_result.num_people_to_score {
         // Use a pre-computed map to find the original .fam index for this output slot.
         let original_fam_idx = prep_result.output_idx_to_fam_idx[out_idx] as usize;
-        
+
         // --- On-the-fly Genotype Decoding ---
         // This is extremely fast (a few bitwise operations) and allocation-free.
         let byte_index = original_fam_idx / 4;
         let bit_offset = (original_fam_idx % 4) * 2;
         let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
-        
+
         // The logic for all dosage states is handled in a single, efficient match.
         match packed_val {
             // Homozygous reference (0b00) or other unknown values. Do nothing.
             // For sparse variants, this branch is highly predictable for the CPU.
-            0b00 => (), 
-            
+            0b00 => (),
+
             // Missing genotype (0b01).
             0b01 => {
                 let scores_offset = out_idx * num_scores;
@@ -625,7 +641,7 @@ pub fn run_variant_major_path(
                     }
                 }
             }
-            
+
             // Heterozygous (0b10) or Homozygous alternate (0b11).
             0b10 | 0b11 => {
                 let dosage = if packed_val == 0b10 { 1.0 } else { 2.0 };
@@ -643,7 +659,7 @@ pub fn run_variant_major_path(
                     partial_scores_out[scores_offset + col] += adjustment;
                 }
             }
-            
+
             // Should not be reached with valid PLINK data.
             _ => unreachable!(),
         }
@@ -673,9 +689,8 @@ mod tests {
 
         // Convert the scalar matrix into the SIMD vector format required by the function.
         // `input_vectors[j]` will hold data for variant `j` across all 8 people.
-        let input_vectors: [U8xN; 8] = core::array::from_fn(|j| {
-            U8xN::from_array(variant_major_matrix[j])
-        });
+        let input_vectors: [U8xN; 8] =
+            core::array::from_fn(|j| U8xN::from_array(variant_major_matrix[j]));
 
         // 2. EXECUTION: Perform the transpose operation we want to probe.
         let transposed_vectors = transpose_8x8_u8(input_vectors);
@@ -684,7 +699,10 @@ mod tests {
         eprintln!("\n\n=============== EMPIRICAL TRANSPOSE VERIFICATION ===============");
         eprintln!("Input Matrix (variant-Major): One row per variant");
         for variant_idx in 0..8 {
-            eprintln!("  variant {:?}: {:?}", variant_idx, variant_major_matrix[variant_idx]);
+            eprintln!(
+                "  variant {:?}: {:?}",
+                variant_idx, variant_major_matrix[variant_idx]
+            );
         }
         eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
         eprintln!("Each row represents data for one Person, across all 8 variants...");
@@ -698,10 +716,10 @@ mod tests {
             // This loop will FAIL if the variant data is not shuffled as hypothesized.
             for variant_idx in 0..8 {
                 let expected_val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
-                
+
                 // Get the actual value from the shuffled location.
                 let val_from_shuffled_pos = person_row_actual[VARIANT_TO_SHUFFLED_POS[variant_idx]];
-                
+
                 // Also get the value from the naive sequential position.
                 let val_from_naive_pos = person_row_actual[variant_idx];
 
@@ -709,12 +727,18 @@ mod tests {
                     all_tests_passed = false;
                     eprintln!(
                         "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
-                        person_idx, variant_idx, expected_val, VARIANT_TO_SHUFFLED_POS[variant_idx], val_from_shuffled_pos
+                        person_idx,
+                        variant_idx,
+                        expected_val,
+                        VARIANT_TO_SHUFFLED_POS[variant_idx],
+                        val_from_shuffled_pos
                     );
                 }
-                if val_from_naive_pos == expected_val && VARIANT_TO_SHUFFLED_POS[variant_idx] != variant_idx {
-                     all_tests_passed = false;
-                     eprintln!(
+                if val_from_naive_pos == expected_val
+                    && VARIANT_TO_SHUFFLED_POS[variant_idx] != variant_idx
+                {
+                    all_tests_passed = false;
+                    eprintln!(
                         "    -> FAIL: Naive position [{}] unexpectedly held the correct value for S{}!",
                         variant_idx, variant_idx
                     );
@@ -723,7 +747,12 @@ mod tests {
         }
         eprintln!("==============================================================\n");
 
-        assert!(all_tests_passed, "The transpose output layout does not match the expected shuffle pattern.");
-        eprintln!("✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized.");
+        assert!(
+            all_tests_passed,
+            "The transpose output layout does not match the expected shuffle pattern."
+        );
+        eprintln!(
+            "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
+        );
     }
 }

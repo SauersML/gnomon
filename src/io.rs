@@ -19,8 +19,8 @@ use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
 use memmap2::Mmap;
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The number of variants to process locally before updating the global atomic counter.
 /// A power of 2 is often efficient.
@@ -154,8 +154,9 @@ pub fn multi_file_producer_thread<F>(
             // Unmap the old file (implicitly done by dropping `mmap`) and map the new one.
             mmap = match File::open(&boundaries[current_fileset_idx].bed_path)
                 .map_err(|e| PipelineError::Io(e.to_string()))
-                .and_then(|file| unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string())) })
-            {
+                .and_then(|file| unsafe {
+                    Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))
+                }) {
                 Ok(map) => map,
                 Err(e) => {
                     let _ = sparse_tx.send(Err(e.clone()));
@@ -173,14 +174,16 @@ pub fn multi_file_producer_thread<F>(
         }
 
         // Translate the global index to a local, file-specific index.
-        let local_index = global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
+        let local_index =
+            global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
         let offset = (3 + local_index * bytes_per_variant) as usize;
         let end = offset + bytes_per_variant as usize;
 
         if end > mmap.len() {
             let err = PipelineError::Io(format!(
                 "Fatal: Read past end of .bed file '{}' for variant with global index {}. File may be corrupt.",
-                boundaries[current_fileset_idx].bed_path.display(), global_bim_row_index.0
+                boundaries[current_fileset_idx].bed_path.display(),
+                global_bim_row_index.0
             ));
             let _ = sparse_tx.send(Err(err.clone()));
             let _ = dense_tx.send(Err(err));
@@ -199,7 +202,11 @@ pub fn multi_file_producer_thread<F>(
             reconciled_variant_index: ReconciledVariantIndex(i as u32),
         };
 
-        let tx = if path == ComputePath::Pivot { &dense_tx } else { &sparse_tx };
+        let tx = if path == ComputePath::Pivot {
+            &dense_tx
+        } else {
+            &sparse_tx
+        };
         if tx.send(Ok(work_item)).is_err() {
             break; // Consumers disconnected.
         }

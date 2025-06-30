@@ -55,6 +55,7 @@ struct KeyedBimRecord<'arena> {
 struct KeyedScoreRecord<'arena> {
     key: VariantKey,
     effect_allele: &'arena str,
+    other_allele: &'arena str,
     score_column_index: ScoreColumnIndex,
     weight: f32,
 }
@@ -105,11 +106,13 @@ struct FileStream<'arena> {
     reader: BufReader<File>,
     /// A buffer for weights and column indices from the current line being processed.
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
-    /// The key and effect allele (borrowed from the arena) for the current buffered line.
-    current_line_info: Option<(VariantKey, &'arena str)>,
+    /// The key and alleles (borrowed from the arena) for the current buffered line.
+    current_line_info: Option<(VariantKey, &'arena str, &'arena str)>,
     // This is a temporary buffer for reading lines from the file before they
     // are allocated into the long-lived arena.
     line_string_buffer: String,
+    /// Counter for malformed lines in this specific file stream.
+    malformed_lines_count: usize,
 }
 
 /// An iterator that merges multiple, sorted score files on the fly.
@@ -246,7 +249,7 @@ pub fn prepare_for_computation(
     // containing the canonical chr:pos key for the locus and all score applications.
     let mut intermediate_complex_rules: BTreeMap<
         Vec<(BimRowIndex, &str, &str)>,
-        (VariantKey, Vec<(ScoreColumnIndex, f32, &str)>),
+        (VariantKey, Vec<(ScoreColumnIndex, f32, &str, &str)>),
     > = BTreeMap::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
@@ -256,7 +259,10 @@ pub fn prepare_for_computation(
                 PrepError::Parse(msg) => {
                     if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
                         if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
-                            eprintln!("Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.", chr_name);
+                            eprintln!(
+                                "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.",
+                                chr_name
+                            );
                         }
                     }
                     continue;
@@ -271,7 +277,10 @@ pub fn prepare_for_computation(
                 PrepError::Parse(msg) => {
                     if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
                         if seen_invalid_score_chrs.insert(chr_name.to_string()) {
-                            eprintln!("Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.", chr_name);
+                            eprintln!(
+                                "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.",
+                                chr_name
+                            );
                         }
                     }
                     continue;
@@ -306,7 +315,10 @@ pub fn prepare_for_computation(
                         Err(PrepError::Parse(msg)) => {
                             if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
                                 if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
-                                    eprintln!("Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.", chr_name);
+                                    eprintln!(
+                                        "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.",
+                                        chr_name
+                                    );
                                 }
                             }
                         }
@@ -325,7 +337,10 @@ pub fn prepare_for_computation(
                         Err(PrepError::Parse(msg)) => {
                             if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
                                 if seen_invalid_score_chrs.insert(chr_name.to_string()) {
-                                    eprintln!("Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.", chr_name);
+                                    eprintln!(
+                                        "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.",
+                                        chr_name
+                                    );
                                 }
                             }
                         }
@@ -353,7 +368,8 @@ pub fn prepare_for_computation(
                                 {
                                     return Err(PrepError::AmbiguousReconciliation(format!(
                                         "Ambiguous input: The same variant-score pair is defined with different weights across input files. Variant BIM index: {}, Score: {}",
-                                        bim_rec.bim_row_index.0, score_names[score_record.score_column_index.0]
+                                        bim_rec.bim_row_index.0,
+                                        score_names[score_record.score_column_index.0]
                                     )));
                                 }
                             }
@@ -367,6 +383,7 @@ pub fn prepare_for_computation(
                                 score_record.score_column_index,
                                 score_record.weight,
                                 score_record.effect_allele,
+                                score_record.other_allele,
                             );
 
                             // The key for the map is the set of BIM contexts. On first
@@ -389,6 +406,20 @@ pub fn prepare_for_computation(
         "> TIMING: Stage 3 (Data Collection) took {:.2?}",
         overall_start_time.elapsed()
     );
+
+    // After iterating, sum malformed line counts from all streams
+    let total_malformed_lines: usize = score_iterator
+        .streams
+        .iter()
+        .map(|s| s.malformed_lines_count)
+        .sum();
+
+    if total_malformed_lines > 0 {
+        eprintln!(
+            "> Warning: Skipped {} lines from score files due to missing columns (variant_id, effect_allele, other_allele).",
+            total_malformed_lines
+        );
+    }
 
     // --- STAGE 4: IN-MEMORY PROCESSING AND MATRIX CONSTRUCTION ---
     eprintln!("> Stage 4: Verifying data and building final matrices...");
@@ -415,8 +446,9 @@ pub fn prepare_for_computation(
                     .collect(),
                 score_applications: scores
                     .into_iter()
-                    .map(|(sc_idx, weight, ea)| ScoreInfo {
+                    .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
                         effect_allele: ea.to_string(),
+                        other_allele: oa.to_string(),
                         weight,
                         score_column_index: sc_idx,
                     })
@@ -451,16 +483,18 @@ pub fn prepare_for_computation(
         .zip(flip_mask_matrix.par_chunks_mut(stride))
         .zip(variant_to_scores_map.par_iter_mut())
         .enumerate()
-        .for_each(|(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
-            let bim_row_index = required_bim_indices[reconciled_idx];
-            if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
-                for (&score_col_idx, &(weight, is_flipped)) in score_data_map.iter() {
-                    weights_chunk[score_col_idx.0] = weight;
-                    flip_chunk[score_col_idx.0] = if is_flipped { 1 } else { 0 };
+        .for_each(
+            |(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
+                let bim_row_index = required_bim_indices[reconciled_idx];
+                if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
+                    for (&score_col_idx, &(weight, is_flipped)) in score_data_map.iter() {
+                        weights_chunk[score_col_idx.0] = weight;
+                        flip_chunk[score_col_idx.0] = if is_flipped { 1 } else { 0 };
+                    }
+                    *vtsm_entry = score_data_map.keys().copied().collect();
                 }
-                *vtsm_entry = score_data_map.keys().copied().collect();
-            }
-        });
+            },
+        );
 
     let mut score_variant_counts = vec![0u32; score_names.len()];
     for scores in &variant_to_scores_map {
@@ -634,50 +668,46 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.current_reader.as_mut() {
-                Some(reader) => {
-                    match reader.next() {
-                        Some(Ok(line)) => {
-                            self.local_line_num += 1;
-                            self.line_string_buffer.clear();
-                            self.line_string_buffer.push_str(&line);
-                            let line_in_arena = self.bump.alloc_str(&self.line_string_buffer);
+                Some(reader) => match reader.next() {
+                    Some(Ok(line)) => {
+                        self.local_line_num += 1;
+                        self.line_string_buffer.clear();
+                        self.line_string_buffer.push_str(&line);
+                        let line_in_arena = self.bump.alloc_str(&self.line_string_buffer);
 
-                            let mut parts = line_in_arena.split_whitespace();
-                            let chr = parts.next();
-                            let _id = parts.next();
-                            let _cm = parts.next();
-                            let pos = parts.next();
-                            let a1 = parts.next();
-                            let a2 = parts.next();
+                        let mut parts = line_in_arena.split_whitespace();
+                        let chr = parts.next();
+                        let _id = parts.next();
+                        let _cm = parts.next();
+                        let pos = parts.next();
+                        let a1 = parts.next();
+                        let a2 = parts.next();
 
-                            if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
-                                (chr, pos, a1, a2)
-                            {
-                                match parse_key(chr_str, pos_str) {
-                                    Ok(key) => {
-                                        return Some(Ok(KeyedBimRecord {
-                                            key,
-                                            bim_row_index: BimRowIndex(
-                                                self.global_offset + self.local_line_num - 1,
-                                            ),
-                                            allele1: a1,
-                                            allele2: a2,
-                                        }));
-                                    }
-                                    Err(e) => return Some(Err(e)),
+                        if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
+                            (chr, pos, a1, a2)
+                        {
+                            match parse_key(chr_str, pos_str) {
+                                Ok(key) => {
+                                    return Some(Ok(KeyedBimRecord {
+                                        key,
+                                        bim_row_index: BimRowIndex(
+                                            self.global_offset + self.local_line_num - 1,
+                                        ),
+                                        allele1: a1,
+                                        allele2: a2,
+                                    }));
                                 }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            return Some(Err(PrepError::Io(e, self.current_path.clone())))
-                        }
-                        None => {
-                            if let Ok(false) = self.next_file() {
-                                return None;
+                                Err(e) => return Some(Err(e)),
                             }
                         }
                     }
-                }
+                    Some(Err(e)) => return Some(Err(PrepError::Io(e, self.current_path.clone()))),
+                    None => {
+                        if let Ok(false) = self.next_file() {
+                            return None;
+                        }
+                    }
+                },
                 None => return None,
             }
         }
@@ -734,6 +764,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                 line_buffer: std::collections::VecDeque::new(),
                 current_line_info: None,
                 line_string_buffer: String::new(),
+                malformed_lines_count: 0,
             });
         }
 
@@ -769,7 +800,7 @@ impl<'arena> KWayMergeIterator<'arena> {
 
         // Now, get the mutable borrow of the stream.
         let stream = &mut self.streams[file_idx];
-        
+
         // Call the static helper function using the correct syntax.
         // This avoids the borrow checker conflict.
         if Self::read_line_into_buffer(stream, column_map, bump)? {
@@ -808,17 +839,22 @@ impl<'arena> KWayMergeIterator<'arena> {
         let line_in_arena = bump.alloc_str(&stream.line_string_buffer);
 
         let mut parts = line_in_arena.split('\t');
-        let (variant_id, effect_allele) = match (parts.next(), parts.next()) {
-            (Some(v), Some(e)) if !v.is_empty() && !e.is_empty() => (v, e),
-            _ => return Ok(false),
-        };
-        let _other_allele = parts.next();
+        let (variant_id, effect_allele, other_allele) =
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(v), Some(e), Some(o)) if !v.is_empty() && !e.is_empty() && !o.is_empty() => {
+                    (v, e, o)
+                } // Ensure other_allele is also not empty
+                _ => {
+                    stream.malformed_lines_count += 1;
+                    return Ok(false); // Line doesn't have the required three non-empty columns
+                }
+            };
 
         let mut key_parts = variant_id.splitn(2, ':');
         let chr_str = key_parts.next().unwrap_or("");
         let pos_str = key_parts.next().unwrap_or("");
         let key = parse_key(chr_str, pos_str)?;
-        stream.current_line_info = Some((key, effect_allele));
+        stream.current_line_info = Some((key, effect_allele, other_allele));
 
         for (i, weight_str) in parts.enumerate() {
             if let Ok(weight) = weight_str.trim().parse::<f32>() {
@@ -836,10 +872,11 @@ impl<'arena> KWayMergeIterator<'arena> {
         heap: &mut BinaryHeap<HeapItem<'arena>>,
     ) {
         if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
-            let (key, effect_allele) = stream.current_line_info.unwrap();
+            let (key, effect_allele, other_allele) = stream.current_line_info.unwrap();
             let record = KeyedScoreRecord {
                 key,
                 effect_allele,
+                other_allele,
                 score_column_index,
                 weight,
             };
@@ -902,7 +939,10 @@ fn resolve_person_subset(
     iid_to_original_idx: &AHashMap<String, u32>,
 ) -> Result<(PersonSubset, Vec<String>), PrepError> {
     if let Some(path) = keep_file {
-        eprintln!("> Subsetting individuals based on keep file: {}", path.display());
+        eprintln!(
+            "> Subsetting individuals based on keep file: {}",
+            path.display()
+        );
         let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
         let reader = BufReader::new(file);
         let iids_to_keep: AHashSet<String> = reader
@@ -984,9 +1024,7 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
 
 /// Parses only the headers of multiple score files to quickly build a complete,
 /// sorted, and unique list of all score columns across all files.
-pub fn parse_score_file_headers_only(
-    score_files: &[PathBuf],
-) -> Result<Vec<String>, PrepError> {
+pub fn parse_score_file_headers_only(score_files: &[PathBuf]) -> Result<Vec<String>, PrepError> {
     let all_score_names: BTreeSet<String> = score_files
         .par_iter()
         .map(|path| -> Result<Vec<String>, PrepError> {
@@ -1052,7 +1090,10 @@ impl Display for PrepError {
                     f,
                     "No overlapping variants found between genotype data and score files."
                 )?;
-                writeln!(f, "This likely means no variant keys (chr:pos) were identical in both sets of files.")?;
+                writeln!(
+                    f,
+                    "This likely means no variant keys (chr:pos) were identical in both sets of files."
+                )?;
                 writeln!(f, "\n--- DIAGNOSTIC INFORMATION ---")?;
                 writeln!(
                     f,
@@ -1086,7 +1127,10 @@ impl Display for PrepError {
                         writeln!(f, "  - {}:{}", key.0, key.1)?;
                     }
                 }
-                writeln!(f, "\nTIP: Please check for inconsistencies between your files.")
+                writeln!(
+                    f,
+                    "\nTIP: Please check for inconsistencies between your files."
+                )
             }
             PrepError::AmbiguousReconciliation(s) => write!(f, "{}", s),
         }

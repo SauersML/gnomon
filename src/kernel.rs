@@ -9,7 +9,7 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{cmp::SimdPartialEq, f32x8, u8x8, Simd};
+use std::simd::{Simd, cmp::SimdPartialEq, f32x8, u8x8};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -40,11 +40,7 @@ impl<'a> PaddedInterleavedWeights<'a> {
     /// upfront check to ensure the slice length matches the provided dimensions
     /// and the implied padding.
     #[inline]
-    pub fn new(
-        slice: &'a [f32],
-        num_rows: usize,
-        num_scores: usize,
-    ) -> Result<Self, &'static str> {
+    pub fn new(slice: &'a [f32], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
         // The stride is the width of a single row's data, rounded up to the
         // nearest multiple of the SIMD vector width. This padding is the
         // key to enabling branch-free, "no scalar fallback" SIMD.
@@ -95,11 +91,7 @@ pub struct PaddedInterleavedFlags<'a> {
 impl<'a> PaddedInterleavedFlags<'a> {
     /// Creates a new, validated `PaddedInterleavedFlags` view over a slice.
     #[inline]
-    pub fn new(
-        slice: &'a [u8],
-        num_rows: usize,
-        num_scores: usize,
-    ) -> Result<Self, &'static str> {
+    pub fn new(slice: &'a [u8], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
         let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
         if slice.len() != num_rows * stride {
             return Err(
@@ -119,7 +111,6 @@ impl<'a> PaddedInterleavedFlags<'a> {
         unsafe { Simd::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
     }
 }
-
 
 // ========================================================================================
 //                              THE KERNEL IMPLEMENTATION
@@ -177,7 +168,9 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .simd_eq(u8x8::splat(1));
 
-                let adj = flip_mask.cast().select(-two * weights_vec, two * weights_vec);
+                let adj = flip_mask
+                    .cast()
+                    .select(-two * weights_vec, two * weights_vec);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }

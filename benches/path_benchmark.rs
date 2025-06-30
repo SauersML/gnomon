@@ -18,17 +18,13 @@
 //
 // ========================================================================================
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use gnomon::batch;
 use gnomon::kernel;
-use gnomon::types::{
-    PersonSubset, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
-};
+use gnomon::types::{PersonSubset, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex};
 
 use crossbeam_queue::ArrayQueue;
-use rand::seq::{index, SliceRandom};
+use rand::seq::{SliceRandom, index};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,7 +37,6 @@ const ALLELE_FREQUENCIES_TO_TEST: &[f32] = &[0.00001, 0.001, 0.02, 0.4];
 
 /// The number of dense variants to process in a single person-major batch.
 const PIVOT_PATH_BATCH_SIZE: usize = 256;
-
 
 /// Creates a realistic, shared "computation blueprint" for the benchmark.
 ///
@@ -69,20 +64,26 @@ fn setup_benchmark_context(
     let (person_subset, final_person_iids, output_idx_to_fam_idx) = if subset_percentage >= 1.0 {
         (
             PersonSubset::All,
-            (0..total_num_people).map(|i| format!("IID_{}", i)).collect(),
+            (0..total_num_people)
+                .map(|i| format!("IID_{}", i))
+                .collect(),
             (0..total_num_people as u32).collect(),
         )
     } else {
         let mut rng = rand::thread_rng();
-        let fam_indices_to_keep: Vec<u32> = index::sample(&mut rng, total_num_people, num_people_to_score)
-            .into_vec()
-            .into_iter()
-            .map(|i| i as u32)
-            .collect();
+        let fam_indices_to_keep: Vec<u32> =
+            index::sample(&mut rng, total_num_people, num_people_to_score)
+                .into_vec()
+                .into_iter()
+                .map(|i| i as u32)
+                .collect();
 
         (
             PersonSubset::Indices(fam_indices_to_keep.clone()),
-            fam_indices_to_keep.iter().map(|&i| format!("IID_{}", i)).collect(),
+            fam_indices_to_keep
+                .iter()
+                .map(|&i| format!("IID_{}", i))
+                .collect(),
             fam_indices_to_keep,
         )
     };
@@ -129,7 +130,9 @@ fn generate_variant_data_hwe(num_people: usize, allele_frequency: f32) -> Vec<u8
 
     let num_hom_alt = (num_people as f32 * q * q).round() as usize;
     let num_het = (num_people as f32 * 2.0 * p * q).round() as usize;
-    let num_hom_ref = num_people.saturating_sub(num_hom_alt).saturating_sub(num_het);
+    let num_hom_ref = num_people
+        .saturating_sub(num_hom_alt)
+        .saturating_sub(num_het);
 
     let mut genotypes_to_assign = Vec::with_capacity(num_people);
     genotypes_to_assign.extend(std::iter::repeat(0b11).take(num_hom_alt));
@@ -161,11 +164,13 @@ fn benchmark_the_works(c: &mut Criterion) {
         for &num_scores in NUM_SCORES_TO_TEST.iter() {
             for &subset_pct in SUBSET_PERCENTAGES.iter() {
                 for &freq in ALLELE_FREQUENCIES_TO_TEST.iter() {
-
                     // --- SETUP FOR THIS SCENARIO ---
                     let id_str = format!(
                         "N={}_K={}_Subset={:.0}%_Freq={:.3}",
-                        total_people, num_scores, subset_pct * 100.0, freq
+                        total_people,
+                        num_scores,
+                        subset_pct * 100.0,
+                        freq
                     );
 
                     let prep_result = setup_benchmark_context(
@@ -206,10 +211,12 @@ fn benchmark_the_works(c: &mut Criterion) {
                         PIVOT_PATH_BATCH_SIZE * prep_result.bytes_per_variant as usize,
                     );
                     for _ in 0..PIVOT_PATH_BATCH_SIZE {
-                        batch_variant_data.extend_from_slice(&generate_variant_data_hwe(total_people, freq));
+                        batch_variant_data
+                            .extend_from_slice(&generate_variant_data_hwe(total_people, freq));
                     }
-                    let reconciled_indices: Vec<_> =
-                        (0..PIVOT_PATH_BATCH_SIZE as u32).map(ReconciledVariantIndex).collect();
+                    let reconciled_indices: Vec<_> = (0..PIVOT_PATH_BATCH_SIZE as u32)
+                        .map(ReconciledVariantIndex)
+                        .collect();
                     let weights_for_batch = prep_result.weights_matrix().to_vec();
                     let flips_for_batch = prep_result.flip_mask_matrix().to_vec();
 
@@ -253,7 +260,6 @@ fn benchmark_the_works(c: &mut Criterion) {
     }
     group.finish();
 }
-
 
 // Register the master benchmark group with the Criterion runner.
 criterion_group!(benches, benchmark_the_works);

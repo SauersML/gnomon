@@ -6,8 +6,9 @@ use crate::types::{
     ReconciledVariantIndex, ScoreColumnIndex, WorkItem,
 };
 use ahash::AHashSet;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
+use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use num_cpus;
@@ -15,12 +16,11 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
-use std::sync::Mutex;
-use dashmap::DashSet;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -249,9 +249,8 @@ fn run_single_file_pipeline(
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
     let bed_file = File::open(bed_path)
         .map_err(|e| PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e)))?;
-    let mmap = Arc::new(
-        unsafe { Mmap::map(&bed_file).map_err(|e| PipelineError::Io(e.to_string()))? },
-    );
+    let mmap =
+        Arc::new(unsafe { Mmap::map(&bed_file).map_err(|e| PipelineError::Io(e.to_string()))? });
     mmap.advise(memmap2::Advice::Sequential)
         .map_err(|e| PipelineError::Io(e.to_string()))?;
 
@@ -320,24 +319,24 @@ fn run_single_file_pipeline(
             },
         );
 
-// --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
-        let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-            // Spawn the UI updater thread. This thread is responsible for polling the
-            // atomic counter and updating the progress bar on the screen.
-            let updater_thread_count = Arc::clone(&variants_processed_count);
-            let updater_pb = pb.clone();
-            let total_variants = variants_to_process;
-            s.spawn(move || {
-                // This loop terminates when the number of processed items reaches the
-                // total, ensuring this thread finishes before the scope ends
-                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
-                    let processed = updater_thread_count.load(Ordering::Relaxed);
-                    updater_pb.set_position(processed);
-                    thread::sleep(Duration::from_millis(200));
-                }
-                // Perform one final update to ensure the bar shows 100% completion.
-                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
-            });
+    // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
+    let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
+        // Spawn the UI updater thread. This thread is responsible for polling the
+        // atomic counter and updating the progress bar on the screen.
+        let updater_thread_count = Arc::clone(&variants_processed_count);
+        let updater_pb = pb.clone();
+        let total_variants = variants_to_process;
+        s.spawn(move || {
+            // This loop terminates when the number of processed items reaches the
+            // total, ensuring this thread finishes before the scope ends
+            while updater_thread_count.load(Ordering::Relaxed) < total_variants {
+                let processed = updater_thread_count.load(Ordering::Relaxed);
+                updater_pb.set_position(processed);
+                thread::sleep(Duration::from_millis(200));
+            }
+            // Perform one final update to ensure the bar shows 100% completion.
+            updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+        });
 
         let producer_logic = {
             let mmap = Arc::clone(&mmap);
@@ -425,12 +424,7 @@ fn run_single_file_pipeline(
             );
             // The resolver is created once with the single mmap.
             let resolver = ComplexVariantResolver::SingleFile(Arc::clone(&mmap));
-            resolve_complex_variants(
-                &resolver,
-                prep_result,
-                &mut final_scores,
-                &mut final_counts,
-            )?;
+            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
         pb.finish_with_message("Computation complete.");
         Ok((final_scores, final_counts))
@@ -614,12 +608,7 @@ fn run_multi_file_pipeline(
             );
             // The resolver is created once with all necessary mmaps.
             let resolver = ComplexVariantResolver::new(prep_result)?;
-            resolve_complex_variants(
-                &resolver,
-                prep_result,
-                &mut final_scores,
-                &mut final_counts,
-            )?;
+            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
         pb.finish_with_message("Computation complete.");
         Ok((final_scores, final_counts))
@@ -734,8 +723,12 @@ fn process_sparse_stream(
             || (vec![0.0f64; result_size], vec![0u32; result_size]), // Identity for the reduction.
             |mut a, b| {
                 // Combine accumulators from two threads in parallel.
-                a.0.par_iter_mut().zip(b.0).for_each(|(v_a, v_b)| *v_a += v_b);
-                a.1.par_iter_mut().zip(b.1).for_each(|(v_a, v_b)| *v_a += v_b);
+                a.0.par_iter_mut()
+                    .zip(b.0)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
+                a.1.par_iter_mut()
+                    .zip(b.1)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
                 Ok(a)
             },
         )?;
@@ -764,7 +757,8 @@ fn process_dense_stream(
     let final_result = batch_iterator
         .par_bridge() // This is now possible and correct.
         .try_fold(
-            || { // Per-thread accumulator initializer
+            || {
+                // Per-thread accumulator initializer
                 (
                     vec![0.0f64; result_size],
                     vec![0u32; result_size],
@@ -774,36 +768,54 @@ fn process_dense_stream(
             |mut acc, batch_result| {
                 // The `?` operator handles propagating errors from the channel.
                 let batch = batch_result?;
-                if batch.is_empty() { return Ok(acc); }
+                if batch.is_empty() {
+                    return Ok(acc);
+                }
 
                 let reconciled_indices: Vec<ReconciledVariantIndex> =
                     batch.iter().map(|wi| wi.reconciled_variant_index).collect();
 
                 let concatenated_data = &mut acc.2;
                 concatenated_data.clear();
-                
+
                 // BufferGuard ensures all variant data buffers are returned to the pool,
                 // even if an error occurs during computation.
-                let guards: Vec<_> = batch.into_iter().map(|wi| {
-                    concatenated_data.extend_from_slice(&wi.data);
-                    BufferGuard { buffer: Some(wi.data), pool: &buffer_pool }
-                }).collect();
+                let guards: Vec<_> = batch
+                    .into_iter()
+                    .map(|wi| {
+                        concatenated_data.extend_from_slice(&wi.data);
+                        BufferGuard {
+                            buffer: Some(wi.data),
+                            pool: &buffer_pool,
+                        }
+                    })
+                    .collect();
 
                 let stride = prep_result.stride();
                 let mut weights_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
                 let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
                 for &reconciled_idx in &reconciled_indices {
                     let src_offset = reconciled_idx.0 as usize * stride;
-                    weights_for_batch.extend_from_slice(&prep_result.weights_matrix()[src_offset..src_offset + stride]);
-                    flips_for_batch.extend_from_slice(&prep_result.flip_mask_matrix()[src_offset..src_offset + stride]);
+                    weights_for_batch.extend_from_slice(
+                        &prep_result.weights_matrix()[src_offset..src_offset + stride],
+                    );
+                    flips_for_batch.extend_from_slice(
+                        &prep_result.flip_mask_matrix()[src_offset..src_offset + stride],
+                    );
                 }
 
                 batch::run_person_major_path(
-                    concatenated_data, &weights_for_batch, &flips_for_batch,
-                    &reconciled_indices, prep_result, &mut acc.0, &mut acc.1,
-                    &context.tile_pool, &context.sparse_index_pool,
+                    concatenated_data,
+                    &weights_for_batch,
+                    &flips_for_batch,
+                    &reconciled_indices,
+                    prep_result,
+                    &mut acc.0,
+                    &mut acc.1,
+                    &context.tile_pool,
+                    &context.sparse_index_pool,
                 )?;
-                
+
                 drop(guards); // Explicitly drop to return buffers to the pool.
 
                 Ok::<_, PipelineError>(acc)
@@ -812,8 +824,12 @@ fn process_dense_stream(
         .try_reduce(
             || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
             |mut a, b| {
-                a.0.par_iter_mut().zip(b.0).for_each(|(v_a, v_b)| *v_a += v_b);
-                a.1.par_iter_mut().zip(b.1).for_each(|(v_a, v_b)| *v_a += v_b);
+                a.0.par_iter_mut()
+                    .zip(b.0)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
+                a.1.par_iter_mut()
+                    .zip(b.1)
+                    .for_each(|(v_a, v_b)| *v_a += v_b);
                 Ok(a)
             },
         )?;
@@ -824,7 +840,6 @@ fn process_dense_stream(
     let (scores, counts, _) = final_result;
     Ok((scores, counts))
 }
-
 
 /// A private helper struct to hold the raw components of a warning message.
 /// This avoids heap allocations (`format!`) inside the hot parallel loop.
@@ -861,6 +876,8 @@ enum ResolutionMethod {
     /// Exactly one heterozygous call was found alongside one or more homozygous
     /// calls, and the heterozygous call was chosen.
     PreferHeterozygous { chosen_dosage: f64 },
+    /// A single BIM entry's alleles perfectly matched the score file alleles.
+    ExactScoreAlleleMatch { chosen_dosage: f64 },
 }
 
 /// A private struct holding the data for a critical but non-fatal integrity warning.
@@ -903,14 +920,16 @@ fn process_person_for_rule(
         let (bim_idx, ..) = context;
         let packed_geno =
             resolver.get_packed_genotype(prep_result.bytes_per_variant, *bim_idx, original_fam_idx);
-        if packed_geno != 0b01 { // 0b01 is the PLINK "missing" code
+        if packed_geno != 0b01 {
+            // 0b01 is the PLINK "missing" code
             valid_interpretations.push((packed_geno, context));
         }
     }
 
     // --- Step 2: Apply Decision Policy ---
     match valid_interpretations.len() {
-        0 => { // Case A: No valid genotypes found for this locus.
+        0 => {
+            // Case A: No valid genotypes found for this locus.
             let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
             for score_info in &group_rule.score_applications {
                 counted_cols.insert(score_info.score_column_index);
@@ -920,7 +939,8 @@ fn process_person_for_rule(
             }
             ResolutionOutcome::Success
         }
-        1 => { // Case B: Exactly one valid genotype found. Unambiguous happy path.
+        1 => {
+            // Case B: Exactly one valid genotype found. Unambiguous happy path.
             let (winning_geno, winning_context) = valid_interpretations[0];
             let (_bim_idx, winning_a1, winning_a2) = winning_context;
             for score_info in &group_rule.score_applications {
@@ -931,27 +951,55 @@ fn process_person_for_rule(
                     continue;
                 }
                 let dosage: f64 = if effect_allele == winning_a1 {
-                    match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                    match winning_geno {
+                        0b00 => 2.0,
+                        0b10 => 1.0,
+                        0b11 => 0.0,
+                        _ => unreachable!(),
+                    }
                 } else {
-                    match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                    match winning_geno {
+                        0b00 => 0.0,
+                        0b10 => 1.0,
+                        0b11 => 2.0,
+                        _ => unreachable!(),
+                    }
                 };
                 person_scores_slice[score_col] += dosage * weight;
             }
             ResolutionOutcome::Success
         }
-        _ => { // Case C: A data conflict was detected.
+        _ => {
+            // Case C: A data conflict was detected.
             for score_info in &group_rule.score_applications {
-                let matching_interpretations: Vec<_> = valid_interpretations.iter().filter(|(_, context)| &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2).collect();
+                let matching_interpretations: Vec<_> = valid_interpretations
+                    .iter()
+                    .filter(|(_, context)| {
+                        &score_info.effect_allele == &context.1
+                            || &score_info.effect_allele == &context.2
+                    })
+                    .collect();
                 match matching_interpretations.len() {
                     1 => {
                         let (winning_geno, winning_context) = matching_interpretations[0];
                         let (locus_id, winning_a1, winning_a2) = &**winning_context;
                         let dosage: f64 = if &score_info.effect_allele == winning_a1 {
-                            match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                            match *winning_geno {
+                                0b00 => 2.0,
+                                0b10 => 1.0,
+                                0b11 => 0.0,
+                                _ => unreachable!(),
+                            }
                         } else {
-                            match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                            match *winning_geno {
+                                0b00 => 0.0,
+                                0b10 => 1.0,
+                                0b11 => 2.0,
+                                _ => unreachable!(),
+                            }
                         };
-                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                        person_scores_slice[score_info.score_column_index.0] +=
+                            dosage * score_info.weight as f64;
                         // Return the raw data for the warning, not the formatted string.
                         return ResolutionOutcome::Warning(WarningInfo {
                             person_output_idx,
@@ -966,26 +1014,48 @@ fn process_person_for_rule(
                     // This case handles multiple, conflicting, non-missing genotype
                     // records that are all relevant to the current score.
                     _ => {
-                        // Instead of failing immediately, calculate the dosage from each
-                        // conflicting source to see if they are consistent.
-                        let mut dosages = Vec::with_capacity(matching_interpretations.len());
-                        for (geno, context) in &matching_interpretations {
-                            let a1 = &context.1;
-                            let dosage: f64 = if &score_info.effect_allele == a1 {
-                                match geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
-                            } else {
-                                match geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
-                            };
-                            dosages.push(dosage);
-                        }
+                        // --- HEURISTIC 1: Exact Score Allele Match ---
+                        // Before checking dosages, see if there's one BIM entry that
+                        // perfectly matches both alleles from the score file. This is
+                        // the highest-confidence resolution strategy.
+                        let score_eff_allele = &score_info.effect_allele;
+                        let score_oth_allele = &score_info.other_allele;
 
-                        // Check if all calculated dosages are identical.
-                        let first_dosage = dosages[0];
-                        if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
-                            // BENIGN AMBIGUITY: The data is messy, but the outcome is the same.
-                            // We can safely apply the score and issue a critical warning.
-                            person_scores_slice[score_info.score_column_index.0] += first_dosage * score_info.weight as f64;
-                            
+                        let exact_matches: Vec<_> = matching_interpretations
+                            .iter()
+                            .filter(|(_, context)| {
+                                let bim_a1 = &context.1;
+                                let bim_a2 = &context.2;
+                                (bim_a1 == score_eff_allele && bim_a2 == score_oth_allele)
+                                    || (bim_a1 == score_oth_allele && bim_a2 == score_eff_allele)
+                            })
+                            .collect();
+
+                        if exact_matches.len() == 1 {
+                            // SUCCESS: Found a single, unambiguous BIM entry matching the score.
+                            let (winning_geno, winning_context) = exact_matches[0];
+                            let winning_a1 = &winning_context.1;
+
+                            // Calculate dosage from this winning interpretation.
+                            let chosen_dosage: f64 = if score_eff_allele == winning_a1 {
+                                match *winning_geno {
+                                    0b00 => 2.0,
+                                    0b10 => 1.0,
+                                    0b11 => 0.0,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                match *winning_geno {
+                                    0b00 => 0.0,
+                                    0b10 => 1.0,
+                                    0b11 => 2.0,
+                                    _ => unreachable!(),
+                                }
+                            };
+                            person_scores_slice[score_info.score_column_index.0] +=
+                                chosen_dosage * score_info.weight as f64;
+
+                            // Collect all original conflicting sources for the warning report.
                             let conflicts: Vec<ConflictSource> = matching_interpretations
                                 .iter()
                                 .map(|(packed_geno, context)| ConflictSource {
@@ -995,18 +1065,86 @@ fn process_person_for_rule(
                                 })
                                 .collect();
 
-                            return ResolutionOutcome::CriticalIntegrityWarning(CriticalIntegrityWarningInfo {
-                                iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                conflicts,
-                                resolution_method: ResolutionMethod::ConsistentDosage { dosage: first_dosage },
-                            });
+                            return ResolutionOutcome::CriticalIntegrityWarning(
+                                CriticalIntegrityWarningInfo {
+                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                    score_name: prep_result.score_names
+                                        [score_info.score_column_index.0]
+                                        .clone(),
+                                    conflicts,
+                                    resolution_method: ResolutionMethod::ExactScoreAlleleMatch {
+                                        chosen_dosage,
+                                    },
+                                },
+                            );
+                        }
+
+                        // --- HEURISTIC 2: Consistent Dosage (Fallback) ---
+                        // If the exact match heuristic fails, proceed with existing heuristics.
+                        // Calculate the dosage from each conflicting source to see if they are consistent.
+                        let mut dosages = Vec::with_capacity(matching_interpretations.len());
+                        for (geno, context) in &matching_interpretations {
+                            let a1 = &context.1;
+                            let dosage: f64 = if &score_info.effect_allele == a1 {
+                                match geno {
+                                    0b00 => 2.0,
+                                    0b10 => 1.0,
+                                    0b11 => 0.0,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                match geno {
+                                    0b00 => 0.0,
+                                    0b10 => 1.0,
+                                    0b11 => 2.0,
+                                    _ => unreachable!(),
+                                }
+                            };
+                            dosages.push(dosage);
+                        }
+
+                        // Check if all calculated dosages are identical.
+                        let first_dosage = dosages[0];
+                        if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
+                            // BENIGN AMBIGUITY: The data is messy, but the outcome is the same.
+                            // We can safely apply the score and issue a critical warning.
+                            person_scores_slice[score_info.score_column_index.0] +=
+                                first_dosage * score_info.weight as f64;
+
+                            let conflicts: Vec<ConflictSource> = matching_interpretations
+                                .iter()
+                                .map(|(packed_geno, context)| ConflictSource {
+                                    bim_row: context.0,
+                                    alleles: (context.1.clone(), context.2.clone()),
+                                    genotype_bits: *packed_geno,
+                                })
+                                .collect();
+
+                            return ResolutionOutcome::CriticalIntegrityWarning(
+                                CriticalIntegrityWarningInfo {
+                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                    score_name: prep_result.score_names
+                                        [score_info.score_column_index.0]
+                                        .clone(),
+                                    conflicts,
+                                    resolution_method: ResolutionMethod::ConsistentDosage {
+                                        dosage: first_dosage,
+                                    },
+                                },
+                            );
                         } else {
                             // The dosages were not consistent. As a final attempt, apply
                             // the "Prefer Heterozygous" heuristic.
-                            let heterozygous_calls: Vec<_> = matching_interpretations.iter().filter(|(geno, _)| *geno == 0b10).collect();
-                            let homozygous_calls: Vec<_> = matching_interpretations.iter().filter(|(geno, _)| *geno != 0b10).collect();
+                            let heterozygous_calls: Vec<_> = matching_interpretations
+                                .iter()
+                                .filter(|(geno, _)| *geno == 0b10)
+                                .collect();
+                            let homozygous_calls: Vec<_> = matching_interpretations
+                                .iter()
+                                .filter(|(geno, _)| *geno != 0b10)
+                                .collect();
 
                             if heterozygous_calls.len() == 1 && !homozygous_calls.is_empty() {
                                 // HEURISTIC APPLIED: A single het call is preferred over any
@@ -1015,12 +1153,19 @@ fn process_person_for_rule(
                                 let a1 = &winning_context.1;
                                 let chosen_dosage: f64 = if &score_info.effect_allele == a1 {
                                     // This logic is duplicated from the simple path for clarity.
-                                    match *winning_geno { 0b10 => 1.0, _ => unreachable!() }
+                                    match *winning_geno {
+                                        0b10 => 1.0,
+                                        _ => unreachable!(),
+                                    }
                                 } else {
-                                    match *winning_geno { 0b10 => 1.0, _ => unreachable!() }
+                                    match *winning_geno {
+                                        0b10 => 1.0,
+                                        _ => unreachable!(),
+                                    }
                                 };
 
-                                person_scores_slice[score_info.score_column_index.0] += chosen_dosage * score_info.weight as f64;
+                                person_scores_slice[score_info.score_column_index.0] +=
+                                    chosen_dosage * score_info.weight as f64;
 
                                 let conflicts: Vec<ConflictSource> = matching_interpretations
                                     .iter()
@@ -1031,14 +1176,20 @@ fn process_person_for_rule(
                                     })
                                     .collect();
 
-                                return ResolutionOutcome::CriticalIntegrityWarning(CriticalIntegrityWarningInfo {
-                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                    conflicts,
-                                    resolution_method: ResolutionMethod::PreferHeterozygous { chosen_dosage },
-                                });
-
+                                return ResolutionOutcome::CriticalIntegrityWarning(
+                                    CriticalIntegrityWarningInfo {
+                                        iid: prep_result.final_person_iids[person_output_idx]
+                                            .clone(),
+                                        locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                        score_name: prep_result.score_names
+                                            [score_info.score_column_index.0]
+                                            .clone(),
+                                        conflicts,
+                                        resolution_method: ResolutionMethod::PreferHeterozygous {
+                                            chosen_dosage,
+                                        },
+                                    },
+                                );
                             } else {
                                 // MALIGNANT AMBIGUITY: No further heuristics apply. The program MUST fail.
                                 let conflicts: Vec<ConflictSource> = matching_interpretations
@@ -1053,7 +1204,9 @@ fn process_person_for_rule(
                                 let data = FatalAmbiguityData {
                                     iid: prep_result.final_person_iids[person_output_idx].clone(),
                                     locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                    score_name: prep_result.score_names
+                                        [score_info.score_column_index.0]
+                                        .clone(),
                                     conflicts,
                                 };
                                 return ResolutionOutcome::Fatal(data);
@@ -1066,7 +1219,6 @@ fn process_person_for_rule(
         }
     }
 }
-
 
 /// The "slow path" resolver for complex, multiallelic variants.
 ///
@@ -1105,8 +1257,10 @@ fn resolve_complex_variants(
         let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
         let progress_style = ProgressStyle::with_template(&format!(
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
-            rule_idx + 1, num_rules
-        )).expect("Internal Error: Invalid progress bar template string.");
+            rule_idx + 1,
+            num_rules
+        ))
+        .expect("Internal Error: Invalid progress bar template string.");
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
 
         let progress_counter = Arc::new(AtomicU64::new(0));
@@ -1152,50 +1306,67 @@ fn resolve_complex_variants(
                     .par_chunks_mut(prep_result.score_names.len())
                     .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
                     .enumerate()
-                    .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                        // This guard ensures the progress counter is always incremented
-                        // when the closure for a person finishes, regardless of how it exits
-                        let _progress_guard = ScopeGuard::new(|| {
-                            progress_counter.fetch_add(1, Ordering::Relaxed);
-                        });
+                    .for_each(
+                        |(person_output_idx, (person_scores_slice, person_counts_slice))| {
+                            // This guard ensures the progress counter is always incremented
+                            // when the closure for a person finishes, regardless of how it exits
+                            let _progress_guard = ScopeGuard::new(|| {
+                                progress_counter.fetch_add(1, Ordering::Relaxed);
+                            });
 
-                        // This check provides a fast-fail mechanism, preventing new work
-                        // from being done after a fatal error has been detected.
-                        if fatal_error_occurred.load(Ordering::Relaxed) {
-                            return;
-                        }
-
-                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
-
-                        let outcome = process_person_for_rule(
-                            resolver, prep_result, group_rule, person_output_idx,
-                            original_fam_idx, person_scores_slice, person_counts_slice,
-                        );
-
-                          match outcome {
-                            ResolutionOutcome::Success => {}
-                            ResolutionOutcome::Warning(info) => {
-                                if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
-                                    all_warnings_to_print.lock().unwrap().push(info);
-                                }
-                            }
-                            ResolutionOutcome::CriticalIntegrityWarning(info) => {
-                                // This is a non-fatal but severe warning. We collect it
-                                // to report at the end. We do not set the fatal error flag.
-                                all_critical_warnings_to_print.lock().unwrap().push(info);
-                            }
-                            ResolutionOutcome::Fatal(data) => {
-                                // Use compare_exchange to ensure only the FIRST fatal error
-                                // payload is stored. This prevents race conditions where multiple
-                                // threads might fail on different individuals simultaneously.
-                                if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                    *fatal_error_storage.lock().unwrap() = Some(data);
-                                }
-                                // `return` ensures we stop processing for this thread.
+                            // This check provides a fast-fail mechanism, preventing new work
+                            // from being done after a fatal error has been detected.
+                            if fatal_error_occurred.load(Ordering::Relaxed) {
                                 return;
                             }
-                        }
-                    });
+
+                            let original_fam_idx =
+                                prep_result.output_idx_to_fam_idx[person_output_idx];
+
+                            let outcome = process_person_for_rule(
+                                resolver,
+                                prep_result,
+                                group_rule,
+                                person_output_idx,
+                                original_fam_idx,
+                                person_scores_slice,
+                                person_counts_slice,
+                            );
+
+                            match outcome {
+                                ResolutionOutcome::Success => {}
+                                ResolutionOutcome::Warning(info) => {
+                                    if warned_pairs.insert((info.person_output_idx, info.locus_id))
+                                    {
+                                        all_warnings_to_print.lock().unwrap().push(info);
+                                    }
+                                }
+                                ResolutionOutcome::CriticalIntegrityWarning(info) => {
+                                    // This is a non-fatal but severe warning. We collect it
+                                    // to report at the end. We do not set the fatal error flag.
+                                    all_critical_warnings_to_print.lock().unwrap().push(info);
+                                }
+                                ResolutionOutcome::Fatal(data) => {
+                                    // Use compare_exchange to ensure only the FIRST fatal error
+                                    // payload is stored. This prevents race conditions where multiple
+                                    // threads might fail on different individuals simultaneously.
+                                    if fatal_error_occurred
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        *fatal_error_storage.lock().unwrap() = Some(data);
+                                    }
+                                    // `return` ensures we stop processing for this thread.
+                                    return;
+                                }
+                            }
+                        },
+                    );
             });
         }); // Scope ends, all spawned threads are joined.
 
@@ -1205,27 +1376,43 @@ fn resolve_complex_variants(
     // After all rules are processed, drain and print a summary of warnings. This is
     // performed once by the main thread to avoid lock contention on stderr.
     let collected_warnings = std::mem::take(&mut *all_warnings_to_print.lock().unwrap());
-    let collected_critical_warnings = std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
+    let collected_critical_warnings =
+        std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
     const MAX_WARNINGS_TO_PRINT: usize = 10;
 
     let total_critical_warnings = collected_critical_warnings.len();
     if total_critical_warnings > 0 {
-        eprintln!("\n\n========================= CRITICAL DATA INTEGRITY ISSUE =========================");
-        eprintln!("Gnomon detected one or more loci with conflicting genotype data that were\n\
+        eprintln!(
+            "\n\n========================= CRITICAL DATA INTEGRITY ISSUE ========================="
+        );
+        eprintln!(
+            "Gnomon detected one or more loci with conflicting genotype data that were\n\
                   resolved using a heuristic. While computation was able to continue, the\n\
-                  underlying genotype data is ambiguous and should be investigated.");
-        eprintln!("---------------------------------------------------------------------------------");
+                  underlying genotype data is ambiguous and should be investigated."
+        );
+        eprintln!(
+            "---------------------------------------------------------------------------------"
+        );
         for (i, info) in collected_critical_warnings.into_iter().enumerate() {
             if i >= MAX_WARNINGS_TO_PRINT {
                 break;
             }
-            if i > 0 { eprintln!("---------------------------------------------------------------------------------"); }
+            if i > 0 {
+                eprintln!(
+                    "---------------------------------------------------------------------------------"
+                );
+            }
             eprintln!("{}", format_critical_integrity_warning(&info));
         }
         if total_critical_warnings > MAX_WARNINGS_TO_PRINT {
-             eprintln!("\n... and {} more similar critical warnings.", total_critical_warnings - MAX_WARNINGS_TO_PRINT);
+            eprintln!(
+                "\n... and {} more similar critical warnings.",
+                total_critical_warnings - MAX_WARNINGS_TO_PRINT
+            );
         }
-        eprintln!("=================================================================================\n");
+        eprintln!(
+            "=================================================================================\n"
+        );
     }
 
     let total_warnings = collected_warnings.len();
@@ -1243,7 +1430,10 @@ fn resolve_complex_variants(
             );
         }
         if total_warnings > MAX_WARNINGS_TO_PRINT {
-            eprintln!("... and {} more similar warnings.", total_warnings - MAX_WARNINGS_TO_PRINT);
+            eprintln!(
+                "... and {} more similar warnings.",
+                total_warnings - MAX_WARNINGS_TO_PRINT
+            );
         }
     }
 
@@ -1284,21 +1474,49 @@ fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
     };
 
     // Build the final report string.
-    writeln!(report, "Fatal: Unresolvable ambiguity for individual '{}'.\n", data.iid).unwrap();
+    writeln!(
+        report,
+        "Fatal: Unresolvable ambiguity for individual '{}'.\n",
+        data.iid
+    )
+    .unwrap();
     writeln!(report, "Individual:   {}", data.iid).unwrap();
-    writeln!(report, "Locus:        {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
+    writeln!(
+        report,
+        "Locus:        {}:{}",
+        data.locus_chr_pos.0, data.locus_chr_pos.1
+    )
+    .unwrap();
     writeln!(report, "Score:        {}\n", data.score_name).unwrap();
     writeln!(report, "Conflicting Sources:").unwrap();
 
     for conflict in &data.conflicts {
         writeln!(report, "  - BIM Row: {}", conflict.bim_row.0).unwrap();
-        writeln!(report, "    Alleles (A1,A2): ({}, {})", conflict.alleles.0, conflict.alleles.1).unwrap();
+        writeln!(
+            report,
+            "    Alleles (A1,A2): ({}, {})",
+            conflict.alleles.0, conflict.alleles.1
+        )
+        .unwrap();
 
         let bits_str = match conflict.genotype_bits {
-            0b00 => "00", 0b01 => "01", 0b10 => "10", 0b11 => "11", _ => "??"
+            0b00 => "00",
+            0b01 => "01",
+            0b10 => "10",
+            0b11 => "11",
+            _ => "??",
         };
-        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
-        writeln!(report, "    Genotype Bits:   {} (Interpreted as {})", bits_str, interpretation).unwrap();
+        let interpretation = interpret_genotype(
+            conflict.genotype_bits,
+            &conflict.alleles.0,
+            &conflict.alleles.1,
+        );
+        writeln!(
+            report,
+            "    Genotype Bits:   {} (Interpreted as {})",
+            bits_str, interpretation
+        )
+        .unwrap();
     }
 
     report
@@ -1323,7 +1541,12 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
 
     // Build the final report string.
     writeln!(report, "Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
-    writeln!(report, "  Locus:  {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
+    writeln!(
+        report,
+        "  Locus:  {}:{}",
+        data.locus_chr_pos.0, data.locus_chr_pos.1
+    )
+    .unwrap();
     writeln!(report, "  Score:  {}", data.score_name).unwrap();
 
     match &data.resolution_method {
@@ -1335,19 +1558,30 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             writeln!(report, "  Method: 'Prefer Heterozygous' Heuristic").unwrap();
             writeln!(report, "  Outcome: A single heterozygous call was chosen over conflicting homozygous call(s), yielding a dosage of {}.", chosen_dosage).unwrap();
         }
+        ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage } => {
+            writeln!(report, "  Method: 'Exact Score Allele Match' Heuristic").unwrap();
+            writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {}.", chosen_dosage).unwrap();
+        }
     }
 
     writeln!(report, "  \n  Conflicting Sources Found:").unwrap();
 
     for conflict in &data.conflicts {
-        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
-        writeln!(report, "    - BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+        let interpretation = interpret_genotype(
+            conflict.genotype_bits,
+            &conflict.alleles.0,
+            &conflict.alleles.1,
+        );
+        writeln!(
+            report,
+            "    - BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
             conflict.bim_row.0,
             conflict.alleles.0,
             conflict.alleles.1,
             conflict.genotype_bits,
             interpretation
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     report.trim_end().to_string()
