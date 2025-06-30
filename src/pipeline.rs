@@ -775,6 +775,128 @@ fn process_dense_stream(
 }
 
 
+
+// In src/pipeline.rs, replace the entire `resolve_complex_variants` function with this.
+// Make sure these `use` statements are at the top of src/pipeline.rs.
+use dashmap::DashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+/// A private helper struct to hold the raw components of a warning message.
+/// This avoids heap allocations (`format!`) inside the hot parallel loop.
+struct WarningInfo {
+    person_output_idx: usize,
+    locus_id: BimRowIndex,
+    winning_a1: String,
+    winning_a2: String,
+    score_col_idx: ScoreColumnIndex,
+}
+
+/// A private helper enum to represent the outcome of processing one person for one rule.
+/// This decouples the core logic from the side-effects (like I/O or setting global flags).
+enum ResolutionOutcome {
+    Success,
+    Warning(WarningInfo),
+    Fatal(PipelineError),
+}
+
+/// Processes a single person for a single complex rule.
+///
+/// This is a "pure" function: it contains only the core business logic and is free
+/// of I/O, locks, or other side-effects, making it easy to test and reason about.
+#[inline]
+fn process_person_for_rule(
+    resolver: &ComplexVariantResolver,
+    prep_result: &Arc<PreparationResult>,
+    group_rule: &crate::types::GroupedComplexRule,
+    person_output_idx: usize,
+    original_fam_idx: u32,
+    person_scores_slice: &mut [f64],
+    person_counts_slice: &mut [u32],
+) -> ResolutionOutcome {
+    // --- Step 1: Gather Evidence ---
+    let mut valid_interpretations = Vec::with_capacity(group_rule.possible_contexts.len());
+    for context in &group_rule.possible_contexts {
+        let (bim_idx, ..) = context;
+        let packed_geno =
+            resolver.get_packed_genotype(prep_result.bytes_per_variant, *bim_idx, original_fam_idx);
+        if packed_geno != 0b01 { // 0b01 is the PLINK "missing" code
+            valid_interpretations.push((packed_geno, context));
+        }
+    }
+
+    // --- Step 2: Apply Decision Policy ---
+    match valid_interpretations.len() {
+        0 => { // Case A: No valid genotypes found for this locus.
+            let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
+            for score_info in &group_rule.score_applications {
+                counted_cols.insert(score_info.score_column_index);
+            }
+            for score_col in counted_cols {
+                person_counts_slice[score_col.0] += 1;
+            }
+            ResolutionOutcome::Success
+        }
+        1 => { // Case B: Exactly one valid genotype found. Unambiguous happy path.
+            let (winning_geno, winning_context) = valid_interpretations[0];
+            let (_bim_idx, winning_a1, winning_a2) = winning_context;
+            for score_info in &group_rule.score_applications {
+                let effect_allele = &score_info.effect_allele;
+                let score_col = score_info.score_column_index.0;
+                let weight = score_info.weight as f64;
+                if effect_allele != winning_a1 && effect_allele != winning_a2 {
+                    continue;
+                }
+                let dosage: f64 = if effect_allele == winning_a1 {
+                    match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                } else {
+                    match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                };
+                person_scores_slice[score_col] += dosage * weight;
+            }
+            ResolutionOutcome::Success
+        }
+        _ => { // Case C: A data conflict was detected.
+            for score_info in &group_rule.score_applications {
+                let matching_interpretations: Vec<_> = valid_interpretations.iter().filter(|&&(_, c)| &score_info.effect_allele == c.1 || &score_info.effect_allele == c.2).collect();
+                match matching_interpretations.len() {
+                    1 => {
+                        let (winning_geno, winning_context) = matching_interpretations[0];
+                        let (locus_id, winning_a1, winning_a2) = &**winning_context;
+                        let dosage: f64 = if &score_info.effect_allele == winning_a1 {
+                            match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                        } else {
+                            match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                        };
+                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                        // Return the raw data for the warning, not the formatted string.
+                        return ResolutionOutcome::Warning(WarningInfo {
+                            person_output_idx,
+                            locus_id: *locus_id,
+                            winning_a1: winning_a1.clone(),
+                            winning_a2: winning_a2.clone(),
+                            score_col_idx: score_info.score_column_index,
+                        });
+                    }
+                    0 => continue,
+                    _ => {
+                        let iid = &prep_result.final_person_iids[person_output_idx];
+                        let first_context_id = group_rule.possible_contexts[0].0.0;
+                        let score_name = &prep_result.score_names[score_info.score_column_index.0];
+                        return ResolutionOutcome::Fatal(PipelineError::Compute(format!(
+                            "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
+                            iid, first_context_id, score_name
+                        )));
+                    }
+                }
+            }
+            ResolutionOutcome::Success
+        }
+    }
+}
+
 /// The "slow path" resolver for complex, multiallelic variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
@@ -787,174 +909,116 @@ fn resolve_complex_variants(
     final_scores: &mut [f64],
     final_missing_counts: &mut [u32],
 ) -> Result<(), PipelineError> {
-    let num_scores = prep_result.score_names.len();
     let num_rules = prep_result.complex_rules.len();
-
-    // Do nothing if there are no rules to process.
     if num_rules == 0 {
         return Ok(());
     }
 
     eprintln!("> Resolving {} complex variant rules...", num_rules);
 
-    // Use a high-performance concurrent DashSet for de-duplicating warnings.
-    let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
-    // Use a lock-free atomic flag for fast error checking and a Mutex for storing the error itself.
     let fatal_error_occurred = AtomicBool::new(false);
     let fatal_error_storage = Mutex::new(None::<PipelineError>);
+    let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
 
     // Iterate through rules one by one to provide clear, sequential progress to the user.
     for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
-        // If a fatal error was found in a previous rule's processing, stop immediately.
         if fatal_error_occurred.load(Ordering::Relaxed) {
             break;
         }
 
-        // Create a new progress bar for each rule.
         let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
         let progress_style = ProgressStyle::with_template(&format!(
-            // Style the progress bar to show which rule is being processed.
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
-            rule_idx + 1,
-            num_rules
-        ))
-        .expect("Internal Error: Invalid progress bar template string.");
+            rule_idx + 1, num_rules
+        )).expect("Internal Error: Invalid progress bar template string.");
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏  "));
 
-        // The inner loop is parallel over all people for the current rule.
-        final_scores
-            .par_chunks_mut(num_scores)
-            .zip(final_missing_counts.par_chunks_mut(num_scores))
-            .enumerate()
-            .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                // Fast, lock-free check to bail out of this closure early if another thread has failed.
-                if fatal_error_occurred.load(Ordering::Relaxed) {
-                    return;
+        // Use an atomic counter for lock-free progress updates from worker threads.
+        let progress_counter = Arc::new(AtomicU64::new(0));
+        // Collect raw warning data into a mutex-protected Vec to avoid heap allocations in the hot loop.
+        let warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
+
+        // Use a rayon::scope to run the workers and the progress bar updater concurrently.
+        thread::scope(|s| {
+            // Spawner #1: The dedicated progress bar updater thread.
+            // This thread is the ONLY one that touches the progress bar I/O.
+            s.spawn(|_| {
+                while !pb.is_finished() {
+                    let processed = progress_counter.load(Ordering::Relaxed);
+                    pb.set_position(processed);
+                    thread::sleep(Duration::from_millis(200));
                 }
-
-                // All I/O is deferred until the end of the closure.
-                // These local variables will hold the *decision* to print, not the I/O action itself.
-                let mut warning_to_print: Option<String> = None;
-                let mut fatal_error_to_set: Option<PipelineError> = None;
-
-                let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
-
-                // === STAGE 1 (in-closure): LOGIC & COMPUTATION (NO I/O) ===
-                'score_loop: {
-                    let mut valid_interpretations = Vec::with_capacity(group_rule.possible_contexts.len());
-                    for context in &group_rule.possible_contexts {
-                        let (bim_idx, ..) = context;
-                        let packed_geno = resolver.get_packed_genotype(
-                            prep_result.bytes_per_variant, *bim_idx, original_fam_idx,
-                        );
-                        if packed_geno != 0b01 {
-                            valid_interpretations.push((packed_geno, context));
-                        }
-                    }
-
-                    match valid_interpretations.len() {
-                        0 => {
-                            let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
-                            for score_info in &group_rule.score_applications {
-                                counted_cols.insert(score_info.score_column_index);
-                            }
-                            for score_col in counted_cols {
-                                person_counts_slice[score_col.0] += 1;
-                            }
-                        }
-                        1 => {
-                            let (winning_geno, winning_context) = valid_interpretations[0];
-                            let (_bim_idx, winning_a1, winning_a2) = winning_context;
-                            for score_info in &group_rule.score_applications {
-                                let effect_allele = &score_info.effect_allele;
-                                if effect_allele != winning_a1 && effect_allele != winning_a2 {
-                                    continue;
-                                }
-                                let dosage: f64 = if effect_allele == winning_a1 {
-                                    match winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
-                                } else {
-                                    match winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
-                                };
-                                person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
-                            }
-                        }
-                        _ => {
-                            for score_info in &group_rule.score_applications {
-                                let matching = valid_interpretations.iter().filter(|&&(_, c)| &score_info.effect_allele == c.1 || &score_info.effect_allele == c.2).collect::<Vec<_>>();
-                                match matching.len() {
-                                    1 => {
-                                        let (winning_geno, winning_context) = matching[0];
-                                        let (locus_id, winning_a1, winning_a2) = &**winning_context;
-                                        // Decide if a warning is needed. This acquires a lock.
-                                        if warned_pairs.insert((person_output_idx, *locus_id)) {
-                                            // DECOUPLE: Prepare the message, but do not print it yet.
-                                            warning_to_print = Some(format!(
-                                                "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
-                                                prep_result.final_person_iids[person_output_idx], locus_id.0,
-                                                prep_result.score_names[score_info.score_column_index.0], winning_a1, winning_a2
-                                            ));
-                                        }
-                                        let dosage: f64 = if &score_info.effect_allele == winning_a1 {
-                                            match *winning_geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
-                                        } else {
-                                            match *winning_geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
-                                        };
-                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
-                                    }
-                                    0 => {}
-                                    _ => {
-                                        // Prepare the error, but do not return or store it globally yet.
-                                        fatal_error_to_set = Some(PipelineError::Compute(format!(
-                                            "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
-                                            prep_result.final_person_iids[person_output_idx], group_rule.possible_contexts[0].0.0,
-                                            prep_result.score_names[score_info.score_column_index.0]
-                                        )));
-                                        // Break the inner loop over score applications; no more work needed for this person.
-                                        break 'score_loop;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } // End of 'score_loop block
-
-                // === STAGE 2 (in-closure): ERROR HANDLING & I/O (LOCKS DECOUPLED) ===
-
-                // First, handle fatal errors to stop other threads as fast as possible.
-                if let Some(error) = fatal_error_to_set {
-                    if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                        *fatal_error_storage.lock().unwrap() = Some(error);
-                    }
-                    return; // Exit this closure; this thread's work is done.
-                }
-
-                // Then, print any prepared warning messages. This is now safe.
-                if let Some(msg) = warning_to_print {
-                    // Use pb.println to print messages without scrambling the progress bar.
-                    pb.println(msg);
-                }
-
-                // Finally, update the progress bar.
-                pb.inc(1);
             });
 
-        // Clean up the progress bar for the finished rule.
+            // Spawner #2: The worker threads.
+            s.spawn(|_| {
+                final_scores
+                    .par_chunks_mut(prep_result.score_names.len())
+                    .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
+                    .enumerate()
+                    .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+                        if fatal_error_occurred.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+
+                        // Call the pure logic function.
+                        let outcome = process_person_for_rule(
+                            resolver, prep_result, group_rule, person_output_idx,
+                            original_fam_idx, person_scores_slice, person_counts_slice,
+                        );
+
+                        // Handle the outcome with appropriate side-effects.
+                        match outcome {
+                            ResolutionOutcome::Success => {}
+                            ResolutionOutcome::Warning(info) => {
+                                // Check if warning is a duplicate. This is fast and thread-safe.
+                                if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
+                                    // Lock, push raw data, unlock. No `format!`.
+                                    warnings_to_print.lock().unwrap().push(info);
+                                }
+                            }
+                            ResolutionOutcome::Fatal(error) => {
+                                if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                    *fatal_error_storage.lock().unwrap() = Some(error);
+                                }
+                                return; // Stop this thread's work.
+                            }
+                        }
+
+                        // A single, lock-free atomic increment.
+                        progress_counter.fetch_add(1, Ordering::Relaxed);
+                    });
+            });
+        }); // Scope ends, threads are joined.
+
+        // Now, on the main thread, handle all I/O for the completed rule.
         pb.finish_with_message("Done.");
+
+        // Drain and print all collected warnings.
+        let collected_warnings = std::mem::take(&mut *warnings_to_print.lock().unwrap());
+        for info in collected_warnings {
+            let iid = &prep_result.final_person_iids[info.person_output_idx];
+            let score_name = &prep_result.score_names[info.score_col_idx.0];
+            eprintln!(
+                "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
+                iid, info.locus_id.0, score_name, info.winning_a1, info.winning_a2
+            );
+        }
     }
 
-    // After all rules are processed (or one has failed), check for a captured error.
     if fatal_error_occurred.load(Ordering::Relaxed) {
         if let Ok(mut guard) = fatal_error_storage.lock() {
             if let Some(err) = guard.take() {
                 return Err(err);
             }
         }
-        // Fallback in the unlikely event the lock is poisoned but the flag was set.
         return Err(PipelineError::Compute(
             "A fatal, unspecified error occurred in a parallel task.".to_string(),
         ));
     }
-
+    
     eprintln!("> Complex variant resolution complete.");
     Ok(())
 }
