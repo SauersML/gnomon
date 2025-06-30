@@ -54,9 +54,21 @@ struct Args {
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
-fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn main() {
+    // This wrapper provides a clear exit message upon failure.
+    if let Err(e) = run_gnomon() {
+        eprintln!("Gnomon failed.");
+        eprintln!("--------------------------------------------------");
+        eprintln!("{}", e);
+        eprintln!("--------------------------------------------------");
+        eprintln!("Due to this fatal error, no output file was generated.");
+        std::process::exit(1);
+    }
+}
+
+/// The primary application logic
+fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize the Rayon global thread pool to use all available cores.
-    // This is critical for the performance of the data-parallel compute pipeline.
     rayon::ThreadPoolBuilder::new().build_global().unwrap();
 
     let overall_start_time = Instant::now();
