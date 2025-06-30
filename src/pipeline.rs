@@ -964,6 +964,7 @@ fn resolve_complex_variants(
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<PipelineError>);
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
+    let all_warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
 
     // Iterate through rules one by one to provide clear, sequential progress to the user.
     for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
@@ -980,7 +981,6 @@ fn resolve_complex_variants(
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
 
         let progress_counter = Arc::new(AtomicU64::new(0));
-        let warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
 
         // Use a scoped thread block to ensure the main thread waits for both the
         // workers and the progress updater to finish before proceeding. `thread::scope`
@@ -1047,7 +1047,7 @@ fn resolve_complex_variants(
                             ResolutionOutcome::Success => {}
                             ResolutionOutcome::Warning(info) => {
                                 if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
-                                    warnings_to_print.lock().unwrap().push(info);
+                                    all_warnings_to_print.lock().unwrap().push(info);
                                 }
                             }
                             ResolutionOutcome::Fatal(error) => {
@@ -1065,16 +1065,29 @@ fn resolve_complex_variants(
         }); // Scope ends, all spawned threads are joined.
 
         pb.finish_with_message("Done.");
+    }
 
-        // Drain and print all collected warnings on the main thread.
-        let collected_warnings = std::mem::take(&mut *warnings_to_print.lock().unwrap());
-        for info in collected_warnings {
+    // After all rules are processed, drain and print a summary of warnings. This is
+    // performed once by the main thread to avoid lock contention on stderr.
+    let collected_warnings = std::mem::take(&mut *all_warnings_to_print.lock().unwrap());
+    const MAX_WARNINGS_TO_PRINT: usize = 10;
+    let total_warnings = collected_warnings.len();
+
+    if total_warnings > 0 {
+        eprintln!("\n--- Data Inconsistency Warning Summary ---");
+        for (i, info) in collected_warnings.into_iter().enumerate() {
+            if i >= MAX_WARNINGS_TO_PRINT {
+                break;
+            }
             let iid = &prep_result.final_person_iids[info.person_output_idx];
             let score_name = &prep_result.score_names[info.score_col_idx.0];
             eprintln!(
                 "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
                 iid, info.locus_id.0, score_name, info.winning_a1, info.winning_a2
             );
+        }
+        if total_warnings > MAX_WARNINGS_TO_PRINT {
+            eprintln!("... and {} more similar warnings.", total_warnings - MAX_WARNINGS_TO_PRINT);
         }
     }
 
