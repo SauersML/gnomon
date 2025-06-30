@@ -2,10 +2,6 @@
 //                             High-Level Data Contracts
 // ========================================================================================
 
-// ========================================================================================
-//                             High-Level Data Contracts
-// ========================================================================================
-
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
 use std::path::PathBuf;
@@ -54,6 +50,10 @@ pub struct ScoreInfo {
 /// This struct holds information that is shared across all scores that use this variant.
 #[derive(Debug, Clone)]
 pub struct GroupedComplexRule {
+    /// The canonical chromosome and position for this complex locus. This information
+    /// is vital for generating informative error messages.
+    pub locus_chr_pos: (String, u32),
+
     /// A list of all plausible BIM contexts (genotype definitions). This data is
     /// now stored only once per complex variant, not duplicated for every score.
     pub possible_contexts: Vec<(BimRowIndex, String, String)>, // (BimRowIndex, allele1, allele2)
@@ -61,7 +61,6 @@ pub struct GroupedComplexRule {
     /// A list of all scores that apply to this set of contexts.
     pub score_applications: Vec<ScoreInfo>,
 }
-
 /// Defines the subset of individuals to be processed by the engine.
 ///
 /// This enum makes the program's control flow explicit and type-safe. It is
