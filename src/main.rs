@@ -10,11 +10,11 @@
 // from argument parsing to final output.
 
 use clap::Parser;
+use gnomon::download;
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::PreparationResult;
-use gnomon::download;
 use natord::compare;
 use ryu;
 use std::error::Error;
@@ -86,7 +86,9 @@ fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
         if !args.score.exists() && score_arg_str.contains("PGS") {
             // Define the permanent cache directory. Placing it relative to the
             // output is a good strategy, keeping all generated files together.
-            let output_parent_dir = fileset_prefixes[0].parent().unwrap_or_else(|| Path::new("."));
+            let output_parent_dir = fileset_prefixes[0]
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
             let scores_cache_dir = output_parent_dir.join("gnomon_score_cache");
 
             download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?
@@ -113,8 +115,11 @@ fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 1b: Preparation ---
     // This phase is synchronous and CPU-bound. It parses all input files,
     // reconciles variants, and produces a "computation blueprint".
-    let prep_result =
-        run_preparation_phase(&fileset_prefixes, &resolved_score_files, args.keep.as_deref())?;
+    let prep_result = run_preparation_phase(
+        &fileset_prefixes,
+        &resolved_score_files,
+        args.keep.as_deref(),
+    )?;
 
     // --- Phase 2: Resource Allocation ---
     // A read-only context is created, which allocates all necessary memory pools
@@ -362,8 +367,11 @@ fn write_scores_to_file(
     }
     writeln!(writer)?;
 
-    let mut line_buffer =
-        String::with_capacity(person_iids.get(0).map_or(128, |s| s.len() + num_scores * 24));
+    let mut line_buffer = String::with_capacity(
+        person_iids
+            .get(0)
+            .map_or(128, |s| s.len() + num_scores * 24),
+    );
     let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
     let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
     let mut ryu_buffer_score = ryu::Buffer::new();
@@ -408,7 +416,13 @@ fn write_scores_to_file(
             };
 
             // Write the correctly tab-separated data columns.
-            write!(&mut line_buffer, "\t{}\t{}", ryu_buffer_score.format(avg_score), ryu_buffer_missing.format(missing_pct)).unwrap();
+            write!(
+                &mut line_buffer,
+                "\t{}\t{}",
+                ryu_buffer_score.format(avg_score),
+                ryu_buffer_missing.format(missing_pct)
+            )
+            .unwrap();
         }
         writeln!(writer, "{}", line_buffer)?;
     }

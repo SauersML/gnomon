@@ -40,6 +40,8 @@ pub struct ScoreInfo {
     /// The effect allele as defined in the score file. This could theoretically
     /// differ between scores for the same variant.
     pub effect_allele: String,
+    /// The other (non-effect) allele for the variant, used for disambiguation.
+    pub other_allele: String,
     /// The effect weight for this specific score.
     pub weight: f32,
     /// The global column index for the score this rule applies to.
