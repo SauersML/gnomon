@@ -9,9 +9,14 @@ Download data:
 gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarray/plink/* .
 ```
 
-Run a score:
+Run a local score:
 ```
 ./gnomon/target/release/gnomon --score "score.txt" arrays
+```
+
+Or use a score from PGS catalog:
+```
+./gnomon/target/release/gnomon --score "PGS003725" arrays
 ```
 
 #### Example:
