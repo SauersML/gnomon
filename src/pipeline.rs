@@ -320,18 +320,24 @@ fn run_single_file_pipeline(
             },
         );
 
-    // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
-    let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        // Spawn the UI updater thread
-        let updater_thread_count = Arc::clone(&variants_processed_count);
-        let updater_pb = pb.clone();
-        s.spawn(move || {
-            while !updater_pb.is_finished() {
-                let processed = updater_thread_count.load(Ordering::Relaxed);
-                updater_pb.set_position(processed);
-                thread::sleep(Duration::from_millis(200));
-            }
-        });
+// --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
+        let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
+            // Spawn the UI updater thread. This thread is responsible for polling the
+            // atomic counter and updating the progress bar on the screen.
+            let updater_thread_count = Arc::clone(&variants_processed_count);
+            let updater_pb = pb.clone();
+            let total_variants = variants_to_process;
+            s.spawn(move || {
+                // This loop terminates when the number of processed items reaches the
+                // total, ensuring this thread finishes before the scope ends
+                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
+                    let processed = updater_thread_count.load(Ordering::Relaxed);
+                    updater_pb.set_position(processed);
+                    thread::sleep(Duration::from_millis(200));
+                }
+                // Perform one final update to ensure the bar shows 100% completion.
+                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+            });
 
         let producer_logic = {
             let mmap = Arc::clone(&mmap);
@@ -505,15 +511,21 @@ fn run_multi_file_pipeline(
 
     // --- 3. Orchestration with multi-file producer ---
     let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        // Spawn the UI updater thread
+        // Spawn the UI updater thread. This thread is responsible for polling the
+        // atomic counter and updating the progress bar on the screen.
         let updater_thread_count = Arc::clone(&variants_processed_count);
         let updater_pb = pb.clone();
+        let total_variants = variants_to_process;
         s.spawn(move || {
-            while !updater_pb.is_finished() {
+            // This loop terminates when the number of processed items reaches the
+            // total, ensuring this thread finishes before the scope ends
+            while updater_thread_count.load(Ordering::Relaxed) < total_variants {
                 let processed = updater_thread_count.load(Ordering::Relaxed);
                 updater_pb.set_position(processed);
                 thread::sleep(Duration::from_millis(200));
             }
+            // Perform one final update to ensure the bar shows 100% completion.
+            updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
         });
 
         let producer_logic = {
@@ -933,12 +945,19 @@ fn resolve_complex_variants(
         thread::scope(|s| {
             // Spawner #1: The dedicated progress bar updater thread.
             // This thread is the ONLY one that touches the progress bar I/O.
-            s.spawn(|| {
-                while !pb.is_finished() {
-                    let processed = progress_counter.load(Ordering::Relaxed);
-                    pb.set_position(processed);
+            let pb_updater = pb.clone();
+            let counter_for_updater = Arc::clone(&progress_counter);
+            let total_people = prep_result.num_people_to_score as u64;
+            s.spawn(move || {
+                // This loop terminates when the number of processed items reaches the
+                // total, ensuring this thread finishes before the scope ends
+                while counter_for_updater.load(Ordering::Relaxed) < total_people {
+                    let processed = counter_for_updater.load(Ordering::Relaxed);
+                    pb_updater.set_position(processed);
                     thread::sleep(Duration::from_millis(200));
                 }
+                // Perform one final update to ensure the bar shows 100% completion.
+                pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
             });
 
             // Spawner #2: The worker threads.
