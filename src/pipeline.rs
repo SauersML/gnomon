@@ -853,6 +853,16 @@ struct FatalAmbiguityData {
     conflicts: Vec<ConflictSource>,
 }
 
+/// Describes the specific heuristic used to resolve a critical data ambiguity,
+/// holding the data needed for transparent reporting.
+enum ResolutionMethod {
+    /// All conflicting sources yielded the same effect allele dosage.
+    ConsistentDosage { dosage: f64 },
+    /// Exactly one heterozygous call was found alongside one or more homozygous
+    /// calls, and the heterozygous call was chosen.
+    PreferHeterozygous { chosen_dosage: f64 },
+}
+
 /// A private struct holding the data for a critical but non-fatal integrity warning.
 /// This is used when multiple data sources conflict but lead to a consistent outcome.
 struct CriticalIntegrityWarningInfo {
@@ -860,7 +870,8 @@ struct CriticalIntegrityWarningInfo {
     locus_chr_pos: (String, u32),
     score_name: String,
     conflicts: Vec<ConflictSource>,
-    consistent_dosage: f64,
+    /// The specific heuristic that was successfully applied and its outcome.
+    resolution_method: ResolutionMethod,
 }
 
 /// A private helper enum to represent the outcome of processing one person for one rule.
@@ -971,8 +982,8 @@ fn process_person_for_rule(
                         // Check if all calculated dosages are identical.
                         let first_dosage = dosages[0];
                         if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
-                            // BENIGN AMBIGUITY: The data is messy (wrong or diploid), but the outcome is the same.
-                            // We can apply the score and issue a critical warning.
+                            // BENIGN AMBIGUITY: The data is messy, but the outcome is the same.
+                            // We can safely apply the score and issue a critical warning.
                             person_scores_slice[score_info.score_column_index.0] += first_dosage * score_info.weight as f64;
                             
                             let conflicts: Vec<ConflictSource> = matching_interpretations
@@ -989,28 +1000,64 @@ fn process_person_for_rule(
                                 locus_chr_pos: group_rule.locus_chr_pos.clone(),
                                 score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
                                 conflicts,
-                                consistent_dosage: first_dosage,
+                                resolution_method: ResolutionMethod::ConsistentDosage { dosage: first_dosage },
                             });
-
                         } else {
-                            // MALIGNANT AMBIGUITY: The conflicting data leads to different
-                            // results. The program must fail.
-                            let conflicts: Vec<ConflictSource> = matching_interpretations
-                                .iter()
-                                .map(|(packed_geno, context)| ConflictSource {
-                                    bim_row: context.0,
-                                    alleles: (context.1.clone(), context.2.clone()),
-                                    genotype_bits: *packed_geno,
-                                })
-                                .collect();
+                            // The dosages were not consistent. As a final attempt, apply
+                            // the "Prefer Heterozygous" heuristic.
+                            let heterozygous_calls: Vec<_> = matching_interpretations.iter().filter(|(geno, _)| *geno == 0b10).collect();
+                            let homozygous_calls: Vec<_> = matching_interpretations.iter().filter(|(geno, _)| *geno != 0b10).collect();
 
-                            let data = FatalAmbiguityData {
-                                iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                conflicts,
-                            };
-                            return ResolutionOutcome::Fatal(data);
+                            if heterozygous_calls.len() == 1 && !homozygous_calls.is_empty() {
+                                // HEURISTIC APPLIED: A single het call is preferred over any
+                                // number of conflicting homozygous calls.
+                                let (winning_geno, winning_context) = heterozygous_calls[0];
+                                let a1 = &winning_context.1;
+                                let chosen_dosage: f64 = if &score_info.effect_allele == a1 {
+                                    // This logic is duplicated from the simple path for clarity.
+                                    match *winning_geno { 0b10 => 1.0, _ => unreachable!() }
+                                } else {
+                                    match *winning_geno { 0b10 => 1.0, _ => unreachable!() }
+                                };
+
+                                person_scores_slice[score_info.score_column_index.0] += chosen_dosage * score_info.weight as f64;
+
+                                let conflicts: Vec<ConflictSource> = matching_interpretations
+                                    .iter()
+                                    .map(|(packed_geno, context)| ConflictSource {
+                                        bim_row: context.0,
+                                        alleles: (context.1.clone(), context.2.clone()),
+                                        genotype_bits: *packed_geno,
+                                    })
+                                    .collect();
+
+                                return ResolutionOutcome::CriticalIntegrityWarning(CriticalIntegrityWarningInfo {
+                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                    conflicts,
+                                    resolution_method: ResolutionMethod::PreferHeterozygous { chosen_dosage },
+                                });
+
+                            } else {
+                                // MALIGNANT AMBIGUITY: No further heuristics apply. The program MUST fail.
+                                let conflicts: Vec<ConflictSource> = matching_interpretations
+                                    .iter()
+                                    .map(|(packed_geno, context)| ConflictSource {
+                                        bim_row: context.0,
+                                        alleles: (context.1.clone(), context.2.clone()),
+                                        genotype_bits: *packed_geno,
+                                    })
+                                    .collect();
+
+                                let data = FatalAmbiguityData {
+                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                    conflicts,
+                                };
+                                return ResolutionOutcome::Fatal(data);
+                            }
                         }
                     }
                 }
@@ -1275,10 +1322,21 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     };
 
     // Build the final report string.
-    writeln!(report, "Benign Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
+    writeln!(report, "Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
     writeln!(report, "  Locus:  {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
     writeln!(report, "  Score:  {}", data.score_name).unwrap();
-    writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {}, so computation continued.", data.consistent_dosage).unwrap();
+
+    match &data.resolution_method {
+        ResolutionMethod::ConsistentDosage { dosage } => {
+            writeln!(report, "  Method: 'Consistent Dosage' Heuristic").unwrap();
+            writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {}, so computation continued.", dosage).unwrap();
+        }
+        ResolutionMethod::PreferHeterozygous { chosen_dosage } => {
+            writeln!(report, "  Method: 'Prefer Heterozygous' Heuristic").unwrap();
+            writeln!(report, "  Outcome: A single heterozygous call was chosen over conflicting homozygous call(s), yielding a dosage of {}.", chosen_dosage).unwrap();
+        }
+    }
+
     writeln!(report, "  \n  Conflicting Sources Found:").unwrap();
 
     for conflict in &data.conflicts {
