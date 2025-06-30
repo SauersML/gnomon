@@ -775,15 +775,6 @@ fn process_dense_stream(
 }
 
 
-
-// In src/pipeline.rs, replace the entire `resolve_complex_variants` function with this.
-// Make sure these `use` statements are at the top of src/pipeline.rs.
-use dashmap::DashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-
 /// A private helper struct to hold the raw components of a warning message.
 /// This avoids heap allocations (`format!`) inside the hot parallel loop.
 struct WarningInfo {
@@ -860,7 +851,7 @@ fn process_person_for_rule(
         }
         _ => { // Case C: A data conflict was detected.
             for score_info in &group_rule.score_applications {
-                let matching_interpretations: Vec<_> = valid_interpretations.iter().filter(|&&(_, c)| &score_info.effect_allele == c.1 || &score_info.effect_allele == c.2).collect();
+                let matching_interpretations: Vec<_> = valid_interpretations.iter().filter(|(_, context)| &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2).collect();
                 match matching_interpretations.len() {
                     1 => {
                         let (winning_geno, winning_context) = matching_interpretations[0];
@@ -942,7 +933,7 @@ fn resolve_complex_variants(
         thread::scope(|s| {
             // Spawner #1: The dedicated progress bar updater thread.
             // This thread is the ONLY one that touches the progress bar I/O.
-            s.spawn(|_| {
+            s.spawn(|| {
                 while !pb.is_finished() {
                     let processed = progress_counter.load(Ordering::Relaxed);
                     pb.set_position(processed);
@@ -951,7 +942,7 @@ fn resolve_complex_variants(
             });
 
             // Spawner #2: The worker threads.
-            s.spawn(|_| {
+            s.spawn(|| {
                 final_scores
                     .par_chunks_mut(prep_result.score_names.len())
                     .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
