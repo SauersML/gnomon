@@ -1256,3 +1256,41 @@ fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
 
     report
 }
+
+/// A private helper function to format a critical integrity warning.
+/// This is called only once, on the main thread, to report benign ambiguities.
+fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> String {
+    use std::fmt::Write;
+    let mut report = String::with_capacity(512);
+
+    // Helper to interpret genotype bits and alleles into a human-readable string.
+    let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
+        match bits {
+            0b00 => format!("{}/{}", a1, a1),
+            0b01 => "Missing".to_string(),
+            0b10 => format!("{}/{}", a1, a2),
+            0b11 => format!("{}/{}", a2, a2),
+            _ => "Invalid Bits".to_string(),
+        }
+    };
+
+    // Build the final report string.
+    writeln!(report, "Benign Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
+    writeln!(report, "  Locus:  {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
+    writeln!(report, "  Score:  {}", data.score_name).unwrap();
+    writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {}, so computation continued.", data.consistent_dosage).unwrap();
+    writeln!(report, "  \n  Conflicting Sources Found:").unwrap();
+
+    for conflict in &data.conflicts {
+        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
+        writeln!(report, "    - BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+            conflict.bim_row.0,
+            conflict.alleles.0,
+            conflict.alleles.1,
+            conflict.genotype_bits,
+            interpretation
+        ).unwrap();
+    }
+
+    report.trim_end().to_string()
+}
