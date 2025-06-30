@@ -188,9 +188,9 @@ pub enum PipelineError {
 impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipelineError::Compute(e) => write!(f, "Computation error: {}", e),
-            PipelineError::Io(e) => write!(f, "I/O error: {}", e),
-            PipelineError::Producer(e) => write!(f, "Producer thread error: {}", e),
+            PipelineError::Compute(e) => write!(f, "{}", e),
+            PipelineError::Io(e) => write!(f, "I/O error during pipeline execution: {}", e),
+            PipelineError::Producer(e) => write!(f, "The data producer thread failed: {}", e),
         }
     }
 }
