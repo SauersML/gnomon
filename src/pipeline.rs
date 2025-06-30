@@ -853,13 +853,25 @@ struct FatalAmbiguityData {
     conflicts: Vec<ConflictSource>,
 }
 
+/// A private struct holding the data for a critical but non-fatal integrity warning.
+/// This is used when multiple data sources conflict but lead to a consistent outcome.
+struct CriticalIntegrityWarningInfo {
+    iid: String,
+    locus_chr_pos: (String, u32),
+    score_name: String,
+    conflicts: Vec<ConflictSource>,
+    consistent_dosage: f64,
+}
+
 /// A private helper enum to represent the outcome of processing one person for one rule.
 /// This decouples the core logic from the side-effects (like I/O or setting global flags).
 enum ResolutionOutcome {
     Success,
     Warning(WarningInfo),
+    CriticalIntegrityWarning(CriticalIntegrityWarningInfo),
     Fatal(FatalAmbiguityData),
 }
+
 /// Processes a single person for a single complex rule.
 ///
 /// This is a "pure" function: it contains only the core business logic and is free
@@ -940,25 +952,66 @@ fn process_person_for_rule(
                     }
                     0 => continue,
                     // This is the fatal ambiguity case. We collect all necessary
-                    // raw data here and pass it up for later formatting. This avoids
-                    // expensive string work in the parallel hot path.
+                    // This case handles multiple, conflicting, non-missing genotype
+                    // records that are all relevant to the current score.
                     _ => {
-                        let conflicts: Vec<ConflictSource> = matching_interpretations
-                            .iter()
-                            .map(|(packed_geno, context)| ConflictSource {
-                                bim_row: context.0,
-                                alleles: (context.1.clone(), context.2.clone()),
-                                genotype_bits: *packed_geno,
-                            })
-                            .collect();
+                        // Instead of failing immediately, calculate the dosage from each
+                        // conflicting source to see if they are consistent.
+                        let mut dosages = Vec::with_capacity(matching_interpretations.len());
+                        for (geno, context) in &matching_interpretations {
+                            let a1 = &context.1;
+                            let dosage: f64 = if &score_info.effect_allele == a1 {
+                                match geno { 0b00 => 2.0, 0b10 => 1.0, 0b11 => 0.0, _ => unreachable!() }
+                            } else {
+                                match geno { 0b00 => 0.0, 0b10 => 1.0, 0b11 => 2.0, _ => unreachable!() }
+                            };
+                            dosages.push(dosage);
+                        }
 
-                        let data = FatalAmbiguityData {
-                            iid: prep_result.final_person_iids[person_output_idx].clone(),
-                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                            conflicts,
-                        };
-                        return ResolutionOutcome::Fatal(data);
+                        // Check if all calculated dosages are identical.
+                        let first_dosage = dosages[0];
+                        if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
+                            // BENIGN AMBIGUITY: The data is messy (wrong or diploid), but the outcome is the same.
+                            // We can apply the score and issue a critical warning.
+                            person_scores_slice[score_info.score_column_index.0] += first_dosage * score_info.weight as f64;
+                            
+                            let conflicts: Vec<ConflictSource> = matching_interpretations
+                                .iter()
+                                .map(|(packed_geno, context)| ConflictSource {
+                                    bim_row: context.0,
+                                    alleles: (context.1.clone(), context.2.clone()),
+                                    genotype_bits: *packed_geno,
+                                })
+                                .collect();
+
+                            return ResolutionOutcome::CriticalIntegrityWarning(CriticalIntegrityWarningInfo {
+                                iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                conflicts,
+                                consistent_dosage: first_dosage,
+                            });
+
+                        } else {
+                            // MALIGNANT AMBIGUITY: The conflicting data leads to different
+                            // results. The program must fail.
+                            let conflicts: Vec<ConflictSource> = matching_interpretations
+                                .iter()
+                                .map(|(packed_geno, context)| ConflictSource {
+                                    bim_row: context.0,
+                                    alleles: (context.1.clone(), context.2.clone()),
+                                    genotype_bits: *packed_geno,
+                                })
+                                .collect();
+
+                            let data = FatalAmbiguityData {
+                                iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                conflicts,
+                            };
+                            return ResolutionOutcome::Fatal(data);
+                        }
                     }
                 }
             }
@@ -993,6 +1046,7 @@ fn resolve_complex_variants(
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
     let all_warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
+    let all_critical_warnings_to_print = Mutex::new(Vec::<CriticalIntegrityWarningInfo>::new());
 
     // Iterate through rules one by one to provide clear, sequential progress to the user.
     for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
@@ -1071,12 +1125,17 @@ fn resolve_complex_variants(
                             original_fam_idx, person_scores_slice, person_counts_slice,
                         );
 
-                        match outcome {
+                          match outcome {
                             ResolutionOutcome::Success => {}
                             ResolutionOutcome::Warning(info) => {
                                 if warned_pairs.insert((info.person_output_idx, info.locus_id)) {
                                     all_warnings_to_print.lock().unwrap().push(info);
                                 }
+                            }
+                            ResolutionOutcome::CriticalIntegrityWarning(info) => {
+                                // This is a non-fatal but severe warning. We collect it
+                                // to report at the end. We do not set the fatal error flag.
+                                all_critical_warnings_to_print.lock().unwrap().push(info);
                             }
                             ResolutionOutcome::Fatal(data) => {
                                 // Use compare_exchange to ensure only the FIRST fatal error
@@ -1099,9 +1158,30 @@ fn resolve_complex_variants(
     // After all rules are processed, drain and print a summary of warnings. This is
     // performed once by the main thread to avoid lock contention on stderr.
     let collected_warnings = std::mem::take(&mut *all_warnings_to_print.lock().unwrap());
+    let collected_critical_warnings = std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
     const MAX_WARNINGS_TO_PRINT: usize = 10;
-    let total_warnings = collected_warnings.len();
 
+    let total_critical_warnings = collected_critical_warnings.len();
+    if total_critical_warnings > 0 {
+        eprintln!("\n\n========================= CRITICAL DATA INTEGRITY ISSUE =========================");
+        eprintln!("Gnomon detected one or more loci with conflicting genotype data that were\n\
+                  resolved using a heuristic. While computation was able to continue, the\n\
+                  underlying genotype data is ambiguous and should be investigated.");
+        eprintln!("---------------------------------------------------------------------------------");
+        for (i, info) in collected_critical_warnings.into_iter().enumerate() {
+            if i >= MAX_WARNINGS_TO_PRINT {
+                break;
+            }
+            if i > 0 { eprintln!("---------------------------------------------------------------------------------"); }
+            eprintln!("{}", format_critical_integrity_warning(&info));
+        }
+        if total_critical_warnings > MAX_WARNINGS_TO_PRINT {
+             eprintln!("\n... and {} more similar critical warnings.", total_critical_warnings - MAX_WARNINGS_TO_PRINT);
+        }
+        eprintln!("=================================================================================\n");
+    }
+
+    let total_warnings = collected_warnings.len();
     if total_warnings > 0 {
         eprintln!("\n--- Data Inconsistency Warning Summary ---");
         for (i, info) in collected_warnings.into_iter().enumerate() {
