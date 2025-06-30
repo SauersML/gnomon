@@ -836,14 +836,30 @@ struct WarningInfo {
     score_col_idx: ScoreColumnIndex,
 }
 
+/// A private struct holding the raw data for one conflicting source of evidence.
+/// This is used exclusively for building the final fatal error report.
+struct ConflictSource {
+    bim_row: BimRowIndex,
+    alleles: (String, String),
+    genotype_bits: u8,
+}
+
+/// A private struct holding the complete, raw payload for a fatal ambiguity error.
+/// Collecting this data first and formatting it once at the end is a key optimization.
+struct FatalAmbiguityData {
+    iid: String,
+    locus_chr_pos: (String, u32),
+    score_name: String,
+    conflicts: Vec<ConflictSource>,
+}
+
 /// A private helper enum to represent the outcome of processing one person for one rule.
 /// This decouples the core logic from the side-effects (like I/O or setting global flags).
 enum ResolutionOutcome {
     Success,
     Warning(WarningInfo),
-    Fatal(PipelineError),
+    Fatal(FatalAmbiguityData),
 }
-
 /// Processes a single person for a single complex rule.
 ///
 /// This is a "pure" function: it contains only the core business logic and is free
@@ -923,14 +939,26 @@ fn process_person_for_rule(
                         });
                     }
                     0 => continue,
+                    // This is the fatal ambiguity case. We collect all necessary
+                    // raw data here and pass it up for later formatting. This avoids
+                    // expensive string work in the parallel hot path.
                     _ => {
-                        let iid = &prep_result.final_person_iids[person_output_idx];
-                        let first_context_id = group_rule.possible_contexts[0].0.0;
-                        let score_name = &prep_result.score_names[score_info.score_column_index.0];
-                        return ResolutionOutcome::Fatal(PipelineError::Compute(format!(
-                            "Fatal: Unresolvable ambiguity for individual '{}' at location corresponding to BIM row index '{}'. Multiple conflicting genotypes match the alleles required by score '{}'.",
-                            iid, first_context_id, score_name
-                        )));
+                        let conflicts: Vec<ConflictSource> = matching_interpretations
+                            .iter()
+                            .map(|(packed_geno, context)| ConflictSource {
+                                bim_row: context.0,
+                                alleles: (context.1.clone(), context.2.clone()),
+                                genotype_bits: *packed_geno,
+                            })
+                            .collect();
+
+                        let data = FatalAmbiguityData {
+                            iid: prep_result.final_person_iids[person_output_idx].clone(),
+                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                            conflicts,
+                        };
+                        return ResolutionOutcome::Fatal(data);
                     }
                 }
             }
@@ -962,7 +990,7 @@ fn resolve_complex_variants(
     // This state must persist across all iterations of the rules loop. These are
     // thread-safe types that can be safely shared between threads.
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
-    let fatal_error_storage = Mutex::new(None::<PipelineError>);
+    let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
     let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
     let all_warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
 
@@ -1050,13 +1078,14 @@ fn resolve_complex_variants(
                                     all_warnings_to_print.lock().unwrap().push(info);
                                 }
                             }
-                            ResolutionOutcome::Fatal(error) => {
+                            ResolutionOutcome::Fatal(data) => {
                                 // Use compare_exchange to ensure only the FIRST fatal error
-                                // is stored. This prevents race conditions where multiple
-                                // threads fail simultaneously.
+                                // payload is stored. This prevents race conditions where multiple
+                                // threads might fail on different individuals simultaneously.
                                 if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                    *fatal_error_storage.lock().unwrap() = Some(error);
+                                    *fatal_error_storage.lock().unwrap() = Some(data);
                                 }
+                                // `return` ensures we stop processing for this thread.
                                 return;
                             }
                         }
@@ -1092,19 +1121,58 @@ fn resolve_complex_variants(
     }
 
     // After all rules are processed, check if a fatal error was ever stored.
-    // If so, retrieve it from the mutex and propagate it as the function's result.
+    // If so, retrieve it from the mutex, format the final report, and propagate it.
     if fatal_error_occurred.load(Ordering::Relaxed) {
         if let Ok(mut guard) = fatal_error_storage.lock() {
-            if let Some(err) = guard.take() {
-                return Err(err);
+            if let Some(data) = guard.take() {
+                let report = format_fatal_ambiguity_report(&data);
+                return Err(PipelineError::Compute(report));
             }
         }
         // As a fallback, return a generic error if the specific one can't be retrieved.
         return Err(PipelineError::Compute(
-            "A fatal, unspecified error occurred in a parallel task.".to_string(),
+            "A fatal, unspecified error occurred in a parallel task and the detailed report could not be generated.".to_string(),
         ));
     }
 
     eprintln!("> Complex variant resolution complete.");
     Ok(())
+}
+
+/// A private helper function to format the final, dense data report for a fatal ambiguity.
+/// This is called only once, on the main thread, after a fatal error is confirmed.
+fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
+    use std::fmt::Write;
+    let mut report = String::with_capacity(512);
+
+    // Helper to interpret genotype bits and alleles into a human-readable string.
+    let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
+        match bits {
+            0b00 => format!("{}/{}", a1, a1),
+            0b01 => "Missing".to_string(),
+            0b10 => format!("{}/{}", a1, a2),
+            0b11 => format!("{}/{}", a2, a2),
+            _ => "Invalid Bits".to_string(),
+        }
+    };
+
+    // Build the final report string.
+    writeln!(report, "Fatal: Unresolvable ambiguity for individual '{}'.\n", data.iid).unwrap();
+    writeln!(report, "Individual:   {}", data.iid).unwrap();
+    writeln!(report, "Locus:        {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
+    writeln!(report, "Score:        {}\n", data.score_name).unwrap();
+    writeln!(report, "Conflicting Sources:").unwrap();
+
+    for conflict in &data.conflicts {
+        writeln!(report, "  - BIM Row: {}", conflict.bim_row.0).unwrap();
+        writeln!(report, "    Alleles (A1,A2): ({}, {})", conflict.alleles.0, conflict.alleles.1).unwrap();
+
+        let bits_str = match conflict.genotype_bits {
+            0b00 => "00", 0b01 => "01", 0b10 => "10", 0b11 => "11", _ => "??"
+        };
+        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
+        writeln!(report, "    Genotype Bits:   {} (Interpreted as {})", bits_str, interpretation).unwrap();
+    }
+
+    report
 }
