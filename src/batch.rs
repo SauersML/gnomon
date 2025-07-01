@@ -221,6 +221,43 @@ fn process_block<'a>(
     let _ = tile_pool.push(tile);
 }
 
+/// A helper function to accumulate one SIMD lane of adjustments.
+/// This is a pure refactoring of the original logic from `process_tile`.
+/// The `#[inline(always)]` attribute ensures this is a zero-cost abstraction.
+#[inline(always)]
+fn accumulate_simd_lane(
+    scores_out_slice: &mut [f64],
+    adjustments_f32x8: Simd<f32, 8>,
+    scores_offset: usize,
+    num_scores: usize,
+) {
+    if scores_offset + SIMD_LANES <= num_scores {
+        let adj_array = adjustments_f32x8.to_array();
+        let adj_low_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[0..4]);
+        let adj_high_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[4..8]);
+
+        let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
+        let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
+
+        let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
+        let mut present_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
+        present_scores_low += adj_low_f64x4;
+        scores_slice_low.copy_from_slice(&present_scores_low.to_array());
+
+        let scores_slice_high = &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
+        let mut present_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
+        present_scores_high += adj_high_f64x4;
+        scores_slice_high.copy_from_slice(&present_scores_high.to_array());
+    } else {
+        let start = scores_offset;
+        let end = num_scores;
+        let temp_array = adjustments_f32x8.to_array();
+        for j in 0..(end - start) {
+            scores_out_slice[start + j] += temp_array[j] as f64;
+        }
+    }
+}
+
 /// Dispatches a single, pivoted, person-major tile to the compute kernel after
 /// calculating a baseline score and pre-computing sparse indices.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
@@ -350,33 +387,12 @@ fn process_tile<'a>(
                     let scores_offset = i * SIMD_LANES;
                     let adjustments_f32x8 = kernel_result_buffer[i];
 
-                    if scores_offset + SIMD_LANES <= num_scores {
-                        let adj_array = adjustments_f32x8.to_array();
-                        let adj_low_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[0..4]);
-                        let adj_high_f32x4 = Simd::<f32, 4>::from_slice(&adj_array[4..8]);
-
-                        let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
-                        let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
-
-                        let scores_slice_low =
-                            &mut scores_out_slice[scores_offset..scores_offset + 4];
-                        let mut present_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
-                        present_scores_low += adj_low_f64x4;
-                        scores_slice_low.copy_from_slice(&present_scores_low.to_array());
-
-                        let scores_slice_high =
-                            &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
-                        let mut present_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
-                        present_scores_high += adj_high_f64x4;
-                        scores_slice_high.copy_from_slice(&present_scores_high.to_array());
-                    } else {
-                        let start = scores_offset;
-                        let end = num_scores;
-                        let temp_array = adjustments_f32x8.to_array();
-                        for j in 0..(end - start) {
-                            scores_out_slice[start + j] += temp_array[j] as f64;
-                        }
-                    }
+                    accumulate_simd_lane(
+                        scores_out_slice,
+                        adjustments_f32x8,
+                        scores_offset,
+                        num_scores,
+                    );
                 }
             });
 
