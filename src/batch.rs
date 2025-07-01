@@ -449,7 +449,6 @@ fn process_block<'a>(
 }
 
 /// A helper function to accumulate one SIMD lane of adjustments.
-/// The `#[inline(always)]` attribute means this is a zero-cost abstraction.
 #[inline(always)]
 fn accumulate_simd_lane(
     scores_out_slice: &mut [f64],
@@ -458,36 +457,31 @@ fn accumulate_simd_lane(
     num_scores: usize,
 ) {
     if scores_offset + SIMD_LANES <= num_scores {
-        // --- FINAL OPTIMIZED VERSION ---
+        // --- FINAL STRATEGY: HYBRID SIMD-PREPARE, SCALAR-APPLY ---
 
-        // 1. Efficiently split the f32x8 vector into two f32x4 vectors in-register.
+        // 1. Perform the expensive widening conversion using SIMD registers, which is fast.
         let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
         let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
-
-        // 2. Widen each half to 64-bit floats for accumulation.
         let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
         let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-        // 3. Use raw pointers for the most direct load/store operations, reordered to
-        //    maximize instruction-level parallelism.
-        // SAFETY: The check `scores_offset + SIMD_LANES <= num_scores` ensures
-        // that we can safely read and write 8 elements starting from the offset.
+        // 2. Extract the prepared SIMD vectors into stack arrays.
+        let adj_low_arr = adj_low_f64x4.to_array();
+        let adj_high_arr = adj_high_f64x4.to_array();
+
+        // 3. Apply the results using an unrolled scalar loop. This presents the compiler
+        //    with the EXACT `load -> add -> store` pattern it has proven it can
+        //    auto-vectorize with maximum efficiency, using fast, aligned scalar loads.
+        //    `get_unchecked_mut` is used because the bounds check has already passed.
         unsafe {
-            let base_ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
-            let low_ptr = base_ptr as *mut Simd<f64, 4>;
-            let high_ptr = base_ptr.add(4) as *mut Simd<f64, 4>;
-
-            // Group all reads to help the CPU's out-of-order execution.
-            let scores_low = low_ptr.read_unaligned();
-            let scores_high = high_ptr.read_unaligned();
-
-            // Group all computations.
-            let result_low = scores_low + adj_low_f64x4;
-            let result_high = scores_high + adj_high_f64x4;
-
-            // Group all writes.
-            low_ptr.write_unaligned(result_low);
-            high_ptr.write_unaligned(result_high);
+            *scores_out_slice.get_unchecked_mut(scores_offset) += adj_low_arr[0];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 1) += adj_low_arr[1];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 2) += adj_low_arr[2];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 3) += adj_low_arr[3];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 4) += adj_high_arr[0];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 5) += adj_high_arr[1];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 6) += adj_high_arr[2];
+            *scores_out_slice.get_unchecked_mut(scores_offset + 7) += adj_high_arr[3];
         }
     } else {
         // The scalar fallback for the tail end of the data
@@ -1162,15 +1156,13 @@ mod tests {
                 name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max
             );
         };
-
-        print_stats("Complex SIMD (Current)", stats_simd);
+    
+        print_stats("SIMD (Current)", stats_simd);
         print_stats("Simple Scalar", stats_scalar);
         print_stats("Unrolled Scalar", stats_unrolled);
-        println!(
-            "-------------------------------------------------------------------------------------\n"
-        );
-
-        // The core assertion is now based on the median, which is more robust to noise.
+        println!("-------------------------------------------------------------------------------------\n");
+    
+        // The core assertion is based on the median
         assert!(
             stats_simd.median <= stats_scalar.median,
             "PERFORMANCE REGRESSION DETECTED against simple scalar!\n\

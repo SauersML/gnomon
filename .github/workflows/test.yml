@@ -106,18 +106,12 @@ jobs:
           fi
           echo "Found test harness at: $TEST_HARNESS_PATH"
 
-          # Step 4: Inspect the functions using the correct strategy for each
+          # Step 4: Inspect the functions using the correct strategy
 
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
           echo "---"
           cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
-
-          echo ""
-          echo "---"
-          echo "--- ASSEMBLY FOR SCALAR TEST (from test harness executable) ---"
-          echo "---"
-          cargo asm --file "$TEST_HARNESS_PATH" --intel gnomon::batch::tests::test_accumulation_performance
           
       - name: Install getdoc
         if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
