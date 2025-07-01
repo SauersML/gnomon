@@ -772,3 +772,190 @@ mod tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_transpose_layout_is_empirically_verified() {
+        const VARIANT_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+
+        let mut variant_major_matrix = [[0u8; 8]; 8];
+        for variant_idx in 0..8 {
+            for person_idx in 0..8 {
+                let val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
+                variant_major_matrix[variant_idx][person_idx] = val;
+            }
+        }
+
+        let input_vectors: [U8xN; 8] =
+            core::array::from_fn(|j| U8xN::from_array(variant_major_matrix[j]));
+
+        let transposed_vectors = transpose_8x8_u8(input_vectors);
+
+        eprintln!("\n\n=============== EMPIRICAL TRANSPOSE VERIFICATION ===============");
+        eprintln!("Input Matrix (variant-Major): One row per variant");
+        for variant_idx in 0..8 {
+            eprintln!(
+                "  variant {:?}: {:?}",
+                variant_idx, variant_major_matrix[variant_idx]
+            );
+        }
+        eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
+        eprintln!("Each row represents data for one Person, across all 8 variants...");
+
+        let mut all_tests_passed = true;
+        for person_idx in 0..8 {
+            let person_row_actual = transposed_vectors[person_idx].to_array();
+            eprintln!("  Person {:?}: {:?}", person_idx, person_row_actual);
+            for variant_idx in 0..8 {
+                let expected_val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
+                let val_from_shuffled_pos = person_row_actual[VARIANT_TO_SHUFFLED_POS[variant_idx]];
+                if val_from_shuffled_pos != expected_val {
+                    all_tests_passed = false;
+                    eprintln!(
+                        "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
+                        person_idx,
+                        variant_idx,
+                        expected_val,
+                        VARIANT_TO_SHUFFLED_POS[variant_idx],
+                        val_from_shuffled_pos
+                    );
+                }
+            }
+        }
+        eprintln!("==============================================================\n");
+
+        assert!(
+            all_tests_passed,
+            "The transpose output layout does not match the expected shuffle pattern."
+        );
+        eprintln!(
+            "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
+        );
+    }
+
+    #[test]
+    fn test_accumulation_performance() {
+        // IMPORTANT: This test MUST be run in release mode to be meaningful.
+        // Use the command: cargo test --release -- --nocapture
+
+        use std::simd::f32x8;
+
+        // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPER ---
+
+        // By using `super::...` we are testing the *actual production code*,
+        // assuming it has been refactored into a testable helper function.
+        // This is the best practice to prevent code drift.
+        use super::accumulate_simd_lane;
+
+        /// The proposed, simple scalar loop implementation.
+        /// This is defined locally because it does not exist in production code yet.
+        fn accumulate_simple_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
+            let temp_array = adjustments_f32x8.to_array();
+            for j in 0..8 {
+                scores_out_slice[j] += temp_array[j] as f64;
+            }
+        }
+
+        /// The robust, reusable performance measurement helper.
+        /// It operates on a provided slice to ensure fairness.
+        fn measure_performance<F>(
+            scores: &mut [f64], // Operates on an external buffer.
+            num_iterations: u32,
+            adjustments: f32x8,
+            mut operation: F,
+        ) -> Duration
+        where
+            F: FnMut(&mut [f64], f32x8),
+        {
+            let mut checksum = 0.0f64;
+
+            let start = Instant::now();
+            for _ in 0..num_iterations {
+                operation(scores, adjustments);
+                // "Use" the result of each iteration to create a data dependency,
+                // preventing the optimizer from eliding the loop.
+                checksum += scores[0];
+            }
+            let duration = start.elapsed();
+
+            // "Use" the final checksum to ensure the entire dependency chain is preserved.
+            std::hint::black_box(checksum);
+            duration
+        }
+
+        // --- B. DEFINE TEST PARAMETERS ---
+        const NUM_ITERATIONS: u32 = 10_000_000;
+        let adjustments = f32x8::from_array([0.1, 0.2, -0.05, 0.3, -0.15, 0.0, 0.5, -0.25]);
+
+        // --- C. VERIFY CORRECTNESS FIRST ---
+        {
+            let mut complex_result = vec![100.0f64; 8];
+            let mut scalar_result = vec![100.0f64; 8];
+            accumulate_simd_lane(&mut complex_result, adjustments, 0, 8);
+            accumulate_simple_scalar(&mut scalar_result, adjustments);
+            for i in 0..8 {
+                assert!(
+                    (complex_result[i] - scalar_result[i]).abs() < 1e-9,
+                    "Correctness check FAILED at index {}: complex={}, scalar={}",
+                    i,
+                    complex_result[i],
+                    scalar_result[i]
+                );
+            }
+        }
+
+        // --- D. RUN THE BENCHMARKS AND REPORT RESULTS ---
+        println!("\n\n--- Accumulation Performance Test Report (Ran in RELEASE mode) ---");
+        println!("Correctness check passed. Both functions produce identical results.");
+        println!("Running {} iterations for each method...", NUM_ITERATIONS);
+
+        // Allocate the state buffer ONCE, outside all measurements.
+        let mut scores_buffer = vec![100.0f64; 8];
+
+        // Measure Complex SIMD
+        scores_buffer.fill(100.0); // Reset state before running.
+        let duration_complex = measure_performance(
+            &mut scores_buffer,
+            NUM_ITERATIONS,
+            adjustments,
+            |s, a| accumulate_simd_lane(s, a, 0, 8),
+        );
+
+        // Measure Simple Scalar
+        scores_buffer.fill(100.0); // Reset the *same* state before running.
+        let duration_scalar = measure_performance(
+            &mut scores_buffer,
+            NUM_ITERATIONS,
+            adjustments,
+            accumulate_simple_scalar,
+        );
+
+        // Calculate final metrics.
+        let time_per_op_complex = duration_complex.as_nanos() as f64 / NUM_ITERATIONS as f64;
+        let time_per_op_scalar = duration_scalar.as_nanos() as f64 / NUM_ITERATIONS as f64;
+
+        // Print the final report.
+        println!("------------------------------------------------------------------");
+        println!("Complex SIMD (Current):");
+        println!("  - Total time:  {:?}", duration_complex);
+        println!("  - Per op:      {:.2} ns", time_per_op_complex);
+        println!("\nSimple Scalar (Proposed):");
+        println!("  - Total time:  {:?}", duration_scalar);
+        println!("  - Per op:      {:.2} ns", time_per_op_scalar);
+        println!("------------------------------------------------------------------");
+
+        if time_per_op_scalar < time_per_op_complex {
+            let factor = time_per_op_complex / time_per_op_scalar;
+            println!("✅ WINNER: Simple Scalar is {:.2}x faster.", factor);
+        } else {
+            let factor = time_per_op_scalar / time_per_op_complex;
+            println!("❌ WINNER: Complex SIMD is {:.2}x faster.", factor);
+        }
+        println!("==================================================================\n");
+    }
+}
