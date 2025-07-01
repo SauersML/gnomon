@@ -54,10 +54,6 @@ strip = false
 default = []
 no-inline-profiling = []
 
-# ========================================================================================
-#                          DEVELOPMENT & BENCHMARKING SETUP
-# ========================================================================================
-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
