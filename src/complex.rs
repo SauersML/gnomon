@@ -1,6 +1,6 @@
 use crate::types::{
     BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult,
-    ScoreColumnIndex,
+    ScoreColumnIndex, ScoreInfo
 };
 use ahash::AHashSet;
 use dashmap::DashSet;
@@ -94,6 +94,206 @@ impl ComplexVariantResolver {
         // This indexing is safe because the preparation phase guarantees all indices are valid.
         let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
         (packed_byte >> bit_offset_in_byte) & 0b11
+    }
+}
+
+//========================================================================================
+//
+//                      The Zero-Cost Heuristic Pipeline
+//
+//========================================================================================
+
+use crate::types::{BimRowIndex, ScoreInfo};
+
+/// The data required for any heuristic to make a decision.
+/// It is created once per conflict and passed down the chain.
+pub struct ResolutionContext<'a> {
+    pub score_info: &'a ScoreInfo,
+    pub conflicting_interpretations: &'a [(u8, &'a (BimRowIndex, String, String))],
+}
+
+/// The successful outcome of a resolution, specifying the dosage and the rule that won.
+pub struct Resolution {
+    pub chosen_dosage: f64,
+    pub method_used: Heuristic,
+}
+
+/// An enum representing the complete, ordered set of resolution strategies.
+/// This approach uses static dispatch for zero-cost abstraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heuristic {
+    /// Tries to find one BIM entry that perfectly matches both score file alleles.
+    ExactScoreAlleleMatch,
+    /// Tries to find one interpretation composed ONLY of score file alleles.
+    PrioritizeUnambiguousGenotype,
+    /// Checks if all conflicting interpretations result in the same dosage.
+    ConsistentDosage,
+    /// As a last resort, prefers a single heterozygous call over homozygous ones.
+    PreferHeterozygous,
+}
+
+impl Heuristic {
+    /// The main dispatcher for the enum. It calls the appropriate private method
+    /// for the specific heuristic variant.
+    pub fn try_resolve(&self, context: &ResolutionContext) -> Option<Resolution> {
+        match self {
+            Heuristic::ExactScoreAlleleMatch => self.resolve_exact_match(context),
+            Heuristic::PrioritizeUnambiguousGenotype => self.resolve_unambiguous_genotype(context),
+            Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
+            Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
+        }
+    }
+
+    /// **Heuristic 1:** The most stringent rule. Succeeds only if exactly one
+    /// BIM entry's alleles are identical to the score file's alleles.
+    fn resolve_exact_match(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let score_eff_allele = &context.score_info.effect_allele;
+        let score_oth_allele = &context.score_info.other_allele;
+
+        let exact_matches: Vec<_> = context
+            .conflicting_interpretations
+            .iter()
+            .filter(|(_, (_, bim_a1, bim_a2))| {
+                (bim_a1 == score_eff_allele && bim_a2 == score_oth_allele)
+                    || (bim_a1 == score_oth_allele && bim_a2 == score_eff_allele)
+            })
+            .collect();
+
+        if exact_matches.len() == 1 {
+            let (packed_geno, (_, bim_a1, _)) = exact_matches[0];
+            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, score_eff_allele);
+            Some(Resolution {
+                chosen_dosage: dosage,
+                method_used: *self,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// **Heuristic 2 (NEW):** Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
+    /// exactly one interpretation is composed solely of standard alleles found
+    /// in the score file, while others use non-standard/complex alleles.
+    fn resolve_unambiguous_genotype(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let score_eff_allele = &context.score_info.effect_allele;
+        let score_oth_allele = &context.score_info.other_allele;
+
+        let mut unambiguous_interpretations = Vec::new();
+        for &interpretation in context.conflicting_interpretations {
+            let (_, (_, bim_a1, bim_a2)) = interpretation;
+            let is_a1_valid = bim_a1 == score_eff_allele || bim_a1 == score_oth_allele;
+            let is_a2_valid = bim_a2 == score_eff_allele || bim_a2 == score_oth_allele;
+
+            if is_a1_valid && is_a2_valid {
+                unambiguous_interpretations.push(interpretation);
+            }
+        }
+        
+        if unambiguous_interpretations.len() == 1 {
+            let (packed_geno, (_, bim_a1, _)) = unambiguous_interpretations[0];
+            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, score_eff_allele);
+            Some(Resolution {
+                chosen_dosage: dosage,
+                method_used: *self,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// **Heuristic 3:** Succeeds if all conflicting interpretations, despite
+    /// having different allele definitions, coincidentally result in the same
+    /// final effect allele dosage.
+    fn resolve_consistent_dosage(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let dosages: Vec<f64> = context
+            .conflicting_interpretations
+            .iter()
+            .map(|(packed_geno, (_, bim_a1, _))| {
+                Self::calculate_dosage(*packed_geno, bim_a1, &context.score_info.effect_allele)
+            })
+            .collect();
+
+        let first_dosage = dosages[0];
+        if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
+            Some(Resolution {
+                chosen_dosage: first_dosage,
+                method_used: *self,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// **Heuristic 4:** A final tie-breaker that prefers a single heterozygous
+    /// call if it conflicts with one or more homozygous calls.
+    fn resolve_prefer_het(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let heterozygous_calls: Vec<_> = context
+            .conflicting_interpretations
+            .iter()
+            .filter(|(packed_geno, _)| *packed_geno == 0b10)
+            .collect();
+
+        let homozygous_calls_exist = context
+            .conflicting_interpretations
+            .iter()
+            .any(|(packed_geno, _)| *packed_geno != 0b10);
+
+        if heterozygous_calls.len() == 1 && homozygous_calls_exist {
+            let (packed_geno, (_, bim_a1, _)) = heterozygous_calls[0];
+            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, &context.score_info.effect_allele);
+            Some(Resolution {
+                chosen_dosage: dosage,
+                method_used: *self,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// A private helper to compute dosage from raw PLINK bits.
+    #[inline(always)]
+    fn calculate_dosage(packed_geno: u8, bim_a1: &str, effect_allele: &str) -> f64 {
+        let dosage_wrt_a1 = match packed_geno {
+            0b00 => 2.0, // Homozygous for A1
+            0b10 => 1.0, // Heterozygous
+            0b11 => 0.0, // Homozygous for A2
+            _ => 0.0,    // Should not happen for valid data
+        };
+
+        if bim_a1 == effect_allele {
+            dosage_wrt_a1
+        } else {
+            2.0 - dosage_wrt_a1
+        }
+    }
+}
+
+/// The pipeline orchestrator that holds and runs the heuristic chain.
+pub struct ResolverPipeline {
+    heuristics: Vec<Heuristic>,
+}
+
+impl ResolverPipeline {
+    /// Creates a new pipeline with the heuristics in their correct order of priority.
+    pub fn new() -> Self {
+        // The order is explicit
+        let heuristics = vec![
+            Heuristic::ExactScoreAlleleMatch,
+            Heuristic::PrioritizeUnambiguousGenotype,
+            Heuristic::ConsistentDosage,
+            Heuristic::PreferHeterozygous,
+        ];
+        Self { heuristics }
+    }
+
+    /// Executes the heuristic chain, returning the first successful resolution.
+    pub fn resolve(&self, context: &ResolutionContext) -> Option<Resolution> {
+        for heuristic in &self.heuristics {
+            if let Some(resolution) = heuristic.try_resolve(context) {
+                return Some(resolution); // Success! Stop the chain.
+            }
+        }
+        None // All heuristics failed.
     }
 }
 
