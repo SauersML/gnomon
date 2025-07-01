@@ -1,5 +1,3 @@
-// src/basis.rs
-
 use ndarray::{s, Array, Array1, Array2, ArrayView1, Axis};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -92,8 +90,8 @@ pub fn create_bspline_basis(
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
     // Evaluate the splines for each data point.
-    // While seemingly inefficient, this structure allows the inner loop (de Boor's)
-    // to be highly optimized and cache-friendly for a single point `x`.
+    // This structure allows the inner loop (de Boor's) to be highly optimized
+    // and cache-friendly for a single point `x`.
     for (i, &x) in data.iter().enumerate() {
         let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
         basis_matrix.row_mut(i).assign(&basis_row);
@@ -141,6 +139,7 @@ pub fn create_difference_penalty_matrix(
 /// Internal module for implementation details not exposed in the public API.
 mod internal {
     use super::*;
+    use std::cmp::min;
 
     /// Generates the full knot vector, including repeated boundary knots.
     pub(super) fn generate_full_knot_vector(
@@ -153,6 +152,9 @@ mod internal {
 
         let internal_knots = if let Some(training_data) = training_data_for_quantiles {
             // Quantile-based knots
+            if training_data.is_empty() {
+                return Err(BasisError::QuantileDataMissing);
+            }
             if training_data.len() < num_internal_knots {
                 return Err(BasisError::InsufficientDataForQuantiles {
                     num_quantiles: num_internal_knots,
@@ -175,12 +177,11 @@ mod internal {
         let max_knots = Array1::from_elem(degree + 1, max_val);
 
         // Concatenate [boundary_min, internal, boundary_max] to form the full knot vector.
-        // This operation on views should not fail if logic is correct.
         Ok(ndarray::concatenate(
             Axis(0),
             &[min_knots.view(), internal_knots.view(), max_knots.view()],
         )
-        .unwrap())
+        .expect("Knot vector concatenation should never fail with correct inputs"))
     }
 
     /// Calculates quantiles from a data vector using linear interpolation (Type 7 in R).
@@ -191,7 +192,7 @@ mod internal {
 
         let mut sorted_data = data.to_vec();
         // Use `sort_unstable_by` for performance and to handle non-total-order of f64.
-        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let n = sorted_data.len();
         let quantiles_vec = (1..=num_quantiles)
@@ -214,7 +215,7 @@ mod internal {
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses the stable, iterative version of the Cox-de Boor algorithm.
+    /// This uses the stable, iterative, and in-place version of the Cox-de Boor algorithm.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
@@ -226,51 +227,71 @@ mod internal {
 
         // Find the knot interval `mu` that contains x, such that `knots[mu] <= x < knots[mu+1]`.
         // This is a crucial first step. `rposition` is efficient.
-        // The `unwrap_or` handles the edge case where x is exactly the last knot value.
+        // Clamp `mu` to a valid range to prevent panics if x is outside the boundary knots.
+        // The `min` handles the case where x equals the last knot value.
         let mu = knots
             .iter()
-            .rposition(|&k| k <= x)
-            .unwrap_or(knots.len() - 2);
+            .rposition(|&k| *k <= x)
+            .unwrap_or(0);
+        let mu = min(mu, num_basis + degree - 1);
 
-        // If x is outside the support of all basis functions, return zeros.
-        // The support of the entire basis is from knots[degree] to knots[num_knots - degree - 1].
-        if mu < degree || mu >= num_basis + degree {
-            return basis_values;
-        }
 
-        // Initialize the degree-0 splines. Only one is non-zero.
+        // Initialize the degree-0 splines. Only one is non-zero in the relevant interval.
+        // This buffer `b` will be updated in-place to avoid allocations in the main loop.
         let mut b = Array1::zeros(degree + 1);
         b[0] = 1.0;
 
         // Iteratively compute higher-degree spline values from lower-degree ones.
-        // This is the core of the algorithm.
+        // The recurrence for the j-th basis function of degree d is:
+        // B_j,d(x) = w * B_j,d-1(x) + (1-w) * B_{j+1},d-1(x)
+        // To compute this in-place, we must iterate from right-to-left.
         for d in 1..=degree {
-            // `b_prev` holds the values for degree `d-1`.
-            let b_prev = b.slice(s![..d]).to_owned();
-            b.fill(0.0); // Reset the current buffer
-
-            for i in 0..d {
-                let idx = mu - d + i;
-                // These two terms are the recursive formula.
-                let term1_denom = knots[idx + d] - knots[idx];
-                let term2_denom = knots[idx + d + 1] - knots[idx + 1];
-
-                if term1_denom > 1e-9 {
-                    let w1 = (x - knots[idx]) / term1_denom;
-                    b[i] += w1 * b_prev[i];
-                }
-
-                if term2_denom > 1e-9 {
-                    let w2 = (knots[idx + d + 1] - x) / term2_denom;
-                    b[i] += w2 * b_prev[i];
-                }
+            // At the start of this loop, `b` holds the non-zero basis values for degree `d-1`.
+            
+            // First, calculate the right-most new value, b[d]. It only depends on the
+            // right-most old value, b[d-1], because its left parent is zero.
+            let idx_right = mu - d;
+            let term2_denom = knots[idx_right + d + 1] - knots[idx_right + 1];
+            if term2_denom > 1e-9 {
+                let w2 = (knots[idx_right + d + 1] - x) / term2_denom;
+                // `b[d-1]` is still from degree d-1.
+                b[d] = w2 * b[d - 1];
+            } else {
+                b[d] = 0.0;
             }
-            // The last term is calculated separately
-            let idx = mu;
-            let term1_denom = knots[idx + d] - knots[idx];
+
+            // Next, calculate the inner terms from right to left (i = d-1, ..., 1).
+            for i in (1..d).rev() {
+                let idx = mu - d + i;
+                let term1_denom = knots[idx + d] - knots[idx];
+                let w1 = if term1_denom > 1e-9 {
+                    (x - knots[idx]) / term1_denom
+                } else {
+                    0.0
+                };
+
+                let term2_denom = knots[idx + d + 1] - knots[idx + 1];
+                let w2 = if term2_denom > 1e-9 {
+                    (knots[idx + d + 1] - x) / term2_denom
+                } else {
+                    0.0
+                };
+                
+                // `b[i]` and `b[i-1]` are still the values from degree `d-1` because
+                // we are iterating backwards.
+                b[i] = w1 * b[i] + w2 * b[i - 1];
+            }
+
+            // Finally, update the left-most value, b[0]. It only depends on the
+            // left-most old value, b[0], because its right parent is zero.
+            let idx_left = mu - d;
+            let term1_denom = knots[idx_left + d] - knots[idx_left];
             if term1_denom > 1e-9 {
-                let w1 = (x - knots[idx]) / term1_denom;
-                b[d] = w1 * b_prev[d-1];
+                let w1 = (x - knots[idx_left]) / term1_denom;
+                // `b[0]` is still from degree d-1. We update it in-place.
+                b[0] *= w1;
+            } else {
+                b[0] = 0.0;
             }
         }
         
@@ -357,20 +378,30 @@ mod tests {
     }
 
     #[test]
-    fn test_single_point_evaluation() {
+    fn test_single_point_evaluation_degree_one() {
         // Test a single point where the value can be calculated by hand for a simple case.
-        // Degree 1 (linear) splines with knots at [0,0,1,2,2]
-        // This gives 3 basis functions.
+        // Degree 1 (linear) splines with knots t = [0,0,1,2,2].
+        // This gives 3 basis functions (n = k-d-1 = 5-1-1 = 3), B_{0,1}, B_{1,1}, B_{2,1}.
         let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
-        // B_{0,1}(x) = (x-0)/(1-0) * B_{0,0}(x) + (1-x)/(1-0) * B_{1,0}(x)
-        // B_{1,1}(x) = (x-0)/(2-0) * B_{1,0}(x) + (2-x)/(2-0) * B_{2,0}(x)
-        // At x=0.5, mu=1. knots[1]=0 <= 0.5 < knots[2]=1.
-        // So B_{1,0}(0.5) is 1, others are 0.
-        let values = internal::evaluate_splines_at_point(0.5, 1, knots.view());
-        assert_eq!(values.len(), 3); // n=k-d-1 = 5-1-1 = 3
-        assert!((values[0] - 0.5).abs() < 1e-9); // B_{0,1}(0.5)
-        assert!((values[1] - 0.5).abs() < 1e-9); // B_{1,1}(0.5)
-        assert!((values[2] - 0.0).abs() < 1e-9); // B_{2,1}(0.5)
+        let x = 0.5; // For x=0.5, the knot interval is mu=1, since t_1 <= x < t_2.
+        
+        let values = internal::evaluate_splines_at_point(x, 1, knots.view());
+        assert_eq!(values.len(), 3);
+        
+        // Manual calculation for x=0.5:
+        // The only non-zero basis function of degree 0 is B_{1,0} = 1.
+        // Recurrence for degree 1:
+        // B_{0,1}(x) = ( (x-t0)/(t1-t0) )*B_{0,0} + ( (t2-x)/(t2-t1) )*B_{1,0}
+        //           = ( (0.5-0)/(0-0) )*0       + ( (1-0.5)/(1-0) )*1         = 0.5
+        //           (Note: 0/0 division is taken as 0)
+        // B_{1,1}(x) = ( (x-t1)/(t2-t1) )*B_{1,0} + ( (t3-x)/(t3-t2) )*B_{2,0}
+        //           = ( (0.5-0)/(1-0) )*1       + ( (2-0.5)/(2-1) )*0         = 0.5
+        // B_{2,1}(x) = ( (x-t2)/(t3-t2) )*B_{2,0} + ( (t4-x)/(t4-t3) )*B_{3,0}
+        //           = ( (0.5-1)/(2-1) )*0       + ( (2-0.5)/(2-2) )*0         = 0.0
+
+        assert!((values[0] - 0.5).abs() < 1e-9, "Expected B_0,1 to be 0.5, got {}", values[0]);
+        assert!((values[1] - 0.5).abs() < 1e-9, "Expected B_1,1 to be 0.5, got {}", values[1]);
+        assert!((values[2] - 0.0).abs() < 1e-9, "Expected B_2,1 to be 0.0, got {}", values[2]);
     }
 
     #[test]
