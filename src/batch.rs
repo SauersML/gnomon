@@ -688,93 +688,11 @@ pub fn run_variant_major_path(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
-    #[test]
-    fn test_transpose_layout_is_empirically_verified() {
-        // This map from a logical variant index (0-7) to its physical byte position
-        // in the transposed person-vector
-        const VARIANT_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
-
-        // 1. SETUP: Create a known 8x8 matrix of variant-major data.
-        // We use unique, traceable values: `(person_idx+1)*10 + (variant_idx+1)`.
-        let mut variant_major_matrix = [[0u8; 8]; 8];
-        for variant_idx in 0..8 {
-            for person_idx in 0..8 {
-                let val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
-                variant_major_matrix[variant_idx][person_idx] = val;
-            }
-        }
-
-        // Convert the scalar matrix into the SIMD vector format required by the function.
-        // `input_vectors[j]` will hold data for variant `j` across all 8 people.
-        let input_vectors: [U8xN; 8] =
-            core::array::from_fn(|j| U8xN::from_array(variant_major_matrix[j]));
-
-        // 2. EXECUTION: Perform the transpose operation we want to probe.
-        let transposed_vectors = transpose_8x8_u8(input_vectors);
-
-        // 3. VERIFICATION & REPORTING: Print the ground truth and assert correctness.
-        eprintln!("\n\n=============== EMPIRICAL TRANSPOSE VERIFICATION ===============");
-        eprintln!("Input Matrix (variant-Major): One row per variant");
-        for variant_idx in 0..8 {
-            eprintln!(
-                "  variant {:?}: {:?}",
-                variant_idx, variant_major_matrix[variant_idx]
-            );
-        }
-        eprintln!("\n--- Transposed Output Layout (Person-Major) ---");
-        eprintln!("Each row represents data for one Person, across all 8 variants...");
-
-        let mut all_tests_passed = true;
-        for person_idx in 0..8 {
-            let person_row_actual = transposed_vectors[person_idx].to_array();
-            eprintln!("  Person {:?}: {:?}", person_idx, person_row_actual);
-
-            // Now, verify the contents of this person's row.
-            // This loop will FAIL if the variant data is not shuffled as hypothesized.
-            for variant_idx in 0..8 {
-                let expected_val = ((person_idx + 1) * 10 + (variant_idx + 1)) as u8;
-
-                // Get the actual value from the shuffled location.
-                let val_from_shuffled_pos = person_row_actual[VARIANT_TO_SHUFFLED_POS[variant_idx]];
-
-                // Also get the value from the naive sequential position.
-                let val_from_naive_pos = person_row_actual[variant_idx];
-
-                if val_from_shuffled_pos != expected_val {
-                    all_tests_passed = false;
-                    eprintln!(
-                        "    -> FAIL for P{},S{}: Expected {}, but value at shuffled pos [{}] was {}.",
-                        person_idx,
-                        variant_idx,
-                        expected_val,
-                        VARIANT_TO_SHUFFLED_POS[variant_idx],
-                        val_from_shuffled_pos
-                    );
-                }
-                if val_from_naive_pos == expected_val
-                    && VARIANT_TO_SHUFFLED_POS[variant_idx] != variant_idx
-                {
-                    all_tests_passed = false;
-                    eprintln!(
-                        "    -> FAIL: Naive position [{}] unexpectedly held the correct value for S{}!",
-                        variant_idx, variant_idx
-                    );
-                }
-            }
-        }
-        eprintln!("==============================================================\n");
-
-        assert!(
-            all_tests_passed,
-            "The transpose output layout does not match the expected shuffle pattern."
-        );
-        eprintln!(
-            "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
-        );
-    }
 
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
+        // NOTE: This test is intentionally verbose with `eprintln!` for one-off
+        // visual verification. In a CI/CD environment, these prints would typically be removed.
         const VARIANT_TO_SHUFFLED_POS: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
         let mut variant_major_matrix = [[0u8; 8]; 8];
@@ -835,15 +753,19 @@ mod tests {
     #[test]
     fn test_accumulation_performance() {
         // IMPORTANT: This test MUST be run in release mode to be meaningful.
+        // Use the command: cargo test --release -- --nocapture
 
         use std::simd::f32x8;
 
         // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPER ---
 
+        // By using `super::...` we are testing the *actual production code*,
+        // assuming it has been refactored into this helper function.
+        // This is the best practice to prevent code drift.
         use super::accumulate_simd_lane;
 
         /// The proposed, simple scalar loop implementation.
-        /// This is defined locally because it does not exist in production code.
+        /// This is defined locally because it does not exist in production code yet.
         fn accumulate_simple_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
             let temp_array = adjustments_f32x8.to_array();
             for j in 0..8 {
@@ -883,11 +805,16 @@ mod tests {
         let adjustments = f32x8::from_array([0.1, 0.2, -0.05, 0.3, -0.15, 0.0, 0.5, -0.25]);
 
         // --- C. VERIFY CORRECTNESS FIRST ---
+        // A fast but wrong function is useless. This must pass before we measure.
         {
             let mut complex_result = vec![100.0f64; 8];
             let mut scalar_result = vec![100.0f64; 8];
+
+            // Test the full-lane case for both functions.
             accumulate_simd_lane(&mut complex_result, adjustments, 0, 8);
             accumulate_simple_scalar(&mut scalar_result, adjustments);
+
+            // Assert that the results for ALL 8 elements are functionally identical.
             for i in 0..8 {
                 assert!(
                     (complex_result[i] - scalar_result[i]).abs() < 1e-9,
@@ -897,7 +824,7 @@ mod tests {
                     scalar_result[i]
                 );
             }
-        }
+        } // Correctness-check data goes out of scope here.
 
         // --- D. RUN THE BENCHMARKS AND REPORT RESULTS ---
         println!("\n\n--- Accumulation Performance Test Report (Ran in RELEASE mode) ---");
@@ -905,6 +832,7 @@ mod tests {
         println!("Running {} iterations for each method...", NUM_ITERATIONS);
 
         // Allocate the state buffer ONCE, outside all measurements.
+        // This ensures both tests run on the exact same memory for maximum fairness.
         let mut scores_buffer = vec![100.0f64; 8];
 
         // Measure Complex SIMD
