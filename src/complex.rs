@@ -2,8 +2,6 @@ use crate::types::{
     BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo
 };
-use ahash::AHashSet;
-use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
