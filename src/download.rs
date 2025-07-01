@@ -214,7 +214,7 @@ fn download_missing_files(
                 .with_url(&url)
                 .with_path(&temp_gz_path.to_string_lossy());
 
-            // The downloader uses a builder pattern; each call to `add_file` consumes the
+            // Each call to `add_file` consumes the
             // downloader and returns a new one, so we must re-assign it.
             downloader = downloader.add_file(file_to_download);
             paths_to_reformat.push((temp_gz_path, final_native_path));
