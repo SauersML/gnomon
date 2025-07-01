@@ -94,16 +94,17 @@ jobs:
           cargo +nightly install cargo-show-asm
 
           echo "---"
-          echo "--- ASSEMBLY FOR SIMD VERSION (gnomon::batch::accumulate_simd_lane) ---"
+          echo "--- ASSEMBLY FOR INLINED SIMD VERSION (inside gnomon::batch::process_tile) ---"
           echo "---"
-          cargo asm --release --lib --intel gnomon::batch::accumulate_simd_lane
+          # We inspect the CALLER because accumulate_simd_lane is inlined into it.
+          cargo asm --release --lib --intel gnomon::batch::process_tile
 
           echo ""
           echo "---"
-          echo "--- ASSEMBLY FOR SCALAR VERSION (gnomon::batch::tests::accumulate_simple_scalar) ---"
+          echo "--- ASSEMBLY FOR SCALAR TEST (gnomon::batch::tests::test_accumulation_performance) ---"
           echo "---"
-          cargo asm --release --lib --intel gnomon::batch::tests::accumulate_simple_scalar
-    
+          cargo asm --release --test gnomon --intel gnomon::batch::tests::test_accumulation_performance
+          
       - name: Install getdoc
         if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
         run: cargo +nightly install getdoc --locked
