@@ -1,6 +1,6 @@
-use crate::types::{
-    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ScoreInfo
-};
+use crate::pipeline::{PipelineError, ScopeGuard};
+use crate::types::{BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ScoreInfo};
+use ahash::AHashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -10,8 +10,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
-use crate::pipeline::{PipelineError, ScopeGuard};
-use ahash::AHashSet;
 
 /// A read-only resolver for fetching complex variant genotypes.
 ///
@@ -184,7 +182,7 @@ impl Heuristic {
                 unambiguous_interpretations.push(interpretation);
             }
         }
-        
+
         if unambiguous_interpretations.len() == 1 {
             let (packed_geno, (_, bim_a1, bim_a2)) = unambiguous_interpretations[0];
             let dosage = Self::calculate_dosage(packed_geno, bim_a1, bim_a2, score_eff_allele);
@@ -205,7 +203,12 @@ impl Heuristic {
             .conflicting_interpretations
             .iter()
             .map(|(packed_geno, (_, bim_a1, bim_a2))| {
-                Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, &context.score_info.effect_allele)
+                Self::calculate_dosage(
+                    *packed_geno,
+                    bim_a1,
+                    bim_a2,
+                    &context.score_info.effect_allele,
+                )
             })
             .collect();
 
@@ -236,7 +239,12 @@ impl Heuristic {
 
         if heterozygous_calls.len() == 1 && homozygous_calls_exist {
             let (packed_geno, (_, bim_a1, bim_a2)) = heterozygous_calls[0];
-            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, &context.score_info.effect_allele);
+            let dosage = Self::calculate_dosage(
+                *packed_geno,
+                bim_a1,
+                bim_a2,
+                &context.score_info.effect_allele,
+            );
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -467,7 +475,6 @@ pub fn resolve_complex_variants(
                                     let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
                                         &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2
                                     }).collect();
-                                    
                                     // If no interpretations match this score's alleles, skip to the next score.
                                     if matching_interpretations.is_empty() {
                                         continue;
@@ -488,7 +495,6 @@ pub fn resolve_complex_variants(
                                     if let Some(resolution) = pipeline.resolve(&context) {
                                         person_scores_slice[score_info.score_column_index.0] +=
                                             resolution.chosen_dosage * score_info.weight as f64;
-                                        
                                         let resolution_method = match resolution.method_used {
                                             Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
                                             Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
@@ -529,25 +535,43 @@ pub fn resolve_complex_variants(
         pb.finish_with_message("Done.");
     }
 
-    let collected_critical_warnings = std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
+    let collected_critical_warnings =
+        std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
     const MAX_WARNINGS_TO_PRINT: usize = 10;
 
     if !collected_critical_warnings.is_empty() {
-        eprintln!("\n\n========================= CRITICAL DATA INTEGRITY ISSUE =========================");
-        eprintln!("Gnomon detected loci with conflicting genotype data that were resolved\nusing a heuristic. While computation continued, the underlying data is\nambiguous and should be investigated.");
-        eprintln!("---------------------------------------------------------------------------------");
-        
-        for (i, info) in collected_critical_warnings.iter().enumerate().take(MAX_WARNINGS_TO_PRINT) {
+        eprintln!(
+            "\n\n========================= CRITICAL DATA INTEGRITY ISSUE ========================="
+        );
+        eprintln!(
+            "Gnomon detected loci with conflicting genotype data that were resolved\nusing a heuristic. While computation continued, the underlying data is\nambiguous and should be investigated."
+        );
+        eprintln!(
+            "---------------------------------------------------------------------------------"
+        );
+
+        for (i, info) in collected_critical_warnings
+            .iter()
+            .enumerate()
+            .take(MAX_WARNINGS_TO_PRINT)
+        {
             if i > 0 {
-                eprintln!("---------------------------------------------------------------------------------");
+                eprintln!(
+                    "---------------------------------------------------------------------------------"
+                );
             }
             eprintln!("{}", format_critical_integrity_warning(&info));
         }
 
         if collected_critical_warnings.len() > MAX_WARNINGS_TO_PRINT {
-            eprintln!("\n... and {} more similar critical warnings.", collected_critical_warnings.len() - MAX_WARNINGS_TO_PRINT);
+            eprintln!(
+                "\n... and {} more similar critical warnings.",
+                collected_critical_warnings.len() - MAX_WARNINGS_TO_PRINT
+            );
         }
-        eprintln!("=================================================================================\n");
+        eprintln!(
+            "=================================================================================\n"
+        );
     }
 
     if fatal_error_occurred.load(Ordering::Relaxed) {
@@ -670,7 +694,11 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {}.", chosen_dosage).unwrap();
         }
         ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage } => {
-            writeln!(report, "  Method: 'Prioritize Unambiguous Genotype' Heuristic").unwrap();
+            writeln!(
+                report,
+                "  Method: 'Prioritize Unambiguous Genotype' Heuristic"
+            )
+            .unwrap();
             writeln!(report, "  Outcome: A single interpretation was chosen because its alleles matched the score file's allele better than alternatives, yielding a dosage of {}.", chosen_dosage).unwrap();
         }
     }
