@@ -24,8 +24,7 @@ use std::marker::PhantomData;
 use std::simd::{
     Simd,
     cmp::SimdPartialEq,
-    num::{SimdFloat, SimdUint},
-    simd_swizzle,
+    num::SimdUint,
 };
 
 // --- State Markers (Zero-Sized Types) ---
