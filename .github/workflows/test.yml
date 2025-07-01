@@ -91,23 +91,33 @@ jobs:
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'true'
         run: |
-          # Install the tool with the necessary feature for disassembly
+          # Step 1: Install the tool with the required 'disasm' feature
           cargo +nightly install cargo-show-asm --features disasm
 
+          # Step 2: Build the test harness to ensure the executable exists
+          echo "--- Building test harness for inspection ---"
+          cargo +nightly test --release --no-run
+
+          # Step 3: Find the exact path to the compiled test harness executable
+          TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
+          if [[ -z "$TEST_HARNESS_PATH" ]]; then
+            echo "::error::Could not find compiled test harness."
+            exit 1
+          fi
+          echo "Found test harness at: $TEST_HARNESS_PATH"
+
+          # Step 4: Inspect the functions using the correct strategy for each
+
           echo "---"
-          echo "--- ASSEMBLY FOR SIMD VERSION (gnomon::batch::process_tile) ---"
+          echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
           echo "---"
-          # The key is `-C lto=off`. This temporarily disables Link-Time Optimization,
-          # forcing the compiler to keep the symbol for the private function.
           cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
 
           echo ""
           echo "---"
-          echo "--- ASSEMBLY FOR SCALAR TEST (gnomon::batch::tests::test_accumulation_performance) ---"
+          echo "--- ASSEMBLY FOR SCALAR TEST (from test harness executable) ---"
           echo "---"
-          # We apply the same logic to the test, targeting the test artifact.
-          # This ensures the test function symbol is preserved for inspection.
-          cargo asm -C lto=off --profile profiling --test gnomon --intel gnomon::batch::tests::test_accumulation_performance
+          cargo asm --file "$TEST_HARNESS_PATH" --intel gnomon::batch::tests::test_accumulation_performance
           
       - name: Install getdoc
         if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
