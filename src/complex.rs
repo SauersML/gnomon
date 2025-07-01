@@ -345,10 +345,6 @@ struct CriticalIntegrityWarningInfo {
     resolution_method: ResolutionMethod,
 }
 
-REVIEW THE BELOW CODE. DID I FIX IT 100% PERFECTLY AND FULLY?
-
-
-
 // The "slow path" resolver for complex variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
