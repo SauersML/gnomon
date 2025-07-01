@@ -472,17 +472,17 @@ pub fn resolve_complex_variants(
                                         conflicting_interpretations: &matching_interpretations,
                                     };
 
+                                    // Collect conflict details once before branching.
+                                    let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                        bim_row: ctx.0,
+                                        alleles: (ctx.1.clone(), ctx.2.clone()),
+                                        genotype_bits: *bits,
+                                    }).collect();
+
                                     if let Some(resolution) = pipeline.resolve(&context) {
                                         person_scores_slice[score_info.score_column_index.0] +=
                                             resolution.chosen_dosage * score_info.weight as f64;
-
-                                        // Efficiency: Collect conflict details only when a resolution is found.
-                                        let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                            bim_row: ctx.0,
-                                            alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits,
-                                        }).collect();
-
+                                        
                                         let resolution_method = match resolution.method_used {
                                             Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
                                             Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
@@ -499,13 +499,7 @@ pub fn resolve_complex_variants(
                                         });
 
                                     } else {
-                                        // The entire pipeline failed for this score application. This is a fatal error.
-                                        let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                            bim_row: ctx.0,
-                                            alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits,
-                                        }).collect();
-
+                                        // The entire pipeline failed. This is a fatal error.
                                         let data = FatalAmbiguityData {
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
                                             locus_chr_pos: group_rule.locus_chr_pos.clone(),
@@ -669,6 +663,10 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage } => {
             writeln!(report, "  Method: 'Exact Score Allele Match' Heuristic").unwrap();
             writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {}.", chosen_dosage).unwrap();
+        }
+        ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage } => {
+            writeln!(report, "  Method: 'Prioritize Unambiguous Genotype' Heuristic").unwrap();
+            writeln!(report, "  Outcome: A single interpretation composed of standard alleles was chosen over others, yielding a dosage of {}.", chosen_dosage).unwrap();
         }
     }
 
