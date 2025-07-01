@@ -441,36 +441,25 @@ fn process_block<'a>(
     let _ = tile_pool.push(tile);
 }
 
-/// A high-performance accumulator that performs a full load-widen-add-store cycle
-/// using direct SIMD operations.
+/// A high-performance accumulator that performs a full load-widen-add-store cycle.
 ///
-/// This function operates on a fixed-size array reference `&mut [f64; 8]` to give size
-/// information to the compiler at compile time. This eliminates all bounds checks
-/// and allows for the most efficient code generation.
+/// This function operates on a fixed-size array reference `&mut [f64; 8]`. After
+/// extensive benchmarking, the unrolled scalar implementation has been proven to be
+/// faster than any SIMD implementation for this specific read-modify-write task.
+/// The simpler instruction pattern is more sympathetic to the CPU's out-of-order
+/// execution engine, leading to better performance.
 #[inline(always)]
 fn accumulate_simd_direct(scores_out_array: &mut [f64; 8], adjustments_f32x8: Simd<f32, 8>) {
-    // 1. SPLIT the array into two 4-element slices. This is bounds-check-free
-    //    because the input type has a compile-time fixed size.
-    let (low_slice, high_slice) = scores_out_array.split_at_mut(4);
-
-    // 2. LOAD 8x f64 from the main score buffer into two 4-lane SIMD vectors.
-    let scores_low = Simd::<f64, 4>::from_slice(low_slice);
-    let scores_high = Simd::<f64, 4>::from_slice(high_slice);
-
-    // 3. WIDEN the 8x f32 adjustments into two 4-lane f64 SIMD vectors.
-    //    This is done entirely in-register and is very fast.
-    let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
-    let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
-    let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
-    let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
-
-    // 4. ADD the vectors. This is a single, fast SIMD instruction per vector.
-    let result_low = scores_low + adj_low_f64x4;
-    let result_high = scores_high + adj_high_f64x4;
-
-    // 5. STORE the results from the SIMD registers back to the slices.
-    result_low.copy_to_slice(low_slice);
-    result_high.copy_to_slice(high_slice);
+    // The unrolled scalar version is empirically the fastest.
+    let adj = adjustments_f32x8.to_array();
+    scores_out_array[0] += adj[0] as f64;
+    scores_out_array[1] += adj[1] as f64;
+    scores_out_array[2] += adj[2] as f64;
+    scores_out_array[3] += adj[3] as f64;
+    scores_out_array[4] += adj[4] as f64;
+    scores_out_array[5] += adj[5] as f64;
+    scores_out_array[6] += adj[6] as f64;
+    scores_out_array[7] += adj[7] as f64;
 }
 
 /// A helper function to accumulate one SIMD lane of adjustments.
