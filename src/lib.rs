@@ -1,3 +1,4 @@
+#![feature(portable_simd)] // Do not remove this
 pub mod batch;
 pub mod complex;
 pub mod decide;
