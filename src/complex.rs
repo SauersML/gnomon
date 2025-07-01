@@ -103,8 +103,6 @@ impl ComplexVariantResolver {
 //
 //========================================================================================
 
-use crate::types::{BimRowIndex, ScoreInfo};
-
 /// The data required for any heuristic to make a decision.
 /// It is created once per conflict and passed down the chain.
 pub struct ResolutionContext<'a> {
