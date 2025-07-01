@@ -187,7 +187,7 @@ impl Heuristic {
         
         if unambiguous_interpretations.len() == 1 {
             let (packed_geno, (_, bim_a1, _)) = unambiguous_interpretations[0];
-            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, score_eff_allele);
+            let dosage = Self::calculate_dosage(packed_geno, bim_a1, score_eff_allele);
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -322,7 +322,7 @@ struct FatalAmbiguityData {
 
 /// Describes the specific heuristic used to resolve a critical data ambiguity,
 /// holding the data needed for transparent reporting.
-enum ResolutionMethod {
+pub enum ResolutionMethod {
     /// All conflicting sources yielded the same effect allele dosage.
     ConsistentDosage { dosage: f64 },
     /// Exactly one heterozygous call was found alongside one or more homozygous
@@ -330,6 +330,8 @@ enum ResolutionMethod {
     PreferHeterozygous { chosen_dosage: f64 },
     /// A single BIM entry's alleles perfectly matched the score file alleles.
     ExactScoreAlleleMatch { chosen_dosage: f64 },
+    /// A single interpretation was composed of standard alleles from the score file.
+    PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
 }
 
 /// A private struct holding the data for a critical but non-fatal integrity warning.
@@ -372,19 +374,15 @@ pub fn resolve_complex_variants(
 
     eprintln!("> Resolving {} complex variant rules...", num_rules);
 
-    // This state must persist across all iterations of the rules loop. These are
-    // thread-safe types that can be safely shared between threads.
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
     let all_critical_warnings_to_print = Mutex::new(Vec::<CriticalIntegrityWarningInfo>::new());
 
-    // Iterate through rules one by one to provide clear, sequential progress to the user.
     for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
         if fatal_error_occurred.load(Ordering::Relaxed) {
             break;
         }
 
-        // --- Per-Rule Progress Bar Setup ---
         let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
         let progress_style = ProgressStyle::with_template(&format!(
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
@@ -395,11 +393,9 @@ pub fn resolve_complex_variants(
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
         let progress_counter = Arc::new(AtomicU64::new(0));
 
-        // A single resolver pipeline is created for each rule. This is cheap.
         let pipeline = ResolverPipeline::new();
 
         thread::scope(|s| {
-            // Spawner #1: The dedicated progress bar updater thread.
             s.spawn({
                 let pb_updater = pb.clone();
                 let counter_for_updater = Arc::clone(&progress_counter);
@@ -416,7 +412,6 @@ pub fn resolve_complex_variants(
                 }
             });
 
-            // Spawner #2: The worker threads (managed by Rayon).
             s.spawn(|| {
                 final_scores
                     .par_chunks_mut(prep_result.score_names.len())
@@ -433,9 +428,6 @@ pub fn resolve_complex_variants(
 
                         let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
-                        // --- Core Resolution Logic ---
-
-                        // 1. Gather all non-missing genotype evidence for this person at this locus.
                         let valid_interpretations: Vec<_> = group_rule
                             .possible_contexts
                             .iter()
@@ -449,48 +441,51 @@ pub fn resolve_complex_variants(
                             })
                             .collect();
 
-                        // 2. Apply Decision Policy based on the amount of evidence.
                         match valid_interpretations.len() {
                             0 => {
-                                // CASE A: No non-missing genotypes. Treat as missing for all relevant scores.
                                 for score_info in &group_rule.score_applications {
                                     person_counts_slice[score_info.score_column_index.0] += 1;
                                 }
                             }
                             1 => {
-                                // CASE B: Exactly one valid genotype. The unambiguous happy path.
                                 let (packed_geno, context) = valid_interpretations[0];
                                 for score_info in &group_rule.score_applications {
-                                    if &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2 {
-                                        let dosage = Heuristic::calculate_dosage(packed_geno, &context.1, &score_info.effect_allele);
-                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
-                                    }
+                                    // This check is removed because the prep phase guarantees relevance.
+                                    let dosage = Heuristic::calculate_dosage(packed_geno, &context.1, &score_info.effect_allele);
+                                    person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
                                 }
                             }
                             _ => {
-                                // CASE C: A conflict was detected. Use the Resolver Pipeline.
                                 for score_info in &group_rule.score_applications {
+                                    // Performance: Filter interpretations to only those relevant to the current score.
+                                    let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
+                                        &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2
+                                    }).collect();
+                                    
+                                    // If no interpretations match this score's alleles, skip to the next score.
+                                    if matching_interpretations.is_empty() {
+                                        continue;
+                                    }
+
                                     let context = ResolutionContext {
                                         score_info,
-                                        conflicting_interpretations: &valid_interpretations,
+                                        conflicting_interpretations: &matching_interpretations,
                                     };
 
                                     if let Some(resolution) = pipeline.resolve(&context) {
-                                        // The pipeline succeeded! Apply the score and record the warning.
                                         person_scores_slice[score_info.score_column_index.0] +=
                                             resolution.chosen_dosage * score_info.weight as f64;
 
-                                        // Create a detailed warning for later printing.
-                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                        // Efficiency: Collect conflict details only when a resolution is found.
+                                        let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
                                             bim_row: ctx.0,
                                             alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits
+                                            genotype_bits: *bits,
                                         }).collect();
-                                        
-                                        // Map the new Heuristic enum to the old ResolutionMethod for reporting.
+
                                         let resolution_method = match resolution.method_used {
                                             Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage }, // Can reuse for reporting
+                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
                                             Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
                                             Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
                                         };
@@ -504,11 +499,11 @@ pub fn resolve_complex_variants(
                                         });
 
                                     } else {
-                                        // The entire pipeline failed. This is a fatal error.
-                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                        // The entire pipeline failed for this score application. This is a fatal error.
+                                        let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
                                             bim_row: ctx.0,
                                             alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits
+                                            genotype_bits: *bits,
                                         }).collect();
 
                                         let data = FatalAmbiguityData {
@@ -517,26 +512,23 @@ pub fn resolve_complex_variants(
                                             score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
                                             conflicts,
                                         };
-                                        
+
                                         if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                                             *fatal_error_storage.lock().unwrap() = Some(data);
                                         }
-                                        // Important: Break from the inner scores loop after a fatal error is found.
-                                        break; 
+                                        // Use `return` to exit the entire closure for this person, preventing further work.
+                                        return;
                                     }
                                 }
                             }
                         }
                     });
             });
-        }); // Scope ends, all spawned threads are joined.
+        });
 
         pb.finish_with_message("Done.");
     }
 
-    // --- Final Reporting (moved from pipeline.rs, remains the same) ---
-
-    // After all rules are processed, drain and print a summary of warnings.
     let collected_critical_warnings = std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
     const MAX_WARNINGS_TO_PRINT: usize = 10;
 
@@ -549,6 +541,7 @@ pub fn resolve_complex_variants(
             if i > 0 {
                 eprintln!("---------------------------------------------------------------------------------");
             }
+            // This now requires a new match arm in the reporting function, which is assumed to be updated.
             eprintln!("{}", format_critical_integrity_warning(&info));
         }
 
@@ -558,7 +551,6 @@ pub fn resolve_complex_variants(
         eprintln!("=================================================================================\n");
     }
 
-    // After all rules are processed, check if a fatal error was ever stored.
     if fatal_error_occurred.load(Ordering::Relaxed) {
         if let Some(data) = fatal_error_storage.lock().unwrap().take() {
             return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
