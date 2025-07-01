@@ -50,7 +50,6 @@ inherits = "release"
 debug = 1
 strip = false
 
-# This section defines optional features that can be enabled at compile time.
 [features]
 default = []
 # This feature, when enabled, can be used with `#[cfg_attr]` to disable inlining 
