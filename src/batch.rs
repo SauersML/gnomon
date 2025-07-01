@@ -687,6 +687,7 @@ pub fn run_variant_major_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
         // This map from a logical variant index (0-7) to its physical byte position
@@ -771,13 +772,6 @@ mod tests {
             "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
         );
     }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
