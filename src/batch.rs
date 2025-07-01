@@ -444,10 +444,9 @@ fn process_block<'a>(
 /// Accumulates a SIMD lane of `f32` adjustments into a `f64` score slice.
 ///
 /// This function handles both full 8-element lanes and partial tail lanes.
-/// After benchmarking, the simple scalar `for` loop has been
+/// After benchmarking, the manually unrolled scalar loop has been
 /// empirically proven to be the fastest implementation for this specific
-/// read-modify-write task on target hardware, as its predictable memory access
-/// pattern is highly sympathetic to the CPU's out-of-order execution engine.
+/// read-modify-write task on the target hardware.
 #[inline(always)]
 fn accumulate_simd_lane(
     scores_out_slice: &mut [f64],
@@ -459,19 +458,23 @@ fn accumulate_simd_lane(
     if scores_offset + SIMD_LANES <= num_scores {
         // SAFETY: The `if` condition guarantees that we can safely access a sub-slice
         // of `SIMD_LANES` (8) elements starting at `scores_offset`. We get a raw
-        // pointer and cast it directly to a mutable reference to a fixed-size array.
-        // This is the most direct, zero-cost way to provide the callee with
-        // compile-time size information and eliminate all bounds checks.
+        // pointer and cast it directly to a mutable reference to a fixed-size array
+        // to give the compiler size information and eliminate all bounds checks.
         let target_array = unsafe {
             let ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
             &mut *(ptr as *mut [f64; 8])
         };
 
-        // This simple scalar `for` loop is the empirically fastest implementation.
-        let temp_array = adjustments_f32x8.to_array();
-        for j in 0..8 {
-            target_array[j] += temp_array[j] as f64;
-        }
+        // This manually unrolled scalar loop is the empirically fastest implementation.
+        let adj = adjustments_f32x8.to_array();
+        target_array[0] += adj[0] as f64;
+        target_array[1] += adj[1] as f64;
+        target_array[2] += adj[2] as f64;
+        target_array[3] += adj[3] as f64;
+        target_array[4] += adj[4] as f64;
+        target_array[5] += adj[5] as f64;
+        target_array[6] += adj[6] as f64;
+        target_array[7] += adj[7] as f64;
     } else {
         // This is the scalar fallback for the tail end of the data (e.g., if there
         // are 1-7 elements left).
