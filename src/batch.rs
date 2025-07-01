@@ -232,36 +232,48 @@ fn accumulate_simd_lane(
     num_scores: usize,
 ) {
     if scores_offset + SIMD_LANES <= num_scores {
-        // --- FINAL OPTIMIZED VERSION ---
+        // --- FINAL, REVISED OPTIMIZED VERSION ---
 
-        // 1. Efficiently split the f32x8 vector into two f32x4 vectors in-register.
+        // 1. Widen the f32 adjustments to f64 vectors in-register. This is efficient.
         let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
         let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
-
-        // 2. Widen each half to 64-bit floats for accumulation.
         let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
         let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-        // 3. Use raw pointers for the most direct load/store operations, reordered to
-        //    maximize instruction-level parallelism.
-        // SAFETY: The check `scores_offset + SIMD_LANES <= num_scores` ensures
-        // that we can safely read and write 8 elements starting from the offset.
+        // 2. Load data from memory.
+        // SAFETY: The bounds check at the top of the function ensures that reading 8
+        // elements from `scores_offset` is safe.
+        let scores_low: Simd<f64, 4>;
+        let scores_high: Simd<f64, 4>;
+        unsafe {
+            let base_ptr = scores_out_slice.as_ptr().add(scores_offset);
+            scores_low = Simd::from_array([
+                *base_ptr,
+                *base_ptr.add(1),
+                *base_ptr.add(2),
+                *base_ptr.add(3),
+            ]);
+            scores_high = Simd::from_array([
+                *base_ptr.add(4),
+                *base_ptr.add(5),
+                *base_ptr.add(6),
+                *base_ptr.add(7),
+            ]);
+        }
+
+        // 3. Perform the arithmetic in SIMD registers. This is fast.
+        let result_low = scores_low + adj_low_f64x4;
+        let result_high = scores_high + adj_high_f64x4;
+
+        // 4. Write the results back to memory.
+        //    Unaligned vector stores are generally less of a performance penalty
+        //    than unaligned loads, so writing back the full vectors is fine.
+        //
+        // SAFETY: The bounds check also guarantees this write is safe.
         unsafe {
             let base_ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
-            let low_ptr = base_ptr as *mut Simd<f64, 4>;
-            let high_ptr = base_ptr.add(4) as *mut Simd<f64, 4>;
-
-            // Group all reads to help the CPU's out-of-order execution.
-            let scores_low = low_ptr.read_unaligned();
-            let scores_high = high_ptr.read_unaligned();
-
-            // Group all computations.
-            let result_low = scores_low + adj_low_f64x4;
-            let result_high = scores_high + adj_high_f64x4;
-
-            // Group all writes.
-            low_ptr.write_unaligned(result_low);
-            high_ptr.write_unaligned(result_high);
+            (base_ptr as *mut Simd<f64, 4>).write_unaligned(result_low);
+            (base_ptr.add(4) as *mut Simd<f64, 4>).write_unaligned(result_high);
         }
     } else {
         // The scalar fallback for the tail end of the data
