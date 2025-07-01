@@ -89,7 +89,7 @@ jobs:
         continue-on-error: true
 
       - name: Inspect Assembly for Performance Analysis
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: steps.rust_changes.outputs.rust == 'false'
         run: |
           # Step 1: Install the tool with the required 'disasm' feature
           cargo +nightly install cargo-show-asm --features disasm
