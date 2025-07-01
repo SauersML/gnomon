@@ -448,6 +448,35 @@ fn process_block<'a>(
     let _ = tile_pool.push(tile);
 }
 
+/// A high-performance accumulator that performs a full load-widen-add-store cycle
+/// using direct SIMD operations.
+///
+/// This function is the core of the optimization. It avoids spilling intermediate
+/// values to the stack via `.to_array()`, instead keeping all data in fast SIMD
+/// registers for the entire operation. It assumes `scores_out_slice` has a length
+/// of at least 8.
+#[inline(always)]
+fn accumulate_simd_direct(scores_out_slice: &mut [f64], adjustments_f32x8: Simd<f32, 8>) {
+    // 1. LOAD 8x f64 from the main score buffer directly into two 4-lane SIMD vectors.
+    let scores_low = Simd::<f64, 4>::from_slice(&scores_out_slice[0..4]);
+    let scores_high = Simd::<f64, 4>::from_slice(&scores_out_slice[4..8]);
+
+    // 2. WIDEN the 8x f32 adjustments into two 4-lane f64 SIMD vectors.
+    //    This is done entirely in-register and is very fast.
+    let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
+    let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
+    let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
+    let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
+
+    // 3. ADD the vectors. This is a single, fast SIMD instruction per vector.
+    let result_low = scores_low + adj_low_f64x4;
+    let result_high = scores_high + adj_high_f64x4;
+
+    // 4. STORE the results from the SIMD registers back to the main score buffer.
+    result_low.copy_to_slice(&mut scores_out_slice[0..4]);
+    result_high.copy_to_slice(&mut scores_out_slice[4..8]);
+}
+
 /// A helper function to accumulate one SIMD lane of adjustments.
 #[inline(always)]
 fn accumulate_simd_lane(
@@ -456,39 +485,21 @@ fn accumulate_simd_lane(
     scores_offset: usize,
     num_scores: usize,
 ) {
+    // This is the fast path for full 8-element chunks.
     if scores_offset + SIMD_LANES <= num_scores {
-        // --- FINAL STRATEGY: HYBRID SIMD-PREPARE, SCALAR-APPLY ---
+        // Get a mutable slice pointing to the exact 8-element chunk we need to update.
+        let target_slice = &mut scores_out_slice[scores_offset..scores_offset + SIMD_LANES];
 
-        // 1. Perform the expensive widening conversion using SIMD registers, which is fast.
-        let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
-        let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
-        let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
-        let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
-
-        // 2. Extract the prepared SIMD vectors into stack arrays.
-        let adj_low_arr = adj_low_f64x4.to_array();
-        let adj_high_arr = adj_high_f64x4.to_array();
-
-        // 3. Apply the results using an unrolled scalar loop. This presents the compiler
-        //    with the EXACT `load -> add -> store` pattern it has proven it can
-        //    auto-vectorize with maximum efficiency, using fast, aligned scalar loads.
-        //    `get_unchecked_mut` is used because the bounds check has already passed.
-        unsafe {
-            *scores_out_slice.get_unchecked_mut(scores_offset) += adj_low_arr[0];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 1) += adj_low_arr[1];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 2) += adj_low_arr[2];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 3) += adj_low_arr[3];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 4) += adj_high_arr[0];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 5) += adj_high_arr[1];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 6) += adj_high_arr[2];
-            *scores_out_slice.get_unchecked_mut(scores_offset + 7) += adj_high_arr[3];
-        }
+        // Call the function that operates directly on the slice.
+        accumulate_simd_direct(target_slice, adjustments_f32x8);
     } else {
-        // The scalar fallback for the tail end of the data
+        // This is the scalar fallback for the tail end of the data (e.g., if there
+        // are 1-7 elements left).
         let start = scores_offset;
         let end = num_scores;
         let temp_array = adjustments_f32x8.to_array();
         for j in 0..(end - start) {
+            // Using a standard index is safe due to the loop bounds.
             scores_out_slice[start + j] += temp_array[j] as f64;
         }
     }
