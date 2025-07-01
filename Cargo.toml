@@ -54,7 +54,6 @@ strip = false
 default = []
 # This feature, when enabled, can be used with `#[cfg_attr]` to disable inlining 
 # on specific hot functions, providing better visibility in profilers like `perf`.
-# It should NOT be enabled for normal release builds as it will harm performance.
 no-inline-profiling = []
 
 # ========================================================================================
