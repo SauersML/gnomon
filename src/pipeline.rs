@@ -2,13 +2,11 @@ use crate::batch::{self, SparseIndexPool};
 use crate::decide::{self, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
-    BimRowIndex, EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
-    ReconciledVariantIndex, ScoreColumnIndex, WorkItem,
+    EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
+    ReconciledVariantIndex, WorkItem,
 };
-use ahash::AHashSet;
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
-use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use num_cpus;
@@ -17,10 +15,10 @@ use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
+use crate::complex::{ComplexVariantResolver, resolve_complex_variants};
 
 // --- Pipeline Tuning Parameters ---
 
@@ -562,7 +560,7 @@ impl<'a> Drop for BufferGuard<'a> {
 /// (e.g., normal completion, early return, or panic). It holds an optional closure,
 /// which is taken and executed in the `drop` implementation, guaranteeing the
 /// action runs exactly once.
-struct ScopeGuard<F: FnOnce()> {
+pub struct ScopeGuard<F: FnOnce()> {
     /// The closure to execute on drop. `Option` is used to allow the closure
     /// to be taken and called, preventing multiple executions.
     action: Option<F>,
@@ -573,7 +571,7 @@ impl<F: FnOnce()> ScopeGuard<F> {
     ///
     /// The action will be executed when the returned guard is dropped.
     #[inline(always)]
-    fn new(action: F) -> Self {
+    pub fn new(action: F) -> Self {
         Self {
             action: Some(action),
         }

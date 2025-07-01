@@ -1,33 +1,26 @@
-use crate::batch::{self, SparseIndexPool};
-use crate::decide::{self, DecisionContext, RunStrategy};
-use crate::io;
 use crate::types::{
-    BimRowIndex, EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
-    ReconciledVariantIndex, ScoreColumnIndex, WorkItem,
+    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult,
+    ScoreColumnIndex,
 };
 use ahash::AHashSet;
-use crossbeam_channel::{Receiver, bounded};
-use crossbeam_queue::ArrayQueue;
 use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
-use num_cpus;
 use rayon::prelude::*;
-use std::error::Error;
 use std::fs::File;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
+use crate::pipeline::{PipelineError, ScopeGuard};
 
 /// A performant, read-only resolver for fetching complex variant genotypes.
 ///
 /// This enum is initialized ONCE at the start of the pipeline run. It holds
 /// either a single memory map or a collection of them, avoiding the massive
 /// performance penalty of re-opening and re-mapping files inside a parallel loop.
-enum ComplexVariantResolver {
+pub enum ComplexVariantResolver {
     SingleFile(Arc<Mmap>),
     MultiFile {
         // A vector of all memory maps for the multi-file case.
@@ -39,7 +32,7 @@ enum ComplexVariantResolver {
 
 impl ComplexVariantResolver {
     /// Creates a new resolver based on the pipeline strategy.
-    fn new(prep_result: &PreparationResult) -> Result<Self, PipelineError> {
+    pub fn new(prep_result: &PreparationResult) -> Result<Self, PipelineError> {
         match &prep_result.pipeline_kind {
             PipelineKind::SingleFile(bed_path) => {
                 let file = File::open(bed_path).map_err(|e| {
@@ -489,7 +482,7 @@ fn process_person_for_rule(
 /// iterates through each person and resolves their score contributions for the small
 /// set of variants that could not be handled by the fast path. It uses a rule-major
 /// outer loop with a person-major parallel inner loop to provide granular progress.
-fn resolve_complex_variants(
+pub fn resolve_complex_variants(
     resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
     final_scores: &mut [f64],
