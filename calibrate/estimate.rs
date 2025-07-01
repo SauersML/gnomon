@@ -1,6 +1,6 @@
 use crate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::data::TrainingData;
-use crate::model::{LinkFunction, MappedCoefficients, MainEffects, ModelConfig, TrainedModel};
+use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel};
 
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::Solve;
@@ -41,7 +41,8 @@ pub fn train_model(
 
     // 1. Build the large, one-time matrices for the model. This is the most complex
     //    non-iterative part, translating the model formula into matrices.
-    let (x_matrix, penalty_matrix) = internal::build_design_and_penalty_matrices(data, config)?;
+    let (x_matrix, penalty_matrix, layout) =
+        internal::build_design_and_penalty_matrices(data, config)?;
     log::info!(
         "Constructed design matrix with {} samples and {} total coefficients.",
         x_matrix.nrows(),
@@ -51,20 +52,14 @@ pub fn train_model(
     // 2. Initialize the IRLS algorithm.
     let mut beta = Array1::zeros(x_matrix.ncols());
     let mut last_deviance = f64::INFINITY;
-    // Track the last deviance change to report it correctly on failure.
     let mut last_deviance_change = f64::INFINITY;
 
     // 3. Run the IRLS loop.
     for iter in 1..=config.max_iterations {
-        // Calculate the linear predictor `eta` from the current coefficients.
         let eta = x_matrix.dot(&beta);
-
-        // Update GLM-specific vectors based on the current `eta`.
         let (mu, weights, z) =
             internal::update_glm_vectors(data.y.view(), &eta, config.link_function);
 
-        // Solve the core penalized weighted least squares system to get new coefficients.
-        // This is the numerical workhorse of each iteration.
         beta = internal::solve_penalized_wls(
             x_matrix.view(),
             z.view(),
@@ -73,10 +68,8 @@ pub fn train_model(
             config.lambda,
         )?;
 
-        // Check for convergence by monitoring the change in deviance.
         let deviance = internal::calculate_deviance(data.y.view(), &mu, config.link_function);
         let deviance_change = (last_deviance - deviance).abs();
-        // Store the change from this iteration.
         last_deviance_change = deviance_change;
 
         log::debug!(
@@ -93,7 +86,7 @@ pub fn train_model(
                 deviance
             );
             // On success, "un-flatten" the beta vector into the structured MappedCoefficients.
-            let mapped_coefficients = internal::map_coefficients(&beta, config);
+            let mapped_coefficients = internal::map_coefficients(&beta, config, &layout);
             return Ok(TrainedModel {
                 config: config.clone(),
                 coefficients: mapped_coefficients,
@@ -112,13 +105,78 @@ pub fn train_model(
 /// Internal module for implementation details.
 mod internal {
     use super::*;
+    use std::ops::Range;
+
+    /// A single source of truth for the column layout of the design matrix `X`.
+    ///
+    /// This struct encapsulates the complex indexing logic, ensuring that matrix
+    /// construction, penalty application, and coefficient mapping are always consistent.
+    pub(super) struct ModelLayout {
+        /// The column index for the intercept.
+        pub intercept_col: usize,
+        /// Column ranges for the main effect of each PC. Indexed by PC order.
+        pub pc_main_cols: Vec<Range<usize>>,
+        /// Column range for the main effect of the PGS (for basis functions m > 0).
+        pub pgs_main_cols: Range<usize>,
+        /// Column ranges for interaction terms.
+        /// Outer vec: indexed by PGS basis function (m > 0).
+        /// Inner vec: indexed by PC order.
+        pub interaction_cols: Vec<Vec<Range<usize>>>,
+        /// The total number of columns in the design matrix / coefficients in beta.
+        pub total_coeffs: usize,
+    }
+
+    impl ModelLayout {
+        /// Creates a new layout based on the model configuration and the dimensions
+        /// of the generated basis expansions.
+        pub(super) fn new(
+            pc_basis_ncols: &[usize],
+            pgs_basis_ncols: usize,
+        ) -> Self {
+            let mut pc_main_cols = Vec::with_capacity(pc_basis_ncols.len());
+            let mut interaction_cols = Vec::new();
+            let mut current_col = 0;
+
+            let intercept_col = current_col;
+            current_col += 1;
+
+            for &num_basis in pc_basis_ncols {
+                pc_main_cols.push(current_col..current_col + num_basis);
+                current_col += num_basis;
+            }
+
+            let num_pgs_main_coeffs = pgs_basis_ncols.saturating_sub(1);
+            let pgs_main_cols = current_col..current_col + num_pgs_main_coeffs;
+            current_col += num_pgs_main_coeffs;
+
+            if num_pgs_main_coeffs > 0 {
+                interaction_cols.reserve(num_pgs_main_coeffs);
+                for _m_idx in 0..num_pgs_main_coeffs {
+                    let mut pc_interaction_group = Vec::with_capacity(pc_basis_ncols.len());
+                    for &num_basis in pc_basis_ncols {
+                        pc_interaction_group.push(current_col..current_col + num_basis);
+                        current_col += num_basis;
+                    }
+                    interaction_cols.push(pc_interaction_group);
+                }
+            }
+
+            ModelLayout {
+                intercept_col,
+                pc_main_cols,
+                pgs_main_cols,
+                interaction_cols,
+                total_coeffs: current_col,
+            }
+        }
+    }
 
     /// Constructs the full design matrix `X` and the block-diagonal penalty matrix `S`.
-    /// This is a performance-optimized implementation.
+    /// This is orchestrated by a `ModelLayout` to ensure correctness.
     pub(super) fn build_design_and_penalty_matrices(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    ) -> Result<(Array2<f64>, Array2<f64>, ModelLayout), BasisError> {
         // --- 1. Generate all individual basis expansions ---
         let (pgs_basis, _) = create_bspline_basis(
             data.p.view(),
@@ -144,87 +202,62 @@ mod internal {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // --- 2. Assemble the full design matrix X (optimized) ---
-        // Pre-calculate the total number of columns to allocate the matrix only once.
-        let num_samples = data.y.len();
-        let num_pc_main_coeffs: usize = pc_bases.iter().map(|b| b.ncols()).sum();
-        let num_pgs_main_coeffs = pgs_basis.ncols() - 1;
-        let num_interaction_coeffs = num_pgs_main_coeffs * num_pc_main_coeffs;
-        let total_coeffs = 1 + num_pc_main_coeffs + num_pgs_main_coeffs + num_interaction_coeffs;
+        // --- 2. Create the layout as the single source of truth for column indices ---
+        let pc_basis_ncols: Vec<usize> = pc_bases.iter().map(|b| b.ncols()).collect();
+        let layout = ModelLayout::new(&pc_basis_ncols, pgs_basis.ncols());
 
-        let mut x_matrix = Array2::zeros((num_samples, total_coeffs));
-        let mut current_col = 0;
+        // --- 3. Assemble the full design matrix X, guided by the layout ---
+        let mut x_matrix = Array2::zeros((data.y.len(), layout.total_coeffs));
 
-        // Fill columns without re-allocating.
-        // Intercept
-        x_matrix.column_mut(current_col).fill(1.0);
-        current_col += 1;
+        x_matrix.column_mut(layout.intercept_col).fill(1.0);
 
-        // Term 1: Main effects of PCs
-        for pc_basis in &pc_bases {
-            let num_cols = pc_basis.ncols();
+        for (i, pc_basis) in pc_bases.iter().enumerate() {
             x_matrix
-                .slice_mut(s![.., current_col..current_col + num_cols])
+                .slice_mut(s![.., layout.pc_main_cols[i].clone()])
                 .assign(pc_basis);
-            current_col += num_cols;
         }
 
-        // Term 2: Main effects of PGS (m > 0)
         let pgs_main_basis = pgs_basis.slice(s![.., 1..]);
         x_matrix
-            .slice_mut(s![.., current_col..current_col + num_pgs_main_coeffs])
+            .slice_mut(s![.., layout.pgs_main_cols.clone()])
             .assign(&pgs_main_basis);
-        current_col += num_pgs_main_coeffs;
-
-        // Term 3: Non-linear interactions
-        for pgs_basis_col in pgs_main_basis.axis_iter(Axis(1)) {
-            for pc_basis in &pc_bases {
-                let num_cols = pc_basis.ncols();
-                for (j, pc_basis_col) in pc_basis.axis_iter(Axis(1)).enumerate() {
-                    let interaction_term = &pgs_basis_col * &pc_basis_col;
-                    x_matrix.column_mut(current_col + j).assign(&interaction_term);
-                }
-                current_col += num_cols;
+        
+        for (m, pgs_basis_col) in pgs_main_basis.axis_iter(Axis(1)).enumerate() {
+            for (i, pc_basis) in pc_bases.iter().enumerate() {
+                let interaction_block = &pgs_basis_col.to_shape((data.y.len(), 1)).unwrap() * pc_basis;
+                x_matrix
+                    .slice_mut(s![.., layout.interaction_cols[m][i].clone()])
+                    .assign(&interaction_block);
             }
         }
 
-        // --- 3. Assemble the block-diagonal penalty matrix S ---
-        let mut penalty_matrix = Array2::zeros((total_coeffs, total_coeffs));
-        let mut current_pos = 1; // Skip unpenalized global intercept
+        // --- 4. Assemble the block-diagonal penalty matrix S, also guided by the layout ---
+        let mut penalty_matrix = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
 
-        // Penalty for main effects of PCs
-        for (pc_conf, pc_basis) in config.pc_basis_configs.iter().zip(pc_bases.iter()) {
-            let num_basis = pc_basis.ncols();
-            let p_mat = create_difference_penalty_matrix(num_basis, config.penalty_order)?;
+        for (i, pc_conf) in config.pc_basis_configs.iter().enumerate() {
+            let p_mat = create_difference_penalty_matrix(pc_basis_ncols[i], config.penalty_order)?;
             penalty_matrix
-                .slice_mut(s![current_pos..current_pos + num_basis, current_pos..current_pos + num_basis])
+                .slice_mut(s![layout.pc_main_cols[i].clone(), layout.pc_main_cols[i].clone()])
                 .assign(&p_mat);
-            current_pos += num_basis;
         }
 
-        // Main PGS effects are unpenalized.
-        current_pos += num_pgs_main_coeffs;
-
-        // Penalty for interaction terms
-        for _m_idx in 1..pgs_basis.ncols() {
-            for (pc_conf, pc_basis) in config.pc_basis_configs.iter().zip(pc_bases.iter()) {
-                 let num_basis = pc_basis.ncols();
-                 let p_mat = create_difference_penalty_matrix(num_basis, config.penalty_order)?;
-                 penalty_matrix
-                    .slice_mut(s![current_pos..current_pos + num_basis, current_pos..current_pos + num_basis])
+        for (m, _pgs_basis_col) in pgs_main_basis.axis_iter(Axis(1)).enumerate() {
+            for (i, pc_conf) in config.pc_basis_configs.iter().enumerate() {
+                let p_mat = create_difference_penalty_matrix(pc_basis_ncols[i], config.penalty_order)?;
+                penalty_matrix
+                    .slice_mut(s![layout.interaction_cols[m][i].clone(), layout.interaction_cols[m][i].clone()])
                     .assign(&p_mat);
-                 current_pos += num_basis;
             }
         }
 
-        Ok((x_matrix, penalty_matrix))
+        Ok((x_matrix, penalty_matrix, layout))
     }
 
     /// Solves the core penalized weighted least squares system for one IRLS step.
     pub(super) fn solve_penalized_wls(
         x: ArrayView2<f64>,
         z: ArrayView1<f64>,
-        w: ArrayView1<f64>, // Diagonal of the weight matrix
+        w: ArrayView1<f64>,
         s: ArrayView2<f64>,
         lambda: f64,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -236,7 +269,7 @@ mod internal {
             .map_err(EstimationError::MatrixInversionFailed)
     }
 
-    /// Calculates the mean vector `mu`, weight vector `w`, and working response `z`.
+    /// Calculates `mu`, `w`, and `z` for a given link function and linear predictor `eta`.
     pub(super) fn update_glm_vectors(
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
@@ -246,9 +279,9 @@ mod internal {
 
         match link {
             LinkFunction::Logit => {
-                let mu: Array1<f64> = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-                let weights: Array1<f64> = (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
-                let z: Array1<f64> = eta + (y - &mu) / &weights;
+                let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())); // Sigmoid
+                let weights = (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
+                let z = eta + (y - &mu) / &weights;
                 (mu, weights, z)
             }
             LinkFunction::Identity => {
@@ -260,8 +293,7 @@ mod internal {
         }
     }
 
-    /// Calculates the deviance of the model given the observed and fitted values.
-    /// This implementation is numerically stable and memory-efficient.
+    /// Calculates the deviance of the model in a numerically stable way.
     pub(super) fn calculate_deviance(
         y: ArrayView1<f64>,
         mu: &Array1<f64>,
@@ -270,17 +302,19 @@ mod internal {
         const EPS: f64 = 1e-9;
         match link {
             LinkFunction::Logit => {
-                // Sum the deviance residuals directly without allocating a new array.
-                let total_residual = ndarray::Zip::from(y)
-                    .and_from(mu)
-                    .fold(0.0, |acc, &yi, &mui| {
-                        let mui_c = mui.clamp(EPS, 1.0 - EPS);
-
-                        let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
-                        let term2 = if yi < 1.0 - EPS { (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln() } else { 0.0 };
-                        
-                        acc + term1 + term2
-                    });
+                let total_residual =
+                    ndarray::Zip::from(y)
+                        .and_from(mu)
+                        .fold(0.0, |acc, &yi, &mui| {
+                            let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                            let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
+                            let term2 = if yi < 1.0 - EPS {
+                                (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
+                            } else {
+                                0.0
+                            };
+                            acc + term1 + term2
+                        });
                 2.0 * total_residual
             }
             LinkFunction::Identity => (y - mu).mapv(|v| v.powi(2)).sum(),
@@ -288,47 +322,39 @@ mod internal {
     }
 
     /// Converts the flat coefficient vector `beta` into a structured `MappedCoefficients`.
-    /// This is the inverse of the logic in `model::internal::flatten_coefficients`.
     pub(super) fn map_coefficients(
         beta: &Array1<f64>,
         config: &ModelConfig,
+        layout: &ModelLayout,
     ) -> MappedCoefficients {
-        let mut current_pos = 0;
+        let intercept = beta[layout.intercept_col];
 
-        let intercept = beta[current_pos];
-        current_pos += 1;
-
-        let mut pc_coeffs_map = HashMap::new();
-        for (pc_name, pc_conf) in config.pc_names.iter().zip(&config.pc_basis_configs) {
-            let num_basis = pc_conf.num_knots + pc_conf.degree + 1;
-            let coeffs = beta.slice(s![current_pos..current_pos + num_basis]).to_vec();
-            pc_coeffs_map.insert(pc_name.clone(), coeffs);
-            current_pos += num_basis;
+        let mut pcs = HashMap::new();
+        for (i, pc_name) in config.pc_names.iter().enumerate() {
+            pcs.insert(
+                pc_name.clone(),
+                beta.slice(s![layout.pc_main_cols[i].clone()]).to_vec(),
+            );
         }
 
-        let num_pgs_main_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
-        let pgs_coeffs = beta.slice(s![current_pos..current_pos + num_pgs_main_coeffs]).to_vec();
-        current_pos += num_pgs_main_coeffs;
+        let pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
 
         let mut interaction_effects = HashMap::new();
-        for m in 1..=num_pgs_main_coeffs {
-            let pgs_key = format!("pgs_B{}", m);
-            let mut pc_interaction_map = HashMap::new();
-            for (pc_name, pc_conf) in config.pc_names.iter().zip(&config.pc_basis_configs) {
-                let num_basis = pc_conf.num_knots + pc_conf.degree + 1;
-                let coeffs = beta.slice(s![current_pos..current_pos + num_basis]).to_vec();
-                pc_interaction_map.insert(pc_name.clone(), coeffs);
-                current_pos += num_basis;
+        for m in 0..layout.interaction_cols.len() {
+            let pgs_key = format!("pgs_B{}", m + 1); // B1, B2, ...
+            let mut pc_map = HashMap::new();
+            for (i, pc_name) in config.pc_names.iter().enumerate() {
+                pc_map.insert(
+                    pc_name.clone(),
+                    beta.slice(s![layout.interaction_cols[m][i].clone()]).to_vec(),
+                );
             }
-            interaction_effects.insert(pgs_key, pc_interaction_map);
+            interaction_effects.insert(pgs_key, pc_map);
         }
 
         MappedCoefficients {
             intercept,
-            main_effects: MainEffects {
-                pgs: pgs_coeffs,
-                pcs: pc_coeffs_map,
-            },
+            main_effects: MainEffects { pgs, pcs },
             interaction_effects,
         }
     }
@@ -338,30 +364,23 @@ mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::BasisConfig;
     use ndarray::array;
 
     #[test]
     fn test_calculate_deviance_logit_stable() {
-        // Test with edge cases y=0 and y=1
         let y = array![0.0, 1.0, 0.5];
-        let mu = array![0.1, 0.9, 0.5]; // mu shouldn't be 0 or 1
+        let mu = array![0.1, 0.9, 0.5];
         let deviance = internal::calculate_deviance(y.view(), &mu, LinkFunction::Logit);
 
-        // For y=0, mu=0.1: 2 * (0 + 1*ln(1/0.9)) = 2 * ln(1.111...) = 0.21072
-        let d1 = 2.0 * (1.0 / 0.9).ln();
-        // For y=1, mu=0.9: 2 * (1*ln(1/0.9) + 0) = 2 * ln(1.111...) = 0.21072
-        let d2 = 2.0 * (1.0 / 0.9).ln();
-        // For y=0.5, mu=0.5: 2 * (0.5*ln(1) + 0.5*ln(1)) = 0
-        let d3 = 0.0;
-
-        let expected_deviance = d1 + d2 + d3;
+        let d1 = 2.0 * (1.0f64.ln() - 0.0f64.ln() + (1.0 / 0.9).ln());
+        let d2 = 2.0 * ((1.0 / 0.9).ln() + 1.0f64.ln() - 0.0f64.ln());
+        let expected_deviance = 2.0 * ((1.0/0.9).ln() + (1.0/0.9).ln());
         assert!((deviance - expected_deviance).abs() < 1e-5);
 
-        // Test with y=0 and mu close to 0
         let y_zero = array![0.0];
         let mu_small = array![1e-12];
         let deviance_zero = internal::calculate_deviance(y_zero.view(), &mu_small, LinkFunction::Logit);
-        // Should be 2 * ln(1/(1-1e-12)) which is very close to 0.
         assert!(deviance_zero.abs() < 1e-9);
     }
 
@@ -370,7 +389,58 @@ mod tests {
         let y = array![1.0, 2.0, 3.0];
         let mu = array![1.1, 2.2, 2.9];
         let deviance = internal::calculate_deviance(y.view(), &mu, LinkFunction::Identity);
-        // Sum of Squared Errors: (-0.1)^2 + (-0.2)^2 + (0.1)^2 = 0.01 + 0.04 + 0.01 = 0.06
         assert!((deviance - 0.06).abs() < 1e-9);
+    }
+
+    // Helper to create a simple ModelConfig for testing matrix/coefficient logic.
+    fn create_test_config() -> ModelConfig {
+        ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            lambda: 1.0,
+            convergence_tolerance: 1e-6,
+            max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 2, degree: 2 }, // 2+2+1=5 basis functions
+            pc_basis_configs: vec![BasisConfig { num_knots: 1, degree: 2 }], // 1+2+1=4 basis functions
+            pgs_range: (0.0, 1.0),
+            pc_ranges: vec![(0.0, 1.0)],
+            pc_names: vec!["PC1".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_model_layout() {
+        let pc_ncols = &[4]; // From config: 1 knot + 2 degree + 1 = 4
+        let pgs_ncols = 5; // From config: 2 knots + 2 degree + 1 = 5
+        let layout = internal::ModelLayout::new(pc_ncols, pgs_ncols);
+        
+        // 1 (intercept) + 4 (PC main) + 4 (PGS main) + 4*4 (interactions) = 25
+        assert_eq!(layout.total_coeffs, 1 + 4 + 4 + 16);
+
+        assert_eq!(layout.intercept_col, 0);
+        assert_eq!(layout.pc_main_cols, vec![1..5]);
+        assert_eq!(layout.pgs_main_cols, 5..9);
+        assert_eq!(layout.interaction_cols.len(), 4); // 4 PGS main effect terms
+        assert_eq!(layout.interaction_cols[0], vec![9..13]);
+        assert_eq!(layout.interaction_cols[3], vec![21..25]);
+    }
+    
+    #[test]
+    fn test_map_coefficients() {
+        let config = create_test_config();
+        let pc_ncols = &[4];
+        let pgs_ncols = 5;
+        let layout = internal::ModelLayout::new(pc_ncols, pgs_ncols);
+        
+        let beta = Array1::range(0.0, layout.total_coeffs as f64, 1.0); // 0.0, 1.0, ..., 24.0
+
+        let mapped = internal::map_coefficients(&beta, &config, &layout);
+
+        assert_eq!(mapped.intercept, 0.0);
+        assert_eq!(mapped.main_effects.pcs["PC1"], vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(mapped.main_effects.pgs, vec![5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(mapped.interaction_effects.len(), 4);
+        assert_eq!(mapped.interaction_effects["pgs_B1"]["PC1"], vec![9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(mapped.interaction_effects["pgs_B4"]["PC1"], vec![21.0, 22.0, 23.0, 24.0]);
     }
 }
