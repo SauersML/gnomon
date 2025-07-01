@@ -4,8 +4,6 @@
 //
 // ========================================================================================
 //
-// ### Purpose ###
-//
 // This module contains the producer logic for the gnomon compute pipeline. Its sole
 // responsibility is to read the required variant data from a memory-mapped .bed file
 // and send it downstream to the consumer threads for processing. It leverages a
