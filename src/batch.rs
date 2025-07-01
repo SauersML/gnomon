@@ -77,11 +77,6 @@ pub struct SparseIndexBuilder<'a, State> {
     _marker: PhantomData<&'a ()>,
 }
 
-// Helper struct to safely send raw pointers across threads when we know it's safe.
-struct UnsafeSendSyncPtr<T>(*mut T);
-unsafe impl<T> Send for UnsafeSendSyncPtr<T> {}
-unsafe impl<T> Sync for UnsafeSendSyncPtr<T> {}
-
 // ========================================================================================
 //                             SPARSE INDEX BUILDER (TYPESTATE)
 // ========================================================================================
@@ -207,9 +202,9 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
         let num_people = self.state.num_people;
         let variants_in_chunk = self.state.tile.len() / num_people;
 
-        // THE FIX: Create the Send+Sync wrappers here.
-        let g1_ptr_wrapper = UnsafeSendSyncPtr(self.state.all_g1_indices.as_mut_ptr());
-        let g2_ptr_wrapper = UnsafeSendSyncPtr(self.state.all_g2_indices.as_mut_ptr());
+        // Alternative pointer passing: Cast to usize to ensure Send + Sync for the captured variable.
+        let g1_ptr_addr = self.state.all_g1_indices.as_mut_ptr() as usize;
+        let g2_ptr_addr = self.state.all_g2_indices.as_mut_ptr() as usize;
 
         // These variables are all thread-safe and can be captured by the closure.
         let tile_ref = self.state.tile;
@@ -227,12 +222,15 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
             let g2_offset = g2_offsets_ref[person_idx];
             let g2_count = person_counts_ref[person_idx].1 as usize;
 
-            // Inside the thread, we unwrap the raw pointer from our safe wrapper
-            // and use it. This is our promise to the compiler that this is safe.
+            // Inside the thread, cast usize back to raw pointer and use it.
+            // This is our promise to the compiler that this is safe because the underlying Vec lives.
+            let g1_ptr = g1_ptr_addr as *mut usize;
+            let g2_ptr = g2_ptr_addr as *mut usize;
+
             let person_g1_slice =
-                unsafe { std::slice::from_raw_parts_mut(g1_ptr_wrapper.0.add(g1_offset), g1_count) };
+                unsafe { std::slice::from_raw_parts_mut(g1_ptr.add(g1_offset), g1_count) };
             let person_g2_slice =
-                unsafe { std::slice::from_raw_parts_mut(g2_ptr_wrapper.0.add(g2_offset), g2_count) };
+                unsafe { std::slice::from_raw_parts_mut(g2_ptr.add(g2_offset), g2_count) };
 
             let mut g1_written = 0;
             let mut g2_written = 0;
@@ -870,7 +868,7 @@ pub fn run_variant_major_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
