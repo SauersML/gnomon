@@ -157,8 +157,8 @@ impl Heuristic {
             .collect();
 
         if exact_matches.len() == 1 {
-            let (packed_geno, (_, bim_a1, _)) = exact_matches[0];
-            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, score_eff_allele);
+            let (packed_geno, (_, bim_a1, bim_a2)) = exact_matches[0];
+            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, score_eff_allele);
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -187,8 +187,8 @@ impl Heuristic {
         }
         
         if unambiguous_interpretations.len() == 1 {
-            let (packed_geno, (_, bim_a1, _)) = unambiguous_interpretations[0];
-            let dosage = Self::calculate_dosage(packed_geno, bim_a1, score_eff_allele);
+            let (packed_geno, (_, bim_a1, bim_a2)) = unambiguous_interpretations[0];
+            let dosage = Self::calculate_dosage(packed_geno, bim_a1, bim_a2, score_eff_allele);
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -205,8 +205,8 @@ impl Heuristic {
         let dosages: Vec<f64> = context
             .conflicting_interpretations
             .iter()
-            .map(|(packed_geno, (_, bim_a1, _))| {
-                Self::calculate_dosage(*packed_geno, bim_a1, &context.score_info.effect_allele)
+            .map(|(packed_geno, (_, bim_a1, bim_a2))| {
+                Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, &context.score_info.effect_allele)
             })
             .collect();
 
@@ -236,8 +236,8 @@ impl Heuristic {
             .any(|(packed_geno, _)| *packed_geno != 0b10);
 
         if heterozygous_calls.len() == 1 && homozygous_calls_exist {
-            let (packed_geno, (_, bim_a1, _)) = heterozygous_calls[0];
-            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, &context.score_info.effect_allele);
+            let (packed_geno, (_, bim_a1, bim_a2)) = heterozygous_calls[0];
+            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, &context.score_info.effect_allele);
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -248,6 +248,8 @@ impl Heuristic {
     }
 
     /// A private helper to compute dosage from raw PLINK bits.
+    /// This function is now fully safe and self-contained, returning 0.0 if the
+    /// effect allele is not one of the two alleles from the BIM entry.
     #[inline(always)]
     fn calculate_dosage(packed_geno: u8, bim_a1: &str, bim_a2: &str, effect_allele: &str) -> f64 {
         // Decodes the genotype with respect to the BIM alleles.
@@ -460,7 +462,7 @@ pub fn resolve_complex_variants(
                                         continue;
                                     }
 
-                                    let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, effect_allele);
+                                    let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, bim_a2, effect_allele);
                                     person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
                                 }
                             }
