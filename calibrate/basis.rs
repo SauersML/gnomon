@@ -1,1 +1,411 @@
+// src/basis.rs
 
+use ndarray::{s, Array, Array1, Array2, ArrayView1, Axis};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Defines the strategy for placing the internal knots of a spline.
+/// This is part of the public API and will be saved in the model configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KnotStrategy {
+    /// Place knots uniformly across the specified `data_range`.
+    /// This is deterministic and suitable for prediction.
+    Uniform,
+    /// Place knots at the quantiles of the provided `training_data_for_quantiles`.
+    /// This adapts to the data's distribution and is recommended for model training.
+    Quantile,
+}
+
+/// A comprehensive error type for all operations within the basis module.
+#[derive(Error, Debug, PartialEq)]
+pub enum BasisError {
+    #[error("Spline degree must be at least 1, but was {0}.")]
+    InvalidDegree(usize),
+
+    #[error("Data range is invalid: start ({0}) must be less than or equal to end ({1}).")]
+    InvalidRange(f64, f64),
+
+    #[error("Quantile strategy requires a non-empty training data set for quantile calculation.")]
+    QuantileDataMissing,
+
+    #[error("Cannot compute {num_quantiles} quantiles from only {num_points} data points.")]
+    InsufficientDataForQuantiles {
+        num_quantiles: usize,
+        num_points: usize,
+    },
+
+    #[error("Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis}).")]
+    InvalidPenaltyOrder { order: usize, num_basis: usize },
+}
+
+/// Creates a B-spline basis expansion matrix and its corresponding knot vector.
+///
+/// This is the primary workhorse function, implementing a numerically stable
+/// version of the Cox-de Boor algorithm for evaluation.
+///
+/// # Arguments
+///
+/// * `data`: A 1D view of the data points to be transformed (e.g., a single vector
+///   of PGS values or a single Principal Component).
+/// * `training_data_for_quantiles`: An `Option` containing a view of the *original,
+///   full training dataset column*. This is **required** and must be `Some` when
+///   `knot_strategy` is `Quantile`. It is ignored otherwise.
+/// * `data_range`: A tuple `(min, max)` defining the boundaries for knot placement.
+///   **Crucially, this must always be the range of the original training data**,
+///   even when making predictions on new data, to ensure a consistent basis.
+/// * `num_internal_knots`: The number of knots to place *between* the boundaries.
+/// * `degree`: The degree of the B-spline polynomials (e.g., 3 for cubic).
+///
+/// # Returns
+///
+/// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
+/// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
+///     The number of basis functions is `num_internal_knots + degree + 1`.
+/// 2.  The **full knot vector** used to generate the basis. This is needed for the penalty matrix.
+pub fn create_bspline_basis(
+    data: ArrayView1<f64>,
+    training_data_for_quantiles: Option<ArrayView1<f64>>,
+    data_range: (f64, f64),
+    num_internal_knots: usize,
+    degree: usize,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    if data_range.0 > data_range.1 {
+        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
+    }
+
+    let knot_vector = internal::generate_full_knot_vector(
+        data_range,
+        num_internal_knots,
+        degree,
+        training_data_for_quantiles,
+    )?;
+
+    // The number of B-spline basis functions for a given knot vector and degree `d` is
+    // n = k - d - 1, where k is the number of knots.
+    // Our knot vector has k = num_internal_knots + 2 * (degree + 1) knots.
+    // So, n = (num_internal_knots + 2*d + 2) - d - 1 = num_internal_knots + d + 1.
+    let num_basis_functions = knot_vector.len() - degree - 1;
+
+    let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+
+    // Evaluate the splines for each data point.
+    // While seemingly inefficient, this structure allows the inner loop (de Boor's)
+    // to be highly optimized and cache-friendly for a single point `x`.
+    for (i, &x) in data.iter().enumerate() {
+        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
+        basis_matrix.row_mut(i).assign(&basis_row);
+    }
+
+    Ok((basis_matrix, knot_vector))
+}
+
+/// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
+/// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
+/// differences of the spline coefficients. This is the core of P-splines.
+///
+/// # Arguments
+/// * `num_basis_functions`: The number of basis functions (i.e., columns in the basis matrix).
+/// * `order`: The order of the difference penalty (e.g., 2 for second differences).
+///
+/// # Returns
+/// A square `Array2<f64>` of shape `[num_basis, num_basis]` representing the penalty `S`.
+pub fn create_difference_penalty_matrix(
+    num_basis_functions: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order == 0 || order >= num_basis_functions {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order,
+            num_basis: num_basis_functions,
+        });
+    }
+
+    // Start with the identity matrix
+    let mut d = Array2::<f64>::eye(num_basis_functions);
+
+    // Apply the differencing operation `order` times.
+    // Each `diff` reduces the number of rows by 1.
+    for _ in 0..order {
+        // This calculates the difference between adjacent rows.
+        d = &d.slice(s![1.., ..]) - &d.slice(s![..-1, ..]);
+    }
+
+    // The penalty matrix S = D' * D
+    let s = d.t().dot(&d);
+    Ok(s)
+}
+
+/// Internal module for implementation details not exposed in the public API.
+mod internal {
+    use super::*;
+
+    /// Generates the full knot vector, including repeated boundary knots.
+    pub(super) fn generate_full_knot_vector(
+        data_range: (f64, f64),
+        num_internal_knots: usize,
+        degree: usize,
+        training_data_for_quantiles: Option<ArrayView1<f64>>,
+    ) -> Result<Array1<f64>, BasisError> {
+        let (min_val, max_val) = data_range;
+
+        let internal_knots = if let Some(training_data) = training_data_for_quantiles {
+            // Quantile-based knots
+            if training_data.len() < num_internal_knots {
+                return Err(BasisError::InsufficientDataForQuantiles {
+                    num_quantiles: num_internal_knots,
+                    num_points: training_data.len(),
+                });
+            }
+            quantiles(training_data, num_internal_knots)?
+        } else {
+            // Uniformly spaced knots
+            if num_internal_knots == 0 {
+                Array1::from_vec(vec![])
+            } else {
+                let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
+                Array::from_iter((1..=num_internal_knots).map(|i| min_val + i as f64 * h))
+            }
+        };
+
+        // B-splines require `degree + 1` repeated knots at each boundary.
+        let min_knots = Array1::from_elem(degree + 1, min_val);
+        let max_knots = Array1::from_elem(degree + 1, max_val);
+
+        // Concatenate [boundary_min, internal, boundary_max] to form the full knot vector.
+        // This operation on views should not fail if logic is correct.
+        Ok(ndarray::concatenate(
+            Axis(0),
+            &[min_knots.view(), internal_knots.view(), max_knots.view()],
+        )
+        .unwrap())
+    }
+
+    /// Calculates quantiles from a data vector using linear interpolation (Type 7 in R).
+    fn quantiles(data: ArrayView1<f64>, num_quantiles: usize) -> Result<Array1<f64>, BasisError> {
+        if num_quantiles == 0 {
+            return Ok(Array1::from_vec(vec![]));
+        }
+
+        let mut sorted_data = data.to_vec();
+        // Use `sort_unstable_by` for performance and to handle non-total-order of f64.
+        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let n = sorted_data.len();
+        let quantiles_vec = (1..=num_quantiles)
+            .map(|k| {
+                let p = k as f64 / (num_quantiles as f64 + 1.0);
+                let float_idx = (n as f64 - 1.0) * p;
+                let lower_idx = float_idx.floor() as usize;
+                let upper_idx = float_idx.ceil() as usize;
+
+                if lower_idx == upper_idx {
+                    sorted_data[lower_idx]
+                } else {
+                    let fraction = float_idx - lower_idx as f64;
+                    sorted_data[lower_idx] * (1.0 - fraction) + sorted_data[upper_idx] * fraction
+                }
+            })
+            .collect();
+
+        Ok(Array1::from_vec(quantiles_vec))
+    }
+
+    /// Evaluates all B-spline basis functions at a single point `x`.
+    /// This uses the stable, iterative version of the Cox-de Boor algorithm.
+    pub(super) fn evaluate_splines_at_point(
+        x: f64,
+        degree: usize,
+        knots: ArrayView1<f64>,
+    ) -> Array1<f64> {
+        let num_knots = knots.len();
+        let num_basis = num_knots - degree - 1;
+        let mut basis_values = Array1::zeros(num_basis);
+
+        // Find the knot interval `mu` that contains x, such that `knots[mu] <= x < knots[mu+1]`.
+        // This is a crucial first step. `rposition` is efficient.
+        // The `unwrap_or` handles the edge case where x is exactly the last knot value.
+        let mu = knots
+            .iter()
+            .rposition(|&k| k <= x)
+            .unwrap_or(knots.len() - 2);
+
+        // If x is outside the support of all basis functions, return zeros.
+        // The support of the entire basis is from knots[degree] to knots[num_knots - degree - 1].
+        if mu < degree || mu >= num_basis + degree {
+            return basis_values;
+        }
+
+        // Initialize the degree-0 splines. Only one is non-zero.
+        let mut b = Array1::zeros(degree + 1);
+        b[0] = 1.0;
+
+        // Iteratively compute higher-degree spline values from lower-degree ones.
+        // This is the core of the algorithm.
+        for d in 1..=degree {
+            // `b_prev` holds the values for degree `d-1`.
+            let b_prev = b.slice(s![..d]).to_owned();
+            b.fill(0.0); // Reset the current buffer
+
+            for i in 0..d {
+                let idx = mu - d + i;
+                // These two terms are the recursive formula.
+                let term1_denom = knots[idx + d] - knots[idx];
+                let term2_denom = knots[idx + d + 1] - knots[idx + 1];
+
+                if term1_denom > 1e-9 {
+                    let w1 = (x - knots[idx]) / term1_denom;
+                    b[i] += w1 * b_prev[i];
+                }
+
+                if term2_denom > 1e-9 {
+                    let w2 = (knots[idx + d + 1] - x) / term2_denom;
+                    b[i] += w2 * b_prev[i];
+                }
+            }
+            // The last term is calculated separately
+            let idx = mu;
+            let term1_denom = knots[idx + d] - knots[idx];
+            if term1_denom > 1e-9 {
+                let w1 = (x - knots[idx]) / term1_denom;
+                b[d] = w1 * b_prev[d-1];
+            }
+        }
+        
+        // The final `b` vector contains the `degree+1` non-zero spline values.
+        // We need to place them in the correct locations in the full `basis_values` vector.
+        let start_index = mu - degree;
+        basis_values
+            .slice_mut(s![start_index..start_index + degree + 1])
+            .assign(&b);
+
+        basis_values
+    }
+}
+
+// Unit tests are crucial for a mathematical library like this.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn test_knot_generation_uniform() {
+        let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2, None).unwrap();
+        // 3 internal + 2 * (2+1) boundary = 9 knots
+        assert_eq!(knots.len(), 9);
+        assert_eq!(
+            knots,
+            array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn test_knot_generation_quantile() {
+        let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
+        let knots = internal::generate_full_knot_vector(
+            (0.0, 10.0),
+            3,
+            2,
+            Some(training_data.view()),
+        )
+        .unwrap();
+        // Quantiles at 1/4, 2/4, 3/4.
+        // p=0.25 -> idx=(7-1)*0.25=1.5 -> (data[1]+data[2])/2 = (1+2)/2=1.5
+        // p=0.50 -> idx=(7-1)*0.50=3.0 -> data[3] = 5.0
+        // p=0.75 -> idx=(7-1)*0.75=4.5 -> (data[4]+data[5])/2 = (8+9)/2=8.5
+        assert_eq!(
+            knots,
+            array![0.0, 0.0, 0.0, 1.5, 5.0, 8.5, 10.0, 10.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn test_penalty_matrix_creation() {
+        let s = create_difference_penalty_matrix(5, 2).unwrap();
+        assert_eq!(s.shape(), &[5, 5]);
+        // D_2 for n=5 is [[1, -2, 1, 0, 0], [0, 1, -2, 1, 0], [0, 0, 1, -2, 1]]
+        // S = D_2' * D_2
+        let expected_s = array![
+            [1., -2., 1., 0., 0.],
+            [-2., 5., -4., 1., 0.],
+            [1., -4., 6., -4., 1.],
+            [0., 1., -4., 5., -2.],
+            [0., 0., 1., -2., 1.]
+        ];
+        assert!(s.all_close(&expected_s, 1e-9));
+    }
+
+    #[test]
+    fn test_bspline_basis_sums_to_one() {
+        let data = Array::linspace(0.1, 9.9, 100);
+        let (basis, _) =
+            create_bspline_basis(data.view(), None, (0.0, 10.0), 10, 3).unwrap();
+
+        let sums = basis.sum_axis(Axis(1));
+
+        // Every row should sum to 1.0 (with floating point tolerance)
+        for &sum in sums.iter() {
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "Basis did not sum to 1, got {}",
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_point_evaluation() {
+        // Test a single point where the value can be calculated by hand for a simple case.
+        // Degree 1 (linear) splines with knots at [0,0,1,2,2]
+        // This gives 3 basis functions.
+        let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        // B_{0,1}(x) = (x-0)/(1-0) * B_{0,0}(x) + (1-x)/(1-0) * B_{1,0}(x)
+        // B_{1,1}(x) = (x-0)/(2-0) * B_{1,0}(x) + (2-x)/(2-0) * B_{2,0}(x)
+        // At x=0.5, mu=1. knots[1]=0 <= 0.5 < knots[2]=1.
+        // So B_{1,0}(0.5) is 1, others are 0.
+        let values = internal::evaluate_splines_at_point(0.5, 1, knots.view());
+        assert_eq!(values.len(), 3); // n=k-d-1 = 5-1-1 = 3
+        assert!((values[0] - 0.5).abs() < 1e-9); // B_{0,1}(0.5)
+        assert!((values[1] - 0.5).abs() < 1e-9); // B_{1,1}(0.5)
+        assert!((values[2] - 0.0).abs() < 1e-9); // B_{2,1}(0.5)
+    }
+
+    #[test]
+    fn test_error_conditions() {
+        assert_eq!(
+            create_bspline_basis(array![].view(), None, (0.0, 10.0), 5, 0).unwrap_err(),
+            BasisError::InvalidDegree(0)
+        );
+
+        assert_eq!(
+            create_bspline_basis(array![].view(), None, (10.0, 0.0), 5, 1).unwrap_err(),
+            BasisError::InvalidRange(10.0, 0.0)
+        );
+
+        assert_eq!(
+            create_bspline_basis(
+                array![].view(),
+                Some(array![1., 2.].view()),
+                (0.0, 10.0),
+                3,
+                1
+            )
+            .unwrap_err(),
+            BasisError::InsufficientDataForQuantiles {
+                num_quantiles: 3,
+                num_points: 2
+            }
+        );
+
+        assert_eq!(
+            create_difference_penalty_matrix(5, 5).unwrap_err(),
+            BasisError::InvalidPenaltyOrder {
+                order: 5,
+                num_basis: 5
+            }
+        );
+    }
+}
