@@ -849,27 +849,33 @@ mod tests {
             accumulate_simple_scalar,
         );
 
-        // Calculate final metrics.
+        // Calculate final metrics for reporting.
         let time_per_op_complex = duration_complex.as_nanos() as f64 / NUM_ITERATIONS as f64;
         let time_per_op_scalar = duration_scalar.as_nanos() as f64 / NUM_ITERATIONS as f64;
 
-        // Print the final report.
+        // Print the performance data for diagnostic purposes before the assertion.
         println!("------------------------------------------------------------------");
-        println!("Complex SIMD (Current):");
-        println!("  - Total time:  {:?}", duration_complex);
-        println!("  - Per op:      {:.2} ns", time_per_op_complex);
-        println!("\nSimple Scalar (Proposed):");
-        println!("  - Total time:  {:?}", duration_scalar);
-        println!("  - Per op:      {:.2} ns", time_per_op_scalar);
+        println!(
+            "Complex SIMD (Current):   {:.2} ns/op (Total: {:?})",
+            time_per_op_complex, duration_complex
+        );
+        println!(
+            "Simple Scalar (Proposed): {:.2} ns/op (Total: {:?})",
+            time_per_op_scalar, duration_scalar
+        );
         println!("------------------------------------------------------------------");
 
-        if time_per_op_scalar < time_per_op_complex {
-            let factor = time_per_op_complex / time_per_op_scalar;
-            println!("WINNER: Simple Scalar is {:.2}x faster.", factor);
-        } else {
-            let factor = time_per_op_scalar / time_per_op_complex;
-            println!("WINNER: Complex SIMD is {:.2}x faster.", factor);
-        }
+        // Assert that the complex SIMD version is faster than or equal to the scalar version.
+        assert!(
+            duration_complex <= duration_scalar,
+            "PERFORMANCE CHECK FAILED.\n\
+             - Complex SIMD time: {:?}\n\
+             - Simple Scalar time: {:?}",
+            duration_complex,
+            duration_scalar
+        );
+
+        println!("✅ PERFORMANCE CHECK PASSED: The current SIMD implementation is faster than or equal to scalar.");
         println!("==================================================================\n");
     }
 }
