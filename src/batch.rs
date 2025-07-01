@@ -483,14 +483,15 @@ fn accumulate_simd_lane(
 ) {
     // This is the fast path for full 8-element chunks.
     if scores_offset + SIMD_LANES <= num_scores {
-        // Get a mutable slice pointing to the exact 8-element chunk we need to update.
-        let target_slice = &mut scores_out_slice[scores_offset..scores_offset + SIMD_LANES];
-
-        // Convert the slice to a fixed-size array reference. The `if` condition above
-        // guarantees this slice is exactly 8 elements long, so the `unwrap` is safe.
-        // This conversion is crucial for providing compile-time size information to the
-        // callee, which eliminates bounds checks for maximum performance.
-        let target_array: &mut [f64; 8] = target_slice.try_into().unwrap();
+        // SAFETY: The `if` condition guarantees that we can safely access a sub-slice
+        // of `SIMD_LANES` (8) elements starting at `scores_offset`. We get a raw
+        // pointer and cast it directly to a mutable reference to a fixed-size array.
+        // This is the most direct, zero-cost way to provide the callee with the
+        // compile-time size information needed to eliminate all bounds checks.
+        let target_array = unsafe {
+            let ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
+            &mut *(ptr as *mut [f64; 8])
+        };
 
         // Call the function that operates on the fixed-size array.
         accumulate_simd_direct(target_array, adjustments_f32x8);
@@ -558,8 +559,18 @@ fn process_tile<'a>(
         // --- Create Kernel Input Views ---
         let matrix_slice_start = variant_mini_batch_start * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
-        let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
-        let flip_flags_chunk = &flips_for_batch[matrix_slice_start..matrix_slice_end];
+
+        // SAFETY: The loop structure and mini-batch calculations ensure that the
+        // `matrix_slice_start..matrix_slice_end` range is always within the bounds
+        // of `weights_for_batch` and `flips_for_batch`. Using `get_unchecked`
+        // bypasses the compiler's bounds checks, which is critical for performance
+        // in this hot loop.
+        let (weights_chunk, flip_flags_chunk) = unsafe {
+            (
+                weights_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
+                flips_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
+            )
+        };
 
         // SAFETY: The logic of the mini-batch slicing guarantees the chunks passed to
         // the `new` functions have the correct dimensions. Therefore, these operations
