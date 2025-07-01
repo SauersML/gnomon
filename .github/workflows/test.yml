@@ -91,17 +91,23 @@ jobs:
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'true'
         run: |
-          cargo +nightly install cargo-show-asm
+          # Step 1: Install the tool WITH the required 'disasm' feature.
+          cargo +nightly install cargo-show-asm --features disasm
 
+          # Step 2: Explicitly build the two artifacts we need to inspect.
+          echo "--- Building artifacts for inspection ---"
           cargo +nightly build --profile profiling --features no-inline-profiling
           cargo +nightly test --release --no-run
 
+          # Step 3: Find the exact path to the compiled test harness executable.
           TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
           if [[ -z "$TEST_HARNESS_PATH" ]]; then
             echo "::error::Could not find compiled test harness."
             exit 1
           fi
           echo "Found test harness at: $TEST_HARNESS_PATH"
+
+          # Step 4: Inspect the functions by pointing directly at the compiled files.
 
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (from profiling build) ---"
