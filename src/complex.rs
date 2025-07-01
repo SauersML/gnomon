@@ -293,16 +293,6 @@ impl ResolverPipeline {
     }
 }
 
-/// A private helper struct to hold the raw components of a warning message.
-/// This avoids heap allocations (`format!`) inside the hot parallel loop.
-struct WarningInfo {
-    person_output_idx: usize,
-    locus_id: BimRowIndex,
-    winning_a1: String,
-    winning_a2: String,
-    score_col_idx: ScoreColumnIndex,
-}
-
 /// A private struct holding the raw data for one conflicting source of evidence.
 /// This is used exclusively for building the final fatal error report.
 struct ConflictSource {
@@ -344,16 +334,6 @@ struct CriticalIntegrityWarningInfo {
     /// The specific heuristic that was successfully applied and its outcome.
     resolution_method: ResolutionMethod,
 }
-
-/// A private helper enum to represent the outcome of processing one person for one rule.
-/// This decouples the core logic from the side-effects (like I/O or setting global flags).
-enum ResolutionOutcome {
-    Success,
-    Warning(WarningInfo),
-    CriticalIntegrityWarning(CriticalIntegrityWarningInfo),
-    Fatal(FatalAmbiguityData),
-}
-
 
 /// The "slow path" resolver for complex, multiallelic variants.
 ///
