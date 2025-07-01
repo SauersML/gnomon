@@ -444,30 +444,33 @@ fn process_block<'a>(
 /// A high-performance accumulator that performs a full load-widen-add-store cycle
 /// using direct SIMD operations.
 ///
-/// This function is the core of the optimization. It avoids spilling intermediate
-/// values to the stack via `.to_array()`, instead keeping all data in fast SIMD
-/// registers for the entire operation. It assumes `scores_out_slice` has a length
-/// of at least 8.
+/// This function operates on a fixed-size array reference `&mut [f64; 8]` to give size
+/// information to the compiler at compile time. This eliminates all bounds checks
+/// and allows for the most efficient code generation.
 #[inline(always)]
-fn accumulate_simd_direct(scores_out_slice: &mut [f64], adjustments_f32x8: Simd<f32, 8>) {
-    // 1. LOAD 8x f64 from the main score buffer directly into two 4-lane SIMD vectors.
-    let scores_low = Simd::<f64, 4>::from_slice(&scores_out_slice[0..4]);
-    let scores_high = Simd::<f64, 4>::from_slice(&scores_out_slice[4..8]);
+fn accumulate_simd_direct(scores_out_array: &mut [f64; 8], adjustments_f32x8: Simd<f32, 8>) {
+    // 1. SPLIT the array into two 4-element slices. This is bounds-check-free
+    //    because the input type has a compile-time fixed size.
+    let (low_slice, high_slice) = scores_out_array.split_at_mut(4);
 
-    // 2. WIDEN the 8x f32 adjustments into two 4-lane f64 SIMD vectors.
+    // 2. LOAD 8x f64 from the main score buffer into two 4-lane SIMD vectors.
+    let scores_low = Simd::<f64, 4>::from_slice(low_slice);
+    let scores_high = Simd::<f64, 4>::from_slice(high_slice);
+
+    // 3. WIDEN the 8x f32 adjustments into two 4-lane f64 SIMD vectors.
     //    This is done entirely in-register and is very fast.
     let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
     let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
     let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
     let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-    // 3. ADD the vectors. This is a single, fast SIMD instruction per vector.
+    // 4. ADD the vectors. This is a single, fast SIMD instruction per vector.
     let result_low = scores_low + adj_low_f64x4;
     let result_high = scores_high + adj_high_f64x4;
 
-    // 4. STORE the results from the SIMD registers back to the main score buffer.
-    result_low.copy_to_slice(&mut scores_out_slice[0..4]);
-    result_high.copy_to_slice(&mut scores_out_slice[4..8]);
+    // 5. STORE the results from the SIMD registers back to the slices.
+    result_low.copy_to_slice(low_slice);
+    result_high.copy_to_slice(high_slice);
 }
 
 /// A helper function to accumulate one SIMD lane of adjustments.
@@ -483,8 +486,14 @@ fn accumulate_simd_lane(
         // Get a mutable slice pointing to the exact 8-element chunk we need to update.
         let target_slice = &mut scores_out_slice[scores_offset..scores_offset + SIMD_LANES];
 
-        // Call the function that operates directly on the slice.
-        accumulate_simd_direct(target_slice, adjustments_f32x8);
+        // Convert the slice to a fixed-size array reference. The `if` condition above
+        // guarantees this slice is exactly 8 elements long, so the `unwrap` is safe.
+        // This conversion is crucial for providing compile-time size information to the
+        // callee, which eliminates bounds checks for maximum performance.
+        let target_array: &mut [f64; 8] = target_slice.try_into().unwrap();
+
+        // Call the function that operates on the fixed-size array.
+        accumulate_simd_direct(target_array, adjustments_f32x8);
     } else {
         // This is the scalar fallback for the tail end of the data (e.g., if there
         // are 1-7 elements left).
@@ -552,12 +561,18 @@ fn process_tile<'a>(
         let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
         let flip_flags_chunk = &flips_for_batch[matrix_slice_start..matrix_slice_end];
 
-        let weights =
+        // SAFETY: The logic of the mini-batch slicing guarantees the chunks passed to
+        // the `new` functions have the correct dimensions. Therefore, these operations
+        // will never fail, and using `unwrap_unchecked` is safe and removes the
+        // performance-killing panic branch from the hot loop.
+        let weights = unsafe {
             kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
-                .unwrap();
-        let flip_flags =
+                .unwrap_unchecked()
+        };
+        let flip_flags = unsafe {
             kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
-                .unwrap();
+                .unwrap_unchecked()
+        };
 
         // --- Dispatch to Kernel and Accumulate Results ---
         block_scores_out
