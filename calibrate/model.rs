@@ -3,17 +3,21 @@ use ndarray::{s, Array1, Array2, ArrayView1, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use thiserror::Error;
 
 // --- Public Data Structures ---
-// These structs define the public, human-readable format of the trained model.
+// These structs define the public, human-readable format of the trained model
+// when serialized to a TOML file.
 
 /// Defines the link function, connecting the linear predictor to the mean response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkFunction {
-    Logit,    // For binary/proportional outcomes.
-    Identity, // For continuous outcomes.
+    /// The logit link, for binary or proportional outcomes (e.g., logistic regression).
+    /// Maps probabilities (0, 1) to the real line (-inf, +inf).
+    Logit,
+    /// The identity link, for continuous outcomes (e.g., Gaussian regression).
+    Identity,
 }
 
 /// Configuration for a single basis expansion (e.g., for one variable).
@@ -35,22 +39,29 @@ pub struct ModelConfig {
     // Data-dependent parameters saved from training are crucial for prediction.
     pub pgs_range: (f64, f64),
     pub pc_ranges: Vec<(f64, f64)>,
-    pub pc_names: Vec<String>, // Defines the canonical order for PCs.
+    /// Defines the canonical order for Principal Components. This order is strictly
+    /// enforced during both model fitting and prediction to ensure correctness.
+    pub pc_names: Vec<String>,
 }
 
-/// A structured representation of the fitted model coefficients, designed for interpretability.
+/// A structured representation of the fitted model coefficients, designed for
+/// human interpretation and sharing. This structure is used in the TOML file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MappedCoefficients {
     pub intercept: f64,
     pub main_effects: MainEffects,
-    /// Nested map for interaction terms. Outer key is the PGS basis function name
-    /// (e.g., "pgs_B1"), inner key is the PC name (e.g., "PC1").
+    /// Nested map for interaction terms.
+    /// - Outer key: PGS basis function name (e.g., "pgs_B1").
+    /// - Inner key: PC name (e.g., "PC1").
+    /// - Value: The vector of coefficients for that interaction's spline.
     pub interaction_effects: HashMap<String, HashMap<String, Vec<f64>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MainEffects {
+    /// Coefficients for the main effect of PGS (for basis functions m > 0).
     pub pgs: Vec<f64>,
+    /// Coefficients for the main effects of each PC, keyed by PC name.
     pub pcs: HashMap<String, Vec<f64>>,
 }
 
@@ -75,6 +86,8 @@ pub enum ModelError {
     MismatchedPcCount { found: usize, expected: usize },
     #[error("Underlying basis function generation failed during prediction: {0}")]
     BasisError(#[from] basis::BasisError),
+    #[error("Internal error: failed to stack design matrix columns during prediction.")]
+    InternalStackingError,
 }
 
 impl TrainedModel {
@@ -148,15 +161,10 @@ mod internal {
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
         config: &ModelConfig,
-    ) -> Result<Array2<f64>, basis::BasisError> {
-        // --- A. Generate individual basis expansions using saved config ---
-        let (pgs_basis, _) = create_bspline_basis(
-            p_new,
-            None, // No quantile data at prediction time
-            config.pgs_range,
-            config.pgs_basis_config.num_knots,
-            config.pgs_basis_config.degree,
-        )?;
+    ) -> Result<Array2<f64>, ModelError> {
+        let pgs_basis =
+            create_bspline_basis(p_new, None, config.pgs_range, config.pgs_basis_config.num_knots, config.pgs_basis_config.degree)?
+                .0;
 
         let pc_bases: Vec<Array2<f64>> = pcs_new
             .axis_iter(Axis(1))
@@ -167,27 +175,17 @@ mod internal {
             })
             .collect::<Result<_, _>>()?;
 
-        // --- B. Assemble columns into a Vec in the canonical order ---
-        // This vec will own the product arrays for the interaction terms.
         let mut owned_cols: Vec<Array1<f64>> = Vec::new();
-        
-        // 1. Intercept
         owned_cols.push(Array1::ones(p_new.len()));
-
-        // 2. Main PC effects
         for pc_basis in &pc_bases {
             for col in pc_basis.axis_iter(Axis(1)) {
                 owned_cols.push(col.to_owned());
             }
         }
-
-        // 3. Main PGS effects (m > 0)
         let pgs_main_effects = pgs_basis.slice(s![.., 1..]);
         for col in pgs_main_effects.axis_iter(Axis(1)) {
             owned_cols.push(col.to_owned());
         }
-
-        // 4. Interaction effects
         for pgs_basis_col in pgs_main_effects.axis_iter(Axis(1)) {
             for pc_basis in &pc_bases {
                 for pc_basis_col in pc_basis.axis_iter(Axis(1)) {
@@ -196,34 +194,34 @@ mod internal {
             }
         }
         
-        // --- C. Stack into a single matrix ---
         let col_views: Vec<_> = owned_cols.iter().map(Array1::view).collect();
-        // This stack should never fail if the logic is correct.
-        Ok(ndarray::stack(Axis(1), &col_views).unwrap())
+        ndarray::stack(Axis(1), &col_views).map_err(|_| ModelError::InternalStackingError)
     }
 
     /// Flattens the structured `MappedCoefficients` into a single `Array1` vector,
     /// following the exact same canonical order used in `construct_design_matrix`.
+    /// This function is the "mirror image" of the design matrix construction.
     pub(super) fn flatten_coefficients(
         coeffs: &MappedCoefficients,
         config: &ModelConfig,
     ) -> Array1<f64> {
         let mut flattened: Vec<f64> = Vec::new();
 
+        // Order of concatenation MUST exactly match `construct_design_matrix`.
         // 1. Intercept
         flattened.push(coeffs.intercept);
 
-        // 2. Main PC effects (ordered by pc_names)
+        // 2. Main PC effects (ordered by `pc_names` for determinism).
         for pc_name in &config.pc_names {
             if let Some(c) = coeffs.main_effects.pcs.get(pc_name) {
                 flattened.extend_from_slice(c);
             }
         }
 
-        // 3. Main PGS effects
+        // 3. Main PGS effects (for basis functions m > 0).
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
-        // 4. Interaction effects (ordered by PGS basis index, then by pc_names)
+        // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
         let num_pgs_main_effects = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
         for m in 1..=num_pgs_main_effects {
             let pgs_key = format!("pgs_B{}", m);
