@@ -84,7 +84,7 @@ jobs:
       - name: Run Rust unit tests
         id: test_step
         if: steps.rust_changes.outputs.rust == 'true'
-        run: cargo +nightly test
+        run: cargo +nightly test --release
         continue-on-error: true
 
       - name: Install getdoc
