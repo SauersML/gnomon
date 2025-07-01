@@ -962,12 +962,12 @@ mod tests {
                      name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max);
         };
     
-        print_stats("Complex SIMD (Current)", stats_simd);
+        print_stats("SIMD (Current)", stats_simd);
         print_stats("Simple Scalar", stats_scalar);
         print_stats("Unrolled Scalar", stats_unrolled);
         println!("-------------------------------------------------------------------------------------\n");
     
-        // The core assertion is now based on the median, which is more robust to noise.
+        // The core assertion is based on the median
         assert!(
             stats_simd.median <= stats_scalar.median,
             "PERFORMANCE REGRESSION DETECTED against simple scalar!\n\
