@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::pipeline::{PipelineError, ScopeGuard};
 use ahash::AHashSet;
 
-/// A performant, read-only resolver for fetching complex variant genotypes.
+/// A read-only resolver for fetching complex variant genotypes.
 ///
 /// This enum is initialized ONCE at the start of the pipeline run. It holds
 /// either a single memory map or a collection of them, avoiding the massive
