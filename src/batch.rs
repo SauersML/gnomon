@@ -232,28 +232,37 @@ fn accumulate_simd_lane(
     num_scores: usize,
 ) {
     if scores_offset + SIMD_LANES <= num_scores {
-        // --- PERFORMANCE FIX ---
-        // Split the 8-lane f32 vector into two 4-lane vectors using an efficient,
-        // in-register swizzle operation. This avoids the massive performance penalty of
-        // writing to a memory array and reading back from it.
+        // --- FINAL OPTIMIZED VERSION ---
+
+        // 1. Efficiently split the f32x8 vector into two f32x4 vectors in-register.
         let adj_low_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [0, 1, 2, 3]);
         let adj_high_f32x4: Simd<f32, 4> = simd_swizzle!(adjustments_f32x8, [4, 5, 6, 7]);
 
-        // Widen each 4-lane vector to 64-bit floats for accumulation.
+        // 2. Widen each half to 64-bit floats for accumulation.
         let adj_low_f64x4 = adj_low_f32x4.cast::<f64>();
         let adj_high_f64x4 = adj_high_f32x4.cast::<f64>();
 
-        // Load, add, and store the low half.
-        let scores_slice_low = &mut scores_out_slice[scores_offset..scores_offset + 4];
-        let mut present_scores_low = Simd::<f64, 4>::from_slice(scores_slice_low);
-        present_scores_low += adj_low_f64x4;
-        scores_slice_low.copy_from_slice(&present_scores_low.to_array());
+        // 3. Use raw pointers for the most direct load/store operations, reordered to
+        //    maximize instruction-level parallelism.
+        // SAFETY: The check `scores_offset + SIMD_LANES <= num_scores` ensures
+        // that we can safely read and write 8 elements starting from the offset.
+        unsafe {
+            let base_ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
+            let low_ptr = base_ptr as *mut Simd<f64, 4>;
+            let high_ptr = base_ptr.add(4) as *mut Simd<f64, 4>;
 
-        // Load, add, and store the high half.
-        let scores_slice_high = &mut scores_out_slice[scores_offset + 4..scores_offset + 8];
-        let mut present_scores_high = Simd::<f64, 4>::from_slice(scores_slice_high);
-        present_scores_high += adj_high_f64x4;
-        scores_slice_high.copy_from_slice(&present_scores_high.to_array());
+            // Group all reads to help the CPU's out-of-order execution.
+            let scores_low = low_ptr.read_unaligned();
+            let scores_high = high_ptr.read_unaligned();
+
+            // Group all computations.
+            let result_low = scores_low + adj_low_f64x4;
+            let result_high = scores_high + adj_high_f64x4;
+
+            // Group all writes.
+            low_ptr.write_unaligned(result_low);
+            high_ptr.write_unaligned(result_high);
+        }
     } else {
         // The scalar fallback for the tail end of the data
         let start = scores_offset;
