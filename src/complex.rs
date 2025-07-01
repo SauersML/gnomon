@@ -380,8 +380,6 @@ pub fn resolve_complex_variants(
     // thread-safe types that can be safely shared between threads.
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
-    let warned_pairs = DashSet::<(usize, BimRowIndex)>::new();
-    let all_warnings_to_print = Mutex::new(Vec::<WarningInfo>::new());
     let all_critical_warnings_to_print = Mutex::new(Vec::<CriticalIntegrityWarningInfo>::new());
 
     // Iterate through rules one by one to provide clear, sequential progress to the user.
@@ -390,7 +388,7 @@ pub fn resolve_complex_variants(
             break;
         }
 
-        // This state is specific to the processing of a single rule.
+        // --- Per-Rule Progress Bar Setup ---
         let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
         let progress_style = ProgressStyle::with_template(&format!(
             ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
@@ -399,193 +397,178 @@ pub fn resolve_complex_variants(
         ))
         .expect("Internal Error: Invalid progress bar template string.");
         pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
-
         let progress_counter = Arc::new(AtomicU64::new(0));
 
-        // Use a scoped thread block to ensure the main thread waits for both the
-        // workers and the progress updater to finish before proceeding. `thread::scope`
-        // guarantees that any threads spawned within it will complete before the scope
-        // exits, allowing safe borrowing of data from the parent stack.
+        // A single resolver pipeline is created for each rule. This is cheap.
+        let pipeline = ResolverPipeline::new();
+
         thread::scope(|s| {
             // Spawner #1: The dedicated progress bar updater thread.
-            // This closure uses `move` because it only needs to own its copies of the
-            // `Arc` pointers, which is a cheap and correct way to pass them.
             s.spawn({
                 let pb_updater = pb.clone();
                 let counter_for_updater = Arc::clone(&progress_counter);
                 let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
                 let total_people = prep_result.num_people_to_score as u64;
-
                 move || {
-                    // This loop terminates under two conditions:
-                    // 1. All work is complete (counter reaches total).
-                    // 2. A fatal error has been signaled by a worker thread.
-                    // This prevents the updater from hanging if workers stop early.
                     while counter_for_updater.load(Ordering::Relaxed) < total_people
                         && !error_flag_for_updater.load(Ordering::Relaxed)
                     {
                         pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
                         thread::sleep(Duration::from_millis(200));
                     }
-                    // Perform one final update to show the terminal state. If an error
-                    // occurred, this accurately reflects how many items were processed
-                    // before the operation was aborted.
                     pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
                 }
             });
 
             // Spawner #2: The worker threads (managed by Rayon).
-            // This closure does NOT use `move`. It correctly borrows data from the
-            // parent scope. This is safe because `thread::scope` guarantees this thread
-            // cannot outlive the borrowed data (like `final_scores`, `warned_pairs`, etc.).
             s.spawn(|| {
                 final_scores
                     .par_chunks_mut(prep_result.score_names.len())
                     .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
                     .enumerate()
-                    .for_each(
-                        |(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                            // This guard ensures the progress counter is always incremented
-                            // when the closure for a person finishes, regardless of how it exits
-                            let _progress_guard = ScopeGuard::new(|| {
-                                progress_counter.fetch_add(1, Ordering::Relaxed);
-                            });
+                    .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
+                        let _progress_guard = ScopeGuard::new(|| {
+                            progress_counter.fetch_add(1, Ordering::Relaxed);
+                        });
 
-                            // This check provides a fast-fail mechanism, preventing new work
-                            // from being done after a fatal error has been detected.
-                            if fatal_error_occurred.load(Ordering::Relaxed) {
-                                return;
-                            }
+                        if fatal_error_occurred.load(Ordering::Relaxed) {
+                            return;
+                        }
 
-                            let original_fam_idx =
-                                prep_result.output_idx_to_fam_idx[person_output_idx];
+                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
-                            let outcome = process_person_for_rule(
-                                resolver,
-                                prep_result,
-                                group_rule,
-                                person_output_idx,
-                                original_fam_idx,
-                                person_scores_slice,
-                                person_counts_slice,
-                            );
+                        // --- Core Resolution Logic ---
 
-                            match outcome {
-                                ResolutionOutcome::Success => {}
-                                ResolutionOutcome::Warning(info) => {
-                                    if warned_pairs.insert((info.person_output_idx, info.locus_id))
-                                    {
-                                        all_warnings_to_print.lock().unwrap().push(info);
-                                    }
-                                }
-                                ResolutionOutcome::CriticalIntegrityWarning(info) => {
-                                    // This is a non-fatal but severe warning. We collect it
-                                    // to report at the end. We do not set the fatal error flag.
-                                    all_critical_warnings_to_print.lock().unwrap().push(info);
-                                }
-                                ResolutionOutcome::Fatal(data) => {
-                                    // Use compare_exchange to ensure only the FIRST fatal error
-                                    // payload is stored. This prevents race conditions where multiple
-                                    // threads might fail on different individuals simultaneously.
-                                    if fatal_error_occurred
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Relaxed,
-                                        )
-                                        .is_ok()
-                                    {
-                                        *fatal_error_storage.lock().unwrap() = Some(data);
-                                    }
-                                    // `return` ensures we stop processing for this thread.
-                                    return;
+                        // 1. Gather all non-missing genotype evidence for this person at this locus.
+                        let valid_interpretations: Vec<_> = group_rule
+                            .possible_contexts
+                            .iter()
+                            .filter_map(|context| {
+                                let packed_geno = resolver.get_packed_genotype(
+                                    prep_result.bytes_per_variant,
+                                    context.0,
+                                    original_fam_idx,
+                                );
+                                (packed_geno != 0b01).then_some((packed_geno, context))
+                            })
+                            .collect();
+
+                        // 2. Apply Decision Policy based on the amount of evidence.
+                        match valid_interpretations.len() {
+                            0 => {
+                                // CASE A: No non-missing genotypes. Treat as missing for all relevant scores.
+                                for score_info in &group_rule.score_applications {
+                                    person_counts_slice[score_info.score_column_index.0] += 1;
                                 }
                             }
-                        },
-                    );
+                            1 => {
+                                // CASE B: Exactly one valid genotype. The unambiguous happy path.
+                                let (packed_geno, context) = valid_interpretations[0];
+                                for score_info in &group_rule.score_applications {
+                                    if &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2 {
+                                        let dosage = Heuristic::calculate_dosage(packed_geno, &context.1, &score_info.effect_allele);
+                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // CASE C: A conflict was detected. Use the Resolver Pipeline.
+                                for score_info in &group_rule.score_applications {
+                                    let context = ResolutionContext {
+                                        score_info,
+                                        conflicting_interpretations: &valid_interpretations,
+                                    };
+
+                                    if let Some(resolution) = pipeline.resolve(&context) {
+                                        // The pipeline succeeded! Apply the score and record the warning.
+                                        person_scores_slice[score_info.score_column_index.0] +=
+                                            resolution.chosen_dosage * score_info.weight as f64;
+
+                                        // Create a detailed warning for later printing.
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits
+                                        }).collect();
+                                        
+                                        // Map the new Heuristic enum to the old ResolutionMethod for reporting.
+                                        let resolution_method = match resolution.method_used {
+                                            Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage }, // Can reuse for reporting
+                                            Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
+                                            Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
+                                        };
+
+                                        all_critical_warnings_to_print.lock().unwrap().push(CriticalIntegrityWarningInfo {
+                                            iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                            conflicts,
+                                            resolution_method,
+                                        });
+
+                                    } else {
+                                        // The entire pipeline failed. This is a fatal error.
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits
+                                        }).collect();
+
+                                        let data = FatalAmbiguityData {
+                                            iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                            conflicts,
+                                        };
+                                        
+                                        if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                            *fatal_error_storage.lock().unwrap() = Some(data);
+                                        }
+                                        // Important: Break from the inner scores loop after a fatal error is found.
+                                        break; 
+                                    }
+                                }
+                            }
+                        }
+                    });
             });
         }); // Scope ends, all spawned threads are joined.
 
         pb.finish_with_message("Done.");
     }
 
-    // After all rules are processed, drain and print a summary of warnings. This is
-    // performed once by the main thread to avoid lock contention on stderr.
-    let collected_warnings = std::mem::take(&mut *all_warnings_to_print.lock().unwrap());
-    let collected_critical_warnings =
-        std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
+    // --- Final Reporting (moved from pipeline.rs, remains the same) ---
+
+    // After all rules are processed, drain and print a summary of warnings.
+    let collected_critical_warnings = std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
     const MAX_WARNINGS_TO_PRINT: usize = 10;
 
-    let total_critical_warnings = collected_critical_warnings.len();
-    if total_critical_warnings > 0 {
-        eprintln!(
-            "\n\n========================= CRITICAL DATA INTEGRITY ISSUE ========================="
-        );
-        eprintln!(
-            "Gnomon detected one or more loci with conflicting genotype data that were\n\
-                  resolved using a heuristic. While computation was able to continue, the\n\
-                  underlying genotype data is ambiguous and should be investigated."
-        );
-        eprintln!(
-            "---------------------------------------------------------------------------------"
-        );
-        for (i, info) in collected_critical_warnings.into_iter().enumerate() {
-            if i >= MAX_WARNINGS_TO_PRINT {
-                break;
-            }
+    if !collected_critical_warnings.is_empty() {
+        eprintln!("\n\n========================= CRITICAL DATA INTEGRITY ISSUE =========================");
+        eprintln!("Gnomon detected loci with conflicting genotype data that were resolved\nusing a heuristic. While computation continued, the underlying data is\nambiguous and should be investigated.");
+        eprintln!("---------------------------------------------------------------------------------");
+        
+        for (i, info) in collected_critical_warnings.iter().enumerate().take(MAX_WARNINGS_TO_PRINT) {
             if i > 0 {
-                eprintln!(
-                    "---------------------------------------------------------------------------------"
-                );
+                eprintln!("---------------------------------------------------------------------------------");
             }
             eprintln!("{}", format_critical_integrity_warning(&info));
         }
-        if total_critical_warnings > MAX_WARNINGS_TO_PRINT {
-            eprintln!(
-                "\n... and {} more similar critical warnings.",
-                total_critical_warnings - MAX_WARNINGS_TO_PRINT
-            );
-        }
-        eprintln!(
-            "=================================================================================\n"
-        );
-    }
 
-    let total_warnings = collected_warnings.len();
-    if total_warnings > 0 {
-        eprintln!("\n--- Data Inconsistency Warning Summary ---");
-        for (i, info) in collected_warnings.into_iter().enumerate() {
-            if i >= MAX_WARNINGS_TO_PRINT {
-                break;
-            }
-            let iid = &prep_result.final_person_iids[info.person_output_idx];
-            let score_name = &prep_result.score_names[info.score_col_idx.0];
-            eprintln!(
-                "WARNING: Resolved data inconsistency for IID '{}' at locus corresponding to BIM row {}. Multiple non-missing genotypes found. Used the one matching score '{}' (alleles: {}, {}).",
-                iid, info.locus_id.0, score_name, info.winning_a1, info.winning_a2
-            );
+        if collected_critical_warnings.len() > MAX_WARNINGS_TO_PRINT {
+            eprintln!("\n... and {} more similar critical warnings.", collected_critical_warnings.len() - MAX_WARNINGS_TO_PRINT);
         }
-        if total_warnings > MAX_WARNINGS_TO_PRINT {
-            eprintln!(
-                "... and {} more similar warnings.",
-                total_warnings - MAX_WARNINGS_TO_PRINT
-            );
-        }
+        eprintln!("=================================================================================\n");
     }
 
     // After all rules are processed, check if a fatal error was ever stored.
-    // If so, retrieve it from the mutex, format the final report, and propagate it.
     if fatal_error_occurred.load(Ordering::Relaxed) {
-        if let Ok(mut guard) = fatal_error_storage.lock() {
-            if let Some(data) = guard.take() {
-                let report = format_fatal_ambiguity_report(&data);
-                return Err(PipelineError::Compute(report));
-            }
+        if let Some(data) = fatal_error_storage.lock().unwrap().take() {
+            return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
         }
-        // As a fallback, return a generic error if the specific one can't be retrieved.
         return Err(PipelineError::Compute(
-            "A fatal, unspecified error occurred in a parallel task and the detailed report could not be generated.".to_string(),
+            "A fatal, unspecified error occurred in a parallel task.".to_string(),
         ));
     }
 
