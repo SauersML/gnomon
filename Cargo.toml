@@ -13,6 +13,13 @@ repository = "https://github.com/SauersML/gnomon/"
 keywords = ["bioinformatics", "genomics"]
 categories = ["science"]
 
+[lib]
+path = "score/lib.rs"
+
+[[bin]]
+name = "gnomon"
+path = "score/main.rs"
+
 [dependencies]
 ahash = "0.8.12"
 clap = { version = "4.5.39", features = ["derive"] }
