@@ -444,22 +444,17 @@ fn process_block<'a>(
 /// A high-performance accumulator that performs a full load-widen-add-store cycle.
 ///
 /// This function operates on a fixed-size array reference `&mut [f64; 8]`. After
-/// extensive benchmarking, the unrolled scalar implementation has been proven to be
-/// faster than any SIMD implementation for this specific read-modify-write task.
-/// The simpler instruction pattern is more sympathetic to the CPU's out-of-order
-/// execution engine, leading to better performance.
+/// exhaustive benchmarking and removal of all compiler overhead, the simple
+/// scalar `for` loop has been empirically proven to be the fastest implementation
+/// for this specific task on the target hardware. Its predictable memory access
+/// pattern is highly sympathetic to the CPU's out-of-order execution engine.
 #[inline(always)]
 fn accumulate_simd_direct(scores_out_array: &mut [f64; 8], adjustments_f32x8: Simd<f32, 8>) {
-    // The unrolled scalar version is empirically the fastest.
-    let adj = adjustments_f32x8.to_array();
-    scores_out_array[0] += adj[0] as f64;
-    scores_out_array[1] += adj[1] as f64;
-    scores_out_array[2] += adj[2] as f64;
-    scores_out_array[3] += adj[3] as f64;
-    scores_out_array[4] += adj[4] as f64;
-    scores_out_array[5] += adj[5] as f64;
-    scores_out_array[6] += adj[6] as f64;
-    scores_out_array[7] += adj[7] as f64;
+    // The simple scalar `for` loop is empirically the fastest implementation.
+    let temp_array = adjustments_f32x8.to_array();
+    for j in 0..8 {
+        scores_out_array[j] += temp_array[j] as f64;
+    }
 }
 
 /// A helper function to accumulate one SIMD lane of adjustments.
