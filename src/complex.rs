@@ -1,6 +1,5 @@
 use crate::types::{
-    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult,
-    ScoreColumnIndex, ScoreInfo
+    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ScoreInfo
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
