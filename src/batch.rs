@@ -750,132 +750,231 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_accumulation_performance() {
-        // IMPORTANT: This test MUST be run in release mode to be meaningful.
-
+        // IMPORTANT: This test MUST be run in release mode (`--release`) to be meaningful.
+    
         use std::simd::f32x8;
-
-        // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPER ---
-
-
+    
+        // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPERS ---
+    
+        // The function from the original code.
         use super::accumulate_simd_lane;
-
-        /// The simple scalar loop implementation.
+    
+        /// Competitor 1: The simple scalar loop implementation.
         fn accumulate_simple_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
             let temp_array = adjustments_f32x8.to_array();
             for j in 0..8 {
                 scores_out_slice[j] += temp_array[j] as f64;
             }
         }
-
-        /// The robust, reusable performance measurement helper.
-        /// It operates on a provided slice to ensure fairness.
-        fn measure_performance<F>(
-            scores: &mut [f64], // Operates on an external buffer.
-            num_iterations: u32,
+        
+        /// Competitor 2: A manually unrolled scalar loop. This avoids the `to_array()` overhead
+        fn accumulate_unrolled_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
+            let adj = adjustments_f32x8.to_array(); // Still need to get data out of SIMD reg
+            scores_out_slice[0] += adj[0] as f64;
+            scores_out_slice[1] += adj[1] as f64;
+            scores_out_slice[2] += adj[2] as f64;
+            scores_out_slice[3] += adj[3] as f64;
+            scores_out_slice[4] += adj[4] as f64;
+            scores_out_slice[5] += adj[5] as f64;
+            scores_out_slice[6] += adj[6] as f64;
+            scores_out_slice[7] += adj[7] as f64;
+        }
+    
+    
+        /// A struct to hold calculated statistics for a benchmark run.
+        #[derive(Debug, Clone, Copy)]
+        struct BenchmarkStats {
+            mean: f64,
+            median: f64,
+            std_dev: f64,
+            min: f64,
+            max: f64,
+        }
+    
+        /// Calculates statistics from a vector of trial durations.
+        fn calculate_stats(durations_ns: &mut [f64]) -> BenchmarkStats {
+            durations_ns.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let count = durations_ns.len() as f64;
+            
+            let sum = durations_ns.iter().sum::<f64>();
+            let mean = sum / count;
+    
+            let median = if durations_ns.len() % 2 == 0 {
+                (durations_ns[durations_ns.len() / 2 - 1] + durations_ns[durations_ns.len() / 2]) / 2.0
+            } else {
+                durations_ns[durations_ns.len() / 2]
+            };
+    
+            let variance = durations_ns.iter().map(|&val| (val - mean).powi(2)).sum::<f64>() / count;
+            let std_dev = variance.sqrt();
+    
+            BenchmarkStats {
+                mean,
+                median,
+                std_dev,
+                min: durations_ns[0],
+                max: *durations_ns.last().unwrap(),
+            }
+        }
+    
+    
+        /// The reusable performance measurement helper.
+        /// It performs a warmup, then runs multiple trials and returns the results.
+        fn run_benchmark_trials<F>(
+            name: &str,
+            scores: &mut [f64],
             adjustments: f32x8,
+            warmup_iterations: u32,
+            num_trials: u32,
+            iterations_per_trial: u32,
             mut operation: F,
-        ) -> Duration
+        ) -> BenchmarkStats
         where
             F: FnMut(&mut [f64], f32x8),
         {
-            let mut checksum = 0.0f64;
-
-            let start = Instant::now();
-            for _ in 0..num_iterations {
+            println!("> Benchmarking '{}'...", name);
+            
+            // 1. WARMUP PHASE: Run the operation to get the CPU and caches ready.
+            let mut warmup_checksum = 0.0f64;
+            for _ in 0..warmup_iterations {
                 operation(scores, adjustments);
-                // "Use" the result of each iteration to create a data dependency,
-                // preventing the optimizer from eliding the loop.
-                checksum += scores[0];
+                warmup_checksum += scores[0];
             }
-            let duration = start.elapsed();
-
-            // "Use" the final checksum to ensure the entire dependency chain is preserved.
-            std::hint::black_box(checksum);
-            duration
+            std::hint::black_box(warmup_checksum);
+    
+    
+            // 2. MEASUREMENT PHASE: Run multiple trials to collect robust data.
+            let mut trial_durations = Vec::with_capacity(num_trials as usize);
+            for i in 0..num_trials {
+                // Reset state for EACH trial to ensure fairness.
+                scores.fill(100.0);
+                
+                let mut checksum = 0.0f64;
+                let start = Instant::now();
+    
+                for _ in 0..iterations_per_trial {
+                    operation(scores, adjustments);
+                    checksum += scores[0];
+                }
+    
+                let duration = start.elapsed();
+                trial_durations.push(duration);
+    
+                // Prevent the optimizer from eliding the loop.
+                std::hint::black_box(checksum);
+                
+                if (i + 1) % 5 == 0 {
+                    print!(".");
+                    use std::io::{stdout, Write};
+                    let _ = stdout().flush();
+                }
+            }
+            println!(" Done.");
+    
+            let mut durations_ns: Vec<f64> = trial_durations
+                .iter()
+                .map(|d| d.as_nanos() as f64 / iterations_per_trial as f64)
+                .collect();
+            
+            calculate_stats(&mut durations_ns)
         }
-
+    
         // --- B. DEFINE TEST PARAMETERS ---
-        const NUM_ITERATIONS: u32 = 10_000_000;
+        const WARMUP_ITERATIONS: u32 = 200_000;
+        const NUM_TRIALS: u32 = 20;
+        const ITERATIONS_PER_TRIAL: u32 = 1_000_000;
+        
         let adjustments = f32x8::from_array([0.1, 0.2, -0.05, 0.3, -0.15, 0.0, 0.5, -0.25]);
-
+    
         // --- C. VERIFY CORRECTNESS FIRST ---
         // A fast but wrong function is useless. This must pass before we measure.
         {
             let mut complex_result = vec![100.0f64; 8];
             let mut scalar_result = vec![100.0f64; 8];
-
-            // Test the full-lane case for both functions.
+            let mut unrolled_result = vec![100.0f64; 8];
+    
             accumulate_simd_lane(&mut complex_result, adjustments, 0, 8);
             accumulate_simple_scalar(&mut scalar_result, adjustments);
-
-            // Assert that the results for ALL 8 elements are functionally identical.
+            accumulate_unrolled_scalar(&mut unrolled_result, adjustments);
+    
             for i in 0..8 {
                 assert!(
                     (complex_result[i] - scalar_result[i]).abs() < 1e-9,
-                    "Correctness check FAILED at index {}: complex={}, scalar={}",
-                    i,
-                    complex_result[i],
-                    scalar_result[i]
+                    "Correctness check FAILED at index {}: SIMD={}, Scalar={}",
+                    i, complex_result[i], scalar_result[i]
+                );
+                assert!(
+                    (complex_result[i] - unrolled_result[i]).abs() < 1e-9,
+                    "Correctness check FAILED at index {}: SIMD={}, Unrolled Scalar={}",
+                    i, complex_result[i], unrolled_result[i]
                 );
             }
-        } // Correctness-check data goes out of scope here.
-
+        }
+    
         // --- D. RUN THE BENCHMARKS AND REPORT RESULTS ---
         println!("\n\n--- Accumulation Performance Test Report (Ran in RELEASE mode) ---");
-        println!("Correctness check passed. Both functions produce identical results.");
-        println!("Running {} iterations for each method...", NUM_ITERATIONS);
-
-        // Allocate the state buffer ONCE, outside all measurements.
-        // This ensures both tests run on the exact same memory for maximum fairness.
+        println!("Methodology: Warmup followed by {} trials of {} iterations each.", NUM_TRIALS, ITERATIONS_PER_TRIAL);
+        println!("Correctness check passed. All functions produce identical results.");
+    
         let mut scores_buffer = vec![100.0f64; 8];
-
-        // Measure Complex SIMD
-        scores_buffer.fill(100.0); // Reset state before running.
-        let duration_complex = measure_performance(
-            &mut scores_buffer,
-            NUM_ITERATIONS,
-            adjustments,
+    
+        // Measure each implementation
+        let stats_simd = run_benchmark_trials(
+            "Complex SIMD (Current)", &mut scores_buffer, adjustments,
+            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
             |s, a| accumulate_simd_lane(s, a, 0, 8),
         );
-
-        // Measure Simple Scalar
-        scores_buffer.fill(100.0); // Reset the *same* state before running.
-        let duration_scalar = measure_performance(
-            &mut scores_buffer,
-            NUM_ITERATIONS,
-            adjustments,
+    
+        let stats_scalar = run_benchmark_trials(
+            "Simple Scalar", &mut scores_buffer, adjustments,
+            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
             accumulate_simple_scalar,
         );
-
-        // Calculate final metrics for reporting.
-        let time_per_op_complex = duration_complex.as_nanos() as f64 / NUM_ITERATIONS as f64;
-        let time_per_op_scalar = duration_scalar.as_nanos() as f64 / NUM_ITERATIONS as f64;
-
-        // Print the performance data for diagnostic purposes before the assertion.
-        println!("------------------------------------------------------------------");
-        println!(
-            "Complex SIMD (Current):   {:.2} ns/op (Total: {:?})",
-            time_per_op_complex, duration_complex
+        
+        let stats_unrolled = run_benchmark_trials(
+            "Unrolled Scalar", &mut scores_buffer, adjustments,
+            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
+            accumulate_unrolled_scalar,
         );
-        println!(
-            "Simple Scalar (Proposed): {:.2} ns/op (Total: {:?})",
-            time_per_op_scalar, duration_scalar
-        );
-        println!("------------------------------------------------------------------");
-
-        // Assert that the complex SIMD version is faster than or equal to the scalar version.
+    
+        // --- E. ANALYZE AND ASSERT ---
+        println!("\n--- Final Results (time per operation) ---");
+        println!("-------------------------------------------------------------------------------------");
+        println!("{:<22} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}", 
+                 "Implementation", "Median", "Mean", "Std Dev", "Min", "Max");
+        println!("-------------------------------------------------------------------------------------");
+        
+        let print_stats = |name: &str, stats: BenchmarkStats| {
+            println!("{:<22} | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns",
+                     name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max);
+        };
+    
+        print_stats("Complex SIMD (Current)", stats_simd);
+        print_stats("Simple Scalar", stats_scalar);
+        print_stats("Unrolled Scalar", stats_unrolled);
+        println!("-------------------------------------------------------------------------------------\n");
+    
+        // The core assertion is now based on the median, which is more robust to noise.
         assert!(
-            duration_complex <= duration_scalar,
-            "PERFORMANCE CHECK FAILED.\n\
-             - Complex SIMD time: {:?}\n\
-             - Simple Scalar time: {:?}",
-            duration_complex,
-            duration_scalar
+            stats_simd.median <= stats_scalar.median,
+            "PERFORMANCE REGRESSION DETECTED against simple scalar!\n\
+             - SIMD Median:   {:.3} ns/op\n\
+             - Scalar Median: {:.3} ns/op",
+            stats_simd.median, stats_scalar.median
         );
-
-        println!("✅ PERFORMANCE CHECK PASSED: The current SIMD implementation is faster than or equal to scalar.");
-        println!("==================================================================\n");
+        
+        assert!(
+            stats_simd.median <= stats_unrolled.median,
+            "PERFORMANCE REGRESSION DETECTED against unrolled scalar!\n\
+             - SIMD Median:      {:.3} ns/op\n\
+             - Unrolled Median:  {:.3} ns/op",
+            stats_simd.median, stats_unrolled.median
+        );
+    
+        println!("✅ PERFORMANCE CHECK PASSED: The current SIMD implementation's median performance is faster than or equal to both scalar implementations.");
+        println!("======================================================================================================================================\n");
     }
 }
