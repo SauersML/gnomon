@@ -1,9 +1,10 @@
-use crate::batch::{self, SparseIndexPool};
+use crate::batch;
+use crate::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::decide::{self, DecisionContext, RunStrategy};
 use crate::io;
 use crate::types::{
-    EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
-    ReconciledVariantIndex, WorkItem,
+    EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex,
+    WorkItem,
 };
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
@@ -18,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
-use crate::complex::{ComplexVariantResolver, resolve_complex_variants};
 
 // --- Pipeline Tuning Parameters ---
 
@@ -123,7 +123,6 @@ impl From<Box<dyn Error + Send + Sync>> for PipelineError {
 pub struct PipelineContext {
     pub prep_result: Arc<PreparationResult>,
     pub tile_pool: Arc<ArrayQueue<Vec<EffectAlleleDosage>>>,
-    pub sparse_index_pool: Arc<SparseIndexPool>,
 }
 
 impl PipelineContext {
@@ -132,7 +131,6 @@ impl PipelineContext {
         Self {
             prep_result,
             tile_pool: Arc::new(ArrayQueue::new(num_cpus::get().max(1) * 4)),
-            sparse_index_pool: Arc::new(SparseIndexPool::new()),
         }
     }
 }
@@ -729,7 +727,6 @@ fn process_dense_stream(
                     &mut acc.0,
                     &mut acc.1,
                     &context.tile_pool,
-                    &context.sparse_index_pool,
                 )?;
 
                 drop(guards); // Explicitly drop to return buffers to the pool.

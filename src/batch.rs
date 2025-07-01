@@ -18,14 +18,282 @@ use crate::types::{
     ReconciledVariantIndex,
 };
 use crossbeam_queue::ArrayQueue;
-use num_cpus;
+use rayon::prelude::*;
 use std::error::Error;
+use std::marker::PhantomData;
 use std::simd::{
     Simd,
     cmp::SimdPartialEq,
     num::{SimdFloat, SimdUint},
     simd_swizzle,
 };
+
+// --- State Markers (Zero-Sized Types) ---
+pub struct Ready;
+pub struct Counted;
+pub struct Allocated;
+pub struct Filled;
+
+// --- Data Structs For Each State ---
+pub struct ReadyData<'a> {
+    tile: &'a [EffectAlleleDosage],
+    num_people: usize,
+    mini_batch_size: usize,
+    variant_mini_batch_start: usize,
+}
+
+pub struct CountedData {
+    num_people: usize,
+    person_counts: Vec<(u32, u32)>,
+    missing_events: Vec<(usize, usize)>,
+}
+
+pub struct AllocatedData<'a> {
+    // We need to pass the tile reference through for the final fill pass.
+    tile: &'a [EffectAlleleDosage],
+    variant_mini_batch_start: usize,
+    mini_batch_size: usize,
+    num_people: usize,
+    person_counts: Vec<(u32, u32)>,
+    missing_events: Vec<(usize, usize)>,
+    g1_offsets: Vec<usize>,
+    g2_offsets: Vec<usize>,
+    all_g1_indices: Vec<usize>,
+    all_g2_indices: Vec<usize>,
+}
+
+pub struct FilledData {
+    pub person_counts: Vec<(u32, u32)>,
+    pub missing_events: Vec<(usize, usize)>,
+    pub g1_offsets: Vec<usize>,
+    pub g2_offsets: Vec<usize>,
+    pub all_g1_indices: Vec<usize>,
+    pub all_g2_indices: Vec<usize>,
+}
+
+// --- The Main Builder Struct ---
+pub struct SparseIndexBuilder<'a, State> {
+    state: State,
+    _marker: PhantomData<&'a ()>,
+}
+
+// Helper struct to safely send raw pointers across threads when we know it's safe.
+struct UnsafeSendSyncPtr<T>(*mut T);
+unsafe impl<T> Send for UnsafeSendSyncPtr<T> {}
+unsafe impl<T> Sync for UnsafeSendSyncPtr<T> {}
+
+// ========================================================================================
+//                             SPARSE INDEX BUILDER (TYPESTATE)
+// ========================================================================================
+
+impl<'a> SparseIndexBuilder<'a, ReadyData<'a>> {
+    /// Creates a new builder in the initial `Ready` state.
+    pub fn new(data: ReadyData<'a>) -> Self {
+        Self {
+            state: data,
+            _marker: PhantomData,
+        }
+    }
+
+    /// PASS 1: Parallel Count.
+    pub fn count_dosages(self) -> SparseIndexBuilder<'a, CountedData> {
+        let variants_in_chunk = self.state.tile.len() / self.state.num_people;
+
+        let (person_counts, nested_missing_events): (Vec<(u32, u32)>, Vec<Vec<(usize, usize)>>) =
+            (0..self.state.num_people)
+                .into_par_iter()
+                .map(|person_idx| {
+                    let mut g1_count = 0;
+                    let mut g2_count = 0;
+                    let mut local_missing_events = Vec::new();
+
+                    let genotype_tile_row_offset = person_idx * variants_in_chunk;
+                    let mini_batch_genotype_start =
+                        genotype_tile_row_offset + self.state.variant_mini_batch_start;
+                    let genotype_row = &self.state.tile[mini_batch_genotype_start
+                        ..mini_batch_genotype_start + self.state.mini_batch_size];
+
+                    for (i, &dosage) in genotype_row.iter().enumerate() {
+                        match dosage.0 {
+                            1 => g1_count += 1,
+                            2 => g2_count += 1,
+                            3 => {
+                                let variant_idx_in_chunk = self.state.variant_mini_batch_start + i;
+                                local_missing_events.push((person_idx, variant_idx_in_chunk));
+                            }
+                            _ => (),
+                        }
+                    }
+                    ((g1_count, g2_count), local_missing_events)
+                })
+                .unzip();
+
+        let missing_events = nested_missing_events.into_iter().flatten().collect();
+
+        SparseIndexBuilder {
+            state: CountedData {
+                num_people: self.state.num_people,
+                person_counts,
+                missing_events,
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a> SparseIndexBuilder<'a, CountedData> {
+    /// PASS 2: Serial Allocation & Offset Calculation.
+    pub fn allocate_and_prepare(
+        self,
+        tile: &'a [EffectAlleleDosage],
+        variant_mini_batch_start: usize,
+        mini_batch_size: usize,
+    ) -> SparseIndexBuilder<'a, AllocatedData<'a>> {
+        let total_g1: usize = self
+            .state
+            .person_counts
+            .iter()
+            .map(|(g1, _)| *g1 as usize)
+            .sum();
+        let total_g2: usize = self
+            .state
+            .person_counts
+            .iter()
+            .map(|(_, g2)| *g2 as usize)
+            .sum();
+
+        let mut all_g1_indices = Vec::with_capacity(total_g1);
+        let mut all_g2_indices = Vec::with_capacity(total_g2);
+
+        // This is safe because we are creating uninitialized Vecs and will fill them completely.
+        unsafe {
+            all_g1_indices.set_len(total_g1);
+            all_g2_indices.set_len(total_g2);
+        }
+
+        let mut g1_offsets = Vec::with_capacity(self.state.num_people);
+        let mut g2_offsets = Vec::with_capacity(self.state.num_people);
+        let mut g1_running_total = 0;
+        let mut g2_running_total = 0;
+
+        for (g1_count, g2_count) in &self.state.person_counts {
+            g1_offsets.push(g1_running_total);
+            g2_offsets.push(g2_running_total);
+            g1_running_total += *g1_count as usize;
+            g2_running_total += *g2_count as usize;
+        }
+
+        SparseIndexBuilder {
+            state: AllocatedData {
+                tile,
+                variant_mini_batch_start,
+                mini_batch_size,
+                num_people: self.state.num_people,
+                person_counts: self.state.person_counts,
+                missing_events: self.state.missing_events,
+                g1_offsets,
+                g2_offsets,
+                all_g1_indices,
+                all_g2_indices,
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
+    /// PASS 3: Parallel Fill. This is where the single `unsafe` block lives.
+    pub fn parallel_fill(mut self) -> SparseIndexBuilder<'a, FilledData> {
+        let num_people = self.state.num_people;
+        let variants_in_chunk = self.state.tile.len() / num_people;
+
+        // Wrap raw pointers for safe sending across threads.
+        let g1_ptr_sendable = UnsafeSendSyncPtr(self.state.all_g1_indices.as_mut_ptr());
+        let g2_ptr_sendable = UnsafeSendSyncPtr(self.state.all_g2_indices.as_mut_ptr());
+
+        // Destructure needed fields from self.state that are Send + Sync
+        // tile, variant_mini_batch_start, and mini_batch_size are part of AllocatedData,
+        // which has a lifetime 'a tied to the input tile.
+        // person_counts, g1_offsets, g2_offsets are Vecs which are Send + Sync if their items are.
+        // (u32, u32) and usize are Send + Sync.
+        let tile_ref = self.state.tile; // This is &'a [EffectAlleleDosage]
+        let variant_mini_batch_start_val = self.state.variant_mini_batch_start;
+        let mini_batch_size_val = self.state.mini_batch_size;
+        let person_counts_ref = &self.state.person_counts;
+        let g1_offsets_ref = &self.state.g1_offsets;
+        let g2_offsets_ref = &self.state.g2_offsets;
+
+        (0..num_people).into_par_iter().for_each(move |person_idx| {
+            let g1_offset = g1_offsets_ref[person_idx];
+            let g1_count = person_counts_ref[person_idx].0 as usize;
+            let g2_offset = g2_offsets_ref[person_idx];
+            let g2_count = person_counts_ref[person_idx].1 as usize;
+
+            // This is the single, justified `unsafe` block, perfectly encapsulated.
+            // It creates mutable slices that are guaranteed to be disjoint by our algorithm.
+            let person_g1_slice = unsafe {
+                std::slice::from_raw_parts_mut(g1_ptr_sendable.0.add(g1_offset), g1_count)
+            };
+            let person_g2_slice = unsafe {
+                std::slice::from_raw_parts_mut(g2_ptr_sendable.0.add(g2_offset), g2_count)
+            };
+
+            let mut g1_written = 0;
+            let mut g2_written = 0;
+
+            let genotype_tile_row_offset = person_idx * variants_in_chunk;
+            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start_val;
+            let genotype_row = &tile_ref
+                [mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size_val];
+
+            for (i, &dosage) in genotype_row.iter().enumerate() {
+                match dosage.0 {
+                    1 => {
+                        person_g1_slice[g1_written] = i;
+                        g1_written += 1;
+                    }
+                    2 => {
+                        person_g2_slice[g2_written] = i;
+                        g2_written += 1;
+                    }
+                    _ => (),
+                }
+            }
+        });
+
+        SparseIndexBuilder {
+            state: FilledData {
+                person_counts: self.state.person_counts,
+                missing_events: self.state.missing_events,
+                g1_offsets: self.state.g1_offsets,
+                g2_offsets: self.state.g2_offsets,
+                all_g1_indices: self.state.all_g1_indices,
+                all_g2_indices: self.state.all_g2_indices,
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a> SparseIndexBuilder<'a, FilledData> {
+    // Final safe getters
+    pub fn g1_slice_for_person(&self, person_idx: usize) -> &[usize] {
+        let start = self.state.g1_offsets[person_idx];
+        let count = self.state.person_counts[person_idx].0 as usize;
+        &self.state.all_g1_indices[start..start + count]
+    }
+    pub fn g2_slice_for_person(&self, person_idx: usize) -> &[usize] {
+        let start = self.state.g2_offsets[person_idx];
+        let count = self.state.person_counts[person_idx].1 as usize;
+        &self.state.all_g2_indices[start..start + count]
+    }
+    pub fn missing_events(&self) -> &[(usize, usize)] {
+        &self.state.missing_events
+    }
+    pub fn into_inner(self) -> FilledData {
+        self.state
+    }
+}
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -43,44 +311,6 @@ const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
 /// A thread-safe pool for reusing the large memory buffers required for storing
 /// sparse indices (`g1_indices`, `g2_indices`) and deferred missingness events.
-/// This implementation uses a lock-free queue, making it safe and efficient for
-/// use with Rayon's work-stealing scheduler.
-#[derive(Debug)]
-pub struct SparseIndexPool {
-    /// The lock-free queue holding the reusable buffer sets.
-    pool: ArrayQueue<(Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)>,
-}
-
-impl SparseIndexPool {
-    /// Creates a new pool, pre-allocating a number of empty buffer sets
-    /// proportional to the number of CPU cores. This "primes the pump"
-    /// to avoid initial allocation stalls.
-    pub fn new() -> Self {
-        let pool = ArrayQueue::new(num_cpus::get() * 2);
-        for _ in 0..num_cpus::get() * 2 {
-            // Pre-populate with empty, but allocated, buffer sets.
-            pool.push(Default::default()).unwrap();
-        }
-        Self { pool }
-    }
-
-    /// Pops a buffer set from the pool for use by a compute task.
-    /// If the pool is empty, it returns a new default allocation.
-    #[inline(always)]
-    pub fn pop(&self) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>) {
-        self.pool.pop().unwrap_or_default()
-    }
-
-    /// Pushes a buffer set back into the pool after it has been used.
-    /// This allows its memory to be recycled by another task.
-    #[inline(always)]
-    pub fn push(&self, buffers: (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<(usize, usize)>)) {
-        // We don't care if the push fails (e.g., if the pool is full),
-        // as the buffer will simply be dropped, which is safe.
-        let _ = self.pool.push(buffers);
-    }
-}
-
 // ========================================================================================
 //                                   PUBLIC API
 // ========================================================================================
@@ -98,7 +328,6 @@ pub fn run_person_major_path(
     partial_scores_out: &mut [f64],
     partial_missing_counts_out: &mut [u32],
     tile_pool: &ArrayQueue<Vec<EffectAlleleDosage>>,
-    sparse_index_pool: &SparseIndexPool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Entry Point Validation ---
     let expected_len = prep_result.num_people_to_score * prep_result.score_names.len();
@@ -165,7 +394,6 @@ pub fn run_person_major_path(
                     block_scores_out,
                     block_missing_counts_out,
                     tile_pool,
-                    sparse_index_pool,
                 );
             },
         );
@@ -190,7 +418,6 @@ fn process_block<'a>(
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
     tile_pool: &'a ArrayQueue<Vec<EffectAlleleDosage>>,
-    sparse_index_pool: &'a SparseIndexPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices_for_batch.len();
     let tile_size = person_indices_in_block.len() * variants_in_chunk;
@@ -215,7 +442,6 @@ fn process_block<'a>(
         reconciled_variant_indices_for_batch,
         block_scores_out,
         block_missing_counts_out,
-        sparse_index_pool,
     );
 
     // Return the tile to the pool for reuse.
@@ -286,7 +512,6 @@ fn process_tile<'a>(
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
-    sparse_index_pool: &'a SparseIndexPool,
 ) {
     let variants_in_chunk = reconciled_variant_indices_for_batch.len();
     let num_scores = prep_result.score_names.len();
@@ -295,17 +520,14 @@ fn process_tile<'a>(
     } else {
         0
     };
+
     if num_people_in_block == 0 {
         return;
     }
+
     let stride = prep_result.stride();
     let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
 
-    // Acquire a buffer set ONCE before all mini-batch loops.
-    let mut buffers = sparse_index_pool.pop();
-
-    // --- Part 2: Main Processing Loop (Mini-Batching) ---
-    // Iterate over the tile in small, accuracy-preserving chunks.
     for variant_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =
             (variants_in_chunk - variant_mini_batch_start).min(KERNEL_MINI_BATCH_SIZE);
@@ -313,67 +535,20 @@ fn process_tile<'a>(
             continue;
         }
 
-        // --- A. Build Sparse Indices and RECORD Missingness for the Mini-Batch ---
-        // The buffer set is local to this thread for the duration of the function.
-        let (g1_indices, g2_indices, missing_events) = &mut buffers;
+        // --- Execute the Type-Safe State Machine ---
+        let ready_data = ReadyData {
+            tile,
+            num_people: num_people_in_block,
+            mini_batch_size,
+            variant_mini_batch_start,
+        };
 
-        // This logic ensures we only grow the vectors, then clear the relevant inner
-        // vectors, preserving their allocated capacity. This prevents a "malloc storm"
-        // that occurs when the outer vector is truncated and forced to re-allocate
-        // all its inner vectors on the next full-sized block.
-        if g1_indices.len() < num_people_in_block {
-            g1_indices.resize_with(num_people_in_block, Default::default);
-        }
-        g1_indices
-            .iter_mut()
-            .take(num_people_in_block)
-            .for_each(|v| v.clear());
+        let filled_builder = SparseIndexBuilder::new(ready_data)
+            .count_dosages()
+            .allocate_and_prepare(tile, variant_mini_batch_start, mini_batch_size)
+            .parallel_fill();
 
-        if g2_indices.len() < num_people_in_block {
-            g2_indices.resize_with(num_people_in_block, Default::default);
-        }
-        g2_indices
-            .iter_mut()
-            .take(num_people_in_block)
-            .for_each(|v| v.clear());
-        missing_events.clear();
-
-        for person_idx in 0..num_people_in_block {
-            let genotype_tile_row_offset = person_idx * variants_in_chunk;
-            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start;
-            let genotype_row_for_mini_batch =
-                &tile[mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size];
-
-            for (variant_idx_in_mini_batch, &dosage) in
-                genotype_row_for_mini_batch.iter().enumerate()
-            {
-                match dosage.0 {
-                    1 => unsafe {
-                        g1_indices
-                            .get_unchecked_mut(person_idx)
-                            .push(variant_idx_in_mini_batch)
-                    },
-                    2 => unsafe {
-                        g2_indices
-                            .get_unchecked_mut(person_idx)
-                            .push(variant_idx_in_mini_batch)
-                    },
-                    3 => {
-                        // Defer the expensive work.
-                        // Instead of doing the lookups and calculations now,
-                        // just record the event and move on. This is extremely fast.
-                        let variant_idx_in_chunk =
-                            variant_mini_batch_start + variant_idx_in_mini_batch;
-                        missing_events.push((person_idx, variant_idx_in_chunk));
-                    }
-                    _ => (),
-                }
-            }
-        }
-
-        // --- B. Create Kernel Input Views (Zero-Cost Slicing) ---
-        // This is fast. We just create views over the contiguous,
-        // pre-gathered data that was passed in for the entire batch.
+        // --- Create Kernel Input Views ---
         let matrix_slice_start = variant_mini_batch_start * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
         let weights_chunk = &weights_for_batch[matrix_slice_start..matrix_slice_end];
@@ -381,28 +556,29 @@ fn process_tile<'a>(
 
         let weights =
             kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
-                .expect("CRITICAL: Mini-batch weights matrix validation failed.");
+                .unwrap();
         let flip_flags =
             kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
-                .expect("CRITICAL: Mini-batch flip flags matrix validation failed.");
+                .unwrap();
 
-        // --- C. Dispatch to Kernel and Accumulate Results ---
+        // --- Dispatch to Kernel and Accumulate Results ---
         block_scores_out
             .chunks_exact_mut(num_scores)
             .enumerate()
             .for_each(|(person_idx, scores_out_slice)| {
+                let g1_slice = filled_builder.g1_slice_for_person(person_idx);
+                let g2_slice = filled_builder.g2_slice_for_person(person_idx);
+
                 let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
                     &weights,
                     &flip_flags,
-                    &g1_indices[person_idx],
-                    &g2_indices[person_idx],
+                    g1_slice,
+                    g2_slice,
                 );
 
-                // Add the kernel's calculated adjustments to the baseline.
                 for i in 0..num_accumulator_lanes {
                     let scores_offset = i * SIMD_LANES;
                     let adjustments_f32x8 = kernel_result_buffer[i];
-
                     accumulate_simd_lane(
                         scores_out_slice,
                         adjustments_f32x8,
@@ -412,20 +588,14 @@ fn process_tile<'a>(
                 }
             });
 
-        // --- All Deferred Missing Events in a Batch ---
-        // Now that the fast-path work is done, we process the slow-path work all at once.
-        for &(person_idx, variant_idx_in_chunk) in missing_events.iter() {
-            // This is a rare, slow path for missing data. We use the index metadata
-            // to look up the global information needed.
+        // --- Process Deferred Missing Events ---
+        for &(person_idx, variant_idx_in_chunk) in filled_builder.missing_events() {
             let global_matrix_row_idx =
                 reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
             let scores_for_this_variant = &prep_result.variant_to_scores_map[global_matrix_row_idx];
-
-            // For the baseline correction, we use the pre-gathered batch data, which is fast.
             let weight_row_offset = variant_idx_in_chunk * stride;
             let weight_row = &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
             let flip_row = &flips_for_batch[weight_row_offset..weight_row_offset + num_scores];
-
             let person_scores_slice =
                 &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
             let person_missing_counts_slice = &mut block_missing_counts_out
@@ -443,9 +613,6 @@ fn process_tile<'a>(
             }
         }
     }
-
-    // Return the buffers to the pool ONCE after all mini-batches are complete.
-    sparse_index_pool.push(buffers);
 }
 
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
@@ -766,18 +933,17 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_accumulation_performance() {
         // IMPORTANT: This test MUST be run in release mode (`--release`) to be meaningful.
-    
+
         use std::simd::f32x8;
-    
+
         // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPERS ---
-    
+
         // The function from the original code.
         use super::accumulate_simd_lane;
-    
+
         /// Competitor 1: The simple scalar loop implementation.
         fn accumulate_simple_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
             let temp_array = adjustments_f32x8.to_array();
@@ -785,7 +951,7 @@ mod tests {
                 scores_out_slice[j] += temp_array[j] as f64;
             }
         }
-        
+
         /// Competitor 2: A manually unrolled scalar loop. This avoids the `to_array()` overhead
         fn accumulate_unrolled_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
             let adj = adjustments_f32x8.to_array(); // Still need to get data out of SIMD reg
@@ -798,8 +964,7 @@ mod tests {
             scores_out_slice[6] += adj[6] as f64;
             scores_out_slice[7] += adj[7] as f64;
         }
-    
-    
+
         /// A struct to hold calculated statistics for a benchmark run.
         #[derive(Debug, Clone, Copy)]
         struct BenchmarkStats {
@@ -809,24 +974,29 @@ mod tests {
             min: f64,
             max: f64,
         }
-    
+
         /// Calculates statistics from a vector of trial durations.
         fn calculate_stats(durations_ns: &mut [f64]) -> BenchmarkStats {
             durations_ns.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let count = durations_ns.len() as f64;
-            
+
             let sum = durations_ns.iter().sum::<f64>();
             let mean = sum / count;
-    
+
             let median = if durations_ns.len() % 2 == 0 {
-                (durations_ns[durations_ns.len() / 2 - 1] + durations_ns[durations_ns.len() / 2]) / 2.0
+                (durations_ns[durations_ns.len() / 2 - 1] + durations_ns[durations_ns.len() / 2])
+                    / 2.0
             } else {
                 durations_ns[durations_ns.len() / 2]
             };
-    
-            let variance = durations_ns.iter().map(|&val| (val - mean).powi(2)).sum::<f64>() / count;
+
+            let variance = durations_ns
+                .iter()
+                .map(|&val| (val - mean).powi(2))
+                .sum::<f64>()
+                / count;
             let std_dev = variance.sqrt();
-    
+
             BenchmarkStats {
                 mean,
                 median,
@@ -835,8 +1005,7 @@ mod tests {
                 max: *durations_ns.last().unwrap(),
             }
         }
-    
-    
+
         /// The reusable performance measurement helper.
         /// It performs a warmup, then runs multiple trials and returns the results.
         fn run_benchmark_trials<F>(
@@ -852,7 +1021,7 @@ mod tests {
             F: FnMut(&mut [f64], f32x8),
         {
             println!("> Benchmarking '{}'...", name);
-            
+
             // 1. WARMUP PHASE: Run the operation to get the CPU and caches ready.
             let mut warmup_checksum = 0.0f64;
             for _ in 0..warmup_iterations {
@@ -860,137 +1029,171 @@ mod tests {
                 warmup_checksum += scores[0];
             }
             std::hint::black_box(warmup_checksum);
-    
-    
+
             // 2. MEASUREMENT PHASE: Run multiple trials to collect robust data.
             let mut trial_durations = Vec::with_capacity(num_trials as usize);
             for i in 0..num_trials {
                 // Reset state for EACH trial to ensure fairness.
                 scores.fill(100.0);
-                
+
                 let mut checksum = 0.0f64;
                 let start = Instant::now();
-    
+
                 for _ in 0..iterations_per_trial {
                     operation(scores, adjustments);
                     checksum += scores[0];
                 }
-    
+
                 let duration = start.elapsed();
                 trial_durations.push(duration);
-    
+
                 // Prevent the optimizer from eliding the loop.
                 std::hint::black_box(checksum);
-                
+
                 if (i + 1) % 5 == 0 {
                     print!(".");
-                    use std::io::{stdout, Write};
+                    use std::io::{Write, stdout};
                     let _ = stdout().flush();
                 }
             }
             println!(" Done.");
-    
+
             let mut durations_ns: Vec<f64> = trial_durations
                 .iter()
                 .map(|d| d.as_nanos() as f64 / iterations_per_trial as f64)
                 .collect();
-            
+
             calculate_stats(&mut durations_ns)
         }
-    
+
         // --- B. DEFINE TEST PARAMETERS ---
         const WARMUP_ITERATIONS: u32 = 200_000;
         const NUM_TRIALS: u32 = 20;
         const ITERATIONS_PER_TRIAL: u32 = 1_000_000;
-        
+
         let adjustments = f32x8::from_array([0.1, 0.2, -0.05, 0.3, -0.15, 0.0, 0.5, -0.25]);
-    
+
         // --- C. VERIFY CORRECTNESS FIRST ---
         // A fast but wrong function is useless. This must pass before we measure.
         {
             let mut complex_result = vec![100.0f64; 8];
             let mut scalar_result = vec![100.0f64; 8];
             let mut unrolled_result = vec![100.0f64; 8];
-    
+
             accumulate_simd_lane(&mut complex_result, adjustments, 0, 8);
             accumulate_simple_scalar(&mut scalar_result, adjustments);
             accumulate_unrolled_scalar(&mut unrolled_result, adjustments);
-    
+
             for i in 0..8 {
                 assert!(
                     (complex_result[i] - scalar_result[i]).abs() < 1e-9,
                     "Correctness check FAILED at index {}: SIMD={}, Scalar={}",
-                    i, complex_result[i], scalar_result[i]
+                    i,
+                    complex_result[i],
+                    scalar_result[i]
                 );
                 assert!(
                     (complex_result[i] - unrolled_result[i]).abs() < 1e-9,
                     "Correctness check FAILED at index {}: SIMD={}, Unrolled Scalar={}",
-                    i, complex_result[i], unrolled_result[i]
+                    i,
+                    complex_result[i],
+                    unrolled_result[i]
                 );
             }
         }
-    
+
         // --- D. RUN THE BENCHMARKS AND REPORT RESULTS ---
         println!("\n\n--- Accumulation Performance Test Report (Ran in RELEASE mode) ---");
-        println!("Methodology: Warmup followed by {} trials of {} iterations each.", NUM_TRIALS, ITERATIONS_PER_TRIAL);
+        println!(
+            "Methodology: Warmup followed by {} trials of {} iterations each.",
+            NUM_TRIALS, ITERATIONS_PER_TRIAL
+        );
         println!("Correctness check passed. All functions produce identical results.");
-    
+
         let mut scores_buffer = vec![100.0f64; 8];
-    
+
         // Measure each implementation
         let stats_simd = run_benchmark_trials(
-            "Complex SIMD (Current)", &mut scores_buffer, adjustments,
-            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
+            "Complex SIMD (Current)",
+            &mut scores_buffer,
+            adjustments,
+            WARMUP_ITERATIONS,
+            NUM_TRIALS,
+            ITERATIONS_PER_TRIAL,
             |s, a| accumulate_simd_lane(s, a, 0, 8),
         );
-    
+
         let stats_scalar = run_benchmark_trials(
-            "Simple Scalar", &mut scores_buffer, adjustments,
-            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
+            "Simple Scalar",
+            &mut scores_buffer,
+            adjustments,
+            WARMUP_ITERATIONS,
+            NUM_TRIALS,
+            ITERATIONS_PER_TRIAL,
             accumulate_simple_scalar,
         );
-        
+
         let stats_unrolled = run_benchmark_trials(
-            "Unrolled Scalar", &mut scores_buffer, adjustments,
-            WARMUP_ITERATIONS, NUM_TRIALS, ITERATIONS_PER_TRIAL,
+            "Unrolled Scalar",
+            &mut scores_buffer,
+            adjustments,
+            WARMUP_ITERATIONS,
+            NUM_TRIALS,
+            ITERATIONS_PER_TRIAL,
             accumulate_unrolled_scalar,
         );
-    
+
         // --- E. ANALYZE AND ASSERT ---
         println!("\n--- Final Results (time per operation) ---");
-        println!("-------------------------------------------------------------------------------------");
-        println!("{:<22} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}", 
-                 "Implementation", "Median", "Mean", "Std Dev", "Min", "Max");
-        println!("-------------------------------------------------------------------------------------");
-        
+        println!(
+            "-------------------------------------------------------------------------------------"
+        );
+        println!(
+            "{:<22} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}",
+            "Implementation", "Median", "Mean", "Std Dev", "Min", "Max"
+        );
+        println!(
+            "-------------------------------------------------------------------------------------"
+        );
+
         let print_stats = |name: &str, stats: BenchmarkStats| {
-            println!("{:<22} | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns",
-                     name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max);
+            println!(
+                "{:<22} | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns | {:>9.3} ns",
+                name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max
+            );
         };
-    
+
         print_stats("Complex SIMD (Current)", stats_simd);
         print_stats("Simple Scalar", stats_scalar);
         print_stats("Unrolled Scalar", stats_unrolled);
-        println!("-------------------------------------------------------------------------------------\n");
-    
+        println!(
+            "-------------------------------------------------------------------------------------\n"
+        );
+
         // The core assertion is now based on the median, which is more robust to noise.
         assert!(
             stats_simd.median <= stats_scalar.median,
             "PERFORMANCE REGRESSION DETECTED against simple scalar!\n\
              - SIMD Median:   {:.3} ns/op\n\
              - Scalar Median: {:.3} ns/op",
-            stats_simd.median, stats_scalar.median
+            stats_simd.median,
+            stats_scalar.median
         );
-        
+
         assert!(
             stats_simd.median <= stats_unrolled.median,
             "PERFORMANCE REGRESSION DETECTED against unrolled scalar!\n\
              - SIMD Median:      {:.3} ns/op\n\
              - Unrolled Median:  {:.3} ns/op",
-            stats_simd.median, stats_unrolled.median
+            stats_simd.median,
+            stats_unrolled.median
         );
-    
-        println!("✅ PERFORMANCE CHECK PASSED: The current SIMD implementation's median performance is faster than or equal to both scalar implementations.");
-        println!("======================================================================================================================================\n");
+
+        println!(
+            "✅ PERFORMANCE CHECK PASSED: The current SIMD implementation's median performance is faster than or equal to both scalar implementations."
+        );
+        println!(
+            "======================================================================================================================================\n"
+        );
     }
 }
