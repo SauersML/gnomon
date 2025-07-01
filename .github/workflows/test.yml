@@ -91,7 +91,7 @@ jobs:
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'true'
         run: |
-          cargo +nightly install cargo-asm
+          cargo +nightly install cargo-show-asm
 
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (gnomon::batch::accumulate_simd_lane) ---"
@@ -103,7 +103,7 @@ jobs:
           echo "--- ASSEMBLY FOR SCALAR VERSION (gnomon::batch::tests::accumulate_simple_scalar) ---"
           echo "---"
           cargo asm --release --lib --intel gnomon::batch::tests::accumulate_simple_scalar
-
+    
       - name: Install getdoc
         if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
         run: cargo +nightly install getdoc --locked
