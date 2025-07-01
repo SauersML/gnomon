@@ -646,7 +646,7 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
         ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage } => {
             writeln!(report, "  Method: 'Prioritize Unambiguous Genotype' Heuristic").unwrap();
-            writeln!(report, "  Outcome: A single interpretation composed of standard alleles was chosen over others, yielding a dosage of {}.", chosen_dosage).unwrap();
+            writeln!(report, "  Outcome: A single interpretation was chosen because its alleles matched the score file's allele better than alternatives, yielding a dosage of {}.", chosen_dosage).unwrap();
         }
     }
 
