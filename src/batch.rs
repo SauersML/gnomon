@@ -441,23 +441,13 @@ fn process_block<'a>(
     let _ = tile_pool.push(tile);
 }
 
-/// A high-performance accumulator that performs a full load-widen-add-store cycle.
+/// Accumulates a SIMD lane of `f32` adjustments into a `f64` score slice.
 ///
-/// This function operates on a fixed-size array reference `&mut [f64; 8]`. After
-/// exhaustive benchmarking and removal of all compiler overhead, the simple
-/// scalar `for` loop has been empirically proven to be the fastest implementation
-/// for this specific task on the target hardware. Its predictable memory access
+/// This function handles both full 8-element lanes and partial tail lanes.
+/// After benchmarking, the simple scalar `for` loop has been
+/// empirically proven to be the fastest implementation for this specific
+/// read-modify-write task on target hardware, as its predictable memory access
 /// pattern is highly sympathetic to the CPU's out-of-order execution engine.
-#[inline(always)]
-fn accumulate_simd_direct(scores_out_array: &mut [f64; 8], adjustments_f32x8: Simd<f32, 8>) {
-    // The simple scalar `for` loop is empirically the fastest implementation.
-    let temp_array = adjustments_f32x8.to_array();
-    for j in 0..8 {
-        scores_out_array[j] += temp_array[j] as f64;
-    }
-}
-
-/// A helper function to accumulate one SIMD lane of adjustments.
 #[inline(always)]
 fn accumulate_simd_lane(
     scores_out_slice: &mut [f64],
@@ -470,15 +460,18 @@ fn accumulate_simd_lane(
         // SAFETY: The `if` condition guarantees that we can safely access a sub-slice
         // of `SIMD_LANES` (8) elements starting at `scores_offset`. We get a raw
         // pointer and cast it directly to a mutable reference to a fixed-size array.
-        // This is the most direct, zero-cost way to provide the callee with the
-        // compile-time size information needed to eliminate all bounds checks.
+        // This is the most direct, zero-cost way to provide the callee with
+        // compile-time size information and eliminate all bounds checks.
         let target_array = unsafe {
             let ptr = scores_out_slice.as_mut_ptr().add(scores_offset);
             &mut *(ptr as *mut [f64; 8])
         };
 
-        // Call the function that operates on the fixed-size array.
-        accumulate_simd_direct(target_array, adjustments_f32x8);
+        // This simple scalar `for` loop is the empirically fastest implementation.
+        let temp_array = adjustments_f32x8.to_array();
+        for j in 0..8 {
+            target_array[j] += temp_array[j] as f64;
+        }
     } else {
         // This is the scalar fallback for the tail end of the data (e.g., if there
         // are 1-7 elements left).
