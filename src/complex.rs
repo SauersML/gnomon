@@ -248,18 +248,25 @@ impl Heuristic {
 
     /// A private helper to compute dosage from raw PLINK bits.
     #[inline(always)]
-    fn calculate_dosage(packed_geno: u8, bim_a1: &str, effect_allele: &str) -> f64 {
+    fn calculate_dosage(packed_geno: u8, bim_a1: &str, bim_a2: &str, effect_allele: &str) -> f64 {
+        // Decodes the genotype with respect to the BIM alleles.
         let dosage_wrt_a1 = match packed_geno {
             0b00 => 2.0, // Homozygous for A1
-            0b10 => 1.0, // Heterozygous
+            0b10 => 1.0, // Heterozygous (one A1, one A2)
             0b11 => 0.0, // Homozygous for A2
-            _ => 0.0,    // Should not happen for valid data
+            _ => 0.0,    // Missing or invalid
         };
 
         if bim_a1 == effect_allele {
+            // Case 1: The effect allele is A1. The dosage is the count of A1.
             dosage_wrt_a1
-        } else {
+        } else if bim_a2 == effect_allele {
+            // Case 2: The effect allele is A2. The dosage is the count of A2,
+            // which is the inverse of the A1 count.
             2.0 - dosage_wrt_a1
+        } else {
+            // Case 3: The effect allele is neither A1 nor A2. The dosage must be 0.
+            0.0
         }
     }
 }
