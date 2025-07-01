@@ -207,42 +207,39 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
         let num_people = self.state.num_people;
         let variants_in_chunk = self.state.tile.len() / num_people;
 
-        // Wrap raw pointers for safe sending across threads.
-        let g1_ptr_sendable = UnsafeSendSyncPtr(self.state.all_g1_indices.as_mut_ptr());
-        let g2_ptr_sendable = UnsafeSendSyncPtr(self.state.all_g2_indices.as_mut_ptr());
+        // THE FIX: Create the Send+Sync wrappers here.
+        let g1_ptr_wrapper = UnsafeSendSyncPtr(self.state.all_g1_indices.as_mut_ptr());
+        let g2_ptr_wrapper = UnsafeSendSyncPtr(self.state.all_g2_indices.as_mut_ptr());
 
-        // Destructure needed fields from self.state that are Send + Sync
-        // tile, variant_mini_batch_start, and mini_batch_size are part of AllocatedData,
-        // which has a lifetime 'a tied to the input tile.
-        // person_counts, g1_offsets, g2_offsets are Vecs which are Send + Sync if their items are.
-        // (u32, u32) and usize are Send + Sync.
-        let tile_ref = self.state.tile; // This is &'a [EffectAlleleDosage]
+        // These variables are all thread-safe and can be captured by the closure.
+        let tile_ref = self.state.tile;
         let variant_mini_batch_start_val = self.state.variant_mini_batch_start;
         let mini_batch_size_val = self.state.mini_batch_size;
         let person_counts_ref = &self.state.person_counts;
         let g1_offsets_ref = &self.state.g1_offsets;
         let g2_offsets_ref = &self.state.g2_offsets;
 
+        // The `move` closure will now capture `g1_ptr_wrapper` and `g2_ptr_wrapper`,
+        // which are Send+Sync, thus satisfying the compiler.
         (0..num_people).into_par_iter().for_each(move |person_idx| {
             let g1_offset = g1_offsets_ref[person_idx];
             let g1_count = person_counts_ref[person_idx].0 as usize;
             let g2_offset = g2_offsets_ref[person_idx];
             let g2_count = person_counts_ref[person_idx].1 as usize;
 
-            // This is the single, justified `unsafe` block, perfectly encapsulated.
-            // It creates mutable slices that are guaranteed to be disjoint by our algorithm.
-            let person_g1_slice = unsafe {
-                std::slice::from_raw_parts_mut(g1_ptr_sendable.0.add(g1_offset), g1_count)
-            };
-            let person_g2_slice = unsafe {
-                std::slice::from_raw_parts_mut(g2_ptr_sendable.0.add(g2_offset), g2_count)
-            };
+            // Inside the thread, we unwrap the raw pointer from our safe wrapper
+            // and use it. This is our promise to the compiler that this is safe.
+            let person_g1_slice =
+                unsafe { std::slice::from_raw_parts_mut(g1_ptr_wrapper.0.add(g1_offset), g1_count) };
+            let person_g2_slice =
+                unsafe { std::slice::from_raw_parts_mut(g2_ptr_wrapper.0.add(g2_offset), g2_count) };
 
             let mut g1_written = 0;
             let mut g2_written = 0;
 
             let genotype_tile_row_offset = person_idx * variants_in_chunk;
-            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start_val;
+            let mini_batch_genotype_start =
+                genotype_tile_row_offset + variant_mini_batch_start_val;
             let genotype_row = &tile_ref
                 [mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size_val];
 
@@ -309,8 +306,6 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
-/// A thread-safe pool for reusing the large memory buffers required for storing
-/// sparse indices (`g1_indices`, `g2_indices`) and deferred missingness events.
 // ========================================================================================
 //                                   PUBLIC API
 // ========================================================================================
