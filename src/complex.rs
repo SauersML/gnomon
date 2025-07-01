@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use crate::pipeline::{PipelineError, ScopeGuard};
+use ahash::AHashSet;
 
 /// A performant, read-only resolver for fetching complex variant genotypes.
 ///
@@ -342,7 +343,11 @@ struct CriticalIntegrityWarningInfo {
     resolution_method: ResolutionMethod,
 }
 
-/// The "slow path" resolver for complex, multiallelic variants.
+REVIEW THE BELOW CODE. DID I FIX IT 100% PERFECTLY AND FULLY?
+
+
+
+// The "slow path" resolver for complex variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
 /// iterates through each person and resolves their score contributions for the small
@@ -430,15 +435,32 @@ pub fn resolve_complex_variants(
 
                         match valid_interpretations.len() {
                             0 => {
+                                // Ensure we only increment the missing count ONCE per unique score
+                                // column, even if a locus is used in multiple score file rows that
+                                // map to the same final score.
+                                let mut counted_cols = AHashSet::new();
                                 for score_info in &group_rule.score_applications {
-                                    person_counts_slice[score_info.score_column_index.0] += 1;
+                                    counted_cols.insert(score_info.score_column_index);
+                                }
+                                for &score_col_idx in counted_cols.iter() {
+                                    person_counts_slice[score_col_idx.0] += 1;
                                 }
                             }
                             1 => {
                                 let (packed_geno, context) = valid_interpretations[0];
+                                let (_, bim_a1, bim_a2) = context;
+
                                 for score_info in &group_rule.score_applications {
-                                    // This check is removed because the prep phase guarantees relevance.
-                                    let dosage = Heuristic::calculate_dosage(packed_geno, &context.1, &score_info.effect_allele);
+                                    // Add a guard to ensure the score's effect allele is actually
+                                    // present in the single genotype context we found. If not, this
+                                    // score rule is irrelevant, so we skip it. This prevents calls
+                                    // to calculate_dosage with bad data.
+                                    let effect_allele = &score_info.effect_allele;
+                                    if effect_allele != bim_a1 && effect_allele != bim_a2 {
+                                        continue;
+                                    }
+
+                                    let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, effect_allele);
                                     person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
                                 }
                             }
@@ -522,7 +544,6 @@ pub fn resolve_complex_variants(
             if i > 0 {
                 eprintln!("---------------------------------------------------------------------------------");
             }
-            // This now requires a new match arm in the reporting function, which is assumed to be updated.
             eprintln!("{}", format_critical_integrity_warning(&info));
         }
 
