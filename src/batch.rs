@@ -753,19 +753,15 @@ mod tests {
     #[test]
     fn test_accumulation_performance() {
         // IMPORTANT: This test MUST be run in release mode to be meaningful.
-        // Use the command: cargo test --release -- --nocapture
 
         use std::simd::f32x8;
 
         // --- A. DEFINE COMPETING LOGIC & BENCHMARKING HELPER ---
 
-        // By using `super::...` we are testing the *actual production code*,
-        // assuming it has been refactored into this helper function.
-        // This is the best practice to prevent code drift.
+
         use super::accumulate_simd_lane;
 
-        /// The proposed, simple scalar loop implementation.
-        /// This is defined locally because it does not exist in production code yet.
+        /// The simple scalar loop implementation.
         fn accumulate_simple_scalar(scores_out_slice: &mut [f64], adjustments_f32x8: f32x8) {
             let temp_array = adjustments_f32x8.to_array();
             for j in 0..8 {
