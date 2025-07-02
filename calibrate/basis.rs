@@ -3,6 +3,9 @@ use ndarray_linalg::QR;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(test)]
+use approx::assert_abs_diff_eq;
+
 /// Defines the strategy for placing the internal knots of a spline.
 /// This is part of the public API and will be saved in the model configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,11 +278,20 @@ mod internal {
         let x_clamped = x.clamp(knots[degree], knots[num_basis]);
 
         // Find the knot interval `mu` such that `knots[mu] <= x < knots[mu+1]`.
-        let mu = match knots.iter().rposition(|&k| k <= x_clamped) {
+        let mut mu = match knots.iter().rposition(|&k| k <= x_clamped) {
             Some(pos) => pos,
             // This case should ideally not be reached due to clamping.
             None => degree,
         };
+
+        // --- ROBUST FIX ---
+        // If x is at the upper boundary, mu could be too large. 
+        // The knot span index cannot exceed the index of the start of the last segment.
+        // This index is `num_basis - 1`.
+        if mu >= num_basis {
+            mu = num_basis - 1;
+        }
+        // --- END OF FIX ---
 
         // `b` will store the non-zero basis function values for the current degree.
         // At any point x, at most `degree + 1` basis functions are non-zero.
@@ -383,7 +395,7 @@ mod tests {
             [0., 1., -4., 5., -2.],
             [0., 0., 1., -2., 1.]
         ];
-        assert!(s.all_close(&expected_s, 1e-9));
+        assert_abs_diff_eq!(s, expected_s, epsilon = 1e-9);
     }
 
     #[test]
@@ -457,6 +469,29 @@ mod tests {
                 val
             );
         }
+    }
+
+    #[test]
+    fn test_boundary_value_panic_fix() {
+        // Test for the boundary value panic bug described in the issue.
+        // This test ensures that evaluation at the upper boundary doesn't panic.
+        
+        // Test the internal function directly with the problematic case
+        let knots = array![0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0];
+        let x = 10.0; // This is the value that caused the panic
+        let degree = 3;
+        
+        let basis_values = internal::evaluate_splines_at_point(x, degree, knots.view());
+        
+        // Should not panic and should return valid results
+        assert_eq!(basis_values.len(), 8); // num_basis = 12 - 3 - 1 = 8
+        
+        let sum = basis_values.sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "Basis functions should sum to 1.0 at boundary, got {}",
+            sum
+        );
     }
 
     #[test]
