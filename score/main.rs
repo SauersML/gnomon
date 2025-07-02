@@ -54,6 +54,7 @@ struct Args {
 //                              THE MAIN ORCHESTRATION LOGIC
 // ========================================================================================
 
+#[allow(dead_code)]
 fn main() {
     // This wrapper provides a clear exit message upon failure.
     if let Err(e) = run_gnomon() {
@@ -81,6 +82,7 @@ pub fn run_gnomon_with_args(
 }
 
 /// The primary application logic
+#[allow(dead_code)]
 fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
     run_gnomon_impl(args)

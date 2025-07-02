@@ -33,6 +33,10 @@ pub struct BasisConfig {
 pub struct ModelConfig {
     pub link_function: LinkFunction,
     pub penalty_order: usize,
+    pub convergence_tolerance: f64,
+    pub max_iterations: usize,
+    pub reml_convergence_tolerance: f64,
+    pub reml_max_iterations: u64,
     pub pgs_basis_config: BasisConfig,
     pub pc_basis_configs: Vec<BasisConfig>,
     // Data-dependent parameters saved from training are crucial for prediction.

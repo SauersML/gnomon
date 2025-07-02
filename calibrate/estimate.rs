@@ -21,9 +21,9 @@
 //! from the data, fixing the key discrepancies identified in the initial implementation.
 
 // External Crate for Optimization
-use argmin::core::{CostFunction, Error, Executor, Gradient};
-use argmin::solver::quasinewton::BFGS;
-use argmin::solver::linesearch::MoreThuenteLineSearch;
+use bfgs;
+// Import the exact ndarray version that bfgs crate uses (0.11.2)
+use ndarray_bfgs;
 
 // Crate-level imports
 use crate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
@@ -48,6 +48,7 @@ pub enum EstimationError {
     LinearSystemSolveFailed(ndarray_linalg::error::LinalgError),
 
     #[error("Eigendecomposition failed: {0}")]
+    #[allow(dead_code)]
     EigendecompositionFailed(ndarray_linalg::error::LinalgError),
 
     #[error(
@@ -81,34 +82,46 @@ pub fn train_model(
     log_layout_info(&layout);
 
     // 2. Set up the REML optimization problem.
-    let cost_function =
+    let reml_state =
         internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, config);
 
-    // 3. Configure the BFGS optimizer and the line search strategy.
-    let linesearch = MoreThuenteLineSearch::new();
-    let solver = BFGS::new(linesearch);
+    // 3. Create a shared reference to the REML state for the closures 
+    use std::sync::Arc;
+    let reml_state_arc = Arc::new(reml_state);
+    let reml_state_cost = reml_state_arc.clone();
+    let reml_state_grad = reml_state_arc.clone();
+    
+    // Define cost and gradient functions for BFGS using the exact signature expected by bfgs crate.
+    let cost_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> f64 {
+        // Convert from bfgs ndarray (0.11.2) to our ndarray version (0.16.1)
+        let rho = Array1::from_vec(rho_bfgs.to_vec());
+        reml_state_cost.compute_cost(&rho).unwrap_or(f64::INFINITY)
+    };
+    
+    let gradient_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> ndarray_bfgs::Array1<f64> {
+        // Convert from bfgs ndarray to our ndarray version  
+        let rho = Array1::from_vec(rho_bfgs.to_vec());
+        let grad = reml_state_grad.compute_gradient(&rho).unwrap_or_else(|_| Array1::zeros(rho.len()));
+        // Convert back to bfgs ndarray version
+        ndarray_bfgs::Array1::from_vec(grad.to_vec())
+    };
 
     // 4. Define the initial guess for log-smoothing parameters (rho).
     let initial_rho = Array1::zeros(layout.num_penalties);
 
-    // 5. Run the optimizer.
-    let res = Executor::new(cost_function, solver)
-        .configure(|state| {
-            state
-                .param(initial_rho)
-                .max_iters(100) // Default value
-                .gradient_tol(1e-6) // Default value
-        })
-        .run()
-        .map_err(|e| EstimationError::RemlOptimizationFailed(e.to_string()))?;
+    // 5. Run the BFGS optimizer.
+    // Convert to bfgs crate's ndarray version (0.11.2)
+    let initial_rho_bfgs = ndarray_bfgs::Array1::from_vec(initial_rho.to_vec());
+    
+    let final_rho_bfgs = bfgs::bfgs(initial_rho_bfgs, cost_fn, gradient_fn)
+        .map_err(|e| EstimationError::RemlOptimizationFailed(format!("BFGS failed: {:?}", e)))?;
+    
+    // Convert back to our ndarray version
+    let final_rho = Array1::from_vec(final_rho_bfgs.to_vec());
 
-    log::info!(
-        "REML optimization finished: {}",
-        res.state().termination_reason.unwrap()
-    );
+    log::info!("REML optimization completed successfully");
 
     // 6. Extract the final results.
-    let final_rho = res.state.best_param.as_ref().unwrap().clone();
     let final_lambda = final_rho.mapv(f64::exp);
     log::info!(
         "Final estimated smoothing parameters (lambda): {:?}",
@@ -120,7 +133,7 @@ pub fn train_model(
         final_rho.view(),
         x_matrix.view(),
         data.y.view(),
-        &res.state.cost_function.unwrap().s_list,
+        &reml_state_arc.s_list,
         &layout,
         config,
     )?;
@@ -167,6 +180,7 @@ mod internal {
         pub(super) beta: Array1<f64>,
         pub(super) penalized_hessian: Array2<f64>,
         pub(super) deviance: f64,
+        #[allow(dead_code)]
         pub(super) final_weights: Array1<f64>,
     }
 
@@ -200,7 +214,7 @@ mod internal {
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
-        fn execute_pirls_if_needed(&self, rho: &Array1<f64>) -> Result<PirlsResult, Error> {
+        fn execute_pirls_if_needed(&self, rho: &Array1<f64>) -> Result<PirlsResult, EstimationError> {
             let key: Vec<u64> = rho.iter().map(|&v| v.to_bits()).collect();
             if let Some(cached_result) = self.cache.borrow().get(&key) {
                 return Ok(cached_result.clone());
@@ -214,19 +228,16 @@ mod internal {
                 self.layout,
                 self.config,
             )
-            .map_err(Error::from)?;
+?;
 
             self.cache.borrow_mut().insert(key, pirls_result.clone());
             Ok(pirls_result)
         }
     }
 
-    /// Implementation of the LAML score (cost function) for the BFGS optimizer.
-    impl CostFunction for RemlState<'_> {
-        type Param = Array1<f64>;
-        type Output = f64;
-
-        fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+    impl RemlState<'_> {
+        /// Compute the LAML cost (negative log-REML score) for BFGS optimization.
+        pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(p)?;
             let lambdas = p.mapv(f64::exp);
 
@@ -239,7 +250,8 @@ mod internal {
                 - 0.5 * pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
 
             // Log-determinant of the penalty matrix.
-            let log_det_s = calculate_log_det_pseudo(&s_lambda).map_err(Error::from)?;
+            let log_det_s = calculate_log_det_pseudo(&s_lambda)
+                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
             // Log-determinant of the penalized Hessian.
             // Using Cholesky decomposition: log|H| = 2 * sum(log(diag(L)))
@@ -255,16 +267,9 @@ mod internal {
 
             Ok(-laml)
         }
-    }
 
-    /// Implementation of the LAML gradient for the BFGS optimizer.
-    /// This function calculates the exact gradient of the negative log-REML score,
-    /// which is the objective function being minimized.
-    impl Gradient for RemlState<'_> {
-        type Param = Array1<f64>;
-        type Gradient = Array1<f64>;
-    
-        fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, Error> {
+        /// Compute the LAML gradient for BFGS optimization.
+        pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
     
@@ -277,7 +282,8 @@ mod internal {
             // S_λ = Σ λ_k S_k
             let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
             // S_λ⁺ (Moore-Penrose pseudo-inverse for the log|S| term)
-            let s_lambda_plus = pseudo_inverse(&s_lambda).map_err(Error::from)?;
+            let s_lambda_plus = pseudo_inverse(&s_lambda)
+                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
     
             // --- Iterate through each smoothing parameter to build the gradient vector ---
             let mut grad_of_neg_laml = Array1::zeros(p.len());
@@ -302,7 +308,7 @@ mod internal {
                 let rhs_for_d_beta = -lambdas[k] * self.s_list[k].dot(beta);
                 let d_beta_d_rho_k = h_penalized
                     .solve_into(rhs_for_d_beta)
-                    .map_err(Error::from)?;
+                    .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
     
                 // Step 3b: Calculate dη/dρ_k = X * (dβ/dρ_k)
                 let d_eta_d_rho_k = self.x.dot(&d_beta_d_rho_k);
@@ -323,13 +329,18 @@ mod internal {
                 let d_h_d_rho_k = d_xtwx_d_rho_k + &d_s_lambda_d_rho_k;
     
                 // Step 3f: Calculate the trace term tr(H⁻¹ * dH/dρ_k)
-                // Solve the full linear system H * X = dH/dρ_k to find X = H⁻¹ * dH/dρ_k
-                let h_inv_dot_dh = h_penalized
-                    .solve(&d_h_d_rho_k)
-                    .map_err(Error::from)?;
-                
-                // Compute the trace by summing diagonal elements of the resulting matrix
-                let trace_sum = h_inv_dot_dh.diag().sum();
+                // We can compute the trace efficiently by solving H * x_i = dH/dρ_k[:, i] for each column i
+                // and then summing x_i[i] (the diagonal elements)
+                let mut trace_sum = 0.0;
+                let n = d_h_d_rho_k.nrows();
+                for i in 0..n {
+                    let col_i = d_h_d_rho_k.column(i);
+                    let col_i_owned = col_i.to_owned();
+                    let x_i = h_penalized
+                        .solve(&col_i_owned)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                    trace_sum += x_i[i];
+                }
                 let log_det_h_deriv_term = 0.5 * trace_sum;
                 
                 // --- Final Assembly ---

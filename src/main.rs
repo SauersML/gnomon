@@ -128,11 +128,16 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         ];
 
         // Lambda values are now estimated automatically via REML
+        println!("Training model with REML estimation of smoothing parameters");
 
         // Create final model configuration
         let config = ModelConfig {
             link_function,
             penalty_order: args.penalty_order,
+            convergence_tolerance: args.convergence_tolerance,
+            max_iterations: args.max_iterations,
+            reml_convergence_tolerance: args.reml_convergence_tolerance,
+            reml_max_iterations: args.reml_max_iterations,
             pgs_basis_config,
             pc_basis_configs,
             pgs_range,
@@ -271,5 +276,5 @@ fn main() {
 fn run_score(input_path: PathBuf, score: PathBuf, keep: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     // Call the score calculation logic directly
     score_main::run_gnomon_with_args(input_path, score, keep)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        .map_err(|e| e as Box<dyn std::error::Error>)
 }
