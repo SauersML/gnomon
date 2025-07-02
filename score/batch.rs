@@ -9,7 +9,7 @@
 // `spawn_blocking` context. Its sole responsibility is to take a raw, variant-major
 // chunk of genotype data, pivot it into a person-major tile, generate a sparse
 // index of non-zero work, and dispatch it to the kernel. It performs ZERO
-// scientific logic or reconciliation. We don't support over 100 scores yet.
+// scientific logic or reconciliation. We don't support over 100 scores.
 // It will panic / overflow if we try.
 
 use crate::kernel;
