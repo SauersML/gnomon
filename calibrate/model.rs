@@ -1,5 +1,5 @@
 use crate::basis::{self, create_bspline_basis};
-use ndarray::{s, Array1, Array2, ArrayView1, Axis};
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;

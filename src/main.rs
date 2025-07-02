@@ -13,7 +13,7 @@ mod estimate;
 mod model;
 
 // Import the calibrate functionality
-use basis::BasisConfig;
+use model::BasisConfig;
 use data::{load_prediction_data, load_training_data};
 use estimate::train_model;
 use model::{LinkFunction, ModelConfig, TrainedModel};
