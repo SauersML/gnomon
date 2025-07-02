@@ -26,9 +26,9 @@ use bfgs;
 use ndarray_bfgs;
 
 // Crate-level imports
-use crate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
-use crate::data::TrainingData;
-use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel, Constraint};
+use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
+use crate::calibrate::data::TrainingData;
+use crate::calibrate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel, Constraint};
 
 // Ndarray and Linalg
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -77,7 +77,7 @@ pub fn train_model(
     );
 
     // 1. Build the one-time matrices and define the model structure.
-    let (x_matrix, s_list, layout, constraints) =
+    let (x_matrix, s_list, layout, constraints, knot_vectors) =
         internal::build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
 
@@ -164,6 +164,7 @@ pub fn train_model(
     // Create updated config with constraints
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
+    config_with_constraints.knot_vectors = knot_vectors;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -481,24 +482,28 @@ mod internal {
     }
 
     /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-    /// Returns the design matrix, penalty matrices, model layout, and constraint transformations.
+    /// Returns the design matrix, penalty matrices, model layout, constraint transformations, and knot vectors.
     pub(super) fn build_design_and_penalty_matrices(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout, HashMap<String, Constraint>), EstimationError> {
+    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout, HashMap<String, Constraint>, HashMap<String, Array1<f64>>), EstimationError> {
         let n_samples = data.y.len();
         
-        // Initialize constraint storage
+        // Initialize constraint and knot vector storage
         let mut constraints = HashMap::new();
+        let mut knot_vectors = HashMap::new();
 
         // 1. Generate basis for PGS and apply sum-to-zero constraint
-        let (pgs_basis_unc, _) = create_bspline_basis(
+        let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
             data.p.view(),
             Some(data.p.view()),
             config.pgs_range,
             config.pgs_basis_config.num_knots,
             config.pgs_basis_config.degree,
         )?;
+        
+        // Save PGS knot vector
+        knot_vectors.insert("pgs".to_string(), pgs_knots);
         
         // Apply sum-to-zero constraint to PGS main effects (excluding intercept)
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -514,13 +519,17 @@ mod internal {
 
         for i in 0..config.pc_names.len() {
             let pc_col = data.pcs.column(i);
-            let (pc_basis_unc, _) = create_bspline_basis(
+            let pc_name = &config.pc_names[i];
+            let (pc_basis_unc, pc_knots) = create_bspline_basis(
                 pc_col.view(),
                 Some(pc_col.view()),
                 config.pc_ranges[i],
                 config.pc_basis_configs[i].num_knots,
                 config.pc_basis_configs[i].degree,
             )?;
+            
+            // Save PC knot vector
+            knot_vectors.insert(pc_name.clone(), pc_knots);
             // Apply sum-to-zero constraint to PC basis
             let (constrained_basis, z_transform) = 
                 basis::apply_sum_to_zero_constraint(pc_basis_unc.view())?;
@@ -584,15 +593,22 @@ mod internal {
                 let pc_constrained_basis = &pc_constrained_bases[pc_idx];
                 
                 // Multiply the vector across the matrix columns (broadcasting)
-                let interaction_data = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
+                let interaction_data_raw = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
+                
+                // Re-apply sum-to-zero constraint to fix broken identifiability
+                let (interaction_data_constrained, interaction_z_transform) = basis::apply_sum_to_zero_constraint(interaction_data_raw.view())?;
+                
+                // Save the interaction constraint transformation
+                let interaction_key = format!("interaction_pgs_B{}_{}", m_idx + 1, pc_name);
+                constraints.insert(interaction_key, Constraint { z_transform: interaction_z_transform });
 
                 x_matrix
                     .slice_mut(s![.., block.col_range.clone()])
-                    .assign(&interaction_data);
+                    .assign(&interaction_data_constrained);
             }
         }
 
-        Ok((x_matrix, s_list, layout, constraints))
+        Ok((x_matrix, s_list, layout, constraints, knot_vectors))
     }
 
     /// The P-IRLS inner loop for a fixed set of smoothing parameters.
@@ -875,7 +891,7 @@ mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::BasisConfig;
+    use crate::calibrate::model::BasisConfig;
     use ndarray::Array;
 
     fn create_test_config() -> ModelConfig {
@@ -898,6 +914,7 @@ mod tests {
             pc_ranges: vec![(-3.0, 3.0)],
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
         }
     }
 
@@ -957,10 +974,11 @@ mod tests {
             pc_ranges: vec![(-4.0, 4.0)],
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
         };
 
         // Test with extreme lambda values that might cause issues
-        let (x_matrix, s_list, layout, _) =
+        let (x_matrix, s_list, layout, _, _) =
             internal::build_design_and_penalty_matrices(&data, &config).unwrap();
         
         // Try with very large lambda values (exp(10) ~ 22000)
@@ -1023,10 +1041,11 @@ mod tests {
             pc_ranges: vec![(-3.0, 3.0)],
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
         };
 
         // Test that we can at least compute cost without getting infinity
-        let (x_matrix, s_list, layout, _) =
+        let (x_matrix, s_list, layout, _, _) =
             internal::build_design_and_penalty_matrices(&data, &config).unwrap();
         
         let reml_state = internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
@@ -1072,9 +1091,10 @@ mod tests {
             pc_ranges: vec![(0.0, 1.0)],
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
         };
 
-        let (x, s_list, layout, _constraints) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, _constraints, _knot_vectors) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_n_basis = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1; // 6
         let pc_n_basis = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5

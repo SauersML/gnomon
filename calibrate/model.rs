@@ -1,4 +1,4 @@
-use crate::basis::{self, create_bspline_basis};
+use crate::calibrate::basis::{self, create_bspline_basis};
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -58,6 +58,9 @@ pub struct ModelConfig {
     /// Use an Option because not all terms might be constrained.
     #[serde(default)] // For backward compatibility with old models that don't have this field
     pub constraints: HashMap<String, Constraint>,
+    /// Knot vectors used during training, saved for exact reproduction during prediction
+    #[serde(default)] // For backward compatibility with old models that don't have this field
+    pub knot_vectors: HashMap<String, Array1<f64>>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -182,14 +185,20 @@ mod internal {
         pcs_new: ArrayView2<f64>,
         config: &ModelConfig,
     ) -> Result<Array2<f64>, ModelError> {
-        // 1. Generate basis for PGS
-        let (pgs_basis_unc, _) = create_bspline_basis(
-            p_new, 
-            None, // ALWAYS use None for training_data_for_quantiles during prediction
-            config.pgs_range, 
-            config.pgs_basis_config.num_knots, 
-            config.pgs_basis_config.degree
-        )?;
+        // 1. Generate basis for PGS using saved knot vector if available
+        let (pgs_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get("pgs") {
+            // Use saved knot vector for exact reproduction
+            basis::create_bspline_basis_with_knots(p_new, saved_knots.view(), config.pgs_basis_config.degree)?
+        } else {
+            // Fallback to original method for backward compatibility
+            create_bspline_basis(
+                p_new, 
+                None,
+                config.pgs_range, 
+                config.pgs_basis_config.num_knots, 
+                config.pgs_basis_config.degree
+            )?
+        };
 
         // Apply the SAVED PGS constraint
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -198,17 +207,24 @@ mod internal {
             .z_transform;
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
-        // 2. Generate bases for PCs
+        // 2. Generate bases for PCs using saved knot vectors if available
         let mut pc_constrained_bases = Vec::new();
         for i in 0..config.pc_names.len() {
             let pc_col = pcs_new.column(i);
-            let (pc_basis_unc, _) = create_bspline_basis(
-                pc_col,
-                None,
-                config.pc_ranges[i],
-                config.pc_basis_configs[i].num_knots,
-                config.pc_basis_configs[i].degree
-            )?;
+            let pc_name = &config.pc_names[i];
+            let (pc_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get(pc_name) {
+                // Use saved knot vector for exact reproduction
+                basis::create_bspline_basis_with_knots(pc_col, saved_knots.view(), config.pc_basis_configs[i].degree)?
+            } else {
+                // Fallback to original method for backward compatibility
+                create_bspline_basis(
+                    pc_col,
+                    None,
+                    config.pc_ranges[i],
+                    config.pc_basis_configs[i].num_knots,
+                    config.pc_basis_configs[i].degree
+                )?
+            };
 
             // Apply the SAVED PC constraint
             let pc_name = &config.pc_names[i];
@@ -238,12 +254,23 @@ mod internal {
         }
 
         // 4. Interaction effects
-        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects
+        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects  
             let pgs_weight_col = pgs_basis_unc.column(m + 1); // Use UNCONSTRAINED PGS basis column
-            for pc_basis in &pc_constrained_bases {
-                for col in pc_basis.axis_iter(Axis(1)) {
-                    let interaction_col = &col * &pgs_weight_col;
-                    owned_cols.push(interaction_col.to_owned());
+            for (pc_idx, pc_basis) in pc_constrained_bases.iter().enumerate() {
+                let pc_name = &config.pc_names[pc_idx];
+                
+                // Create raw interaction terms
+                let interaction_raw: Array2<f64> = pc_basis * &pgs_weight_col.view().insert_axis(Axis(1));
+                
+                // Apply saved interaction constraint
+                let interaction_key = format!("interaction_pgs_B{}_{}", m + 1, pc_name);
+                let interaction_z = &config.constraints.get(&interaction_key)
+                    .ok_or_else(|| ModelError::ConstraintMissing(interaction_key.clone()))?
+                    .z_transform;
+                let interaction_constrained = interaction_raw.dot(interaction_z);
+                
+                for col in interaction_constrained.axis_iter(Axis(1)) {
+                    owned_cols.push(col.to_owned());
                 }
             }
         }
@@ -277,7 +304,7 @@ mod internal {
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
         // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
-        let num_pgs_main_effects = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        let num_pgs_main_effects = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // after constraint
         for m in 1..=num_pgs_main_effects {
             let pgs_key = format!("pgs_B{}", m);
             if let Some(pc_map) = coeffs.interaction_effects.get(&pgs_key) {

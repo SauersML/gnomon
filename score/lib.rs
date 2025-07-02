@@ -9,3 +9,7 @@ pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
 pub mod types;
+
+// Add calibrate module
+#[path = "../calibrate/lib.rs"]
+pub mod calibrate;

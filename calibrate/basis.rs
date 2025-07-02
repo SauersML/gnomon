@@ -67,6 +67,29 @@ pub enum BasisError {
 /// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
 ///     The number of basis functions is `num_internal_knots + degree + 1`.
 /// 2.  The **full knot vector** used to generate the basis. This is needed for the penalty matrix.
+/// Creates a B-spline basis matrix using a pre-computed knot vector.
+/// This function is used during prediction to ensure exact reproduction of training basis.
+pub fn create_bspline_basis_with_knots(
+    data: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+
+    let num_basis_functions = knot_vector.len() - degree - 1;
+    let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+
+    // Evaluate the splines for each data point
+    for (i, &x) in data.iter().enumerate() {
+        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector);
+        basis_matrix.row_mut(i).assign(&basis_row);
+    }
+
+    Ok((basis_matrix, knot_vector.to_owned()))
+}
+
 pub fn create_bspline_basis(
     data: ArrayView1<f64>,
     training_data_for_quantiles: Option<ArrayView1<f64>>,

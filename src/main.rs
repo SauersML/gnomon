@@ -2,21 +2,11 @@ use clap::{Parser, Subcommand};
 use std::process;
 use std::path::PathBuf;
 
-// Include the calibrate module files
-#[path = "../calibrate/basis.rs"]
-mod basis;
-#[path = "../calibrate/data.rs"] 
-mod data;
-#[path = "../calibrate/estimate.rs"]
-mod estimate;
-#[path = "../calibrate/model.rs"]
-mod model;
-
 // Import the calibrate functionality
-use model::BasisConfig;
-use data::{load_prediction_data, load_training_data};
-use estimate::train_model;
-use model::{LinkFunction, ModelConfig, TrainedModel};
+use gnomon::calibrate::model::BasisConfig;
+use gnomon::calibrate::data::{load_prediction_data, load_training_data};
+use gnomon::calibrate::estimate::train_model;
+use gnomon::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 
 use clap::Args;
 use ndarray::{Array1, ArrayView1};
@@ -144,6 +134,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             pc_ranges,
             pc_names,
             constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
         };
 
         // Train the final model
