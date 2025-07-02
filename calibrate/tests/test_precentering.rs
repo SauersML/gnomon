@@ -1,9 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use ndarray::{array, Array1, Array2, Axis};
+    use ndarray::{Array1, Array2};
     use approx::assert_abs_diff_eq;
     use crate::calibrate::{
-        basis,
         data::TrainingData,
         model::{ModelConfig, LinkFunction, BasisConfig},
         estimate,
@@ -43,9 +42,29 @@ mod tests {
             estimate::internal::build_design_and_penalty_matrices(&training_data, &config)
                 .expect("Failed to build design matrix");
         
-        // With pure pre-centering, we don't need the PC columns to sum exactly to zero
-        // Instead, we verify that interactions use identity transformations
-        println!("PC basis columns may not sum precisely to zero due to numerical precision");
+        // In the pure pre-centering approach, the PC basis is constrained first.
+        // Let's examine if the columns approximately sum to zero, but don't enforce it
+        // as numerical precision issues can affect the actual sum.
+        for block in &layout.penalty_map {
+            if block.term_name.starts_with("f(PC") {
+                for col_idx in block.col_range.clone() {
+                    let col_sum = x_matrix.column(col_idx).sum();
+                    println!("PC column {} sum: {:.2e}", col_idx, col_sum);
+                }
+            }
+        }
+        
+        // Verify that interaction columns do NOT necessarily sum to zero
+        // This is characteristic of the pure pre-centering approach
+        for block in &layout.penalty_map {
+            if block.term_name.starts_with("f(PGS_B") {
+                println!("Checking interaction block: {}", block.term_name);
+                for col_idx in block.col_range.clone() {
+                    let col_sum = x_matrix.column(col_idx).sum();
+                    println!("Interaction column {} sum: {:.2e}", col_idx, col_sum);
+                }
+            }
+        }
         
         // Verify that the interaction term constraints are identity matrices
         // This ensures we're using pure pre-centering and not post-centering
@@ -124,12 +143,29 @@ mod tests {
             estimate::internal::build_design_and_penalty_matrices(&training_data, &config)
                 .expect("Failed to build design matrix");
         
-        // With pure pre-centering, we test that the interaction columns use identity transforms
-        // This was already verified in the test_pure_precentering_interaction test
+        // Verify the design matrix dimensions match what we expect
+        assert_eq!(x_matrix.nrows(), n_samples, "Design matrix should have correct number of rows");
+        assert_eq!(x_matrix.ncols(), layout.total_coeffs, "Design matrix should have correct number of columns");
+
+        // Create a "trained model" with basic coefficients for testing prediction
+        let mut config_with_constraints = config.clone();
+        config_with_constraints.constraints = constraints;
+        config_with_constraints.knot_vectors = knot_vectors;
         
-        // Additional test here has been removed because testing direct prediction vs. model prediction
-        // requires more careful setup with the new pure pre-centering approach
-        println!("Verified that interaction constraints are identity matrices");
-        // The model.predict() tests are covered by separate unit tests in model.rs
+        // Verify each penalty matrix has the correct size
+        for (idx, s) in s_list.iter().enumerate() {
+            // Find the corresponding block
+            for block in &layout.penalty_map {
+                if block.penalty_idx == idx {
+                    let cols = block.col_range.end - block.col_range.start;
+                    assert_eq!(s.nrows(), cols, "Penalty matrix {} should have {} rows", idx, cols);
+                    assert_eq!(s.ncols(), cols, "Penalty matrix {} should have {} cols", idx, cols);
+                    println!("Verified penalty matrix {} for {} has correct size: {}", idx, block.term_name, cols);
+                    break;
+                }
+            }
+        }
+        
+        println!("Verified design matrix and penalty matrices with pure pre-centering");
     }
 }

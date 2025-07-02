@@ -200,38 +200,6 @@ pub fn apply_sum_to_zero_constraint(
     Ok((constrained, z))
 }
 
-/// Centres every column of a design block so that **each column sums to zero** and
-/// returns a full-rank re-parameterisation (k-1 columns).
-///
-/// X = n × k
-/// returns (Xc, Z) with shape (n × (k-1), k × (k-1))  such that
-///    Xc = X · Z            and        1ᵀ Xc = 0ᵀ.
-pub fn centre_columns(
-    x: ArrayView2<f64>,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let (_, k) = x.dim();
-    assert!(k >= 2, "Need ≥2 columns to centre");
-
-    // --- (1) build centring matrix C = I - 1/k · 11ᵀ ------------------------
-    let mut c = Array2::<f64>::eye(k);
-    let f = 1.0 / k as f64;
-    for i in 0..k {
-        for j in 0..k {
-            c[(i, j)] -= f;
-        }
-    }
-
-    // --- (2) centre the block -----------------------------------------------
-    let x_centered = x.dot(&c);
-
-    // --- (3) drop one dof with the *existing* helper -------------------------
-    let (x_con, z_drop) = apply_sum_to_zero_constraint(x_centered.view())?;
-
-    // Full transform  Z = C · Z_drop   (k × (k-1))
-    let z_full = c.dot(&z_drop);
-
-    Ok((x_con, z_full))
-}
 
 /// Internal module for implementation details not exposed in the public API.
 mod internal {

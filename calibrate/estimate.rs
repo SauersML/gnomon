@@ -998,7 +998,7 @@ mod tests {
     
     // Full end-to-end test of the model training pipeline with realistic data
     #[test]
-    #[ignore] // Skip this test as it's unstable with BFGS line search failures
+    // Previously ignored due to BFGS line search failures, but now unignored to verify it works with pre-centering
     fn smoke_test_full_training_pipeline() {
         // Create a simple test case with clear class separation
         let n_samples = 120;
