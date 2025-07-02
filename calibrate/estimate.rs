@@ -230,7 +230,7 @@ mod internal {
             let pirls_result = self.execute_pirls_if_needed(p)?;
             let lambdas = p.mapv(f64::exp);
 
-            let s_lambda = construct_s_lambda(&lambdas, &self.s_list);
+            let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
 
             // Penalized log-likelihood part of the score.
             // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
@@ -275,7 +275,7 @@ mod internal {
     
             // --- Pre-compute shared matrices ---
             // S_λ = Σ λ_k S_k
-            let s_lambda = construct_s_lambda(&lambdas, &self.s_list);
+            let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
             // S_λ⁺ (Moore-Penrose pseudo-inverse for the log|S| term)
             let s_lambda_plus = pseudo_inverse(&s_lambda).map_err(Error::from)?;
     
@@ -323,12 +323,17 @@ mod internal {
                 let d_h_d_rho_k = d_xtwx_d_rho_k + &d_s_lambda_d_rho_k;
     
                 // Step 3f: Calculate the trace term tr(H⁻¹ * dH/dρ_k)
-                // This is solved efficiently as sum(diag(H⁻¹ * dH))
-                let log_det_h_deriv_term = 0.5 * h_penalized
-                    .solve_into(d_h_d_rho_k)
-                    .map_err(Error::from)?
-                    .diag()
-                    .sum();
+                // This is calculated efficiently by solving column-wise and summing diagonal
+                let mut trace_sum = 0.0;
+                for i in 0..d_h_d_rho_k.nrows() {
+                    let mut rhs = Array1::zeros(d_h_d_rho_k.nrows());
+                    rhs[i] = d_h_d_rho_k[(i, i)];
+                    let solution = h_penalized
+                        .solve_into(rhs)
+                        .map_err(Error::from)?;
+                    trace_sum += solution[i];
+                }
+                let log_det_h_deriv_term = 0.5 * trace_sum;
                 
                 // --- Final Assembly ---
                 // The gradient of the negative LAML score (-V) is the sum of the components.
@@ -386,15 +391,9 @@ mod internal {
 
             // Main effect for PGS (non-constant basis terms)
             let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
-            if pgs_main_basis_ncols > 0 {
-                penalty_map.push(PenalizedBlock {
-                    term_name: "f(PGS)".to_string(),
-                    col_range: pgs_main_cols.clone(),
-                    penalty_idx: penalty_idx_counter,
-                });
-                penalty_idx_counter += 1;
-            }
-            current_col += pgs_main_basis_ncols;
+            current_col += pgs_main_basis_ncols; // Still advance the column counter
+
+            // (The `if` block that pushed to `penalty_map` and incremented `penalty_idx_counter` is removed)
 
             // Interaction effects
             for m in 0..pgs_main_basis_ncols {
@@ -438,7 +437,7 @@ mod internal {
         
         // Apply sum-to-zero constraint to PGS main effects (excluding intercept)
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let (pgs_main_basis, pgs_z_transform) = 
+        let (pgs_main_basis, _pgs_z_transform) = 
             basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
 
         // 2. Generate constrained bases and unscaled penalty matrices for PCs
@@ -465,15 +464,8 @@ mod internal {
             s_list.push(z_transform.t().dot(&s_unconstrained.dot(&z_transform)));
         }
 
-        // 3. Create penalties for PGS main effect and interactions
-        if pgs_main_basis.ncols() > 0 {
-            // Transform the penalty matrix for PGS main effects: S_constrained = Z^T * S_unconstrained * Z
-            let pgs_s_unconstrained = create_difference_penalty_matrix(
-                pgs_main_basis_unc.ncols(),
-                config.penalty_order,
-            )?;
-            s_list.push(pgs_z_transform.t().dot(&pgs_s_unconstrained.dot(&pgs_z_transform)));
-        }
+        // 3. Create penalties for interaction effects only
+        // (The block for the main PGS effect penalty has been removed)
         for _ in 0..pgs_main_basis.ncols() {
             for i in 0..pc_constrained_bases.len() {
                 s_list.push(s_list[i].clone()); // Re-use the PC main effect penalty matrix
@@ -515,7 +507,7 @@ mod internal {
 
                 let pgs_col = pgs_main_basis.column(m_idx);
                 let pc_basis = &pc_constrained_bases[pc_idx];
-                let interaction_data = &pgs_col.to_shape((n_samples, 1)).unwrap() * pc_basis;
+                let interaction_data = &pgs_col.clone().into_shape_with_order((n_samples, 1)).unwrap() * pc_basis;
                 x_matrix
                     .slice_mut(s![.., block.col_range.clone()])
                     .assign(&interaction_data);
@@ -535,7 +527,7 @@ mod internal {
         config: &ModelConfig,
     ) -> Result<PirlsResult, EstimationError> {
         let lambdas = rho_vec.mapv(f64::exp);
-        let s_lambda = construct_s_lambda(&lambdas, s_list);
+        let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
 
         let mut beta = Array1::zeros(x.ncols());
         let mut last_deviance = f64::INFINITY;
@@ -582,13 +574,30 @@ mod internal {
     }
 
     /// Helper to construct the summed, weighted penalty matrix S_lambda.
-    fn construct_s_lambda(lambdas: &Array1<f64>, s_list: &[Array2<f64>]) -> Array2<f64> {
-        // This assumes s_list has the same number of elements as lambdas and corresponds
-        // to all penalized blocks in the model.
-        let mut s_lambda = Array2::zeros(s_list[0].raw_dim());
-        for (i, s_i) in s_list.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[i], s_i);
+    /// This version correctly builds a block-diagonal matrix based on the model layout.
+    fn construct_s_lambda(
+        lambdas: &Array1<f64>,
+        s_list: &[Array2<f64>],
+        layout: &ModelLayout,
+    ) -> Array2<f64> {
+        // Initialize a zero matrix with dimensions matching the full coefficient vector.
+        let mut s_lambda = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
+
+        // Iterate through the penalized blocks defined in the layout.
+        for block in &layout.penalty_map {
+            // Get the smoothing parameter (lambda) for this specific block.
+            let lambda_k = lambdas[block.penalty_idx];
+            
+            // Get the corresponding unscaled penalty matrix S_k.
+            let s_k = &s_list[block.penalty_idx];
+
+            // Get the slice of the full S_lambda matrix where this block belongs.
+            let mut target_block = s_lambda.slice_mut(s![block.col_range.clone(), block.col_range.clone()]);
+            
+            // Add the scaled penalty matrix to the target block.
+            target_block.scaled_add(lambda_k, s_k);
         }
+
         s_lambda
     }
 
@@ -677,14 +686,16 @@ mod internal {
         let mut pgs = vec![];
         let mut interaction_effects = HashMap::new();
 
+        // Extract the unpenalized PGS main effect coefficients
+        if layout.pgs_main_cols.len() > 0 {
+            pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
+        }
+
         for block in &layout.penalty_map {
             let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
             
             // This logic is now driven entirely by the term_name established in the layout
             match block.term_name.as_str() {
-                "f(PGS)" => {
-                    pgs = coeffs;
-                }
                 name if name.starts_with("f(PC") => {
                     let pc_name = name.replace("f(", "").replace(")", "");
                     pcs.insert(pc_name, coeffs);
@@ -702,11 +713,6 @@ mod internal {
                 _ => return Err(EstimationError::LayoutError(format!("Unknown term name in layout during coefficient mapping: {}", block.term_name))),
             }
         }
-        
-        // Handle the unpenalized part of the PGS main effect by taking the full slice
-        if layout.pgs_main_cols.len() > 0 && pgs.is_empty() {
-             pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
-        }
 
         Ok(MappedCoefficients {
             intercept,
@@ -722,7 +728,7 @@ mod internal {
 mod tests {
     use super::*;
     use crate::model::BasisConfig;
-    use ndarray::{array, Array};
+    use ndarray::Array;
 
     fn create_test_config() -> ModelConfig {
         ModelConfig {
@@ -766,8 +772,7 @@ mod tests {
         let model = result.unwrap();
 
         // Check that some lambdas were estimated.
-        assert!(model.estimated_lambdas.is_some());
-        let lambdas = model.estimated_lambdas.unwrap();
+        let lambdas = &model.lambdas;
         assert!(!lambdas.is_empty());
         assert!(lambdas.iter().all(|&l| l > 0.0));
     }
@@ -776,7 +781,7 @@ mod tests {
     fn test_layout_and_matrix_construction() {
         let n_samples = 50;
         let pgs = Array::linspace(0.0, 1.0, n_samples);
-        let pcs = Array::linspace(0.1, 0.9, n_samples).into_shape((n_samples, 1)).unwrap();
+        let pcs = Array::linspace(0.1, 0.9, n_samples).into_shape_with_order((n_samples, 1)).unwrap();
         let data = TrainingData { y: Array1::zeros(n_samples), p: pgs, pcs };
         
         let config = ModelConfig {
@@ -810,8 +815,7 @@ mod tests {
         assert_eq!(x.ncols(), expected_coeffs, "Design matrix column count mismatch");
 
         let expected_penalties = 1 // main PC
-            + 1 // main PGS
-            + num_pgs_main_effects; // one interaction penalty per PGS main effect basis fn
+            + num_pgs_main_effects; // one interaction penalty per PGS main effect basis fn (PGS main removed)
         assert_eq!(s_list.len(), expected_penalties, "Penalty list count mismatch");
         assert_eq!(layout.num_penalties, expected_penalties, "Layout penalty count mismatch");
     }
