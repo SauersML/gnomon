@@ -1,5 +1,5 @@
 use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::QR;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -158,30 +158,23 @@ pub fn create_difference_penalty_matrix(
 pub fn apply_sum_to_zero_constraint(
     basis_matrix: ArrayView2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let n_basis = basis_matrix.ncols();
+    let k = basis_matrix.ncols();
+    if k < 2 {
+        return Err(BasisError::InvalidDegree(k));        // cannot constrain a single column
+    }
 
-    // 1. Construct the constraint vector `c = B' * 1`.
-    // We want the sum over the data points for each basis function to be zero.
-    // This is equivalent to requiring the basis functions to be orthogonal to the intercept.
-    let constraint_vec = basis_matrix.sum_axis(Axis(0));
+    // --- build a full-rank null-space basis for 1ᵀ --------------------------
+    // Z has k rows and k-1 columns; each column sums to zero and the k-1 cols
+    // are linearly independent, so B·Z drops exactly one dof (the mean).
+    let mut z = Array2::<f64>::zeros((k, k - 1));
+    for j in 0..k - 1 {
+        z[[j, j]] = 1.0;          // identity block
+        z[[k - 1, j]] = -1.0;     // last row makes column sum zero
+    }
 
-    // Reshape into a column vector for QR decomposition.
-    let c = constraint_vec.to_shape((n_basis, 1)).unwrap();
-
-    // 2. Find the null space basis `Z` using QR decomposition.
-    // The QR decomposition of a vector `c` gives an orthogonal matrix `Q`
-    // whose first column is proportional to `c` and whose remaining columns
-    // are orthogonal to `c`, spanning its null space.
-    let (q, _r) = c.qr()?;
-    
-    // The transformation matrix Z is composed of all columns of Q except the first.
-    let z_transform = q.slice(s![.., 1..]).to_owned();
-
-    // 3. Create the new, constrained basis by projecting the original basis.
-    // B_constrained = B * Z
-    let constrained_basis = basis_matrix.dot(&z_transform);
-
-    Ok((constrained_basis, z_transform))
+    // project the original basis
+    let constrained = basis_matrix.dot(&z);
+    Ok((constrained, z))
 }
 
 /// Internal module for implementation details not exposed in the public API.

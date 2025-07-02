@@ -293,8 +293,19 @@ mod internal {
             let mut grad_of_neg_laml = Array1::zeros(p.len());
     
             for k in 0..p.len() {
-                // This is ∂S_λ/∂ρ_k = λ_k * S_k
-                let d_s_lambda_d_rho_k = lambdas[k] * &self.s_list[k];
+                // Embed λₖ S_k into a full-size zero matrix so it lines up with β
+                let mut d_s_lambda_d_rho_k = Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                
+                // locate the block this penalty acts on
+                for blk in &self.layout.penalty_map {
+                    if blk.penalty_idx == k {
+                        let mut tgt = d_s_lambda_d_rho_k
+                                      .slice_mut(s![blk.col_range.clone(),
+                                                    blk.col_range.clone()]);
+                        tgt.scaled_add(lambdas[k], &self.s_list[k]);    // same shape (b × b)
+                        break;
+                    }
+                }
     
                 // --- Component 1: Derivative of the deviance penalty term ---
                 // This is d/dρ_k [ 0.5 * β' * S_λ * β ] = 0.5 * β' * (λ_k S_k) * β
@@ -309,7 +320,7 @@ mod internal {
                 
                 // Step 3a: Calculate dβ/dρ_k using implicit differentiation.
                 // dβ/dρ_k = -H⁻¹ * (λ_k * S_k * β)
-                let rhs_for_d_beta = -lambdas[k] * self.s_list[k].dot(beta);
+                let rhs_for_d_beta = -d_s_lambda_d_rho_k.dot(beta);
                 let d_beta_d_rho_k = h_penalized
                     .solve_into(rhs_for_d_beta)
                     .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
@@ -369,6 +380,7 @@ mod internal {
 
     /// Information about a single penalized block of coefficients.
     #[derive(Clone)]
+    #[derive(Debug)]
     pub(super) struct PenalizedBlock {
         pub term_name: String,
         pub col_range: Range<usize>,
