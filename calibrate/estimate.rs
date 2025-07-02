@@ -130,7 +130,7 @@ pub fn train_model(
     Ok(TrainedModel {
         config: config.clone(),
         coefficients: mapped_coefficients,
-        lambdas: estimated_lambdas,
+        lambdas: final_lambda.to_vec(),
     })
 }
 
@@ -427,15 +427,19 @@ mod internal {
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), EstimationError> {
         let n_samples = data.y.len();
 
-        // 1. Generate basis for PGS
-        let (pgs_basis, _) = create_bspline_basis(
+        // 1. Generate basis for PGS and apply sum-to-zero constraint
+        let (pgs_basis_unc, _) = create_bspline_basis(
             data.p.view(),
             Some(data.p.view()),
             config.pgs_range,
             config.pgs_basis_config.num_knots,
             config.pgs_basis_config.degree,
         )?;
-        let pgs_main_basis = pgs_basis.slice(s![.., 1..]);
+        
+        // Apply sum-to-zero constraint to PGS main effects (excluding intercept)
+        let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
+        let (pgs_main_basis, pgs_z_transform) = 
+            basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
 
         // 2. Generate constrained bases and unscaled penalty matrices for PCs
         let mut pc_constrained_bases = Vec::new();
@@ -450,11 +454,12 @@ mod internal {
                 config.pc_basis_configs[i].num_knots,
                 config.pc_basis_configs[i].degree,
             )?;
-            // TODO: Fix apply_sum_to_zero_constraint function
-            let constrained_basis = pc_basis_unc.clone();
-            let z_transform = Array2::eye(pc_basis_unc.ncols());
+            // Apply sum-to-zero constraint to PC basis
+            let (constrained_basis, z_transform) = 
+                basis::apply_sum_to_zero_constraint(pc_basis_unc.view())?;
             pc_constrained_bases.push(constrained_basis);
 
+            // Transform the penalty matrix: S_constrained = Z^T * S_unconstrained * Z
             let s_unconstrained =
                 create_difference_penalty_matrix(pc_basis_unc.ncols(), config.penalty_order)?;
             s_list.push(z_transform.t().dot(&s_unconstrained.dot(&z_transform)));
@@ -462,10 +467,12 @@ mod internal {
 
         // 3. Create penalties for PGS main effect and interactions
         if pgs_main_basis.ncols() > 0 {
-            s_list.push(create_difference_penalty_matrix(
-                pgs_main_basis.ncols(),
+            // Transform the penalty matrix for PGS main effects: S_constrained = Z^T * S_unconstrained * Z
+            let pgs_s_unconstrained = create_difference_penalty_matrix(
+                pgs_main_basis_unc.ncols(),
                 config.penalty_order,
-            )?);
+            )?;
+            s_list.push(pgs_z_transform.t().dot(&pgs_s_unconstrained.dot(&pgs_z_transform)));
         }
         for _ in 0..pgs_main_basis.ncols() {
             for i in 0..pc_constrained_bases.len() {
@@ -618,7 +625,7 @@ mod internal {
             LinkFunction::Logit => {
                 let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
                 let weights = (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
-                let z = &eta + &((&y.view() - &mu) / &weights);
+                let z = eta + ((&y.view() - &mu) / &weights);
                 (mu, weights, z)
             }
             LinkFunction::Identity => {

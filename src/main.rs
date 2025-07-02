@@ -51,13 +51,21 @@ pub struct TrainArgs {
         #[arg(long, default_value = "2")]
         pub penalty_order: usize,
 
-        /// Maximum number of IRLS iterations
+        /// Maximum number of P-IRLS iterations for the inner loop (per REML step)
         #[arg(long, default_value = "50")]
-        pub max_iter: usize,
+        pub max_iterations: usize,
 
-        /// Convergence tolerance for IRLS
-        #[arg(long, default_value = "1e-6")]
-        pub tolerance: f64,
+        /// Convergence tolerance for the P-IRLS inner loop deviance change
+        #[arg(long, default_value = "1e-7")]
+        pub convergence_tolerance: f64,
+        
+        /// Maximum number of iterations for the outer REML/BFGS optimization loop
+        #[arg(long, default_value = "100")]
+        pub reml_max_iterations: u64,
+
+        /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
+        #[arg(long, default_value = "1e-3")]
+        pub reml_convergence_tolerance: f64,
     }
 
 #[derive(Args)]
@@ -119,15 +127,12 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.num_pcs
         ];
 
-        // Use default lambda value tuned for genomics applications
-        let lambda = 0.001;
-        println!("Using lambda: {:.6e}", lambda);
+        // Lambda values are now estimated automatically via REML
 
         // Create final model configuration
         let config = ModelConfig {
             link_function,
             penalty_order: args.penalty_order,
-            lambda,
             pgs_basis_config,
             pc_basis_configs,
             pgs_range,

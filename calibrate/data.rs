@@ -110,8 +110,29 @@ mod internal {
             None
         };
         let pgs = series_to_f64_array(df.column("score")?)?;
-        let pcs_polars = df.select(&pc_names)?.to_ndarray::<Float64Type>()?;
-        let pcs = Array2::from_shape_vec(pcs_polars.dim(), pcs_polars.into_raw_vec()).unwrap();
+        // For now, convert each column individually due to ndarray version conflicts
+        let mut pcs_vecs = Vec::new();
+        for col_name in &pc_names {
+            let series = df.column(col_name)?;
+            let col_array = series_to_f64_array(series)?;
+            pcs_vecs.push(col_array);
+        }
+        
+        // Stack columns to form the matrix
+        if pcs_vecs.is_empty() {
+            return Err(DataError::ColumnNotFound("No PC columns found".to_string()));
+        }
+        
+        let n_rows = pcs_vecs[0].len();
+        let n_cols = pcs_vecs.len();
+        let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
+        
+        // Column-major order for Array2
+        for col in pcs_vecs {
+            pcs_flat.extend_from_slice(col.as_slice().unwrap());
+        }
+        
+        let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat).unwrap();
 
         Ok((pgs, pcs, phenotype_opt))
     }
@@ -167,12 +188,8 @@ mod internal {
             .to_ndarray()?;
         
         // Convert from polars ndarray (0.15) to our ndarray (0.16)
-        Array1::from_shape_vec(polars_array.dim(), polars_array.into_raw_vec())
-            .map_err(|_| DataError::ColumnWrongType {
-                column_name: series.name().to_string(),
-                expected_type: "f64 (numeric)",
-                found_type: "conversion error".to_string(),
-            })
+        // Use to_vec() instead of into_raw_vec() since it's a view
+        Ok(Array1::from_vec(polars_array.to_vec()))
     }
 }
 
