@@ -265,7 +265,15 @@ mod internal {
         /// Compute the LAML cost (negative log-REML score) for BFGS optimization.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(p)?;
-            let lambdas = p.mapv(f64::exp);
+            let mut lambdas = p.mapv(f64::exp);
+            
+            // Apply lambda floor to prevent numerical issues and infinite wiggliness
+            const LAMBDA_FLOOR: f64 = 1e-8;
+            let floored_count = lambdas.iter().filter(|&&l| l < LAMBDA_FLOOR).count();
+            if floored_count > 0 {
+                log::warn!("Applied lambda floor to {} parameters (λ < {:.0e})", floored_count, LAMBDA_FLOOR);
+            }
+            lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
             let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
 
@@ -624,7 +632,12 @@ mod internal {
         layout: &ModelLayout,
         config: &ModelConfig,
     ) -> Result<PirlsResult, EstimationError> {
-        let lambdas = rho_vec.mapv(f64::exp);
+        let mut lambdas = rho_vec.mapv(f64::exp);
+        
+        // Apply lambda floor to prevent numerical issues
+        const LAMBDA_FLOOR: f64 = 1e-8;
+        lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
+        
         let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
 
         let mut beta = Array1::zeros(x.ncols());
@@ -666,7 +679,11 @@ mod internal {
             }
 
             let x_t_w = &x.t() * &weights;
-            let penalized_hessian = x_t_w.dot(&x) + &s_lambda;
+            let mut penalized_hessian = x_t_w.dot(&x) + &s_lambda;
+            
+            // Add numerical ridge for stability
+            penalized_hessian.diag_mut().mapv_inplace(|d| d + 1e-10);
+            
             let rhs = x_t_w.dot(&z);
             beta = penalized_hessian
                 .solve_into(rhs)
@@ -944,7 +961,7 @@ mod tests {
         // Check that some lambdas were estimated.
         let lambdas = &model.lambdas;
         assert!(!lambdas.is_empty());
-        assert!(lambdas.iter().all(|&l| l >= 0.0), "Some lambdas are negative: {:?}", lambdas);
+        assert!(lambdas.iter().all(|&l| l > 0.0), "Some lambdas are not positive: {:?}", lambdas);
     }
 
     #[test]
