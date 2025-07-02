@@ -299,31 +299,30 @@ mod internal {
         // Base case (d=0): For degree 0, only one basis function is non-zero (=1) in the interval.
         b[0] = 1.0;
 
-        // Iteratively compute values for higher degrees from d=1 up to the target degree.
+        // Iteratively compute values for higher degrees using Cox-de Boor recursion
         for d in 1..=degree {
-            // `b_old` holds the values from the previous degree (d-1). We clone it to
-            // read from while we write the new values for degree `d`.
-            let b_old = b.slice(s![..d]).to_owned();
-            b.fill(0.0); // Reset the current buffer.
+            let b_old = b.clone();
+            b.fill(0.0);
 
-            // In this loop, `b_old[j]` contributes to `b[j]` and `b[j+1]`.
-            for j in 0..d {
-                if b_old[j] == 0.0 { continue; } // Optimization: skip if parent is zero.
+            for j in 0..=d {
+                let i = mu - degree + j;
 
-                let i_knot = mu - d + 1 + j;
-
-                // First term of the recursion: Contribution from B_{i,d-1}(x)
-                let den1 = knots[i_knot + d] - knots[i_knot];
-                if den1 > 1e-12 { // Handle 0/0 for repeated knots 
-                    let w = (x_clamped - knots[i_knot]) / den1;
-                    b[j] += w * b_old[j];
+                // First term: contribution from B_{i,d-1}(x)
+                if j > 0 && j - 1 < b_old.len() && b_old[j - 1] != 0.0 {
+                    let den = knots[i + degree] - knots[i];
+                    if den > 1e-12 {
+                        let alpha = (x_clamped - knots[i]) / den;
+                        b[j] += alpha * b_old[j - 1];
+                    }
                 }
 
-                // Second term of the recursion: Contribution from B_{i,d-1}(x)
-                let den2 = knots[i_knot + d + 1] - knots[i_knot + 1];
-                if den2 > 1e-12 { // Handle 0/0 for repeated knots 
-                    let w = (knots[i_knot + d + 1] - x_clamped) / den2;
-                    b[j + 1] += w * b_old[j];
+                // Second term: contribution from B_{i+1,d-1}(x) 
+                if j < b_old.len() && b_old[j] != 0.0 {
+                    let den = knots[i + 1 + degree] - knots[i + 1];
+                    if den > 1e-12 {
+                        let beta = (knots[i + 1 + degree] - x_clamped) / den;
+                        b[j] += beta * b_old[j];
+                    }
                 }
             }
         }
