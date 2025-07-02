@@ -214,8 +214,8 @@ mod tests {
         format!("{}\n{}", header, data_rows)
     }
     
-    const TEST_HEADER: &str = "phenotype,score,PC1,PC2,extra_col";
-    const TEST_DATA_ROW: &str = "1,1.5,0.1,0.2,A";
+    const TEST_HEADER: &str = "phenotype\tscore\tPC1\tPC2\textra_col";
+    const TEST_DATA_ROW: &str = "1.0\t1.5\t0.1\t0.2\tA";
 
     #[test]
     fn test_load_training_data_success() {
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(data.pcs.shape(), &[30, 2]);
         assert_eq!(data.y[0], 1.0);
         assert_eq!(data.p[0], 1.5);
-        assert_eq!(data.pcs[[0, 1]], 0.2);
+        assert_eq!(data.pcs[[0, 0]], 0.1);
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_error_column_not_found() {
-        let content = generate_csv_content("phenotype,score,PC1", "1,1.5,0.1", 30);
+        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\t1.5\t0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 2).unwrap_err();
         match err {
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_error_missing_values() {
-        let content = generate_csv_content("phenotype,score,PC1", "1,,0.1", 30);
+        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\t\t0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
         match err {
@@ -267,14 +267,14 @@ mod tests {
 
     #[test]
     fn test_error_wrong_type() {
-        let content = generate_csv_content("phenotype,score,PC1", "1,not_a_number,0.1", 30);
+        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\tnot_a_number\t0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
         match err {
             DataError::ColumnWrongType { column_name, expected_type, found_type } => {
                 assert_eq!(column_name, "score");
                 assert_eq!(expected_type, "f64 (numeric)");
-                assert_eq!(found_type, "Utf8");
+                assert_eq!(found_type, "String");
             },
             _ => panic!("Expected ColumnWrongType error"),
         }
