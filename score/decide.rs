@@ -106,7 +106,7 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
 ///
 /// This is the most accurate logic, used when the meta-model determines
 /// that maximum core performance is critical and worth the per-variant
-/// overhead of calculating frequency.
+/// overhead of calculating frequency
 #[inline(always)]
 pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
     if ctx.n_cohort <= 20_000.0026_f32 {
