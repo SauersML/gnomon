@@ -32,7 +32,7 @@ use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, T
 
 // Ndarray and Linalg
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
+use ndarray_linalg::{Cholesky, Eigh, EigVals, Solve, UPLO};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -95,7 +95,17 @@ pub fn train_model(
     let cost_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> f64 {
         // Convert from bfgs ndarray (0.11.2) to our ndarray version (0.16.1)
         let rho = Array1::from_vec(rho_bfgs.to_vec());
-        reml_state_cost.compute_cost(&rho).unwrap_or(f64::INFINITY)
+        match reml_state_cost.compute_cost(&rho) {
+            Ok(cost) if cost.is_finite() => cost,
+            Ok(cost) => {
+                log::warn!("Non-finite cost encountered: {}, returning large finite value", cost);
+                1e10 // Return a large but finite value
+            }
+            Err(e) => {
+                log::warn!("Cost computation failed: {:?}, returning large finite value", e);
+                1e10 // Return a large but finite value instead of infinity
+            }
+        }
     };
     
     let gradient_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> ndarray_bfgs::Array1<f64> {
@@ -109,12 +119,23 @@ pub fn train_model(
     // 4. Define the initial guess for log-smoothing parameters (rho).
     let initial_rho = Array1::zeros(layout.num_penalties);
 
+    // 4a. Check that the initial cost is finite before starting BFGS
+    let initial_cost = reml_state_arc.compute_cost(&initial_rho)?;
+    if !initial_cost.is_finite() {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "Initial cost is not finite: {}. Cannot start BFGS optimization.", initial_cost
+        )));
+    }
+    log::info!("Initial REML cost: {:.6}", initial_cost);
+
     // 5. Run the BFGS optimizer.
     // Convert to bfgs crate's ndarray version (0.11.2)
     let initial_rho_bfgs = ndarray_bfgs::Array1::from_vec(initial_rho.to_vec());
     
+    eprintln!("Starting BFGS optimization with {} parameters...", initial_rho.len());
     let final_rho_bfgs = bfgs::bfgs(initial_rho_bfgs, cost_fn, gradient_fn)
         .map_err(|e| EstimationError::RemlOptimizationFailed(format!("BFGS failed: {:?}", e)))?;
+    eprintln!("BFGS optimization completed.");
     
     // Convert back to our ndarray version
     let final_rho = Array1::from_vec(final_rho_bfgs.to_vec());
@@ -259,11 +280,27 @@ mod internal {
 
             // Log-determinant of the penalized Hessian.
             // Using Cholesky decomposition: log|H| = 2 * sum(log(diag(L)))
-            let log_det_h = pirls_result
-                .penalized_hessian
-                .cholesky(UPLO::Lower)
-                .map(|l| 2.0 * l.diag().mapv(f64::ln).sum())
-                .unwrap_or(f64::NEG_INFINITY); // A large negative value if not positive definite
+            let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
+                Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
+                Err(_) => {
+                    // If Cholesky fails (matrix not positive definite), fall back to eigenvalue method
+                    // This prevents infinite costs that crash BFGS
+                    log::warn!("Cholesky decomposition failed for penalized Hessian, using eigenvalue fallback");
+                    
+                    // Compute eigenvalues and use only positive ones for log-determinant
+                    let eigenvals = pirls_result.penalized_hessian.eigvals()
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                    
+                    // Add a small ridge to ensure numerical stability
+                    let ridge = 1e-8;
+                    let stabilized_log_det: f64 = eigenvals.iter()
+                        .map(|&ev| (ev.re + ridge).max(ridge)) // Use only real part, ensure positive
+                        .map(|ev| ev.ln())
+                        .sum();
+                    
+                    stabilized_log_det
+                }
+            };
 
             // The LAML score is Lp + 0.5*log|S| - 0.5*log|H|
             // We return the *negative* because argmin minimizes.
@@ -817,6 +854,62 @@ mod tests {
         let lambdas = &model.lambdas;
         assert!(!lambdas.is_empty());
         assert!(lambdas.iter().all(|&l| l > 0.0));
+    }
+
+    #[test]
+    fn test_minimal_bfgs_failure_replication() {
+        // Replicate the exact conditions that cause BFGS to fail
+        let n_samples = 50; // Smaller than the full test for speed
+        let mut y = Array::from_elem(n_samples, 0.0);
+        y.slice_mut(s![n_samples / 2..]).fill(1.0);
+        let p = Array::linspace(-2.0, 2.0, n_samples);
+        let pcs = Array::linspace(-2.5, 2.5, n_samples)
+            .into_shape_with_order((n_samples, 1))
+            .unwrap();
+        let data = TrainingData { y, p, pcs };
+
+        // Use the same config but smaller basis to speed up
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-7,
+            max_iterations: 15,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 15,
+            pgs_basis_config: BasisConfig {
+                num_knots: 3, // Smaller than original 5
+                degree: 3,
+            },
+            pc_basis_configs: vec![BasisConfig {
+                num_knots: 2, // Smaller than original 4
+                degree: 3,
+            }],
+            pgs_range: (-3.0, 3.0),
+            pc_ranges: vec![(-3.0, 3.0)],
+            pc_names: vec!["PC1".to_string()],
+            constraints: HashMap::new(),
+        };
+
+        // Test that we can at least compute cost without getting infinity
+        let (x_matrix, s_list, layout, _) =
+            internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        
+        let reml_state = internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
+        
+        // Try the initial rho = [0, 0] that causes the problem
+        let initial_rho = Array1::zeros(layout.num_penalties);
+        let cost_result = reml_state.compute_cost(&initial_rho);
+        
+        // This should not be infinite!
+        match cost_result {
+            Ok(cost) => {
+                assert!(cost.is_finite(), "Cost should be finite, got: {}", cost);
+                println!("Initial cost is finite: {}", cost);
+            }
+            Err(e) => {
+                panic!("Cost computation failed: {:?}", e);
+            }
+        }
     }
 
     #[test]
