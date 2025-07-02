@@ -8,7 +8,7 @@
 
 [package]
 name = "gnomon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024" # And nightly is required
 description = "A high-performance engine for polygenic score calculation."
 repository = "https://github.com/SauersML/gnomon/"
@@ -24,13 +24,13 @@ path = "src/main.rs"
 
 [dependencies]
 ahash = "0.8.12"
-clap = { version = "4.5.39", features = ["derive"] }
+clap = { version = "4.5.40", features = ["derive"] }
 memmap2 = "0.9.5"
 rayon = "1.10.0"
-thread_local = "1.1.8"
+thread_local = "1.1.9"
 crossbeam-queue = "0.3.12"
 sysinfo = "0.35.2"
-tokio = { version = "1.45.1", features = ["sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1.46.0", features = ["sync", "rt-multi-thread", "macros"] }
 num_cpus = "1.17.0"
 cache-size = "0.7.0"
 ryu = "1.0.20"
@@ -52,7 +52,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 toml = "0.8.23"
 polars = { version = "0.43", features = ["lazy", "csv", "ndarray"] }
-wolfe_bfgs = "0.1.0"
+wolfe_bfgs = "0.1.1"
 log = "0.4.27"
 
 [profile.release]
@@ -74,7 +74,7 @@ no-inline-profiling = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
-tempfile = "3.13"
+tempfile = "3.20"
 approx = "0.5"
 
 [[bench]]
