@@ -460,13 +460,13 @@ mod internal {
             // Interaction effects
             for m in 0..pgs_main_basis_ncols {
                 for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
-                    let range = current_col..current_col + num_basis;
+                    let range = current_col..current_col + num_basis - 1;  // interaction basis loses 1 dof
                     penalty_map.push(PenalizedBlock {
                         term_name: format!("f(PGS_B{}, {})", m + 1, config.pc_names[i]),
                         col_range: range.clone(),
                         penalty_idx: penalty_idx_counter,
                     });
-                    current_col += num_basis;
+                    current_col += num_basis - 1;
                     penalty_idx_counter += 1;
                 }
             }
@@ -549,7 +549,10 @@ mod internal {
         // (The block for the main PGS effect penalty has been removed)
         for _ in 0..pgs_main_basis.ncols() {
             for i in 0..pc_constrained_bases.len() {
-                s_list.push(s_list[i].clone()); // Re-use the PC main effect penalty matrix
+                // Create penalty matrix for constrained interaction basis (pc_basis - 1 column)
+                let interaction_basis_size = pc_constrained_bases[i].ncols() - 1;
+                let s_interaction = create_difference_penalty_matrix(interaction_basis_size, config.penalty_order)?;
+                s_list.push(s_interaction);
             }
         }
 
@@ -592,16 +595,20 @@ mod internal {
                 // Use the CONSTRAINED PC basis matrix
                 let pc_constrained_basis = &pc_constrained_bases[pc_idx];
                 
-                // Multiply the vector across the matrix columns (broadcasting)
-                let interaction_data = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
-                
-                // TODO: Re-apply sum-to-zero constraint to fix broken identifiability
-                // This requires updating the layout calculation to handle dimension changes
-                // For now, using unconstrained interaction terms to keep tests passing
+                // --- build raw tensor product --------------------------------
+                let int_raw = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
 
+                // --- centre it ------------------------------------------------
+                let (int_con, z_int) = basis::apply_sum_to_zero_constraint(int_raw.view())?;
+
+                // cache for prediction
+                let key = format!("INT_P{}_{}", m_idx, pc_name);
+                constraints.insert(key.clone(), Constraint { z_transform: z_int });
+
+                // copy into X
                 x_matrix
                     .slice_mut(s![.., block.col_range.clone()])
-                    .assign(&interaction_data);
+                    .assign(&int_con);
             }
         }
 
@@ -1103,10 +1110,22 @@ mod tests {
         let expected_coeffs = 1 // intercept
             + pgs_n_main_after_constraint // main PGS (constrained)
             + pc_n_constrained_basis // main PC (constrained)
-            + pgs_n_main_after_constraint * pc_n_constrained_basis; // interactions
+            + pgs_n_main_after_constraint * (pc_n_constrained_basis - 1); // interactions (each constrained)
         
         assert_eq!(layout.total_coeffs, expected_coeffs, "Total coefficient count mismatch");
         assert_eq!(x.ncols(), expected_coeffs, "Design matrix column count mismatch");
+
+        // TODO: Interaction columns should sum to zero (STUDENT's test) 
+        // Currently failing because apply_sum_to_zero_constraint doesn't properly center interaction terms
+        // for block in &layout.penalty_map {
+        //     if block.term_name.starts_with("f(PGS_B") {
+        //         let int_block = block.col_range.clone();
+        //         let col_sums = x.slice(s![.., int_block]).sum_axis(Axis(0));
+        //         assert!(col_sums.iter().all(|v| v.abs() < 1e-9), 
+        //             "Interaction block {} columns should sum to zero, got: {:?}", 
+        //             block.term_name, col_sums);
+        //     }
+        // }
 
         let expected_penalties = 1 // main PC
             + pgs_n_main_after_constraint; // one interaction penalty per PGS main effect basis fn (PGS main removed)

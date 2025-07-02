@@ -207,6 +207,13 @@ mod internal {
             .z_transform;
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
+        // helper closure to fetch a Z from model or panic nicely
+        let lookup_z = |name: &str| -> Result<&Array2<f64>, ModelError> {
+            Ok(&config.constraints.get(name)
+                .ok_or_else(|| ModelError::ConstraintMissing(name.to_string()))?
+                .z_transform)
+        };
+
         // 2. Generate bases for PCs using saved knot vectors if available
         let mut pc_constrained_bases = Vec::new();
         for i in 0..config.pc_names.len() {
@@ -254,12 +261,19 @@ mod internal {
         }
 
         // 4. Interaction effects
-        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects
-            let pgs_weight_col = pgs_basis_unc.column(m + 1); // Use UNCONSTRAINED PGS basis column
-            for pc_basis in &pc_constrained_bases {
-                for col in pc_basis.axis_iter(Axis(1)) {
-                    let interaction_col = &col * &pgs_weight_col;
-                    owned_cols.push(interaction_col.to_owned());
+        for m in 0..pgs_main_basis.ncols() {
+            let pgs_weight_col = pgs_basis_unc.column(m + 1);       // unconstrained
+            for (pc_idx, pc_basis_con) in pc_constrained_bases.iter().enumerate() {
+                // raw tensor product
+                let int_raw = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
+
+                // centre with saved Z
+                let key = format!("INT_P{}_{}", m, config.pc_names[pc_idx]);
+                let z_int = lookup_z(&key)?;
+                let int_con = int_raw.dot(z_int);
+
+                for col in int_con.axis_iter(Axis(1)) {
+                    owned_cols.push(col.to_owned());
                 }
             }
         }
