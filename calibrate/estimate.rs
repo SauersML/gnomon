@@ -947,11 +947,10 @@ mod tests {
         }
     }
 
-    // This test ensures core components of the model estimation process work correctly
-    // without requiring full REML convergence which may be sensitive to specific data patterns
+    // Component level test to verify individual steps work correctly
     #[test]
     fn test_model_estimation_components() {
-        let n_samples = 100; // Reduced from 200 for easier testing
+        let n_samples = 100;
         let mut y = Array::from_elem(n_samples, 0.0);
         y.slice_mut(s![n_samples / 2..]).fill(1.0);
         let p = Array::linspace(-1.0, 1.0, n_samples);
@@ -960,7 +959,6 @@ mod tests {
             .unwrap();
         let data = TrainingData { y, p, pcs };
 
-        // Create a standard configuration with good statistical properties
         let config = create_test_config();
         
         // 1. Test that we can construct the design and penalty matrices
@@ -987,9 +985,64 @@ mod tests {
         let pirls_result = internal::fit_model_for_fixed_rho(
             test_rho.view(), x_matrix.view(), data.y.view(), &s_list, &layout, &config);
         assert!(pirls_result.is_ok(), "P-IRLS failed to converge: {:?}", pirls_result.err());
+    }
+    
+    // Full end-to-end test of the model training pipeline with realistic data
+    #[test]
+    fn smoke_test_full_training_pipeline() {
+        // Create a simple test case with clear class separation
+        let n_samples = 120;
         
-        // Note: We skip testing full BFGS optimization which can be sensitive to specific test data
-        // The wolfe_bfgs library is assumed to work correctly for general optimization problems
+        // Create binary outcomes with a clear threshold
+        let mut y = Array::from_elem(n_samples, 0.0);
+        y.slice_mut(s![n_samples / 2..]).fill(1.0);
+        
+        // Generate PGS values with a clear separation pattern 
+        // Use different ranges for each class to make the model easier to fit
+        let mut p = Array::zeros(n_samples);
+        p.slice_mut(s![..n_samples/2]).assign(&Array::linspace(-2.0, -0.5, n_samples/2));
+        p.slice_mut(s![n_samples/2..]).assign(&Array::linspace(0.5, 2.0, n_samples/2));
+        
+        // Create a single PC with meaningful pattern
+        let mut pcs = Array::zeros((n_samples, 1));
+        for i in 0..n_samples {
+            // Higher PC values for higher class
+            if i < n_samples / 2 {
+                pcs[[i, 0]] = -1.0 + 2.0 * (i as f64) / (n_samples as f64);
+            } else {
+                pcs[[i, 0]] = 0.0 + 2.0 * ((i - n_samples/2) as f64) / (n_samples as f64);
+            }
+        }
+        
+        let data = TrainingData { y, p, pcs };
+
+        // Use more appropriate test configuration
+        let mut config = create_test_config();
+        // We want fewer knots for a simple test problem
+        config.pgs_basis_config.num_knots = 2;
+        config.pc_basis_configs[0].num_knots = 2;
+        // But we want good statistical properties
+        config.convergence_tolerance = 1e-6;
+        config.reml_convergence_tolerance = 1e-3;
+        
+        // For test purposes, create clearly separated data that can be fitted reliably
+        
+        // Run the full model training pipeline
+        let result = train_model(&data, &config);
+
+        // Verify successful training
+        assert!(result.is_ok(), "Full model training failed: {:?}", result.err());
+        
+        let model = result.unwrap();
+
+        // Check that smoothing parameters were estimated
+        let lambdas = &model.lambdas;
+        assert!(!lambdas.is_empty());
+        assert!(lambdas.iter().all(|&l| l > 0.0), "Some lambdas are not positive: {:?}", lambdas);
+        
+        // Check that coefficients were estimated
+        assert!(model.coefficients.main_effects.pcs.contains_key("PC1"));
+        assert!(!model.coefficients.main_effects.pgs.is_empty());
     }
 
     #[test]
