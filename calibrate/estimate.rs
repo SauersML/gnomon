@@ -32,7 +32,7 @@ pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    log::info!(
+    println!(
         "Starting model training with lambda = {:.4e}, penalty order = {}, {} total samples.",
         config.lambda,
         config.penalty_order,
@@ -43,7 +43,7 @@ pub fn train_model(
     //    non-iterative part, translating the model formula into matrices.
     let (x_matrix, penalty_matrix, layout) =
         internal::build_design_and_penalty_matrices(data, config)?;
-    log::info!(
+    println!(
         "Constructed design matrix with {} samples and {} total coefficients.",
         x_matrix.nrows(),
         x_matrix.ncols()
@@ -72,7 +72,7 @@ pub fn train_model(
         let deviance_change = (last_deviance - deviance).abs();
         last_deviance_change = deviance_change;
 
-        log::debug!(
+        println!(
             "Iter {: >3}: Deviance = {:.6}, Change = {:.6e}",
             iter,
             deviance,
@@ -80,7 +80,7 @@ pub fn train_model(
         );
 
         if deviance_change < config.convergence_tolerance {
-            log::info!(
+            println!(
                 "IRLS converged after {} iterations. Final Deviance: {:.6}",
                 iter,
                 deviance

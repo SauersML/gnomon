@@ -119,8 +119,11 @@ mod internal {
         path: &str,
         required_cols: &[String],
     ) -> Result<DataFrame, DataError> {
-        log::info!("Loading data from '{}'", path);
-        let lf = LazyCsvReader::new(path).with_infer_schema_length(Some(100)).finish()?;
+        println!("Loading data from '{}'", path);
+        let lf = LazyCsvReader::new(path)
+            .with_separator(b'\t')
+            .with_infer_schema_length(Some(100))
+            .finish()?;
 
         let available_cols: HashSet<_> = lf.schema()?.iter_names().map(|s| s.to_string()).collect();
         for col_name in required_cols {
@@ -128,11 +131,11 @@ mod internal {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-        log::debug!("All required columns found: {:?}", required_cols);
+        println!("All required columns found: {:?}", required_cols);
 
         let col_exprs: Vec<Expr> = required_cols.iter().map(|name| col(name)).collect();
         let df = lf.select(col_exprs).collect()?;
-        log::info!("Successfully loaded {} rows.", df.height());
+        println!("Successfully loaded {} rows.", df.height());
 
         if df.height() < MINIMUM_ROWS {
             return Err(DataError::InsufficientRows {
@@ -145,7 +148,7 @@ mod internal {
                 return Err(DataError::MissingValuesFound(col_name.clone()));
             }
         }
-        log::debug!("Data validation successful: no missing values found.");
+        println!("Data validation successful: no missing values found.");
         Ok(df)
     }
 
