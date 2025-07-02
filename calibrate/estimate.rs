@@ -1286,6 +1286,7 @@ mod tests {
         let pgs_n_basis = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1; // 6
         let pc_n_basis = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5
 
+        // After sum-to-zero constraint is applied
         let pc_n_constrained_basis = pc_n_basis - 1; // 4
         let pgs_n_main_before_constraint = pgs_n_basis - 1; // 5 (excluding intercept)
         let pgs_n_main_after_constraint = pgs_n_main_before_constraint - 1; // 4 (after constraint)
@@ -1293,20 +1294,20 @@ mod tests {
         let expected_coeffs = 1 // intercept
             + pgs_n_main_after_constraint // main PGS (constrained)
             + pc_n_constrained_basis // main PC (constrained)
-            + pgs_n_main_after_constraint * pc_n_constrained_basis; // interactions (with pure pre-centering)
+            + pgs_n_main_after_constraint * pc_n_constrained_basis; // interactions with pure pre-centering
         
         assert_eq!(layout.total_coeffs, expected_coeffs, "Total coefficient count mismatch");
         assert_eq!(x.ncols(), expected_coeffs, "Design matrix column count mismatch");
 
-        // For test_layout_and_matrix_construction, we'll just check if the columns are close to zero sum
-        // instead of requiring strict zero sum which depends on the exact data used
+        // Verify the structure of interaction blocks with pre-centering
         for block in &layout.penalty_map {
             if block.term_name.starts_with("f(PGS_B") {
-                // With pure pre-centering, we don't expect the interaction columns to sum to zero
-                // Since we're using the unconstrained PGS basis with the constrained PC basis
+                // With pure pre-centering, the interaction tensor product uses:
+                // - Unconstrained PGS basis column as weight
+                // - Constrained PC basis directly
+                // So each interaction block should have the same number of columns as the constrained PC basis
                 
-                // Verify that the shape is correct
-                let expected_cols = pc_n_constrained_basis; // With pure pre-centering, same size as PC basis
+                let expected_cols = pc_n_constrained_basis;
                 let actual_cols = block.col_range.end - block.col_range.start;
                 
                 assert_eq!(actual_cols, expected_cols,
@@ -1317,9 +1318,27 @@ mod tests {
             }
         }
 
-        let expected_penalties = 1 // main PC
-            + pgs_n_main_after_constraint; // one interaction penalty per PGS main effect basis function
+        // Penalty count check
+        // Each PC main effect has one penalty, and each PGS basis function creates one interaction penalty per PC
+        let expected_penalties = 1 // main PC effect
+            + pgs_n_main_after_constraint; // interaction penalties (one per PGS basis function)
+            
         assert_eq!(s_list.len(), expected_penalties, "Penalty list count mismatch");
         assert_eq!(layout.num_penalties, expected_penalties, "Layout penalty count mismatch");
+        
+        // Verify that S matrices have correct dimensions
+        for (i, s) in s_list.iter().enumerate() {
+            assert_eq!(s.nrows(), s.ncols(), "Penalty matrix {} is not square", i);
+            
+            if i == 0 {
+                // PC main effect penalty
+                assert_eq!(s.nrows(), pc_n_constrained_basis, 
+                    "PC main effect penalty has wrong dimensions");
+            } else {
+                // Interaction penalties with pure pre-centering should match PC basis dimensions
+                assert_eq!(s.nrows(), pc_n_constrained_basis,
+                    "Interaction penalty {} has wrong dimensions", i);
+            }
+        }
     }
 }
