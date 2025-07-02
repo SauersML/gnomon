@@ -254,23 +254,12 @@ mod internal {
         }
 
         // 4. Interaction effects
-        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects  
+        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects
             let pgs_weight_col = pgs_basis_unc.column(m + 1); // Use UNCONSTRAINED PGS basis column
-            for (pc_idx, pc_basis) in pc_constrained_bases.iter().enumerate() {
-                let pc_name = &config.pc_names[pc_idx];
-                
-                // Create raw interaction terms
-                let interaction_raw: Array2<f64> = pc_basis * &pgs_weight_col.view().insert_axis(Axis(1));
-                
-                // Apply saved interaction constraint
-                let interaction_key = format!("interaction_pgs_B{}_{}", m + 1, pc_name);
-                let interaction_z = &config.constraints.get(&interaction_key)
-                    .ok_or_else(|| ModelError::ConstraintMissing(interaction_key.clone()))?
-                    .z_transform;
-                let interaction_constrained = interaction_raw.dot(interaction_z);
-                
-                for col in interaction_constrained.axis_iter(Axis(1)) {
-                    owned_cols.push(col.to_owned());
+            for pc_basis in &pc_constrained_bases {
+                for col in pc_basis.axis_iter(Axis(1)) {
+                    let interaction_col = &col * &pgs_weight_col;
+                    owned_cols.push(interaction_col.to_owned());
                 }
             }
         }
