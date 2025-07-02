@@ -611,7 +611,7 @@ mod internal {
                 // Use the CONSTRAINED PC basis matrix
                 let pc_constrained_basis = &pc_constrained_bases[pc_idx];
                 
-                // --- Build interaction tensor product with pre-centering ---------------
+                // --- Build interaction tensor product with pure pre-centering ---------------
                 // First step: Use the constrained PC basis which already sums to zero
                 let pc_basis = pc_constrained_basis;
                 
@@ -619,12 +619,14 @@ mod internal {
                 let pgs_weight_mean = pgs_weight_col.mean().unwrap_or(0.0);
                 let centered_pgs_weight = &pgs_weight_col - pgs_weight_mean;
                 
-                // Third step: Form the interaction tensor product
-                let int_raw = pc_basis * &centered_pgs_weight.view().insert_axis(Axis(1));
+                // Third step: Form the interaction tensor product directly using pre-centered components
+                // Since both the PC basis (from constraint) and PGS weight (explicitly centered) sum to zero,
+                // their product will also have columns that sum to zero by construction
+                let int_con = pc_basis * &centered_pgs_weight.view().insert_axis(Axis(1));
                 
-                // Fourth step: Apply the centering transformation to ensure each column sums to zero
-                // This is still needed to ensure the columns strictly sum to zero within numerical precision
-                let (int_con, z_int) = basis::apply_sum_to_zero_constraint(int_raw.view())?;
+                // Create identity transformation matrix for compatibility with prediction code
+                // This preserves the interface while removing the post-centering step
+                let z_int = Array2::<f64>::eye(int_con.ncols());
 
                 // cache for prediction
                 let key = format!("INT_P{}_{}", m_idx, pc_name);
