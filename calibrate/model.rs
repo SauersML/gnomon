@@ -33,7 +33,6 @@ pub struct BasisConfig {
 pub struct ModelConfig {
     pub link_function: LinkFunction,
     pub penalty_order: usize,
-    pub lambda: f64,
     pub pgs_basis_config: BasisConfig,
     pub pc_basis_configs: Vec<BasisConfig>,
     // Data-dependent parameters saved from training are crucial for prediction.
@@ -71,6 +70,8 @@ pub struct MainEffects {
 pub struct TrainedModel {
     pub config: ModelConfig,
     pub coefficients: MappedCoefficients,
+    /// Estimated smoothing parameters from REML
+    pub lambdas: Vec<f64>,
 }
 
 /// Custom error type for model loading, saving, and prediction.

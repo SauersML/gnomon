@@ -1,4 +1,5 @@
-use ndarray::{s, Array, Array1, Array2, ArrayView1, Axis};
+use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray_linalg::QR;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,7 +16,7 @@ pub enum KnotStrategy {
 }
 
 /// A comprehensive error type for all operations within the basis module.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum BasisError {
     #[error("Spline degree must be at least 1, but was {0}.")]
     InvalidDegree(usize),
@@ -34,6 +35,9 @@ pub enum BasisError {
 
     #[error("Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis}).")]
     InvalidPenaltyOrder { order: usize, num_basis: usize },
+
+    #[error("QR decomposition failed while applying constraints: {0}")]
+    LinalgError(#[from] ndarray_linalg::error::LinalgError),
 }
 
 /// Creates a B-spline basis expansion matrix and its corresponding knot vector.
@@ -136,10 +140,51 @@ pub fn create_difference_penalty_matrix(
     Ok(s)
 }
 
+/// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
+///
+/// This is achieved by reparameterizing the basis to be orthogonal to the intercept.
+/// In GAMs, this constraint removes the confounding between the intercept and smooth functions.
+///
+/// # Arguments
+/// * `basis_matrix`: An `ArrayView2<f64>` of the original, unconstrained basis matrix.
+///
+/// # Returns
+/// A tuple containing:
+/// 1. The new, constrained basis matrix (with one fewer column).
+/// 2. The transformation matrix `Z` used to create it.
+pub fn apply_sum_to_zero_constraint(
+    basis_matrix: ArrayView2<f64>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let n_basis = basis_matrix.ncols();
+
+    // 1. Construct the constraint vector `c = B' * 1`.
+    // We want the sum over the data points for each basis function to be zero.
+    // This is equivalent to requiring the basis functions to be orthogonal to the intercept.
+    let constraint_vec = basis_matrix.sum_axis(Axis(0));
+
+    // Reshape into a column vector for QR decomposition.
+    let c = constraint_vec.to_shape((n_basis, 1)).unwrap();
+
+    // 2. Find the null space basis `Z` using QR decomposition.
+    // The QR decomposition of a vector `c` gives an orthogonal matrix `Q`
+    // whose first column is proportional to `c` and whose remaining columns
+    // are orthogonal to `c`, spanning its null space.
+    let (q, _r) = c.qr()?;
+    
+    // The transformation matrix Z is composed of all columns of Q except the first.
+    let z_transform = q.slice(s![.., 1..]).to_owned();
+
+    // 3. Create the new, constrained basis by projecting the original basis.
+    // B_constrained = B * Z
+    let constrained_basis = basis_matrix.dot(&z_transform);
+
+    Ok((constrained_basis, z_transform))
+}
+
 /// Internal module for implementation details not exposed in the public API.
 mod internal {
     use super::*;
-    use std::cmp::min;
+
 
     /// Generates the full knot vector, including repeated boundary knots.
     pub(super) fn generate_full_knot_vector(
@@ -215,7 +260,8 @@ mod internal {
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses the stable, iterative, and in-place version of the Cox-de Boor algorithm.
+    /// This uses a corrected, stable implementation of the Cox-de Boor algorithm
+    /// that properly handles the recurrence relation without in-place update issues.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
@@ -223,85 +269,62 @@ mod internal {
     ) -> Array1<f64> {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
-        let mut basis_values = Array1::zeros(num_basis);
 
         // Find the knot interval `mu` that contains x, such that `knots[mu] <= x < knots[mu+1]`.
-        // This is a crucial first step. `rposition` is efficient.
-        // Clamp `mu` to a valid range to prevent panics if x is outside the boundary knots.
-        // The `min` handles the case where x equals the last knot value.
-        let mu = knots
-            .iter()
-            .rposition(|&k| *k <= x)
-            .unwrap_or(0);
-        let mu = min(mu, num_basis + degree - 1);
+        let mu = match knots.iter().rposition(|&k| k <= x) {
+            Some(pos) => {
+                // Clamp to valid range
+                pos.min(num_basis + degree - 1).max(degree)
+            }
+            None => degree, // Default to the first valid interval
+        };
 
-
-        // Initialize the degree-0 splines. Only one is non-zero in the relevant interval.
-        // This buffer `b` will be updated in-place to avoid allocations in the main loop.
+        // Initialize basis values for degree 0
         let mut b = Array1::zeros(degree + 1);
         b[0] = 1.0;
 
-        // Iteratively compute higher-degree spline values from lower-degree ones.
-        // The recurrence for the j-th basis function of degree d is:
-        // B_j,d(x) = w * B_j,d-1(x) + (1-w) * B_{j+1},d-1(x)
-        // To compute this in-place, we must iterate from right-to-left.
+        // Apply the Cox-de Boor recurrence relation iteratively
         for d in 1..=degree {
-            // At the start of this loop, `b` holds the non-zero basis values for degree `d-1`.
-            
-            // First, calculate the right-most new value, b[d]. It only depends on the
-            // right-most old value, b[d-1], because its left parent is zero.
-            let idx_right = mu - d;
-            let term2_denom = knots[idx_right + d + 1] - knots[idx_right + 1];
-            if term2_denom > 1e-9 {
-                let w2 = (knots[idx_right + d + 1] - x) / term2_denom;
-                // `b[d-1]` is still from degree d-1.
-                b[d] = w2 * b[d - 1];
-            } else {
-                b[d] = 0.0;
-            }
+            // Use a temporary buffer to read the "old" values from degree d-1
+            let b_old = b.clone();
+            // Reset the current buffer for the new degree's values
+            b.fill(0.0);
 
-            // Next, calculate the inner terms from right to left (i = d-1, ..., 1).
-            for i in (1..d).rev() {
+            for i in 0..=d {
+                // Index for knots array
                 let idx = mu - d + i;
-                let term1_denom = knots[idx + d] - knots[idx];
-                let w1 = if term1_denom > 1e-9 {
-                    (x - knots[idx]) / term1_denom
-                } else {
-                    0.0
-                };
 
-                let term2_denom = knots[idx + d + 1] - knots[idx + 1];
-                let w2 = if term2_denom > 1e-9 {
-                    (knots[idx + d + 1] - x) / term2_denom
-                } else {
-                    0.0
-                };
-                
-                // `b[i]` and `b[i-1]` are still the values from degree `d-1` because
-                // we are iterating backwards.
-                b[i] = w1 * b[i] + w2 * b[i - 1];
-            }
+                // Left parent spline contribution
+                if i < d && b_old[i] > 0.0 {
+                    let denom = knots[idx + d] - knots[idx];
+                    if denom > 1e-12 {
+                        let w = (x - knots[idx]) / denom;
+                        b[i] += w * b_old[i];
+                    }
+                }
 
-            // Finally, update the left-most value, b[0]. It only depends on the
-            // left-most old value, b[0], because its right parent is zero.
-            let idx_left = mu - d;
-            let term1_denom = knots[idx_left + d] - knots[idx_left];
-            if term1_denom > 1e-9 {
-                let w1 = (x - knots[idx_left]) / term1_denom;
-                // `b[0]` is still from degree d-1. We update it in-place.
-                b[0] *= w1;
-            } else {
-                b[0] = 0.0;
+                // Right parent spline contribution
+                if i > 0 && b_old[i - 1] > 0.0 {
+                    let denom = knots[idx + d] - knots[idx];
+                    if denom > 1e-12 {
+                        let w = (knots[idx + d] - x) / denom;
+                        b[i] += w * b_old[i - 1];
+                    }
+                }
             }
         }
-        
-        // The final `b` vector contains the `degree+1` non-zero spline values.
-        // We need to place them in the correct locations in the full `basis_values` vector.
-        let start_index = mu - degree;
-        basis_values
-            .slice_mut(s![start_index..start_index + degree + 1])
-            .assign(&b);
 
+        // Place the non-zero values in the correct positions
+        let mut basis_values = Array1::zeros(num_basis);
+        let start_index = mu.saturating_sub(degree);
+        
+        for i in 0..=degree {
+            let global_idx = start_index + i;
+            if global_idx < num_basis {
+                basis_values[global_idx] = b[i];
+            }
+        }
+       
         basis_values
     }
 }
@@ -406,37 +429,40 @@ mod tests {
 
     #[test]
     fn test_error_conditions() {
-        assert_eq!(
-            create_bspline_basis(array![].view(), None, (0.0, 10.0), 5, 0).unwrap_err(),
-            BasisError::InvalidDegree(0)
-        );
+        match create_bspline_basis(array![].view(), None, (0.0, 10.0), 5, 0).unwrap_err() {
+            BasisError::InvalidDegree(deg) => assert_eq!(deg, 0),
+            _ => panic!("Expected InvalidDegree error"),
+        }
 
-        assert_eq!(
-            create_bspline_basis(array![].view(), None, (10.0, 0.0), 5, 1).unwrap_err(),
-            BasisError::InvalidRange(10.0, 0.0)
-        );
+        match create_bspline_basis(array![].view(), None, (10.0, 0.0), 5, 1).unwrap_err() {
+            BasisError::InvalidRange(start, end) => {
+                assert_eq!(start, 10.0);
+                assert_eq!(end, 0.0);
+            },
+            _ => panic!("Expected InvalidRange error"),
+        }
 
-        assert_eq!(
-            create_bspline_basis(
-                array![].view(),
-                Some(array![1., 2.].view()),
-                (0.0, 10.0),
-                3,
-                1
-            )
-            .unwrap_err(),
-            BasisError::InsufficientDataForQuantiles {
-                num_quantiles: 3,
-                num_points: 2
-            }
-        );
+        match create_bspline_basis(
+            array![].view(),
+            Some(array![1., 2.].view()),
+            (0.0, 10.0),
+            3,
+            1
+        )
+        .unwrap_err() {
+            BasisError::InsufficientDataForQuantiles { num_quantiles, num_points } => {
+                assert_eq!(num_quantiles, 3);
+                assert_eq!(num_points, 2);
+            },
+            _ => panic!("Expected InsufficientDataForQuantiles error"),
+        }
 
-        assert_eq!(
-            create_difference_penalty_matrix(5, 5).unwrap_err(),
-            BasisError::InvalidPenaltyOrder {
-                order: 5,
-                num_basis: 5
-            }
-        );
+        match create_difference_penalty_matrix(5, 5).unwrap_err() {
+            BasisError::InvalidPenaltyOrder { order, num_basis } => {
+                assert_eq!(order, 5);
+                assert_eq!(num_basis, 5);
+            },
+            _ => panic!("Expected InvalidPenaltyOrder error"),
+        }
     }
 }

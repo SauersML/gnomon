@@ -17,6 +17,7 @@
 
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
+
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -45,7 +46,7 @@ pub struct PredictionData {
 }
 
 /// A comprehensive error type for all data loading and validation failures.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum DataError {
     #[error("Error from the underlying Polars DataFrame library: {0}")]
     PolarsError(#[from] PolarsError),
@@ -89,7 +90,7 @@ mod internal {
         path: &str,
         num_pcs: usize,
         include_phenotype: bool,
-    ) -> Result<(Array2<f64>, Array1<f64>, Option<Array1<f64>>), DataError> {
+    ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>), DataError> {
         // --- 1. Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{}", i)).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
@@ -109,9 +110,10 @@ mod internal {
             None
         };
         let pgs = series_to_f64_array(df.column("score")?)?;
-        let pcs = df.select(&pc_names)?.to_ndarray::<Float64Type>()?;
+        let pcs_polars = df.select(&pc_names)?.to_ndarray::<Float64Type>()?;
+        let pcs = Array2::from_shape_vec(pcs_polars.dim(), pcs_polars.into_raw_vec()).unwrap();
 
-        Ok((pcs, pgs, phenotype_opt))
+        Ok((pgs, pcs, phenotype_opt))
     }
 
     /// Reads a file into a Polars DataFrame, validating schema and data integrity.
@@ -120,12 +122,12 @@ mod internal {
         required_cols: &[String],
     ) -> Result<DataFrame, DataError> {
         println!("Loading data from '{}'", path);
-        let lf = LazyCsvReader::new(path)
+        let mut lf = LazyCsvReader::new(path)
             .with_separator(b'\t')
             .with_infer_schema_length(Some(100))
             .finish()?;
 
-        let available_cols: HashSet<_> = lf.schema()?.iter_names().map(|s| s.to_string()).collect();
+        let available_cols: HashSet<_> = lf.collect_schema()?.iter_names().map(|s| s.to_string()).collect();
         for col_name in required_cols {
             if !available_cols.contains(col_name) {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
@@ -155,16 +157,22 @@ mod internal {
     /// Helper to convert a Polars Series to an ndarray Array1<f64>, providing
     /// a more specific error message on failure.
     fn series_to_f64_array(series: &Series) -> Result<Array1<f64>, DataError> {
-        series
+        let polars_array = series
             .f64()
             .map_err(|_| DataError::ColumnWrongType {
                 column_name: series.name().to_string(),
                 expected_type: "f64 (numeric)",
                 found_type: format!("{:?}", series.dtype()),
             })?
-            .to_ndarray()?
-            .into_dimensionality()
-            .map_err(PolarsError::from)
+            .to_ndarray()?;
+        
+        // Convert from polars ndarray (0.15) to our ndarray (0.16)
+        Array1::from_shape_vec(polars_array.dim(), polars_array.into_raw_vec())
+            .map_err(|_| DataError::ColumnWrongType {
+                column_name: series.name().to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: "conversion error".to_string(),
+            })
     }
 }
 
@@ -223,7 +231,10 @@ mod tests {
         let content = generate_csv_content("phenotype,score,PC1", "1,1.5,0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 2).unwrap_err();
-        assert_eq!(err, DataError::ColumnNotFound("PC2".to_string()));
+        match err {
+            DataError::ColumnNotFound(col) => assert_eq!(col, "PC2"),
+            _ => panic!("Expected ColumnNotFound error"),
+        }
     }
 
     #[test]
@@ -231,7 +242,10 @@ mod tests {
         let content = generate_csv_content("phenotype,score,PC1", "1,,0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
-        assert_eq!(err, DataError::MissingValuesFound("score".to_string()));
+        match err {
+            DataError::MissingValuesFound(col) => assert_eq!(col, "score"),
+            _ => panic!("Expected MissingValuesFound error"),
+        }
     }
 
     #[test]
@@ -239,11 +253,14 @@ mod tests {
         let content = generate_csv_content("phenotype,score,PC1", "1,not_a_number,0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
-        assert_eq!(err, DataError::ColumnWrongType { 
-            column_name: "score".to_string(), 
-            expected_type: "f64 (numeric)", 
-            found_type: "Utf8".to_string() 
-        });
+        match err {
+            DataError::ColumnWrongType { column_name, expected_type, found_type } => {
+                assert_eq!(column_name, "score");
+                assert_eq!(expected_type, "f64 (numeric)");
+                assert_eq!(found_type, "Utf8");
+            },
+            _ => panic!("Expected ColumnWrongType error"),
+        }
     }
 
     #[test]
@@ -251,6 +268,12 @@ mod tests {
         let content = generate_csv_content(TEST_HEADER, TEST_DATA_ROW, 5);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
-        assert_eq!(err, DataError::InsufficientRows { found: 5, required: 20 });
+        match err {
+            DataError::InsufficientRows { found, required } => {
+                assert_eq!(found, 5);
+                assert_eq!(required, 20);
+            },
+            _ => panic!("Expected InsufficientRows error"),
+        }
     }
 }
