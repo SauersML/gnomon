@@ -547,7 +547,8 @@ def main():
                 shutil.move(str(sf_path), str(new_path))
                 moved_gnomon_score_files.append(new_path)
             
-            gnomon_cmd = [gnomon_abs_path, "--score", gnomon_score_dir.name, data_prefix.name]
+            # The 'score' subcommand is added here.
+            gnomon_cmd = [gnomon_abs_path, "score", "--score", gnomon_score_dir.name, data_prefix.name]
             if keep_file_path:
                 gnomon_cmd.extend(["--keep", keep_file_path.name])
             gnomon_res = run_and_monitor_process("gnomon", gnomon_cmd, WORKDIR)

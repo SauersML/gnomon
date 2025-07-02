@@ -298,7 +298,8 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
     # to avoid overwriting files in parallel or sequential runs.
     g_iter_prefix = CI_WORKDIR / f"_g_iter_{iteration_name}"
     # The command does NOT take an --out flag.
-    g_cmd = [str(GNOMON_BINARY), "--score", str(temp_score_path), str(SHARED_GENOTYPE_PREFIX)]
+    # The 'score' subcommand is added here.
+    g_cmd = [str(GNOMON_BINARY), "score", "--score", str(temp_score_path), str(SHARED_GENOTYPE_PREFIX)]
     g_res = run_and_measure(g_cmd, f"Gnomon_Iter_{iteration_name}", SHARED_GENOTYPE_PREFIX)
     # After running, move the output to the unique name we expect
     if g_res['success']:
@@ -440,7 +441,8 @@ def main():
         pgs_run_results = []
         
         commands_to_run = [
-            ("gnomon", [str(GNOMON_BINARY), "--score", str(unified_score_file_path), str(SHARED_GENOTYPE_PREFIX)], SHARED_GENOTYPE_PREFIX),
+            # The 'score' subcommand is added here.
+            ("gnomon", [str(GNOMON_BINARY), "score", "--score", str(unified_score_file_path), str(SHARED_GENOTYPE_PREFIX)], SHARED_GENOTYPE_PREFIX),
             ("plink2", [str(PLINK2_BINARY), "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "1", "2", "4", "header", "no-mean-imputation", "--out", str(CI_WORKDIR / f"plink2_{pgs_id}")], CI_WORKDIR / f"plink2_{pgs_id}"),
             ("pylink", ["python3", str(PYLINK_SCRIPT), "--precise", "--bfile", str(SHARED_GENOTYPE_PREFIX), "--score", str(unified_score_file_path), "--out", str(CI_WORKDIR / f"pylink_{pgs_id}"), "1", "2", "4"], CI_WORKDIR / f"pylink_{pgs_id}"),
         ]
