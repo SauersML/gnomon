@@ -21,9 +21,7 @@
 //! from the data, fixing the key discrepancies identified in the initial implementation.
 
 // External Crate for Optimization
-use bfgs;
-// Import the exact ndarray version that bfgs crate uses (0.11.2)
-use ndarray_bfgs;
+use wolfe_bfgs;
 
 // Crate-level imports
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
@@ -91,9 +89,7 @@ pub fn train_model(
     let reml_state_cost = reml_state_arc.clone();
     let reml_state_grad = reml_state_arc.clone();
     
-    // Define cost and gradient functions for BFGS using the exact signature expected by bfgs crate.
-    let cost_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> f64 {
-        // Convert from bfgs ndarray (0.11.2) to our ndarray version (0.16.1)
+    let cost_fn = move |rho_bfgs: &ndarray::Array1<f64>| -> f64 {
         let rho = Array1::from_vec(rho_bfgs.to_vec());
         match reml_state_cost.compute_cost(&rho) {
             Ok(cost) if cost.is_finite() => cost,
@@ -108,12 +104,10 @@ pub fn train_model(
         }
     };
     
-    let gradient_fn = move |rho_bfgs: &ndarray_bfgs::Array1<f64>| -> ndarray_bfgs::Array1<f64> {
-        // Convert from bfgs ndarray to our ndarray version  
+    let gradient_fn = move |rho_bfgs: &ndarray::Array1<f64>| -> ndarray::Array1<f64> {
         let rho = Array1::from_vec(rho_bfgs.to_vec());
         let grad = reml_state_grad.compute_gradient(&rho).unwrap_or_else(|_| Array1::zeros(rho.len()));
-        // Convert back to bfgs ndarray version
-        ndarray_bfgs::Array1::from_vec(grad.to_vec())
+        ndarray::Array1::from_vec(grad.to_vec())
     };
 
     // 4. Define the initial guess for log-smoothing parameters (rho).
@@ -129,8 +123,7 @@ pub fn train_model(
     log::info!("Initial REML cost: {:.6}", initial_cost);
 
     // 5. Run the BFGS optimizer.
-    // Convert to bfgs crate's ndarray version (0.11.2)
-    let initial_rho_bfgs = ndarray_bfgs::Array1::from_vec(initial_rho.to_vec());
+    let initial_rho_bfgs = ndarray::Array1::from_vec(initial_rho.to_vec());
     
     eprintln!("Starting BFGS optimization with {} parameters...", initial_rho.len());
     let final_rho_bfgs = bfgs::bfgs(initial_rho_bfgs, cost_fn, gradient_fn)
@@ -585,7 +578,7 @@ mod internal {
 
         for block in &layout.penalty_map {
             // This logic is complex; a more direct mapping from basis creation to block insertion is safer.
-            // This is a simplified placeholder for the assembly logic based on the layout map.
+            // This is WRONG for the assembly logic based on the layout map. FIX
             if block.term_name.starts_with("f(PC") {
                 let pc_idx = config.pc_names.iter().position(|n| *n == block.term_name.replace("f(","").replace(")","")).unwrap();
                 x_matrix
@@ -597,7 +590,6 @@ mod internal {
                 let pc_name = parts[1].trim();
                 let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                // **THE FIX FOR INTERACTION TERMS**
                 // Use the UNCONSTRAINED PGS basis column as the weight
                 let pgs_weight_col = pgs_basis_unc.column(m_idx + 1); // +1 because main effect is from 1..
                 // Use the CONSTRAINED PC basis matrix
