@@ -66,13 +66,32 @@ fn main() {
     }
 }
 
+/// Public interface for calling gnomon with explicit arguments
+pub fn run_gnomon_with_args(
+    input_path: PathBuf,
+    score: PathBuf, 
+    keep: Option<PathBuf>
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let args = Args {
+        score,
+        keep,
+        input_path,
+    };
+    run_gnomon_impl(args)
+}
+
 /// The primary application logic
 fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let args = Args::parse();
+    run_gnomon_impl(args)
+}
+
+/// Core implementation that takes args as parameter
+fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize the Rayon global thread pool to use all available cores.
     rayon::ThreadPoolBuilder::new().build_global().unwrap();
 
     let overall_start_time = Instant::now();
-    let args = Args::parse();
     let fileset_prefixes = resolve_filesets(&args.input_path)?;
 
     // --- Phase 1a: Score File Resolution ---
