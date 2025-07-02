@@ -9,7 +9,7 @@
 [package]
 name = "gnomon"
 version = "0.1.0"
-edition = "2024" # And nightly is expected
+edition = "2024" # And nightly is required
 description = "A high-performance engine for polygenic score calculation."
 repository = "https://github.com/SauersML/gnomon/"
 keywords = ["bioinformatics", "genomics"]
