@@ -258,69 +258,85 @@ mod internal {
     }
 
     /// Implementation of the LAML gradient for the BFGS optimizer.
+    /// This function calculates the exact gradient of the negative log-REML score,
+    /// which is the objective function being minimized.
     impl Gradient for RemlState<'_> {
         type Param = Array1<f64>;
         type Gradient = Array1<f64>;
-
+    
         fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, Error> {
+            // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
-
-            let h_penalized = &pirls_result.penalized_hessian;
-            let beta = &pirls_result.beta;
-            let lambdas = p.mapv(f64::exp);
-            
+    
+            // --- Extract converged model components ---
+            let h_penalized = &pirls_result.penalized_hessian; // This is H
+            let beta = &pirls_result.beta; // This is β-hat
+            let lambdas = p.mapv(f64::exp); // This is λ
+    
+            // --- Pre-compute shared matrices ---
+            // S_λ = Σ λ_k S_k
             let s_lambda = construct_s_lambda(&lambdas, &self.s_list);
+            // S_λ⁺ (Moore-Penrose pseudo-inverse for the log|S| term)
             let s_lambda_plus = pseudo_inverse(&s_lambda).map_err(Error::from)?;
-
-            let mut grad = Array1::zeros(p.len());
-
+    
+            // --- Iterate through each smoothing parameter to build the gradient vector ---
+            let mut grad_of_neg_laml = Array1::zeros(p.len());
+    
             for k in 0..p.len() {
-                // d(S_lambda)/d(rho_k) = lambda_k * S_k
+                // This is ∂S_λ/∂ρ_k = λ_k * S_k
                 let d_s_lambda_d_rho_k = lambdas[k] * &self.s_list[k];
-
-                // Term 1: from the penalty on beta: d/d(rho_k) of -0.5 * beta' * S_lambda * beta
-                let term1 = -beta.dot(&d_s_lambda_d_rho_k.dot(beta));
-
-                // Term 2: from log|S_lambda|+
-                let term2 = (s_lambda_plus.dot(&d_s_lambda_d_rho_k)).diag().sum();
-
-                // Term 3: from -log|H|. Requires d(H)/d(rho_k)
-                // H = X'WX + S_lambda
-                // dH/d(rho_k) = d(X'WX)/d(rho_k) + d(S_lambda)/d(rho_k)
+    
+                // --- Component 1: Derivative of the deviance penalty term ---
+                // This is d/dρ_k [ 0.5 * β' * S_λ * β ] = 0.5 * β' * (λ_k S_k) * β
+                let penalty_deriv_term = 0.5 * beta.dot(&d_s_lambda_d_rho_k.dot(beta));
+    
+                // --- Component 2: Derivative of the log-determinant of the penalty ---
+                // This is d/dρ_k [ -0.5 * log|S_λ|_+ ] = -0.5 * tr(S_λ⁺ * λ_k * S_k)
+                let log_det_s_deriv_term = -0.5 * (s_lambda_plus.dot(&d_s_lambda_d_rho_k)).diag().sum();
                 
-                // First, find d(beta)/d(rho_k) using implicit differentiation of the P-IRLS solution.
-                // The gradient of the penalized deviance is 0 at the optimum: d(Dp)/d(beta) = 0.
-                // d/d(rho_k) [d(Dp)/d(beta)] = 0 => H * d(beta)/d(rho_k) + d/d(rho_k)[d(Dp)/d(beta)] = 0
-                let grad_p = &s_lambda.dot(beta);
-                let d_grad_p_d_rho_k = d_s_lambda_d_rho_k.dot(beta);
+                // --- Component 3: Derivative of the log-determinant of the Hessian ---
+                // This is d/dρ_k [ 0.5 * log|H| ] = 0.5 * tr(H⁻¹ * dH/dρ_k)
                 
-                // This requires d(X'Wz)/d(rho_k), which is complicated.
-                // The correct gradient for the REML score is given in Wood (2011), which simplifies
-                // to the following form where many terms cancel.
-                // Here, we implement the final form directly.
-                // Note: a full derivation is exceptionally tedious. This is the result.
+                // Step 3a: Calculate dβ/dρ_k using implicit differentiation.
+                // dβ/dρ_k = -H⁻¹ * (λ_k * S_k * β)
+                let rhs_for_d_beta = -lambdas[k] * self.s_list[k].dot(beta);
                 let d_beta_d_rho_k = h_penalized
-                    .solve_into(-d_grad_p_d_rho_k)
+                    .solve_into(rhs_for_d_beta)
                     .map_err(Error::from)?;
-
+    
+                // Step 3b: Calculate dη/dρ_k = X * (dβ/dρ_k)
                 let d_eta_d_rho_k = self.x.dot(&d_beta_d_rho_k);
-                
+    
+                // Step 3c: Calculate dW/dρ_k = diag( (dw/dη) * (dη/dρ_k) )
+                // For logistic regression, dw/dη = μ(1-μ)(1-2μ) [cite: 4007, 4571]
                 let mu = (self.x.dot(beta)).mapv(|eta| 1.0 / (1.0 + (-eta).exp()));
                 let d_w_d_eta = &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu);
-                let d_w_d_rho_k = &d_w_d_eta * &d_eta_d_rho_k;
-                let d_xtwx_d_rho_k = self.x.t().dot(&(self.x.view() * d_w_d_rho_k.view().insert_axis(Axis(1))));
-                
+                let d_w_d_rho_k_diag = &d_w_d_eta * &d_eta_d_rho_k;
+    
+                // Step 3d: Calculate d(X'WX)/dρ_k = X' * diag(dW/dρ_k) * X
+                // This is computed efficiently without forming the diagonal matrix.
+                let d_xtwx_d_rho_k =
+                    self.x.t().dot(&(self.x.view() * d_w_d_rho_k_diag.view().insert_axis(Axis(1))));
+    
+                // Step 3e: Assemble the full derivative of the Hessian
+                // dH/dρ_k = d(X'WX)/dρ_k + ∂S_λ/∂ρ_k
                 let d_h_d_rho_k = d_xtwx_d_rho_k + &d_s_lambda_d_rho_k;
+    
+                // Step 3f: Calculate the trace term tr(H⁻¹ * dH/dρ_k)
+                // This is solved efficiently as sum(diag(H⁻¹ * dH))
+                let log_det_h_deriv_term = 0.5 * h_penalized
+                    .solve_into(d_h_d_rho_k)
+                    .map_err(Error::from)?
+                    .diag()
+                    .sum();
                 
-                let term3 = h_penalized.solve_into(d_h_d_rho_k).map_err(Error::from)?.diag().sum();
-
-                // Combining terms based on the final formula for d(REML)/d(rho_k)
-                // The deviance derivative term, (grad_D)' * d_beta_d_rho_k, is implicitly
-                // handled by the other terms at the REML optimum.
-                grad[k] = 0.5 * (term1 - term3 + term2);
+                // --- Final Assembly ---
+                // The gradient of the negative LAML score (-V) is the sum of the components.
+                grad_of_neg_laml[k] = penalty_deriv_term + log_det_h_deriv_term + log_det_s_deriv_term;
             }
-
-            Ok(-grad)
+    
+            // The optimizer minimizes, so we return the gradient of the function to be minimized.
+            Ok(grad_of_neg_laml)
         }
     }
 
