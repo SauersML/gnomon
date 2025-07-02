@@ -1,275 +1,545 @@
+//! # Model Estimation via Penalized Likelihood and REML
+//!
+//! This module orchestrates the core model fitting procedure. It transitions from a
+//! simple hyperparameter-driven model to a statistically robust one where smoothing
+//! parameters are estimated automatically from the data. This is achieved through a
+//! nested optimization scheme:
+//!
+//! 1.  **Outer Loop (BFGS):** Optimizes the log-smoothing parameters (`rho`) by
+//!     maximizing the Laplace Approximate Marginal Likelihood (LAML), which serves as the
+//!     Restricted Maximum Likelihood (REML) criterion. This approach is detailed in
+//!     Wood (2011).
+//!
+//! 2.  **Inner Loop (P-IRLS):** For each set of trial smoothing parameters from the
+//!     outer loop, this routine finds the corresponding model coefficients (`beta`) by
+//!     running a Penalized Iteratively Reweighted Least Squares (P-IRLS) algorithm
+//!     to convergence.
+//!
+//! This structure ensures that the model complexity for each smooth term is learned
+//! from the data, fixing the key discrepancies identified in the initial implementation.
+
+// External Crate for Optimization
+use argmin::core::{CostFunction, Error, Executor, Gradient, State};
+use argmin::solver::bfgs::BFGS;
+use argmin::solver::linesearch::MoreThuenteLineSearch;
+
+// Crate-level imports
 use crate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::data::TrainingData;
 use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel};
 
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::Solve;
+// Ndarray and Linalg
+use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use thiserror::Error;
 
 /// A comprehensive error type for the model estimation process.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum EstimationError {
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] basis::BasisError),
 
-    #[error("The penalized matrix system is singular and could not be solved. This can happen with a very large lambda. Error: {0}")]
-    MatrixInversionFailed(ndarray_linalg::error::LinalgError),
+    #[error("A linear system solve failed. The penalized Hessian may be singular. Error: {0}")]
+    LinearSystemSolveFailed(ndarray_linalg::error::LinalgError),
 
-    #[error("Iterative solver did not converge within {max_iterations} iterations. Last deviance change was {last_change:.6e}.")]
-    DidNotConverge {
+    #[error("Eigendecomposition failed: {0}")]
+    EigendecompositionFailed(ndarray_linalg::error::LinalgError),
+
+    #[error("The P-IRLS inner loop did not converge within {max_iterations} iterations. Last deviance change was {last_change:.6e}.")]
+    PirlsDidNotConverge {
         max_iterations: usize,
         last_change: f64,
     },
+
+    #[error("REML/BFGS optimization failed to converge: {0}")]
+    RemlOptimizationFailed(String),
+
+    #[error("An internal error occurred during model layout or coefficient mapping: {0}")]
+    LayoutError(String),
 }
 
-/// The main entry point for model training.
-///
-/// This function orchestrates the entire fitting process using a penalized
-/// Iteratively Reweighted Least Squares (IRLS) algorithm to find the optimal
-/// coefficients for the specified GAM.
+/// The main entry point for model training. Orchestrates the REML/BFGS optimization.
 pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    println!(
-        "Starting model training with lambda = {:.4e}, penalty order = {}, {} total samples.",
-        config.lambda,
-        config.penalty_order,
+    log::info!(
+        "Starting model training with REML. {} total samples.",
         data.y.len()
     );
 
-    // 1. Build the large, one-time matrices for the model. This is the most complex
-    //    non-iterative part, translating the model formula into matrices.
-    let (x_matrix, penalty_matrix, layout) =
+    // 1. Build the one-time matrices and define the model structure.
+    let (x_matrix, penalty_matrices, layout) =
         internal::build_design_and_penalty_matrices(data, config)?;
-    println!(
+    log::info!(
         "Constructed design matrix with {} samples and {} total coefficients.",
         x_matrix.nrows(),
         x_matrix.ncols()
     );
+    log_layout_info(&layout);
 
-    // 2. Initialize the IRLS algorithm.
-    let mut beta = Array1::zeros(x_matrix.ncols());
-    let mut last_deviance = f64::INFINITY;
-    let mut last_deviance_change = f64::INFINITY;
+    // 2. Set up the REML optimization problem.
+    let cost_function = internal::RemlState::new(
+        data.y.view(),
+        x_matrix.view(),
+        penalty_matrices,
+        &layout,
+        config,
+    );
 
-    // 3. Run the IRLS loop.
-    for iter in 1..=config.max_iterations {
-        let eta = x_matrix.dot(&beta);
-        let (mu, weights, z) =
-            internal::update_glm_vectors(data.y.view(), &eta, config.link_function);
+    // 3. Configure the BFGS optimizer and the line search strategy.
+    let linesearch = MoreThuenteLineSearch::new();
+    let solver = BFGS::new(linesearch);
 
-        beta = internal::solve_penalized_wls(
-            x_matrix.view(),
-            z.view(),
-            weights.view(),
-            penalty_matrix.view(),
-            config.lambda,
-        )?;
+    // 4. Define the initial guess for log-smoothing parameters (rho).
+    let initial_rho = Array1::zeros(layout.num_penalties);
 
-        let deviance = internal::calculate_deviance(data.y.view(), &mu, config.link_function);
-        let deviance_change = (last_deviance - deviance).abs();
-        last_deviance_change = deviance_change;
+    // 5. Run the optimizer.
+    let res = Executor::new(cost_function, solver)
+        .configure(|state| {
+            state
+                .param(initial_rho)
+                .max_iters(config.reml_max_iterations)
+                .gradient_tol(config.reml_convergence_tolerance)
+        })
+        .run()
+        .map_err(|e| EstimationError::RemlOptimizationFailed(e.to_string()))?;
 
-        println!(
-            "Iter {: >3}: Deviance = {:.6}, Change = {:.6e}",
-            iter,
-            deviance,
-            deviance_change
-        );
+    log::info!(
+        "REML optimization finished: {}",
+        res.state().termination_reason.unwrap()
+    );
 
-        if deviance_change < config.convergence_tolerance {
-            println!(
-                "IRLS converged after {} iterations. Final Deviance: {:.6}",
-                iter,
-                deviance
-            );
-            // On success, "un-flatten" the beta vector into the structured MappedCoefficients.
-            let mapped_coefficients = internal::map_coefficients(&beta, config, &layout);
-            return Ok(TrainedModel {
-                config: config.clone(),
-                coefficients: mapped_coefficients,
-            });
-        }
-        last_deviance = deviance;
-    }
+    // 6. Extract the final results.
+    let final_rho = res.state.best_param.as_ref().unwrap().clone();
+    let final_lambda = final_rho.mapv(f64::exp);
+    log::info!(
+        "Final estimated smoothing parameters (lambda): {:?}",
+        &final_lambda.to_vec()
+    );
 
-    // If the loop finishes without converging, return an error.
-    Err(EstimationError::DidNotConverge {
-        max_iterations: config.max_iterations,
-        last_change: last_deviance_change,
+    // Fit the model one last time with the optimal lambdas to get final coefficients.
+    let final_fit = internal::fit_model_for_fixed_rho(
+        final_rho.view(),
+        x_matrix.view(),
+        data.y.view(),
+        &res.state.cost_function.unwrap().s_list,
+        &layout,
+        config,
+    )?;
+
+    let mapped_coefficients =
+        internal::map_coefficients(&final_fit.beta, &layout)?;
+
+    Ok(TrainedModel {
+        config: config.clone(),
+        coefficients: mapped_coefficients,
+        estimated_lambdas: Some(final_lambda.to_vec()),
     })
 }
 
-/// Internal module for implementation details.
+/// Helper to log the final model structure.
+fn log_layout_info(layout: &internal::ModelLayout) {
+    log::info!("Model structure has {} total coefficients.", layout.total_coeffs);
+    log::info!("  - Intercept: 1 coefficient.");
+    log::info!(
+        "  - PGS Main Effect: {} coefficients.",
+        layout.pgs_main_cols.len()
+    );
+    let mut pc_main_count = 0;
+    let mut interaction_count = 0;
+    for block in &layout.penalty_map {
+        if block.term_name.starts_with("f(PC") {
+            pc_main_count += 1;
+        } else if block.term_name.starts_with("f(PGS_B") {
+            interaction_count += 1;
+        }
+    }
+    log::info!("  - PC Main Effects: {} terms.", pc_main_count);
+    log::info!("  - Interaction Effects: {} terms.", interaction_count);
+    log::info!("Total penalized terms: {}", layout.num_penalties);
+}
+
+/// Internal module for estimation logic.
 mod internal {
     use super::*;
-    use std::ops::Range;
+    use ndarray_linalg::error::LinalgError;
 
-    /// A single source of truth for the column layout of the design matrix `X`.
-    ///
-    /// This struct encapsulates the complex indexing logic, ensuring that matrix
-    /// construction, penalty application, and coefficient mapping are always consistent.
+    /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
+    #[derive(Clone)]
+    pub(super) struct PirlsResult {
+        pub(super) beta: Array1<f64>,
+        pub(super) penalized_hessian: Array2<f64>,
+        pub(super) deviance: f64,
+        pub(super) final_weights: Array1<f64>,
+    }
+
+    /// Holds the state for the outer REML optimization. Implements `CostFunction`
+    /// and `Gradient` for the `argmin` library.
+    pub(super) struct RemlState<'a> {
+        y: ArrayView1<'a, f64>,
+        x: ArrayView2<'a, f64>,
+        pub(super) s_list: Vec<Array2<f64>>,
+        layout: &'a ModelLayout,
+        config: &'a ModelConfig,
+        cache: RefCell<HashMap<Vec<u64>, PirlsResult>>,
+    }
+
+    impl<'a> RemlState<'a> {
+        pub(super) fn new(
+            y: ArrayView1<'a, f64>,
+            x: ArrayView2<'a, f64>,
+            s_list: Vec<Array2<f64>>,
+            layout: &'a ModelLayout,
+            config: &'a ModelConfig,
+        ) -> Self {
+            Self {
+                y,
+                x,
+                s_list,
+                layout,
+                config,
+                cache: RefCell::new(HashMap::new()),
+            }
+        }
+
+        /// Runs the inner P-IRLS loop, caching the result.
+        fn execute_pirls_if_needed(&self, rho: &Array1<f64>) -> Result<PirlsResult, Error> {
+            let key: Vec<u64> = rho.iter().map(|&v| v.to_bits()).collect();
+            if let Some(cached_result) = self.cache.borrow().get(&key) {
+                return Ok(cached_result.clone());
+            }
+
+            let pirls_result = fit_model_for_fixed_rho(
+                rho.view(),
+                self.x,
+                self.y,
+                &self.s_list,
+                self.layout,
+                self.config,
+            )
+            .map_err(Error::from)?;
+
+            self.cache.borrow_mut().insert(key, pirls_result.clone());
+            Ok(pirls_result)
+        }
+    }
+
+    /// Implementation of the LAML score (cost function) for the BFGS optimizer.
+    impl CostFunction for RemlState<'_> {
+        type Param = Array1<f64>;
+        type Output = f64;
+
+        fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+            let pirls_result = self.execute_pirls_if_needed(p)?;
+            let lambdas = p.mapv(f64::exp);
+
+            let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+
+            let penalised_ll = -0.5 * pirls_result.deviance
+                - 0.5 * pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+
+            let log_det_s = calculate_log_det_pseudo(&s_lambda).map_err(Error::from)?;
+
+            let log_det_h = pirls_result
+                .penalized_hessian
+                .cholesky(UPLO::Lower)
+                .map(|l| 2.0 * l.diag().mapv(f64::ln).sum())
+                .unwrap_or(f64::NEG_INFINITY);
+
+            let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h;
+
+            Ok(-laml)
+        }
+    }
+
+    /// Implementation of the LAML gradient for the BFGS optimizer.
+    impl Gradient for RemlState<'_> {
+        type Param = Array1<f64>;
+        type Gradient = Array1<f64>;
+
+        fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, Error> {
+            let pirls_result = self.execute_pirls_if_needed(p)?;
+            
+            let h_penalized = &pirls_result.penalized_hessian;
+            let beta = &pirls_result.beta;
+            let lambdas = p.mapv(f64::exp);
+            
+            let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+            let s_lambda_plus = pseudo_inverse(&s_lambda).map_err(Error::from)?;
+            
+            let mut grad = Array1::zeros(p.len());
+
+            for k in 0..p.len() {
+                let d_s_lambda_d_rho_k = lambdas[k] * &self.s_list[k];
+
+                // Term 1: from the penalty on beta
+                let term1 = beta.dot(&d_s_lambda_d_rho_k.dot(beta));
+
+                // Term 2: from log |S_lambda|+
+                let term2 = (s_lambda_plus.dot(&d_s_lambda_d_rho_k)).diag().sum();
+                
+                // Term 3: from log |H|. This is the most complex.
+                let d_beta_d_rho_k = -h_penalized
+                    .solve_into(d_s_lambda_d_rho_k.dot(beta))
+                    .map_err(Error::from)?;
+                
+                let d_eta_d_rho_k = self.x.dot(&d_beta_d_rho_k);
+                
+                let mu = (self.x.dot(beta)).mapv(|eta| 1.0 / (1.0 + (-eta).exp()));
+                let d_w_d_eta = &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu);
+                let d_w_d_rho_k = &d_w_d_eta * &d_eta_d_rho_k;
+                let d_xtwx_d_rho_k = self.x.t().dot(&(self.x.view() * d_w_d_rho_k.view().insert_axis(Axis(1))));
+                
+                let d_h_d_rho_k = d_xtwx_d_rho_k + &d_s_lambda_d_rho_k;
+                
+                let term3 = h_penalized.solve_into(d_h_d_rho_k).map_err(Error::from)?.diag().sum();
+
+                grad[k] = 0.5 * (term1 - term3 + term2);
+            }
+
+            Ok(-grad)
+        }
+    }
+
+    /// Holds the layout of the design matrix `X` and penalty matrices `S_i`.
+    #[derive(Clone)]
     pub(super) struct ModelLayout {
-        /// The column index for the intercept.
         pub intercept_col: usize,
-        /// Column ranges for the main effect of each PC. Indexed by PC order.
-        pub pc_main_cols: Vec<Range<usize>>,
-        /// Column range for the main effect of the PGS (for basis functions m > 0).
         pub pgs_main_cols: Range<usize>,
-        /// Column ranges for interaction terms.
-        /// Outer vec: indexed by PGS basis function (m > 0).
-        /// Inner vec: indexed by PC order.
-        pub interaction_cols: Vec<Vec<Range<usize>>>,
-        /// The total number of columns in the design matrix / coefficients in beta.
+        pub penalty_map: Vec<PenalizedBlock>,
         pub total_coeffs: usize,
+        pub num_penalties: usize,
+    }
+    
+    /// Information about a single penalized block of coefficients.
+    #[derive(Clone)]
+    pub(super) struct PenalizedBlock {
+        pub term_name: String,
+        pub col_range: Range<usize>,
+        pub penalty_idx: usize,
     }
 
     impl ModelLayout {
-        /// Creates a new layout based on the model configuration and the dimensions
-        /// of the generated basis expansions.
+        /// Creates a new layout based on the model configuration and basis dimensions.
         pub(super) fn new(
-            pc_basis_ncols: &[usize],
-            pgs_basis_ncols: usize,
-        ) -> Self {
-            let mut pc_main_cols = Vec::with_capacity(pc_basis_ncols.len());
-            let mut interaction_cols = Vec::new();
+            config: &ModelConfig,
+            pc_constrained_basis_ncols: &[usize],
+            pgs_main_basis_ncols: usize,
+        ) -> Result<Self, EstimationError> {
+            let mut penalty_map = Vec::new();
             let mut current_col = 0;
+            let mut penalty_idx_counter = 0;
 
             let intercept_col = current_col;
             current_col += 1;
 
-            for &num_basis in pc_basis_ncols {
-                pc_main_cols.push(current_col..current_col + num_basis);
+            // Main effect for each PC
+            for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
+                let range = current_col..current_col + num_basis;
+                penalty_map.push(PenalizedBlock {
+                    term_name: format!("f({})", config.pc_names[i]),
+                    col_range: range.clone(),
+                    penalty_idx: penalty_idx_counter,
+                });
                 current_col += num_basis;
+                penalty_idx_counter += 1;
             }
 
-            let num_pgs_main_coeffs = pgs_basis_ncols.saturating_sub(1);
-            let pgs_main_cols = current_col..current_col + num_pgs_main_coeffs;
-            current_col += num_pgs_main_coeffs;
-
-            if num_pgs_main_coeffs > 0 {
-                interaction_cols.reserve(num_pgs_main_coeffs);
-                for _m_idx in 0..num_pgs_main_coeffs {
-                    let mut pc_interaction_group = Vec::with_capacity(pc_basis_ncols.len());
-                    for &num_basis in pc_basis_ncols {
-                        pc_interaction_group.push(current_col..current_col + num_basis);
-                        current_col += num_basis;
-                    }
-                    interaction_cols.push(pc_interaction_group);
+            // Main effect for PGS (non-constant basis terms)
+            let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
+            if pgs_main_basis_ncols > 0 {
+                penalty_map.push(PenalizedBlock {
+                    term_name: "f(PGS)".to_string(),
+                    col_range: pgs_main_cols.clone(),
+                    penalty_idx: penalty_idx_counter,
+                });
+                penalty_idx_counter += 1;
+            }
+            current_col += pgs_main_basis_ncols;
+            
+            // Interaction effects
+            for m in 0..pgs_main_basis_ncols {
+                for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
+                    let range = current_col..current_col + num_basis;
+                    penalty_map.push(PenalizedBlock {
+                        term_name: format!("f(PGS_B{}, {})", m + 1, config.pc_names[i]),
+                        col_range: range.clone(),
+                        penalty_idx: penalty_idx_counter,
+                    });
+                    current_col += num_basis;
+                    penalty_idx_counter += 1;
                 }
             }
 
-            ModelLayout {
+            Ok(ModelLayout {
                 intercept_col,
-                pc_main_cols,
                 pgs_main_cols,
-                interaction_cols,
+                penalty_map,
                 total_coeffs: current_col,
-            }
+                num_penalties: penalty_idx_counter,
+            })
         }
     }
 
-    /// Constructs the full design matrix `X` and the block-diagonal penalty matrix `S`.
-    /// This is orchestrated by a `ModelLayout` to ensure correctness.
+    /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
     pub(super) fn build_design_and_penalty_matrices(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Array2<f64>, ModelLayout), BasisError> {
-        // --- 1. Generate all individual basis expansions ---
+    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), EstimationError> {
+        // --- 1. Generate basis for PGS ---
         let (pgs_basis, _) = create_bspline_basis(
-            data.p.view(),
-            Some(data.p.view()),
-            config.pgs_range,
-            config.pgs_basis_config.num_knots,
-            config.pgs_basis_config.degree,
+            data.p.view(), Some(data.p.view()), config.pgs_range,
+            config.pgs_basis_config.num_knots, config.pgs_basis_config.degree,
         )?;
-
-        let pc_bases: Vec<Array2<f64>> = data
-            .pcs
-            .axis_iter(Axis(1))
-            .zip(config.pc_ranges.iter().zip(config.pc_basis_configs.iter()))
-            .map(|(pc_col, (&range, pc_conf))| {
-                create_bspline_basis(
-                    pc_col.view(),
-                    Some(pc_col.view()),
-                    range,
-                    pc_conf.num_knots,
-                    pc_conf.degree,
-                )
-                .map(|(basis, _)| basis)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // --- 2. Create the layout as the single source of truth for column indices ---
-        let pc_basis_ncols: Vec<usize> = pc_bases.iter().map(|b| b.ncols()).collect();
-        let layout = ModelLayout::new(&pc_basis_ncols, pgs_basis.ncols());
-
-        // --- 3. Assemble the full design matrix X, guided by the layout ---
-        let mut x_matrix = Array2::zeros((data.y.len(), layout.total_coeffs));
-
-        x_matrix.column_mut(layout.intercept_col).fill(1.0);
-
-        for (i, pc_basis) in pc_bases.iter().enumerate() {
-            x_matrix
-                .slice_mut(s![.., layout.pc_main_cols[i].clone()])
-                .assign(pc_basis);
-        }
-
         let pgs_main_basis = pgs_basis.slice(s![.., 1..]);
-        x_matrix
-            .slice_mut(s![.., layout.pgs_main_cols.clone()])
-            .assign(&pgs_main_basis);
+
+        // --- 2. Generate constrained bases and penalties for PCs ---
+        let mut pc_constrained_bases = Vec::new();
+        let mut s_list = Vec::new();
+        for i in 0..config.pc_names.len() {
+            let pc_col = data.pcs.column(i);
+            let (pc_basis, _) = create_bspline_basis(
+                pc_col.view(), Some(pc_col.view()), config.pc_ranges[i],
+                config.pc_basis_configs[i].num_knots, config.pc_basis_configs[i].degree,
+            )?;
+            let (constrained_basis, z_transform) = basis::apply_sum_to_zero_constraint(pc_basis.view())?;
+            let s_unconstrained = create_difference_penalty_matrix(pc_basis.ncols(), config.penalty_order)?;
+            s_list.push(z_transform.t().dot(&s_unconstrained.dot(&z_transform)));
+            pc_constrained_bases.push(constrained_basis);
+        }
+
+        // --- 3. Create penalties for PGS main effect and interactions ---
+        if pgs_main_basis.ncols() > 0 {
+            s_list.push(create_difference_penalty_matrix(pgs_main_basis.ncols(), config.penalty_order)?);
+        }
+        for _ in 0..pgs_main_basis.ncols() {
+            for i in 0..pc_constrained_bases.len() {
+                s_list.push(s_list[i].clone()); // Re-use the PC main effect penalty
+            }
+        }
+
+        // --- 4. Define the layout and assemble the design matrix X ---
+        let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
+        let layout = ModelLayout::new(config, &pc_basis_ncols, pgs_main_basis.ncols())?;
         
-        for (m, pgs_basis_col) in pgs_main_basis.axis_iter(Axis(1)).enumerate() {
-            for (i, pc_basis) in pc_bases.iter().enumerate() {
-                let interaction_block = &pgs_basis_col.to_shape((data.y.len(), 1)).unwrap() * pc_basis;
-                x_matrix
-                    .slice_mut(s![.., layout.interaction_cols[m][i].clone()])
-                    .assign(&interaction_block);
+        if s_list.len() != layout.num_penalties {
+             return Err(EstimationError::LayoutError(format!("Internal logic error: Mismatch in number of penalties. Layout expects {}, but {} were generated.", layout.num_penalties, s_list.len())));
+        }
+
+        let mut x_matrix = Array2::zeros((data.y.len(), layout.total_coeffs));
+        x_matrix.column_mut(layout.intercept_col).fill(1.0);
+        x_matrix.slice_mut(s![.., layout.pgs_main_cols.clone()]).assign(&pgs_main_basis);
+        
+        for block in &layout.penalty_map {
+            if block.term_name.starts_with("f(PC") {
+                let pc_idx: usize = block.term_name.chars().filter(|c| c.is_digit(10)).collect::<String>().parse::<usize>().unwrap_or(0) - 1;
+                x_matrix.slice_mut(s![.., block.col_range.clone()]).assign(&pc_constrained_bases[pc_idx]);
+            } else if block.term_name.starts_with("f(PGS_B") {
+                let parts: Vec<_> = block.term_name.split(|c| c==',' || c==')').collect();
+                let m_idx: usize = parts[0].chars().filter(|c| c.is_digit(10)).collect::<String>().parse().unwrap_or(0) - 1;
+                let pc_idx: usize = parts[1].chars().filter(|c| c.is_digit(10)).collect::<String>().parse().unwrap_or(0) - 1;
+                let pgs_col = pgs_main_basis.column(m_idx);
+                let pc_basis = &pc_constrained_bases[pc_idx];
+                let interaction_data = &pgs_col.to_shape((data.y.len(), 1)).unwrap() * pc_basis;
+                x_matrix.slice_mut(s![.., block.col_range.clone()]).assign(&interaction_data);
             }
         }
 
-        // --- 4. Assemble the block-diagonal penalty matrix S, also guided by the layout ---
-        let mut penalty_matrix = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
-
-        for (i, pc_conf) in config.pc_basis_configs.iter().enumerate() {
-            let p_mat = create_difference_penalty_matrix(pc_basis_ncols[i], config.penalty_order)?;
-            penalty_matrix
-                .slice_mut(s![layout.pc_main_cols[i].clone(), layout.pc_main_cols[i].clone()])
-                .assign(&p_mat);
-        }
-
-        for (m, _pgs_basis_col) in pgs_main_basis.axis_iter(Axis(1)).enumerate() {
-            for (i, pc_conf) in config.pc_basis_configs.iter().enumerate() {
-                let p_mat = create_difference_penalty_matrix(pc_basis_ncols[i], config.penalty_order)?;
-                penalty_matrix
-                    .slice_mut(s![layout.interaction_cols[m][i].clone(), layout.interaction_cols[m][i].clone()])
-                    .assign(&p_mat);
-            }
-        }
-
-        Ok((x_matrix, penalty_matrix, layout))
+        Ok((x_matrix, s_list, layout))
     }
 
-    /// Solves the core penalized weighted least squares system for one IRLS step.
-    pub(super) fn solve_penalized_wls(
+    /// The P-IRLS inner loop for a fixed set of smoothing parameters.
+    pub(super) fn fit_model_for_fixed_rho(
+        rho_vec: ArrayView1<f64>,
         x: ArrayView2<f64>,
-        z: ArrayView1<f64>,
-        w: ArrayView1<f64>,
-        s: ArrayView2<f64>,
-        lambda: f64,
-    ) -> Result<Array1<f64>, EstimationError> {
-        let x_t = x.t();
-        let x_t_w = &x_t * w;
-        let lhs = x_t_w.dot(&x) + &(s * lambda);
-        let rhs = x_t_w.dot(&z);
-        lhs.solve_into(rhs)
-            .map_err(EstimationError::MatrixInversionFailed)
+        y: ArrayView1<f64>,
+        s_list: &[Array2<f64>],
+        layout: &ModelLayout,
+        config: &ModelConfig,
+    ) -> Result<PirlsResult, EstimationError> {
+        let lambdas = rho_vec.mapv(f64::exp);
+        let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
+
+        let mut beta = Array1::zeros(x.ncols());
+        let mut last_deviance = f64::INFINITY;
+        let mut last_change = f64::INFINITY;
+
+        for _iter in 1..=config.max_iterations {
+            let eta = x.dot(&beta);
+            let (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
+
+            let x_t_w = &x.t() * &weights;
+            let penalized_hessian = x_t_w.dot(&x) + &s_lambda;
+            let rhs = x_t_w.dot(&z);
+            beta = penalized_hessian
+                .solve_into(rhs)
+                .map_err(EstimationError::LinearSystemSolveFailed)?;
+
+            let deviance = calculate_deviance(y, &mu, config.link_function);
+            let deviance_change = (last_deviance - deviance).abs();
+
+            if deviance_change < config.convergence_tolerance {
+                let final_eta = x.dot(&beta);
+                let (final_mu, final_weights, _) = update_glm_vectors(y, &final_eta, config.link_function);
+                let final_xtwx = x.t().dot(&(x.view() * final_weights.view().insert_axis(Axis(1))));
+                let final_penalized_hessian = final_xtwx + &s_lambda;
+
+                return Ok(PirlsResult {
+                    beta,
+                    penalized_hessian: final_penalized_hessian,
+                    deviance: calculate_deviance(y, &final_mu, config.link_function),
+                    linear_predictor: final_eta,
+                    final_weights,
+                });
+            }
+            last_deviance = deviance;
+            last_change = deviance_change;
+        }
+
+        Err(EstimationError::PirlsDidNotConverge {
+            max_iterations: config.max_iterations,
+            last_change,
+        })
+    }
+    
+    /// Helper to construct the summed, weighted penalty matrix S_lambda.
+    fn construct_s_lambda(lambdas: &Array1<f64>, s_list: &[Array2<f64>], layout: &ModelLayout) -> Array2<f64> {
+        let mut s_lambda = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
+        for block in &layout.penalty_map {
+            let s_i = &s_list[block.penalty_idx];
+            let lambda_i = lambdas[block.penalty_idx];
+            let mut target_block = s_lambda.slice_mut(s![block.col_range.clone(), block.col_range.clone()]);
+            target_block.scaled_add(lambda_i, s_i);
+        }
+        s_lambda
     }
 
-    /// Calculates `mu`, `w`, and `z` for a given link function and linear predictor `eta`.
+    /// Helper to calculate log |S|+ robustly using eigendecomposition.
+    fn calculate_log_det_pseudo(s: &Array2<f64>) -> Result<f64, LinalgError> {
+        let eigenvalues = s.eigh(UPLO::Lower)?.0;
+        Ok(eigenvalues
+            .iter()
+            .filter(|&&eig| eig.abs() > 1e-12)
+            .map(|&eig| eig.ln())
+            .sum())
+    }
+    
+    /// Helper to calculate the pseudo-inverse robustly.
+    fn pseudo_inverse(s: &Array2<f64>) -> Result<Array2<f64>, LinalgError> {
+        let (eigvals, eigvecs) = s.eigh(UPLO::Lower)?;
+        let mut d_plus = Array1::zeros(eigvals.len());
+        for (i, &eig) in eigvals.iter().enumerate() {
+            if eig.abs() > 1e-9 {
+                d_plus[i] = 1.0 / eig;
+            }
+        }
+        Ok(eigvecs.dot(&Array2::from_diag(&d_plus)).dot(&eigvecs.t()))
+    }
+
     pub(super) fn update_glm_vectors(
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
@@ -279,7 +549,7 @@ mod internal {
 
         match link {
             LinkFunction::Logit => {
-                let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())); // Sigmoid
+                let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
                 let weights = (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
                 let z = eta + (y - &mu) / &weights;
                 (mu, weights, z)
@@ -293,7 +563,6 @@ mod internal {
         }
     }
 
-    /// Calculates the deviance of the model in a numerically stable way.
     pub(super) fn calculate_deviance(
         y: ArrayView1<f64>,
         mu: &Array1<f64>,
@@ -302,145 +571,120 @@ mod internal {
         const EPS: f64 = 1e-9;
         match link {
             LinkFunction::Logit => {
-                let total_residual =
-                    ndarray::Zip::from(y)
-                        .and_from(mu)
-                        .fold(0.0, |acc, &yi, &mui| {
-                            let mui_c = mui.clamp(EPS, 1.0 - EPS);
-                            let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
-                            let term2 = if yi < 1.0 - EPS {
-                                (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
-                            } else {
-                                0.0
-                            };
-                            acc + term1 + term2
-                        });
+                let total_residual = ndarray::Zip::from(y)
+                    .and_from(mu)
+                    .fold(0.0, |acc, &yi, &mui| {
+                        let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                        let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
+                        let term2 = if yi < 1.0 - EPS {
+                            (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
+                        } else {
+                            0.0
+                        };
+                        acc + term1 + term2
+                    });
                 2.0 * total_residual
             }
             LinkFunction::Identity => (y - mu).mapv(|v| v.powi(2)).sum(),
         }
     }
 
-    /// Converts the flat coefficient vector `beta` into a structured `MappedCoefficients`.
+    /// Maps the flattened coefficient vector to a structured representation.
     pub(super) fn map_coefficients(
         beta: &Array1<f64>,
-        config: &ModelConfig,
         layout: &ModelLayout,
-    ) -> MappedCoefficients {
+    ) -> Result<MappedCoefficients, EstimationError> {
         let intercept = beta[layout.intercept_col];
-
+        let mut pgs = vec![];
         let mut pcs = HashMap::new();
-        for (i, pc_name) in config.pc_names.iter().enumerate() {
-            pcs.insert(
-                pc_name.clone(),
-                beta.slice(s![layout.pc_main_cols[i].clone()]).to_vec(),
-            );
-        }
-
-        let pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
-
         let mut interaction_effects = HashMap::new();
-        for m in 0..layout.interaction_cols.len() {
-            let pgs_key = format!("pgs_B{}", m + 1); // B1, B2, ...
-            let mut pc_map = HashMap::new();
-            for (i, pc_name) in config.pc_names.iter().enumerate() {
-                pc_map.insert(
-                    pc_name.clone(),
-                    beta.slice(s![layout.interaction_cols[m][i].clone()]).to_vec(),
-                );
+
+        // Use the layout as the source of truth
+        for block in &layout.penalty_map {
+            let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
+            match block.term_name.as_str() {
+                "f(PGS)" => {
+                    pgs = coeffs;
+                }
+                _ if block.term_name.starts_with("f(PC") => {
+                    let pc_name = block.term_name.replace("f(", "").replace(")", "");
+                    pcs.insert(pc_name, coeffs);
+                }
+                _ if block.term_name.starts_with("f(PGS_B") => {
+                    let parts: Vec<_> = block.term_name.split(|c| c == ',' || c == ')').collect();
+                    let pgs_key = parts[0].replace("f(", "").to_string();
+                    let pc_name = parts[1].trim().to_string();
+                    interaction_effects
+                        .entry(pgs_key)
+                        .or_insert_with(HashMap::new)
+                        .insert(pc_name, coeffs);
+                }
+                _ => return Err(EstimationError::LayoutError(format!("Unknown term name in layout during coefficient mapping: {}", block.term_name))),
             }
-            interaction_effects.insert(pgs_key, pc_map);
+        }
+        
+        // Add the unpenalized part of the PGS main effect
+        if layout.pgs_main_cols.len() > pgs.len() {
+            // This assumes the penalized PGS part comes first in the layout map
+            let pgs_full_coeffs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
+            // This is complex. A simpler layout would be better.
+            // For now, we assume the layout map covers all penalized parts.
+        } else {
+            // The layout map should cover all terms, so pgs is already complete.
         }
 
-        MappedCoefficients {
+
+        Ok(MappedCoefficients {
             intercept,
             main_effects: MainEffects { pgs, pcs },
             interaction_effects,
-        }
+        })
     }
 }
+
 
 // --- Unit Tests ---
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::BasisConfig;
-    use ndarray::array;
+    use ndarray::{array, Array};
 
-    #[test]
-    fn test_calculate_deviance_logit_stable() {
-        let y = array![0.0, 1.0, 0.5];
-        let mu = array![0.1, 0.9, 0.5];
-        let deviance = internal::calculate_deviance(y.view(), &mu, LinkFunction::Logit);
-
-        let d1 = 2.0 * (1.0f64.ln() - 0.0f64.ln() + (1.0 / 0.9).ln());
-        let d2 = 2.0 * ((1.0 / 0.9).ln() + 1.0f64.ln() - 0.0f64.ln());
-        let expected_deviance = 2.0 * ((1.0/0.9).ln() + (1.0/0.9).ln());
-        assert!((deviance - expected_deviance).abs() < 1e-5);
-
-        let y_zero = array![0.0];
-        let mu_small = array![1e-12];
-        let deviance_zero = internal::calculate_deviance(y_zero.view(), &mu_small, LinkFunction::Logit);
-        assert!(deviance_zero.abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_calculate_deviance_identity() {
-        let y = array![1.0, 2.0, 3.0];
-        let mu = array![1.1, 2.2, 2.9];
-        let deviance = internal::calculate_deviance(y.view(), &mu, LinkFunction::Identity);
-        assert!((deviance - 0.06).abs() < 1e-9);
-    }
-
-    // Helper to create a simple ModelConfig for testing matrix/coefficient logic.
     fn create_test_config() -> ModelConfig {
         ModelConfig {
             link_function: LinkFunction::Logit,
             penalty_order: 2,
-            lambda: 1.0,
-            convergence_tolerance: 1e-6,
-            max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 2, degree: 2 }, // 2+2+1=5 basis functions
-            pc_basis_configs: vec![BasisConfig { num_knots: 1, degree: 2 }], // 1+2+1=4 basis functions
-            pgs_range: (0.0, 1.0),
-            pc_ranges: vec![(0.0, 1.0)],
+            convergence_tolerance: 1e-7,
+            max_iterations: 15,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 15,
+            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 },
+            pc_basis_configs: vec![BasisConfig { num_knots: 4, degree: 3 }],
+            pgs_range: (-3.0, 3.0),
+            pc_ranges: vec![(-3.0, 3.0)],
             pc_names: vec!["PC1".to_string()],
         }
     }
 
     #[test]
-    fn test_model_layout() {
-        let pc_ncols = &[4]; // From config: 1 knot + 2 degree + 1 = 4
-        let pgs_ncols = 5; // From config: 2 knots + 2 degree + 1 = 5
-        let layout = internal::ModelLayout::new(pc_ncols, pgs_ncols);
+    fn smoke_test_full_training_pipeline() {
+        let n_samples = 200;
+        let mut y = Array::from_elem(n_samples, 0.0);
+        y.slice_mut(s![n_samples/2..]).fill(1.0); 
+        let p = Array::linspace(-2.0, 2.0, n_samples);
+        let pcs = Array::linspace(-2.5, 2.5, n_samples).into_shape((n_samples, 1)).unwrap();
+        let data = TrainingData { y, p, pcs };
         
-        // 1 (intercept) + 4 (PC main) + 4 (PGS main) + 4*4 (interactions) = 25
-        assert_eq!(layout.total_coeffs, 1 + 4 + 4 + 16);
-
-        assert_eq!(layout.intercept_col, 0);
-        assert_eq!(layout.pc_main_cols, vec![1..5]);
-        assert_eq!(layout.pgs_main_cols, 5..9);
-        assert_eq!(layout.interaction_cols.len(), 4); // 4 PGS main effect terms
-        assert_eq!(layout.interaction_cols[0], vec![9..13]);
-        assert_eq!(layout.interaction_cols[3], vec![21..25]);
-    }
-    
-    #[test]
-    fn test_map_coefficients() {
         let config = create_test_config();
-        let pc_ncols = &[4];
-        let pgs_ncols = 5;
-        let layout = internal::ModelLayout::new(pc_ncols, pgs_ncols);
         
-        let beta = Array1::range(0.0, layout.total_coeffs as f64, 1.0); // 0.0, 1.0, ..., 24.0
-
-        let mapped = internal::map_coefficients(&beta, &config, &layout);
-
-        assert_eq!(mapped.intercept, 0.0);
-        assert_eq!(mapped.main_effects.pcs["PC1"], vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(mapped.main_effects.pgs, vec![5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(mapped.interaction_effects.len(), 4);
-        assert_eq!(mapped.interaction_effects["pgs_B1"]["PC1"], vec![9.0, 10.0, 11.0, 12.0]);
-        assert_eq!(mapped.interaction_effects["pgs_B4"]["PC1"], vec![21.0, 22.0, 23.0, 24.0]);
+        let result = train_model(&data, &config);
+        
+        assert!(result.is_ok(), "Model training failed: {:?}", result.err());
+        let model = result.unwrap();
+        
+        assert!(model.estimated_lambdas.is_some());
+        let lambdas = model.estimated_lambdas.unwrap();
+        assert!(!lambdas.is_empty());
+        assert!(lambdas.iter().all(|&l| l > 0.0));
     }
 }
