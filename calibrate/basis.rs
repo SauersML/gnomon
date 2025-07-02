@@ -260,71 +260,75 @@ mod internal {
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses a corrected, stable implementation of the Cox-de Boor algorithm
-    /// that properly handles the recurrence relation without in-place update issues.
+    /// This uses a corrected, stable implementation of the Cox-de Boor algorithm.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
     ) -> Array1<f64> {
         let num_knots = knots.len();
+        // The number of B-spline basis functions is num_knots - degree - 1.
         let num_basis = num_knots - degree - 1;
 
-        // Find the knot interval `mu` that contains x, such that `knots[mu] <= x < knots[mu+1]`.
-        let mu = match knots.iter().rposition(|&k| k <= x) {
-            Some(pos) => {
-                // Clamp to valid range
-                pos.min(num_basis + degree - 1).max(degree)
-            }
-            None => degree, // Default to the first valid interval
+        // Clamp x to the valid domain defined by the knots to handle boundary conditions.
+        // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`.
+        let x_clamped = x.clamp(knots[degree], knots[num_basis]);
+
+        // Find the knot interval `mu` such that `knots[mu] <= x < knots[mu+1]`.
+        let mu = match knots.iter().rposition(|&k| k <= x_clamped) {
+            Some(pos) => pos,
+            // This case should ideally not be reached due to clamping.
+            None => degree,
         };
 
-        // Initialize basis values for degree 0
+        // `b` will store the non-zero basis function values for the current degree.
+        // At any point x, at most `degree + 1` basis functions are non-zero.
         let mut b = Array1::zeros(degree + 1);
+        // Base case (d=0): For degree 0, only one basis function is non-zero (=1) in the interval.
         b[0] = 1.0;
 
-        // Apply the Cox-de Boor recurrence relation iteratively
+        // Iteratively compute values for higher degrees from d=1 up to the target degree.
         for d in 1..=degree {
-            // Use a temporary buffer to read the "old" values from degree d-1
-            let b_old = b.clone();
-            // Reset the current buffer for the new degree's values
-            b.fill(0.0);
+            // `b_old` holds the values from the previous degree (d-1). We clone it to
+            // read from while we write the new values for degree `d`.
+            let b_old = b.slice(s![..d]).to_owned();
+            b.fill(0.0); // Reset the current buffer.
 
-            for i in 0..=d {
-                // Index for knots array
-                let idx = mu - d + i;
+            // In this loop, `b_old[j]` contributes to `b[j]` and `b[j+1]`.
+            for j in 0..d {
+                if b_old[j] == 0.0 { continue; } // Optimization: skip if parent is zero.
 
-                // Left parent spline contribution
-                if i < d && b_old[i] > 0.0 {
-                    let denom = knots[idx + d] - knots[idx];
-                    if denom > 1e-12 {
-                        let w = (x - knots[idx]) / denom;
-                        b[i] += w * b_old[i];
-                    }
+                let i_knot = mu - d + 1 + j;
+
+                // First term of the recursion: Contribution from B_{i,d-1}(x)
+                let den1 = knots[i_knot + d] - knots[i_knot];
+                if den1 > 1e-12 { // Handle 0/0 for repeated knots 
+                    let w = (x_clamped - knots[i_knot]) / den1;
+                    b[j] += w * b_old[j];
                 }
 
-                // Right parent spline contribution
-                if i > 0 && b_old[i - 1] > 0.0 {
-                    let denom = knots[idx + d] - knots[idx];
-                    if denom > 1e-12 {
-                        let w = (knots[idx + d] - x) / denom;
-                        b[i] += w * b_old[i - 1];
-                    }
+                // Second term of the recursion: Contribution from B_{i,d-1}(x)
+                let den2 = knots[i_knot + d + 1] - knots[i_knot + 1];
+                if den2 > 1e-12 { // Handle 0/0 for repeated knots 
+                    let w = (knots[i_knot + d + 1] - x_clamped) / den2;
+                    b[j + 1] += w * b_old[j];
                 }
             }
         }
 
-        // Place the non-zero values in the correct positions
+        // `b` now contains the values of the `degree + 1` potentially non-zero basis functions.
+        // These correspond to B_{mu-degree, degree}, ..., B_{mu, degree}.
+        // Place them in the correct locations in the final full basis vector.
         let mut basis_values = Array1::zeros(num_basis);
         let start_index = mu.saturating_sub(degree);
-        
+
         for i in 0..=degree {
             let global_idx = start_index + i;
             if global_idx < num_basis {
                 basis_values[global_idx] = b[i];
             }
         }
-       
+        
         basis_values
     }
 }
@@ -425,6 +429,34 @@ mod tests {
         assert!((values[0] - 0.5).abs() < 1e-9, "Expected B_0,1 to be 0.5, got {}", values[0]);
         assert!((values[1] - 0.5).abs() < 1e-9, "Expected B_1,1 to be 0.5, got {}", values[1]);
         assert!((values[2] - 0.0).abs() < 1e-9, "Expected B_2,1 to be 0.0, got {}", values[2]);
+    }
+
+    #[test]
+    fn test_cox_de_boor_fix_higher_degree() {
+        // Test that verifies the Cox-de Boor denominator fix for higher degree splines
+        // Using non-uniform knots where the bug would be more apparent
+        let knots = array![0.0, 0.0, 0.0, 1.0, 3.0, 4.0, 4.0, 4.0];
+        let x = 2.0;
+        
+        let values = internal::evaluate_splines_at_point(x, 2, knots.view());
+        
+        // The basis functions should sum to 1.0 (partition of unity property)
+        let sum = values.sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "Basis functions should sum to 1.0, got {}",
+            sum
+        );
+        
+        // All values should be non-negative
+        for (i, &val) in values.iter().enumerate() {
+            assert!(
+                val >= -1e-9,
+                "Basis function {} should be non-negative, got {}",
+                i,
+                val
+            );
+        }
     }
 
     #[test]
