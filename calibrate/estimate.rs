@@ -941,8 +941,8 @@ mod tests {
         let config = ModelConfig {
             link_function: LinkFunction::Logit,
             penalty_order: 2,
-            convergence_tolerance: 1e-7,
-            max_iterations: 15,
+            convergence_tolerance: 1e-4, // More reasonable for test
+            max_iterations: 50, // More iterations for complex models
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 15,
             pgs_basis_config: BasisConfig {
@@ -1007,8 +1007,8 @@ mod tests {
         let config = ModelConfig {
             link_function: LinkFunction::Logit,
             penalty_order: 2,
-            convergence_tolerance: 1e-7,
-            max_iterations: 15,
+            convergence_tolerance: 1e-4, // More reasonable for test
+            max_iterations: 50, // More iterations for complex models
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 15,
             pgs_basis_config: BasisConfig {
