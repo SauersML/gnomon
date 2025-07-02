@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The number of variants to process locally before updating the global atomic counter.
-/// A power of 2 is often efficient.
+/// A power of 2 is often efficient
 const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 /// The generic entry point for the producer thread.
