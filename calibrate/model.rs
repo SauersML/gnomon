@@ -27,6 +27,14 @@ pub struct BasisConfig {
     pub degree: usize,
 }
 
+/// Holds the transformation matrix for a sum-to-zero constraint.
+/// This is serializable so it can be saved to the TOML file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Constraint {
+    /// The Z matrix that transforms an unconstrained basis B to a constrained one B_c = B.dot(Z)
+    pub z_transform: Array2<f64>,
+}
+
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +53,11 @@ pub struct ModelConfig {
     /// Defines the canonical order for Principal Components. This order is strictly
     /// enforced during both model fitting and prediction to ensure correctness.
     pub pc_names: Vec<String>,
+    
+    /// A map from a term name (e.g., "PC1", "pgs_main") to its constraint transformation.
+    /// Use an Option because not all terms might be constrained.
+    #[serde(default)] // For backward compatibility with old models that don't have this field
+    pub constraints: HashMap<String, Constraint>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -93,6 +106,8 @@ pub enum ModelError {
     BasisError(#[from] basis::BasisError),
     #[error("Internal error: failed to stack design matrix columns during prediction.")]
     InternalStackingError,
+    #[error("Constraint transformation matrix missing for term '{0}'. This usually indicates a model format mismatch.")]
+    ConstraintMissing(String),
 }
 
 impl TrainedModel {
@@ -167,38 +182,73 @@ mod internal {
         pcs_new: ArrayView2<f64>,
         config: &ModelConfig,
     ) -> Result<Array2<f64>, ModelError> {
-        let pgs_basis =
-            create_bspline_basis(p_new, None, config.pgs_range, config.pgs_basis_config.num_knots, config.pgs_basis_config.degree)?
-                .0;
+        // 1. Generate basis for PGS
+        let (pgs_basis_unc, _) = create_bspline_basis(
+            p_new, 
+            None, // ALWAYS use None for training_data_for_quantiles during prediction
+            config.pgs_range, 
+            config.pgs_basis_config.num_knots, 
+            config.pgs_basis_config.degree
+        )?;
 
-        let pc_bases: Vec<Array2<f64>> = pcs_new
-            .axis_iter(Axis(1))
-            .zip(config.pc_ranges.iter().zip(config.pc_basis_configs.iter()))
-            .map(|(pc_col, (&range, pc_conf))| {
-                create_bspline_basis(pc_col, None, range, pc_conf.num_knots, pc_conf.degree)
-                    .map(|(basis, _)| basis)
-            })
-            .collect::<Result<_, _>>()?;
+        // Apply the SAVED PGS constraint
+        let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
+        let pgs_z = &config.constraints.get("pgs_main")
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))? 
+            .z_transform;
+        let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
+        // 2. Generate bases for PCs
+        let mut pc_constrained_bases = Vec::new();
+        for i in 0..config.pc_names.len() {
+            let pc_col = pcs_new.column(i);
+            let (pc_basis_unc, _) = create_bspline_basis(
+                pc_col,
+                None,
+                config.pc_ranges[i],
+                config.pc_basis_configs[i].num_knots,
+                config.pc_basis_configs[i].degree
+            )?;
+
+            // Apply the SAVED PC constraint
+            let pc_name = &config.pc_names[i];
+            let pc_z = &config.constraints.get(pc_name)
+                .ok_or_else(|| ModelError::ConstraintMissing(pc_name.clone()))?
+                .z_transform;
+            pc_constrained_bases.push(pc_basis_unc.dot(pc_z)); // Now constrained
+        }
+
+        // 3. Assemble the design matrix following the canonical order
+        let n_samples = p_new.len();
         let mut owned_cols: Vec<Array1<f64>> = Vec::new();
-        owned_cols.push(Array1::ones(p_new.len()));
-        for pc_basis in &pc_bases {
+
+        // 1. Intercept
+        owned_cols.push(Array1::ones(n_samples));
+
+        // 2. Main PC effects
+        for pc_basis in &pc_constrained_bases {
             for col in pc_basis.axis_iter(Axis(1)) {
                 owned_cols.push(col.to_owned());
             }
         }
-        let pgs_main_effects = pgs_basis.slice(s![.., 1..]);
-        for col in pgs_main_effects.axis_iter(Axis(1)) {
+
+        // 3. Main PGS effect
+        for col in pgs_main_basis.axis_iter(Axis(1)) {
             owned_cols.push(col.to_owned());
         }
-        for pgs_basis_col in pgs_main_effects.axis_iter(Axis(1)) {
-            for pc_basis in &pc_bases {
-                for pc_basis_col in pc_basis.axis_iter(Axis(1)) {
-                    owned_cols.push(&pgs_basis_col * &pc_basis_col);
+
+        // 4. Interaction effects
+        for m in 0..pgs_main_basis.ncols() { // Loop over main PGS effects
+            let pgs_weight_col = pgs_basis_unc.column(m + 1); // Use UNCONSTRAINED PGS basis column
+            for pc_basis in &pc_constrained_bases {
+                for col in pc_basis.axis_iter(Axis(1)) {
+                    let interaction_col = &col * &pgs_weight_col;
+                    owned_cols.push(interaction_col.to_owned());
                 }
             }
         }
         
+        // Stack all column views into the final design matrix
         let col_views: Vec<_> = owned_cols.iter().map(Array1::view).collect();
         ndarray::stack(Axis(1), &col_views).map_err(|_| ModelError::InternalStackingError)
     }

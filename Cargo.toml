@@ -46,7 +46,7 @@ dwldutil = "2.0.4"
 indicatif = "0.17"
 flate2 = "1.1.2"
 dashmap = "6.1.0"
-ndarray = "0.16.1"
+ndarray = { version = "0.16.1", features = ["serde"] }
 ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-static"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
@@ -76,6 +76,8 @@ no-inline-profiling = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+tempfile = "3.13"
+approx = "0.5"
 
 [[bench]]
 name = "path_benchmark"

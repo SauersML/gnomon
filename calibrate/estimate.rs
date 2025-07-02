@@ -28,7 +28,7 @@ use ndarray_bfgs;
 // Crate-level imports
 use crate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::data::TrainingData;
-use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel};
+use crate::model::{LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel, Constraint};
 
 // Ndarray and Linalg
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -77,7 +77,7 @@ pub fn train_model(
     );
 
     // 1. Build the one-time matrices and define the model structure.
-    let (x_matrix, s_list, layout) =
+    let (x_matrix, s_list, layout, constraints) =
         internal::build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
 
@@ -140,8 +140,12 @@ pub fn train_model(
 
     let mapped_coefficients = internal::map_coefficients(&final_fit.beta, &layout)?;
 
+    // Create updated config with constraints
+    let mut config_with_constraints = config.clone();
+    config_with_constraints.constraints = constraints;
+
     Ok(TrainedModel {
-        config: config.clone(),
+        config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
     })
@@ -428,11 +432,15 @@ mod internal {
     }
 
     /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
+    /// Returns the design matrix, penalty matrices, model layout, and constraint transformations.
     pub(super) fn build_design_and_penalty_matrices(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), EstimationError> {
+    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout, HashMap<String, Constraint>), EstimationError> {
         let n_samples = data.y.len();
+        
+        // Initialize constraint storage
+        let mut constraints = HashMap::new();
 
         // 1. Generate basis for PGS and apply sum-to-zero constraint
         let (pgs_basis_unc, _) = create_bspline_basis(
@@ -445,8 +453,11 @@ mod internal {
         
         // Apply sum-to-zero constraint to PGS main effects (excluding intercept)
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let (pgs_main_basis, _pgs_z_transform) = 
+        let (pgs_main_basis, pgs_z_transform) = 
             basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
+        
+        // Save the PGS constraint transformation
+        constraints.insert("pgs_main".to_string(), Constraint { z_transform: pgs_z_transform });
 
         // 2. Generate constrained bases and unscaled penalty matrices for PCs
         let mut pc_constrained_bases = Vec::new();
@@ -465,6 +476,10 @@ mod internal {
             let (constrained_basis, z_transform) = 
                 basis::apply_sum_to_zero_constraint(pc_basis_unc.view())?;
             pc_constrained_bases.push(constrained_basis);
+
+            // Save the PC constraint transformation
+            let pc_name = &config.pc_names[i];
+            constraints.insert(pc_name.clone(), Constraint { z_transform: z_transform.clone() });
 
             // Transform the penalty matrix: S_constrained = Z^T * S_unconstrained * Z
             let s_unconstrained =
@@ -513,16 +528,22 @@ mod internal {
                 let pc_name = parts[1].trim();
                 let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                let pgs_col = pgs_main_basis.column(m_idx);
-                let pc_basis = &pc_constrained_bases[pc_idx];
-                let interaction_data = &pgs_col.clone().into_shape_with_order((n_samples, 1)).unwrap() * pc_basis;
+                // **THE FIX FOR INTERACTION TERMS**
+                // Use the UNCONSTRAINED PGS basis column as the weight
+                let pgs_weight_col = pgs_basis_unc.column(m_idx + 1); // +1 because main effect is from 1..
+                // Use the CONSTRAINED PC basis matrix
+                let pc_constrained_basis = &pc_constrained_bases[pc_idx];
+                
+                // Multiply the vector across the matrix columns (broadcasting)
+                let interaction_data = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
+
                 x_matrix
                     .slice_mut(s![.., block.col_range.clone()])
                     .assign(&interaction_data);
             }
         }
 
-        Ok((x_matrix, s_list, layout))
+        Ok((x_matrix, s_list, layout, constraints))
     }
 
     /// The P-IRLS inner loop for a fixed set of smoothing parameters.
@@ -757,6 +778,7 @@ mod tests {
             pgs_range: (-3.0, 3.0),
             pc_ranges: vec![(-3.0, 3.0)],
             pc_names: vec!["PC1".to_string()],
+            constraints: HashMap::new(),
         }
     }
 
@@ -767,7 +789,7 @@ mod tests {
         y.slice_mut(s![n_samples / 2..]).fill(1.0);
         let p = Array::linspace(-2.0, 2.0, n_samples);
         let pcs = Array::linspace(-2.5, 2.5, n_samples)
-            .into_shape((n_samples, 1))
+            .into_shape_with_order((n_samples, 1))
             .unwrap();
         let data = TrainingData { y, p, pcs };
 
@@ -804,26 +826,28 @@ mod tests {
             pgs_range: (0.0, 1.0),
             pc_ranges: vec![(0.0, 1.0)],
             pc_names: vec!["PC1".to_string()],
+            constraints: HashMap::new(),
         };
 
-        let (x, s_list, layout) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, _constraints) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_n_basis = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1; // 6
         let pc_n_basis = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5
 
         let pc_n_constrained_basis = pc_n_basis - 1; // 4
-        let num_pgs_main_effects = pgs_n_basis - 1; // 5
+        let pgs_n_main_before_constraint = pgs_n_basis - 1; // 5 (excluding intercept)
+        let pgs_n_main_after_constraint = pgs_n_main_before_constraint - 1; // 4 (after constraint)
 
         let expected_coeffs = 1 // intercept
-            + num_pgs_main_effects // main PGS
-            + pc_n_constrained_basis // main PC
-            + num_pgs_main_effects * pc_n_constrained_basis; // interactions
+            + pgs_n_main_after_constraint // main PGS (constrained)
+            + pc_n_constrained_basis // main PC (constrained)
+            + pgs_n_main_after_constraint * pc_n_constrained_basis; // interactions
         
         assert_eq!(layout.total_coeffs, expected_coeffs, "Total coefficient count mismatch");
         assert_eq!(x.ncols(), expected_coeffs, "Design matrix column count mismatch");
 
         let expected_penalties = 1 // main PC
-            + num_pgs_main_effects; // one interaction penalty per PGS main effect basis fn (PGS main removed)
+            + pgs_n_main_after_constraint; // one interaction penalty per PGS main effect basis fn (PGS main removed)
         assert_eq!(s_list.len(), expected_penalties, "Penalty list count mismatch");
         assert_eq!(layout.num_penalties, expected_penalties, "Layout penalty count mismatch");
     }

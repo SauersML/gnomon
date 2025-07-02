@@ -143,6 +143,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             pgs_range,
             pc_ranges,
             pc_names,
+            constraints: std::collections::HashMap::new(),
         };
 
         // Train the final model
