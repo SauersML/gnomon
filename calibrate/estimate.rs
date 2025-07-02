@@ -323,16 +323,13 @@ mod internal {
                 let d_h_d_rho_k = d_xtwx_d_rho_k + &d_s_lambda_d_rho_k;
     
                 // Step 3f: Calculate the trace term tr(H⁻¹ * dH/dρ_k)
-                // This is calculated efficiently by solving column-wise and summing diagonal
-                let mut trace_sum = 0.0;
-                for i in 0..d_h_d_rho_k.nrows() {
-                    let mut rhs = Array1::zeros(d_h_d_rho_k.nrows());
-                    rhs[i] = d_h_d_rho_k[(i, i)];
-                    let solution = h_penalized
-                        .solve_into(rhs)
-                        .map_err(Error::from)?;
-                    trace_sum += solution[i];
-                }
+                // Solve the full linear system H * X = dH/dρ_k to find X = H⁻¹ * dH/dρ_k
+                let h_inv_dot_dh = h_penalized
+                    .solve(&d_h_d_rho_k)
+                    .map_err(Error::from)?;
+                
+                // Compute the trace by summing diagonal elements of the resulting matrix
+                let trace_sum = h_inv_dot_dh.diag().sum();
                 let log_det_h_deriv_term = 0.5 * trace_sum;
                 
                 // --- Final Assembly ---
