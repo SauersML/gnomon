@@ -1051,30 +1051,18 @@ mod tests {
                 let fixed_log_lambda = Array1::from_elem(layout.num_penalties, -1.0);
                 
                 // Run P-IRLS once with these fixed parameters
-                // Increase iterations for better convergence chance
                 let mut modified_config = config.clone();
-                modified_config.max_iterations = 200; // Increase from 50 to 200
+                modified_config.max_iterations = 200;
                 
-                let pirls_result = match internal::fit_model_for_fixed_rho(
+                // Run P-IRLS once with these fixed parameters - unwrap to ensure test fails if fitting fails
+                let pirls_result = internal::fit_model_for_fixed_rho(
                     fixed_log_lambda.view(),
                     x_matrix.view(),
                     data.y.view(),
                     &s_list,
                     &layout,
                     &modified_config,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        // For test purposes only, create a dummy result to make the test pass
-                        println!("PIRLS did not converge, but continuing test with dummy result: {:?}", e);
-                        internal::PirlsResult {
-                            beta: Array1::from_elem(x_matrix.ncols(), 0.1),
-                            penalized_hessian: Array2::eye(x_matrix.ncols()),
-                            deviance: 10.0,
-                            final_weights: Array1::from_elem(data.y.len(), 0.5)
-                        }
-                    }
-                };
+                ).unwrap();
                 
                 // Map coefficients to their structured form
                 let mapped_coefficients = internal::map_coefficients(&pirls_result.beta, &layout)
@@ -1118,9 +1106,19 @@ mod tests {
             (1.5, 1.0),    // High PGS, High PC
         ];
         
-        // Expected relative pattern (based on our generating function)
-        // We don't expect exact matches but the pattern should be consistent
-        // The pattern should follow: 0.5 + 0.8*PGS + 0.6*PC1 - 0.4*PGS*PC1
+        // True coefficients from the generating function: 0.5 + 0.8*PGS + 0.6*PC1 - 0.4*PGS*PC1
+        let true_intercept = 0.5;
+        let true_pgs_effect = 0.8;
+        let true_pc_effect = 0.6;
+        let true_interaction = -0.4;
+        
+        // Calculate the expected true values at test points
+        let true_values = test_points.iter().map(|&(pgs_val, pc_val)| {
+            let logit = true_intercept + true_pgs_effect * pgs_val + true_pc_effect * pc_val + true_interaction * pgs_val * pc_val;
+            1.0 / (1.0 + f64::exp(-logit))
+        }).collect::<Vec<_>>();
+        
+        // Calculate predictions from our model
         let mut predictions = Vec::new();
         
         for &(pgs_val, pc_val) in &test_points {
@@ -1162,25 +1160,27 @@ mod tests {
                 }
             }
             
-            // Interaction effects would require tensor product calculation
-            // We'll skip precise calculation for brevity in the test
-            
             // Convert linear predictor to probability
             let prob = 1.0 / (1.0 + (-linear_pred).exp());
             predictions.push(prob);
         }
         
-        // Check relative pattern of predictions matches generating function
-        // low_low = 0.5 + 0.8*(-1.5) + 0.6*(-1.0) - 0.4*(-1.5)*(-1.0) = -1.9
-        // low_high = 0.5 + 0.8*(-1.5) + 0.6*(1.0) - 0.4*(-1.5)*(1.0) = -0.1
-        // high_low = 0.5 + 0.8*(1.5) + 0.6*(-1.0) - 0.4*(1.5)*(-1.0) = 2.3
-        // high_high = 0.5 + 0.8*(1.5) + 0.6*(1.0) - 0.4*(1.5)*(1.0) = 1.3
+        // Verify that our predictions are within 20% of the true values
+        for (i, (&predicted, &true_value)) in predictions.iter().zip(true_values.iter()).enumerate() {
+            let relative_error = (predicted - true_value).abs() / true_value.max(0.001);
+            assert!(relative_error < 0.2, 
+                "Prediction at test point {:?} too far from true value. Predicted: {}, True: {}, Relative error: {}", 
+                test_points[i], predicted, true_value, relative_error);
+            println!("Test point {:?}: Predicted={:.4}, True={:.4}, Rel. Error={:.4}", 
+                    test_points[i], predicted, true_value, relative_error);
+        }
         
-        // Print predictions instead of asserting a specific pattern
-        println!("Predictions: low_low={}, low_high={}, high_low={}, high_high={}",
-                 predictions[0], predictions[1], predictions[2], predictions[3]);
-        // Note: The expected pattern was high_low > high_high > low_high > low_low
-        // but our model may not reproduce this exactly after the B-spline basis fix
+        // Also verify that the model preserves the expected pattern
+        // high_low > high_high > low_high > low_low
+        assert!(predictions[2] > predictions[3] && predictions[3] > predictions[1] && predictions[1] > predictions[0],
+            "Model predictions do not follow the expected pattern: high_low > high_high > low_high > low_low");
+        println!("Predicted pattern verified: high_low={:.4} > high_high={:.4} > low_high={:.4} > low_low={:.4}",
+                 predictions[2], predictions[3], predictions[1], predictions[0]);
     }
     
     /// A minimal test that verifies the basic estimation workflow without
@@ -1209,32 +1209,20 @@ mod tests {
         let fixed_rho = Array1::from_elem(layout.num_penalties, 0.0);  // lambda = exp(0) = 1.0
         
         // Fit the model with these fixed parameters
-        // Increase iterations for better convergence chance
         let mut modified_config = config.clone();
-        modified_config.max_iterations = 200; // Increase from default to 200
+        modified_config.max_iterations = 200;
         
-        let pirls_result = match internal::fit_model_for_fixed_rho(
+        // Run PIRLS with fixed smoothing parameters - unwrap to ensure test fails if fitting fails
+        let pirls_result = internal::fit_model_for_fixed_rho(
             fixed_rho.view(),
             x_matrix.view(),
             data.y.view(),
             &s_list,
             &layout,
             &modified_config,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                // For test purposes only, create a dummy result to make the test pass
-                println!("PIRLS did not converge, but continuing test with dummy result: {:?}", e);
-                internal::PirlsResult {
-                    beta: Array1::from_elem(x_matrix.ncols(), 0.1),
-                    penalized_hessian: Array2::eye(x_matrix.ncols()),
-                    deviance: 10.0,
-                    final_weights: Array1::from_elem(data.y.len(), 0.5)
-                }
-            }
-        };
+        ).unwrap();
         
-        // No need to unwrap since we're handling the Result above
+        // Store result for later use
         let fit = pirls_result;
         let coeffs = internal::map_coefficients(&fit.beta, &layout)
             .expect("Coefficient mapping should succeed");
@@ -1257,26 +1245,115 @@ mod tests {
         
         // Verify model predictions make sense
         
-        // Verify coefficient bounds without specific samples
-            
+        // Test the model predictions against expected values
+        // Since we created a test dataset with y = 0 for first half and y = 1 for second half
+        // at the midpoint of the data range, we can check if the model correctly predicts this pattern
+        
         // Extract parameters from model
         let intercept = trained_model.coefficients.intercept;
         let pgs_coeffs = &trained_model.coefficients.main_effects.pgs;
         let pc_coeffs = trained_model.coefficients.main_effects.pcs.get("PC1").unwrap();
         
-        // For a model with such a simple basis, predictions should follow a monotonic pattern
-        // where higher PGS and PC values lead to higher probabilities
-        assert!(intercept > -10.0 && intercept < 10.0, "Intercept should be reasonable");
+        // For this model, we expect that the intercept should be near zero
+        // (since the class boundary is at the middle of the range)
+        // and the coefficients for PGS and PC should be positive
+        // (since higher values should predict class 1)
         
-        // Make sure all PGS coefficients have reasonable magnitudes
-        for &coeff in pgs_coeffs {
-            assert!(coeff > -10.0 && coeff < 10.0, "PGS coefficients should be reasonable");
+        println!("Intercept: {}", intercept);
+        println!("PGS coefficients: {:?}", pgs_coeffs);
+        println!("PC1 coefficients: {:?}", pc_coeffs);
+        
+        // Compute predictions for samples at 25% and 75% of the range
+        let quarter_point = n_samples / 4;
+        let three_quarter_point = 3 * n_samples / 4;
+        
+        // Create test samples
+        let test_pgs_low = p[quarter_point];
+        let test_pgs_high = p[three_quarter_point];
+        let test_pc_low = pcs[[quarter_point, 0]];
+        let test_pc_high = pcs[[three_quarter_point, 0]];
+        
+        println!("Test points: low=({}, {}), high=({}, {})",
+                 test_pgs_low, test_pc_low, test_pgs_high, test_pc_high);
+        
+        // We expect:  
+        // - low_low should predict close to 0
+        // - high_high should predict close to 1
+        // Create basis expansions for test points
+        let (pgs_basis_low, _) = create_bspline_basis(
+            array![test_pgs_low].view(),
+            None,
+            config.pgs_range,
+            config.pgs_basis_config.num_knots,
+            config.pgs_basis_config.degree,
+        ).expect("PGS basis creation should succeed");
+        
+        let (pgs_basis_high, _) = create_bspline_basis(
+            array![test_pgs_high].view(),
+            None,
+            config.pgs_range,
+            config.pgs_basis_config.num_knots,
+            config.pgs_basis_config.degree,
+        ).expect("PGS basis creation should succeed");
+        
+        let (pc_basis_low, _) = create_bspline_basis(
+            array![test_pc_low].view(),
+            None,
+            config.pc_ranges[0],
+            config.pc_basis_configs[0].num_knots,
+            config.pc_basis_configs[0].degree,
+        ).expect("PC basis creation should succeed");
+        
+        let (pc_basis_high, _) = create_bspline_basis(
+            array![test_pc_high].view(),
+            None,
+            config.pc_ranges[0],
+            config.pc_basis_configs[0].num_knots,
+            config.pc_basis_configs[0].degree,
+        ).expect("PC basis creation should succeed");
+        
+        // Compute predictions
+        let mut low_low_pred = intercept;
+        let mut high_high_pred = intercept;
+        
+        // Add PGS contributions
+        let pgs_low_basis_row = pgs_basis_low.row(0);
+        let pgs_high_basis_row = pgs_basis_high.row(0);
+        for (i, &coeff) in pgs_coeffs.iter().enumerate() {
+            if i + 1 < pgs_low_basis_row.len() {
+                low_low_pred += coeff * pgs_low_basis_row[i + 1];
+                high_high_pred += coeff * pgs_high_basis_row[i + 1];
+            }
         }
         
-        // Make sure all PC coefficients have reasonable magnitudes
-        for &coeff in pc_coeffs {
-            assert!(coeff > -10.0 && coeff < 10.0, "PC coefficients should be reasonable");
+        // Add PC contributions
+        let pc_low_basis_row = pc_basis_low.row(0);
+        let pc_high_basis_row = pc_basis_high.row(0);
+        for (i, &coeff) in pc_coeffs.iter().enumerate() {
+            if i < pc_low_basis_row.len() {
+                low_low_pred += coeff * pc_low_basis_row[i];
+                high_high_pred += coeff * pc_high_basis_row[i];
+            }
         }
+        
+        // Convert to probabilities
+        let low_low_prob = 1.0 / (1.0 + f64::exp(-low_low_pred));
+        let high_high_prob = 1.0 / (1.0 + f64::exp(-high_high_pred));
+        
+        println!("Predictions: low_low={:.4}, high_high={:.4}", low_low_prob, high_high_prob);
+        
+        // The low_low point should predict close to 0 (< 0.4)
+        assert!(low_low_prob < 0.4, 
+                "Low point prediction should be below 0.4, got {}", low_low_prob);
+        
+        // The high_high point should predict close to 1 (> 0.6)
+        assert!(high_high_prob > 0.6, 
+                "High point prediction should be above 0.6, got {}", high_high_prob);
+        
+        // Ensure the difference is significant
+        assert!(high_high_prob - low_low_prob > 0.3, 
+                "Difference between high and low predictions should be significant");
+
     }
 
     #[test]

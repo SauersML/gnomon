@@ -309,14 +309,12 @@ mod internal {
             None => degree,
         };
 
-        // --- ROBUST FIX ---
         // If x is at the upper boundary, mu could be too large. 
         // The knot span index cannot exceed the index of the start of the last segment.
         // This index is `num_basis - 1`.
         if mu >= num_basis {
             mu = num_basis - 1;
         }
-        // --- END OF FIX ---
 
         // `b` will store the non-zero basis function values for the current degree.
         // At any point x, at most `degree + 1` basis functions are non-zero.
@@ -337,7 +335,6 @@ mod internal {
 
                 // First term: contribution from B_{i,d-1}(x)
                 if j > 0 && j - 1 < b_old.len() && b_old[j - 1] != 0.0 {
-                    // FIXED: Use d instead of degree for knot index calculations
                     // Check bounds first to prevent subtraction with overflow
                     if i + d < knots.len() && i < knots.len() {
                         let den = knots[i + d] - knots[i];
@@ -350,7 +347,6 @@ mod internal {
 
                 // Second term: contribution from B_{i+1,d-1}(x) 
                 if j < b_old.len() && b_old[j] != 0.0 {
-                    // FIXED: Use d instead of degree for knot index calculations
                     // Check bounds first to prevent subtraction with overflow
                     if i + 1 + d < knots.len() && i + 1 < knots.len() {
                         let den = knots[i + 1 + d] - knots[i + 1];

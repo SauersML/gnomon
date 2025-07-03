@@ -151,7 +151,7 @@ impl TrainedModel {
 
         // --- 4. Apply Inverse Link Function ---
         let predictions = match self.config.link_function {
-            LinkFunction::Logit => eta.mapv(|e| 1.0 / (1.0 + (-e).exp())), // Sigmoid
+            LinkFunction::Logit => eta.mapv(|e| 1.0 / (1.0 + f64::exp(-e))), // Sigmoid
             LinkFunction::Identity => eta,
         };
 
@@ -305,7 +305,6 @@ mod internal {
         // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
         let num_pgs_main_effects = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // after constraint
         for m in 1..=num_pgs_main_effects {
-            // FIXED: Use uppercase PGS_ to match what's generated in map_coefficients
             let pgs_key = format!("PGS_B{}", m);
             if let Some(pc_map) = coeffs.interaction_effects.get(&pgs_key) {
                 for pc_name in &config.pc_names {
@@ -375,8 +374,7 @@ mod tests {
                 },
                 knot_vectors: {
                     let mut knots = HashMap::new();
-                    // Add minimal knot vectors for testing
-                    // Add more knots to avoid issues with the degree
+                    // Knot vectors for testing
                     knots.insert("pgs".to_string(), Array1::from_vec(vec![-2.0, -2.0, -1.0, 0.0, 1.0, 2.0, 2.0]));
                     knots.insert("PC1".to_string(), Array1::from_vec(vec![-1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0]));
                     knots.insert("PC2".to_string(), Array1::from_vec(vec![-1.5, -1.5, -0.75, 0.0, 0.75, 1.5, 1.5]));
@@ -405,8 +403,8 @@ mod tests {
                     pgs_b2_effects.insert("PC1".to_string(), vec![0.1, 0.2]);
                     pgs_b2_effects.insert("PC2".to_string(), vec![-0.1, -0.3]);
                     
-                    interactions.insert("pgs_B1".to_string(), pgs_b1_effects);
-                    interactions.insert("pgs_B2".to_string(), pgs_b2_effects);
+                    interactions.insert("PGS_B1".to_string(), pgs_b1_effects); // Fixed case to match code (PGS_B1, not pgs_B1)
+                    interactions.insert("PGS_B2".to_string(), pgs_b2_effects); // Fixed case to match code
                     interactions
                 },
             },
@@ -420,27 +418,26 @@ mod tests {
         // Verify we got the right number of predictions
         assert_eq!(predictions.len(), n_test, "Should have one prediction per input sample");
         
-        // We know the exact form of the model, so we can manually compute the expected predictions
-        // and compare with what the model returns
+        // Manually compute expected predictions using the same matrix math as the real model
+        // For each test point, we'll construct the design matrix X and compute X.dot(beta)
         for i in 0..n_test {
-            let pgs_val = pgs_values[i];
-            let pc1_val = pcs[[i, 0]];
-            let pc2_val = pcs[[i, 1]];
+            // Step 1: Create the design matrix for this single sample
+            let x_i = internal::construct_design_matrix(
+                pgs_values.slice(s![i..i+1]).view(),
+                pcs.slice(s![i..i+1, ..]).view(),
+                &model.config
+            ).expect("Should be able to construct design matrix");
             
-            // With the identity link function, we expect a direct linear combination 
-            // This is a very simplified test that doesn't exactly match the full basis expansion,
-            // but gives us a way to check that the predict method is behaving reasonably
-            let expected = model.coefficients.intercept 
-                + pgs_val * 2.0  // Simplified approximation of PGS main effect
-                + pc1_val * 3.0  // Simplified approximation of PC1 main effect
-                + pc2_val * 0.5  // Simplified approximation of PC2 main effect
-                + pgs_val * pc1_val * 0.5  // Simplified interaction approximation
-                + pgs_val * pc2_val * (-0.2);  // Simplified interaction approximation
+            // Step 2: Flatten the coefficients vector
+            let beta = internal::flatten_coefficients(&model.coefficients, &model.config);
             
-            // Allow for some numerical differences due to basis expansion
+            // Step 3: Compute expected prediction using exact matrix multiplication
+            let expected = x_i.dot(&beta)[0]; // Should be a 1x1 matrix
+            
+            // Step 4: Compare with the predict method's result
             assert!(
-                (predictions[i] - expected).abs() < 5.0, 
-                "Prediction should be close to expected value. Prediction: {}, Expected: {}", 
+                (predictions[i] - expected).abs() < 1e-10,
+                "Prediction should match manual calculation. Prediction: {}, Expected: {}",
                 predictions[i], expected
             );
         }
@@ -522,10 +519,8 @@ mod tests {
                 pgs_b2.insert("PC1".to_string(), vec![12.0, 13.0]);
                 pgs_b2.insert("PC2".to_string(), vec![14.0, 15.0]);
                 
-                // Use lowercase pgs_B* to match what's expected in the test
-                interactions.insert("pgs_B1".to_string(), pgs_b1);
-                interactions.insert("pgs_B2".to_string(), pgs_b2);
-                // NOTE: We modified the case to match the format in map_coefficients
+                interactions.insert("PGS_B1".to_string(), pgs_b1);
+                interactions.insert("PGS_B2".to_string(), pgs_b2);
                 interactions
             },
         };
@@ -566,31 +561,26 @@ mod tests {
             4.0, 5.0,                     // PC1 main effects
             6.0, 7.0,                     // PC2 main effects
             2.0, 3.0,                     // PGS main effects
-            // The rest of the expected interactions were removed
-            // because they wouldn't be found due to case sensitivity issues
-            // This is a temporary fix to make the test pass
+            8.0, 9.0,                     // PGS_B1 * PC1 interaction
+            10.0, 11.0,                   // PGS_B1 * PC2 interaction
+            12.0, 13.0,                   // PGS_B2 * PC1 interaction
+            14.0, 15.0                    // PGS_B2 * PC2 interaction
         ];
         
         // Convert to vectors for easier comparison
         let flat_vec = flattened.to_vec();
         
         // Check total length
-        // Reversed the assertion since we modified the expected vector
-        assert_eq!(expected.len(), flat_vec.len(), 
+        assert_eq!(flat_vec.len(), expected.len(), 
                    "Flattened vector has incorrect length: expected {}, got {}", 
-                   flat_vec.len(), expected.len());
+                   expected.len(), flat_vec.len());
         
-        // Since the PGS key case was changed from "pgs_B*" to "PGS_B*"
-        // we can't compare exact positions, but we can check certain elements are present
-        
-        // Check the intercept and main effects are correct
-        assert_eq!(flat_vec[0], 1.0, "Intercept should be 1.0");
-        assert!(flat_vec.contains(&4.0), "PC1 main effect coefficient 4.0 missing");
-        assert!(flat_vec.contains(&5.0), "PC1 main effect coefficient 5.0 missing");
-        assert!(flat_vec.contains(&6.0), "PC2 main effect coefficient 6.0 missing");
-        assert!(flat_vec.contains(&7.0), "PC2 main effect coefficient 7.0 missing");
-        assert!(flat_vec.contains(&2.0), "PGS main effect coefficient 2.0 missing");
-        assert!(flat_vec.contains(&3.0), "PGS main effect coefficient 3.0 missing");
+        // Check each element in the expected order
+        for (i, &expected_val) in expected.iter().enumerate() {
+            assert_eq!(flat_vec[i], expected_val, 
+                       "Mismatch at position {}: expected {}, got {}", 
+                       i, expected_val, flat_vec[i]);
+        }
     }
     
     /// Tests that the model can be saved to and loaded from a file,
@@ -621,7 +611,6 @@ mod tests {
                 },
                 knot_vectors: {
                     let mut knots = HashMap::new();
-                    // Add more knots to avoid issues with the degree
                     knots.insert("pgs".to_string(), Array1::from_vec(vec![-1.0, -1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0]));
                     knots.insert("PC1".to_string(), Array1::from_vec(vec![-0.5, -0.5, -0.5, -0.25, 0.0, 0.25, 0.5, 0.5, 0.5, 0.5]));
                     knots
@@ -643,8 +632,8 @@ mod tests {
                     pgs_b1.insert("PC1".to_string(), vec![5.0, 6.0]);
                     let mut pgs_b2 = HashMap::new();
                     pgs_b2.insert("PC1".to_string(), vec![7.0, 8.0]);
-                    interactions.insert("pgs_B1".to_string(), pgs_b1);
-                    interactions.insert("pgs_B2".to_string(), pgs_b2);
+                    interactions.insert("PGS_B1".to_string(), pgs_b1);
+                    interactions.insert("PGS_B2".to_string(), pgs_b2);
                     interactions
                 },
             },
@@ -702,8 +691,8 @@ mod tests {
         
         // Check PGS_B1 interactions
         if let (Some(pgs_b1_loaded), Some(pgs_b1_orig)) = (
-            loaded_model.coefficients.interaction_effects.get("pgs_B1"),
-            original_model.coefficients.interaction_effects.get("pgs_B1")
+            loaded_model.coefficients.interaction_effects.get("PGS_B1"),
+            original_model.coefficients.interaction_effects.get("PGS_B1")
         ) {
             assert_eq!(pgs_b1_loaded.len(), pgs_b1_orig.len());
             if let (Some(pc1_loaded), Some(pc1_orig)) = (
@@ -720,8 +709,8 @@ mod tests {
         
         // Check PGS_B2 interactions
         if let (Some(pgs_b2_loaded), Some(pgs_b2_orig)) = (
-            loaded_model.coefficients.interaction_effects.get("pgs_B2"),
-            original_model.coefficients.interaction_effects.get("pgs_B2")
+            loaded_model.coefficients.interaction_effects.get("PGS_B2"),
+            original_model.coefficients.interaction_effects.get("PGS_B2")
         ) {
             assert_eq!(pgs_b2_loaded.len(), pgs_b2_orig.len());
             if let (Some(pc1_loaded), Some(pc1_orig)) = (
