@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cox_de_boor_fix_higher_degree() {
+    fn test_cox_de_boor_higher_degree() {
         // Test that verifies the Cox-de Boor denominator fix for higher degree splines
         // Using non-uniform knots where the bug would be more apparent
         let knots = array![0.0, 0.0, 0.0, 1.0, 3.0, 4.0, 4.0, 4.0];
