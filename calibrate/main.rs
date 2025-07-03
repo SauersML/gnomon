@@ -294,6 +294,7 @@ fn save_predictions(predictions: &Array1<f64>, output_path: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TrainedModel;
     use ndarray::{Array1, Array2};
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -457,16 +458,29 @@ mod tests {
                  metrics1.auc.max(metrics2.auc));
         
         // Extract TOML model content and analyze coefficients
-        println!("\n5. Analyzing model structures...");
+        println!("\n5. Analyzing model structures and validating coefficients...");
+        
+        // --- Analyze Model 1 ---
         let model1_content = std::fs::read_to_string(model_files[0].to_str().unwrap())?;
+        let model1: TrainedModel = toml::from_str(&model1_content)
+            .expect("Failed to parse model 1 TOML file into TrainedModel struct");
+        
+        // We can still use the check_model_properties logic with the parsed model
+        let model1_json: serde_json::Value = toml::from_str(&model1_content)?;
+        
+        // --- Analyze Model 2 ---
         let model2_content = std::fs::read_to_string(model_files[1].to_str().unwrap())?;
+        let model2: TrainedModel = toml::from_str(&model2_content)
+            .expect("Failed to parse model 2 TOML file into TrainedModel struct");
         
-        // Parse TOML models
-        let model1: serde_json::Value = toml::from_str(&model1_content)?;
-        let model2: serde_json::Value = toml::from_str(&model2_content)?;
+        let model2_json: serde_json::Value = toml::from_str(&model2_content)?;
         
-        // Check for key model properties
-        check_model_properties(&model1, &model2);
+        // Check for key model properties using the existing function
+        check_model_properties(&model1_json, &model2_json);
+        
+        // Call our new validation function for both models
+        validate_coefficient_structure(&model1, &true_effects, "Standard");
+        validate_coefficient_structure(&model2, &true_effects, "Flexible");
         
         println!("\n===== INTEGRATION TEST COMPLETED SUCCESSFULLY =====");
         
@@ -1146,6 +1160,115 @@ mod tests {
         monotonicity_score: f64,
         pc1_interaction_detected: bool,
         pc2_interaction_detected: bool,
+    }
+    
+    /// Validates that the model's internal coefficient structure reflects the ground truth.
+    ///
+    /// It checks if real effects have larger coefficient magnitudes (L2 Norm) than null effects,
+    /// and that null effects are correctly shrunk towards zero by the penalty.
+    fn validate_coefficient_structure(model: &TrainedModel, true_effects: &TrueEffects, model_name: &str) {
+        println!("\n   Validating coefficient structure for {} model...", model_name);
+        
+        // Calculate L2 norm (Euclidean magnitude) of coefficients for each interaction term
+        // This gives us a single value representing the overall "energy" or strength of each term
+        let mut pc_magnitudes = HashMap::new();
+        
+        for pc_idx in 0..true_effects.pc_main_effects.len() {
+            let pc_name = format!("PC{}", pc_idx + 1);
+            let mut squared_sum = 0.0;
+            
+            // Go through all PGS basis functions looking for interactions with this PC
+            for (pgs_key, pc_map) in &model.coefficients.interaction_effects {
+                if let Some(coeffs) = pc_map.get(&pc_name) {
+                    // Add squared coefficients for this interaction
+                    for &coef in coeffs.iter() {
+                        squared_sum += coef * coef;
+                    }
+                }
+            }
+            
+            // Calculate L2 norm (square root of sum of squares)
+            let l2_norm = squared_sum.sqrt();
+            pc_magnitudes.insert(pc_name, l2_norm);
+        }
+        
+        // 1. Real vs. Null: Check if real effects (PC1, PC2, PC4) are significantly larger than null effects (PC3, PC5)
+        println!("   1. Validating Real vs. Null Effects");
+        
+        // Calculate the average magnitude for real and null effects
+        let real_pcs = ["PC1", "PC2", "PC4"];
+        let null_pcs = ["PC3", "PC5"];
+        
+        let real_magnitude_sum: f64 = real_pcs.iter()
+            .filter_map(|&pc| pc_magnitudes.get(pc))
+            .sum();
+        let real_avg_magnitude = real_magnitude_sum / real_pcs.len() as f64;
+        
+        let null_magnitude_sum: f64 = null_pcs.iter()
+            .filter_map(|&pc| pc_magnitudes.get(pc))
+            .sum();
+        let null_avg_magnitude = null_magnitude_sum / null_pcs.len() as f64;
+        
+        println!("     - Real effects average magnitude: {:.6}", real_avg_magnitude);
+        println!("     - Null effects average magnitude: {:.6}", null_avg_magnitude);
+        println!("     - Ratio (real/null): {:.2}x", real_avg_magnitude / null_avg_magnitude);
+        
+        // Verify real effects are significantly larger than null effects (at least 2x)
+        assert!(
+            real_avg_magnitude > null_avg_magnitude * 2.0,
+            "Real effects (PC1, PC2, PC4) should have significantly larger magnitudes than null effects (PC3, PC5)"
+        );
+        
+        // 2. Effect Hierarchy: Verify PC1 > PC2 > PC4 (should match the strength of simulated effects)
+        println!("   2. Validating Effect Hierarchy");
+        
+        let pc1_magnitude = pc_magnitudes.get("PC1").unwrap_or(&0.0);
+        let pc2_magnitude = pc_magnitudes.get("PC2").unwrap_or(&0.0);
+        let pc4_magnitude = pc_magnitudes.get("PC4").unwrap_or(&0.0);
+        
+        println!("     - PC1 magnitude: {:.6}", pc1_magnitude);
+        println!("     - PC2 magnitude: {:.6}", pc2_magnitude);
+        println!("     - PC4 magnitude: {:.6}", pc4_magnitude);
+        
+        // Verify that PC1 > PC2
+        assert!(
+            pc1_magnitude > pc2_magnitude,
+            "PC1 should have larger coefficient magnitude than PC2"
+        );
+        
+        // Verify that PC2 > PC4
+        assert!(
+            pc2_magnitude > pc4_magnitude,
+            "PC2 should have larger coefficient magnitude than PC4"
+        );
+        
+        // 3. Shrinkage: Verify null effects are very close to zero (effective regularization)
+        println!("   3. Validating Shrinkage of Null Effects");
+        
+        let pc3_magnitude = pc_magnitudes.get("PC3").unwrap_or(&0.0);
+        let pc5_magnitude = pc_magnitudes.get("PC5").unwrap_or(&0.0);
+        
+        println!("     - PC3 magnitude (null): {:.6}", pc3_magnitude);
+        println!("     - PC5 magnitude (null): {:.6}", pc5_magnitude);
+        
+        // Define a threshold for "close to zero" - should be very small compared to real effects
+        let threshold = real_avg_magnitude * 0.1; // 10% of average real effect
+        
+        // Verify null effects are below threshold
+        assert!(
+            *pc3_magnitude < threshold,
+            "PC3 coefficient magnitude should be shrunk close to zero (< {:.6})", threshold
+        );
+        assert!(
+            *pc5_magnitude < threshold,
+            "PC5 coefficient magnitude should be shrunk close to zero (< {:.6})", threshold
+        );
+        
+        // Output overall validation results
+        println!("   ✓ Coefficient structure validation passed for {} model", model_name);
+        println!("     - Real effects properly distinguished from null effects");
+        println!("     - Effect hierarchy correctly preserved (PC1 > PC2 > PC4)");
+        println!("     - Null effects properly regularized toward zero");
     }
     
     /// Validate predictions against expected values based on our known true effects

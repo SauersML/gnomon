@@ -1,3 +1,5 @@
+#![feature(core_intrinsics)]
+
 use clap::{Parser, Subcommand};
 use std::process;
 use std::path::PathBuf;
