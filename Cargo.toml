@@ -47,7 +47,7 @@ indicatif = "0.17"
 flate2 = "1.1.2"
 dashmap = "6.1.0"
 ndarray = { version = "0.16.1", features = ["serde"] }
-ndarray-linalg = { version = "0.17.0", default-features = false, features = ["netlib"] }
+ndarray-linalg = { version = "0.17.0", default-features = false, features = ["intel-mkl-static"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 toml = "0.8.23"
