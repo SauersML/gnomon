@@ -89,6 +89,10 @@ enum Commands {
         /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop.
         #[arg(long, default_value = "1e-3")]
         reml_convergence_tolerance: f64,
+
+        /// Path to output the trained model file.
+        #[arg(long, default_value = "model.toml")]
+        output_path: String,
     },
 
     /// Apply a trained model to new data for prediction.
@@ -101,6 +105,10 @@ enum Commands {
         /// Path to the trained model file (`model.toml`).
         #[arg(long)]
         model: String,
+
+        /// Path to output the predictions file.
+        #[arg(long, default_value = "predictions.tsv")]
+        output_path: String,
     },
 }
 
@@ -125,6 +133,7 @@ fn main() {
             convergence_tolerance,
             reml_max_iterations,
             reml_convergence_tolerance,
+            output_path,
         } => train_command(
             &training_data,
             num_pcs,
@@ -137,8 +146,9 @@ fn main() {
             convergence_tolerance,
             reml_max_iterations,
             reml_convergence_tolerance,
+            &output_path,
         ),
-        Commands::Infer { test_data, model } => infer_command(&test_data, &model),
+        Commands::Infer { test_data, model, output_path } => infer_command(&test_data, &model, &output_path),
     };
 
     if let Err(e) = result {
@@ -161,6 +171,7 @@ fn train_command(
     convergence_tolerance: f64,
     reml_max_iterations: u64,
     reml_convergence_tolerance: f64,
+    output_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Loading training data from: {}", training_data_path);
 
@@ -227,15 +238,14 @@ fn train_command(
     let trained_model = train_model(&data, &config)?;
 
     // Save the final, trained model to disk.
-    let output_path = "model.toml";
     trained_model.save(output_path)?;
     log::info!("Model training complete. Saved to: {}", output_path);
 
     Ok(())
 }
 
-/// Handles the `infer` command logic. This function remains unchanged.
-fn infer_command(test_data_path: &str, model_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Handles the `infer` command logic.
+fn infer_command(test_data_path: &str, model_path: &str, output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Loading model from: {}", model_path);
 
     // Load the trained model from the specified TOML file.
@@ -253,7 +263,6 @@ fn infer_command(test_data_path: &str, model_path: &str) -> Result<(), Box<dyn s
     let predictions = model.predict(data.p.view(), data.pcs.view())?;
 
     // Save the predictions to a TSV file.
-    let output_path = "predictions.tsv";
     save_predictions(&predictions, output_path)?;
     log::info!("Predictions saved to: {}", output_path);
 
@@ -373,11 +382,7 @@ mod tests {
             println!("   - PC basis: {} knots, degree {}", pc_knots, pc_degree);
             println!("   - Penalty order: {}", penalty_order);
             
-            // Temporarily set output files
-            std::env::set_var("MODEL_OUTPUT", model_file.to_str().unwrap());
-            std::env::set_var("PREDICTIONS_OUTPUT", predictions_file.to_str().unwrap());
-            
-            // Train the model
+            // Train the model with the temporary output path
             let train_result = train_command(
                 training_file_path.to_str().unwrap(),
                 num_pcs,
@@ -390,16 +395,18 @@ mod tests {
                 convergence_tolerance,
                 reml_max_iterations,
                 reml_convergence_tolerance,
+                model_file.to_str().unwrap(),
             );
             assert!(train_result.is_ok(), "Model training failed for config {}: {:?}", config_name, train_result);
             
             // Verify the model file was created
             assert!(model_file.exists(), "Model file wasn't created for config {}", config_name);
             
-            // Run inference on test data
+            // Run inference on test data with the temporary output path
             let infer_result = infer_command(
                 test_file_path.to_str().unwrap(),
                 model_file.to_str().unwrap(),
+                predictions_file.to_str().unwrap(),
             );
             assert!(infer_result.is_ok(), "Model inference failed for config {}: {:?}", config_name, infer_result);
             

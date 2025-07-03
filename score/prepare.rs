@@ -677,8 +677,8 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
 
                         let mut parts = line_in_arena.split_whitespace();
                         let chr = parts.next();
-                        let _id = parts.next();
-                        let _cm = parts.next();
+                        parts.next(); // Skip variant ID from BIM file
+                        parts.next(); // Skip genetic distance in centiMorgans
                         let pos = parts.next();
                         let a1 = parts.next();
                         let a2 = parts.next();

@@ -977,28 +977,97 @@ mod tests {
         assert!(matrices_result.is_ok(), "Failed to build matrices: {:?}", matrices_result.err());
         let (x_matrix, s_list, layout, _, _) = matrices_result.unwrap();
         
+        // Verify design matrix has correct dimensions
+        assert_eq!(x_matrix.nrows(), n_samples, "Design matrix should have n_samples rows");
+        assert_eq!(x_matrix.ncols(), layout.total_coeffs, "Design matrix columns should match layout.total_coeffs");
+        
+        // Verify that the first column is the intercept (all 1s)
+        let intercept_col = x_matrix.column(layout.intercept_col);
+        assert!(intercept_col.iter().all(|&x| (x - 1.0).abs() < 1e-10), 
+                "Intercept column should contain all 1s");
+        
         // 2. Set up the REML state
         let reml_state = internal::RemlState::new(data.y.view(), x_matrix.view(), s_list.clone(), &layout, &config);
         
         // 3. Test that the cost and gradient can be computed for a fixed rho
         let test_rho = Array1::from_elem(layout.num_penalties, -0.5);
         let cost_result = reml_state.compute_cost(&test_rho);
-        if let Err(e) = &cost_result {
-            println!("Cost computation failed: {:?}, but test will continue", e);
-            return; // Skip the rest of the test
-        }
+        assert!(cost_result.is_ok(), "Cost computation failed: {:?}", cost_result.err());
         let cost = cost_result.unwrap();
         assert!(cost.is_finite(), "Cost should be finite, got: {}", cost);
         
+        // Verify that cost responds to different smoothing parameters
+        let less_smooth_rho = Array1::from_elem(layout.num_penalties, -2.0);  // smaller λ = less smoothing
+        let more_smooth_rho = Array1::from_elem(layout.num_penalties, 0.5);   // larger λ = more smoothing
+        
+        let less_smooth_cost = reml_state.compute_cost(&less_smooth_rho).unwrap();
+        let more_smooth_cost = reml_state.compute_cost(&more_smooth_rho).unwrap();
+        
+        // Costs should differ when smoothing changes (not an exact relationship, but they should differ)
+        assert!((less_smooth_cost - more_smooth_cost).abs() > 1e-5, 
+                "Costs should differ with different smoothing parameters");
+        
+        // 4. Test gradient computation
         let grad_result = reml_state.compute_gradient(&test_rho);
         assert!(grad_result.is_ok(), "Gradient computation failed: {:?}", grad_result.err());
         let grad = grad_result.unwrap();
         assert!(grad.iter().all(|&g| g.is_finite()), "Gradient should contain only finite values");
         
-        // 4. Test that the inner P-IRLS loop converges for a fixed rho
+        // Numerical gradient check: perturb each component and see if cost changes in expected direction
+        for i in 0..grad.len() {
+            let mut rho_plus = test_rho.clone();
+            let h = 1e-4;  // small perturbation
+            rho_plus[i] += h;
+            
+            let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
+            let numerical_deriv = (cost_plus - cost) / h;
+            
+            // The gradient direction should match the numerical derivative direction
+            // (we can't exactly match the value without a central difference method)
+            assert!((grad[i] * numerical_deriv) > 0.0 || grad[i].abs() < 1e-5, 
+                    "Gradient component {} sign should match numerical derivative", i);
+        }
+        
+        // 5. Test that the inner P-IRLS loop converges for a fixed rho and produces sensible results
         let pirls_result = internal::fit_model_for_fixed_rho(
             test_rho.view(), x_matrix.view(), data.y.view(), &s_list, &layout, &config);
         assert!(pirls_result.is_ok(), "P-IRLS failed to converge: {:?}", pirls_result.err());
+        
+        let pirls = pirls_result.unwrap();
+        
+        // Check that beta coefficients are finite
+        assert!(pirls.beta.iter().all(|&b| b.is_finite()), 
+                "All beta coefficients should be finite");
+        
+        // Verify model predictions are reasonable (since we have y=0 for first half, y=1 for second half)
+        let eta = x_matrix.dot(&pirls.beta);
+        let predictions: Vec<f64> = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())).to_vec();
+        
+        // First quarter should predict closer to 0, last quarter closer to 1
+        let first_quarter: Vec<f64> = predictions[0..n_samples/4].to_vec();
+        let last_quarter: Vec<f64> = predictions[3*n_samples/4..].to_vec();
+        
+        let first_quarter_avg = first_quarter.iter().sum::<f64>() / first_quarter.len() as f64;
+        let last_quarter_avg = last_quarter.iter().sum::<f64>() / last_quarter.len() as f64;
+        
+        assert!(first_quarter_avg < 0.4, 
+                "First quarter predictions should be closer to 0, got average: {}", first_quarter_avg);
+        assert!(last_quarter_avg > 0.6, 
+                "Last quarter predictions should be closer to 1, got average: {}", last_quarter_avg);
+        
+        // Verify penalized Hessian is positive definite (all eigenvalues > 0)
+        // This is a property required for the REML score calculation
+        let eigenvals = match pirls.penalized_hessian.eigvals() {
+            Ok(evs) => evs,
+            Err(e) => panic!("Failed to compute eigenvalues: {:?}", e)
+        };
+        
+        let min_eigenval = eigenvals.iter()
+            .map(|&ev| ev.re)  // Use real part of eigenvalue
+            .fold(f64::INFINITY, |a, b| a.min(b));
+            
+        // Some numerical tolerance for eigenvalues close to zero
+        assert!(min_eigenval > -1e-8, "Penalized Hessian should be positive (semi-)definite");
     }
     
     /// Tests the inner P-IRLS fitting mechanism with fixed smoothing parameters.
@@ -1009,9 +1078,6 @@ mod tests {
         // Create synthetic data with a clear pattern
         let n_samples = 100;
         
-        // Create binary outcomes with a pattern that depends on PGS and PC1
-        let mut y = Array::zeros(n_samples);
-        
         // Create meaningful PGS values
         let p = Array::linspace(-2.0, 2.0, n_samples);
         
@@ -1019,14 +1085,27 @@ mod tests {
         let pc1 = Array::linspace(-1.5, 1.5, n_samples);
         let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
         
-        // Generate outcomes based on a simple model:
+        // Define the true generating function:
         // logit(p(y=1)) = 0.5 + 0.8*PGS + 0.6*PC1 - 0.4*PGS*PC1
+        let true_intercept = 0.5;
+        let true_pgs_effect = 0.8;
+        let true_pc_effect = 0.6;
+        let true_interaction = -0.4;
+        
+        // Function that computes the true logit value for any (PGS, PC1) point
+        let true_logit_fn = |pgs_val: f64, pc_val: f64| -> f64 {
+            true_intercept + true_pgs_effect * pgs_val + true_pc_effect * pc_val + 
+            true_interaction * pgs_val * pc_val
+        };
+        
+        // Generate outcomes based on the true model
+        let mut y = Array::zeros(n_samples);
         for i in 0..n_samples {
             let pgs_val = p[i];
             let pc1_val = pcs[[i, 0]];
             
-            // The logistic model
-            let logit = 0.5 + 0.8 * pgs_val + 0.6 * pc1_val - 0.4 * pgs_val * pc1_val;
+            // Calculate true logit and probability
+            let logit = true_logit_fn(pgs_val, pc1_val);
             let prob = 1.0 / (1.0 + f64::exp(-logit));
             
             // Deterministic assignment for reproducibility
@@ -1045,7 +1124,7 @@ mod tests {
         // Test the P-IRLS with fixed smoothing parameters
         // This isolates the test from the instability of the BFGS optimization
         let result = internal::build_design_and_penalty_matrices(&data, &config)
-            .map(|(x_matrix, s_list, layout, _, _)| {
+            .map(|(x_matrix, s_list, layout, constraints, knot_vectors)| {
                 // Use fixed log smoothing parameters (known to be stable)
                 // This would be -1.0 in log space, exp(-1.0) = 0.368 for lambda
                 let fixed_log_lambda = Array1::from_elem(layout.num_penalties, -1.0);
@@ -1068,119 +1147,373 @@ mod tests {
                 let mapped_coefficients = internal::map_coefficients(&pirls_result.beta, &layout)
                     .expect("Coefficient mapping should succeed");
                 
-                // Return the components we need for testing
-                (mapped_coefficients, fixed_log_lambda.mapv(f64::exp), pirls_result.deviance)
+                // Create a trained model for prediction
+                let mut config_with_constraints = config.clone();
+                config_with_constraints.constraints = constraints;
+                config_with_constraints.knot_vectors = knot_vectors;
+                
+                let trained_model = TrainedModel {
+                    config: config_with_constraints,
+                    coefficients: mapped_coefficients.clone(),
+                    lambdas: fixed_log_lambda.mapv(f64::exp).to_vec(),
+                };
+                
+                (trained_model, mapped_coefficients, pirls_result.deviance)
             });
         
         // Verify results
         assert!(result.is_ok(), "P-IRLS with fixed smoothing parameters failed");
         
-        let (coeffs, lambdas, deviance) = result.unwrap();
+        let (trained_model, _, deviance) = result.unwrap();
         
         // Test 1: Verify that the deviance is reasonable (model fits the data)
         assert!(deviance > 0.0 && deviance < 100.0, "Deviance should be positive but reasonable, got {}", deviance);
         
-        // Test 2: Verify that the intercept has a reasonable value
-        // Just print the intercept value without asserting
-        println!("Intercept value: {}", coeffs.intercept);
-        // The test value varies too much, so don't assert on it
+        // ----- FUNCTION OUTPUT VALIDATION -----
         
-        // Test 3: Verify that the main effects have been estimated
-        assert!(!coeffs.main_effects.pgs.is_empty(), "PGS main effects should exist");
-        assert!(coeffs.main_effects.pcs.contains_key("PC1"), "PC1 main effect should exist");
+        // Create a grid of test points covering the input space
+        let n_grid = 20;
+        let pgs_grid = Array1::linspace(-2.0, 2.0, n_grid);
+        let pc_grid = Array1::linspace(-1.5, 1.5, n_grid);
         
-        // Test 4: Verify that the interaction effects have been estimated
-        let pgs_keys: Vec<_> = coeffs.interaction_effects.keys().collect();
-        assert!(!pgs_keys.is_empty(), "Should have at least one interaction effect");
+        // Arrays to store true and predicted values
+        let mut true_values = Vec::with_capacity(n_grid * n_grid);
+        let mut pred_values = Vec::with_capacity(n_grid * n_grid);
         
-        // Test 5: Verify that all lambdas are positive and reasonable
-        assert!(lambdas.iter().all(|&l| l > 0.0), "All lambdas should be positive");
+        // For every combination of PGS and PC values in our grid
+        for &pgs_val in pgs_grid.iter() {
+            for &pc_val in pc_grid.iter() {
+                // Calculate the true logit value from our generating function
+                let true_logit = true_logit_fn(pgs_val, pc_val);
+                true_values.push(true_logit);
+                
+                // Get the model's prediction for this point
+                let test_pgs = Array1::from_elem(1, pgs_val);
+                let test_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
+                
+                let pred_prob = trained_model.predict(test_pgs.view(), test_pc.view()).unwrap()[0];
+                // Convert probability back to logit for direct comparison
+                let pred_logit = if pred_prob <= 0.0 {
+                    -30.0 // Avoid -Inf
+                } else if pred_prob >= 1.0 {
+                    30.0  // Avoid Inf
+                } else {
+                    (pred_prob / (1.0 - pred_prob)).ln()
+                };
+                
+                pred_values.push(pred_logit);
+            }
+        }
         
-        // Test 6: Verify model predictions match expected pattern
+        // Convert to arrays for computation
+        let true_array = Array1::from_vec(true_values);
+        let pred_array = Array1::from_vec(pred_values);
         
-        // Create a 2x2 grid of test points to check model behavior at extremes
-        let test_points = [
-            (-1.5, -1.0),  // Low PGS, Low PC
-            (-1.5, 1.0),   // Low PGS, High PC
-            (1.5, -1.0),   // High PGS, Low PC
-            (1.5, 1.0),    // High PGS, High PC
-        ];
+        // Calculate Mean Squared Error (MSE) between true and predicted functions
+        let mse = (&true_array - &pred_array)
+            .mapv(|x| x * x)
+            .mean().unwrap_or(f64::INFINITY);
         
-        // True coefficients from the generating function: 0.5 + 0.8*PGS + 0.6*PC1 - 0.4*PGS*PC1
-        let true_intercept = 0.5;
-        let true_pgs_effect = 0.8;
-        let true_pc_effect = 0.6;
-        let true_interaction = -0.4;
+        // Calculate correlation between true and predicted values
+        let correlation = correlation_coefficient(&true_array, &pred_array);
         
-        // Calculate the expected true values at test points
-        let true_values = test_points.iter().map(|&(pgs_val, pc_val)| {
-            let logit = true_intercept + true_pgs_effect * pgs_val + true_pc_effect * pc_val + true_interaction * pgs_val * pc_val;
-            1.0 / (1.0 + f64::exp(-logit))
-        }).collect::<Vec<_>>();
+        println!("MSE between true and predicted function: {:.6}", mse);
+        println!("Correlation between true and predicted function: {:.6}", correlation);
         
-        // Calculate predictions from our model
-        let mut predictions = Vec::new();
+        // The spline function should approximate the true function well
+        assert!(mse < 1.0, "MSE between true function and spline approximation too large: {}", mse);
+        assert!(correlation > 0.90, "Correlation between true function and spline approximation too low: {}", correlation);
         
-        for &(pgs_val, pc_val) in &test_points {
-            // Build mini-basis expansions for these points
-            let (pgs_basis, _) = create_bspline_basis(
-                array![pgs_val].view(),
-                None,
-                config.pgs_range,
-                config.pgs_basis_config.num_knots,
-                config.pgs_basis_config.degree,
-            ).expect("PGS basis creation should succeed");
+        // ------ VALIDATE MARGINAL EFFECTS ------
+        
+        // Check if the model captures the main PGS effect by evaluating at different PGS values with PC=0
+        let pc_zero = Array2::zeros((n_grid, 1));
+        let pgs_test = Array1::linspace(-1.8, 1.8, n_grid);
+        
+        // Get model predictions for varying PGS with PC=0
+        let pgs_preds = trained_model.predict(pgs_test.view(), pc_zero.view()).unwrap();
+        
+        // Calculate approximate slopes (derivatives) to measure the PGS effect
+        let mut pgs_slopes = Vec::new();
+        for i in 1..n_grid {
+            // For the derivative, we need to convert from probability to logit
+            let p1 = pgs_preds[i-1];
+            let p2 = pgs_preds[i];
+            let logit1 = (p1 / (1.0 - p1)).ln();
+            let logit2 = (p2 / (1.0 - p2)).ln();
             
-            let (pc_basis, _) = create_bspline_basis(
-                array![pc_val].view(),
-                None,
-                config.pc_ranges[0],
-                config.pc_basis_configs[0].num_knots,
-                config.pc_basis_configs[0].degree,
-            ).expect("PC basis creation should succeed");
+            let slope = (logit2 - logit1) / (pgs_test[i] - pgs_test[i-1]);
+            pgs_slopes.push(slope);
+        }
+        
+        // Average slope should approximate the true PGS effect
+        let avg_pgs_slope = pgs_slopes.iter().sum::<f64>() / pgs_slopes.len() as f64;
+        println!("True PGS effect: {}, Average estimated PGS effect: {:.4}", true_pgs_effect, avg_pgs_slope);
+        
+        let pgs_error_ratio = (avg_pgs_slope - true_pgs_effect).abs() / true_pgs_effect.abs();
+        assert!(pgs_error_ratio < 0.2, 
+                "Average PGS effect doesn't match true effect. True: {}, Estimated: {:.4}, Relative Error: {:.2}", 
+                true_pgs_effect, avg_pgs_slope, pgs_error_ratio);
+        
+        // ----- VALIDATE INTERACTION EFFECT -----
+        
+        // Create grid points to test interaction
+        let n_int = 10;
+        let pgs_pos = Array1::from_elem(n_int, 1.0); // Fixed positive PGS
+        let pgs_neg = Array1::from_elem(n_int, -1.0); // Fixed negative PGS
+        let pc_values = Array1::linspace(-1.0, 1.0, n_int);
+        
+        // Convert PC array to 2D matrix format for each prediction
+        let pc_array = Array2::from_shape_fn((n_int, 1), |(i, _)| pc_values[i]);
+        
+        // Get predictions for positive and negative PGS across PC values
+        let pred_pos_pgs = trained_model.predict(pgs_pos.view(), pc_array.view()).unwrap();
+        let pred_neg_pgs = trained_model.predict(pgs_neg.view(), pc_array.view()).unwrap();
+        
+        // For interaction effect, compute difference in slopes between positive and negative PGS
+        // True interaction effect: when PGS changes from -1 to 1, the slope of PC1 changes by -0.4*2 = -0.8
+        let mut pos_pc_slopes = Vec::new();
+        let mut neg_pc_slopes = Vec::new();
+        
+        for i in 1..n_int-1 {
+            // Calculate slopes for positive PGS
+            let logit_pos_1 = (pred_pos_pgs[i-1] / (1.0 - pred_pos_pgs[i-1])).ln();
+            let logit_pos_2 = (pred_pos_pgs[i+1] / (1.0 - pred_pos_pgs[i+1])).ln();
+            let pos_slope = (logit_pos_2 - logit_pos_1) / (pc_values[i+1] - pc_values[i-1]);
+            pos_pc_slopes.push(pos_slope);
             
-            // Compute prediction using coefficient dot products
-            let mut linear_pred = coeffs.intercept;
+            // Calculate slopes for negative PGS
+            let logit_neg_1 = (pred_neg_pgs[i-1] / (1.0 - pred_neg_pgs[i-1])).ln();
+            let logit_neg_2 = (pred_neg_pgs[i+1] / (1.0 - pred_neg_pgs[i+1])).ln();
+            let neg_slope = (logit_neg_2 - logit_neg_1) / (pc_values[i+1] - pc_values[i-1]);
+            neg_pc_slopes.push(neg_slope);
+        }
+        
+        // Average slopes
+        let avg_pos_slope = pos_pc_slopes.iter().sum::<f64>() / pos_pc_slopes.len() as f64;
+        let avg_neg_slope = neg_pc_slopes.iter().sum::<f64>() / neg_pc_slopes.len() as f64;
+        
+        // The difference in slopes gives us the interaction effect per 2.0 units of PGS
+        let estimated_interaction = (avg_pos_slope - avg_neg_slope) / 2.0;
+        
+        println!("True interaction effect: {}, Estimated: {:.4}", true_interaction, estimated_interaction);
+        let int_error_ratio = (estimated_interaction - true_interaction).abs() / true_interaction.abs();
+        
+        assert!(int_error_ratio < 0.3, 
+                "Interaction effect doesn't match. True: {}, Estimated: {:.4}, Relative Error: {:.2}", 
+                true_interaction, estimated_interaction, int_error_ratio);
+    }
+    
+    /// Calculates the correlation coefficient between two arrays
+    fn correlation_coefficient(x: &Array1<f64>, y: &Array1<f64>) -> f64 {
+        let x_mean = x.mean().unwrap_or(0.0);
+        let y_mean = y.mean().unwrap_or(0.0);
+        
+        let numerator: f64 = x.iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean))
+            .sum();
             
-            // Add PGS main effect contribution (using the first row of basis)
-            let pgs_basis_row = pgs_basis.row(0);
-            for (i, coeff) in coeffs.main_effects.pgs.iter().enumerate() {
-                if i + 1 < pgs_basis_row.len() {  // Skip intercept (column 0)
-                    linear_pred += coeff * pgs_basis_row[i + 1];
+        let x_variance: f64 = x.iter().map(|&xi| (xi - x_mean).powi(2)).sum();
+        let y_variance: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
+        
+        numerator / (x_variance.sqrt() * y_variance.sqrt())
+    }
+    
+    /// Tests that REML correctly shrinks smooth terms to zero when they have no effect
+    #[test]
+    fn test_reml_shrinks_null_effect() {
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+        
+        // Create synthetic data where y depends on PC1 but has NO relationship with PC2
+        let n_samples = 200;
+        
+        // Create two PC columns - PC1 will have an effect, PC2 will have no effect
+        let pc1 = Array::linspace(-1.5, 1.5, n_samples);
+        let pc2 = Array::linspace(-1.0, 1.0, n_samples);
+        
+        // Shuffle PC2 to ensure no accidental correlation with y
+        // Use a fixed seed for reproducible tests
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut pc2_indices: Vec<usize> = (0..n_samples).collect();
+        pc2_indices.shuffle(&mut rng);
+        let pc2_shuffled = Array1::from_vec(pc2_indices.iter().map(|&i| pc2[i]).collect());
+        
+        // Create a 2-column PC matrix
+        let mut pcs = Array2::zeros((n_samples, 2));
+        pcs.column_mut(0).assign(&pc1);
+        pcs.column_mut(1).assign(&pc2_shuffled);
+        
+        // Create meaningful PGS values
+        let p = Array::linspace(-2.0, 2.0, n_samples);
+        
+        // Generate outcomes based on a simple model that only depends on PC1 (not PC2):
+        // logit(p(y=1)) = 0.5 + 0.8*PGS + 0.6*PC1 + 0.0*PC2
+        let mut y = Array1::zeros(n_samples);
+        for i in 0..n_samples {
+            let pgs_val = p[i];
+            let pc1_val = pcs[[i, 0]];
+            // PC2 is not used in the model
+            
+            // The logistic model
+            let logit = 0.5 + 0.8 * pgs_val + 0.6 * pc1_val; // No PC2 term
+            let prob = 1.0 / (1.0 + f64::exp(-logit));
+            
+            // Deterministic assignment for reproducibility
+            y[i] = if prob > 0.5 { 1.0 } else { 0.0 };
+        }
+        
+        let data = TrainingData { y, p, pcs };
+
+        // Configure a model with both PC1 and PC2
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 150,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 20,
+            pgs_basis_config: BasisConfig {
+                num_knots: 4,
+                degree: 3,
+            },
+            pc_basis_configs: vec![
+                BasisConfig { num_knots: 4, degree: 3 },  // PC1
+                BasisConfig { num_knots: 4, degree: 3 },  // PC2 - same basis size as PC1
+            ],
+            pgs_range: (-2.5, 2.5),
+            pc_ranges: vec![(-2.0, 2.0), (-1.5, 1.5)], // Ranges for PC1 and PC2
+            pc_names: vec!["PC1".to_string(), "PC2".to_string()],
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+        };
+        
+        // Run the full model training with REML 
+        let trained_model = train_model(&data, &config).unwrap();
+        
+        // Now evaluate the learned spline functions for PC1 and PC2
+        // Create grid of evaluation points
+        let n_grid = 50;
+        let pc1_grid = Array::linspace(-1.5, 1.5, n_grid);
+        let pc2_grid = Array::linspace(-1.0, 1.0, n_grid);
+        
+        // We'll evaluate each PC's contribution separately
+        // Using the mean values for other predictors
+        
+        // Function to evaluate each PC's effect
+        // Simple function to evaluate a PC effect across a range of values
+        let evaluate_pc_effect = |pc_idx: usize, pc_vals: &Array1<f64>| -> Array1<f64> {
+            let pc_name = &config.pc_names[pc_idx];
+            let mut effects = Vec::with_capacity(pc_vals.len());
+            
+            // Get coefficients for this PC
+            if let Some(pc_coeffs) = trained_model.coefficients.main_effects.pcs.get(pc_name) {
+                for &pc_val in pc_vals.iter() {
+                    // Create basis for this PC value
+                    let (pc_basis, _) = create_bspline_basis(
+                        array![pc_val].view(),
+                        None, 
+                        config.pc_ranges[pc_idx],
+                        config.pc_basis_configs[pc_idx].num_knots,
+                        config.pc_basis_configs[pc_idx].degree,
+                    ).unwrap();
+                    
+                    // Apply constraint if available
+                    let constrained_basis = if let Some(constraint) = trained_model.config.constraints.get(pc_name) {
+                        pc_basis.dot(&constraint.z_transform)
+                    } else {
+                        pc_basis
+                    };
+                    
+                    // Calculate effect using dot product
+                    let effect: f64 = pc_coeffs.iter()
+                        .zip(constrained_basis.row(0).iter())
+                        .map(|(&c, &b)| c * b)
+                        .sum();
+                        
+                    effects.push(effect);
                 }
             }
             
-            // Add PC main effect contribution
-            if let Some(pc_coeffs) = coeffs.main_effects.pcs.get("PC1") {
-                let pc_basis_row = pc_basis.row(0);
-                for (i, coeff) in pc_coeffs.iter().enumerate() {
-                    if i < pc_basis_row.len() {
-                        linear_pred += coeff * pc_basis_row[i];
-                    }
-                }
-            }
+            Array1::from_vec(effects)
+        };
+        
+        // Evaluate PC1 and PC2 effects
+        let pc1_effects = evaluate_pc_effect(0, &pc1_grid);
+        let pc2_effects = evaluate_pc_effect(1, &pc2_grid);
+        
+        // Calculate standard deviations to measure the "flatness" of each function
+        let pc1_std = pc1_effects.iter().map(|&x| (x - pc1_effects.mean().unwrap_or(0.0)).powi(2)).sum::<f64>().sqrt() / (pc1_effects.len() as f64 - 1.0).sqrt();
+        let pc2_std = pc2_effects.iter().map(|&x| (x - pc2_effects.mean().unwrap_or(0.0)).powi(2)).sum::<f64>().sqrt() / (pc2_effects.len() as f64 - 1.0).sqrt();
+        
+        println!("PC1 effect standard deviation: {:.6}", pc1_std);
+        println!("PC2 effect standard deviation: {:.6}", pc2_std);
+        
+        // Calculate mean absolute effect for each PC
+        let pc1_mean_abs = pc1_effects.iter().map(|&x| x.abs()).sum::<f64>() / pc1_effects.len() as f64;
+        let pc2_mean_abs = pc2_effects.iter().map(|&x| x.abs()).sum::<f64>() / pc2_effects.len() as f64;
+        
+        println!("PC1 mean absolute effect: {:.6}", pc1_mean_abs);
+        println!("PC2 mean absolute effect: {:.6}", pc2_mean_abs);
+        
+        // Calculate min/max effects to measure range
+        let pc1_min = pc1_effects.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let pc1_max = pc1_effects.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let pc1_range = pc1_max - pc1_min;
+        
+        let pc2_min = pc2_effects.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let pc2_max = pc2_effects.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let pc2_range = pc2_max - pc2_min;
+        
+        println!("PC1 effect range: [{:.6}, {:.6}], width: {:.6}", pc1_min, pc1_max, pc1_range);
+        println!("PC2 effect range: [{:.6}, {:.6}], width: {:.6}", pc2_min, pc2_max, pc2_range);
+        
+        // The PC1 effect should be significant (not flat)
+        assert!(pc1_std > 0.1, "PC1 effect is too flat, should show variation across the range");
+        assert!(pc1_range > 0.5, "PC1 effect range is too small: {}", pc1_range);
+        
+        // The PC2 effect should be very close to flat (regularized to zero) because it has no effect
+        assert!(pc2_std < 0.05, "PC2 effect shows variation despite having no true effect");
+        assert!(pc2_range < 0.2, "PC2 effect range is too large: {}", pc2_range);
+        
+        // The PC1 effect should be substantially larger than PC2 effect
+        assert!(pc1_mean_abs > 5.0 * pc2_mean_abs, 
+                "PC1 effect should be much larger than PC2 effect. PC1: {}, PC2: {}", 
+                pc1_mean_abs, pc2_mean_abs);
+        
+        // The ratio of std devs should be large, showing that PC1 has much more variation than PC2
+        let std_ratio = pc1_std / pc2_std;
+        println!("Ratio of PC1 to PC2 effect variation: {:.1}", std_ratio);
+        assert!(std_ratio > 5.0, "PC1 effect should have much more variation than PC2 effect");
+        
+        // Calculate R² for the relationship between PC values and their effects
+        // PC1 should have a strong relationship, PC2 should not
+        
+        // Helper function to calculate correlation coefficient
+        fn correlation_coefficient(x: &Array1<f64>, y: &Array1<f64>) -> f64 {
+            let x_mean = x.mean().unwrap_or(0.0);
+            let y_mean = y.mean().unwrap_or(0.0);
             
-            // Convert linear predictor to probability
-            let prob = 1.0 / (1.0 + (-linear_pred).exp());
-            predictions.push(prob);
+            let numerator: f64 = x.iter()
+                .zip(y.iter())
+                .map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean))
+                .sum();
+                
+            let x_variance: f64 = x.iter().map(|&xi| (xi - x_mean).powi(2)).sum();
+            let y_variance: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
+            
+            numerator / (x_variance.sqrt() * y_variance.sqrt())
         }
         
-        // Verify that our predictions are within 20% of the true values
-        for (i, (&predicted, &true_value)) in predictions.iter().zip(true_values.iter()).enumerate() {
-            let relative_error = (predicted - true_value).abs() / true_value.max(0.001);
-            assert!(relative_error < 0.2, 
-                "Prediction at test point {:?} too far from true value. Predicted: {}, True: {}, Relative error: {}", 
-                test_points[i], predicted, true_value, relative_error);
-            println!("Test point {:?}: Predicted={:.4}, True={:.4}, Rel. Error={:.4}", 
-                    test_points[i], predicted, true_value, relative_error);
-        }
+        let pc1_corr = correlation_coefficient(&pc1_grid, &pc1_effects);
+        let pc2_corr = correlation_coefficient(&pc2_grid, &pc2_effects);
+        let pc1_r2 = pc1_corr * pc1_corr;
+        let pc2_r2 = pc2_corr * pc2_corr;
         
-        // Also verify that the model preserves the expected pattern
-        // high_low > high_high > low_high > low_low
-        assert!(predictions[2] > predictions[3] && predictions[3] > predictions[1] && predictions[1] > predictions[0],
-            "Model predictions do not follow the expected pattern: high_low > high_high > low_high > low_low");
-        println!("Predicted pattern verified: high_low={:.4} > high_high={:.4} > low_high={:.4} > low_low={:.4}",
-                 predictions[2], predictions[3], predictions[1], predictions[0]);
+        println!("PC1 R²: {:.6}, PC2 R²: {:.6}", pc1_r2, pc2_r2);
+        assert!(pc1_r2 > 0.5, "PC1 effect should show strong relationship with PC1 values");
+        assert!(pc2_r2 < 0.2, "PC2 effect should show weak relationship with PC2 values");
     }
     
     /// A minimal test that verifies the basic estimation workflow without
@@ -1507,7 +1840,10 @@ mod tests {
             knot_vectors: HashMap::new(),
         };
 
-        let (x, s_list, layout, _constraints, _knot_vectors) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, constraints_unused, knot_vectors_unused) = internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        // Explicitly drop unused variables
+        drop(constraints_unused);
+        drop(knot_vectors_unused);
 
         let pgs_n_basis = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1; // 6
         let pc_n_basis = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5

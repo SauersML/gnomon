@@ -1,4 +1,7 @@
 
+#![deny(unused_variables)]
+#![deny(clippy::no_effect_underscore_binding)]
+
 use clap::{Parser, Subcommand};
 use std::process;
 use std::path::PathBuf;

@@ -65,18 +65,18 @@ pub struct ModelConfig {
 
 /// A structured representation of the fitted model coefficients, designed for
 /// human interpretation and sharing. This structure is used in the TOML file.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MappedCoefficients {
     pub intercept: f64,
     pub main_effects: MainEffects,
     /// Nested map for interaction terms.
-    /// - Outer key: PGS basis function name (e.g., "pgs_B1").
+    /// - Outer key: PGS basis function name (e.g., "PGS_B1").
     /// - Inner key: PC name (e.g., "PC1").
     /// - Value: The vector of coefficients for that interaction's spline.
     pub interaction_effects: HashMap<String, HashMap<String, Vec<f64>>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainEffects {
     /// Coefficients for the main effect of PGS (for basis functions m > 0).
     pub pgs: Vec<f64>,
@@ -207,12 +207,8 @@ mod internal {
             .z_transform;
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
-        // helper closure to fetch a Z from model or panic nicely
-        let _lookup_z = |name: &str| -> Result<&Array2<f64>, ModelError> {
-            Ok(&config.constraints.get(name)
-                .ok_or_else(|| ModelError::ConstraintMissing(name.to_string()))?
-                .z_transform)
-        };
+        // This closure was not used - removed
+        // Previously defined a helper to fetch Z transform from model
 
         // 2. Generate bases for PCs using saved knot vectors if available
         let mut pc_constrained_bases = Vec::new();
@@ -323,125 +319,94 @@ mod internal {
 mod tests {
     use super::*;
     // TrainingData is not used in tests
-    use ndarray::{Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
-    /// Tests that the prediction method of TrainedModel works correctly.
+    /// Test a trivially simple case with degree 1 B-spline (piecewise linear interpolation).
+    /// This test uses a simple ground truth we can calculate by hand to verify the prediction.
     #[test]
     fn test_trained_model_predict() {
-        // Create a simple test case with known inputs and outputs
-        let n_test = 5;
+        // Create a model with degree 1 B-spline and a single internal knot (0.5)
+        // Knot vector: [0, 0, 0.5, 1, 1]
+        let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
+        let z_transform = Array2::<f64>::eye(2); // Identity matrix for no constraint
         
-        // Create test PGS values
-        let pgs_values = Array1::linspace(-1.0, 1.0, n_test);
-        
-        // Create test PC values (2 PCs)
-        let pc1 = Array1::linspace(-0.5, 0.5, n_test);
-        let pc2 = Array1::linspace(-1.0, 1.0, n_test);
-        let mut pcs = Array2::zeros((n_test, 2));
-        for i in 0..n_test {
-            pcs[[i, 0]] = pc1[i];
-            pcs[[i, 1]] = pc2[i];
-        }
-        
-        // Create a minimal TrainedModel with known coefficients for testing
-        // We'll use the identity link function for simplicity of testing
+        // Simple model with intercept=0, main effect coeffs [2.0, 4.0]
         let model = TrainedModel {
             config: ModelConfig {
-                link_function: LinkFunction::Identity,  // Simple linear combination
+                link_function: LinkFunction::Identity,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                pgs_basis_config: BasisConfig { num_knots: 2, degree: 1 }, // Simple linear basis
-                pc_basis_configs: vec![
-                    BasisConfig { num_knots: 2, degree: 1 },  // Simple linear basis for PC1
-                    BasisConfig { num_knots: 2, degree: 1 },  // Simple linear basis for PC2
-                ],
-                pgs_range: (-2.0, 2.0),
-                pc_ranges: vec![(-1.0, 1.0), (-1.5, 1.5)],
-                pc_names: vec!["PC1".to_string(), "PC2".to_string()],
+                pgs_basis_config: BasisConfig { num_knots: 1, degree: 1 },  // Degree 1 with 1 internal knot
+                pc_basis_configs: vec![],  // No PC effects in this simple test
+                pgs_range: (0.0, 1.0),
+                pc_ranges: vec![],
+                pc_names: vec![],
                 constraints: {
                     let mut constraints = HashMap::new();
-                    // Add minimal identity constraints for testing
                     constraints.insert("pgs_main".to_string(), 
-                        Constraint { z_transform: Array2::eye(2) });
-                    constraints.insert("PC1".to_string(),
-                        Constraint { z_transform: Array2::eye(2) });
-                    constraints.insert("PC2".to_string(),
-                        Constraint { z_transform: Array2::eye(2) });
+                        Constraint { z_transform: z_transform.clone() });
                     constraints
                 },
                 knot_vectors: {
                     let mut knots = HashMap::new();
-                    // Knot vectors for testing
-                    knots.insert("pgs".to_string(), Array1::from_vec(vec![-2.0, -2.0, -1.0, 0.0, 1.0, 2.0, 2.0]));
-                    knots.insert("PC1".to_string(), Array1::from_vec(vec![-1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0]));
-                    knots.insert("PC2".to_string(), Array1::from_vec(vec![-1.5, -1.5, -0.75, 0.0, 0.75, 1.5, 1.5]));
+                    knots.insert("pgs".to_string(), knot_vector);
                     knots
                 },
             },
             coefficients: MappedCoefficients {
-                intercept: 5.0,  // Constant term
+                intercept: 0.0,
                 main_effects: MainEffects {
-                    pgs: vec![2.0, 1.0],  // Linear effect for PGS
-                    pcs: {
-                        let mut pc_effects = HashMap::new();
-                        pc_effects.insert("PC1".to_string(), vec![3.0, 1.5]);  // Effects for PC1
-                        pc_effects.insert("PC2".to_string(), vec![0.5, -1.0]);  // Effects for PC2
-                        pc_effects
-                    },
+                    pgs: vec![2.0, 4.0],  // Two coefficients for degree 1 B-spline
+                    pcs: HashMap::new(),
                 },
-                interaction_effects: {
-                    let mut interactions = HashMap::new();
-                    // Add interaction effects between PGS basis functions and PCs
-                    let mut pgs_b1_effects = HashMap::new();
-                    pgs_b1_effects.insert("PC1".to_string(), vec![0.5, 0.3]);
-                    pgs_b1_effects.insert("PC2".to_string(), vec![-0.2, -0.4]);
-                    
-                    let mut pgs_b2_effects = HashMap::new();
-                    pgs_b2_effects.insert("PC1".to_string(), vec![0.1, 0.2]);
-                    pgs_b2_effects.insert("PC2".to_string(), vec![-0.1, -0.3]);
-                    
-                    interactions.insert("PGS_B1".to_string(), pgs_b1_effects); // Fixed case to match code (PGS_B1, not pgs_B1)
-                    interactions.insert("PGS_B2".to_string(), pgs_b2_effects); // Fixed case to match code
-                    interactions
-                },
+                interaction_effects: HashMap::new(),
             },
-            lambdas: vec![0.1, 0.2, 0.3, 0.4], // Not used in prediction, just for completeness
+            lambdas: vec![],
         };
-
-        // Generate predictions
-        let predictions = model.predict(pgs_values.view(), pcs.view())
-            .expect("Prediction should succeed with valid inputs");
         
-        // Verify we got the right number of predictions
-        assert_eq!(predictions.len(), n_test, "Should have one prediction per input sample");
+        // Test point x = 0.25, which is halfway between knots at 0 and 0.5
+        let test_point = array![0.25];
+        let empty_pcs = Array2::<f64>::zeros((1, 0)); // No PCs
         
-        // Manually compute expected predictions using the same matrix math as the real model
-        // For each test point, we'll construct the design matrix X and compute X.dot(beta)
-        for i in 0..n_test {
-            // Step 1: Create the design matrix for this single sample
-            let x_i = internal::construct_design_matrix(
-                pgs_values.slice(s![i..i+1]).view(),
-                pcs.slice(s![i..i+1, ..]).view(),
-                &model.config
-            ).expect("Should be able to construct design matrix");
-            
-            // Step 2: Flatten the coefficients vector
-            let beta = internal::flatten_coefficients(&model.coefficients, &model.config);
-            
-            // Step 3: Compute expected prediction using exact matrix multiplication
-            let expected = x_i.dot(&beta)[0]; // Should be a 1x1 matrix
-            
-            // Step 4: Compare with the predict method's result
-            assert!(
-                (predictions[i] - expected).abs() < 1e-10,
-                "Prediction should match manual calculation. Prediction: {}, Expected: {}",
-                predictions[i], expected
-            );
-        }
+        // Calculate expected result by hand:
+        // For x = 0.25, the basis functions will have values B_0,1 = 0.5, B_1,1 = 0.5
+        // Linear predictor: eta = (0.5 * 2.0) + (0.5 * 4.0) = 3.0
+        let expected_value = 3.0;
+        
+        // Get the model prediction
+        let prediction = model.predict(test_point.view(), empty_pcs.view()).unwrap();
+        
+        // Verify the result matches our ground truth
+        assert_eq!(prediction.len(), 1);
+        assert!(
+            (prediction[0] - expected_value).abs() < 1e-10,
+            "Prediction {} does not match expected value {}",
+            prediction[0],
+            expected_value
+        );
+        
+        // Also test at x = 0.75, which is halfway between knots at 0.5 and 1.0
+        // For x = 0.75, the basis functions will have values B_1,1 = 0.5, B_2,1 = 0.5
+        // Linear predictor: eta = (0.5 * 4.0) + (0.5 * 0.0) = 2.0
+        // (Note: The coefficient vector has length 2, so there's no coefficient for B_2,1)
+        let test_point_2 = array![0.75];
+        let expected_value_2 = 2.0;
+        
+        let prediction_2 = model.predict(test_point_2.view(), empty_pcs.view()).unwrap();
+        assert!(
+            (prediction_2[0] - expected_value_2).abs() < 1e-10,
+            "Prediction {} does not match expected value {}",
+            prediction_2[0],
+            expected_value_2
+        );
     }
+    
+    
+    
+    
     
     /// Tests that the prediction fails appropriately with invalid input dimensions.
     #[test]

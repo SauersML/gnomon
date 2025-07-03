@@ -616,14 +616,14 @@ fn process_sparse_stream(
                 // scope ends, whether by success or by `?` propagating an error.
                 {
                     let work_item = work_result?;
-                    let _guard = BufferGuard {
+                    let guard = BufferGuard {
                         buffer: Some(work_item.data),
                         pool: &buffer_pool,
                     };
 
                     batch::run_variant_major_path(
                         // The guard holds the buffer, so we borrow it from there.
-                        _guard.buffer.as_ref().unwrap(),
+                        guard.buffer.as_ref().unwrap(),
                         prep_result,
                         &mut acc.0,
                         &mut acc.1,

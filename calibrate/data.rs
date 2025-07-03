@@ -18,93 +18,11 @@
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
+use std::fs::File;
 use thiserror::Error;
 
-fn csv_to_df(path: PathBuf, delimiter: Option<u8>) -> Result<DataFrame, PolarsError> {
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
-    
-    // Read the file directly as lines
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
-    // Read header line
-    let header_line = match lines.next() {
-        Some(Ok(line)) => line,
-        _ => return Err(PolarsError::ComputeError("CSV file is empty".into())),
-    };
-    
-    // Parse headers
-    let sep_char = delimiter.unwrap_or(b',') as char;
-    let headers: Vec<String> = header_line.split(sep_char).map(|s| s.trim().to_string()).collect();
-    
-    // Read all rows
-    let mut rows = Vec::new();
-    for line_result in lines {
-        match line_result {
-            Ok(line) => {
-                let fields: Vec<String> = line.split(sep_char).map(|s| s.trim().to_string()).collect();
-                rows.push(fields);
-            },
-            Err(e) => return Err(PolarsError::ComputeError(format!("Error reading line: {}", e).into())),
-        }
-    }
-    
-    // Check if we have any data
-    if rows.is_empty() {
-        return Err(PolarsError::ComputeError("CSV file has no data rows".into()));
-    }
-    
-    // Create dummy columns for the DataFrame
-    // We don't need to create a proper DataFrame with correct types
-    // since we'll manually extract the data anyway
-    let mut cols = Vec::new();
-    
-    // Transpose the data
-    for (i, header) in headers.iter().enumerate() {
-        // Extract column values
-        let mut col_data = Vec::with_capacity(rows.len());
-        
-        for row in &rows {
-            if i < row.len() {
-                // Try to parse as f64
-                // Store any parsing issues to be validated later
-                let is_empty = row[i].is_empty();
-                let parse_result = if !is_empty { row[i].parse::<f64>() } else { Err("empty string".parse::<f64>().unwrap_err()) };
-                
-                match parse_result {
-                    Ok(val) => col_data.push(val),
-                    Err(_) => {
-                        // Properly propagate parsing errors instead of silently using 0.0
-                        // This ensures data validation happens immediately instead of later
-                        if is_empty {
-                            return Err(PolarsError::ComputeError(
-                                format!("Empty value found in column {}", headers[i]).into()
-                            ));
-                        } else {
-                            return Err(PolarsError::ComputeError(
-                                format!("Non-numeric value '{}' found in column {}", row[i], headers[i]).into()
-                            ));
-                        }
-                    }
-                }
-            } else {
-                // Row doesn't have this column, which is a data error
-                return Err(PolarsError::ComputeError(
-                    format!("Row missing column {} (index {})", headers[i], i).into()
-                ));
-            }
-        }
-        
-        // Create Series object with PlSmallStr name
-        cols.push(Series::new(header.into(), &col_data));
-    }
-    
-    // Create DataFrame
-    DataFrame::new(cols.into_iter().map(|s| s.into_column()).collect())
-}
+// Removed custom CSV parser in favor of using the Polars built-in functionality
 
 // --- Public Data Structures ---
 
@@ -137,6 +55,8 @@ pub enum DataError {
     PolarsError(#[from] PolarsError),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("CSV parsing error: {0}")]
+    CsvError(#[from] csv::Error),
     #[error("The required column '{0}' was not found in the input file. Please check spelling and case.")]
     ColumnNotFound(String),
     #[error("The required column '{column_name}' could not be converted to the expected type '{expected_type}'. It contains non-numeric data. (Found type: {found_type})")]
@@ -187,224 +107,135 @@ mod internal {
         required_cols.push("score".to_string());
         required_cols.extend_from_slice(&pc_names);
 
-        // --- 2. Delegate reading and structural validation to the core helper ---
-        let df = load_and_validate_dataframe(path, &required_cols)?;
-
-        // --- 3. Parse the raw data ---
-        // Let's manually extract the data from the DataFrame
-        let phenotype_opt = if include_phenotype {
-            // Get the phenotype column
-            let phenotype_col = match df.column("phenotype") {
-                Ok(col) => col,
-                Err(_) => return Err(DataError::ColumnNotFound("phenotype".to_string())),
-            };
-            
-            // Convert to f64
-            let mut phenotype_vec = Vec::with_capacity(df.height());
-            for i in 0..df.height() {
-                match phenotype_col.get(i) {
-                    Ok(val) => match val {
-                        AnyValue::Float64(f) => phenotype_vec.push(f),
-                        _ => return Err(DataError::ColumnWrongType {
-                            column_name: "phenotype".to_string(),
-                            expected_type: "f64 (numeric)",
-                            found_type: format!("{:?}", phenotype_col.dtype()),
-                        }),
-                    },
-                    Err(_) => return Err(DataError::MissingValuesFound("phenotype".to_string())),
-                }
-            }
-            
-            Some(Array1::from_vec(phenotype_vec))
-        } else {
-            None
-        };
-        
-        // Get the score column
-        let score_col = match df.column("score") {
-            Ok(col) => col,
-            Err(_) => return Err(DataError::ColumnNotFound("score".to_string())),
-        };
-        
-        // Convert to f64
-        let mut score_vec = Vec::with_capacity(df.height());
-        for i in 0..df.height() {
-            match score_col.get(i) {
-                Ok(val) => match val {
-                    AnyValue::Float64(f) => score_vec.push(f),
-                    _ => return Err(DataError::ColumnWrongType {
-                        column_name: "score".to_string(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", score_col.dtype()),
-                    }),
-                },
-                Err(_) => return Err(DataError::MissingValuesFound("score".to_string())),
-            }
-        }
-        let pgs = Array1::from_vec(score_vec);
-        
-        // Process PC columns
-        let mut pcs_vecs = Vec::new();
-        for col_name in &pc_names {
-            let pc_col = match df.column(col_name) {
-                Ok(col) => col,
-                Err(_) => return Err(DataError::ColumnNotFound(col_name.clone())),
-            };
-            
-            // Convert to f64
-            let mut pc_vec = Vec::with_capacity(df.height());
-            for i in 0..df.height() {
-                match pc_col.get(i) {
-                    Ok(val) => match val {
-                        AnyValue::Float64(f) => pc_vec.push(f),
-                        _ => return Err(DataError::ColumnWrongType {
-                            column_name: col_name.clone(),
-                            expected_type: "f64 (numeric)",
-                            found_type: format!("{:?}", pc_col.dtype()),
-                        }),
-                    },
-                    Err(_) => return Err(DataError::MissingValuesFound(col_name.clone())),
-                }
-            }
-            
-            pcs_vecs.push(Array1::from_vec(pc_vec));
-        }
-        
-        // Stack columns to form the matrix
-        if pcs_vecs.is_empty() {
-            return Err(DataError::ColumnNotFound("No PC columns found".to_string()));
-        }
-        
-        let n_rows = pcs_vecs[0].len();
-        let n_cols = pcs_vecs.len();
-        let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
-        
-        // Convert column vectors to row-major format for correct array construction
-        for row_idx in 0..n_rows {
-            for col_idx in 0..n_cols {
-                pcs_flat.push(pcs_vecs[col_idx][row_idx]);
-            }
-        }
-        
-        let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat).unwrap();
-
-        Ok((pgs, pcs, phenotype_opt))
-    }
-
-    /// Reads a file into a Polars DataFrame, validating schema and data integrity.
-    fn load_and_validate_dataframe(
-        path: &str,
-        required_cols: &[String],
-    ) -> Result<DataFrame, DataError> {
+        // --- 2. Read and validate the DataFrame using Polars ---
         println!("Loading data from '{}'", path);
-        let file_path = std::path::PathBuf::from(path);
         
-        // Catch specific CSV parsing errors and convert to appropriate DataError types
-        let df = match csv_to_df(file_path, Some(b'\t')) {
-            Ok(df) => df,
-            Err(e) => {
-                // Convert specific polars errors to more user-friendly DataError types
-                match e {
-                    PolarsError::ComputeError(ref err_str) => {
-                        let err_msg = err_str.to_string();
-                        if err_msg.contains("Empty value found in column") {
-                            // Extract column name from error message
-                            let col_name = err_msg.split(" column ").nth(1).unwrap_or("unknown").to_string();
-                            return Err(DataError::MissingValuesFound(col_name));
-                        } else if err_msg.contains("Non-numeric value") {
-                            // Extract column name from error message
-                            let parts: Vec<&str> = err_msg.split(" found in column ").collect();
-                            if parts.len() == 2 {
-                                let col_name = parts[1].to_string();
-                                return Err(DataError::ColumnWrongType {
-                                    column_name: col_name,
-                                    expected_type: "f64 (numeric)",
-                                    found_type: "String".to_string(),
-                                });
-                            }
-                        }
-                        // Fall back to default error if specific pattern not matched
-                        return Err(DataError::PolarsError(e.clone()));
-                    },
-                    // Pass through other errors
-                    _ => return Err(DataError::PolarsError(e)),
-                }
-            }
-        };
-
-        let schema = df.schema();
-        let available_cols: HashSet<_> = schema.iter_names().map(|s| s.to_string()).collect();
-        for col_name in required_cols {
-            if !available_cols.contains(col_name) {
-                return Err(DataError::ColumnNotFound(col_name.clone()));
-            }
-        }
-        println!("All required columns found: {:?}", required_cols);
-
-        // Select only the required columns
-        let df = df.select(required_cols)?;
-        println!("Successfully loaded {} rows.", df.height());
-
+        // Use the Polars CsvReader for efficiency
+        let df = CsvReader::new(File::open(Path::new(path))?)
+            .with_options(
+                CsvReadOptions::default()
+                    .with_has_header(true)
+                    .with_parse_options(
+                        CsvParseOptions::default()
+                            .with_separator(b'\t') // Using tab as separator
+                    )
+            )
+            .finish()?;
+            
+        println!("Successfully loaded data file.");
+        
+        // Check if we have the minimum number of rows
         if df.height() < MINIMUM_ROWS {
             return Err(DataError::InsufficientRows {
                 found: df.height(),
                 required: MINIMUM_ROWS,
             });
         }
-        for col_name in required_cols {
-            if df.column(col_name)?.null_count() > 0 {
-                return Err(DataError::MissingValuesFound(col_name.clone()));
+        
+        // Verify all required columns exist
+        let df_columns = df.get_column_names();
+        let columns_set: HashSet<String> = df_columns.into_iter().map(|s| s.to_string()).collect();
+        
+        for col_name in &required_cols {
+            if !columns_set.contains(col_name) {
+                return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-        println!("Data validation successful: no missing values found.");
-        Ok(df)
-    }
-
-    /// Helper to convert a Polars Column to an ndarray Array1<f64>, providing
-    /// a more specific error message on failure.
-    // Function not currently used but kept for future use
-    #[allow(dead_code)]
-    fn series_to_f64_array(column: &Column) -> Result<Array1<f64>, DataError> {
-        // Convert column to vector manually
-        let values = match column.dtype() {
-            DataType::Float64 => {
-                // Extract values from the column
-                let name = column.name();
-                
-                // Convert to vector of f64
-                let mut result = Vec::with_capacity(column.len());
-                for i in 0..column.len() {
-                    let value_result = column.get(i);
-                    match value_result {
-                        Ok(value) => {
-                            match value {
-                                AnyValue::Float64(f) => result.push(f),
-                                _ => return Err(DataError::ColumnWrongType {
-                                    column_name: name.to_string(),
-                                    expected_type: "f64 (numeric)",
-                                    found_type: format!("{:?}", column.dtype()),
-                                }),
-                            }
-                        },
-                        Err(_) => {
-                            return Err(DataError::MissingValuesFound(name.to_string()));
-                        }
-                    }
-                }
-                result
-            },
-            _ => {
-                // Non-float64 type
-                return Err(DataError::ColumnWrongType {
-                    column_name: column.name().to_string(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", column.dtype()),
-                });
+        println!("All required columns found: {:?}", required_cols);
+        
+        // --- 3. Convert columns efficiently to ndarray structures ---
+        
+        // Process phenotype column if needed
+        let phenotype_opt = if include_phenotype {
+            let phenotype_series = df.column("phenotype")?;
+            if phenotype_series.null_count() > 0 {
+                return Err(DataError::MissingValuesFound("phenotype".to_string()));
             }
+            
+            // Convert to f64
+            match phenotype_series.cast(&DataType::Float64) {
+                Ok(casted) => {
+                    // Use efficient Polars to ndarray conversion
+                    let arr = casted.f64()?
+                        .to_ndarray()?
+                        .to_owned();
+                    Some(arr)
+                },
+                Err(_) => return Err(DataError::ColumnWrongType {
+                    column_name: "phenotype".to_string(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", phenotype_series.dtype()),
+                }),
+            }
+        } else {
+            None
         };
         
-        // Create ndarray from collected values
-        Ok(Array1::from_vec(values))
+        // Process score column
+        let score_series = df.column("score")?;
+        if score_series.null_count() > 0 {
+            return Err(DataError::MissingValuesFound("score".to_string()));
+        }
+        
+        // Convert to f64
+        let pgs = match score_series.cast(&DataType::Float64) {
+            Ok(casted) => {
+                casted.f64()?
+                    .to_ndarray()?
+                    .to_owned()
+            },
+            Err(_) => return Err(DataError::ColumnWrongType {
+                column_name: "score".to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", score_series.dtype()),
+            }),
+        };
+        
+        // Process PC columns efficiently
+        let mut pc_arrays = Vec::with_capacity(num_pcs);
+        for pc_name in &pc_names {
+            let pc_series = df.column(pc_name)?;
+            if pc_series.null_count() > 0 {
+                return Err(DataError::MissingValuesFound(pc_name.clone()));
+            }
+            
+            // Convert to f64
+            match pc_series.cast(&DataType::Float64) {
+                Ok(casted) => {
+                    let arr = casted.f64()?
+                        .to_ndarray()?
+                        .to_owned();
+                    pc_arrays.push(arr);
+                },
+                Err(_) => return Err(DataError::ColumnWrongType {
+                    column_name: pc_name.clone(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", pc_series.dtype()),
+                }),
+            }
+        }
+        
+        // Stack PC arrays into a matrix
+        if pc_arrays.is_empty() {
+            return Err(DataError::ColumnNotFound("No PC columns found".to_string()));
+        }
+        
+        let n_rows = pc_arrays[0].len();
+        let n_cols = pc_arrays.len();
+        let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
+        
+        // Convert column vectors to row-major format
+        for row_idx in 0..n_rows {
+            for col_idx in 0..n_cols {
+                pcs_flat.push(pc_arrays[col_idx][row_idx]);
+            }
+        }
+        
+        let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
+            .expect("PC arrays should have consistent dimensions");
+
+        println!("Data validation successful: all required columns have numeric data with no missing values.");
+        Ok((pgs, pcs, phenotype_opt))
     }
 }
 
@@ -414,6 +245,7 @@ mod tests {
     use super::*;
     use std::io::{self, Write};
     use tempfile::NamedTempFile;
+    use approx::assert_abs_diff_eq;
 
     /// A robust helper to create a temporary CSV file for testing.
     fn create_test_csv(content: &str) -> io::Result<NamedTempFile> {
@@ -436,8 +268,21 @@ mod tests {
     fn test_load_training_data_success() {
         // Create test data that only includes required columns (no extra_col)
         let header = "phenotype\tscore\tPC1\tPC2";
-        let data_row = "1.0\t1.5\t0.1\t0.2";
-        let content = generate_csv_content(header, data_row, 30);
+        
+        // Generate varied test data with different values in each row
+        let mut rows = Vec::with_capacity(31);
+        rows.push(header.to_string());
+        
+        for i in 0..30 {
+            let row = format!("{:.2}\t{:.2}\t{:.3}\t{:.3}",
+                          i as f64 / 10.0,
+                          (i as f64 + 5.0) / 10.0,
+                          (i as f64 - 2.0) / 20.0,
+                          (i as f64 + 3.0) / 15.0);
+            rows.push(row);
+        }
+        
+        let content = rows.join("\n");
         let file = create_test_csv(&content).unwrap();
         let data = load_training_data(file.path().to_str().unwrap(), 2).unwrap();
 
@@ -446,19 +291,23 @@ mod tests {
         assert_eq!(data.p.len(), 30);
         assert_eq!(data.pcs.shape(), &[30, 2]);
         
-        // Test scalar values
-        assert_eq!(data.y[0], 1.0);
-        assert_eq!(data.p[0], 1.5);
+        // Test specific values in the first row
+        assert_abs_diff_eq!(data.y[0], 0.00, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.p[0], 0.50, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[0, 0]], -0.100, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[0, 1]], 0.200, epsilon = 1e-6);
         
-        // Test the entire PCs matrix for the first row
-        assert_eq!(data.pcs[[0, 0]], 0.1);
-        assert_eq!(data.pcs[[0, 1]], 0.2);
+        // Test specific values in a middle row
+        assert_abs_diff_eq!(data.y[15], 1.50, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.p[15], 2.00, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[15, 0]], 0.650, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[15, 1]], 1.200, epsilon = 1e-6);
         
-        // All rows should have the same values since we're repeating the same data row
-        for i in 1..30 {
-            assert_eq!(data.pcs[[i, 0]], 0.1);
-            assert_eq!(data.pcs[[i, 1]], 0.2);
-        }
+        // Test specific values in the last row
+        assert_abs_diff_eq!(data.y[29], 2.90, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.p[29], 3.40, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[29, 0]], 1.350, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[29, 1]], 2.133, epsilon = 1e-6);
     }
     
     #[test]
@@ -487,12 +336,12 @@ mod tests {
         assert_eq!(data.pcs.shape(), &[20, 2]);
         
         // Verify the matrix contents for a few key elements
-        assert_eq!(data.pcs[[0, 0]], 0.2);
-        assert_eq!(data.pcs[[0, 1]], 0.3);
-        assert_eq!(data.pcs[[10, 0]], 1.2);
-        assert_eq!(data.pcs[[10, 1]], 1.3);
-        assert_eq!(data.pcs[[19, 0]], 2.1);
-        assert_eq!(data.pcs[[19, 1]], 2.2);
+        assert_abs_diff_eq!(data.pcs[[0, 0]], 0.2, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[0, 1]], 0.3, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[10, 0]], 1.2, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[10, 1]], 1.3, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[19, 0]], 2.1, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[19, 1]], 2.2, epsilon = 1e-6);
     }
     
     #[test]
@@ -506,8 +355,8 @@ mod tests {
 
         assert_eq!(data.p.len(), 30);
         assert_eq!(data.pcs.shape(), &[30, 1]);
-        assert_eq!(data.p[0], 1.5);
-        assert_eq!(data.pcs[[0, 0]], 0.1);
+        assert_abs_diff_eq!(data.p[0], 1.5, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.pcs[[0, 0]], 0.1, epsilon = 1e-6);
     }
 
     #[test]
