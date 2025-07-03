@@ -54,6 +54,7 @@ toml = "0.8.23"
 polars = { version = "0.43", features = ["lazy", "csv", "ndarray"] }
 wolfe_bfgs = "0.1.1"
 log = "0.4.27"
+env_logger = "0.10.2"
 
 [profile.release]
 opt-level = 3
@@ -74,8 +75,10 @@ no-inline-profiling = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+rand_distr = "0.4.3"
 tempfile = "3.20"
 approx = "0.5"
+serde_json = "1.0"
 
 [[bench]]
 name = "path_benchmark"
