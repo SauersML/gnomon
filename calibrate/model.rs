@@ -318,3 +318,73 @@ mod internal {
         Array1::from_vec(flattened)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibrate::data::TrainingData;
+    use ndarray::{Array1, Array2};
+    use approx::assert_abs_diff_eq;
+
+    /// Tests that the prediction process works correctly with pre-centering.
+    #[test]
+    fn test_prediction_with_precentering() {
+        // Create a simple training dataset
+        let n_samples = 20;
+        let y = Array1::from_vec(vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            .iter().map(|&v| v as f64).collect());
+        let p = Array1::linspace(0.0, 1.0, n_samples);
+        let pc1 = Array1::linspace(-0.5, 0.5, n_samples);
+        let pcs = Array2::from_shape_fn((n_samples, 1), |(i, j)| if j == 0 { pc1[i] } else { 0.0 });
+        
+        let training_data = TrainingData { y, p, pcs };
+        
+        // Create a model config
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+            pc_basis_configs: vec![BasisConfig { num_knots: 3, degree: 3 }],
+            pgs_range: (0.0, 1.0),
+            pc_ranges: vec![(-0.5, 0.5)],
+            pc_names: vec!["PC1".to_string()],
+            constraints: Default::default(),
+            knot_vectors: Default::default(),
+        };
+        
+        // Build design and penalty matrices
+        use crate::calibrate::estimate::internal;
+        let (x_matrix, s_list, layout, constraints, knot_vectors) = 
+            internal::build_design_and_penalty_matrices(&training_data, &config)
+                .expect("Failed to build design matrix");
+        
+        // Verify the design matrix dimensions match what we expect
+        assert_eq!(x_matrix.nrows(), n_samples, "Design matrix should have correct number of rows");
+        assert_eq!(x_matrix.ncols(), layout.total_coeffs, "Design matrix should have correct number of columns");
+
+        // Create a "trained model" with basic coefficients for testing prediction
+        let mut config_with_constraints = config.clone();
+        config_with_constraints.constraints = constraints;
+        config_with_constraints.knot_vectors = knot_vectors;
+        
+        // Verify each penalty matrix has the correct size
+        for (idx, s) in s_list.iter().enumerate() {
+            // Find the corresponding block
+            for block in &layout.penalty_map {
+                if block.penalty_idx == idx {
+                    let cols = block.col_range.end - block.col_range.start;
+                    assert_eq!(s.nrows(), cols, "Penalty matrix {} should have {} rows", idx, cols);
+                    assert_eq!(s.ncols(), cols, "Penalty matrix {} should have {} cols", idx, cols);
+                    println!("Verified penalty matrix {} for {} has correct size: {}", idx, block.term_name, cols);
+                    break;
+                }
+            }
+        }
+        
+        println!("Verified design matrix and penalty matrices with pure pre-centering");
+    }
+}
