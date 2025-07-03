@@ -324,7 +324,6 @@ mod tests {
     use super::*;
     use crate::calibrate::data::TrainingData;
     use ndarray::{Array1, Array2};
-    use approx::assert_abs_diff_eq;
 
     /// Tests that the prediction process works correctly with pre-centering.
     #[test]
