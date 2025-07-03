@@ -479,7 +479,10 @@ pub mod internal {
             current_col += pgs_main_basis_ncols; // Still advance the column counter
 
             // Interaction effects
-            for m in 0..pgs_main_basis_ncols {
+            // CRITICAL FIX: Use the total number of unconstrained PGS basis functions,
+            // not the constrained size (pgs_main_basis_ncols). The formula is num_knots + degree.
+            let num_pgs_basis_funcs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+            for m in 0..num_pgs_basis_funcs {
                 for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
                     let range = current_col..current_col + num_basis;  // with pure pre-centering, uses full PC basis size
                     penalty_map.push(PenalizedBlock {
@@ -567,8 +570,11 @@ pub mod internal {
         }
 
         // 3. Create penalties for interaction effects only
-        // (The block for the main PGS effect penalty has been removed)
-        for _ in 0..pgs_main_basis.ncols() {
+        // CRITICAL FIX: Use the unconstrained basis size (pgs_main_basis_unc.ncols())
+        // rather than the constrained basis size (pgs_main_basis.ncols()).
+        // We need one interaction term for each basis function in the unconstrained basis.
+        let num_pgs_basis_funcs = pgs_main_basis_unc.ncols();
+        for _ in 0..num_pgs_basis_funcs {
             for i in 0..pc_constrained_bases.len() {
                 // Create penalty matrix for interaction basis using pure pre-centering
                 // With pure pre-centering, the interaction basis has the same number of columns as the PC basis
