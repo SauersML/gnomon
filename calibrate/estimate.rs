@@ -471,10 +471,12 @@ pub mod internal {
             }
 
             // Main effect for PGS (non-constant basis terms)
+            // NOTE: The PGS main effect is unpenalized INTENTIONALLY.
+            // This is because there is little reason to expect a priori that score (arbitrary scale) has a linear relationship to phenotype.
+            // For example, a common observation is that higher values of score correspond to greater unit increases in phenotype.
+            // PCs also are not linear, but there are many PCs and PC*score terms, so we penalize to prevent overfitting.
             let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
             current_col += pgs_main_basis_ncols; // Still advance the column counter
-
-            // (The `if` block that pushed to `penalty_map` and incremented `penalty_idx_counter` is removed)
 
             // Interaction effects
             for m in 0..pgs_main_basis_ncols {
