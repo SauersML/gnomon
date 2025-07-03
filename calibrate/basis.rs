@@ -391,21 +391,19 @@ mod tests {
             // Make this match the logic in evaluate_splines_at_point by using a clamped x value
             // and handling the boundaries consistently
             let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
-            if (i < knots.len() - 1) && (knots[i] <= x_clamped) && (x_clamped <= knots[i + 1]) {
-                // Changed x < knots[i+1] to x <= knots[i+1] to match the iterative implementation
-                // which treats right endpoints as part of the interval, except the very last one
-                if i + 1 == knots.len() - 1 && x_clamped == knots[i + 1] {
-                    // For the last knot, only include it if we're the last basis function
-                    if i == knots.len() - 2 {
-                        return 1.0;
-                    } else {
-                        return 0.0;
-                    }
-                }
+            
+            // Use half-open interval [t_i, t_{i+1}) for interior knots
+            // The key issue is that when x is exactly on a knot, only one basis function should be 1
+            if (i < knots.len() - 1) && (knots[i] <= x_clamped) && (x_clamped < knots[i + 1]) {
                 return 1.0;
-            } else {
-                return 0.0;
             }
+            
+            // Special case for the upper boundary - only the last basis function is 1 at the upper boundary
+            if i == knots.len() - 2 && x_clamped == knots[i + 1] {
+                return 1.0;
+            }
+            
+            return 0.0;
         }
         
         // Recursion for degree > 0

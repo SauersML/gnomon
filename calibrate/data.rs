@@ -153,22 +153,30 @@ mod internal {
             }
             
             // Convert to f64
-            match phenotype_series.cast(&DataType::Float64) {
-                Ok(casted) => {
-                    // Use efficient Polars to ndarray conversion
-                    // Rechunk to ensure contiguous memory before converting to ndarray
-                    let arr = casted.rechunk()
-                        .f64()?
-                        .to_ndarray()?
-                        .to_owned();
-                    Some(arr)
-                },
+            let phenotype_casted = match phenotype_series.cast(&DataType::Float64) {
+                Ok(casted) => casted,
                 Err(_) => return Err(DataError::ColumnWrongType {
                     column_name: "phenotype".to_string(),
                     expected_type: "f64 (numeric)",
                     found_type: format!("{:?}", phenotype_series.dtype()),
                 }),
+            };
+            
+            // Check for nulls AFTER casting - this is the key fix!
+            if phenotype_casted.null_count() > 0 {
+                return Err(DataError::ColumnWrongType {
+                    column_name: "phenotype".to_string(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", phenotype_series.dtype()),
+                });
             }
+            
+            // Now convert to ndarray
+            let arr = phenotype_casted.rechunk()
+                .f64()?
+                .to_ndarray()?
+                .to_owned();
+            Some(arr)
         } else {
             None
         };
@@ -180,20 +188,30 @@ mod internal {
         }
         
         // Convert to f64
-        let pgs = match score_series.cast(&DataType::Float64) {
-            Ok(casted) => {
-                // Rechunk to ensure contiguous memory before converting to ndarray
-                casted.rechunk()
-                    .f64()?
-                    .to_ndarray()?
-                    .to_owned()
-            },
+        let score_casted = match score_series.cast(&DataType::Float64) {
+            Ok(casted) => casted,
             Err(_) => return Err(DataError::ColumnWrongType {
                 column_name: "score".to_string(),
                 expected_type: "f64 (numeric)",
                 found_type: format!("{:?}", score_series.dtype()),
             }),
         };
+        
+        // Check for nulls AFTER casting - this is the key fix!
+        // Casting non-numeric strings to f64 produces nulls, which we need to detect here
+        if score_casted.null_count() > 0 {
+            return Err(DataError::ColumnWrongType {
+                column_name: "score".to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", score_series.dtype()),
+            });
+        }
+        
+        // Now convert to ndarray
+        let pgs = score_casted.rechunk()
+            .f64()?
+            .to_ndarray()?
+            .to_owned();
         
         // Process PC columns efficiently
         let mut pc_arrays = Vec::with_capacity(num_pcs);
@@ -204,21 +222,30 @@ mod internal {
             }
             
             // Convert to f64
-            match pc_series.cast(&DataType::Float64) {
-                Ok(casted) => {
-                    // Rechunk to ensure contiguous memory before converting to ndarray
-                    let arr = casted.rechunk()
-                        .f64()?
-                        .to_ndarray()?
-                        .to_owned();
-                    pc_arrays.push(arr);
-                },
+            let pc_casted = match pc_series.cast(&DataType::Float64) {
+                Ok(casted) => casted,
                 Err(_) => return Err(DataError::ColumnWrongType {
                     column_name: pc_name.clone(),
                     expected_type: "f64 (numeric)",
                     found_type: format!("{:?}", pc_series.dtype()),
                 }),
+            };
+            
+            // Check for nulls AFTER casting - this is the key fix!
+            if pc_casted.null_count() > 0 {
+                return Err(DataError::ColumnWrongType {
+                    column_name: pc_name.clone(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", pc_series.dtype()),
+                });
             }
+            
+            // Now convert to ndarray
+            let arr = pc_casted.rechunk()
+                .f64()?
+                .to_ndarray()?
+                .to_owned();
+            pc_arrays.push(arr);
         }
         
         // Stack PC arrays into a matrix

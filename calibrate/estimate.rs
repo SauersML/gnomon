@@ -591,51 +591,65 @@ pub mod internal {
         }
 
         // 5. Assemble the full design matrix `X` using the layout as the guide
+        // Following a strict canonical order to match the coefficient flattening logic in model.rs
         let mut x_matrix = Array2::zeros((n_samples, layout.total_coeffs));
+        
+        // 1. Intercept - always the first column
         x_matrix.column_mut(layout.intercept_col).fill(1.0);
+        
+        // 2. Main PC effects - iterate through PC bases in order of config.pc_names
+        for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
+            for block in &layout.penalty_map {
+                if block.term_name == format!("f({})", pc_name) {
+                    x_matrix
+                        .slice_mut(s![.., block.col_range.clone()])
+                        .assign(&pc_constrained_bases[pc_idx]);
+                    break;
+                }
+            }
+        }
+        
+        // 3. Main PGS effect - directly use the layout range
         x_matrix
             .slice_mut(s![.., layout.pgs_main_cols.clone()])
             .assign(&pgs_main_basis);
-
-        for block in &layout.penalty_map {
-            // This logic is complex; a more direct mapping from basis creation to block insertion is safer.
-            // This is WRONG for the assembly logic based on the layout map. FIX
-            if block.term_name.starts_with("f(PC") {
-                let pc_idx = config.pc_names.iter().position(|n| *n == block.term_name.replace("f(","").replace(")","")).unwrap();
-                x_matrix
-                    .slice_mut(s![.., block.col_range.clone()])
-                    .assign(&pc_constrained_bases[pc_idx]);
-            } else if block.term_name.starts_with("f(PGS_B") {
-                let parts: Vec<_> = block.term_name.split(|c| c == ',' || c == ')').collect();
-                let m_idx: usize = parts[0][7..].parse().unwrap_or(0) - 1;
-                let pc_name = parts[1].trim();
-                let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
-
-                // Use the UNCONSTRAINED PGS basis column as the weight
-                let pgs_weight_col = pgs_basis_unc.column(m_idx + 1); // +1 because main effect is from 1..
-                // Use the CONSTRAINED PC basis matrix
-                let pc_constrained_basis = &pc_constrained_bases[pc_idx];
-                
-                // --- Build interaction tensor product with pure pre-centering ---------------
-                // We only constrain the PC basis, and use the unconstrained PGS basis directly
-                // This is the approach described in the paper, where only the PC basis is constrained
-                
-                // Form the interaction tensor product directly
-                // PC basis is already constrained (sums to zero), and we use the unconstrained PGS weight column
-                let interaction_term = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
-                
-                // No transformation is needed - the interaction inherits the constraint property
-                // from the PC basis, which is sufficient for model identifiability
-                let z_int = Array2::<f64>::eye(interaction_term.ncols());
-
-                // cache for prediction
-                let key = format!("INT_P{}_{}", m_idx, pc_name);
-                constraints.insert(key.clone(), Constraint { z_transform: z_int });
-
-                // copy into X
-                x_matrix
-                    .slice_mut(s![.., block.col_range.clone()])
-                    .assign(&interaction_term);
+        
+        // 4. Interaction effects - in order of PGS basis function index, then PC name
+        // This matches exactly with the flattening logic in model.rs (lines 316-325)
+        // The correct formula for total PGS bases is (num_knots + degree)
+        let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        
+        for m in 1..=total_pgs_bases {
+            for pc_name in &config.pc_names {
+                for block in &layout.penalty_map {
+                    if block.term_name == format!("f(PGS_B{}, {})", m, pc_name) {
+                        // Find PC index from name
+                        let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
+                        
+                        // Use the UNCONSTRAINED PGS basis column as the weight
+                        let pgs_weight_col = pgs_basis_unc.column(m); // Note: no +1 offset here, using correct index
+                        
+                        // Use the CONSTRAINED PC basis matrix
+                        let pc_constrained_basis = &pc_constrained_bases[pc_idx];
+                        
+                        // Form the interaction tensor product with pure pre-centering
+                        let interaction_term = pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
+                        
+                        // No transformation is needed - the interaction inherits the constraint property
+                        let z_int = Array2::<f64>::eye(interaction_term.ncols());
+                        
+                        // Cache for prediction
+                        let key = format!("INT_P{}_{}", m, pc_name);
+                        constraints.insert(key, Constraint { z_transform: z_int });
+                        
+                        // Copy into X
+                        x_matrix
+                            .slice_mut(s![.., block.col_range.clone()])
+                            .assign(&interaction_term);
+                            
+                        break;
+                    }
+                }
             }
         }
 
@@ -747,7 +761,21 @@ pub mod internal {
                 break;
             }
 
-            if deviance_change < config.convergence_tolerance {
+            // Check for convergence using both absolute and relative criteria
+            // The relative criterion is especially important for binary data with 
+            // perfect or near-perfect separation, where convergence slows dramatically
+            let relative_change = if last_deviance.abs() > 1e-10 {
+                deviance_change / last_deviance.abs()
+            } else {
+                // If last_deviance is very close to zero, just use the absolute change
+                1.0
+            };
+            
+            // Consider converged if either absolute or relative criterion is met
+            let absolute_converged = deviance_change < config.convergence_tolerance;
+            let relative_converged = relative_change < 1e-3; // 0.1% relative change is tight enough
+            
+            if absolute_converged || relative_converged {
                 let final_eta = x.dot(&beta);
                 let (final_mu, final_weights, _) =
                     update_glm_vectors(y, &final_eta, config.link_function);

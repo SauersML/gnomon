@@ -311,8 +311,9 @@ mod internal {
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
         // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
-        let num_pgs_main_effects = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // after constraint
-        for m in 1..=num_pgs_main_effects {
+        // The correct formula for total PGS bases is (num_knots + degree)
+        let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        for m in 1..=total_pgs_bases {
             let pgs_key = format!("PGS_B{}", m);
             if let Some(pc_map) = coeffs.interaction_effects.get(&pgs_key) {
                 for pc_name in &config.pc_names {
