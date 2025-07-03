@@ -156,7 +156,9 @@ mod internal {
             match phenotype_series.cast(&DataType::Float64) {
                 Ok(casted) => {
                     // Use efficient Polars to ndarray conversion
-                    let arr = casted.f64()?
+                    // Rechunk to ensure contiguous memory before converting to ndarray
+                    let arr = casted.rechunk()
+                        .f64()?
                         .to_ndarray()?
                         .to_owned();
                     Some(arr)
@@ -180,7 +182,9 @@ mod internal {
         // Convert to f64
         let pgs = match score_series.cast(&DataType::Float64) {
             Ok(casted) => {
-                casted.f64()?
+                // Rechunk to ensure contiguous memory before converting to ndarray
+                casted.rechunk()
+                    .f64()?
                     .to_ndarray()?
                     .to_owned()
             },
@@ -202,7 +206,9 @@ mod internal {
             // Convert to f64
             match pc_series.cast(&DataType::Float64) {
                 Ok(casted) => {
-                    let arr = casted.f64()?
+                    // Rechunk to ensure contiguous memory before converting to ndarray
+                    let arr = casted.rechunk()
+                        .f64()?
                         .to_ndarray()?
                         .to_owned();
                     pc_arrays.push(arr);

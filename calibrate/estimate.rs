@@ -697,13 +697,17 @@ pub mod internal {
                 });
             }
 
-            let x_t_w = &x.t() * &weights;
-            let mut penalized_hessian = x_t_w.dot(&x) + &s_lambda;
+            // For weighted regression with X'WX, we multiply each row of X by the corresponding weight
+            // and then perform standard matrix multiplication
+            let x_weighted = &x.view() * &weights.view().insert_axis(Axis(1));
+            let xtwx = x.t().dot(&x_weighted);
+            let mut penalized_hessian = xtwx + &s_lambda;
             
             // Add numerical ridge for stability
             penalized_hessian.diag_mut().mapv_inplace(|d| d + 1e-10);
             
-            let rhs = x_t_w.dot(&z);
+            // Right-hand side of the equation: X'Wz
+            let rhs = x.t().dot(&(weights * &z));
             beta = penalized_hessian
                 .solve_into(rhs)
                 .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -747,9 +751,9 @@ pub mod internal {
                 let final_eta = x.dot(&beta);
                 let (final_mu, final_weights, _) =
                     update_glm_vectors(y, &final_eta, config.link_function);
-                let final_xtwx =
-                    x.t()
-                        .dot(&(&x.view() * &final_weights.view().insert_axis(Axis(1))));
+                // Same X'WX calculation method for the final step
+                let final_x_weighted = &x.view() * &final_weights.view().insert_axis(Axis(1));
+                let final_xtwx = x.t().dot(&final_x_weighted);
                 let final_penalized_hessian = final_xtwx + &s_lambda;
 
                 return Ok(PirlsResult {
@@ -1402,7 +1406,8 @@ mod tests {
         // Using the mean values for other predictors
         
         // Function to evaluate each PC's effect
-        // Simple function to evaluate a PC effect across a range of values
+        // Function to evaluate a PC effect across a range of values,
+        // using the exact knot vectors and constraints from the trained model
         let evaluate_pc_effect = |pc_idx: usize, pc_vals: &Array1<f64>| -> Array1<f64> {
             let pc_name = &config.pc_names[pc_idx];
             let mut effects = Vec::with_capacity(pc_vals.len());
@@ -1410,16 +1415,26 @@ mod tests {
             // Get coefficients for this PC
             if let Some(pc_coeffs) = trained_model.coefficients.main_effects.pcs.get(pc_name) {
                 for &pc_val in pc_vals.iter() {
-                    // Create basis for this PC value
-                    let (pc_basis, _) = create_bspline_basis(
-                        array![pc_val].view(),
-                        None, 
-                        config.pc_ranges[pc_idx],
-                        config.pc_basis_configs[pc_idx].num_knots,
-                        config.pc_basis_configs[pc_idx].degree,
-                    ).unwrap();
+                    // Create basis using the SAVED knot vector from the model
+                    let (pc_basis, _) = if let Some(saved_knots) = trained_model.config.knot_vectors.get(pc_name) {
+                        // Use the exact knot vector that was used during training
+                        basis::create_bspline_basis_with_knots(
+                            array![pc_val].view(),
+                            saved_knots.view(),
+                            config.pc_basis_configs[pc_idx].degree
+                        ).unwrap()
+                    } else {
+                        // Fallback to original method (should not happen with properly saved models)
+                        create_bspline_basis(
+                            array![pc_val].view(),
+                            None, 
+                            config.pc_ranges[pc_idx],
+                            config.pc_basis_configs[pc_idx].num_knots,
+                            config.pc_basis_configs[pc_idx].degree,
+                        ).unwrap()
+                    };
                     
-                    // Apply constraint if available
+                    // Apply the SAVED constraint transformation from the model
                     let constrained_basis = if let Some(constraint) = trained_model.config.constraints.get(pc_name) {
                         pc_basis.dot(&constraint.z_transform)
                     } else {

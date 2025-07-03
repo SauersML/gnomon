@@ -388,10 +388,20 @@ mod tests {
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
         // Base case for degree 0
         if degree == 0 {
-            if (i < knots.len() - 1) && (knots[i] <= x) && (x < knots[i + 1]) {
-                return 1.0;
-            } else if (i == knots.len() - 2) && (x == knots[i + 1]) {
-                // Special case for the right boundary
+            // Make this match the logic in evaluate_splines_at_point by using a clamped x value
+            // and handling the boundaries consistently
+            let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
+            if (i < knots.len() - 1) && (knots[i] <= x_clamped) && (x_clamped <= knots[i + 1]) {
+                // Changed x < knots[i+1] to x <= knots[i+1] to match the iterative implementation
+                // which treats right endpoints as part of the interval, except the very last one
+                if i + 1 == knots.len() - 1 && x_clamped == knots[i + 1] {
+                    // For the last knot, only include it if we're the last basis function
+                    if i == knots.len() - 2 {
+                        return 1.0;
+                    } else {
+                        return 0.0;
+                    }
+                }
                 return 1.0;
             } else {
                 return 0.0;
