@@ -478,12 +478,191 @@ mod tests {
         // Check for key model properties using the existing function
         check_model_properties(&model1_json, &model2_json);
         
-        // Call our new validation function for both models
+        // Call our coefficient validation functions for both models
         validate_coefficient_structure(&model1, &true_effects, "Standard");
         validate_coefficient_structure(&model2, &true_effects, "Flexible");
         
+        // Call our smooth function shape validation for both models
+        validate_smooth_function_shapes(&model1, &true_effects);
+        validate_smooth_function_shapes(&model2, &true_effects);
+        
         println!("\n===== INTEGRATION TEST COMPLETED SUCCESSFULLY =====");
         
+        Ok(())
+    }
+    
+    #[test]
+    fn test_reml_lambda_sensitivity_to_noise() -> Result<(), Box<dyn std::error::Error>> {
+        // Create synthetic datasets with controlled noise levels
+        println!("\n===== TESTING REML LAMBDA SENSITIVITY TO NOISE =====");
+        
+        // Set reproducible random seed
+        use rand::{SeedableRng, Rng};
+        use rand_distr::Normal;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        
+        // 1. Generate base dataset
+        let n_samples = 300;
+        let n_pcs = 3;
+        
+        // Create PGS values
+        let pgs = Array1::from_vec((0..n_samples)
+            .map(|_| rng.gen_range(-2.0..2.0))
+            .collect());
+        
+        // Create PC values
+        let mut pcs = Array2::zeros((n_samples, n_pcs));
+        for i in 0..n_samples {
+            for j in 0..n_pcs {
+                pcs[[i, j]] = normal.sample(&mut rng);
+            }
+        }
+        
+        // Generate true relationship with known effects
+        let mut eta = Array1::zeros(n_samples);
+        
+        // Intercept
+        eta.fill(-1.0);
+        
+        // PGS main effect
+        for i in 0..n_samples {
+            eta[i] += 0.8 * pgs[i];
+        }
+        
+        // PC1: Strong non-linear effect
+        for i in 0..n_samples {
+            let x = pcs[[i, 0]];
+            eta[i] += 0.6 * x + 0.2 * x.powi(2) - 0.1 * x.powi(3);
+        }
+        
+        // PC2: Moderate effect
+        for i in 0..n_samples {
+            eta[i] += 0.3 * pcs[[i, 1]];
+        }
+        
+        // PC3: No effect
+        
+        // Add base noise
+        let base_noise = 0.4;
+        for i in 0..n_samples {
+            eta[i] += base_noise * normal.sample(&mut rng);
+        }
+        
+        // Convert to binary outcome
+        let y = eta.mapv(|x| 1.0 / (1.0 + (-x).exp()))
+                   .mapv(|p| if rng.gen::<f64>() < p { 1.0 } else { 0.0 });
+        
+        // 2. Create noisy version of PC1 with three noise components
+        let mut pcs_noisy = pcs.clone();
+        
+        for i in 0..n_samples {
+            let x = pcs[[i, 0]];
+            
+            // High-frequency sinusoidal noise
+            let sin_noise = 0.3 * (10.0 * x).sin();
+            
+            // Random spikes (10% chance)
+            let spike = if rng.gen::<f64>() < 0.1 { 
+                rng.gen_range(-0.9..0.9) 
+            } else { 
+                0.0 
+            };
+            
+            // White noise
+            let white_noise = 0.25 * normal.sample(&mut rng);
+            
+            pcs_noisy[[i, 0]] = x + sin_noise + spike + white_noise;
+        }
+        
+        // 3. Create training datasets
+        let data_clean = data::TrainingData {
+            y: y.clone(),
+            p: pgs.clone(),
+            pcs: pcs,
+        };
+        
+        let data_noisy = data::TrainingData {
+            y,
+            p: pgs,
+            pcs: pcs_noisy,
+        };
+        
+        // 4. Create model configuration
+        let pc_names: Vec<String> = (1..=n_pcs).map(|i| format!("PC{}", i)).collect();
+        
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 50,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 8, degree: 3 },
+            pc_basis_configs: vec![
+                BasisConfig { num_knots: 8, degree: 3 },
+                BasisConfig { num_knots: 6, degree: 2 },
+                BasisConfig { num_knots: 6, degree: 2 },
+            ],
+            pgs_range: (-2.5, 2.5),
+            pc_ranges: vec![(-3.0, 3.0), (-3.0, 3.0), (-3.0, 3.0)],
+            pc_names,
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+        };
+        
+        // 5. Train models
+        println!("Training model on clean data...");
+        let model_clean = train_model(&data_clean, &config)?;
+        
+        println!("Training model on noisy data...");
+        let model_noisy = train_model(&data_noisy, &config)?;
+        
+        // 6. Extract lambdas for corresponding terms
+        // Helper function to get lambda for a specific PC
+        // In this implementation we assume the first N lambdas correspond to the N PCs
+        fn get_pc_lambda(model: &TrainedModel, pc_idx: usize) -> Option<f64> {
+            model.lambdas.get(pc_idx).copied()
+        }
+        
+        // 7. Compare lambdas for PC1 (real effect)
+        let pc1_idx = 0;
+        if let (Some(lambda_clean), Some(lambda_noisy)) = (
+            get_pc_lambda(&model_clean, pc1_idx),
+            get_pc_lambda(&model_noisy, pc1_idx)
+        ) {
+            println!("\nPC1 (real effect with added noise):");
+            println!("Lambda for clean PC1: {:.6}", lambda_clean);
+            println!("Lambda for noisy PC1: {:.6}", lambda_noisy);
+            println!("Ratio (noisy/clean): {:.2}x", lambda_noisy / lambda_clean);
+            
+            // ASSERTION: Lambda should increase by at least 50% for noisy data
+            assert!(
+                lambda_noisy > lambda_clean * 1.5,
+                "REML didn't sufficiently increase lambda for noisy data. Expected at least 50% increase, got {:.2}x",
+                lambda_noisy / lambda_clean
+            );
+        }
+        
+        // 8. Control test: Check PC3 (null effect)
+        let pc3_idx = 2;
+        if let (Some(lambda_clean_pc3), Some(lambda_noisy_pc3)) = (
+            get_pc_lambda(&model_clean, pc3_idx),
+            get_pc_lambda(&model_noisy, pc3_idx)
+        ) {
+            println!("\nPC3 (null effect, no added noise):");
+            println!("Lambda for clean PC3: {:.6}", lambda_clean_pc3);
+            println!("Lambda for noisy PC3: {:.6}", lambda_noisy_pc3);
+            println!("Ratio: {:.2}x", lambda_noisy_pc3 / lambda_clean_pc3);
+            
+            // For null effect, both lambdas should be high but not dramatically different
+            println!("Note: Both should be high since PC3 is a null effect");
+            
+            // No formal assertion here, as we don't know exact lambda values,
+            // but both should be relatively high compared to real effects
+        }
+        
+        println!("✓ REML lambda sensitivity test passed");
         Ok(())
     }
     
@@ -1269,6 +1448,121 @@ mod tests {
         println!("     - Real effects properly distinguished from null effects");
         println!("     - Effect hierarchy correctly preserved (PC1 > PC2 > PC4)");
         println!("     - Null effects properly regularized toward zero");
+    }
+    
+    /// Validates that null effects are learned as flat functions and real effects are not.
+    /// This ensures regularization correctly identifies and penalizes effects that should be zero.
+    fn validate_smooth_function_shapes(model: &TrainedModel, true_effects: &TrueEffects) {
+        println!("\n===== VALIDATING SMOOTH FUNCTION SHAPES =====");
+        
+        // Calculate smooth function values for each PC
+        let mut pc_function_stats = HashMap::new();
+        
+        for pc_name in &model.config.pc_names {
+            // Find PC index in model configuration
+            let pc_idx = model.config.pc_names.iter().position(|n| n == pc_name).unwrap();
+            let pc_range = model.config.pc_ranges[pc_idx];
+            
+            // Create evaluation grid spanning the PC's range
+            let grid = Array1::linspace(pc_range.0, pc_range.1, 100);
+            
+            // Get coefficients for this PC
+            if let Some(pc_coeffs) = model.coefficients.main_effects.pcs.get(pc_name) {
+                // Create basis matrix for evaluation
+                if let Ok((basis_unc, _)) = basis::create_bspline_basis(
+                    grid.view(), None, pc_range, 
+                    model.config.pc_basis_configs[pc_idx].num_knots,
+                    model.config.pc_basis_configs[pc_idx].degree
+                ) {
+                    // Apply constraint transformation
+                    if let Some(constraint) = model.config.constraints.get(pc_name) {
+                        let basis_con = basis_unc.dot(&constraint.z_transform);
+                        
+                        // Evaluate function: f(x) = B(x) * coeffs
+                        let coeffs_array = Array1::from_vec(pc_coeffs.clone());
+                        let function_values = basis_con.dot(&coeffs_array);
+                        
+                        // Calculate statistics
+                        let std_dev = function_values.std(0.0);
+                        let range = function_values.fold(f64::NEG_INFINITY, |a, &b| a.max(b)) - 
+                                    function_values.fold(f64::INFINITY, |a, &b| a.min(b));
+                        
+                        pc_function_stats.insert(pc_name.clone(), (std_dev, range));
+                        
+                        println!("PC {}: std_dev={:.6}, range={:.6}", pc_name, std_dev, range);
+                    }
+                }
+            }
+        }
+        
+        // Classify PCs based on known true effects
+        let mut real_pcs = Vec::new();
+        let mut null_pcs = Vec::new();
+        
+        for pc_name in &model.config.pc_names {
+            let effect_size = true_effects.interaction_effects
+                .get(pc_name).copied().unwrap_or(0.0).abs();
+                
+            if effect_size > 0.1 {
+                real_pcs.push(pc_name.clone());
+            } else {
+                null_pcs.push(pc_name.clone());
+            }
+        }
+        
+        println!("\nReal effects: {:?}", real_pcs);
+        println!("Null effects: {:?}", null_pcs);
+        
+        // Calculate average variability for real vs null effects
+        let real_avg_std = real_pcs.iter()
+            .filter_map(|pc| pc_function_stats.get(pc).map(|(std, _)| *std))
+            .sum::<f64>() / real_pcs.len() as f64;
+            
+        let null_avg_std = null_pcs.iter()
+            .filter_map(|pc| pc_function_stats.get(pc).map(|(std, _)| *std))
+            .sum::<f64>() / null_pcs.len() as f64;
+        
+        println!("\nAverage std dev for real effects: {:.6}", real_avg_std);
+        println!("Average std dev for null effects: {:.6}", null_avg_std);
+        println!("Ratio (real/null): {:.2}x", real_avg_std / null_avg_std);
+        
+        // Calculate relative threshold based on data scale
+        let threshold = real_avg_std * 0.1; // 10% of average real effect
+        
+        // ASSERTION 1: Null effects should be nearly flat
+        for pc in &null_pcs {
+            if let Some((std_dev, _)) = pc_function_stats.get(pc) {
+                assert!(
+                    *std_dev < threshold,
+                    "Null effect {} not properly flattened (std_dev={:.6} > threshold={:.6})",
+                    pc, std_dev, threshold
+                );
+            }
+        }
+        
+        // ASSERTION 2: Real effects should have significantly higher variability
+        assert!(
+            real_avg_std > 5.0 * null_avg_std,
+            "Real effects not sufficiently distinguished from null effects (ratio={:.2}x)",
+            real_avg_std / null_avg_std
+        );
+        
+        // ASSERTION 3: Effect hierarchy should match known pattern
+        if let (Some((std_pc1, _)), Some((std_pc2, _)), Some((std_pc4, _))) = (
+            pc_function_stats.get("PC1"),
+            pc_function_stats.get("PC2"),
+            pc_function_stats.get("PC4")
+        ) {
+            println!("\nEffect hierarchy check:");
+            println!("PC1 std_dev: {:.6}", std_pc1);
+            println!("PC2 std_dev: {:.6}", std_pc2);
+            println!("PC4 std_dev: {:.6}", std_pc4);
+            
+            assert!(std_pc1 > std_pc2, "Expected PC1 effect > PC2 effect");
+            assert!(std_pc2 > std_pc4, "Expected PC2 effect > PC4 effect");
+        }
+        
+        println!("✓ Smooth function shape validation passed");
     }
     
     /// Validate predictions against expected values based on our known true effects

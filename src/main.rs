@@ -1,4 +1,3 @@
-#![feature(core_intrinsics)]
 
 use clap::{Parser, Subcommand};
 use std::process;

@@ -78,6 +78,14 @@ pub fn create_bspline_basis_with_knots(
         return Err(BasisError::InvalidDegree(degree));
     }
 
+    // FIXED: Add error checking to prevent overflow
+    if knot_vector.len() <= degree + 1 {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order: degree,
+            num_basis: knot_vector.len(),
+        });
+    }
+
     let num_basis_functions = knot_vector.len() - degree - 1;
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
@@ -322,23 +330,34 @@ mod internal {
             b.fill(0.0);
 
             for j in 0..=d {
-                let i = mu - degree + j;
+                // Calculate i based on the current recursion level d, not the final degree
+                // This is the correct implementation of the Cox-de Boor formula
+                // Ensure we don't underflow with unsigned subtraction
+                let i = if d <= mu + j { mu + j - d } else { 0 };
 
                 // First term: contribution from B_{i,d-1}(x)
                 if j > 0 && j - 1 < b_old.len() && b_old[j - 1] != 0.0 {
-                    let den = knots[i + degree] - knots[i];
-                    if den > 1e-12 {
-                        let alpha = (x_clamped - knots[i]) / den;
-                        b[j] += alpha * b_old[j - 1];
+                    // FIXED: Use d instead of degree for knot index calculations
+                    // Check bounds first to prevent subtraction with overflow
+                    if i + d < knots.len() && i < knots.len() {
+                        let den = knots[i + d] - knots[i];
+                        if den > 1e-12 {
+                            let alpha = (x_clamped - knots[i]) / den;
+                            b[j] += alpha * b_old[j - 1];
+                        }
                     }
                 }
 
                 // Second term: contribution from B_{i+1,d-1}(x) 
                 if j < b_old.len() && b_old[j] != 0.0 {
-                    let den = knots[i + 1 + degree] - knots[i + 1];
-                    if den > 1e-12 {
-                        let beta = (knots[i + 1 + degree] - x_clamped) / den;
-                        b[j] += beta * b_old[j];
+                    // FIXED: Use d instead of degree for knot index calculations
+                    // Check bounds first to prevent subtraction with overflow
+                    if i + 1 + d < knots.len() && i + 1 < knots.len() {
+                        let den = knots[i + 1 + d] - knots[i + 1];
+                        if den > 1e-12 {
+                            let beta = (knots[i + 1 + d] - x_clamped) / den;
+                            b[j] += beta * b_old[j];
+                        }
                     }
                 }
             }
