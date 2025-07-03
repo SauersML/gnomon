@@ -311,7 +311,8 @@ mod internal {
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
         // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
-        // The correct formula for total PGS bases is (num_knots + degree)
+        // The correct formula for total PGS bases is (num_knots + degree + 1) - 1
+        // We subtract 1 to exclude the intercept basis function
         let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
         for m in 1..=total_pgs_bases {
             let pgs_key = format!("PGS_B{}", m);
@@ -598,21 +599,29 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.5,
                 main_effects: MainEffects {
-                    pgs: vec![1.0, 2.0],
+                    // Correctly sized vector for a basis with num_knots=6, degree=3, with sum-to-zero constraint
+                    // (6+3+1-1)-1 = 8 constrained basis functions
+                    pgs: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                     pcs: {
                         let mut pc_map = HashMap::new();
-                        pc_map.insert("PC1".to_string(), vec![3.0, 4.0]);
+                        // Correctly sized vector for a basis with num_knots=6, degree=3, with sum-to-zero constraint
+                        // (6+3+1)-1 = 9 constrained basis functions
+                        pc_map.insert("PC1".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
                         pc_map
                     },
                 },
                 interaction_effects: {
                     let mut interactions = HashMap::new();
-                    let mut pgs_b1 = HashMap::new();
-                    pgs_b1.insert("PC1".to_string(), vec![5.0, 6.0]);
-                    let mut pgs_b2 = HashMap::new();
-                    pgs_b2.insert("PC1".to_string(), vec![7.0, 8.0]);
-                    interactions.insert("PGS_B1".to_string(), pgs_b1);
-                    interactions.insert("PGS_B2".to_string(), pgs_b2);
+                    
+                    // Build correct interaction terms - one for each PGS basis function (minus intercept)
+                    // For each PGS basis function (PGS_B1 through PGS_B9), create an interaction with PC1
+                    for i in 1..=9 {
+                        let mut pgs_bx = HashMap::new();
+                        // Same size as PC1 constrained basis (9 values)
+                        let pc1_coefs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+                        pgs_bx.insert("PC1".to_string(), pc1_coefs);
+                        interactions.insert(format!("PGS_B{}", i), pgs_bx);
+                    }
                     interactions
                 },
             },

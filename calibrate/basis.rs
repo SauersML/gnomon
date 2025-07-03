@@ -302,16 +302,19 @@ mod internal {
         // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`.
         let x_clamped = x.clamp(knots[degree], knots[num_basis]);
 
-        // Find the knot interval `mu` such that `knots[mu] <= x < knots[mu+1]`.
-        let mut mu = match knots.iter().rposition(|&k| k <= x_clamped) {
-            Some(pos) => pos,
-            // This case should ideally not be reached due to clamping.
-            None => degree,
+        // We need to exactly match the recursive implementation's logic for the "half-open interval":
+        // A point x in [t_i, t_{i+1}) is assigned to span i, except at the upper boundary.
+        // This means we need to be very careful with points that fall exactly on knots.
+        
+        // First find the knot position
+        let mut mu = match knots.iter().position(|&k| k > x_clamped) {
+            // If we found a knot greater than x_clamped, the interval is the previous knot
+            Some(pos) if pos > 0 => pos - 1,
+            // Otherwise, we're at or beyond the last knot, so use the last valid interval
+            _ => num_basis - 1
         };
-
-        // If x is at the upper boundary, mu could be too large. 
-        // The knot span index cannot exceed the index of the start of the last segment.
-        // This index is `num_basis - 1`.
+        
+        // Extra safety check to ensure we're in a valid range
         if mu >= num_basis {
             mu = num_basis - 1;
         }
