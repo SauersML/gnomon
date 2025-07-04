@@ -763,8 +763,9 @@ pub mod internal {
                 };
                 
                         // Complete gradient formula with all terms for LAML
-                        // From Wood (2011): ∂V_r / ∂ρ_k = 0.5 * λ_k * [tr(H⁻¹Sₖ) - tr(S⁺Sₖ)] + 0.5 * tr(H⁻¹Xᵀ(∂W/∂ρₖ)X)
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term) + 0.5 * weight_deriv_term;
+                        // The correct derivative of L with respect to ρ_k is:
+                        // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k)] + 0.5 * tr(H_p⁻¹ Xᵀ(∂W/∂ρ_k)X)
+                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term) + 0.5 * weight_deriv_term;
 
                         // Handle numerical stability
                         if !gradient[k].is_finite() {
