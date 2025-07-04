@@ -507,6 +507,10 @@ pub mod internal {
                     
                     // Calculate sigma² using the proper EDF
                     let sigma_sq = rss / (n - edf);
+                    if sigma_sq <= 0.0 { // Guard against division by zero or negative variance
+                        log::warn!("REML variance estimate is non-positive: {}", sigma_sq);
+                        return Err(EstimationError::RemlOptimizationFailed("Estimated residual variance is non-positive.".to_string()));
+                    }
                     
                     for k in 0..p.len() {
                         // Calculate tr((XᵀX + S_λ)⁻¹S_k)
@@ -549,6 +553,7 @@ pub mod internal {
                         let beta_term = beta.dot(&s_k_full.dot(beta));
                         
                         // Assemble REML gradient component
+                        // CORRECT FORMULA: ∂V_R/∂ρ_k = 0.5 * λ_k * [tr((XᵀX + S_λ)⁻¹S_k) - (β̂ᵀS_kβ̂)/σ²]
                         gradient[k] = 0.5 * lambdas[k] * (trace_term - beta_term / sigma_sq);
                     }
                 },
