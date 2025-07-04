@@ -449,8 +449,16 @@ pub mod internal {
         }
 
         /// Compute the gradient for BFGS optimization.
-        /// For Gaussian models (Identity link), this is the exact REML gradient.
-        /// For non-Gaussian GLMs, this is the LAML gradient from Wood (2011, Appendix C & D).
+        /// 
+        /// This method handles two distinct statistical criteria:
+        /// 1. For Gaussian models (Identity link), this calculates the exact REML gradient
+        ///    (Restricted Maximum Likelihood).
+        /// 2. For non-Gaussian GLMs, this calculates the LAML gradient (Laplace Approximate
+        ///    Marginal Likelihood) as derived in Wood (2011, Appendix C & D).
+        /// 
+        /// The key distinction is that the REML gradient (Gaussian case) includes the 
+        /// term (β̂ᵀS_kβ̂)/σ², while the LAML gradient (non-Gaussian case) does not include
+        /// this term because it is mathematically canceled out in the derivation.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
@@ -465,8 +473,13 @@ pub mod internal {
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // --- GAUSSIAN REML GRADIENT ---
-                    // For the Gaussian case, we need the REML gradient:
+                    // For the Gaussian case, we need the Restricted Maximum Likelihood (REML) gradient:
                     // ∂V_R/∂ρ_k = 0.5 * λ_k * [tr((XᵀX + S_λ)⁻¹S_k) - (β̂ᵀS_kβ̂)/σ²]
+                    //
+                    // Key characteristics of the REML gradient:
+                    // 1. The beta term (β̂ᵀS_kβ̂)/σ² is INCLUDED as a crucial component
+                    // 2. σ² is the REML variance estimate: RSS/(n-edf)
+                    // 3. Both trace_term and beta_term are necessary for correct optimization
                     
                     // H_penalized is already XᵀX + S_λ for Gaussian models
                     let h_penalized = &pirls_result.penalized_hessian;
@@ -559,14 +572,27 @@ pub mod internal {
                 },
                 _ => {
                     // --- NON-GAUSSIAN LAML GRADIENT ---
+                    // For non-Gaussian models, we use the Laplace Approximate Marginal Likelihood (LAML) gradient.
+                    // The LAML gradient differs fundamentally from the REML gradient above:
+                    // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺S_k) - tr(H_p⁻¹S_k)] + 0.5 * tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X)
+                    //
+                    // Key differences from the REML gradient:
+                    // 1. The beta term (β̂ᵀS_kβ̂) is NOT included (it mathematically cancels out)
+                    // 2. We must compute tr(S_λ⁺S_k) using the pseudo-inverse
+                    // 3. We need the weight derivative term for non-Gaussian link functions
                     let h_penalized = &pirls_result.penalized_hessian;
 
                     for k in 0..p.len() {
                         // Get the corresponding S_k for this parameter
                         let s_k = &self.s_list[k];
 
-                        // The beta term (β^T S_k β) is NOT included in the correct gradient
-                        // as shown in Wood (2011). It is cancelled out in the full mathematical derivation.
+                        // The beta term (β^T S_k β) is NOT included in the LAML gradient for non-Gaussian models
+                        // as shown in Wood (2011). This is mathematically justified because when we take the
+                        // total derivative of the penalized log-likelihood with respect to ρ_k, the implicit
+                        // dependency through β̂ creates terms that exactly cancel the explicit β^T S_k β term.
+                        // 
+                        // Note: This cancellation ONLY applies to the LAML gradient (non-Gaussian case).
+                        // For the Gaussian REML gradient above, the beta term IS required and included.
                         // We leave the code commented out for reference.
                 /*
                 // Find the block this penalty applies to
