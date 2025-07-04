@@ -1,4 +1,4 @@
-use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,7 +36,9 @@ pub enum BasisError {
         num_points: usize,
     },
 
-    #[error("Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis}).")]
+    #[error(
+        "Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis})."
+    )]
     InvalidPenaltyOrder { order: usize, num_basis: usize },
 
     #[error("QR decomposition failed while applying constraints: {0}")]
@@ -191,7 +193,7 @@ pub fn apply_sum_to_zero_constraint(
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let k = basis_matrix.ncols();
     if k < 2 {
-        return Err(BasisError::InvalidDegree(k));        // cannot constrain a single column
+        return Err(BasisError::InvalidDegree(k)); // cannot constrain a single column
     }
 
     // --- build a full-rank null-space basis for 1ᵀ --------------------------
@@ -199,8 +201,8 @@ pub fn apply_sum_to_zero_constraint(
     // are linearly independent, so B·Z drops exactly one dof (the mean).
     let mut z = Array2::<f64>::zeros((k, k - 1));
     for j in 0..k - 1 {
-        z[[j, j]] = 1.0;          // identity block
-        z[[k - 1, j]] = -1.0;     // last row makes column sum zero
+        z[[j, j]] = 1.0; // identity block
+        z[[k - 1, j]] = -1.0; // last row makes column sum zero
     }
 
     // project the original basis
@@ -208,11 +210,9 @@ pub fn apply_sum_to_zero_constraint(
     Ok((constrained, z))
 }
 
-
 /// Internal module for implementation details not exposed in the public API.
 mod internal {
     use super::*;
-
 
     /// Generates the full knot vector, including repeated boundary knots.
     pub(super) fn generate_full_knot_vector(
@@ -302,22 +302,29 @@ mod internal {
         // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`.
         let x_clamped = x.clamp(knots[degree], knots[num_basis]);
 
-        // We need to exactly match the recursive implementation's logic for the "half-open interval":
-        // A point x in [t_i, t_{i+1}) is assigned to span i, except at the upper boundary.
-        // This means we need to be very careful with points that fall exactly on knots.
-        
-        // First find the knot position
-        let mut mu = match knots.iter().position(|&k| k > x_clamped) {
-            // If we found a knot greater than x_clamped, the interval is the previous knot
-            Some(pos) if pos > 0 => pos - 1,
-            // Otherwise, we're at or beyond the last knot, so use the last valid interval
-            _ => num_basis - 1
+        // In the Cox-de Boor algorithm, we need to determine the knot span [tᵢ, tᵢ₊₁)
+        // containing x_clamped. This span is half-open, EXCEPT at the upper boundary
+        // where we use a closed interval [t_{m-p-1}, t_{m-p}].
+
+        // Special case for upper boundary: if x is exactly at the upper boundary,
+        // use the last valid knot span
+        let mu = if x_clamped == knots[num_basis] {
+            // At the upper boundary, use the last valid knot span
+            num_basis - 1
+        } else {
+            // Find the index of the first knot strictly greater than x_clamped
+            let pos = knots
+                .iter()
+                .position(|&k| k > x_clamped)
+                .unwrap_or(num_basis);
+
+            // Subtract 1 to get the index of the knot that starts the interval
+            // This handles the half-open interval [tᵢ, tᵢ₊₁) convention
+            pos - 1
         };
-        
-        // Extra safety check to ensure we're in a valid range
-        if mu >= num_basis {
-            mu = num_basis - 1;
-        }
+
+        // The result should always be a valid knot span index
+        debug_assert!(mu < num_basis, "Knot span index out of bounds");
 
         // `b` will store the non-zero basis function values for the current degree.
         // At any point x, at most `degree + 1` basis functions are non-zero.
@@ -348,7 +355,7 @@ mod internal {
                     }
                 }
 
-                // Second term: contribution from B_{i+1,d-1}(x) 
+                // Second term: contribution from B_{i+1,d-1}(x)
                 if j < b_old.len() && b_old[j] != 0.0 {
                     // Check bounds first to prevent subtraction with overflow
                     if i + 1 + d < knots.len() && i + 1 < knots.len() {
@@ -374,7 +381,7 @@ mod internal {
                 basis_values[global_idx] = b[i];
             }
         }
-        
+
         basis_values
     }
 }
@@ -384,7 +391,7 @@ mod internal {
 mod tests {
     use super::*;
     use ndarray::array;
-    
+
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This is a correct implementation of the Cox-de Boor algorithm using recursion.
     /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
@@ -394,37 +401,39 @@ mod tests {
             // Make this match the logic in evaluate_splines_at_point by using a clamped x value
             // and handling the boundaries consistently
             let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
-            
+
             // Use half-open interval [t_i, t_{i+1}) for interior knots
             // The key issue is that when x is exactly on a knot, only one basis function should be 1
             if (i < knots.len() - 1) && (knots[i] <= x_clamped) && (x_clamped < knots[i + 1]) {
                 return 1.0;
             }
-            
+
             // Special case for the upper boundary - only the last basis function is 1 at the upper boundary
             if i == knots.len() - 2 && x_clamped == knots[i + 1] {
                 return 1.0;
             }
-            
+
             return 0.0;
         }
-        
+
         // Recursion for degree > 0
         let mut result = 0.0;
-        
+
         // First term
         if (i + degree < knots.len()) && (knots[i + degree] - knots[i] > 1e-10) {
-            result += (x - knots[i]) / (knots[i + degree] - knots[i]) * 
-                    evaluate_bspline(x, knots, i, degree - 1);
+            result += (x - knots[i]) / (knots[i + degree] - knots[i])
+                * evaluate_bspline(x, knots, i, degree - 1);
         }
-        
+
         // Second term
-        if (i + 1 < knots.len()) && (i + degree + 1 < knots.len()) && 
-           (knots[i + degree + 1] - knots[i + 1] > 1e-10) {
-            result += (knots[i + degree + 1] - x) / (knots[i + degree + 1] - knots[i + 1]) * 
-                    evaluate_bspline(x, knots, i + 1, degree - 1);
+        if (i + 1 < knots.len())
+            && (i + degree + 1 < knots.len())
+            && (knots[i + degree + 1] - knots[i + 1] > 1e-10)
+        {
+            result += (knots[i + degree + 1] - x) / (knots[i + degree + 1] - knots[i + 1])
+                * evaluate_bspline(x, knots, i + 1, degree - 1);
         }
-        
+
         return result;
     }
 
@@ -443,13 +452,9 @@ mod tests {
     #[test]
     fn test_knot_generation_quantile() {
         let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
-        let knots = internal::generate_full_knot_vector(
-            (0.0, 10.0),
-            3,
-            2,
-            Some(training_data.view()),
-        )
-        .unwrap();
+        let knots =
+            internal::generate_full_knot_vector((0.0, 10.0), 3, 2, Some(training_data.view()))
+                .unwrap();
         // Quantiles at 1/4, 2/4, 3/4.
         // p=0.25 -> idx=(7-1)*0.25=1.5 -> (data[1]+data[2])/2 = (1+2)/2=1.5
         // p=0.50 -> idx=(7-1)*0.50=3.0 -> data[3] = 5.0
@@ -480,8 +485,7 @@ mod tests {
     #[test]
     fn test_bspline_basis_sums_to_one() {
         let data = Array::linspace(0.1, 9.9, 100);
-        let (basis, _) =
-            create_bspline_basis(data.view(), None, (0.0, 10.0), 10, 3).unwrap();
+        let (basis, _) = create_bspline_basis(data.view(), None, (0.0, 10.0), 10, 3).unwrap();
 
         let sums = basis.sum_axis(Axis(1));
 
@@ -502,10 +506,10 @@ mod tests {
         // This gives 3 basis functions (n = k-d-1 = 5-1-1 = 3), B_{0,1}, B_{1,1}, B_{2,1}.
         let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
         let x = 0.5; // For x=0.5, the knot interval is mu=1, since t_1 <= x < t_2.
-        
+
         let values = internal::evaluate_splines_at_point(x, 1, knots.view());
         assert_eq!(values.len(), 3);
-        
+
         // Manual calculation for x=0.5:
         // The only non-zero basis function of degree 0 is B_{1,0} = 1.
         // Recurrence for degree 1:
@@ -517,9 +521,21 @@ mod tests {
         // B_{2,1}(x) = ( (x-t2)/(t3-t2) )*B_{2,0} + ( (t4-x)/(t4-t3) )*B_{3,0}
         //           = ( (0.5-1)/(2-1) )*0       + ( (2-0.5)/(2-2) )*0         = 0.0
 
-        assert!((values[0] - 0.5).abs() < 1e-9, "Expected B_0,1 to be 0.5, got {}", values[0]);
-        assert!((values[1] - 0.5).abs() < 1e-9, "Expected B_1,1 to be 0.5, got {}", values[1]);
-        assert!((values[2] - 0.0).abs() < 1e-9, "Expected B_2,1 to be 0.0, got {}", values[2]);
+        assert!(
+            (values[0] - 0.5).abs() < 1e-9,
+            "Expected B_0,1 to be 0.5, got {}",
+            values[0]
+        );
+        assert!(
+            (values[1] - 0.5).abs() < 1e-9,
+            "Expected B_1,1 to be 0.5, got {}",
+            values[1]
+        );
+        assert!(
+            (values[2] - 0.0).abs() < 1e-9,
+            "Expected B_2,1 to be 0.0, got {}",
+            values[2]
+        );
     }
 
     #[test]
@@ -528,9 +544,9 @@ mod tests {
         // Using non-uniform knots where the bug would be more apparent
         let knots = array![0.0, 0.0, 0.0, 1.0, 3.0, 4.0, 4.0, 4.0];
         let x = 2.0;
-        
+
         let values = internal::evaluate_splines_at_point(x, 2, knots.view());
-        
+
         // The basis functions should sum to 1.0 (partition of unity property)
         let sum = values.sum();
         assert!(
@@ -538,7 +554,7 @@ mod tests {
             "Basis functions should sum to 1.0, got {}",
             sum
         );
-        
+
         // All values should be non-negative
         for (i, &val) in values.iter().enumerate() {
             assert!(
@@ -554,17 +570,19 @@ mod tests {
     fn test_boundary_value_panic_fix() {
         // Test for the boundary value panic bug described in the issue.
         // This test ensures that evaluation at the upper boundary doesn't panic.
-        
+
         // Test the internal function directly with the problematic case
-        let knots = array![0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0];
+        let knots = array![
+            0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0
+        ];
         let x = 10.0; // This is the value that caused the panic
         let degree = 3;
-        
+
         let basis_values = internal::evaluate_splines_at_point(x, degree, knots.view());
-        
+
         // Should not panic and should return valid results
         assert_eq!(basis_values.len(), 8); // num_basis = 12 - 3 - 1 = 8
-        
+
         let sum = basis_values.sum();
         assert!(
             (sum - 1.0).abs() < 1e-9,
@@ -572,51 +590,54 @@ mod tests {
             sum
         );
     }
-    
+
     #[test]
     fn test_iterative_vs_recursive_bspline() {
         // This test verifies that our iterative implementation of the Cox-de Boor algorithm
         // matches the recursive implementation
-        
+
         // Test with various degrees and knot configurations
         let test_cases = vec![
             // (knots, degree)
-            (array![0.0, 0.0, 1.0, 2.0, 2.0], 1),           // Linear spline with 1 internal knot
-            (array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0], 2),  // Quadratic with 3 internal knots
-            (array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0], 3)  // Cubic with 1 internal knot
+            (array![0.0, 0.0, 1.0, 2.0, 2.0], 1), // Linear spline with 1 internal knot
+            (array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0], 2), // Quadratic with 3 internal knots
+            (array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0], 3), // Cubic with 1 internal knot
         ];
-        
+
         // Test points distributed within and at boundaries
         let test_points = vec![0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0];
-        
+
         for (knots, degree) in test_cases {
             for &x in &test_points {
                 // Skip points outside the domain
                 if x < knots[degree] || x > knots[knots.len() - degree - 1] {
                     continue;
                 }
-                
+
                 // Get basis values from iterative implementation
                 let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
-                
+
                 // Calculate basis values using recursive implementation
                 let num_basis = knots.len() - degree - 1;
                 let mut recursive_basis = Array1::zeros(num_basis);
-                
+
                 for i in 0..num_basis {
                     recursive_basis[i] = evaluate_bspline(x, &knots, i, degree);
                 }
-                
+
                 // Compare results - they should match exactly
                 for i in 0..num_basis {
                     assert!(
                         (iterative_basis[i] - recursive_basis[i]).abs() < 1e-10,
                         "B-spline basis function {} at x={} doesn't match between implementations. \
                          Iterative: {}, Recursive: {}",
-                        i, x, iterative_basis[i], recursive_basis[i]
+                        i,
+                        x,
+                        iterative_basis[i],
+                        recursive_basis[i]
                     );
                 }
-                
+
                 // Check sum-to-one property for both implementations
                 let iterative_sum = iterative_basis.sum();
                 let recursive_sum = recursive_basis.sum();
@@ -645,7 +666,7 @@ mod tests {
             BasisError::InvalidRange(start, end) => {
                 assert_eq!(start, 10.0);
                 assert_eq!(end, 0.0);
-            },
+            }
             _ => panic!("Expected InvalidRange error"),
         }
 
@@ -654,13 +675,17 @@ mod tests {
             Some(array![1., 2.].view()),
             (0.0, 10.0),
             3,
-            1
+            1,
         )
-        .unwrap_err() {
-            BasisError::InsufficientDataForQuantiles { num_quantiles, num_points } => {
+        .unwrap_err()
+        {
+            BasisError::InsufficientDataForQuantiles {
+                num_quantiles,
+                num_points,
+            } => {
                 assert_eq!(num_quantiles, 3);
                 assert_eq!(num_points, 2);
-            },
+            }
             _ => panic!("Expected InsufficientDataForQuantiles error"),
         }
 
@@ -668,7 +693,7 @@ mod tests {
             BasisError::InvalidPenaltyOrder { order, num_basis } => {
                 assert_eq!(order, 5);
                 assert_eq!(num_basis, 5);
-            },
+            }
             _ => panic!("Expected InvalidPenaltyOrder error"),
         }
     }

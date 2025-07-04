@@ -415,9 +415,12 @@ pub fn resolve_complex_variants(
                     .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
                     .enumerate()
                     .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                        let _progress_guard = ScopeGuard::new(|| {
+                        // Create a guard that will increment the counter when dropped
+                        let guard = ScopeGuard::new(|| {
                             progress_counter.fetch_add(1, Ordering::Relaxed);
                         });
+                        // Use the guard to avoid unused variable warning
+                        let _ = &guard;
 
                         if fatal_error_occurred.load(Ordering::Relaxed) {
                             return;

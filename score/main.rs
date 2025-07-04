@@ -70,8 +70,8 @@ fn main() {
 /// Public interface for calling gnomon with explicit arguments
 pub fn run_gnomon_with_args(
     input_path: PathBuf,
-    score: PathBuf, 
-    keep: Option<PathBuf>
+    score: PathBuf,
+    keep: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,

@@ -1,5 +1,5 @@
 use crate::calibrate::basis::{self, create_bspline_basis};
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -53,7 +53,7 @@ pub struct ModelConfig {
     /// Defines the canonical order for Principal Components. This order is strictly
     /// enforced during both model fitting and prediction to ensure correctness.
     pub pc_names: Vec<String>,
-    
+
     /// A map from a term name (e.g., "PC1", "pgs_main") to its constraint transformation.
     /// Use an Option because not all terms might be constrained.
     #[serde(default)] // For backward compatibility with old models that don't have this field
@@ -107,9 +107,13 @@ pub enum ModelError {
     MismatchedPcCount { found: usize, expected: usize },
     #[error("Underlying basis function generation failed during prediction: {0}")]
     BasisError(#[from] basis::BasisError),
-    #[error("Internal error: failed to stack design matrix columns or constraint matrix dimensions don't match basis dimensions during prediction.")]
+    #[error(
+        "Internal error: failed to stack design matrix columns or constraint matrix dimensions don't match basis dimensions during prediction."
+    )]
     InternalStackingError,
-    #[error("Constraint transformation matrix missing for term '{0}'. This usually indicates a model format mismatch.")]
+    #[error(
+        "Constraint transformation matrix missing for term '{0}'. This usually indicates a model format mismatch."
+    )]
     ConstraintMissing(String),
 }
 
@@ -188,29 +192,35 @@ mod internal {
         // 1. Generate basis for PGS using saved knot vector if available
         let (pgs_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get("pgs") {
             // Use saved knot vector for exact reproduction
-            basis::create_bspline_basis_with_knots(p_new, saved_knots.view(), config.pgs_basis_config.degree)?
+            basis::create_bspline_basis_with_knots(
+                p_new,
+                saved_knots.view(),
+                config.pgs_basis_config.degree,
+            )?
         } else {
             // Fallback to original method for backward compatibility
             create_bspline_basis(
-                p_new, 
+                p_new,
                 None,
-                config.pgs_range, 
-                config.pgs_basis_config.num_knots, 
-                config.pgs_basis_config.degree
+                config.pgs_range,
+                config.pgs_basis_config.num_knots,
+                config.pgs_basis_config.degree,
             )?
         };
 
         // Apply the SAVED PGS constraint
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let pgs_z = &config.constraints.get("pgs_main")
-            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))? 
+        let pgs_z = &config
+            .constraints
+            .get("pgs_main")
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
             .z_transform;
-        
+
         // Check that dimensions match before matrix multiplication
         if pgs_main_basis_unc.ncols() != pgs_z.nrows() {
             return Err(ModelError::InternalStackingError);
         }
-        
+
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
         // This closure was not used - removed
@@ -223,7 +233,11 @@ mod internal {
             let pc_name = &config.pc_names[i];
             let (pc_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get(pc_name) {
                 // Use saved knot vector for exact reproduction
-                basis::create_bspline_basis_with_knots(pc_col, saved_knots.view(), config.pc_basis_configs[i].degree)?
+                basis::create_bspline_basis_with_knots(
+                    pc_col,
+                    saved_knots.view(),
+                    config.pc_basis_configs[i].degree,
+                )?
             } else {
                 // Fallback to original method for backward compatibility
                 create_bspline_basis(
@@ -231,21 +245,23 @@ mod internal {
                     None,
                     config.pc_ranges[i],
                     config.pc_basis_configs[i].num_knots,
-                    config.pc_basis_configs[i].degree
+                    config.pc_basis_configs[i].degree,
                 )?
             };
 
             // Apply the SAVED PC constraint
             let pc_name = &config.pc_names[i];
-            let pc_z = &config.constraints.get(pc_name)
+            let pc_z = &config
+                .constraints
+                .get(pc_name)
                 .ok_or_else(|| ModelError::ConstraintMissing(pc_name.clone()))?
                 .z_transform;
-                
+
             // Check that dimensions match before matrix multiplication
             if pc_basis_unc.ncols() != pc_z.nrows() {
                 return Err(ModelError::InternalStackingError);
             }
-            
+
             pc_constrained_bases.push(pc_basis_unc.dot(pc_z)); // Now constrained
         }
 
@@ -269,8 +285,10 @@ mod internal {
         }
 
         // 4. Interaction effects
-        for m in 0..pgs_main_basis.ncols() {
-            let pgs_weight_col = pgs_basis_unc.column(m + 1);       // unconstrained
+        // CORRECTED: Loop over the UNCONSTRAINED non-intercept PGS basis
+        for m in 0..pgs_main_basis_unc.ncols() {
+            // CORRECTED: Use m directly to index the unconstrained basis
+            let pgs_weight_col = pgs_main_basis_unc.column(m);
             for (_pc_idx, pc_basis_con) in pc_constrained_bases.iter().enumerate() {
                 // Pure pre-centering approach: use constrained PC basis with unconstrained PGS
                 // PC basis is already constrained (sum-to-zero). No need to center PGS or apply further constraints.
@@ -281,7 +299,7 @@ mod internal {
                 }
             }
         }
-        
+
         // Stack all column views into the final design matrix
         let col_views: Vec<_> = owned_cols.iter().map(Array1::view).collect();
         ndarray::stack(Axis(1), &col_views).map_err(|_| ModelError::InternalStackingError)
@@ -311,8 +329,9 @@ mod internal {
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
         // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
-        // The correct formula for total PGS bases is (num_knots + degree + 1) - 1
-        // We subtract 1 to exclude the intercept basis function
+        // The correct formula for unconstrained non-intercept PGS basis functions is:
+        // total_bases - 1 = (num_knots + degree + 1) - 1 = num_knots + degree
+        // We subtract 1 to exclude the intercept basis function (index 0)
         let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
         for m in 1..=total_pgs_bases {
             let pgs_key = format!("PGS_B{}", m);
@@ -343,7 +362,7 @@ mod tests {
         // Knot vector: [0, 0, 0.5, 1, 1]
         let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
         let z_transform = Array2::<f64>::eye(2); // Identity matrix for no constraint
-        
+
         // Simple model with intercept=0, main effect coeffs [2.0, 4.0]
         let model = TrainedModel {
             config: ModelConfig {
@@ -353,15 +372,22 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                pgs_basis_config: BasisConfig { num_knots: 1, degree: 1 },  // Degree 1 with 1 internal knot
-                pc_basis_configs: vec![],  // No PC effects in this simple test
+                pgs_basis_config: BasisConfig {
+                    num_knots: 1,
+                    degree: 1,
+                }, // Degree 1 with 1 internal knot
+                pc_basis_configs: vec![], // No PC effects in this simple test
                 pgs_range: (0.0, 1.0),
                 pc_ranges: vec![],
                 pc_names: vec![],
                 constraints: {
                     let mut constraints = HashMap::new();
-                    constraints.insert("pgs_main".to_string(), 
-                        Constraint { z_transform: z_transform.clone() });
+                    constraints.insert(
+                        "pgs_main".to_string(),
+                        Constraint {
+                            z_transform: z_transform.clone(),
+                        },
+                    );
                     constraints
                 },
                 knot_vectors: {
@@ -373,27 +399,27 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.0,
                 main_effects: MainEffects {
-                    pgs: vec![2.0, 4.0],  // Two coefficients for degree 1 B-spline
+                    pgs: vec![2.0, 4.0], // Two coefficients for degree 1 B-spline
                     pcs: HashMap::new(),
                 },
                 interaction_effects: HashMap::new(),
             },
             lambdas: vec![],
         };
-        
+
         // Test point x = 0.25, which is halfway between knots at 0 and 0.5
         let test_point = array![0.25];
         let empty_pcs = Array2::<f64>::zeros((1, 0)); // No PCs
-        
+
         // Calculate expected result by hand:
         // For x = 0.25, the basis functions will have values B_0,1 = 0.5, B_1,1 = 0.5, B_2,1 = 0.0
-        // But the model ignores B_0,1 (first basis column) and only uses B_1,1 and B_2,1 
+        // But the model ignores B_0,1 (first basis column) and only uses B_1,1 and B_2,1
         // Linear predictor: eta = (0.5 * 2.0) + (0.0 * 4.0) = 1.0
         let expected_value = 1.0;
-        
+
         // Get the model prediction
         let prediction = model.predict(test_point.view(), empty_pcs.view()).unwrap();
-        
+
         // Verify the result matches our ground truth
         assert_eq!(prediction.len(), 1);
         assert!(
@@ -402,15 +428,17 @@ mod tests {
             prediction[0],
             expected_value
         );
-        
+
         // Also test at x = 0.75, which is halfway between knots at 0.5 and 1.0
         // For x = 0.75, the basis functions will have values B_0,1 = 0.0, B_1,1 = 0.5, B_2,1 = 0.5
         // But the model ignores B_0,1 (first basis column) and only uses B_1,1 and B_2,1
         // Linear predictor: eta = (0.5 * 2.0) + (0.5 * 4.0) = 3.0
         let test_point_2 = array![0.75];
         let expected_value_2 = 3.0;
-        
-        let prediction_2 = model.predict(test_point_2.view(), empty_pcs.view()).unwrap();
+
+        let prediction_2 = model
+            .predict(test_point_2.view(), empty_pcs.view())
+            .unwrap();
         assert!(
             (prediction_2[0] - expected_value_2).abs() < 1e-10,
             "Prediction {} does not match expected value {}",
@@ -418,11 +446,7 @@ mod tests {
             expected_value_2
         );
     }
-    
-    
-    
-    
-    
+
     /// Tests that the prediction fails appropriately with invalid input dimensions.
     #[test]
     fn test_trained_model_predict_invalid_input() {
@@ -434,8 +458,14 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                pgs_basis_config: BasisConfig { num_knots: 2, degree: 1 },
-                pc_basis_configs: vec![BasisConfig { num_knots: 2, degree: 1 }],
+                pgs_basis_config: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                pc_basis_configs: vec![BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                }],
                 pgs_range: (-2.0, 2.0),
                 pc_ranges: vec![(-1.0, 1.0)],
                 pc_names: vec!["PC1".to_string()],
@@ -452,15 +482,18 @@ mod tests {
             },
             lambdas: vec![],
         };
-        
+
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
         let pgs = Array1::linspace(0.0, 1.0, 5);
         let pcs = Array2::zeros((5, 2)); // 2 PC columns, but model expects 1
-        
+
         let result = model.predict(pgs.view(), pcs.view());
-        
+
         // Verify we get the expected error
-        assert!(result.is_err(), "Should return an error when PC dimensions don't match");
+        assert!(
+            result.is_err(),
+            "Should return an error when PC dimensions don't match"
+        );
         if let Err(ModelError::MismatchedPcCount { found, expected }) = result {
             assert_eq!(found, 2);
             assert_eq!(expected, 1);
@@ -468,7 +501,7 @@ mod tests {
             panic!("Expected MismatchedPcCount error");
         }
     }
-    
+
     /// Tests that the coefficient flattening logic works correctly.
     /// This test verifies that the structured MappedCoefficients are correctly
     /// flattened into a single vector following the canonical order.
@@ -488,23 +521,23 @@ mod tests {
             },
             interaction_effects: {
                 let mut interactions = HashMap::new();
-                
+
                 // PGS_B1 interactions
                 let mut pgs_b1 = HashMap::new();
                 pgs_b1.insert("PC1".to_string(), vec![8.0, 9.0]);
                 pgs_b1.insert("PC2".to_string(), vec![10.0, 11.0]);
-                
+
                 // PGS_B2 interactions
                 let mut pgs_b2 = HashMap::new();
                 pgs_b2.insert("PC1".to_string(), vec![12.0, 13.0]);
                 pgs_b2.insert("PC2".to_string(), vec![14.0, 15.0]);
-                
+
                 interactions.insert("PGS_B1".to_string(), pgs_b1);
                 interactions.insert("PGS_B2".to_string(), pgs_b2);
                 interactions
             },
         };
-        
+
         // Create a simple model config for testing
         let config = ModelConfig {
             link_function: LinkFunction::Identity,
@@ -513,10 +546,19 @@ mod tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+            pgs_basis_config: BasisConfig {
+                num_knots: 3,
+                degree: 3,
+            },
             pc_basis_configs: vec![
-                BasisConfig { num_knots: 3, degree: 3 }, 
-                BasisConfig { num_knots: 3, degree: 3 }
+                BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
+                BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
             ],
             pgs_range: (0.0, 1.0),
             pc_ranges: vec![(0.0, 1.0), (0.0, 1.0)],
@@ -524,45 +566,51 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
         };
-        
+
         // Use the internal flatten_coefficients function
         use super::internal::flatten_coefficients;
         let flattened = flatten_coefficients(&coeffs, &config);
-        
+
         // Verify the canonical order of flattening:
         // 1. Intercept
         // 2. PC main effects (ordered by config.pc_names)
         // 3. PGS main effects
         // 4. Interaction effects (PGS basis function 1, then PC1, PC2, etc.; then PGS basis function 2...)
-        
+
         // Define expected order based on the canonical ordering rules
         let expected = vec![
-            1.0,                          // Intercept
-            4.0, 5.0,                     // PC1 main effects
-            6.0, 7.0,                     // PC2 main effects
-            2.0, 3.0,                     // PGS main effects
-            8.0, 9.0,                     // PGS_B1 * PC1 interaction
-            10.0, 11.0,                   // PGS_B1 * PC2 interaction
-            12.0, 13.0,                   // PGS_B2 * PC1 interaction
-            14.0, 15.0                    // PGS_B2 * PC2 interaction
+            1.0, // Intercept
+            4.0, 5.0, // PC1 main effects
+            6.0, 7.0, // PC2 main effects
+            2.0, 3.0, // PGS main effects
+            8.0, 9.0, // PGS_B1 * PC1 interaction
+            10.0, 11.0, // PGS_B1 * PC2 interaction
+            12.0, 13.0, // PGS_B2 * PC1 interaction
+            14.0, 15.0, // PGS_B2 * PC2 interaction
         ];
-        
+
         // Convert to vectors for easier comparison
         let flat_vec = flattened.to_vec();
-        
+
         // Check total length
-        assert_eq!(flat_vec.len(), expected.len(), 
-                   "Flattened vector has incorrect length: expected {}, got {}", 
-                   expected.len(), flat_vec.len());
-        
+        assert_eq!(
+            flat_vec.len(),
+            expected.len(),
+            "Flattened vector has incorrect length: expected {}, got {}",
+            expected.len(),
+            flat_vec.len()
+        );
+
         // Check each element in the expected order
         for (i, &expected_val) in expected.iter().enumerate() {
-            assert_eq!(flat_vec[i], expected_val, 
-                       "Mismatch at position {}: expected {}, got {}", 
-                       i, expected_val, flat_vec[i]);
+            assert_eq!(
+                flat_vec[i], expected_val,
+                "Mismatch at position {}: expected {}, got {}",
+                i, expected_val, flat_vec[i]
+            );
         }
     }
-    
+
     /// Tests that the model can be saved to and loaded from a file,
     /// preserving all its contents exactly.
     #[test]
@@ -576,23 +624,47 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                pgs_basis_config: BasisConfig { num_knots: 6, degree: 3 },
-                pc_basis_configs: vec![BasisConfig { num_knots: 6, degree: 3 }],
+                pgs_basis_config: BasisConfig {
+                    num_knots: 6,
+                    degree: 3,
+                },
+                pc_basis_configs: vec![BasisConfig {
+                    num_knots: 6,
+                    degree: 3,
+                }],
                 pgs_range: (-1.0, 1.0),
                 pc_ranges: vec![(-0.5, 0.5)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: {
                     let mut constraints = HashMap::new();
-                    constraints.insert("pgs_main".to_string(), 
-                        Constraint { z_transform: Array2::eye(2) });
-                    constraints.insert("PC1".to_string(),
-                        Constraint { z_transform: Array2::eye(2) });
+                    constraints.insert(
+                        "pgs_main".to_string(),
+                        Constraint {
+                            z_transform: Array2::eye(2),
+                        },
+                    );
+                    constraints.insert(
+                        "PC1".to_string(),
+                        Constraint {
+                            z_transform: Array2::eye(2),
+                        },
+                    );
                     constraints
                 },
                 knot_vectors: {
                     let mut knots = HashMap::new();
-                    knots.insert("pgs".to_string(), Array1::from_vec(vec![-1.0, -1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0]));
-                    knots.insert("PC1".to_string(), Array1::from_vec(vec![-0.5, -0.5, -0.5, -0.25, 0.0, 0.25, 0.5, 0.5, 0.5, 0.5]));
+                    knots.insert(
+                        "pgs".to_string(),
+                        Array1::from_vec(vec![
+                            -1.0, -1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0,
+                        ]),
+                    );
+                    knots.insert(
+                        "PC1".to_string(),
+                        Array1::from_vec(vec![
+                            -0.5, -0.5, -0.5, -0.25, 0.0, 0.25, 0.5, 0.5, 0.5, 0.5,
+                        ]),
+                    );
                     knots
                 },
             },
@@ -606,13 +678,16 @@ mod tests {
                         let mut pc_map = HashMap::new();
                         // Correctly sized vector for a basis with num_knots=6, degree=3, with sum-to-zero constraint
                         // (6+3+1)-1 = 9 constrained basis functions
-                        pc_map.insert("PC1".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+                        pc_map.insert(
+                            "PC1".to_string(),
+                            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                        );
                         pc_map
                     },
                 },
                 interaction_effects: {
                     let mut interactions = HashMap::new();
-                    
+
                     // Build correct interaction terms - one for each PGS basis function (minus intercept)
                     // For each PGS basis function (PGS_B1 through PGS_B9), create an interaction with PC1
                     for i in 1..=9 {
@@ -627,42 +702,67 @@ mod tests {
             },
             lambdas: vec![0.1, 0.2],
         };
-        
+
         // Create a temporary file for testing
         use tempfile::NamedTempFile;
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let file_path = temp_file.path().to_str().unwrap();
-        
+
         // Save the model
-        original_model.save(file_path).expect("Failed to save model");
-        
+        original_model
+            .save(file_path)
+            .expect("Failed to save model");
+
         // Load the model back
         let loaded_model = TrainedModel::load(file_path).expect("Failed to load model");
-        
+
         // Compare the models
-        
+
         // 1. Check model configuration
-        assert_eq!(loaded_model.config.link_function, original_model.config.link_function);
-        assert_eq!(loaded_model.config.penalty_order, original_model.config.penalty_order);
-        assert_eq!(loaded_model.config.pgs_basis_config.num_knots, 
-                  original_model.config.pgs_basis_config.num_knots);
-        assert_eq!(loaded_model.config.pgs_basis_config.degree, 
-                  original_model.config.pgs_basis_config.degree);
+        assert_eq!(
+            loaded_model.config.link_function,
+            original_model.config.link_function
+        );
+        assert_eq!(
+            loaded_model.config.penalty_order,
+            original_model.config.penalty_order
+        );
+        assert_eq!(
+            loaded_model.config.pgs_basis_config.num_knots,
+            original_model.config.pgs_basis_config.num_knots
+        );
+        assert_eq!(
+            loaded_model.config.pgs_basis_config.degree,
+            original_model.config.pgs_basis_config.degree
+        );
         assert_eq!(loaded_model.config.pc_names, original_model.config.pc_names);
-        assert_eq!(loaded_model.config.pgs_range, original_model.config.pgs_range);
-        assert_eq!(loaded_model.config.pc_ranges, original_model.config.pc_ranges);
-        
+        assert_eq!(
+            loaded_model.config.pgs_range,
+            original_model.config.pgs_range
+        );
+        assert_eq!(
+            loaded_model.config.pc_ranges,
+            original_model.config.pc_ranges
+        );
+
         // 2. Check constraint transformations exist
         assert!(loaded_model.config.constraints.contains_key("pgs_main"));
         assert!(loaded_model.config.constraints.contains_key("PC1"));
-        
+
         // 3. Check coefficient values
-        assert_eq!(loaded_model.coefficients.intercept, original_model.coefficients.intercept);
-        assert_eq!(loaded_model.coefficients.main_effects.pgs, 
-                  original_model.coefficients.main_effects.pgs);
-        assert_eq!(loaded_model.coefficients.main_effects.pcs.len(), 
-                  original_model.coefficients.main_effects.pcs.len());
-        
+        assert_eq!(
+            loaded_model.coefficients.intercept,
+            original_model.coefficients.intercept
+        );
+        assert_eq!(
+            loaded_model.coefficients.main_effects.pgs,
+            original_model.coefficients.main_effects.pgs
+        );
+        assert_eq!(
+            loaded_model.coefficients.main_effects.pcs.len(),
+            original_model.coefficients.main_effects.pcs.len()
+        );
+
         if let Some(pc1_loaded) = loaded_model.coefficients.main_effects.pcs.get("PC1") {
             if let Some(pc1_orig) = original_model.coefficients.main_effects.pcs.get("PC1") {
                 assert_eq!(pc1_loaded, pc1_orig);
@@ -672,21 +772,25 @@ mod tests {
         } else {
             panic!("Loaded model missing PC1 main effects");
         }
-        
+
         // 4. Check interaction effects
-        assert_eq!(loaded_model.coefficients.interaction_effects.len(),
-                  original_model.coefficients.interaction_effects.len());
-        
+        assert_eq!(
+            loaded_model.coefficients.interaction_effects.len(),
+            original_model.coefficients.interaction_effects.len()
+        );
+
         // Check PGS_B1 interactions
         if let (Some(pgs_b1_loaded), Some(pgs_b1_orig)) = (
             loaded_model.coefficients.interaction_effects.get("PGS_B1"),
-            original_model.coefficients.interaction_effects.get("PGS_B1")
+            original_model
+                .coefficients
+                .interaction_effects
+                .get("PGS_B1"),
         ) {
             assert_eq!(pgs_b1_loaded.len(), pgs_b1_orig.len());
-            if let (Some(pc1_loaded), Some(pc1_orig)) = (
-                pgs_b1_loaded.get("PC1"),
-                pgs_b1_orig.get("PC1")
-            ) {
+            if let (Some(pc1_loaded), Some(pc1_orig)) =
+                (pgs_b1_loaded.get("PC1"), pgs_b1_orig.get("PC1"))
+            {
                 assert_eq!(pc1_loaded, pc1_orig);
             } else {
                 panic!("Missing PC1 in PGS_B1 interaction effects");
@@ -694,17 +798,19 @@ mod tests {
         } else {
             panic!("Missing PGS_B1 interaction effects");
         }
-        
+
         // Check PGS_B2 interactions
         if let (Some(pgs_b2_loaded), Some(pgs_b2_orig)) = (
             loaded_model.coefficients.interaction_effects.get("PGS_B2"),
-            original_model.coefficients.interaction_effects.get("PGS_B2")
+            original_model
+                .coefficients
+                .interaction_effects
+                .get("PGS_B2"),
         ) {
             assert_eq!(pgs_b2_loaded.len(), pgs_b2_orig.len());
-            if let (Some(pc1_loaded), Some(pc1_orig)) = (
-                pgs_b2_loaded.get("PC1"),
-                pgs_b2_orig.get("PC1")
-            ) {
+            if let (Some(pc1_loaded), Some(pc1_orig)) =
+                (pgs_b2_loaded.get("PC1"), pgs_b2_orig.get("PC1"))
+            {
                 assert_eq!(pc1_loaded, pc1_orig);
             } else {
                 panic!("Missing PC1 in PGS_B2 interaction effects");
@@ -712,26 +818,31 @@ mod tests {
         } else {
             panic!("Missing PGS_B2 interaction effects");
         }
-        
+
         // 5. Check lambdas
         assert_eq!(loaded_model.lambdas, original_model.lambdas);
-        
+
         // 6. Test that we can use the loaded model for prediction
         let test_pgs = Array1::linspace(-0.5, 0.5, 3);
         let test_pcs = Array2::from_shape_fn((3, 1), |(i, _)| {
             (i as f64 - 1.0) * 0.25 // Values: -0.25, 0, 0.25
         });
-        
-        let predictions_orig = original_model.predict(test_pgs.view(), test_pcs.view())
+
+        let predictions_orig = original_model
+            .predict(test_pgs.view(), test_pcs.view())
             .expect("Prediction with original model failed");
-        
-        let predictions_loaded = loaded_model.predict(test_pgs.view(), test_pcs.view())
+
+        let predictions_loaded = loaded_model
+            .predict(test_pgs.view(), test_pcs.view())
             .expect("Prediction with loaded model failed");
-        
+
         // Verify that predictions are identical
         for i in 0..predictions_orig.len() {
-            assert_eq!(predictions_orig[i], predictions_loaded[i], 
-                      "Predictions differ at position {}", i);
+            assert_eq!(
+                predictions_orig[i], predictions_loaded[i],
+                "Predictions differ at position {}",
+                i
+            );
         }
     }
 }

@@ -21,11 +21,7 @@ use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
 use std::error::Error;
 use std::marker::PhantomData;
-use std::simd::{
-    Simd,
-    cmp::SimdPartialEq,
-    num::SimdUint,
-};
+use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
 // --- State Markers (Zero-Sized Types) ---
 pub struct Ready;
@@ -235,8 +231,7 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
             let mut g2_written = 0;
 
             let genotype_tile_row_offset = person_idx * variants_in_chunk;
-            let mini_batch_genotype_start =
-                genotype_tile_row_offset + variant_mini_batch_start_val;
+            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start_val;
             let genotype_row = &tile_ref
                 [mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size_val];
 
@@ -454,7 +449,7 @@ fn accumulate_simd_lane(
     num_scores: usize,
 ) {
     let adj = adjustments_f32x8.to_array();
-    
+
     // This is the fast path for full 8-element chunks.
     if scores_offset + SIMD_LANES <= num_scores {
         // Unrolled scalar loop - empirically fastest implementation
@@ -1154,12 +1149,14 @@ mod tests {
                 name, stats.median, stats.mean, stats.std_dev, stats.min, stats.max
             );
         };
-    
+
         print_stats("SIMD (Current)", stats_simd);
         print_stats("Simple Scalar", stats_scalar);
         print_stats("Unrolled Scalar", stats_unrolled);
-        println!("-------------------------------------------------------------------------------------\n");
-    
+        println!(
+            "-------------------------------------------------------------------------------------\n"
+        );
+
         // The core assertion is based on the median. After optimization, the
         // performance of all implementations is statistically identical. We add a 5%
         // tolerance to the assertion to prevent failures from insignificant,
