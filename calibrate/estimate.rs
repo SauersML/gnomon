@@ -467,7 +467,7 @@ pub mod internal {
             let lambdas = p.mapv(f64::exp); // This is λ
 
             // --- Create the gradient vector ---
-            let mut gradient = Array1::zeros(p.len());
+            let mut gradient = Array1::zeros(lambdas.len());
             
             // Select the appropriate gradient calculation based on the link function
             match self.config.link_function {
@@ -525,7 +525,7 @@ pub mod internal {
                         return Err(EstimationError::RemlOptimizationFailed("Estimated residual variance is non-positive.".to_string()));
                     }
                     
-                    for k in 0..p.len() {
+                    for k in 0..lambdas.len() {
                         // Calculate tr((XᵀX + S_λ)⁻¹S_k)
                         let s_k = &self.s_list[k];
                         
@@ -582,7 +582,7 @@ pub mod internal {
                     // 3. We need the weight derivative term for non-Gaussian link functions
                     let h_penalized = &pirls_result.penalized_hessian;
 
-                    for k in 0..p.len() {
+                    for k in 0..lambdas.len() {
                         // Get the corresponding S_k for this parameter
                         let s_k = &self.s_list[k];
 
@@ -743,7 +743,7 @@ pub mod internal {
                             Ok(v) => -lambdas[k] * v, // dβ/dρₖ = -λₖ * v
                             Err(e) => {
                                 log::warn!("Linear system solve failed for dβ/dρₖ: {:?}", e);
-                                return Ok(grad_of_neg_laml); // Return partial gradient if this fails
+                                return Ok(gradient); // Return partial gradient if this fails
                             }
                         };
                         
@@ -783,7 +783,7 @@ pub mod internal {
                                 },
                                 Err(e) => {
                                     log::warn!("Linear system solve failed for weight derivative trace: {:?}", e);
-                                    return Ok(grad_of_neg_laml); // Return partial gradient if this fails
+                                    return Ok(gradient); // Return partial gradient if this fails
                                 }
                             }
                         }
