@@ -573,11 +573,11 @@ pub mod internal {
                 _ => {
                     // --- NON-GAUSSIAN LAML GRADIENT ---
                     // For non-Gaussian models, we use the Laplace Approximate Marginal Likelihood (LAML) gradient.
-                    // The LAML gradient differs fundamentally from the REML gradient above:
-                    // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺S_k) - tr(H_p⁻¹S_k)] + 0.5 * tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X)
+                    // The LAML gradient differs from the REML gradient above but has similar components:
+                    // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺S_k) - tr(H_p⁻¹S_k) - β̂ᵀS_kβ̂] + 0.5 * tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X)
                     //
                     // Key differences from the REML gradient:
-                    // 1. The beta term (β̂ᵀS_kβ̂) is NOT included (it mathematically cancels out)
+                    // 1. The beta term (β̂ᵀS_kβ̂) appears without division by σ²
                     // 2. We must compute tr(S_λ⁺S_k) using the pseudo-inverse
                     // 3. We need the weight derivative term for non-Gaussian link functions
                     let h_penalized = &pirls_result.penalized_hessian;
@@ -586,28 +586,24 @@ pub mod internal {
                         // Get the corresponding S_k for this parameter
                         let s_k = &self.s_list[k];
 
-                        // The beta term (β^T S_k β) is NOT included in the LAML gradient for non-Gaussian models
-                        // as shown in Wood (2011). This is mathematically justified because when we take the
-                        // total derivative of the penalized log-likelihood with respect to ρ_k, the implicit
-                        // dependency through β̂ creates terms that exactly cancel the explicit β^T S_k β term.
-                        // 
-                        // Note: This cancellation ONLY applies to the LAML gradient (non-Gaussian case).
-                        // For the Gaussian REML gradient above, the beta term IS required and included.
-                        // We leave the code commented out for reference.
-                /*
-                // Find the block this penalty applies to
-                let mut beta_term = 0.0;
-                for block in &self.layout.penalty_map {
-                    if block.penalty_idx == k {
-                        // Get the relevant coefficient segment
-                        let beta_block = beta.slice(s![block.col_range.clone()]);
+                        // The beta term (β^T S_k β) IS a necessary component of the LAML gradient for non-Gaussian models
+                        // According to the mathematical derivation of the LAML score gradient.
+                        // While terms involving ∂β̂/∂ρ_k do cancel out (as β̂ maximizes the penalized likelihood),
+                        // the term (1/2)β̂ᵀ(∂S_λ/∂ρ_k)β̂ = (1/2)λ_k β̂ᵀS_kβ̂ from the penalty term remains.
+                        //
+                        // Calculate β^T S_k β for this penalty component
+                        let beta = &pirls_result.beta;
+                        let mut beta_term = 0.0;
+                        for block in &self.layout.penalty_map {
+                            if block.penalty_idx == k {
+                                // Get the relevant coefficient segment
+                                let beta_block = beta.slice(s![block.col_range.clone()]);
 
-                        // Calculate β^T S_k β
-                        beta_term = beta_block.dot(&s_k.dot(&beta_block));
-                        break;
-                    }
-                }
-                */
+                                // Calculate β^T S_k β
+                                beta_term = beta_block.dot(&s_k.dot(&beta_block));
+                                break;
+                            }
+                        }
 
                 // Create a full-sized matrix with S_k in the appropriate block
                 // This will be zero everywhere except for the block where S_k applies
@@ -795,8 +791,9 @@ pub mod internal {
                 
                         // Complete gradient formula with all terms for LAML
                         // The correct derivative of L with respect to ρ_k is:
-                        // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k)] + 0.5 * tr(H_p⁻¹ Xᵀ(∂W/∂ρ_k)X)
-                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term) + 0.5 * weight_deriv_term;
+                        // ∂L/∂ρ_k = 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k) - β̂ᵀS_kβ̂] + 0.5 * tr(H_p⁻¹ Xᵀ(∂W/∂ρ_k)X)
+                        // Note that the beta_term has a negative sign when assembling the gradient
+                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term - beta_term) + 0.5 * weight_deriv_term;
 
                         // Handle numerical stability
                         if !gradient[k].is_finite() {
