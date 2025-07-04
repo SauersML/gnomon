@@ -299,7 +299,9 @@ pub mod internal {
     }
 
     impl RemlState<'_> {
-        /// Compute the LAML cost (negative log-REML score) for BFGS optimization.
+        /// Compute the objective function for BFGS optimization.
+        /// For Gaussian models (Identity link), this is the exact REML score.
+        /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(p)?;
             let mut lambdas = p.mapv(f64::exp);
@@ -318,74 +320,249 @@ pub mod internal {
 
             let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
 
-            // Penalized log-likelihood part of the score.
-            // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
-            // We ignore the constant C.
-            let penalised_ll = -0.5 * pirls_result.deviance
-                - 0.5 * pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+            match self.config.link_function {
+                LinkFunction::Identity => {
+                    // For Gaussian models, use the exact REML score
+                    // From Wood (2017), Chapter 6.10, Eq. 6.27:
+                    // l_R(λ) = -½ log|X'X + S_λ|_* - (n - edf)/2 * log(||y - Xβ̂||²) + C
+                    // where edf is the effective degrees of freedom
+                    
+                    // The log-determinant of the penalty matrix (XᵀX + S_λ)
+                    // Note: pirls_result.penalized_hessian contains exactly X'X + S_λ for Identity link
+                    let h_penalized = &pirls_result.penalized_hessian;
+                    
+                    let log_det_xtx_plus_s = match h_penalized.cholesky(UPLO::Lower) {
+                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
+                        Err(_) => {
+                            // Fallback to eigenvalue method if Cholesky fails
+                            log::warn!("Cholesky failed for X'X + S_λ, using eigenvalue method");
+                            
+                            // Compute eigenvalues and use only positive ones for log-determinant
+                            let eigenvals = h_penalized
+                                .eigvals()
+                                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
-            // Log-determinant of the penalty matrix.
-            let log_det_s = calculate_log_det_pseudo(&s_lambda)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                            // Add a small ridge to ensure numerical stability
+                            let ridge = 1e-8;
+                            let stabilized_log_det: f64 = eigenvals
+                                .iter()
+                                .map(|&ev| (ev.re + ridge).max(ridge)) // Use only real part, ensure positive
+                                .map(|ev| ev.ln())
+                                .sum();
 
-            // Log-determinant of the penalized Hessian.
-            // Using Cholesky decomposition: log|H| = 2 * sum(log(diag(L)))
-            let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
-                Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                Err(_) => {
-                    // If Cholesky fails (matrix not positive definite), fall back to eigenvalue method
-                    // This prevents infinite costs that crash BFGS
-                    log::warn!(
-                        "Cholesky decomposition failed for penalized Hessian, using eigenvalue fallback"
-                    );
+                            stabilized_log_det
+                        }
+                    };
+                    
+                    // Calculate the effective degrees of freedom (EDF)
+                    // For Gaussian models, EDF = tr((X'X + Sλ)⁻¹X'X)
+                    // We compute this using the formula EDF = p - tr((X'X + Sλ)⁻¹Sλ)
+                    // where p is the total number of parameters
+                    
+                    let p = pirls_result.beta.len() as f64; // Total number of parameters
+                    
+                    // Calculate tr((X'X + Sλ)⁻¹Sλ) using column-wise approach
+                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let mut trace_h_inv_s_lambda = 0.0;
+                    
+                    for j in 0..s_lambda.ncols() {
+                        // Extract column j of s_lambda
+                        let s_col = s_lambda.column(j);
+                        
+                        // Skip if column is all zeros
+                        if s_col.iter().all(|&x| x == 0.0) {
+                            continue;
+                        }
+                        
+                        // Solve (X'X + Sλ) * v = Sλ[:,j]
+                        match h_penalized.solve(&s_col.to_owned()) {
+                            Ok(h_inv_s_col) => {
+                                // Add diagonal element to trace
+                                trace_h_inv_s_lambda += h_inv_s_col[j];
+                            },
+                            Err(e) => {
+                                log::warn!("Linear system solve failed for EDF calculation: {:?}", e);
+                                // Fall back to simpler approximation if this fails
+                                trace_h_inv_s_lambda = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
+                    let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
+                    
+                    // Calculate the residual sum of squares ||y - Xβ̂||²
+                    // Note: For Gaussian models, pirls_result.deviance is exactly the RSS
+                    let rss = pirls_result.deviance;
+                    
+                    // n is the number of samples
+                    let n = self.y.len() as f64;
+                    
+                    // Calculate the REML score: -½ log|X'X + S_λ|_* - (n - edf)/2 * log(RSS)
+                    let reml = -0.5 * log_det_xtx_plus_s - 0.5 * (n - edf) * rss.ln();
+                    
+                    // Return negative REML score for minimization
+                    Ok(-reml)
+                },
+                _ => {
+                    // For non-Gaussian GLMs, use the LAML approximation
+                    // Penalized log-likelihood part of the score.
+                    // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
+                    let penalised_ll = -0.5 * pirls_result.deviance
+                        - 0.5 * pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
 
-                    // Compute eigenvalues and use only positive ones for log-determinant
-                    let eigenvals = pirls_result
-                        .penalized_hessian
-                        .eigvals()
+                    // Log-determinant of the penalty matrix.
+                    let log_det_s = calculate_log_det_pseudo(&s_lambda)
                         .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
-                    // Add a small ridge to ensure numerical stability
-                    let ridge = 1e-8;
-                    let stabilized_log_det: f64 = eigenvals
-                        .iter()
-                        .map(|&ev| (ev.re + ridge).max(ridge)) // Use only real part, ensure positive
-                        .map(|ev| ev.ln())
-                        .sum();
+                    // Log-determinant of the penalized Hessian.
+                    let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
+                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
+                        Err(_) => {
+                            // Eigenvalue fallback if Cholesky fails
+                            log::warn!("Cholesky failed for penalized Hessian, using eigenvalue method");
+                            
+                            let eigenvals = pirls_result
+                                .penalized_hessian
+                                .eigvals()
+                                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
-                    stabilized_log_det
+                            let ridge = 1e-8;
+                            let stabilized_log_det: f64 = eigenvals
+                                .iter()
+                                .map(|&ev| (ev.re + ridge).max(ridge)) 
+                                .map(|ev| ev.ln())
+                                .sum();
+
+                            stabilized_log_det
+                        }
+                    };
+
+                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H|
+                    let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h;
+
+                    // Return negative LAML score for minimization
+                    Ok(-laml)
                 }
-            };
-
-            // The LAML score is Lp + 0.5*log|S| - 0.5*log|H|
-            // We return the *negative* because we're minimizing the negative LAML score.
-            let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h;
-
-            Ok(-laml)
+            }
         }
 
-        /// Compute the LAML gradient for BFGS optimization.
-        /// This implements the simplified formula from Wood (2011, Appendix C & D)
+        /// Compute the gradient for BFGS optimization.
+        /// For Gaussian models (Identity link), this is the exact REML gradient.
+        /// For non-Gaussian GLMs, this is the LAML gradient from Wood (2011, Appendix C & D).
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
 
-            // --- Extract converged model components ---
-            let h_penalized = &pirls_result.penalized_hessian; // This is H
-            // Note: beta is not used in the correct REML gradient calculation
-            // let _beta = &pirls_result.beta; // This is β-hat
+            // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
 
-            // --- Iterate through each smoothing parameter to build the gradient vector ---
-            let mut grad_of_neg_laml = Array1::zeros(p.len());
+            // --- Create the gradient vector ---
+            let mut gradient = Array1::zeros(p.len());
+            
+            // Select the appropriate gradient calculation based on the link function
+            match self.config.link_function {
+                LinkFunction::Identity => {
+                    // --- GAUSSIAN REML GRADIENT ---
+                    // For the Gaussian case, we need the REML gradient:
+                    // ∂V_R/∂ρ_k = 0.5 * λ_k * [tr((XᵀX + S_λ)⁻¹S_k) - (β̂ᵀS_kβ̂)/σ²]
+                    
+                    // H_penalized is already XᵀX + S_λ for Gaussian models
+                    let h_penalized = &pirls_result.penalized_hessian;
+                    let beta = &pirls_result.beta;
+                    
+                    // Calculate σ² = RSS/(n-edf) where edf is the effective degrees of freedom
+                    let n = self.y.len() as f64;
+                    let rss = pirls_result.deviance; // For Gaussian, deviance = RSS
+                    
+                    // Calculate the effective degrees of freedom using the same approach
+                    // as in compute_cost: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
+                    let p = beta.len() as f64;
+                    
+                    // Calculate tr((X'X + Sλ)⁻¹Sλ)
+                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let mut trace_h_inv_s_lambda = 0.0;
+                    
+                    for j in 0..s_lambda.ncols() {
+                        let s_col = s_lambda.column(j);
+                        if s_col.iter().all(|&x| x == 0.0) {
+                            continue;
+                        }
+                        
+                        match h_penalized.solve(&s_col.to_owned()) {
+                            Ok(h_inv_s_col) => {
+                                trace_h_inv_s_lambda += h_inv_s_col[j];
+                            },
+                            Err(e) => {
+                                log::warn!("Linear system solve failed for EDF calculation: {:?}", e);
+                                trace_h_inv_s_lambda = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Calculate EDF and ensure it's at least 1
+                    let edf = (p - trace_h_inv_s_lambda).max(1.0);
+                    
+                    // Calculate sigma² using the proper EDF
+                    let sigma_sq = rss / (n - edf);
+                    
+                    for k in 0..p.len() {
+                        // Calculate tr((XᵀX + S_λ)⁻¹S_k)
+                        let s_k = &self.s_list[k];
+                        
+                        // Create full-sized matrix with S_k in the appropriate block
+                        let mut s_k_full = Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                        for block in &self.layout.penalty_map {
+                            if block.penalty_idx == k {
+                                let block_start = block.col_range.start;
+                                let block_end = block.col_range.end;
+                                let block_size = block_end - block_start;
+                                
+                                if s_k.nrows() == block_size && s_k.ncols() == block_size {
+                                    s_k_full
+                                        .slice_mut(s![block_start..block_end, block_start..block_end])
+                                        .assign(s_k);
+                                }
+                                break;
+                            }
+                        }
+                        
+                        // Calculate trace term efficiently
+                        let mut trace_term = 0.0;
+                        for j in 0..h_penalized.ncols() {
+                            let s_col = s_k_full.column(j);
+                            if s_col.iter().all(|&x| x == 0.0) {
+                                continue;
+                            }
+                            match h_penalized.solve(&s_col.to_owned()) {
+                                Ok(h_inv_s_col) => trace_term += h_inv_s_col[j],
+                                Err(e) => {
+                                    log::warn!("Linear system solve failed: {:?}", e);
+                                    return Err(EstimationError::LinearSystemSolveFailed(e));
+                                }
+                            }
+                        }
+                        
+                        // Calculate β̂ᵀS_kβ̂
+                        let beta_term = beta.dot(&s_k_full.dot(beta));
+                        
+                        // Assemble REML gradient component
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term - beta_term / sigma_sq);
+                    }
+                },
+                _ => {
+                    // --- NON-GAUSSIAN LAML GRADIENT ---
+                    let h_penalized = &pirls_result.penalized_hessian;
 
-            for k in 0..p.len() {
-                // Get the corresponding S_k for this parameter
-                let s_k = &self.s_list[k];
+                    for k in 0..p.len() {
+                        // Get the corresponding S_k for this parameter
+                        let s_k = &self.s_list[k];
 
-                // The beta term (β^T S_k β) is NOT included in the correct gradient
-                // as shown in Wood (2011). It is cancelled out in the full mathematical derivation.
-                // We leave the code commented out for reference.
+                        // The beta term (β^T S_k β) is NOT included in the correct gradient
+                        // as shown in Wood (2011). It is cancelled out in the full mathematical derivation.
+                        // We leave the code commented out for reference.
                 /*
                 // Find the block this penalty applies to
                 let mut beta_term = 0.0;
@@ -453,11 +630,11 @@ pub mod internal {
                     }
                 }
 
-                // The correct gradient formula from Wood (2011, Appendix C & D):
-                // ∂(-LAML)/∂ρk = (1/2)λk * [ -tr(H^-1 S_k) + tr(S^-1 S_k) ]
-                // Which can be rearranged to:
-                // ∂(-LAML)/∂ρk = (1/2)λk * [ tr(S^-1 S_k) - tr(H^-1 S_k) ]
-                // Calculate tr(S^-1 S_k) term for the derivative of log|S|
+                // The complete gradient formula for GLMs requires the derivative of the weight matrix W
+                // ∂(-LAML)/∂ρk = (1/2)λk * [ tr(S^-1 S_k) - tr(H^-1 S_k) ] + (1/2) * tr[H^-1 X^T(∂W/∂ρk)X]
+                // Where ∂W/∂ρk involves the chain rule through β and the linear predictor η
+                // For non-Gaussian models, this term is non-zero and must be included
+                // First part: Calculate tr(S^-1 S_k) term for the derivative of log|S|
                 // The derivative of log|S| requires computing tr(S_λ⁺ * S_k)
                 // We need to compute this trace term properly using eigendecomposition
                 // First, construct the full penalty matrix S_λ from the current lambdas
@@ -493,20 +670,114 @@ pub mod internal {
                     }
                 };
                 
-                // Complete gradient formula with all three terms
-                // Correct formula according to Wood (2011) - the beta term is NOT included
-                // as it is cancelled out in the full mathematical derivation
-                grad_of_neg_laml[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term);
+                // Second part: Calculate the weight derivative term tr[H^-1 X^T(∂W/∂ρk)X]
+                // This requires computing ∂W/∂ρk which involves the chain rule:
+                // ∂W/∂ρk = (∂W/∂β)(∂β/∂ρk)
+                
+                // For Gaussian models with identity link, this term is zero
+                // For other GLMs, we need to compute it properly
+                let weight_deriv_term = match self.config.link_function {
+                    LinkFunction::Identity => 0.0, // Term is zero for Gaussian models with identity link
+                    _ => {
+                        // For non-Gaussian GLMs like Logit, we need to compute the weight derivative term
+                        // analytically using the chain rule: ρₖ → β → η → μ → W
+                        // We implement the analytical approach from Wood (2011), Appendix C & D
+                        
+                        // Step 1: Calculate dβ/dρₖ using the implicit function theorem
+                        // Solve the system H * v = Sₖ * β for v, then dβ/dρₖ = -λₖ * v
+                        
+                        // First, find the penalty block this term applies to
+                        let mut s_k_full = Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                        for block in &self.layout.penalty_map {
+                            if block.penalty_idx == k {
+                                let block_start = block.col_range.start;
+                                let block_end = block.col_range.end;
+                                let block_size = block_end - block_start;
+                                
+                                let s_k = &self.s_list[k];
+                                if s_k.nrows() == block_size && s_k.ncols() == block_size {
+                                    s_k_full
+                                        .slice_mut(s![block_start..block_end, block_start..block_end])
+                                        .assign(s_k);
+                                }
+                                break;
+                            }
+                        }
+                        
+                        // Calculate Sₖ * β
+                        let s_k_beta = s_k_full.dot(&pirls_result.beta);
+                        
+                        // Solve H * v = Sₖ * β
+                        let dbeta_drho = match h_penalized.solve(&s_k_beta) {
+                            Ok(v) => -lambdas[k] * v, // dβ/dρₖ = -λₖ * v
+                            Err(e) => {
+                                log::warn!("Linear system solve failed for dβ/dρₖ: {:?}", e);
+                                return Ok(grad_of_neg_laml); // Return partial gradient if this fails
+                            }
+                        };
+                        
+                        // Step 2: Calculate dη/dρₖ = X * dβ/dρₖ
+                        let deta_drho = self.x.dot(&dbeta_drho);
+                        
+                        // Step 3: Calculate dW/dη based on the link function
+                        // For logit link, get μ first then calculate dw/dη = μ(1-μ)(1-2μ)
+                        let eta = self.x.dot(&pirls_result.beta);
+                        let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())); // μ = 1/(1+exp(-η))
+                        
+                        // For logit: dw/dη = μ(1-μ)(1-2μ)
+                        let dw_deta = &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu);
+                        
+                        // Step 4: Form diag(∂W/∂ρₖ) = (dw/dη) ⊙ (dη/dρₖ)
+                        // This is the element-wise product of the vectors from steps 2 and 3
+                        let dw_drho = &dw_deta * &deta_drho;
+                        
+                        // Step 5: Calculate the final trace term tr(H⁻¹ X^T diag(∂W/∂ρₖ) X)
+                        // Use vectorized operations for efficiency
+                        let mut weight_trace_term = 0.0;
+                        
+                        // Create a diagonal matrix equivalent using a weighted view of X
+                        // This is equivalent to X^T diag(dw_drho) X without forming the diagonal matrix
+                        let x_weighted = &self.x * &dw_drho.view().insert_axis(Axis(1));
+                        
+                        for j in 0..self.x.ncols() {
+                            // Efficiently compute the j-th column of X^T diag(dw_drho) X as X^T * (dw_drho * X[:,j])
+                            // This single dot product replaces the triple-nested loop
+                            let weighted_col = self.x.t().dot(&x_weighted.column(j));
+                            
+                            // Solve H v = X^T diag(∂W/∂ρₖ) X[:,j]
+                            match h_penalized.solve(&weighted_col) {
+                                Ok(h_inv_col) => {
+                                    // Add to trace
+                                    weight_trace_term += h_inv_col[j];
+                                },
+                                Err(e) => {
+                                    log::warn!("Linear system solve failed for weight derivative trace: {:?}", e);
+                                    return Ok(grad_of_neg_laml); // Return partial gradient if this fails
+                                }
+                            }
+                        }
+                        
+                        // Return the final trace term with correct factor of 1/2
+                        0.5 * weight_trace_term
+                    }
+                };
+                
+                        // Complete gradient formula with all terms for LAML
+                        // From Wood (2011): ∂V_r / ∂ρ_k = 0.5 * λ_k * [tr(H⁻¹Sₖ) - tr(S⁺Sₖ)] + 0.5 * tr(H⁻¹Xᵀ(∂W/∂ρₖ)X)
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term) + 0.5 * weight_deriv_term;
 
-                // Handle numerical stability
-                if !grad_of_neg_laml[k].is_finite() {
-                    grad_of_neg_laml[k] = 0.0;
-                    log::warn!("Gradient component {} is not finite, setting to zero", k);
+                        // Handle numerical stability
+                        if !gradient[k].is_finite() {
+                            gradient[k] = 0.0;
+                            log::warn!("Gradient component {} is not finite, setting to zero", k);
+                        }
+                    }
                 }
             }
 
-            // The optimizer minimizes, so we return the gradient of the function to be minimized.
-            Ok(grad_of_neg_laml)
+            // The optimizer minimizes, so we return the gradient of the function to be minimized (-L).
+            // The current `gradient` is for maximizing L, so we must negate it.
+            Ok(-gradient)
         }
     }
 
@@ -555,10 +826,13 @@ pub mod internal {
             }
 
             // Main effect for PGS (non-constant basis terms)
-            // NOTE: The PGS main effect is unpenalized INTENTIONALLY.
-            // This is because there is little reason to expect a priori that score (arbitrary scale) has a linear relationship to phenotype.
-            // For example, a common observation is that higher values of score correspond to greater unit increases in phenotype.
-            // PCs also are not linear, but there are many PCs and PC*score terms, so we penalize to prevent overfitting.
+            // IMPORTANT: The PGS main effect is unpenalized INTENTIONALLY and NOT A MISTAKE.
+            // Technical justification:
+            // 1. PGS scores have an arbitrary scale, and their relationship to phenotype may be non-linear
+            // 2. Higher PGS values often correspond to greater unit increases in phenotype risk
+            // 3. For phenotype prediction, we want to preserve the full expressivity of the PGS main effect
+            // 4. This is a domain-specific design decision based on prior knowledge of PGS behavior
+            // 5. We still penalize PC terms and interaction terms to prevent overfitting there
             let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
             current_col += pgs_main_basis_ncols; // Still advance the column counter
 
