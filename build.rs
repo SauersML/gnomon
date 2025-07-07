@@ -51,7 +51,7 @@ impl ViolationCollector {
 impl Sink for ViolationCollector {
     type Error = std::io::Error;
 
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         // Get the line number and the content of the matched line.
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
@@ -68,12 +68,53 @@ fn main() {
     // Always rerun this script if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Manually check for unused variables in the build script
+    manually_check_for_unused_variables();
+
     // Scan Rust source files for underscore prefixed variables and fail if found.
     if let Err(e) = scan_for_underscore_prefixes() {
         // Print the formatted error and fail the build.
         // The `eprintln!` here is crucial for showing the error in `cargo`'s output.
         eprintln!("{}", e);
         std::process::exit(1);
+    }
+}
+
+// This function manually checks for unused variables in the current file
+fn manually_check_for_unused_variables() {
+    // Use grep to search for patterns that might indicate unused variables
+    let pattern = r"\blet\s+([^_][a-zA-Z0-9_]+)\s*="; // Look for variable declarations
+    let matcher = RegexMatcher::new_line_matcher(pattern).unwrap();
+    let mut searcher = Searcher::new();
+    
+    let build_path = Path::new("build.rs");
+    let file_content = std::fs::read_to_string(build_path).unwrap();
+    
+    // Collect all variable declarations
+    let mut collector = ViolationCollector::new(build_path);
+    searcher.search_path(&matcher, build_path, &mut collector).unwrap();
+    
+    // For each declared variable, check if it's used elsewhere in the file
+    for line in &collector.violations {
+        // Extract variable name from the violation line
+        if let Some(var_name_start) = line.find("let ") {
+            if let Some(var_name_end) = line[var_name_start+4..].find('=') {
+                let var_name = line[var_name_start+4..var_name_start+4+var_name_end].trim();
+                
+                // Count occurrences of this variable name in the file
+                // (should be more than 1 if it's used after declaration)
+                let count = file_content.matches(var_name).count();
+                
+                if count <= 1 {
+                    // If variable appears only once (its declaration), it's unused
+                    eprintln!("\n❌ ERROR: Unused variable detected in build.rs: {}", var_name);
+                    eprintln!("   {}", line);
+                    eprintln!("\n⚠️ Unused variables are not allowed in this project.");
+                    eprintln!("   Either use the variable or prefix it with an underscore to explicitly mark it as unused.");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
