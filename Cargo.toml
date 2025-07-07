@@ -82,6 +82,10 @@ tempfile = "3.20"
 approx = "0.5"
 serde_json = "1.0"
 
+[build-dependencies]
+walkdir = "2.5.0"
+grep = "0.3.2"
+
 [[bench]]
 name = "path_benchmark"
 harness = false
