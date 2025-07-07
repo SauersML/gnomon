@@ -615,7 +615,25 @@ mod tests {
     /// preserving all its contents exactly.
     #[test]
     fn test_save_load_functionality() {
-        // Create a simple model for testing
+        // Define BasisConfig as the single source of truth
+        let pgs_basis_config = BasisConfig {
+            num_knots: 6,
+            degree: 3,
+        };
+        let pc1_basis_config = BasisConfig {
+            num_knots: 6,
+            degree: 3,
+        };
+        
+        // Derive dimensions based on B-spline theory formulas
+        // The formula for unconstrained basis functions is: num_knots + degree + 1
+        let pgs_unconstrained_dim = pgs_basis_config.num_knots + pgs_basis_config.degree + 1;  // 10
+        let pc1_unconstrained_dim = pc1_basis_config.num_knots + pc1_basis_config.degree + 1;  // 10
+        
+        // For main effect PGS basis (excluding intercept), we need pgs_dim - 1
+        let pgs_main_dim = pgs_unconstrained_dim - 1;  // 9
+        
+        // Create a simple model for testing with correctly sized constraint matrices
         let original_model = TrainedModel {
             config: ModelConfig {
                 link_function: LinkFunction::Logit,
@@ -624,14 +642,8 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 6,
-                    degree: 3,
-                },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 6,
-                    degree: 3,
-                }],
+                pgs_basis_config,
+                pc_basis_configs: vec![pc1_basis_config],
                 pgs_range: (-1.0, 1.0),
                 pc_ranges: vec![(-0.5, 0.5)],
                 pc_names: vec!["PC1".to_string()],
@@ -640,13 +652,15 @@ mod tests {
                     constraints.insert(
                         "pgs_main".to_string(),
                         Constraint {
-                            z_transform: Array2::eye(2),
+                            // Use correct dimension for pgs_main (9 basis functions, excluding intercept)
+                            z_transform: Array2::eye(pgs_main_dim),
                         },
                     );
                     constraints.insert(
                         "PC1".to_string(),
                         Constraint {
-                            z_transform: Array2::eye(2),
+                            // Use correct dimension for PC1 (10 basis functions)
+                            z_transform: Array2::eye(pc1_unconstrained_dim),
                         },
                     );
                     constraints
@@ -656,13 +670,13 @@ mod tests {
                     knots.insert(
                         "pgs".to_string(),
                         Array1::from_vec(vec![
-                            -1.0, -1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0,
+                            -1.0, -1.0, -1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0,
                         ]),
                     );
                     knots.insert(
                         "PC1".to_string(),
                         Array1::from_vec(vec![
-                            -0.5, -0.5, -0.5, -0.25, 0.0, 0.25, 0.5, 0.5, 0.5, 0.5,
+                            -0.5, -0.5, -0.5, -0.5, -0.25, 0.0, 0.25, 0.5, 0.5, 0.5, 0.5,
                         ]),
                     );
                     knots
@@ -671,16 +685,16 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.5,
                 main_effects: MainEffects {
-                    // Correctly sized vector for a basis with num_knots=6, degree=3, with sum-to-zero constraint
-                    // (6+3+1-1)-1 = 8 constrained basis functions
-                    pgs: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                    // For PGS main effects (excluding intercept), constrained by identity matrix of size pgs_main_dim
+                    // Since we're using identity matrix as z_transform, the number of coefficients equals pgs_main_dim
+                    pgs: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
                     pcs: {
                         let mut pc_map = HashMap::new();
-                        // Correctly sized vector for a basis with num_knots=6, degree=3, with sum-to-zero constraint
-                        // (6+3+1)-1 = 9 constrained basis functions
+                        // For PC1, constrained by identity matrix of size pc1_unconstrained_dim
+                        // Since we're using identity matrix as z_transform, the number of coefficients equals pc1_unconstrained_dim
                         pc_map.insert(
                             "PC1".to_string(),
-                            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
                         );
                         pc_map
                     },
@@ -688,12 +702,14 @@ mod tests {
                 interaction_effects: {
                     let mut interactions = HashMap::new();
 
-                    // Build correct interaction terms - one for each PGS basis function (minus intercept)
-                    // For each PGS basis function (PGS_B1 through PGS_B9), create an interaction with PC1
-                    for i in 1..=9 {
+                    // Build interaction terms for each PGS basis function (excluding intercept)
+                    // Using pgs_main_dim to determine the number of PGS basis functions
+                    for i in 1..=pgs_main_dim {
                         let mut pgs_bx = HashMap::new();
-                        // Same size as PC1 constrained basis (9 values)
-                        let pc1_coefs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+                        // Each interaction has pc1_unconstrained_dim coefficients
+                        let pc1_coefs = (1..=pc1_unconstrained_dim)
+                            .map(|j| j as f64)
+                            .collect::<Vec<f64>>();
                         pgs_bx.insert("PC1".to_string(), pc1_coefs);
                         interactions.insert(format!("PGS_B{}", i), pgs_bx);
                     }

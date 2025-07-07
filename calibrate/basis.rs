@@ -393,7 +393,8 @@ mod tests {
     use ndarray::array;
 
     /// Independent recursive implementation of B-spline basis function evaluation.
-    /// This is a correct implementation of the Cox-de Boor algorithm using recursion.
+    /// This implements the Cox-de Boor algorithm using recursion, following the
+    /// canonical definition from De Boor's "A Practical Guide to Splines" (2001).
     /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
         // Base case for degree 0
@@ -401,16 +402,22 @@ mod tests {
             // Make this match the logic in evaluate_splines_at_point by using a clamped x value
             // and handling the boundaries consistently
             let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
+            
+            // Per De Boor's definition, each point must belong to exactly one knot span.
+            // We use the canonical half-open interval [t_i, t_{i+1}) for interior points.
+            // For the upper boundary point (t_{n+1}), we consider it part of the last span.
 
-            // Use half-open interval [t_i, t_{i+1}) for interior knots
-            // The key issue is that when x is exactly on a knot, only one basis function should be 1
-            if (i < knots.len() - 1) && (knots[i] <= x_clamped) && (x_clamped < knots[i + 1]) {
-                return 1.0;
-            }
-
-            // Special case for the upper boundary - only the last basis function is 1 at the upper boundary
-            if i == knots.len() - 2 && x_clamped == knots[i + 1] {
-                return 1.0;
+            if i < knots.len() - 1 {
+                // Case 1: For the interior knot spans, use half-open interval
+                if knots[i] <= x_clamped && x_clamped < knots[i + 1] {
+                    return 1.0;
+                }
+                
+                // Case 2: Special case for the upper boundary point
+                // Only the last basis function should be 1.0 at the upper boundary
+                if i == knots.len() - 2 && x_clamped == knots[i + 1] {
+                    return 1.0;
+                }
             }
 
             return 0.0;
