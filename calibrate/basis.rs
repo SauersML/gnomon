@@ -611,13 +611,10 @@ mod tests {
 
     #[test]
     fn test_iterative_vs_recursive_bspline() {
-        // This test verifies that our iterative implementation of the Cox-de Boor algorithm
-        // matches the recursive implementation in most cases, with some special handling
-        // for edge cases at knot boundaries.
-        
-        // We know there's a mathematical difference in how the two implementations handle
-        // points that fall exactly on knots, especially for degree > 1. We'll work around
-        // this edge case by focusing on interior points.
+        // This test validates our optimized iterative Cox-de Boor implementation against
+        // a canonical recursive reference implementation. Both implementations should now
+        // handle boundary conditions identically, including points that fall exactly on knots.
+        // This cross-validation ensures mathematical correctness of our production code.
 
         // Test with various degrees and knot configurations
         let test_cases = vec![
@@ -627,8 +624,9 @@ mod tests {
             (array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0], 3), // Cubic with 1 internal knot
         ];
 
-        // Test points including both interior and boundary values
-        let test_points = vec![0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0];
+        // Test points including interior values, exact knot positions, and boundaries
+        // This comprehensive set tests the half-open interval [t_i, t_{i+1}) convention
+        let test_points = vec![0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0];
 
         for (knots, degree) in test_cases {
             for &x in &test_points {

@@ -535,15 +535,99 @@ pub mod internal {
             // --- Create the gradient vector ---
             let mut gradient = Array1::zeros(lambdas.len());
             
-            // Use the unified LAML gradient formula for all link functions.
-            // For Gaussian models (Identity link), this naturally simplifies to the correct REML gradient
-            // because the weight derivative term (∂W/∂ρ_k) is zero when W is constant (identity matrix).
-            // This eliminates the mathematical error of including the β̂ᵀS_kβ̂ term, which is correctly
-            // cancelled out in the total derivative formulation for all model types.
-            {
-                    // --- UNIFIED LAML/REML GRADIENT ---
-                    // We use the mathematically correct Laplace Approximate Marginal Likelihood (LAML) gradient
-                    // for all model types. For Gaussian models, this is equivalent to the REML gradient.
+            // Apply the correct gradient formula based on the link function.
+            // The mathematical structure differs fundamentally between Gaussian REML and non-Gaussian LAML.
+            match self.config.link_function {
+                LinkFunction::Identity => {
+                    // --- GAUSSIAN REML GRADIENT ---
+                    // For Gaussian models, use the correct REML gradient formula.
+                    // The β̂ᵀS_kβ̂/σ² term is REQUIRED and does NOT cancel out in the REML derivation.
+                    // This is because H = XᵀX is constant (not a function of β̂) in the Gaussian case.
+                    
+                    let h_penalized = &pirls_result.penalized_hessian;
+                    let beta = &pirls_result.beta;
+                    
+                    // Calculate σ² = RSS/(n-edf) where edf is the effective degrees of freedom
+                    let n = self.y.len() as f64;
+                    let rss = pirls_result.deviance; // For Gaussian, deviance = RSS
+                    
+                    // Calculate the effective degrees of freedom
+                    let num_params = beta.len() as f64;
+                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let mut trace_h_inv_s_lambda = 0.0;
+                    
+                    for j in 0..s_lambda.ncols() {
+                        let s_col = s_lambda.column(j);
+                        if s_col.iter().all(|&x| x == 0.0) {
+                            continue;
+                        }
+                        
+                        match h_penalized.solve(&s_col.to_owned()) {
+                            Ok(h_inv_s_col) => {
+                                trace_h_inv_s_lambda += h_inv_s_col[j];
+                            },
+                            Err(e) => {
+                                log::warn!("Linear system solve failed for EDF calculation: {:?}", e);
+                                trace_h_inv_s_lambda = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
+                    let sigma_sq = rss / (n - edf);
+                    if sigma_sq <= 0.0 {
+                        log::warn!("REML variance estimate is non-positive: {}", sigma_sq);
+                        return Err(EstimationError::RemlOptimizationFailed("Estimated residual variance is non-positive.".to_string()));
+                    }
+                    
+                    for k in 0..lambdas.len() {
+                        let s_k = &self.s_list[k];
+                        
+                        // Create full-sized matrix with S_k in the appropriate block
+                        let mut s_k_full = Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                        for block in &self.layout.penalty_map {
+                            if block.penalty_idx == k {
+                                let block_start = block.col_range.start;
+                                let block_end = block.col_range.end;
+                                let block_size = block_end - block_start;
+                                
+                                if s_k.nrows() == block_size && s_k.ncols() == block_size {
+                                    s_k_full
+                                        .slice_mut(s![block_start..block_end, block_start..block_end])
+                                        .assign(s_k);
+                                }
+                                break;
+                            }
+                        }
+                        
+                        // Calculate trace term efficiently
+                        let mut trace_term = 0.0;
+                        for j in 0..h_penalized.ncols() {
+                            let s_col = s_k_full.column(j);
+                            if s_col.iter().all(|&x| x == 0.0) {
+                                continue;
+                            }
+                            match h_penalized.solve(&s_col.to_owned()) {
+                                Ok(h_inv_s_col) => trace_term += h_inv_s_col[j],
+                                Err(e) => {
+                                    log::warn!("Linear system solve failed: {:?}", e);
+                                    return Err(EstimationError::LinearSystemSolveFailed(e));
+                                }
+                            }
+                        }
+                        
+                        // Calculate β̂ᵀS_kβ̂ - this term is REQUIRED for REML
+                        let beta_term = beta.dot(&s_k_full.dot(beta));
+                        
+                        // Correct REML gradient formula
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term - beta_term / sigma_sq);
+                    }
+                },
+                _ => {
+                    // --- NON-GAUSSIAN LAML GRADIENT ---
+                    // For non-Gaussian models, use the Laplace Approximate Marginal Likelihood (LAML) gradient.
+                    // The β̂ᵀS_kβ̂ term is correctly ABSENT due to exact mathematical cancellation in the total derivative.
                     // 
                     // ## Mathematical Derivation and Cancellation
                     // 
@@ -854,8 +938,9 @@ pub mod internal {
                             gradient[k] = 0.0;
                             log::warn!("Gradient component {} is not finite, setting to zero", k);
                         }
-                        }
-                        }
+                    }
+                }
+            }
 
             // The optimizer minimizes, so we return the gradient of the function to be minimized (-L).
             // The current `gradient` is for maximizing L, so we must negate it.
