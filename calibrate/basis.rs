@@ -313,21 +313,24 @@ mod internal {
         // containing x_clamped. This span is half-open, EXCEPT at the upper boundary
         // where we use a closed interval [t_{m-p-1}, t_{m-p}].
 
-        // Special case for upper boundary: if x is exactly at the upper boundary,
-        // use the last valid knot span
+        // Find the knot span containing x_clamped 
+        // Must match the recursive implementation's boundary handling exactly
         let mu = if x_clamped == knots[num_basis] {
-            // At the upper boundary, use the last valid knot span
+            // At the upper boundary, use the last valid span (closed interval)
             num_basis - 1
+        } else if x_clamped == knots[degree] {
+            // At the lower boundary (first valid knot), use the first span
+            0
         } else {
-            // Find the index of the first knot strictly greater than x_clamped
-            let pos = knots
-                .iter()
-                .position(|&k| k > x_clamped)
-                .unwrap_or(num_basis);
-
-            // Subtract 1 to get the index of the knot that starts the interval
-            // This handles the half-open interval [tᵢ, tᵢ₊₁) convention
-            pos - 1
+            // Standard case: find the span index where knots[degree + mu] <= x < knots[degree + mu + 1]
+            let mut span = 0;
+            for i in 0..(num_basis - 1) {
+                if knots[degree + i] <= x_clamped && x_clamped < knots[degree + i + 1] {
+                    span = i;
+                    break;
+                }
+            }
+            span
         };
 
         // The result should always be a valid knot span index

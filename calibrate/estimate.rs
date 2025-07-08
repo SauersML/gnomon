@@ -1279,7 +1279,7 @@ pub mod internal {
             let mut penalized_hessian = xtwx + &s_lambda;
 
             // Add numerical ridge for stability
-            penalized_hessian.diag_mut().mapv_inplace(|d| d + 1e-10);
+            penalized_hessian.diag_mut().mapv_inplace(|d| d + 1e-9);
 
             // Right-hand side of the equation: X'Wz
             let rhs = x.t().dot(&(weights * &z));
@@ -2781,7 +2781,7 @@ mod tests {
         // Penalty count check
         // Each PC main effect has one penalty, and each PGS basis function creates one interaction penalty per PC
         let expected_penalties = config.pc_names.len() // one penalty per PC main effect
-            + pgs_bases_for_interaction; // interaction penalties (one per unconstrained, non-intercept PGS basis function)
+            + pgs_bases_for_interaction * config.pc_names.len(); // interaction penalties (multiplicative: PGS bases × PCs)
 
         assert_eq!(
             s_list.len(),
