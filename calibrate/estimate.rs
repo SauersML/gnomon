@@ -1,5 +1,3 @@
-// calibrate/estimate.rs
-
 //! # Model Estimation via Penalized Likelihood and REML
 //!
 //! This module orchestrates the core model fitting procedure. It transitions from a
