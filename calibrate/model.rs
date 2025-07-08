@@ -285,11 +285,23 @@ mod internal {
         }
 
         // 4. Interaction effects
-        // CORRECTED: Loop over the UNCONSTRAINED non-intercept PGS basis
-        for m in 0..pgs_main_basis_unc.ncols() {
-            // CORRECTED: Use m directly to index the unconstrained basis
-            let pgs_weight_col = pgs_main_basis_unc.column(m);
-            for (_pc_idx, pc_basis_con) in pc_constrained_bases.iter().enumerate() {
+        // The correct formula for unconstrained non-intercept PGS basis functions is:
+        // (num_knots + degree + 1) - 1 = num_knots + degree
+        // We subtract 1 to exclude the intercept basis function (index 0)
+        let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        
+        // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
+        for m in 1..=total_pgs_bases {
+            // Use the FULL unconstrained basis with column m (just like in estimate.rs)
+            // This ensures we skip the intercept at index 0 and use columns 1,2,3,...
+            let pgs_weight_col = pgs_basis_unc.column(m);
+            
+            // Iterate through PC names in the canonical order
+            for pc_name in &config.pc_names {
+                // Find the PC index from the name
+                let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
+                let pc_basis_con = &pc_constrained_bases[pc_idx];
+                
                 // Pure pre-centering approach: use constrained PC basis with unconstrained PGS
                 // PC basis is already constrained (sum-to-zero). No need to center PGS or apply further constraints.
                 let interaction_term = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
