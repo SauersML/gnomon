@@ -406,45 +406,31 @@ mod tests {
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
         // Base case for degree 0
         if degree == 0 {
-            // Make this match the logic in evaluate_splines_at_point by using a clamped x value
+            // A degree-0 B-spline B_{i,0}(x) is an indicator function for the knot interval [knots[i], knots[i+1]).
+            // It should be 1 if x is inside its corresponding knot interval, and 0 otherwise.
+            // The key subtlety is the boundary condition needed to ensure partition of unity.
+            
+            // Clamp x to the spline's domain for consistent boundary handling
             let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
             
-            // Case 1: Check if this is a point exactly on an internal knot
-            // In the iterative implementation, a point exactly on a knot value is included
-            // in the knot span starting with that knot, not the one ending with it.
-            // For the knot sequence [..., 1.0, 2.0, 3.0, ...], the point x=2.0:
-            // - Should NOT be included in the interval [1.0, 2.0)
-            // - SHOULD be included in the interval [2.0, 3.0)
+            // 1. Guard against zero-length intervals (repeated knots)
+            if (knots[i + 1] - knots[i]).abs() < 1e-12 {
+                return 0.0;
+            }
             
-            // For the very last knot (upper boundary), include it in the last basis function
+            // 2. Standard half-open interval check: [knots[i], knots[i+1])
+            if x_clamped >= knots[i] && x_clamped < knots[i + 1] {
+                return 1.0;
+            }
+            
+            // 3. Critical boundary exception for partition of unity:
+            // The very last interval must be treated as closed [t_n, t_{n+1}] to ensure
+            // that the basis functions sum to 1 everywhere, including at the upper boundary.
             if i == knots.len() - 2 && x_clamped == knots[i + 1] {
                 return 1.0;
             }
             
-            // Special case for the first knot (left boundary): the first basis function includes it
-            if i == 0 && x_clamped == knots[0] {
-                return 1.0;
-            }
-            
-            // For a point exactly on knot i (except the first and last knots), the basis function Ni0
-            // should return 0, as that point belongs to the next interval's basis function
-            if x_clamped == knots[i] && i > 0 && i < knots.len() - 2 {
-                // If we're at an internal knot boundary, this basis function doesn't include the point
-                return 0.0;
-            }
-            
-            // If x is exactly knot[i+1] (an internal knot), it's NOT in this span
-            // It belongs to the next span [knot[i+1], knot[i+2])
-            if x_clamped == knots[i + 1] && i < knots.len() - 2 {
-                return 0.0;
-            }
-            
-            // Standard case: x is in the half-open interval [knot[i], knot[i+1])
-            if knots[i] <= x_clamped && x_clamped < knots[i + 1] {
-                return 1.0;
-            }
-            
-            // For all other cases, the basis function evaluates to 0
+            // 4. All other cases: x is outside this basis function's support
             return 0.0;
         }
 
