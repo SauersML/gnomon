@@ -621,7 +621,7 @@ pub mod internal {
                         let beta_term = beta.dot(&s_k_full.dot(beta));
                         
                         // Correct REML gradient formula
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term - beta_term / sigma_sq);
+                        gradient[k] = 0.5 * lambdas[k] * (beta_term / sigma_sq - trace_term);
                     }
                 },
                 _ => {
@@ -1117,18 +1117,13 @@ pub mod internal {
         }
 
         // 3. Create penalties for interaction effects only
-        // CRITICAL FIX: Use the unconstrained basis size (pgs_main_basis_unc.ncols())
-        // rather than the constrained basis size (pgs_main_basis.ncols()).
-        // We need one interaction term for each basis function in the unconstrained basis.
-        // 
-        // The main effect of PGS is left unpenalized to allow it to fully capture the
-        // primary trend. Penalties are applied to the PC main effects and all
-        // interaction terms to regularize their contributions and prevent overfitting.
-        let num_pgs_basis_funcs = pgs_main_basis_unc.ncols();
-        for _ in 0..num_pgs_basis_funcs {
+        // The main effect of PGS is intentionally left unpenalized.
+        // We iterate through each non-intercept PGS basis function which will act as a weight.
+        let num_pgs_interaction_weights = pgs_basis_unc.ncols() - 1;
+
+        for _ in 0..num_pgs_interaction_weights {
             for i in 0..pc_constrained_bases.len() {
                 // Create penalty matrix for interaction basis using pure pre-centering
-                // With pure pre-centering, the interaction basis has the same number of columns as the PC basis
                 let interaction_basis_size = pc_constrained_bases[i].ncols();
                 let s_interaction =
                     create_difference_penalty_matrix(interaction_basis_size, config.penalty_order)?;
@@ -2549,8 +2544,23 @@ mod tests {
     ///
     /// This is the gold standard test for validating gradient implementations and ensures the
     /// optimization process receives correct gradient information.
-    #[test]
-    fn test_gradient_calculation_against_numerical_approximation() {
+    /// Tests that the analytical gradient calculation for both REML and LAML correctly matches
+    /// a numerical gradient approximation using finite differences.
+        ///
+        /// This test provides a critical validation of the gradient formulas implemented in the
+        /// `compute_gradient` method. The gradient calculation is complex and error-prone, especially
+        /// due to the different formulations required for Gaussian (REML) vs. non-Gaussian (LAML) models.
+        ///
+        /// For each link function (Identity/Gaussian and Logit), the test:
+        /// 1. Sets up a small, well-conditioned test problem.
+        /// 2. Calculates the analytical gradient at a specific point.
+        /// 3. Approximates the numerical gradient using central differences.
+        /// 4. Verifies that they match within numerical precision.
+        ///
+        /// This is the gold standard test for validating gradient implementations and ensures the
+        /// optimization process receives correct gradient information.
+        #[test]
+        fn test_gradient_calculation_against_numerical_approximation() {
         // --- 1. Function to test gradient for a specific link function ---
         let test_gradient_for_link = |link_function: LinkFunction| {
             // --- 2. Create a small, simple test dataset ---

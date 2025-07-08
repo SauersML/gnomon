@@ -313,24 +313,25 @@ mod internal {
         // containing x_clamped. This span is half-open, EXCEPT at the upper boundary
         // where we use a closed interval [t_{m-p-1}, t_{m-p}].
 
-        // Find the knot span containing x_clamped 
-        // Must match the recursive implementation's boundary handling exactly
-        let mu = if x_clamped == knots[num_basis] {
-            // At the upper boundary, use the last valid span (closed interval)
-            num_basis - 1
-        } else if x_clamped == knots[degree] {
-            // At the lower boundary (first valid knot), use the first span
-            0
-        } else {
-            // Standard case: find the span index where knots[degree + mu] <= x < knots[degree + mu + 1]
-            let mut span = 0;
-            for i in 0..(num_basis - 1) {
-                if knots[degree + i] <= x_clamped && x_clamped < knots[degree + i + 1] {
-                    span = i;
-                    break;
+        // Find the knot span `mu` such that knots[degree + mu] <= x < knots[degree + mu + 1].
+        // This is the standard, robust way to find the span. It correctly handles
+        // the half-open interval convention and boundary conditions.
+        let mu = {
+            if x_clamped >= knots[num_basis] {
+                // If x is at or beyond the last knot of the spline's support,
+                // it belongs to the last valid span. num_basis = (num_knots - degree - 1)
+                // The last valid span is [ t_{num_basis-1}, t_{num_basis} ].
+                num_basis - 1
+            } else {
+                // Search for the span in the relevant part of the knot vector
+                // The active knots for a degree `d` spline start at index `d`.
+                // We are looking for an index `i` such that knots[i] <= x < knots[i+1].
+                let mut span = degree;
+                while span < num_basis && x_clamped >= knots[span + 1] {
+                    span += 1;
                 }
+                span
             }
-            span
         };
 
         // The result should always be a valid knot span index
@@ -348,15 +349,16 @@ mod internal {
             b.fill(0.0);
 
             for j in 0..=d {
-                // Calculate i based on the current recursion level d, not the final degree
+                // Calculate i based on the current recursion level `d`, not the final degree
                 // This is the correct implementation of the Cox-de Boor formula
                 // Ensure we don't underflow with unsigned subtraction
-                let i = if d <= mu + j { mu + j - d } else { 0 };
+                let i_isize = mu as isize + j as isize - d as isize;
 
                 // First term: contribution from B_{i,d-1}(x)
-                if j > 0 && j - 1 < b_old.len() && b_old[j - 1] != 0.0 {
+                if j > 0 && j - 1 < b_old.len() && (b_old[j - 1] as f64).abs() > 1e-12 && i_isize >= 0 {
+                    let i = i_isize as usize;
                     // Check bounds first to prevent subtraction with overflow
-                    if i + d < knots.len() && i < knots.len() {
+                    if i + d < knots.len() {
                         let den = knots[i + d] - knots[i];
                         if den > 1e-12 {
                             let alpha = (x_clamped - knots[i]) / den;
@@ -366,12 +368,13 @@ mod internal {
                 }
 
                 // Second term: contribution from B_{i+1,d-1}(x)
-                if j < b_old.len() && b_old[j] != 0.0 {
+                if j < b_old.len() && (b_old[j] as f64).abs() > 1e-12 && i_isize + 1 >= 0 {
+                    let i_plus_1 = (i_isize + 1) as usize;
                     // Check bounds first to prevent subtraction with overflow
-                    if i + 1 + d < knots.len() && i + 1 < knots.len() {
-                        let den = knots[i + 1 + d] - knots[i + 1];
+                    if i_plus_1 + d < knots.len() {
+                        let den = knots[i_plus_1 + d] - knots[i_plus_1];
                         if den > 1e-12 {
-                            let beta = (knots[i + 1 + d] - x_clamped) / den;
+                            let beta = (knots[i_plus_1 + d] - x_clamped) / den;
                             b[j] += beta * b_old[j];
                         }
                     }
@@ -637,8 +640,6 @@ mod tests {
                 if x < knots[degree] || x > knots[knots.len() - degree - 1] {
                     continue;
                 }
-
-
 
                 // Get basis values from iterative implementation
                 let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
