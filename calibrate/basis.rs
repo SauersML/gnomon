@@ -41,6 +41,11 @@ pub enum BasisError {
     )]
     InvalidPenaltyOrder { order: usize, num_basis: usize },
 
+    #[error(
+        "Insufficient knots for degree {degree} spline: need at least {required} knots but only {provided} were provided."
+    )]
+    InsufficientKnotsForDegree { degree: usize, required: usize, provided: usize },
+
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] ndarray_linalg::error::LinalgError),
 }
@@ -80,11 +85,13 @@ pub fn create_bspline_basis_with_knots(
         return Err(BasisError::InvalidDegree(degree));
     }
 
-    // FIXED: Add error checking to prevent overflow
-    if knot_vector.len() <= degree + 1 {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order: degree,
-            num_basis: knot_vector.len(),
+    // Check that we have enough knots for the requested degree
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
         });
     }
 
@@ -414,9 +421,14 @@ mod tests {
                 return 1.0;
             }
             
-            // For a point exactly on knot i (except the last knot), the basis function Ni0
+            // Special case for the first knot (left boundary): the first basis function includes it
+            if i == 0 && x_clamped == knots[0] {
+                return 1.0;
+            }
+            
+            // For a point exactly on knot i (except the first and last knots), the basis function Ni0
             // should return 0, as that point belongs to the next interval's basis function
-            if x_clamped == knots[i] && i < knots.len() - 2 {
+            if x_clamped == knots[i] && i > 0 && i < knots.len() - 2 {
                 // If we're at an internal knot boundary, this basis function doesn't include the point
                 return 0.0;
             }
@@ -639,70 +651,7 @@ mod tests {
                     continue;
                 }
 
-                // Special case handling for boundary points on knots
-                // This is where the two algorithms (recursive vs iterative) handle knot points differently
-                
-                // Check if this point is a knot boundary (exactly equal to any interior knot)
-                // Convert x to f64 explicitly to avoid type ambiguity
-                let x_f64 = x as f64;
-                let is_knot_point = knots.iter().skip(degree).take(knots.len() - 2*degree).any(|&k| (k - x_f64).abs() < 1e-10);
-                
-                // Also check if it's at a domain boundary
-                let is_domain_boundary = (x == knots[degree]) || (x == knots[knots.len() - degree - 1]);
-                
-                if is_knot_point || is_domain_boundary {
-                    // For these edge cases, we don't compare individual basis function values
-                    // Instead, we verify that both implementations satisfy the partition of unity property
-                    
-                    let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
-                    let iterative_sum = iterative_basis.sum();
-                    
-                    // For debugging or verifying special cases, uncomment:
-                    // println!("x={}, knots={:?}, degree={}, iterative_basis={:?}", x, knots, degree, iterative_basis);
-                    
-                    // Calculate recursive basis functions
-                    let num_basis = knots.len() - degree - 1;
-                    let mut recursive_basis = Array1::zeros(num_basis);
-                    
-                    // At domain boundaries, we know exactly which basis function should be 1.0
-                    if degree > 0 && is_domain_boundary {
-                        if x == knots[degree] {
-                            // At left boundary, first basis function is 1.0
-                            recursive_basis[0] = 1.0;
-                        } else if x == knots[knots.len() - degree - 1] {
-                            // At right boundary, last basis function is 1.0
-                            recursive_basis[num_basis - 1] = 1.0;
-                        }
-                    } 
-                    // At interior knots with higher degrees, we need to handle specially
-                    else if is_knot_point {
-                        // Copy the behavior of the iterative implementation
-                        // This ensures both implementations are consistent
-                        recursive_basis = iterative_basis.clone();
-                    } else {
-                        // Standard case: evaluate normally
-                        for i in 0..num_basis {
-                            recursive_basis[i] = evaluate_bspline(x, &knots, i, degree);
-                        }
-                    }
-                    
-                    let recursive_sum = recursive_basis.sum();
-                    
-                    // Check both implementations satisfy partition of unity
-                    assert!(
-                        (iterative_sum - 1.0).abs() < 1e-9,
-                        "Iterative implementation should sum to 1.0 at x={}, got {}",
-                        x, iterative_sum
-                    );
-                    assert!(
-                        (recursive_sum - 1.0).abs() < 1e-9,
-                        "Recursive implementation should sum to 1.0 at x={}, got {}",
-                        x, recursive_sum
-                    );
-                    
-                    // Skip the detailed comparison for these special cases
-                    continue;
-                }
+
 
                 // Get basis values from iterative implementation
                 let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
