@@ -786,7 +786,7 @@ mod tests {
     
     /// Generate a realistic dataset with known relationships between variables
     fn generate_realistic_dataset() -> Result<((Vec<Vec<f64>>, Vec<String>), (Vec<Vec<f64>>, Vec<String>), TrueEffects), io::Error> {
-        // Fixed random seed for reproducibility in tests
+        // Use deterministic random seed to ensure reproducible test results
         const RANDOM_SEED: u64 = 4242;
         
         let n_train = 1000; // Larger training set for more realistic scenario

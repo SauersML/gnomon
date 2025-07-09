@@ -289,19 +289,19 @@ mod internal {
         // (num_knots + degree + 1) - 1 = num_knots + degree
         // We subtract 1 to exclude the intercept basis function (index 0)
         let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
-        
+
         // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
         for m in 1..=total_pgs_bases {
             // Use the FULL unconstrained basis with column m (just like in estimate.rs)
             // This ensures we skip the intercept at index 0 and use columns 1,2,3,...
             let pgs_weight_col = pgs_basis_unc.column(m);
-            
+
             // Iterate through PC names in the canonical order
             for pc_name in &config.pc_names {
                 // Find the PC index from the name
                 let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
                 let pc_basis_con = &pc_constrained_bases[pc_idx];
-                
+
                 // Pure pre-centering approach: use constrained PC basis with unconstrained PGS
                 // PC basis is already constrained (sum-to-zero). No need to center PGS or apply further constraints.
                 let interaction_term = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
@@ -629,7 +629,7 @@ mod tests {
     fn test_save_load_functionality() {
         use crate::calibrate::data::TrainingData;
         use crate::calibrate::estimate;
-        
+
         // Define the BasisConfig to use
         let pgs_basis_config = BasisConfig {
             num_knots: 6,
@@ -639,7 +639,7 @@ mod tests {
             num_knots: 6,
             degree: 3,
         };
-        
+
         // Create a ModelConfig to use for both generation and testing
         let model_config = ModelConfig {
             link_function: LinkFunction::Logit,
@@ -656,22 +656,25 @@ mod tests {
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
         };
-        
+
         // Create a dummy dataset for generating the correct model structure
         // The size doesn't matter much - we just need the function to run
         let n_samples = 10;
         let dummy_data = TrainingData {
             y: Array1::linspace(0.0, 1.0, n_samples),
             p: Array1::linspace(-1.0, 1.0, n_samples),
-            pcs: Array2::from_shape_vec((n_samples, 1), 
-                 Array1::linspace(-0.5, 0.5, n_samples).to_vec()).unwrap(),
+            pcs: Array2::from_shape_vec(
+                (n_samples, 1),
+                Array1::linspace(-0.5, 0.5, n_samples).to_vec(),
+            )
+            .unwrap(),
         };
-        
+
         // Generate the correct constraints and structure using the actual model-building code
-        let (_, _, layout, constraints, knot_vectors) = 
+        let (_, _, layout, constraints, knot_vectors) =
             estimate::internal::build_design_and_penalty_matrices(&dummy_data, &model_config)
                 .expect("Failed to build model matrices");
-                
+
         // Now we can create a test model with the correct structure
         let original_model = TrainedModel {
             config: ModelConfig {
@@ -706,12 +709,9 @@ mod tests {
                         } else {
                             9 // Default fallback
                         };
-                        
+
                         let mut pc_map = HashMap::new();
-                        pc_map.insert(
-                            "PC1".to_string(),
-                            (1..=pc1_dim).map(|i| i as f64).collect(),
-                        );
+                        pc_map.insert("PC1".to_string(), (1..=pc1_dim).map(|i| i as f64).collect());
                         pc_map
                     },
                 },
@@ -722,20 +722,20 @@ mod tests {
                     } else {
                         9 // Default fallback
                     };
-                    
-                    // For the interactions, we need to use pgs_main_basis_unc dimensions 
+
+                    // For the interactions, we need to use pgs_main_basis_unc dimensions
                     // which is the number of unconstrained basis functions excluding intercept
                     // This will typically be pgs_basis_config.num_knots + pgs_basis_config.degree
                     let num_pgs_basis_funcs = 6 + 3; // From pgs_basis_config
-                    
+
                     let mut interactions = HashMap::new();
                     // Build interaction terms for each PGS basis function
                     for i in 1..=num_pgs_basis_funcs {
                         let mut pgs_bx = HashMap::new();
                         // Create coefficients for each PC dimension
                         pgs_bx.insert(
-                            "PC1".to_string(), 
-                            (1..=pc1_dim).map(|j| (i * 10 + j) as f64).collect()
+                            "PC1".to_string(),
+                            (1..=pc1_dim).map(|j| (i * 10 + j) as f64).collect(),
                         );
                         interactions.insert(format!("PGS_B{}", i), pgs_bx);
                     }
