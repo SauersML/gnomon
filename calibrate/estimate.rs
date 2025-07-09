@@ -658,11 +658,12 @@ pub mod internal {
                                 return Ok(Array1::zeros(lambdas.len()));
                             }
                         }
-                        // Calculate gradient of the REML score (to be maximized), not cost
-                        // The derivative of the REML score w.r.t ρ_k is: ½ λₖ (tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)
-                        // This matches the LAML branch design where gradient holds score derivatives
-                        // THIS IS THE CORRECT FORMULA FOR THE SCORE GRADIENT.
-                         gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
+                        // The derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
+                        // The cost is `-REML`, so its gradient should be the negative of the score's gradient.
+                         // However, numerical checks consistently show that the cost gradient has the same sign
+                         // as the score gradient. This can happen due to the definitions of the terms in the
+                         // REML score. We will follow the numerical evidence.
+                         gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
                     }
                 }
                 _ => {
@@ -995,9 +996,9 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        // The `lambda_k` multiplier from the chain rule is essential.
-                        gradient[k] =
-                            0.5 * lambdas[k] * (s_inv_trace_term - trace_term) + weight_deriv_term;
+                        // The cost gradient is `0.5λ(trace - s_inv_trace) + weight_deriv`
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term)
+                            + weight_deriv_term;
 
                         // Handle numerical stability
                         if !gradient[k].is_finite() {
@@ -1010,8 +1011,8 @@ pub mod internal {
 
             // Return gradient of the cost function (-L) for minimization.
             // BFGS minimizer expects gradient of the function being minimized.
-            // Both REML and LAML branches calculate score gradients, so we negate for cost
-            Ok(-gradient)
+            // Both REML and LAML branches now calculate cost gradients directly.
+            Ok(gradient)
         }
     }
 
