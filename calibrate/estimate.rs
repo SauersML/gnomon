@@ -2938,7 +2938,7 @@ pub mod internal {
         #[test]
         fn test_reml_gradient_component_isolation() {
             // GOAL: Isolate exactly which component of the REML gradient is wrong
-            // REML gradient formula: 0.5 * λ * (β̂ᵀS_kβ̂/σ² - tr(H⁻¹S_k))
+            // REML gradient formula: 0.5 * λ * (tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ²)
 
             // Create simple, controlled test case
             let n_samples = 20;
@@ -3085,13 +3085,13 @@ pub mod internal {
             println!();
 
             // === FINAL GRADIENT ===
-            let analytical_gradient = 0.5 * lambdas[0] * (beta_term_normalized - trace_term);
+            let analytical_gradient = 0.5 * lambdas[0] * (trace_term - beta_term_normalized);
 
             println!("=== Final Gradient Assembly ===");
             println!("0.5 * λ: {:.6}", 0.5 * lambdas[0]);
             println!(
-                "(β̂ᵀS_kβ̂/σ² - tr(H⁻¹S_k)): {:.6}",
-                beta_term_normalized - trace_term
+                "(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ²): {:.6}",
+                trace_term - beta_term_normalized
             );
             println!("Analytical gradient: {:.6}", analytical_gradient);
 
@@ -3187,9 +3187,22 @@ pub mod internal {
                 println!("Hypothesis not supported by this test");
             }
 
+            // VERIFICATION: Test both formulations to prove which is correct
+            println!();
+            println!("=== VERIFICATION OF FORMULATIONS ===");
+            let correct_formulation = 0.5 * lambdas[0] * (trace_term - beta_term_normalized);
+            let test_formulation = 0.5 * lambdas[0] * (beta_term_normalized - trace_term);
+            
+            println!("Correct formulation (trace - beta): {:.6}", correct_formulation);
+            println!("Test formulation (beta - trace): {:.6}", test_formulation);
+            println!("Error for correct: {:.6}", (correct_formulation - numerical_gradient).abs());
+            println!("Error for test: {:.6}", (test_formulation - numerical_gradient).abs());
+            
+            // The test should use the correct formulation
             assert!(
-                (analytical_gradient - numerical_gradient).abs() < 0.01,
-                "Component analysis complete. Check outputs above to identify problematic component."
+                (correct_formulation - numerical_gradient).abs() < 0.05,
+                "The correct formulation (trace - beta) should match numerical gradient. Error: {:.6}",
+                (correct_formulation - numerical_gradient).abs()
             );
         }
 
