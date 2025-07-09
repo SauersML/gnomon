@@ -1,4 +1,4 @@
-// Test to verify the CRAZY IDEA about REML gradient sign error
+// Test to verify the hypothesis about REML gradient sign error
 // Hypothesis: beta_term and trace_term should be ADDED, not SUBTRACTED
 
 use ndarray::Array1;

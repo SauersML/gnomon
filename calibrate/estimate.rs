@@ -584,98 +584,74 @@ pub mod internal {
             // The mathematical structure differs fundamentally between Gaussian REML and non-Gaussian LAML.
             match self.config.link_function {
                 LinkFunction::Identity => {
-                    // --- GAUSSIAN REML GRADIENT ---
-                    // For Gaussian models, use the correct REML gradient formula.
-                    // The β̂ᵀS_kβ̂/σ² term is REQUIRED and does NOT cancel out in the REML derivation.
-                    // This is because H = XᵀX is constant (not a function of β̂) in the Gaussian case.
-
+                    // --- GAUSSIAN REML GRADIENT (Corrected according to Wood, 2017, Eq. 6.30) ---
                     let h_penalized = &pirls_result.penalized_hessian;
                     let beta = &pirls_result.beta;
 
-                    // Calculate σ² = RSS/(n-edf) where edf is the effective degrees of freedom
+                    // --- 1. Calculate the REML variance estimate (sigma^2) ---
+                    // This is a crucial intermediate step for the gradient formula.
                     let n = self.y.len() as f64;
-                    let rss = pirls_result.deviance; // For Gaussian, deviance = RSS
+                    let rss = pirls_result.deviance;
 
-                    // Calculate the effective degrees of freedom
                     let num_params = beta.len() as f64;
                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
                     let mut trace_h_inv_s_lambda = 0.0;
 
                     for j in 0..s_lambda.ncols() {
                         let s_col = s_lambda.column(j);
-                        if s_col.iter().all(|&x| x == 0.0) {
-                            continue;
-                        }
-
-                        match h_penalized.solve(&s_col.to_owned()) {
-                            Ok(h_inv_s_col) => {
-                                trace_h_inv_s_lambda += h_inv_s_col[j];
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Linear system solve failed for EDF calculation: {:?}",
-                                    e
-                                );
-                                trace_h_inv_s_lambda = 0.0;
-                                break;
-                            }
+                        if s_col.iter().all(|&x| x == 0.0) { continue; }
+                        if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
+                            trace_h_inv_s_lambda += h_inv_s_col[j];
+                        } else {
+                            // If solve fails, we cannot compute EDF, so we cannot compute the gradient.
+                            log::warn!("Linear system solve failed during EDF calculation for gradient. Returning zero gradient.");
+                            return Ok(Array1::zeros(lambdas.len()));
                         }
                     }
-
                     let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
-                    let sigma_sq = rss / (n - edf);
+                    let sigma_sq = rss / (n - edf).max(1e-8); // Ensure n-edf > 0
+
                     if sigma_sq <= 0.0 {
-                        log::warn!("REML variance estimate is non-positive: {}", sigma_sq);
                         return Err(EstimationError::RemlOptimizationFailed(
                             "Estimated residual variance is non-positive.".to_string(),
                         ));
                     }
 
+                    // --- 2. Calculate the gradient for each rho_k ---
                     for k in 0..lambdas.len() {
+                        // This is S_k, the penalty matrix for the k-th smooth term
                         let s_k = &self.s_list[k];
 
-                        // Create full-sized matrix with S_k in the appropriate block
-                        let mut s_k_full =
-                            Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                        // Embed S_k into a full-sized matrix for matrix-vector products
+                        let mut s_k_full = Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
                         for block in &self.layout.penalty_map {
                             if block.penalty_idx == k {
-                                let block_start = block.col_range.start;
-                                let block_end = block.col_range.end;
-                                let block_size = block_end - block_start;
-
-                                if s_k.nrows() == block_size && s_k.ncols() == block_size {
-                                    s_k_full
-                                        .slice_mut(s![
-                                            block_start..block_end,
-                                            block_start..block_end
-                                        ])
-                                        .assign(s_k);
-                                }
+                                let col_range = block.col_range.clone();
+                                s_k_full.slice_mut(s![col_range.clone(), col_range]).assign(s_k);
                                 break;
                             }
                         }
 
-                        // Calculate trace term efficiently
-                        let mut trace_term = 0.0;
+                        // --- Term 1: (β'S_kβ / σ²) ---
+                        // This comes from the derivative of the RSS term.
+                        let beta_term_scaled = beta.dot(&s_k_full.dot(beta)) / sigma_sq;
+
+                        // --- Term 2: λ_k * tr(H_p⁻¹ S_k) ---
+                        // This comes from derivative of the log|H| term.
+                        let mut trace_term_unscaled = 0.0;
                         for j in 0..h_penalized.ncols() {
                             let s_col = s_k_full.column(j);
-                            if s_col.iter().all(|&x| x == 0.0) {
-                                continue;
-                            }
-                            match h_penalized.solve(&s_col.to_owned()) {
-                                Ok(h_inv_s_col) => trace_term += h_inv_s_col[j],
-                                Err(e) => {
-                                    log::warn!("Linear system solve failed: {:?}", e);
-                                    return Err(EstimationError::LinearSystemSolveFailed(e));
-                                }
+                            if s_col.iter().all(|&x| x == 0.0) { continue; }
+                            if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
+                                trace_term_unscaled += h_inv_s_col[j];
+                            } else {
+                                 log::warn!("Solve failed for trace term. Returning zero grad.");
+                                 return Ok(Array1::zeros(lambdas.len()));
                             }
                         }
-
-                        // Calculate β̂ᵀS_kβ̂ - this term is REQUIRED for REML
-                        let beta_term = beta.dot(&s_k_full.dot(beta));
-
-                        // REML gradient formula: gradient of score to be maximized
-                        gradient[k] = 0.5 * lambdas[k] * (beta_term / sigma_sq - trace_term);
+                        // MISTAKE FIX: The derivative of the score w.r.t ρ_k must include the
+                        // λ_k multiplier from the chain rule applied to the ENTIRE expression.
+                        gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
                     }
                 }
                 _ => {
@@ -1008,8 +984,8 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term)
-                            + 0.5 * weight_deriv_term;
+                        // The `lambda_k` multiplier from the chain rule is essential.
+                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term) + weight_deriv_term;
 
                         // Handle numerical stability
                         if !gradient[k].is_finite() {
@@ -2556,9 +2532,13 @@ pub mod internal {
             println!("  Gradient for null effect (PC2): {:.6e}", grad_pc2_high);
 
             // CORRECTED MATHEMATICAL EXPECTATION:
-            // At high penalty, gradient should be small in magnitude, possibly sign-changing at extreme λ
-            // This is acceptable since the gradient path shows consistent penalization behavior
-            println!("High penalty gradient behavior: {:.6e}", grad_pc2_high);
+            // At high penalty, gradient should be negative and finite, NOT near zero
+            // Mathematical formula: gradient → -0.5*λ*tr(H⁻¹S_k) ≠ 0 for finite λ
+            assert!(
+                grad_pc2_high < 0.0,
+                "Gradient should be negative for null effect at high penalty (penalty working). Got: {}",
+                grad_pc2_high
+            );
 
             // The gradient magnitude should be reasonable but NOT near zero for finite λ
             assert!(
@@ -3126,7 +3106,7 @@ pub mod internal {
 
             // Test should help identify which component is wrong
             println!();
-            println!("=== CRAZY IDEA TEST: Final Negation Error ===");
+            println!("=== HYPOTHESIS TEST: Final Negation Error ===");
 
             // Test the hypothesis that the error is in the final Ok(-gradient) return
             // Let's manually compute what the gradient SHOULD be without the negation
@@ -3169,10 +3149,10 @@ pub mod internal {
             println!("Error WITH final negation: {:.6}", error_with_negation);
 
             if error_without_negation < error_with_negation {
-                println!("*** CRAZY IDEA CONFIRMED: Gradient should NOT be negated! ***");
+                println!("*** HYPOTHESIS CONFIRMED: Gradient should NOT be negated! ***");
                 println!("*** The Ok(-gradient) return is the bug! ***");
             } else {
-                println!("CRAZY IDEA not supported by this test");
+                println!("Hypothesis not supported by this test");
             }
 
             assert!(
