@@ -430,10 +430,21 @@ mod tests {
             }
             
             // 3. Critical boundary exception for partition of unity:
-            // The very last interval must be treated as closed [t_n, t_{n+1}] to ensure
-            // that the basis functions sum to 1 everywhere, including at the upper boundary.
-            if i == knots.len() - 2 && x_clamped == knots[i + 1] {
-                return 1.0;
+            // The rightmost non-zero-length interval must be treated as closed [t_i, t_{i+1}] 
+            // to ensure that the basis functions sum to 1 at the upper boundary.
+            // Find the last non-zero-length interval
+            let mut last_nonzero_interval = None;
+            for j in (0..(knots.len()-1)).rev() {
+                if (knots[j + 1] - knots[j]).abs() >= 1e-12 {
+                    last_nonzero_interval = Some(j);
+                    break;
+                }
+            }
+            
+            if let Some(last_interval) = last_nonzero_interval {
+                if i == last_interval && x_clamped == knots[i + 1] {
+                    return 1.0;
+                }
             }
             
             // 4. All other cases: x is outside this basis function's support
@@ -613,6 +624,168 @@ mod tests {
             "Basis functions should sum to 1.0 at boundary, got {}",
             sum
         );
+    }
+
+    #[test]
+    fn test_basis_boundary_values() {
+        // Property-based test: Verify boundary conditions using mathematical properties
+        // This complements the cross-validation test by testing fundamental B-spline properties
+        
+        // A cubic B-spline basis. Knots are [0,0,0,0, 1,2,3, 4,4,4,4].
+        // The domain is [0, 4].
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3;
+        let num_basis = knots.len() - degree - 1; // 11 - 3 - 1 = 7
+
+        // Test at the lower boundary (x=0)
+        let basis_at_start = internal::evaluate_splines_at_point(0.0, degree, knots.view());
+        
+        // At the very start of the domain, only the first basis function should be non-zero (and equal to 1).
+        assert_abs_diff_eq!(basis_at_start[0], 1.0, epsilon = 1e-9);
+        for i in 1..num_basis {
+            assert_abs_diff_eq!(basis_at_start[i], 0.0, epsilon = 1e-9);
+        }
+
+        // Test at the upper boundary (x=4)
+        let basis_at_end = internal::evaluate_splines_at_point(4.0, degree, knots.view());
+
+        // At the very end of the domain, only the LAST basis function should be non-zero (and equal to 1).
+        for i in 0..(num_basis - 1) {
+            assert_abs_diff_eq!(basis_at_end[i], 0.0, epsilon = 1e-9);
+        }
+        assert_abs_diff_eq!(basis_at_end[num_basis - 1], 1.0, epsilon = 1e-9);
+        
+        // Test intermediate points for partition of unity
+        let test_points = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
+        for &x in &test_points {
+            let basis = internal::evaluate_splines_at_point(x, degree, knots.view());
+            let sum: f64 = basis.sum();
+            assert_abs_diff_eq!(sum, 1.0, epsilon = 1e-9);
+            if (sum - 1.0).abs() >= 1e-9 {
+                panic!("Partition of unity failed at x={}", x);
+            }
+        }
+    }
+
+    #[test]
+    fn test_degree_0_boundary_behavior() {
+        let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        let x = 2.0;
+        
+        println!("Testing degree-0 basis functions at x=2:");
+        println!("Knots: {:?}", knots);
+        println!();
+        
+        // Test each possible degree-0 basis function
+        for i in 0..(knots.len()-1) {
+            let value = evaluate_bspline(x, &knots, i, 0);
+            println!("B_{},0 at x=2: {} (interval [{}, {}))", i, value, knots[i], knots[i+1]);
+            
+            // Manual check
+            let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
+            let in_interval = x_clamped >= knots[i] && x_clamped < knots[i + 1];
+            let is_last_interval = i == knots.len() - 2;
+            let at_upper_boundary = x_clamped == knots[i + 1];
+            
+            println!("  x_clamped={}, in_interval={}, is_last_interval={}, at_upper_boundary={}", 
+                    x_clamped, in_interval, is_last_interval, at_upper_boundary);
+            
+            if (knots[i + 1] - knots[i]).abs() < 1e-12 {
+                println!("  Zero-length interval, should return 0");
+            } else if in_interval {
+                println!("  In interval, should return 1");
+            } else if is_last_interval && at_upper_boundary {
+                println!("  Last interval + upper boundary, should return 1");
+            } else {
+                println!("  Outside, should return 0");
+            }
+            println!();
+        }
+    }
+
+    #[test]
+    fn test_boundary_analysis() {
+        // Test case from the failing test: knots [0, 0, 1, 2, 2], degree 1, x=2
+        let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        let degree = 1;
+        let x = 2.0;
+        
+        println!("Testing knots: {:?}", knots);
+        println!("Degree: {}", degree);
+        println!("Point: x = {}", x);
+        println!();
+        
+        // The number of basis functions for this case
+        let num_basis = knots.len() - degree - 1;
+        println!("Number of basis functions: {}", num_basis);
+        
+        // Test each basis function individually with recursive implementation
+        for i in 0..num_basis {
+            let value = evaluate_bspline(x, &knots, i, degree);
+            println!("Recursive B_{},{} at x={}: {}", i, degree, x, value);
+            
+            // Also test degree 0 components to understand boundary handling
+            if degree == 1 {
+                let b_i_0 = evaluate_bspline(x, &knots, i, 0);
+                let b_i1_0 = if i + 1 < knots.len() - 1 { 
+                    evaluate_bspline(x, &knots, i + 1, 0) 
+                } else { 
+                    0.0 
+                };
+                println!("  Components: B_{},0={}, B_{},0={}", i, b_i_0, i+1, b_i1_0);
+            }
+        }
+        
+        // Test with iterative implementation
+        let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
+        println!();
+        println!("Iterative implementation:");
+        for i in 0..num_basis {
+            println!("Iterative B_{},{} at x={}: {}", i, degree, x, iterative_basis[i]);
+        }
+        
+        // Check sum
+        let recursive_sum: f64 = (0..num_basis)
+            .map(|i| evaluate_bspline(x, &knots, i, degree))
+            .sum();
+        let iterative_sum = iterative_basis.sum();
+        println!();
+        println!("Recursive sum: {}", recursive_sum);
+        println!("Iterative sum: {}", iterative_sum);
+        
+        // Test the specific failing case: basis function 2 at x=2
+        println!();
+        println!("Specific failing case:");
+        println!("Recursive B_{},{} at x={}: {}", 2, degree, x, evaluate_bspline(x, &knots, 2, degree));
+        println!("Iterative B_{},{} at x={}: {}", 2, degree, x, iterative_basis[2]);
+        
+        // Let's manually trace the recursion for B_2,1(x=2)
+        println!();
+        println!("Manual trace of B_2,1(x=2):");
+        println!("B_2,1(x) = (x - t_2)/(t_3 - t_2) * B_2,0(x) + (t_4 - x)/(t_4 - t_3) * B_3,0(x)");
+        println!("t_2 = {}, t_3 = {}, t_4 = {}", knots[2], knots[3], knots[4]);
+        
+        let b20 = evaluate_bspline(x, &knots, 2, 0);
+        let b30 = evaluate_bspline(x, &knots, 3, 0);
+        
+        println!("B_2,0(x=2) = {}", b20);
+        println!("B_3,0(x=2) = {}", b30);
+        
+        let term1 = if (knots[3] - knots[2]).abs() > 1e-10 {
+            (x - knots[2]) / (knots[3] - knots[2]) * b20
+        } else {
+            0.0
+        };
+        
+        let term2 = if (knots[4] - knots[3]).abs() > 1e-10 {
+            (knots[4] - x) / (knots[4] - knots[3]) * b30
+        } else {
+            0.0
+        };
+        
+        println!("Term 1: ({} - {}) / ({} - {}) * {} = {}", x, knots[2], knots[3], knots[2], b20, term1);
+        println!("Term 2: ({} - {}) / ({} - {}) * {} = {}", knots[4], x, knots[4], knots[3], b30, term2);
+        println!("Total: {} + {} = {}", term1, term2, term1 + term2);
     }
 
     #[test]
