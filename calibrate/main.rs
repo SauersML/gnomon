@@ -119,7 +119,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        // --- Corrected Train Command ---
+        // --- Train Command ---
         // Note the absence of `lambda`. It is no longer a user-provided argument.
         Commands::Train {
             training_data,

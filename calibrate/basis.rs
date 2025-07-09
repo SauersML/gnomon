@@ -299,7 +299,7 @@ mod internal {
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses a corrected, stable implementation of the Cox-de Boor algorithm.
+    /// This uses a numerically stable implementation of the Cox-de Boor algorithm.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
@@ -583,8 +583,8 @@ mod tests {
 
     #[test]
     fn test_cox_de_boor_higher_degree() {
-        // Test that verifies the Cox-de Boor denominator fix for higher degree splines
-        // Using non-uniform knots where the bug would be more apparent
+        // Test that verifies the Cox-de Boor denominator handling for higher degree splines
+        // Using non-uniform knots where numerical issues would be more apparent
         let knots = array![0.0, 0.0, 0.0, 1.0, 3.0, 4.0, 4.0, 4.0];
         let x = 2.0;
 
@@ -610,9 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn test_boundary_value_panic_fix() {
-        // Test for the boundary value panic bug described in the issue.
-        // This test ensures that evaluation at the upper boundary doesn't panic.
+    fn test_boundary_value_handling() {
+        // Test for proper boundary value handling at the upper boundary.
+        // This test ensures that evaluation at the upper boundary works correctly.
 
         // Test the internal function directly with the problematic case
         let knots = array![

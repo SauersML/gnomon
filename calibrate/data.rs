@@ -171,7 +171,7 @@ mod internal {
                 }
             };
 
-            // Check for nulls AFTER casting - this is the key fix!
+            // Check for nulls AFTER casting to detect non-numeric values
             if phenotype_casted.null_count() > 0 {
                 return Err(DataError::ColumnWrongType {
                     column_name: "phenotype".to_string(),
@@ -205,7 +205,7 @@ mod internal {
             }
         };
 
-        // Check for nulls AFTER casting - this is the key fix!
+        // Check for nulls AFTER casting to detect non-numeric values
         // Casting non-numeric strings to f64 produces nulls, which we need to detect here
         if score_casted.null_count() > 0 {
             return Err(DataError::ColumnWrongType {
@@ -238,7 +238,7 @@ mod internal {
                 }
             };
 
-            // Check for nulls AFTER casting - this is the key fix!
+            // Check for nulls AFTER casting to detect non-numeric values
             if pc_casted.null_count() > 0 {
                 return Err(DataError::ColumnWrongType {
                     column_name: pc_name.clone(),
