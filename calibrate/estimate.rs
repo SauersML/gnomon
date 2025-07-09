@@ -525,6 +525,43 @@ pub mod internal {
         /// In essence, when differentiating the full LAML score with respect to smoothing parameters,
         /// indirect effects through β̂ create terms that precisely cancel the explicit β̂ᵀS_kβ̂ term.
         /// This is not an approximation but an exact mathematical result from the total derivative.
+
+        // 1.  Start with the chain rule.  For any λₖ,
+        //     dV/dλₖ = ∂V/∂λₖ  (holding β̂ fixed)  +  (∂V/∂β̂)ᵀ · (∂β̂/∂λₖ).
+        //     The first summand is called the direct part, the second the indirect part.
+        //
+        // 2.  Two different outer criteria are used.  With a Gaussian likelihood the programme maximises the
+        //     restricted maximum likelihood (REML).  With a non-Gaussian likelihood it maximises a Laplace
+        //     approximation to the marginal likelihood (LAML).  These objectives respond differently to β̂.
+        //
+        //     2.1  Gaussian case, REML.
+        //          The REML construction integrates the fixed effects out of the likelihood.  At the optimum
+        //          the partial derivative ∂V/∂β̂ is exactly zero.  The indirect part therefore vanishes.
+        //          What remains is the direct derivative of the penalty and determinant terms.  The penalty
+        //          contribution is found by differentiating −½ β̂ᵀ S_λ β̂ / σ² with respect to λₖ; this yields
+        //          −½ β̂ᵀ Sₖ β̂ / σ².  No opposing term exists, so the quantity stays in the REML gradient.
+        //          The code path selected by LinkFunction::Identity therefore computes
+        //          beta_term = β̂ᵀ Sₖ β̂ and places it inside
+        //          gradient[k] = 0.5 * λₖ * (beta_term / σ² − trace_term).
+        //
+        //     2.2  Non-Gaussian case, LAML.
+        //          The Laplace objective contains −½ log |H_p| with H_p = Xᵀ W(β̂) X + S_λ.  Because W
+        //          depends on β̂, the partial derivative ∂V/∂β̂ is not zero.  The indirect part is present
+        //          and must be evaluated.  Differentiating the optimality condition for β̂ gives
+        //          ∂β̂/∂λₖ = −λₖ H_p⁻¹ Sₖ β̂.  Meanwhile ∂V/∂β̂ equals −½ tr(H_p⁻¹ ∂H_p/∂β̂).
+        //          Multiplying these two factors produces +½ λₖ β̂ᵀ Sₖ β̂ plus an additional trace that
+        //          involves the derivative of W.  The direct part still contributes −½ λₖ β̂ᵀ Sₖ β̂.
+        //          The two quadratic terms are equal in magnitude and opposite in sign, so they cancel
+        //          exactly.  After cancellation the gradient reduces to
+        //            0.5 λₖ [ tr(S_λ⁺ Sₖ) − tr(H_p⁻¹ Sₖ) ]  +  0.5 tr(H_p⁻¹ Xᵀ ∂W/∂λₖ X).
+        //          No β̂ᵀ Sₖ β̂ term remains.  The non-Gaussian branch therefore leaves the beta_term code
+        //          commented out and assembles
+        //          gradient[k] = 0.5 * λₖ * (s_inv_trace_term − trace_term) + 0.5 * weight_deriv_term.
+        //
+        // 3.  The sign of ∂β̂/∂λₖ matters.  From the implicit-function theorem the linear solve reads
+        //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
+        //     direct quadratic pieces are exact negatives, which is what the algebra requires.
+
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
