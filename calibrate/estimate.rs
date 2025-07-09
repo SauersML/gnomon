@@ -661,7 +661,7 @@ pub mod internal {
                         // The derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
                         // The cost is `-REML`, so its gradient is the negative of the score's gradient.
                         // Therefore: gradient of cost = 0.5*λ*(β̂ᵀSₖβ̂/σ² - tr(H⁻¹Sₖ))
-                        gradient[k] = -0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
                     }
                 }
                 _ => {
