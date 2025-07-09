@@ -11,6 +11,13 @@ struct ViolationCollector {
     file_path: PathBuf,
 }
 
+// A collector for forbidden comment content
+struct ForbiddenCommentCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+    check_stars_in_doc_comments: bool,
+}
+
 impl ViolationCollector {
     fn new(file_path: &Path) -> Self {
         Self {
@@ -47,6 +54,39 @@ impl ViolationCollector {
     }
 }
 
+impl ForbiddenCommentCollector {
+    fn new(file_path: &Path, check_stars_in_doc_comments: bool) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+            check_stars_in_doc_comments,
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} forbidden comment patterns in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {}\n", violation));
+        }
+
+        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', or 'FIX' are not allowed in this project.\n");
+        error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
+        error_msg.push_str("   Please remove these patterns before committing.\n");
+
+        Some(error_msg)
+    }
+}
+
 // Implement the `Sink` trait for our collector.
 // The `matched` method is called by the searcher for every line that matches the regex.
 impl Sink for ViolationCollector {
@@ -66,6 +106,33 @@ impl Sink for ViolationCollector {
     }
 }
 
+// Implement the Sink trait for the forbidden comment collector
+impl Sink for ForbiddenCommentCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Skip ** in doc comments if not checking for them
+        if !self.check_stars_in_doc_comments && 
+           is_doc_comment(line_text) && 
+           line_text.contains("**") && 
+           !line_text.contains("FIXED") && 
+           !line_text.contains("CORRECTED") && 
+           !line_text.contains("FIX") {
+            // Skip this match, it's just ** in a doc comment
+            return Ok(true);
+        }
+
+        // Format the violation string
+        self.violations
+            .push(format!("{}:{}", line_number, line_text));
+
+        Ok(true)
+    }
+}
+
 fn main() {
     // Always rerun this script if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
@@ -77,6 +144,12 @@ fn main() {
     if let Err(e) = scan_for_underscore_prefixes() {
         // Print the formatted error and fail the build.
         // The `eprintln!` here is crucial for showing the error in `cargo`'s output.
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+    
+    // Scan Rust source files for forbidden comment patterns and fail if found.
+    if let Err(e) = scan_for_forbidden_comment_patterns() {
         eprintln!("{}", e);
         std::process::exit(1);
     }
@@ -159,5 +232,45 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
     }
 
     // If the loop completes without finding any violations, the check passes.
+    Ok(())
+}
+
+fn is_doc_comment(line: &str) -> bool {
+    line.trim_start().starts_with("///")
+}
+
+fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
+    // Regex patterns to find forbidden comment patterns
+    // Note: We specifically target comments by looking for // or /* */ patterns
+    // This ensures we don't flag these terms in actual code
+    
+    // Single pattern to check for all forbidden patterns in all types of comments
+    // We'll filter doc comments with ** in the Sink implementation
+    let comment_pattern = r"(//|/\*).*\b(FIXED|CORRECTED|FIX)\b|(//|/\*).*\*\*";
+    
+    let mut searcher = Searcher::new();
+    
+    // Compile the pattern
+    let comment_matcher = RegexMatcher::new_line_matcher(comment_pattern)?;
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+        .filter(|e| e.file_name() != "build.rs")      // Exclude the build script itself
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+    {
+        let path = entry.path();
+        
+        // Use a single collector with custom filtering logic
+        // false means don't check for ** in doc comments
+        let mut collector = ForbiddenCommentCollector::new(path, false);
+        searcher.search_path(&comment_matcher, path, &mut collector)?;
+        
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            return Err(error_message.into());
+        }
+    }
+
     Ok(())
 }
