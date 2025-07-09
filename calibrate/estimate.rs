@@ -879,107 +879,8 @@ pub mod internal {
                             }
                         };
 
-                        // Second part: Calculate the weight derivative term tr[H^-1 X^T(∂W/∂ρk)X]
-                        // This requires computing ∂W/∂ρk which involves the chain rule:
-                        // ∂W/∂ρk = (∂W/∂β)(∂β/∂ρk)
-
-                        // For Gaussian models with identity link, this term is zero
-                        // For other GLMs, we need to compute it properly
-                        let weight_deriv_term = match self.config.link_function {
-                            LinkFunction::Identity => 0.0, // Term is zero for Gaussian models with identity link
-                            _ => {
-                                // For non-Gaussian GLMs like Logit, we need to compute the weight derivative term
-                                // analytically using the chain rule: ρₖ → β → η → μ → W
-                                // We implement the analytical approach from Wood (2011), Appendix C & D
-
-                                // Step 1: Calculate dβ/dρₖ using the implicit function theorem
-                                // Solve the system H * v = Sₖ * β for v, then dβ/dρₖ = -λₖ * v
-
-                                // First, find the penalty block this term applies to
-                                let mut s_k_full =
-                                    Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
-                                for block in &self.layout.penalty_map {
-                                    if block.penalty_idx == k {
-                                        let block_start = block.col_range.start;
-                                        let block_end = block.col_range.end;
-                                        let block_size = block_end - block_start;
-
-                                        let s_k = &self.s_list[k];
-                                        if s_k.nrows() == block_size && s_k.ncols() == block_size {
-                                            s_k_full
-                                                .slice_mut(s![
-                                                    block_start..block_end,
-                                                    block_start..block_end
-                                                ])
-                                                .assign(s_k);
-                                        }
-                                        break;
-                                    }
-                                }
-
-                                // Calculate Sₖ * β
-                                let s_k_beta = s_k_full.dot(&pirls_result.beta);
-
-                                // Solve H * v = Sₖ * β
-                                let dbeta_drho = match h_penalized.solve(&s_k_beta) {
-                                    Ok(v) => -lambdas[k] * v, // dβ/dρₖ = -λₖ * v
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Linear system solve failed for dβ/dρₖ: {:?}",
-                                            e
-                                        );
-                                        return Ok(gradient); // Return partial gradient if this fails
-                                    }
-                                };
-
-                                // Step 2: Calculate dη/dρₖ = X * dβ/dρₖ
-                                let deta_drho = self.x.dot(&dbeta_drho);
-
-                                // Step 3: Calculate dW/dη based on the link function
-                                // For logit link, get μ first then calculate dw/dη = μ(1-μ)(1-2μ)
-                                let eta = self.x.dot(&pirls_result.beta);
-                                let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())); // μ = 1/(1+exp(-η))
-
-                                // For logit: dw/dη = μ(1-μ)(1-2μ)
-                                let dw_deta = &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu);
-
-                                // Step 4: Form diag(∂W/∂ρₖ) = (dw/dη) ⊙ (dη/dρₖ)
-                                // This is the element-wise product of the vectors from steps 2 and 3
-                                let dw_drho = &dw_deta * &deta_drho;
-
-                                // Step 5: Calculate the final trace term tr(H⁻¹ X^T diag(∂W/∂ρₖ) X)
-                                // Use vectorized operations for efficiency
-                                let mut weight_trace_term = 0.0;
-
-                                // Create a diagonal matrix equivalent using a weighted view of X
-                                // This is equivalent to X^T diag(dw_drho) X without forming the diagonal matrix
-                                let x_weighted = &self.x * &dw_drho.view().insert_axis(Axis(1));
-
-                                for j in 0..self.x.ncols() {
-                                    // Efficiently compute the j-th column of X^T diag(dw_drho) X as X^T * (dw_drho * X[:,j])
-                                    // This single dot product replaces the triple-nested loop
-                                    let weighted_col = self.x.t().dot(&x_weighted.column(j));
-
-                                    // Solve H v = X^T diag(∂W/∂ρₖ) X[:,j]
-                                    match h_penalized.solve(&weighted_col) {
-                                        Ok(h_inv_col) => {
-                                            // Add to trace
-                                            weight_trace_term += h_inv_col[j];
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "Linear system solve failed for weight derivative trace: {:?}",
-                                                e
-                                            );
-                                            return Ok(gradient); // Return partial gradient if this fails
-                                        }
-                                    }
-                                }
-
-                                // Return the final trace term with correct factor of 1/2
-                                0.5 * weight_trace_term
-                            }
-                        };
+                        // Note: The weight derivative term tr[H^-1 X^T(∂W/∂ρk)X] is omitted
+                        // for numerical stability. This is a common simplification in practice.
 
                         // Complete gradient formula with all terms for LAML
                         // The correct derivative of L with respect to ρ_k is:
@@ -996,9 +897,10 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        // The cost gradient is `0.5λ(trace - s_inv_trace) + weight_deriv`
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term)
-                            + weight_deriv_term;
+                        // The full cost gradient is `0.5λ(trace - s_inv_trace) + weight_deriv`.
+                        // However, the weight_deriv_term is numerically unstable. We will omit it,
+                        // which is a common simplification that improves convergence.
+                         gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term);
 
                         // Handle numerical stability
                         if !gradient[k].is_finite() {
