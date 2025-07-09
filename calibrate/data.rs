@@ -7,12 +7,12 @@
 //! statistical core.
 //!
 //! ## Design Philosophy
-//! - **Strict Schema:** Column names are not configurable. The module enforces
+//! - Strict Schema: Column names are not configurable. The module enforces
 //!   the use of `phenotype`, `score`, `PC1`, `PC2`, etc. This simplifies the
 //!   user interface and eliminates a class of configuration errors.
-//! - **User-Centric Errors:** Failures are assumed to be user-input errors.
+//! - User-Centric Errors: Failures are assumed to be user-input errors.
 //!   The `DataError` enum is designed to provide clear, actionable feedback.
-//! - **Performance:** It leverages the `polars` Lazy API to minimize memory
+//! - Performance: It leverages the `polars` Lazy API to minimize memory
 //!   usage and I/O by only loading required columns from disk.
 
 use ndarray::{Array1, Array2};

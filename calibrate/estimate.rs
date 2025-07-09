@@ -5,14 +5,14 @@
 //! moving beyond simple hyperparameter-driven models. This is achieved through a
 //! nested optimization scheme, a standard and robust approach for this class of models:
 //!
-//! 1.  **Outer Loop (BFGS):** Optimizes the log-smoothing parameters (`rho`) by
+//! 1.  Outer Loop (BFGS): Optimizes the log-smoothing parameters (`rho`) by
 //!     maximizing a marginal likelihood criterion. For non-Gaussian models (e.g., Logit),
 //!     this is the Laplace Approximate Marginal Likelihood (LAML). This advanced strategy
 //!     is detailed in Wood (2011), upon which this implementation is heavily based. The
 //!     BFGS algorithm itself is a classic quasi-Newton method, with our implementation
 //!     following the standard described in Nocedal & Wright (2006).
 //!
-//! 2.  **Inner Loop (P-IRLS):** For each set of trial smoothing parameters from the
+//! 2.  Inner Loop (P-IRLS): For each set of trial smoothing parameters from the
 //!     outer loop, this routine finds the corresponding model coefficients (`beta`) by
 //!     running a Penalized Iteratively Reweighted Least Squares (P-IRLS) algorithm
 //!     to convergence.
@@ -3149,8 +3149,8 @@ pub mod internal {
             println!("Error WITH final negation: {:.6}", error_with_negation);
 
             if error_without_negation < error_with_negation {
-                println!("*** HYPOTHESIS CONFIRMED: Gradient should NOT be negated! ***");
-                println!("*** The Ok(-gradient) return is the bug! ***");
+                println!("HYPOTHESIS CONFIRMED: Gradient should NOT be negated!");
+                println!("The Ok(-gradient) return is the bug!");
             } else {
                 println!("Hypothesis not supported by this test");
             }
