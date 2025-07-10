@@ -79,7 +79,8 @@ impl ForbiddenCommentCollector {
             error_msg.push_str(&format!("   {}\n", violation));
         }
 
-        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', or 'FIX' are not allowed in this project.\n");
+        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', or 'FIX' are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str("   Please remove these patterns before committing.\n");
 
@@ -115,6 +116,7 @@ impl Sink for ForbiddenCommentCollector {
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
         // Skip ** in doc comments if not checking for them
+        // But NEVER skip any line containing FIXED, CORRECTED, or FIX
         if !self.check_stars_in_doc_comments && 
            is_doc_comment(line_text) && 
            line_text.contains("**") && 
@@ -244,15 +246,37 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
     
-    // Single pattern to check for all forbidden patterns in all types of comments
-    // We'll filter doc comments with ** in the Sink implementation
-    let comment_pattern = r"(//|/\*).*\b(FIXED|CORRECTED|FIX)\b|(//|/\*).*\*\*";
+    // Split into two separate patterns for clarity and reliability
+    // 1. Pattern to catch forbidden words in comments
+    let forbidden_words_pattern = r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX)";
+    // 2. Pattern to catch ** in comments (excluding doc comments)
+    let stars_pattern = r"(//|/\*).*\*\*";
     
+    // First check for forbidden words
+    let forbidden_matcher = RegexMatcher::new_line_matcher(forbidden_words_pattern)?;
     let mut searcher = Searcher::new();
     
-    // Compile the pattern
-    let comment_matcher = RegexMatcher::new_line_matcher(comment_pattern)?;
-
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+        .filter(|e| e.file_name() != "build.rs")      // Exclude the build script itself
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+    {
+        let path = entry.path();
+        
+        // Use a collector that doesn't filter out doc comments for forbidden words
+        let mut collector = ForbiddenCommentCollector::new(path, true);
+        searcher.search_path(&forbidden_matcher, path, &mut collector)?;
+        
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            return Err(error_message.into());
+        }
+    }
+    
+    // Then check for stars in non-doc comments
+    let stars_matcher = RegexMatcher::new_line_matcher(stars_pattern)?;
+    
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_map(|e| e.ok())
@@ -265,7 +289,7 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
         // Use a single collector with custom filtering logic
         // false means don't check for ** in doc comments
         let mut collector = ForbiddenCommentCollector::new(path, false);
-        searcher.search_path(&comment_matcher, path, &mut collector)?;
+        searcher.search_path(&stars_matcher, path, &mut collector)?;
         
         if let Some(error_message) = collector.check_and_get_error_message() {
             return Err(error_message.into());
