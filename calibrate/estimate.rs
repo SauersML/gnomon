@@ -605,11 +605,10 @@ pub mod internal {
                         if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
                             trace_h_inv_s_lambda += h_inv_s_col[j];
                         } else {
-                            // If solve fails, we cannot compute EDF, so we cannot compute the gradient.
-                            log::warn!(
-                                "Linear system solve failed during EDF calculation for gradient. Returning zero gradient."
-                            );
-                            return Ok(Array1::zeros(lambdas.len()));
+                            // If solve fails, the penalized Hessian is singular or near-singular
+                            return Err(EstimationError::RemlOptimizationFailed(
+                                format!("Penalized Hessian is singular during EDF calculation. This typically indicates the model is over-parameterized (too many penalties: {} for dataset size: {}). Try reducing model complexity or using fewer penalty terms.", lambdas.len(), self.y.len())
+                            ));
                         }
                     }
                     let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
@@ -627,15 +626,17 @@ pub mod internal {
                         let s_k = &self.s_list[k];
 
                         // Embed S_k into a full-sized matrix for matrix-vector products
+                        // Note: Multiple blocks can share the same penalty_idx for interaction terms
                         let mut s_k_full =
                             Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
                         for block in &self.layout.penalty_map {
                             if block.penalty_idx == k {
                                 let col_range = block.col_range.clone();
+                                // Accumulate penalty contributions instead of overwriting
                                 s_k_full
                                     .slice_mut(s![col_range.clone(), col_range])
-                                    .assign(s_k);
-                                break;
+                                    .scaled_add(1.0, s_k);
+                                // Don't break - continue to find all blocks with this penalty_idx
                             }
                         }
 
@@ -654,10 +655,12 @@ pub mod internal {
                             if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
                                 trace_term_unscaled += h_inv_s_col[j];
                             } else {
-                                log::warn!("Solve failed for trace term. Returning zero grad.");
-                                return Ok(Array1::zeros(lambdas.len()));
+                                return Err(EstimationError::RemlOptimizationFailed(
+                                    format!("Penalized Hessian is singular during gradient trace calculation for penalty {}. Model may be over-parameterized ({} penalties for {} data points).", k, lambdas.len(), self.y.len())
+                                ));
                             }
                         }
+                        
                         // The derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
                         gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
                     }
@@ -776,6 +779,7 @@ pub mod internal {
                             Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
 
                         // Find where to place S_k in the full matrix
+                        // Note: Multiple blocks can share the same penalty_idx for interaction terms
                         for block in &self.layout.penalty_map {
                             if block.penalty_idx == k {
                                 let block_start = block.col_range.start;
@@ -784,12 +788,13 @@ pub mod internal {
 
                                 // Verify dimensions match
                                 if s_k.nrows() == block_size && s_k.ncols() == block_size {
+                                    // Accumulate penalty contributions instead of overwriting
                                     s_k_full
                                         .slice_mut(s![
                                             block_start..block_end,
                                             block_start..block_end
                                         ])
-                                        .assign(s_k);
+                                        .scaled_add(1.0, s_k);
                                 } else {
                                     log::warn!(
                                         "S_k dimensions ({}x{}) don't match block size {}",
@@ -798,7 +803,7 @@ pub mod internal {
                                         block_size
                                     );
                                 }
-                                break;
+                                // Don't break - continue to find all blocks with this penalty_idx
                             }
                         }
 
@@ -894,6 +899,7 @@ pub mod internal {
                                 // First, find the penalty block this term applies to
                                 let mut s_k_full =
                                     Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                                // Note: Multiple blocks can share the same penalty_idx for interaction terms
                                 for block in &self.layout.penalty_map {
                                     if block.penalty_idx == k {
                                         let block_start = block.col_range.start;
@@ -902,14 +908,15 @@ pub mod internal {
 
                                         let s_k = &self.s_list[k];
                                         if s_k.nrows() == block_size && s_k.ncols() == block_size {
+                                            // Accumulate penalty contributions instead of overwriting
                                             s_k_full
                                                 .slice_mut(s![
                                                     block_start..block_end,
                                                     block_start..block_end
                                                 ])
-                                                .assign(s_k);
+                                                .scaled_add(1.0, s_k);
                                         }
-                                        break;
+                                        // Don't break - continue to find all blocks with this penalty_idx
                                     }
                                 }
 
@@ -920,11 +927,9 @@ pub mod internal {
                                 let dbeta_drho = match h_penalized.solve(&s_k_beta) {
                                     Ok(v) => -lambdas[k] * v, // dβ/dρₖ = -λₖ * v
                                     Err(e) => {
-                                        log::warn!(
-                                            "Linear system solve failed for dβ/dρₖ: {:?}",
-                                            e
-                                        );
-                                        return Ok(gradient); // Return partial gradient if this fails
+                                    return Err(EstimationError::RemlOptimizationFailed(
+                                    format!("Penalized Hessian is singular during LAML gradient calculation for penalty {} (dβ/dρₖ step). Model may be over-parameterized. Error: {:?}", k, e)
+                                    ));
                                     }
                                 };
 
@@ -963,11 +968,9 @@ pub mod internal {
                                             weight_trace_term += h_inv_col[j];
                                         }
                                         Err(e) => {
-                                            log::warn!(
-                                                "Linear system solve failed for weight derivative trace: {:?}",
-                                                e
-                                            );
-                                            return Ok(gradient); // Return partial gradient if this fails
+                                        return Err(EstimationError::RemlOptimizationFailed(
+                                        format!("Penalized Hessian is singular during LAML weight derivative calculation for penalty {}. Model may be over-parameterized. Error: {:?}", k, e)
+                                        ));
                                         }
                                     }
                                 }
@@ -3207,7 +3210,153 @@ pub mod internal {
         }
 
         #[test]
-        fn test_gradient_correctness_both_cases() {
+        fn test_reml_gradient_on_well_conditioned_model() {
+        // NEW TEST: Prove gradient math works with minimal, well-conditioned setup
+        
+        let n = 100; // More data for complex function
+        
+        // Complex, non-linear data that actually NEEDS smoothing
+        let y = Array1::from_shape_fn(n, |i| {
+            let pgs = (i as f64) / (n as f64) * 4.0 - 2.0; // PGS: -2 to 2
+            let pc1 = ((i as f64) / (n as f64) - 0.5) * 2.0; // PC1: -1 to 1
+            
+            // Complex function with interactions - requires GAM to fit well
+            let true_y = 2.0 * pgs.sin() + 1.5 * pc1.cos() + 0.8 * pgs * pc1 + 
+                         0.5 * (pgs * pgs - 1.0).exp() / (1.0 + (pgs * pgs - 1.0).exp());
+            
+            true_y + 0.2 * (rand::random::<f64>() - 0.5) // Add noise
+        });
+        
+        let p = Array1::from_shape_fn(n, |i| (i as f64) / (n as f64) * 4.0 - 2.0); // PGS: -2 to 2  
+        let pcs = Array2::from_shape_fn((n, 1), |(i, _)| ((i as f64) / (n as f64) - 0.5) * 2.0); // PC1: -1 to 1
+        
+        let data = TrainingData { y, p, pcs };
+        
+        // MINIMAL config: PGS + 1 PC with very few knots
+        let mut config = create_test_config();
+        config.link_function = LinkFunction::Identity;
+        config.pgs_basis_config.num_knots = 4; // Small
+        config.pc_names = vec!["PC1".to_string()]; // Just 1 PC
+        config.pc_basis_configs = vec![BasisConfig {
+            num_knots: 3, // Very small
+            degree: 2,
+        }];
+        config.pc_ranges = vec![(-1.0, 1.0)];
+        config.pgs_range = (-2.0, 2.0); // Match our data range
+        
+        let (x_matrix, s_list, layout, _, _) = 
+            internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+        
+        println!("Minimal test setup: {} penalties, {} data points, {} total coeffs", 
+            layout.num_penalties, n, x_matrix.ncols());
+        
+        // Accept whatever penalties we get, as long as it's reasonable for the data size
+        assert!(
+            layout.num_penalties <= n / 8, // At least 8 data points per penalty  
+            "Too many penalties ({}) for data size ({})", layout.num_penalties, n
+        );
+        
+        let reml_state = internal::RemlState::new(
+            data.y.view(), 
+            x_matrix.view(), 
+            s_list, 
+            &layout, 
+            &config
+        );
+        
+        // Create penalty values for all penalties
+        let test_rho = Array1::from_elem(layout.num_penalties, -0.5);
+        
+        // Calculate analytical gradient - this should work now!
+        let analytical_grad = reml_state.compute_gradient(&test_rho).unwrap();
+        
+        // Test first penalty gradient (representative test)
+        let i = 0;
+        {
+            // Calculate numerical gradient for penalty i
+            let h = 1e-6;
+            let mut rho_plus = test_rho.clone();
+            let mut rho_minus = test_rho.clone();
+            rho_plus[i] += h;
+            rho_minus[i] -= h;
+            
+            let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
+            let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
+            let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
+            
+            let analytical = analytical_grad[i];
+            let relative_error = (analytical - numerical_grad).abs() / numerical_grad.abs().max(1e-8);
+            
+            println!("Penalty {} gradient comparison:", i);
+            println!("  Analytical: {:.6}", analytical);
+            println!("  Numerical:  {:.6}", numerical_grad);
+            println!("  Rel error:  {:.1e}", relative_error);
+            
+            assert!(
+                relative_error < 0.05, // 5% tolerance for well-conditioned case
+                "Gradient mismatch for penalty {}: analytical={:.6}, numerical={:.6}, rel_error={:.1e}",
+                i, analytical, numerical_grad, relative_error
+            );
+        }
+        
+        println!("✅ GRADIENT MATH WORKS! Well-conditioned test passed!");
+        }
+
+    #[test]
+    fn test_reml_fails_gracefully_on_singular_model() {
+        // NEW TEST: Verify that over-parameterized models fail with helpful error
+        // Setup: Deliberately create the exact conditions that cause singularity
+        
+        let n = 30; // Small dataset
+        
+        // Generate minimal data
+        let y = Array1::from_shape_fn(n, |_| rand::random::<f64>());
+        let p = Array1::zeros(n);
+        let pcs = Array2::from_shape_fn((n, 8), |(i, j)| (i + j) as f64 / n as f64);
+        
+        let data = TrainingData { y, p, pcs };
+        
+        // Over-parameterized model: many knots and PCs for small dataset
+        let mut config = create_test_config();
+        config.link_function = LinkFunction::Identity;
+        config.pgs_basis_config.num_knots = 15; // Too many knots for small data
+        // Add many PC terms
+        config.pc_names = vec![
+            "PC1".to_string(), "PC2".to_string(), "PC3".to_string(), "PC4".to_string(),
+            "PC5".to_string(), "PC6".to_string(), "PC7".to_string(), "PC8".to_string(),
+        ];
+        config.pc_basis_configs = vec![
+            BasisConfig { num_knots: 8, degree: 2 }; 8 // Many knots per PC
+        ];
+        config.pc_ranges = vec![(0.0, 1.0); 8];
+        // This creates way too many parameters for 30 data points
+        
+        println!("Singularity test: Attempting to train over-parameterized model ({} data points)", n);
+        
+        // This should fail gracefully with a helpful error
+        let result = train_model(&data, &config);
+        
+        // Verify it fails with the expected error type
+        assert!(result.is_err(), "Over-parameterized model should fail");
+        
+        let error = result.unwrap_err();
+        match error {
+            EstimationError::RemlOptimizationFailed(message) => {
+                println!("✓ Got expected error: {}", message);
+                // Verify the error message mentions the key issues
+                assert!(message.contains("singular") || message.contains("over-parameterized"), 
+                    "Error should mention singularity/over-parameterization: {}", message);
+                assert!(message.contains("penalties"), 
+                    "Error should mention penalties: {}", message);
+            }
+            other => panic!("Expected RemlOptimizationFailed, got: {:?}", other),
+        }
+        
+        println!("✓ Singularity handling test passed!");
+    }
+
+    #[test]
+    fn test_gradient_correctness_both_cases() {
             // Test that compute_gradient returns the correct gradient of the cost function
             // for both REML and LAML cases
 
