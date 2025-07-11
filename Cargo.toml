@@ -25,13 +25,13 @@ path = "src/main.rs"
 
 [dependencies]
 ahash = "0.8.12"
-clap = { version = "4.5.40", features = ["derive"] }
+clap = { version = "4.5.41", features = ["derive"] }
 memmap2 = "0.9.5"
 rayon = "1.10.0"
 thread_local = "1.1.9"
 crossbeam-queue = "0.3.12"
 sysinfo = "0.35.2"
-tokio = { version = "1.46.0", features = ["sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1.46.1", features = ["sync", "rt-multi-thread", "macros"] }
 num_cpus = "1.17.0"
 cache-size = "0.7.0"
 ryu = "1.0.20"

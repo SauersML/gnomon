@@ -1629,15 +1629,34 @@ pub mod internal {
         /// generated the data, which is the only truly identifiable quantity.
         #[test]
         fn test_train_model_approximates_smooth_function() {
+            // Define a consistent epsilon for probability clamping throughout the test
+            // This matches the P-IRLS MIN_WEIGHT value of 1e-6 in pirls.rs
+            const PROB_EPS: f64 = 1e-6;
             // --- 1. Setup: Generate data from a known smooth function ---
             let n_samples = 500; // Use sufficient samples for accurate fitting
 
-            // Create meaningful PGS values
-            let p = Array::linspace(-2.0, 2.0, n_samples);
+            // Create independent inputs using uniform random sampling to avoid collinearity
+            use rand::prelude::*;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            
+            // Generate random PGS values in the range -2.0 to 2.0
+            let p = Array1::from_shape_fn(n_samples, |_| {
+                rng.gen_range(-2.0..=2.0)
+            });
 
-            // Create PC column(s)
-            let pc1 = Array::linspace(-1.5, 1.5, n_samples);
+            // Generate random PC values in the range -1.5 to 1.5
+            let pc1 = Array1::from_shape_fn(n_samples, |_| {
+                rng.gen_range(-1.5..=1.5)
+            });
             let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
+
+            // Check that the generated data has low collinearity to ensure reliable test
+            let p_pc_correlation = correlation_coefficient(&p, &pc1);
+            assert!(
+                p_pc_correlation.abs() < 0.1,
+                "Generated PGS and PC1 values have high correlation ({:.3}), which could affect test reliability", 
+                p_pc_correlation
+            );
 
             // Define a very simple function that's numerically stable
             // while still testing GAM capabilities
@@ -1663,7 +1682,7 @@ pub mod internal {
                     
                     // Clamp the true probability to prevent generating data that perfectly predicts 0 or 1,
                     // which helps stabilize the P-IRLS loop in the test
-                    let prob = prob.clamp(1e-8, 1.0 - 1e-8);
+                    let prob = prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     
                     // Random assignment based on probability (adds noise)
                     if rng.gen_range(0.0..1.0) < prob { 1.0 } else { 0.0 }
@@ -1684,8 +1703,9 @@ pub mod internal {
             config.max_iterations = 200;
             config.reml_max_iterations = 25; // Allow more iterations for BFGS to converge
 
-            // Standard configuration
-            config.max_iterations = 150;     // Default P-IRLS iterations
+            // Increased iterations for better convergence
+            config.max_iterations = 300;     // More P-IRLS iterations for complex model
+            config.reml_max_iterations = 50; // More BFGS iterations to ensure convergence
             
             // Train the model - must succeed for validation to be meaningful
             let trained_model = train_model(&data, &config)
@@ -1707,7 +1727,10 @@ pub mod internal {
                     // Calculate the true probability from our generating function
                     let true_logit = true_function(pgs_val, pc_val);
                     let true_prob = 1.0 / (1.0 + f64::exp(-true_logit));
-                    true_probs.push(true_prob);
+                    // Apply the same clamping to prevent numerical issues
+                    const PROB_EPS: f64 = 1e-6; // Consistent epsilon for better numerical stability
+                    let clamped_true_prob = true_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    true_probs.push(clamped_true_prob);
 
                     // Get the model's prediction
                     let pred_pgs = Array1::from_elem(1, pgs_val);
@@ -1715,8 +1738,11 @@ pub mod internal {
                     let pred_prob = trained_model
                         .predict(pred_pgs.view(), pred_pc.view())
                         .unwrap()[0];
-
-                    pred_probs.push(pred_prob);
+                        
+                    // Apply the same clamping for consistency
+                    const PROB_EPS: f64 = 1e-6; // Consistent epsilon for better numerical stability
+                    let clamped_pred_prob = pred_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    pred_probs.push(clamped_pred_prob);
                 }
             }
 
@@ -1833,7 +1859,7 @@ pub mod internal {
                     .unwrap()[0];
                     
                 // Convert probability to logit scale
-                let pred_prob_clamped = pred_prob.clamp(1e-8, 1.0 - 1e-8); // Prevent numerical issues
+                let pred_prob_clamped = pred_prob.clamp(PROB_EPS, 1.0 - PROB_EPS); // Consistent epsilon for stability
                 let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
                 pgs_pred_logits.push(pred_logit);
                 pgs_preds.push(pred_prob); // Still keep the original probabilities for other tests
@@ -1871,7 +1897,7 @@ pub mod internal {
             // Create a 2D grid to evaluate the full interaction surface
             let int_grid_size = 15; // Reduced grid size for better numerical stability
             let pgs_int_grid = Array1::linspace(-2.0, 2.0, int_grid_size);
-            let pc_int_grid = Array1::linspace(-1.0, 1.0, int_grid_size);
+            let pc_int_grid = Array1::linspace(-1.5, 1.5, int_grid_size); // Consistent with training data range
             
             // First, compute true interaction surface by isolating interaction term from true_function
             let mut true_interaction_surface = Vec::with_capacity(int_grid_size * int_grid_size);
@@ -1905,7 +1931,7 @@ pub mod internal {
             let pgs_zero = Array1::from_elem(1, 0.0);
             let pc_zero = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
             let pred_intercept_prob = trained_model.predict(pgs_zero.view(), pc_zero.view()).unwrap()[0];
-            let pred_intercept_prob_clamped = pred_intercept_prob.clamp(1e-8, 1.0 - 1e-8);
+            let pred_intercept_prob_clamped = pred_intercept_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
             let pred_intercept_logit = (pred_intercept_prob_clamped / (1.0 - pred_intercept_prob_clamped)).ln();
             
             // For each point on the grid, calculate the learned interaction component
@@ -1913,19 +1939,19 @@ pub mod internal {
                 // Calculate PGS main effect once per PGS value
                 let pgs_main = Array1::from_elem(1, pgs_val);
                 let pred_pgs_main_prob = trained_model.predict(pgs_main.view(), pc_zero.view()).unwrap()[0];
-                let pred_pgs_main_prob_clamped = pred_pgs_main_prob.clamp(1e-8, 1.0 - 1e-8);
+                let pred_pgs_main_prob_clamped = pred_pgs_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let pred_pgs_main_logit = (pred_pgs_main_prob_clamped / (1.0 - pred_pgs_main_prob_clamped)).ln();
                 
                 for &pc_val in pc_int_grid.iter() {
                     // Calculate PC main effect
                     let pc_main = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
                     let pred_pc_main_prob = trained_model.predict(pgs_zero.view(), pc_main.view()).unwrap()[0];
-                    let pred_pc_main_prob_clamped = pred_pc_main_prob.clamp(1e-8, 1.0 - 1e-8);
+                    let pred_pc_main_prob_clamped = pred_pc_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     let pred_pc_main_logit = (pred_pc_main_prob_clamped / (1.0 - pred_pc_main_prob_clamped)).ln();
                     
                     // Calculate full effect
                     let pred_full_prob = trained_model.predict(pgs_main.view(), pc_main.view()).unwrap()[0];
-                    let pred_full_prob_clamped = pred_full_prob.clamp(1e-8, 1.0 - 1e-8);
+                    let pred_full_prob_clamped = pred_full_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     let pred_full_logit = (pred_full_prob_clamped / (1.0 - pred_full_prob_clamped)).ln();
                     
                     // Interaction term = Full - PGS_main - PC_main + Intercept
@@ -1964,8 +1990,8 @@ pub mod internal {
             // Calculate R² for the relationship between PC values and their effects
             // PC1 should have a strong relationship, PC2 should not
 
-            // Create grid points for evaluation of PC1 main effect with a more limited range
-            let pc1_grid = Array1::linspace(-1.0, 1.0, 40); // Reduced range for more stability
+            // Create grid points for evaluation of PC1 main effect
+            let pc1_grid = Array1::linspace(-1.5, 1.5, 40); // Use full training data range for consistency
             let pgs_fixed = Array1::from_elem(1, 0.0); // Set PGS to zero to isolate PC effects
 
             // Calculate the true PC1 effect at PGS=0
@@ -1982,7 +2008,7 @@ pub mod internal {
                 let pred_prob = trained_model.predict(pgs_fixed.view(), pc.view()).unwrap()[0];
                 
                 // Convert to logit scale for comparison
-                let pred_prob_clamped = pred_prob.clamp(1e-8, 1.0 - 1e-8);
+                let pred_prob_clamped = pred_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
                 
                 pc1_pred_logits.push(pred_logit);

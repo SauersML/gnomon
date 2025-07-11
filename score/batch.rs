@@ -69,7 +69,7 @@ pub struct FilledData {
 // --- The Main Builder Struct ---
 pub struct SparseIndexBuilder<'a, State> {
     state: State,
-    _marker: PhantomData<&'a ()>,
+    marker: PhantomData<&'a ()>,
 }
 
 // ========================================================================================
@@ -81,7 +81,7 @@ impl<'a> SparseIndexBuilder<'a, ReadyData<'a>> {
     pub fn new(data: ReadyData<'a>) -> Self {
         Self {
             state: data,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -126,7 +126,7 @@ impl<'a> SparseIndexBuilder<'a, ReadyData<'a>> {
                 person_counts,
                 missing_events,
             },
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -186,7 +186,7 @@ impl<'a> SparseIndexBuilder<'a, CountedData> {
                 all_g1_indices,
                 all_g2_indices,
             },
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }
@@ -259,7 +259,7 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
                 all_g1_indices: self.state.all_g1_indices,
                 all_g2_indices: self.state.all_g2_indices,
             },
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }

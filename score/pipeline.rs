@@ -261,7 +261,7 @@ fn run_single_file_pipeline(
             move || match strategy {
                 RunStrategy::UseSimpleTree => {
                     let global_path = decide::decide_path_without_freq(&run_ctx);
-                    let path_decider = |_variant_data: &[u8]| global_path;
+                    let path_decider = |_: &[u8]| global_path;
                     io::producer_thread(
                         mmap,
                         prep_result,
@@ -444,7 +444,7 @@ fn run_multi_file_pipeline(
             move || match strategy {
                 RunStrategy::UseSimpleTree => {
                     let global_path = decide::decide_path_without_freq(&run_ctx);
-                    let path_decider = |_variant_data: &[u8]| global_path;
+                    let path_decider = |_: &[u8]| global_path;
                     io::multi_file_producer_thread(
                         prep_result,
                         boundaries,

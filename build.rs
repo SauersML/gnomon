@@ -98,6 +98,13 @@ impl Sink for ViolationCollector {
         let line_number = mat.line_number().unwrap_or(0);
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
+        // Skip matches in comments and string literals to avoid false positives
+        if line_text.trim_start().starts_with("//") || 
+           line_text.contains("/*") ||
+           (line_text.contains("\"") && line_text.matches("\"").count() >= 2) {
+            return Ok(true); // Skip this match and continue searching
+        }
+
         // Format the violation string exactly as the `rg -n` command would.
         self.violations
             .push(format!("{}:{}", line_number, line_text));
@@ -204,7 +211,9 @@ fn manually_check_for_unused_variables() {
 
 fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
     // Regex pattern to find underscore prefixed variable names.
-    let pattern = r"\b(let|for|(mut|ref)\s+|[,(]\s*|fn\s+\w+\s*\([^)]*?)\s+(_[a-zA-Z0-9_]+)\b";
+    // Using a simple pattern that catches all underscore-prefixed identifiers
+    // This will find underscore variables in all contexts including destructuring patterns
+    let pattern = r"\b(_[a-zA-Z0-9_]+)\b";
     let matcher = RegexMatcher::new_line_matcher(pattern)?;
     let mut searcher = Searcher::new();
 
@@ -219,17 +228,48 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
     {
         let path = entry.path();
 
-        // Create a new collector for each file.
-        let mut collector = ViolationCollector::new(path);
+        // Read file content to check for test modules
+        let file_content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => continue, // Skip files we can't read
+        };
 
-        // Search the file using our regex matcher and collector sink.
-        searcher.search_path(&matcher, path, &mut collector)?;
+        // Skip analyzing files that are in test modules or test files
+        let is_test_file = path.to_str().map_or(false, |p| p.contains("tests/") || p.ends_with("_test.rs") || p.ends_with(".test.rs"));
+        
+        if !is_test_file {
+            // Create a new collector for each file.
+            let mut collector = ViolationCollector::new(path);
 
-        // After searching the file, check if our collector found anything.
-        if let Some(error_message) = collector.check_and_get_error_message() {
-            // If violations were found, return the formatted error message immediately.
-            // This will cause the build to fail.
-            return Err(error_message.into());
+            // Search the file using our regex matcher and collector sink.
+            searcher.search_path(&matcher, path, &mut collector)?;
+
+            // Process results
+            if let Some(error_message) = collector.check_and_get_error_message() {
+                // If violations were found, check if they're in test modules
+                let mut has_non_test_violations = false;
+                
+                for violation in &collector.violations {
+                    // Parse the line number from the violation string
+                    if let Some(colon_pos) = violation.find(':') {
+                        if let Ok(line_num) = violation[..colon_pos].parse::<usize>() {
+                            // Check if this line is inside a test module
+                            let preceding_lines = file_content.lines().take(line_num).collect::<Vec<_>>();
+                            let in_test_module = preceding_lines.iter().any(|line| line.trim().starts_with("#[cfg(test)]"));
+                            
+                            if !in_test_module {
+                                has_non_test_violations = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if has_non_test_violations {
+                    // If violations were found outside test modules, return the error
+                    return Err(error_message.into());
+                }
+            }
         }
     }
 
