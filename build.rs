@@ -99,9 +99,27 @@ impl Sink for ViolationCollector {
         let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
 
         // Skip matches in comments and string literals to avoid false positives
-        if line_text.trim_start().starts_with("//") || 
-           line_text.contains("/*") ||
-           (line_text.contains("\"") && line_text.matches("\"").count() >= 2) {
+        // But make sure we don't miss underscore variables in code
+        
+        // Check if this line is purely a comment
+        let is_pure_comment = line_text.trim_start().starts_with("//") || 
+                             (line_text.contains("/*") && !line_text.contains("*/match") && !line_text.contains("*/let"));
+        
+        // Check if the match is in a string literal and not part of code
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            // More careful string detection logic
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            // If the underscore variable is between quotes, it's in a string
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 && part.contains("_") { // Inside quotes
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+        
+        if is_pure_comment || is_in_string {
             return Ok(true); // Skip this match and continue searching
         }
 
@@ -211,8 +229,8 @@ fn manually_check_for_unused_variables() {
 
 fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
     // Regex pattern to find underscore prefixed variable names.
-    // Using a simple pattern that catches all underscore-prefixed identifiers
-    // This will find underscore variables in all contexts including destructuring patterns
+    // This pattern needs to be more generalized to catch all underscore-prefixed variables,
+    // especially in match statements and destructuring patterns
     let pattern = r"\b(_[a-zA-Z0-9_]+)\b";
     let matcher = RegexMatcher::new_line_matcher(pattern)?;
     let mut searcher = Searcher::new();
@@ -236,6 +254,12 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
 
         // Skip analyzing files that are in test modules or test files
         let is_test_file = path.to_str().map_or(false, |p| p.contains("tests/") || p.ends_with("_test.rs") || p.ends_with(".test.rs"));
+        
+        // Add debug info for estimate.rs to help diagnose the underscore variable detection
+        let is_estimate_rs = path.to_str().map_or(false, |p| p.ends_with("calibrate/estimate.rs"));
+        if is_estimate_rs {
+            println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
+        }
         
         if !is_test_file {
             // Create a new collector for each file.

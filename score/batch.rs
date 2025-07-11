@@ -857,7 +857,6 @@ pub fn run_variant_major_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
