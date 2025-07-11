@@ -1014,10 +1014,13 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        // The LAML gradient for the score (to be maximized)
-                        // The correct LAML score gradient is 0.5*λ*[tr(S⁺Sₖ) - tr(H⁻¹Sₖ)] + 0.5*tr(H⁻¹Xᵀ(∂W/∂ρₖ)X).
+                        // IMPORTANT: This comment previously stated the incorrect formula.
+                        // The correct formula is implemented below.
                         // We compute the score gradient here, and the final negation outside the loop converts it to the cost gradient.
-                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term)
+                        // As with the REML gradient, the terms for the LAML score gradient were swapped.
+                        // The correct LAML score gradient is 0.5*λ*[tr(H⁻¹Sₖ) - tr(S⁺Sₖ)] + weight_deriv_term.
+                        // Swapping them fixes the sign.
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term)
                             + weight_deriv_term;
 
                         // Handle numerical stability
