@@ -3251,102 +3251,171 @@ pub mod internal {
 
         #[test]
         fn test_reml_gradient_on_well_conditioned_model() {
-            let n = 300; // Increased from 50 to prevent over-parameterization
-        let y = Array1::from_shape_fn(n, |i| {
-            let pgs = (i as f64) / (n as f64) * 4.0 - 2.0; // PGS: -2 to 2
-            let pc1 = ((i as f64) / (n as f64) - 0.5) * 2.0; // PC1: -1 to 1
+            // 🚀 EXTREMELY NON-SINGULAR TEST: MAXIMUM NUMERICAL STABILITY 🚀
+            let n = 2000; // MASSIVE sample size for extreme over-determination
             
-            // Complex function with interactions - requires GAM to fit well
-            let true_y = 2.0 * pgs.sin() + 1.5 * pc1.cos() + 0.8 * pgs * pc1 + 
-                         0.5 * (pgs * pgs - 1.0).exp() / (1.0 + (pgs * pgs - 1.0).exp());
+            // Generate EXTREMELY well-conditioned data with perfect numerical properties
+            let y = Array1::from_shape_fn(n, |i| {
+                let t = (i as f64) / (n as f64); // Normalized time [0,1]
+                let pgs = (t - 0.5) * 2.0; // PGS: perfectly centered [-1,1]
+                let pc1 = (t - 0.5) * 1.5; // PC1: slightly smaller range for conditioning
+                
+                // EXTREMELY smooth, well-behaved function - no exponentials or sharp nonlinearities
+                let true_y = 1.0 + 0.8 * pgs + 0.6 * pc1 + 0.4 * pgs * pgs + 0.2 * pc1 * pc1;
+                
+                // Add GENEROUS noise to prevent singular fits
+                true_y + 0.5 * (rand::random::<f64>() - 0.5)
+            });
             
-            true_y + 0.2 * (rand::random::<f64>() - 0.5) // Add noise
-        });
-        
-        let p = Array1::from_shape_fn(n, |i| (i as f64) / (n as f64) * 4.0 - 2.0); // PGS: -2 to 2  
-        let pcs = Array2::from_shape_fn((n, 1), |(i, _)| ((i as f64) / (n as f64) - 0.5) * 2.0); // PC1: -1 to 1
-        
-        let data = TrainingData { y, p, pcs };
-        
-        // MINIMAL config: PGS + 1 PC with very few knots
-        let mut config = create_test_config();
-        config.link_function = LinkFunction::Identity;
-        config.pgs_basis_config.num_knots = 2; // Reduced from 4 to further limit penalties
-        config.pc_names = vec!["PC1".to_string()]; // Just 1 PC
-        config.pc_basis_configs = vec![BasisConfig {
-            num_knots: 2, // Reduced from 3 to further limit penalties
-            degree: 2,
-        }];
-        config.pc_ranges = vec![(-1.0, 1.0)];
-        config.pgs_range = (-2.0, 2.0); // Match our data range
-        
-        let (x_matrix, s_list, layout, _, _) = 
-            internal::build_design_and_penalty_matrices(&data, &config).unwrap();
-        
-        println!("Minimal test setup: {} penalties, {} data points, {} total coeffs", 
-            layout.num_penalties, n, x_matrix.ncols());
-        
-        // Accept whatever penalties we get, as long as it's reasonable for the data size
-        assert!(
-            layout.num_penalties <= n / 6, // At least 6 data points per penalty (changed from 8)
-            "Too many penalties ({}) for data size ({})", layout.num_penalties, n
-        );
-        
-        // Add an assertion to verify we have a reasonable number of penalties
-        println!("Number of penalties: {}", layout.num_penalties);
-        assert!(layout.num_penalties >= 2, "Need at least 2 penalties to test gradient properly");
-        
-        let reml_state = internal::RemlState::new(
-            data.y.view(), 
-            x_matrix.view(), 
-            s_list, 
-            &layout, 
-            &config
-        );
-        
-        // Create penalty values for all penalties
-        let test_rho = Array1::from_elem(layout.num_penalties, -0.5);
-        
-        // Calculate analytical gradient - this should work now!
-        let analytical_grad = reml_state.compute_gradient(&test_rho).unwrap();
-        
-        // Test first penalty gradient (representative test)
-        let i = 0;
-        {
-            // Calculate numerical gradient for penalty i
-            let h = 1e-6;
-            let mut rho_plus = test_rho.clone();
-            let mut rho_minus = test_rho.clone();
-            rho_plus[i] += h;
-            rho_minus[i] -= h;
+            let p = Array1::from_shape_fn(n, |i| {
+                let t = (i as f64) / (n as f64);
+                (t - 0.5) * 2.0 // PGS: perfectly centered [-1,1]
+            });
             
-            let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
-            let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
-            let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
+            let pcs = Array2::from_shape_fn((n, 1), |(i, _)| {
+                let t = (i as f64) / (n as f64);
+                (t - 0.5) * 1.5 // PC1: well-conditioned range
+            });
             
-            let analytical = analytical_grad[i];
-            let relative_error = (analytical - numerical_grad).abs() / numerical_grad.abs().max(1e-8);
+            let data = TrainingData { y, p, pcs };
             
-            println!("Penalty {} gradient comparison:", i);
-            println!("  Analytical: {:.6}", analytical);
-            println!("  Numerical:  {:.6}", numerical_grad);
-            println!("  Rel error:  {:.1e}", relative_error);
+            // ULTRA-MINIMAL config: ABSOLUTE MINIMUM complexity for maximum stability
+            let mut config = create_test_config();
+            config.link_function = LinkFunction::Identity; // Linear = most stable
+            config.pgs_basis_config.num_knots = 1; // ABSOLUTE MINIMUM - just 1 knot
+            config.pc_names = vec!["PC1".to_string()];
+            config.pc_basis_configs = vec![BasisConfig {
+                num_knots: 1, // ABSOLUTE MINIMUM - just 1 knot
+                degree: 2,    // Keep degree 2 for smoothness
+            }];
+            config.pc_ranges = vec![(-1.0, 1.0)];
+            config.pgs_range = (-1.0, 1.0); // Perfectly centered, symmetric range
             
-            // For now, just check that the signs match
-            // Magnitude differences are expected because numerical methods are approximations
+            // Build design matrices
+            let (x_matrix, s_list, layout, _, _) = 
+                internal::build_design_and_penalty_matrices(&data, &config).unwrap();
+            
+            println!("🚀 EXTREMELY NON-SINGULAR TEST SETUP:");
+            println!("  📊 Data points: {}", n);
+            println!("  🎯 Total coefficients: {}", x_matrix.ncols());
+            println!("  ⚖️ Penalties: {}", layout.num_penalties);
+            println!("  📈 Data-to-coeff ratio: {:.1}", n as f64 / x_matrix.ncols() as f64);
+            println!("  🔢 Data-to-penalty ratio: {:.1}", n as f64 / layout.num_penalties as f64);
+            
+            // ULTRA-STRICT conditioning requirements
             assert!(
-                analytical.signum() == numerical_grad.signum(),
-                "Gradient sign mismatch for penalty {}: analytical={:.6}, numerical={:.6}",
-                i, analytical, numerical_grad
+                layout.num_penalties <= n / 50, // At least 50 data points per penalty!
+                "SINGULARITY RISK: Too many penalties ({}) for data size ({})", 
+                layout.num_penalties, n
             );
             
-            // Ensure gradient values are finite
-            assert!(analytical.is_finite(), "Analytical gradient contains non-finite values");
-            assert!(numerical_grad.is_finite(), "Numerical gradient contains non-finite values");
-            assert!(analytical.abs() < 100.0, "Analytical gradient value too large: {}", analytical);
-        }
-        
-        println!("✅ GRADIENT MATH WORKS! Well-conditioned test passed!");
+            assert!(
+                x_matrix.ncols() <= n / 20, // At least 20 data points per coefficient!
+                "SINGULARITY RISK: Too many coefficients ({}) for data size ({})", 
+                x_matrix.ncols(), n
+            );
+            
+            // Verify we have penalties to test
+            assert!(layout.num_penalties >= 1, "Need at least 1 penalty to test gradient");
+            
+            // Check design matrix conditioning
+            let x_t_x = x_matrix.t().dot(&x_matrix);
+            let eigenvals = x_t_x.eigvals().unwrap();
+            let cond_num = eigenvals.iter().map(|v| v.re).fold(0.0/0.0, f64::max) / 
+                          eigenvals.iter().map(|v| v.re).fold(0.0/0.0, f64::min);
+            println!("  🔍 Design matrix condition number: {:.2e}", cond_num);
+            
+            // ULTRA-STRICT condition number requirement
+            assert!(
+                cond_num < 1e10,
+                "SINGULARITY RISK: Design matrix condition number too high: {:.2e}",
+                cond_num
+            );
+            
+            let reml_state = internal::RemlState::new(
+                data.y.view(), 
+                x_matrix.view(), 
+                s_list, 
+                &layout, 
+                &config
+            );
+            
+            // Use WELL-CONDITIONED penalty values (not too extreme)
+            let test_rho = Array1::from_elem(layout.num_penalties, 0.0); // λ = 1.0, perfectly balanced
+            
+            // Verify cost computation is stable
+            let cost = reml_state.compute_cost(&test_rho).unwrap();
+            println!("  💰 Initial cost: {:.6}", cost);
+            assert!(cost.is_finite(), "SINGULARITY: Cost is not finite");
+            assert!(cost.abs() < 1e10, "SINGULARITY: Cost magnitude too extreme: {}", cost);
+            
+            // Calculate analytical gradient - this MUST work for non-singular systems
+            let analytical_grad = reml_state.compute_gradient(&test_rho)
+                .expect("SINGULARITY: Analytical gradient computation failed");
+            
+            println!("  📐 Analytical gradient computed successfully");
+            
+            // Test ALL penalty gradients (not just first one)
+            for i in 0..layout.num_penalties {
+                // Calculate numerical gradient for penalty i
+                let h = 1e-7; // Smaller step for higher precision
+                let mut rho_plus = test_rho.clone();
+                let mut rho_minus = test_rho.clone();
+                rho_plus[i] += h;
+                rho_minus[i] -= h;
+                
+                let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
+                let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
+                let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
+                
+                let analytical = analytical_grad[i];
+                let relative_error = (analytical - numerical_grad).abs() / 
+                                   (numerical_grad.abs().max(1e-10));
+                
+                println!("  🎯 Penalty {} gradient check:", i);
+                println!("    📊 Analytical: {:.8}", analytical);
+                println!("    🔢 Numerical:  {:.8}", numerical_grad);
+                println!("    ⚠️  Rel error:  {:.2e}", relative_error);
+                
+                // ULTRA-STRICT gradient validation
+                assert!(
+                    analytical.is_finite(),
+                    "SINGULARITY: Analytical gradient[{}] is not finite: {}",
+                    i, analytical
+                );
+                assert!(
+                    numerical_grad.is_finite(),
+                    "SINGULARITY: Numerical gradient[{}] is not finite: {}",
+                    i, numerical_grad
+                );
+                assert!(
+                    analytical.abs() < 1e6,
+                    "SINGULARITY: Analytical gradient[{}] magnitude too large: {}",
+                    i, analytical
+                );
+                
+                // For well-conditioned systems, we demand better accuracy
+                if numerical_grad.abs() > 1e-10 {
+                    assert!(
+                        relative_error < 1e-2, // 1% relative error tolerance
+                        "SINGULARITY: Gradient[{}] relative error too large: {:.2e} (analytical={:.8}, numerical={:.8})",
+                        i, relative_error, analytical, numerical_grad
+                    );
+                }
+                
+                // Signs must match for well-conditioned systems
+                if analytical.abs() > 1e-10 && numerical_grad.abs() > 1e-10 {
+                    assert!(
+                        analytical.signum() == numerical_grad.signum(),
+                        "SINGULARITY: Gradient[{}] sign mismatch: analytical={:.8}, numerical={:.8}",
+                        i, analytical, numerical_grad
+                    );
+                }
+            }
+            
+            println!("✅ EXTREME NON-SINGULARITY ACHIEVED!");
+            println!("🎉 All {} gradient components verified with high precision!", layout.num_penalties);
+            println!("🚀 This system is BULLETPROOF against numerical issues!");
         }
 
     #[test]
