@@ -100,11 +100,13 @@ impl Sink for ViolationCollector {
 
         // Skip matches in comments and string literals to avoid false positives
         // But make sure we don't miss underscore variables in code
-        
+
         // Check if this line is purely a comment
-        let is_pure_comment = line_text.trim_start().starts_with("//") || 
-                             (line_text.contains("/*") && !line_text.contains("*/match") && !line_text.contains("*/let"));
-        
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
         // Check if the match is in a string literal and not part of code
         let mut is_in_string = false;
         if line_text.contains("\"") {
@@ -112,13 +114,14 @@ impl Sink for ViolationCollector {
             let parts: Vec<&str> = line_text.split('\"').collect();
             // If the underscore variable is between quotes, it's in a string
             for (i, part) in parts.iter().enumerate() {
-                if i % 2 == 1 && part.contains("_") { // Inside quotes
+                if i % 2 == 1 && part.contains("_") {
+                    // Inside quotes
                     is_in_string = true;
                     break;
                 }
             }
         }
-        
+
         if is_pure_comment || is_in_string {
             return Ok(true); // Skip this match and continue searching
         }
@@ -142,12 +145,13 @@ impl Sink for ForbiddenCommentCollector {
 
         // Skip ** in doc comments if not checking for them
         // But NEVER skip any line containing FIXED, CORRECTED, or FIX
-        if !self.check_stars_in_doc_comments && 
-           is_doc_comment(line_text) && 
-           line_text.contains("**") && 
-           !line_text.contains("FIXED") && 
-           !line_text.contains("CORRECTED") && 
-           !line_text.contains("FIX") {
+        if !self.check_stars_in_doc_comments
+            && is_doc_comment(line_text)
+            && line_text.contains("**")
+            && !line_text.contains("FIXED")
+            && !line_text.contains("CORRECTED")
+            && !line_text.contains("FIX")
+        {
             // Skip this match, it's just ** in a doc comment
             return Ok(true);
         }
@@ -174,7 +178,7 @@ fn main() {
         eprintln!("{}", e);
         std::process::exit(1);
     }
-    
+
     // Scan Rust source files for forbidden comment patterns and fail if found.
     if let Err(e) = scan_for_forbidden_comment_patterns() {
         eprintln!("{}", e);
@@ -248,16 +252,18 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
 
         // Check if we can read the file
         match std::fs::read_to_string(path) {
-            Ok(_) => {}, // File exists and can be read
+            Ok(_) => {}         // File exists and can be read
             Err(_) => continue, // Skip files we can't read
         };
 
         // Add debug info for estimate.rs to help diagnose the underscore variable detection
-        let is_estimate_rs = path.to_str().map_or(false, |p| p.ends_with("calibrate/estimate.rs"));
+        let is_estimate_rs = path
+            .to_str()
+            .map_or(false, |p| p.ends_with("calibrate/estimate.rs"));
         if is_estimate_rs {
             println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
         }
-        
+
         // Create a new collector for each file.
         let mut collector = ViolationCollector::new(path);
 
@@ -283,52 +289,52 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
     // Regex patterns to find forbidden comment patterns
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
-    
+
     // Split into two separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
     let forbidden_words_pattern = r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
-    
+
     // First check for forbidden words
     let forbidden_matcher = RegexMatcher::new_line_matcher(forbidden_words_pattern)?;
     let mut searcher = Searcher::new();
-    
+
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
-        .filter(|e| e.file_name() != "build.rs")      // Exclude the build script itself
+        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
     {
         let path = entry.path();
-        
+
         // Use a collector that doesn't filter out doc comments for forbidden words
         let mut collector = ForbiddenCommentCollector::new(path, true);
         searcher.search_path(&forbidden_matcher, path, &mut collector)?;
-        
+
         if let Some(error_message) = collector.check_and_get_error_message() {
             return Err(error_message.into());
         }
     }
-    
+
     // Then check for stars in non-doc comments
     let stars_matcher = RegexMatcher::new_line_matcher(stars_pattern)?;
-    
+
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
-        .filter(|e| e.file_name() != "build.rs")      // Exclude the build script itself
+        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
     {
         let path = entry.path();
-        
+
         // Use a single collector with custom filtering logic
         // false means don't check for ** in doc comments
         let mut collector = ForbiddenCommentCollector::new(path, false);
         searcher.search_path(&stars_matcher, path, &mut collector)?;
-        
+
         if let Some(error_message) = collector.check_and_get_error_message() {
             return Err(error_message.into());
         }

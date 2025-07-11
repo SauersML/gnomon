@@ -918,5 +918,4 @@ mod tests {
             "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
         );
     }
-
 }
