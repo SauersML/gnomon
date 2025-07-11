@@ -676,10 +676,9 @@ pub mod internal {
                             }
                         }
                         
-                        // IMPORTANT: The previous formula was fundamentally incorrect.
-                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) + β̂ᵀSₖβ̂/σ²)`.
-                        // The score gradient requires the sum of these terms, not their difference.
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled + beta_term_scaled);
+                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(β̂ᵀSₖβ̂/σ² - tr(H⁻¹Sₖ))`.
+                        // For a minimizer, the gradient of the cost function is the negative of this.
+                        gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
                     }
                 }
                 _ => {
@@ -1012,10 +1011,9 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        // IMPORTANT: The previous formula was fundamentally incorrect.
-                        // The correct LAML score gradient is 0.5*λ*[tr(H⁻¹Sₖ) + tr(S⁺Sₖ)] + weight_deriv_term.
-                        // The score gradient requires the sum of these terms, not their difference.
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term + s_inv_trace_term)
+                        // The correct LAML score gradient is 0.5*λ*[tr(S⁺Sₖ) - tr(H⁻¹Sₖ)] + weight_deriv_term.
+                        // For a minimizer, the gradient of the cost function is the negative of this.
+                        gradient[k] = 0.5 * lambdas[k] * (s_inv_trace_term - trace_term)
                             + weight_deriv_term;
 
                         // Handle numerical stability
