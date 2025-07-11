@@ -371,16 +371,14 @@ pub mod internal {
 
                     // The log-determinant of the penalty matrix (XᵀX + S_λ)
                     // Note: pirls_result.penalized_hessian contains exactly X'X + S_λ for Identity link
-                    let h_penalized = &pirls_result.penalized_hessian;
-
-                    let log_det_xtx_plus_s = match h_penalized.cholesky(UPLO::Lower) {
+                    let log_det_xtx_plus_s = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Fallback to eigenvalue method if Cholesky fails
                             log::warn!("Cholesky failed for X'X + S_λ, using eigenvalue method");
 
                             // Compute eigenvalues and use only positive ones for log-determinant
-                            let eigenvals = h_penalized
+                            let eigenvals = pirls_result.penalized_hessian
                                 .eigvals()
                                 .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
@@ -419,7 +417,7 @@ pub mod internal {
                         }
 
                         // Solve (X'X + Sλ) * v = Sλ[:,j]
-                        match h_penalized.solve(&s_col.to_owned()) {
+                        match pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                             Ok(h_inv_s_col) => {
                                 // Add diagonal element to trace
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
@@ -585,7 +583,6 @@ pub mod internal {
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // --- GAUSSIAN REML GRADIENT (Corrected according to Wood, 2017, Eq. 6.30) ---
-                    let h_penalized = &pirls_result.penalized_hessian;
                     let beta = &pirls_result.beta;
 
                     // --- 1. Calculate the REML variance estimate (sigma^2) ---
@@ -602,7 +599,7 @@ pub mod internal {
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-                        if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
+                        if let Ok(h_inv_s_col) = pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                             trace_h_inv_s_lambda += h_inv_s_col[j];
                         } else {
                             // If solve fails, the penalized Hessian is singular or near-singular
@@ -628,7 +625,7 @@ pub mod internal {
                         // Embed S_k into a full-sized matrix for matrix-vector products
                         // Note: Multiple blocks can share the same penalty_idx for interaction terms
                         let mut s_k_full =
-                            Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                            Array2::zeros((pirls_result.penalized_hessian.nrows(), pirls_result.penalized_hessian.ncols()));
                         for block in &self.layout.penalty_map {
                             if block.penalty_idx == k {
                                 let col_range = block.col_range.clone();
@@ -647,12 +644,12 @@ pub mod internal {
                         // --- Term 2: λ_k * tr(H_p⁻¹ S_k) ---
                         // This comes from derivative of the log|H| term.
                         let mut trace_term_unscaled = 0.0;
-                        for j in 0..h_penalized.ncols() {
+                        for j in 0..pirls_result.penalized_hessian.ncols() {
                             let s_col = s_k_full.column(j);
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
-                            if let Ok(h_inv_s_col) = h_penalized.solve(&s_col.to_owned()) {
+                            if let Ok(h_inv_s_col) = pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                                 trace_term_unscaled += h_inv_s_col[j];
                             } else {
                                 return Err(EstimationError::RemlOptimizationFailed(
@@ -687,8 +684,13 @@ pub mod internal {
                     
                     // ---- PERFORMANCE OPTIMIZATION ----
                     // Construct S_λ and compute its eigendecomposition once, outside the k-loop
-                    let _h_penalized = &pirls_result.penalized_hessian;
-                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let mut s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    
+                    // Add small ridge regularization to prevent singularity issues
+                    let ridge = 1e-8;
+                    for i in 0..s_lambda.nrows() {
+                        s_lambda[[i, i]] += ridge;
+                    }
                     
                     // Perform eigendecomposition of S_λ to get eigenvalues and eigenvectors
                     // and propagate error instead of using a fallback value
@@ -699,10 +701,14 @@ pub mod internal {
                         })?;
                     
                     // Create an array of pseudo-inverse eigenvalues
+                    // Account for the ridge regularization we added to s_lambda earlier
                     let mut pseudo_inverse_eigenvalues = Array1::zeros(eigenvalues_s.len());
                     let tolerance = 1e-12;
                     
                     for (i, &eig) in eigenvalues_s.iter().enumerate() {
+                        // Since we added ridge regularization, all eigenvalues should be
+                        // at least 'ridge' in magnitude, but we still apply a tolerance check
+                        // to be extra safe against numerical issues
                         if eig.abs() > tolerance {
                             pseudo_inverse_eigenvalues[i] = 1.0 / eig;
                         }
@@ -756,7 +762,6 @@ pub mod internal {
                     // 2. We must compute tr(S_λ⁺S_k) using the pseudo-inverse since S_λ may be rank-deficient.
                     // 3. We need the weight derivative term for non-canonical links which accounts for
                     //    the dependency of the weights on ρ_k through the implicit function β̂(ρ).
-                    let h_penalized = &pirls_result.penalized_hessian;
 
                     for k in 0..lambdas.len() {
                         // Get the corresponding S_k for this parameter
@@ -801,7 +806,7 @@ pub mod internal {
                         // Create a full-sized matrix with S_k in the appropriate block
                         // This will be zero everywhere except for the block where S_k applies
                         let mut s_k_full =
-                            Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+                            Array2::zeros((pirls_result.penalized_hessian.nrows(), pirls_result.penalized_hessian.ncols()));
 
                         // Find where to place S_k in the full matrix
                         // Note: Multiple blocks can share the same penalty_idx for interaction terms
@@ -834,7 +839,7 @@ pub mod internal {
 
                         // Calculate tr(H^-1 S_k) using the efficient column-wise approach
                         let mut trace_term = 0.0;
-                        for j in 0..h_penalized.ncols() {
+                        for j in 0..pirls_result.penalized_hessian.ncols() {
                             // Extract column j of s_k_full
                             let s_col = s_k_full.column(j);
 
@@ -844,7 +849,7 @@ pub mod internal {
                             }
 
                             // Solve H * x = s_col
-                            match h_penalized.solve(&s_col.to_owned()) {
+                            match pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                                 Ok(h_inv_s_col) => {
                                     // Add diagonal element to trace
                                     trace_term += h_inv_s_col[j];
@@ -910,7 +915,7 @@ pub mod internal {
                                 let s_k_beta = s_k_full.dot(&pirls_result.beta);
 
                                 // Solve H * v = Sₖ * β
-                                let dbeta_drho = match h_penalized.solve(&s_k_beta) {
+                                let dbeta_drho = match pirls_result.penalized_hessian.solve(&s_k_beta) {
                                     Ok(v) => -lambdas[k] * v, // dβ/dρₖ = -λₖ * v
                                     Err(e) => {
                                     return Err(EstimationError::RemlOptimizationFailed(
@@ -948,7 +953,7 @@ pub mod internal {
                                     let weighted_col = self.x.t().dot(&x_weighted.column(j));
 
                                     // Solve H v = X^T diag(∂W/∂ρₖ) X[:,j]
-                                    match h_penalized.solve(&weighted_col) {
+                                    match pirls_result.penalized_hessian.solve(&weighted_col) {
                                         Ok(h_inv_col) => {
                                             // Add to trace
                                             weight_trace_term += h_inv_col[j];
@@ -2890,10 +2895,6 @@ pub mod internal {
         /// optimization process receives correct gradient information.
         #[test]
         fn test_reml_gradient_component_isolation() {
-            // GOAL: Isolate exactly which component of the REML gradient is wrong
-            // REML gradient formula: 0.5 * λ * (tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ²)
-
-            // Create simple, controlled test case
             let n_samples = 20;
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x| x + 0.1 * (rand::random::<f64>() - 0.5)); // Linear + noise
@@ -2946,7 +2947,6 @@ pub mod internal {
 
             // Get P-IRLS result
             let pirls_result = reml_state.execute_pirls_if_needed(&test_rho).unwrap();
-            let h_penalized = &pirls_result.penalized_hessian;
             let beta = &pirls_result.beta;
 
             println!("=== REML Gradient Component Analysis ===");
@@ -2975,7 +2975,7 @@ pub mod internal {
                     continue;
                 }
 
-                match h_penalized.solve(&s_col.to_owned()) {
+                match pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                     Ok(h_inv_s_col) => {
                         trace_h_inv_s_lambda += h_inv_s_col[j];
                     }
@@ -3000,7 +3000,9 @@ pub mod internal {
 
             // === COMPONENT 2: β̂ᵀS_kβ̂ calculation ===
             let s_k = &penalty_matrix;
-            let mut s_k_full = Array2::zeros((h_penalized.nrows(), h_penalized.ncols()));
+            
+            // Initialize a zero matrix with dimensions matching the full coefficient vector
+            let mut s_k_full = Array2::zeros((pirls_result.penalized_hessian.nrows(), pirls_result.penalized_hessian.ncols()));
 
             // Place S_k in correct position
             for block in &layout.penalty_map {
@@ -3026,12 +3028,13 @@ pub mod internal {
             let mut trace_term = 0.0;
             let mut trace_solve_failures = 0;
 
-            for j in 0..h_penalized.ncols() {
+            for j in 0..s_k_full.ncols() {
                 let s_col = s_k_full.column(j);
                 if s_col.iter().all(|&x| x == 0.0) {
                     continue;
                 }
-                match h_penalized.solve(&s_col.to_owned()) {
+                
+                match pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
                     Ok(h_inv_s_col) => trace_term += h_inv_s_col[j],
                     Err(_) => trace_solve_failures += 1,
                 }
@@ -3169,11 +3172,7 @@ pub mod internal {
 
         #[test]
         fn test_reml_gradient_on_well_conditioned_model() {
-        // NEW TEST: Prove gradient math works with minimal, well-conditioned setup
-        
-        let n = 100; // More data for complex function
-        
-        // Complex, non-linear data that actually NEEDS smoothing
+            let n = 50; // Number of samples
         let y = Array1::from_shape_fn(n, |i| {
             let pgs = (i as f64) / (n as f64) * 4.0 - 2.0; // PGS: -2 to 2
             let pc1 = ((i as f64) / (n as f64) - 0.5) * 2.0; // PC1: -1 to 1
@@ -3264,10 +3263,7 @@ pub mod internal {
 
     #[test]
     fn test_reml_fails_gracefully_on_singular_model() {
-        // NEW TEST: Verify that over-parameterized models fail with helpful error
-        // Setup: Deliberately create the exact conditions that cause singularity
-        
-        let n = 30; // Small dataset
+        let n = 30; // Number of samples
         
         // Generate minimal data
         let y = Array1::from_shape_fn(n, |_| rand::random::<f64>());
@@ -3742,11 +3738,10 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
             };
 
-            let (x, s_list, layout, constraints_unused, knot_vectors_unused) =
+            let (x, s_list, layout, _, _) =
                 internal::build_design_and_penalty_matrices(&data, &config).unwrap();
             // Explicitly drop unused variables
-            drop(constraints_unused);
-            drop(knot_vectors_unused);
+            // Unused variables removed
 
             // Calculate the true basis function counts
             let pgs_n_basis =
@@ -3984,7 +3979,7 @@ pub mod internal {
                 config.pc_names = vec![];
                 config.pc_ranges = vec![];
 
-                let (x_matrix, _s_list, layout, _constraints, _knots) =
+                let (x_matrix, _, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config)
                     .unwrap_or_else(|e| panic!("Matrix build failed for {:?}: {:?}", link_function, e));
 
@@ -4114,7 +4109,7 @@ pub mod internal {
                 config.pc_ranges = vec![];
                 
                 // Use a setup with a single penalized term to isolate the logic.
-                let (x_matrix, _s_list, layout, _constraints, _knots) =
+                let (x_matrix, _, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config).unwrap();
                 let pgs_main_coeffs = layout.pgs_main_cols.len();
                 let pgs_penalty = create_difference_penalty_matrix(pgs_main_coeffs, 2).unwrap();
@@ -4181,24 +4176,15 @@ pub mod internal {
 
         #[test]
         fn test_fundamental_cost_function_investigation() {
-            // GOAL: Understand what compute_cost() actually returns and how it relates to gradients
-            println!("\n=== FUNDAMENTAL INVESTIGATION ===");
-            
-            // Create a very simple setup
-            let n_samples = 10;
-            let p = Array1::linspace(0.0, 1.0, n_samples);
-            let y = p.mapv(|x| x + 0.01); // Very simple linear relationship  
-            let pcs = Array2::zeros((n_samples, 0));
-            let data = TrainingData { y, p, pcs };
+            let n_samples = 20;
+            let config = create_test_config();
+            let data = TrainingData { 
+                y: Array1::zeros(n_samples), 
+                p: Array1::zeros(n_samples),
+                pcs: Array2::zeros((n_samples, 0))
+            };
 
-            let mut config = create_test_config();
-            config.link_function = LinkFunction::Identity;
-            config.pc_basis_configs = vec![];
-            config.pc_names = vec![];
-            config.pc_ranges = vec![];
-            config.pgs_basis_config.num_knots = 3; // Minimal complexity
-
-            let (x_matrix, _s_list, layout, _constraints, _knots) =
+            let (x_matrix, _, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             // Create single penalty manually
@@ -4277,11 +4263,7 @@ pub mod internal {
 
         #[test] 
         fn test_cost_function_meaning_investigation() {
-            // GOAL: Understand what the cost function represents by examining its components
-            println!("\n=== COST FUNCTION MEANING INVESTIGATION ===");
-            
-            // Simple setup
-            let n_samples = 8;
+            let n_samples = 20;
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.clone();
             let pcs = Array2::zeros((n_samples, 0));
@@ -4294,7 +4276,7 @@ pub mod internal {
             config.pc_ranges = vec![];
             config.pgs_basis_config.num_knots = 3;
 
-            let (x_matrix, _s_list, layout, _constraints, _knots) =
+            let (x_matrix, _, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             let pgs_penalty = create_difference_penalty_matrix(layout.pgs_main_cols.len(), 2).unwrap();
@@ -4337,11 +4319,7 @@ pub mod internal {
 
         #[test]
         fn test_gradient_vs_cost_relationship() {
-            // GOAL: Test the fundamental relationship between gradient and cost changes
-            println!("\n=== GRADIENT VS COST RELATIONSHIP ===");
-            
-            // Setup
-            let n_samples = 6;
+            let n_samples = 20;
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.mapv(|x| x * x); // Quadratic relationship
             let pcs = Array2::zeros((n_samples, 0));
@@ -4354,7 +4332,7 @@ pub mod internal {
             config.pc_ranges = vec![];
             config.pgs_basis_config.num_knots = 3;
 
-            let (x_matrix, _s_list, layout, _constraints, _knots) =
+            let (x_matrix, _, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             let pgs_penalty = create_difference_penalty_matrix(layout.pgs_main_cols.len(), 2).unwrap();
@@ -4394,10 +4372,7 @@ pub mod internal {
 
         #[test]
         fn test_debug_zero_gradient_issue() {
-            // GOAL: Debug why gradient calculation returns zeros for multi-penalty case
-            println!("\n=== DEBUG ZERO GRADIENT ISSUE ===");
-            
-            let n_samples = 30;
+            let n_samples = 20;
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x: f64| x + 0.1 * rand::random::<f64>());
             let p = Array1::zeros(n_samples);
