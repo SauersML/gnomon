@@ -246,9 +246,9 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
     {
         let path = entry.path();
 
-        // Read file content to check for test modules
-        let file_content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
+        // Check if we can read the file
+        match std::fs::read_to_string(path) {
+            Ok(_) => {}, // File exists and can be read
             Err(_) => continue, // Skip files we can't read
         };
 
