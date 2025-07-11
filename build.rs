@@ -270,29 +270,8 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
 
             // Process results
             if let Some(error_message) = collector.check_and_get_error_message() {
-                // If violations were found, check if they're in test modules
-                let mut has_non_test_violations = false;
-                
-                for violation in &collector.violations {
-                    // Parse the line number from the violation string
-                    if let Some(colon_pos) = violation.find(':') {
-                        if let Ok(line_num) = violation[..colon_pos].parse::<usize>() {
-                            // Check if this line is inside a test module
-                            let preceding_lines = file_content.lines().take(line_num).collect::<Vec<_>>();
-                            let in_test_module = preceding_lines.iter().any(|line| line.trim().starts_with("#[cfg(test)]"));
-                            
-                            if !in_test_module {
-                                has_non_test_violations = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if has_non_test_violations {
-                    // If violations were found outside test modules, return the error
-                    return Err(error_message.into());
-                }
+                // If violations were found, return the error - no exceptions for test modules
+                return Err(error_message.into());
             }
         }
     }
