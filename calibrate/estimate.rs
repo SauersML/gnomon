@@ -676,9 +676,10 @@ pub mod internal {
                             }
                         }
                         
-                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(β̂ᵀSₖβ̂/σ² - tr(H⁻¹Sₖ))`.
-                        // For a minimizer, the gradient of the cost function is the negative of this.
-                        gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
+                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
+                        // We compute this score gradient. The final gradient.mapv_inplace(|v| -v) at the end of the
+                        // function will correctly convert it to the cost gradient needed by the minimizer.
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
                     }
                 }
                 _ => {
