@@ -26,6 +26,7 @@ use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
+use crate::calibrate::pirls::{self, PirlsResult};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::model::{
     Constraint, LinkFunction, MainEffects, MappedCoefficients, ModelConfig, TrainedModel,
@@ -223,7 +224,7 @@ pub fn train_model(
     );
 
     // Fit the model one last time with the optimal lambdas to get final coefficients.
-    let final_fit = internal::fit_model_for_fixed_rho(
+    let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_matrix.view(),
         data.y.view(),
@@ -326,7 +327,7 @@ pub mod internal {
                 return Ok(cached_result.clone());
             }
 
-            let pirls_result = fit_model_for_fixed_rho(
+            let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
                 self.y,
@@ -1286,7 +1287,7 @@ pub mod internal {
 
     /// Helper to construct the summed, weighted penalty matrix S_lambda.
     /// This version correctly builds a block-diagonal matrix based on the model layout.
-    fn construct_s_lambda(
+    pub fn construct_s_lambda(
         lambdas: &Array1<f64>,
         s_list: &[Array2<f64>],
         layout: &ModelLayout,
@@ -1546,7 +1547,7 @@ pub mod internal {
             }
 
             // 5. Test that the inner P-IRLS loop converges for a fixed rho and produces sensible results
-            let pirls_result = internal::fit_model_for_fixed_rho(
+            let pirls_result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 test_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
@@ -2539,7 +2540,7 @@ pub mod internal {
             modified_config.max_iterations = 200;
 
             // Run PIRLS with fixed smoothing parameters - unwrap to ensure test fails if fitting fails
-            let pirls_result = internal::fit_model_for_fixed_rho(
+            let pirls_result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 fixed_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
@@ -2674,7 +2675,7 @@ pub mod internal {
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
 
             println!("Testing P-IRLS with extreme rho values: {:?}", extreme_rho);
-            let result = internal::fit_model_for_fixed_rho(
+            let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 extreme_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
@@ -3072,7 +3073,7 @@ pub mod internal {
             println!("Score gradient (analytical): {:.6}", score_gradient);
             println!("Cost gradient (numerical): {:.6}", cost_gradient_numerical);
             
-            // FIXED: Both gradients are cost gradients and should have same sign
+            // Both gradients are cost gradients and should have same sign
             if score_gradient.abs() > 1e-6 && cost_gradient_numerical.abs() > 1e-6 {
                 assert!(
                     score_gradient * cost_gradient_numerical > 0.0,
@@ -3902,7 +3903,7 @@ pub mod internal {
                 config.pc_names = vec![];
                 config.pc_ranges = vec![];
 
-                let (x_matrix, _s_list, layout, _, _) =
+                let (x_matrix, _s_list, layout, _constraints, _knots) =
                     build_design_and_penalty_matrices(&data, &config)
                     .unwrap_or_else(|e| panic!("Matrix build failed for {:?}: {:?}", link_function, e));
 
@@ -4032,7 +4033,7 @@ pub mod internal {
                 config.pc_ranges = vec![];
                 
                 // Use a setup with a single penalized term to isolate the logic.
-                let (x_matrix, _s_list, layout, _, _) =
+                let (x_matrix, _s_list, layout, _constraints, _knots) =
                     build_design_and_penalty_matrices(&data, &config).unwrap();
                 let pgs_main_coeffs = layout.pgs_main_cols.len();
                 let pgs_penalty = create_difference_penalty_matrix(pgs_main_coeffs, 2).unwrap();
@@ -4116,7 +4117,7 @@ pub mod internal {
             config.pc_ranges = vec![];
             config.pgs_basis_config.num_knots = 3; // Minimal complexity
 
-            let (x_matrix, _s_list, layout, _, _) =
+            let (x_matrix, _s_list, layout, _constraints, _knots) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             // Create single penalty manually
@@ -4212,7 +4213,7 @@ pub mod internal {
             config.pc_ranges = vec![];
             config.pgs_basis_config.num_knots = 3;
 
-            let (x_matrix, _s_list, layout, _, _) =
+            let (x_matrix, _s_list, layout, _constraints, _knots) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             let pgs_penalty = create_difference_penalty_matrix(layout.pgs_main_cols.len(), 2).unwrap();
@@ -4272,7 +4273,7 @@ pub mod internal {
             config.pc_ranges = vec![];
             config.pgs_basis_config.num_knots = 3;
 
-            let (x_matrix, _s_list, layout, _, _) =
+            let (x_matrix, _s_list, layout, _constraints, _knots) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             
             let pgs_penalty = create_difference_penalty_matrix(layout.pgs_main_cols.len(), 2).unwrap();

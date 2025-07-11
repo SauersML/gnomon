@@ -1,3 +1,11 @@
+use crate::calibrate::estimate::internal::construct_s_lambda;
+use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::model::{LinkFunction, ModelConfig};
+use crate::calibrate::estimate::internal::ModelLayout;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray_linalg::Solve;
+use log;
+
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
 ///
 /// # Fields
@@ -9,16 +17,16 @@
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
 /// * `final_weights`: The final IRLS weights at convergence.
 #[derive(Clone)]
-pub(super) struct PirlsResult {
-    pub(super) beta: Array1<f64>,
-    pub(super) penalized_hessian: Array2<f64>,
-    pub(super) deviance: f64,
+pub struct PirlsResult {
+    pub beta: Array1<f64>,
+    pub penalized_hessian: Array2<f64>,
+    pub deviance: f64,
     #[allow(dead_code)]
-    pub(super) final_weights: Array1<f64>,
+    pub final_weights: Array1<f64>,
 }
 
     /// The P-IRLS inner loop for a fixed set of smoothing parameters.
-    pub(super) fn fit_model_for_fixed_rho(
+    pub fn fit_model_for_fixed_rho(
         rho_vec: ArrayView1<f64>,
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
@@ -174,7 +182,7 @@ pub(super) struct PirlsResult {
 
     // Pseudo-inverse functionality is handled directly in compute_gradient
 
-    pub(super) fn update_glm_vectors(
+    pub fn update_glm_vectors(
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
         link: LinkFunction,
@@ -214,7 +222,7 @@ pub(super) struct PirlsResult {
 
 
 
-    pub(super) fn calculate_deviance(
+    pub fn calculate_deviance(
         y: ArrayView1<f64>,
         mu: &Array1<f64>,
         link: LinkFunction,
