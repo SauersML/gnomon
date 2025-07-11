@@ -739,7 +739,7 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
 /// Calculates a fast proxy for non-reference allele frequency using `popcnt`.
 ///
 /// This function is a key performance enabler. It leverages the `popcnt` (population
-/// count) CPU instruction, which is extremely fast. By viewing the byte slice as
+/// count) CPU instruction, which is very fast. By viewing the byte slice as
 /// `u64` chunks, it minimizes loop iterations and lets the hardware do the heavy
 // lifting of counting set bits.
 #[inline]
@@ -803,7 +803,7 @@ pub fn run_variant_major_path(
         let original_fam_idx = prep_result.output_idx_to_fam_idx[out_idx] as usize;
 
         // --- On-the-fly Genotype Decoding ---
-        // This is extremely fast (a few bitwise operations) and allocation-free.
+        // This is very fast (a few bitwise operations) and allocation-free.
         let byte_index = original_fam_idx / 4;
         let bit_offset = (original_fam_idx % 4) * 2;
         let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
