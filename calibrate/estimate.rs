@@ -676,12 +676,10 @@ pub mod internal {
                             }
                         }
                         
-                        // IMPORTANT: This comment previously stated the incorrect formula.
-                        // This has been fixed in the implementation below.
-                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
-                        // The original code had these terms swapped, calculating the negative of the score gradient.
-                        // Swapping them back fixes the sign.
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
+                        // IMPORTANT: The previous formula was fundamentally incorrect.
+                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) + β̂ᵀSₖβ̂/σ²)`.
+                        // The score gradient requires the sum of these terms, not their difference.
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled + beta_term_scaled);
                     }
                 }
                 _ => {
@@ -1014,13 +1012,10 @@ pub mod internal {
                         // - s_inv_trace_term: tr(S_λ⁺S_k) from the log|S_λ|_+ derivative
                         // - trace_term: tr(H_p⁻¹S_k) from the explicit part of the log|H_p| derivative
                         // - weight_deriv_term: tr(H_p⁻¹Xᵀ(∂W/∂ρ_k)X) for non-canonical links
-                        // IMPORTANT: This comment previously stated the incorrect formula.
-                        // The correct formula is implemented below.
-                        // We compute the score gradient here, and the final negation outside the loop converts it to the cost gradient.
-                        // As with the REML gradient, the terms for the LAML score gradient were swapped.
-                        // The correct LAML score gradient is 0.5*λ*[tr(H⁻¹Sₖ) - tr(S⁺Sₖ)] + weight_deriv_term.
-                        // Swapping them fixes the sign.
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term - s_inv_trace_term)
+                        // IMPORTANT: The previous formula was fundamentally incorrect.
+                        // The correct LAML score gradient is 0.5*λ*[tr(H⁻¹Sₖ) + tr(S⁺Sₖ)] + weight_deriv_term.
+                        // The score gradient requires the sum of these terms, not their difference.
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term + s_inv_trace_term)
                             + weight_deriv_term;
 
                         // Handle numerical stability
