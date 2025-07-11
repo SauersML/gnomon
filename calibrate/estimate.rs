@@ -676,9 +676,12 @@ pub mod internal {
                             }
                         }
                         
-                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(β̂ᵀSₖβ̂/σ² - tr(H⁻¹Sₖ))`.
-                        // We compute the score gradient here, and the final negation outside the loop converts it to the cost gradient.
-                        gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled - trace_term_unscaled);
+                        // IMPORTANT: This comment previously stated the incorrect formula.
+                        // This has been fixed in the implementation below.
+                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
+                        // The original code had these terms swapped, calculating the negative of the score gradient.
+                        // Swapping them back fixes the sign.
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
                     }
                 }
                 _ => {
