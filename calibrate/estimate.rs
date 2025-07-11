@@ -1445,7 +1445,7 @@ pub mod internal {
     /// * `Err` - If SVD computation fails
     pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, LinalgError> {
         // Compute SVD
-        let (_u, s, _vt) = matrix.svd(false, false)?;
+        let (_, s, _) = matrix.svd(false, false)?;
 
         // Get max and min singular values
         let max_sv = s.iter().fold(0.0_f64, |max, &val| max.max(val));
