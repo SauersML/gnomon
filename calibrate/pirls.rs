@@ -1,4 +1,4 @@
-use crate::calibrate::estimate::internal::construct_s_lambda;
+use crate::calibrate::estimate::internal::{construct_s_lambda, calculate_condition_number};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use crate::calibrate::estimate::internal::ModelLayout;
@@ -88,6 +88,33 @@ pub struct PirlsResult {
 
             // Add numerical ridge for stability
             penalized_hessian.diag_mut().mapv_inplace(|d| d + 1e-9);
+
+            // Check condition number before attempting to solve
+            const MAX_CONDITION_NUMBER: f64 = 1e12;
+            match calculate_condition_number(&penalized_hessian) {
+                Ok(condition_number) => {
+                    if condition_number > MAX_CONDITION_NUMBER {
+                        log::error!(
+                            "Penalized Hessian is ill-conditioned at iteration {}: condition number = {:.2e}",
+                            iter, condition_number
+                        );
+                        return Err(EstimationError::ModelIsIllConditioned { condition_number });
+                    }
+                    // Log warning if condition number is high but not critical
+                    if condition_number > 1e8 {
+                        log::warn!(
+                            "Penalized Hessian has high condition number at iteration {}: {:.2e}",
+                            iter, condition_number
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to compute condition number at iteration {}: {:?}. Proceeding anyway.",
+                        iter, e
+                    );
+                }
+            }
 
             // Right-hand side of the equation: X'Wz
             let rhs = x.t().dot(&(weights * &z));
