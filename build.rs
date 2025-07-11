@@ -252,27 +252,22 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
             Err(_) => continue, // Skip files we can't read
         };
 
-        // Skip analyzing files that are in test modules or test files
-        let is_test_file = path.to_str().map_or(false, |p| p.contains("tests/") || p.ends_with("_test.rs") || p.ends_with(".test.rs"));
-        
         // Add debug info for estimate.rs to help diagnose the underscore variable detection
         let is_estimate_rs = path.to_str().map_or(false, |p| p.ends_with("calibrate/estimate.rs"));
         if is_estimate_rs {
             println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
         }
         
-        if !is_test_file {
-            // Create a new collector for each file.
-            let mut collector = ViolationCollector::new(path);
+        // Create a new collector for each file.
+        let mut collector = ViolationCollector::new(path);
 
-            // Search the file using our regex matcher and collector sink.
-            searcher.search_path(&matcher, path, &mut collector)?;
+        // Search the file using our regex matcher and collector sink.
+        searcher.search_path(&matcher, path, &mut collector)?;
 
-            // Process results
-            if let Some(error_message) = collector.check_and_get_error_message() {
-                // If violations were found, return the error - no exceptions for test modules
-                return Err(error_message.into());
-            }
+        // Process results
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            // If violations were found, return the error
+            return Err(error_message.into());
         }
     }
 
