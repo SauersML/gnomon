@@ -3351,6 +3351,10 @@ pub mod internal {
 
     #[test]
     fn test_reml_fails_gracefully_on_singular_model() {
+        use std::time::Duration;
+        use std::thread;
+        use std::sync::mpsc;
+        
         let n = 30; // Number of samples
         
         // Generate minimal data
@@ -3377,8 +3381,28 @@ pub mod internal {
         
         println!("Singularity test: Attempting to train over-parameterized model ({} data points)", n);
         
-        // This should fail gracefully with a helpful error
-        let result = train_model(&data, &config);
+        // Run the model training in a separate thread with timeout
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = train_model(&data, &config);
+            tx.send(result).unwrap();
+        });
+        
+        // Wait for result with timeout
+        let result = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The thread is still running, but we can't safely terminate it
+                // So we panic with a timeout error
+                panic!("Test took too long: exceeded 60 second timeout");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("Thread disconnected unexpectedly");
+            }
+        };
+        
+        // Clean up the thread
+        handle.join().unwrap();
         
         // Verify it fails with the expected error type
         assert!(result.is_err(), "Over-parameterized model should fail");
