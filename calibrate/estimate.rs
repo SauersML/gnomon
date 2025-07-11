@@ -93,9 +93,10 @@ pub fn train_model(
     // 4. Define the initial guess for log-smoothing parameters (rho).
     // A rho of 0.0 corresponds to lambda = 1.0, which gives roughly equal weight
     // to the data likelihood and the penalty. Starting near this neutral ground
-    // is a robust default. We use -0.5 (lambda ≈ 0.61) for a slightly less
-    // penalized start that favors fitting the data a bit more.
-    let initial_rho = Array1::from_elem(layout.num_penalties, -0.5); // λ ≈ 0.61
+    // is a robust default. For complex functions with non-linearities, we use
+    // a more conservative starting point with stronger regularization to improve
+    // numerical stability of the optimization process.
+    let initial_rho = Array1::from_elem(layout.num_penalties, 0.5); // λ ≈ 1.65
 
     // 4a. Check that the initial cost is finite before starting BFGS
     let initial_cost = reml_state_arc.compute_cost(&initial_rho)?;
@@ -138,7 +139,9 @@ pub fn train_model(
                         // perturbs the theoretical basis for the Hessian update, it is a
                         // vital pragmatic choice for numerical stability.
                         let grad_norm = grad.dot(&grad).sqrt();
-                        const MAX_GRAD_NORM: f64 = 100.0;
+                        // Use a more conservative gradient scaling factor to improve numerical stability
+                        // for complex non-linear models with potential extreme gradients
+                        const MAX_GRAD_NORM: f64 = 10.0; 
                         if grad_norm > MAX_GRAD_NORM {
                             log::debug!("Gradient norm is large ({}). Scaling down.", grad_norm);
                             grad.mapv_inplace(|g| g * MAX_GRAD_NORM / grad_norm);
@@ -1516,7 +1519,9 @@ pub mod internal {
                 // Prevent extreme values in working response z
                 let residual = &y.view() - &mu;
                 let z_adj = &residual / &weights;
-                let z_clamped = z_adj.mapv(|v| v.clamp(-1e6, 1e6)); // Prevent extreme values
+                // Use a more reasonable clamping range (1e4 instead of 1e6) to prevent numerical instability
+                // while still allowing for reasonable convergence steps
+                let z_clamped = z_adj.mapv(|v| v.clamp(-1e4, 1e4)); 
                 let z = &eta_clamped + &z_clamped;
 
                 (mu, weights, z)
@@ -1862,7 +1867,7 @@ pub mod internal {
         #[test]
         fn test_train_model_approximates_smooth_function() {
             // --- 1. Setup: Generate data from a known smooth function ---
-            let n_samples = 500; // Further increased samples for better numerical stability
+            let n_samples = 500; // Use sufficient samples for accurate fitting
 
             // Create meaningful PGS values
             let p = Array::linspace(-2.0, 2.0, n_samples);
@@ -1871,15 +1876,14 @@ pub mod internal {
             let pc1 = Array::linspace(-1.5, 1.5, n_samples);
             let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
 
-            // Define a non-linear smooth function that combines PGS and PC effects
-            // This function has interesting non-linearities to test the GAM's flexibility:
-            //  - A sinusoidal component in PGS
-            //  - A quadratic component in PC
-            //  - A hyperbolic tangent interaction
+            // Define a very simple function that's numerically stable
+            // while still testing GAM capabilities
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let term1 = 0.5 * pgs_val; // Simple linear PGS effect
-                let term2 = 0.7 * pc_val.powi(2); // Simple quadratic PC effect
-                0.1 + term1 + term2 // Intercept + terms
+                // Balanced terms that test the model's ability to capture key patterns
+                let term1 = (pgs_val * 0.5).sin() * 0.4; // Mild sinusoidal pattern in PGS
+                let term2 = 0.4 * pc_val.powi(2); // Moderate quadratic effect
+                let term3 = 0.15 * (pgs_val * pc_val).tanh(); // Modest interaction effect
+                0.3 + term1 + term2 + term3 // Intercept + terms
             };
 
             // Generate binary outcomes based on the true model
@@ -1906,19 +1910,23 @@ pub mod internal {
             let data = TrainingData { y, p, pcs };
 
             // --- 2. Configure and Train the Model ---
-            // Use even fewer basis functions to avoid overparameterization
+            // Use sufficient basis functions for accurate approximation
             let mut config = create_test_config();
-            config.pgs_basis_config.num_knots = 3; // Minimal knots to avoid overparameterization
-            config.pc_basis_configs[0].num_knots = 3; // Minimal knots to avoid overparameterization
+            config.pgs_basis_config.num_knots = 4; // Sufficient knots to capture sine waves
+            config.pc_basis_configs[0].num_knots = 4; // Sufficient knots for quadratic effects
+            config.pgs_basis_config.degree = 3; // Original cubic splines
+            config.pc_basis_configs[0].degree = 3; // Original cubic splines
+            
+            // Add more stability by increasing P-IRLS iteration limit and improving initialization
+            config.max_iterations = 200;
+            config.reml_max_iterations = 25; // Allow more iterations for BFGS to converge
 
-            // Create a more forgiving test by trying the model fitting and handling errors gracefully
-            let trained_model_result = train_model(&data, &config);
-            assert!(
-                trained_model_result.is_ok(),
-                "train_model failed with error: {:?}",
-                trained_model_result.err()
-            );
-            let trained_model = trained_model_result.unwrap();
+            // Standard configuration
+            config.max_iterations = 150;     // Default P-IRLS iterations
+            
+            // Train the model - must succeed for validation to be meaningful
+            let trained_model = train_model(&data, &config)
+                .expect("Model training failed - test requires a model that can be trained");
 
             // --- 3. Verify the Model's Predictions Against Ground Truth ---
             // Create a fine grid of test points that spans the input space
@@ -1969,14 +1977,14 @@ pub mod internal {
                 correlation
             );
 
-            // Use more relaxed thresholds for the simpler function and randomized data
+            // Use reasonable thresholds appropriate for this complex function
             assert!(
-                rmse < 0.25,
+                rmse < 0.18,
                 "RMSE between true and predicted probabilities too large: {}",
                 rmse
             );
             assert!(
-                correlation > 0.75,
+                correlation > 0.85,
                 "Correlation between true and predicted probabilities too low: {}",
                 correlation
             );
@@ -2048,133 +2056,201 @@ pub mod internal {
             // Set PC to zero to isolate PGS main effect
             let pc_fixed = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
 
-            // True PGS effect: the derivative of the true function with respect to PGS at PC=0
-            let true_pgs_effect = 0.8 * 1.2; // From true_function
-
-            // Get predictions for each PGS value
+            // Calculate the true PGS effect function at PC=0
+            let true_pgs_logits: Vec<f64> = pgs_test.iter()
+                .map(|&pgs_val| true_function(pgs_val, 0.0))
+                .collect();
+                
+            // Get model predictions for each PGS value with PC fixed at 0
+            let mut pgs_pred_logits = Vec::with_capacity(n_grid);
             for &pgs_val in pgs_test.iter() {
                 let test_pgs = Array1::from_elem(1, pgs_val);
-                let pred = trained_model
+                let pred_prob = trained_model
                     .predict(test_pgs.view(), pc_fixed.view())
                     .unwrap()[0];
-                pgs_preds.push(pred);
+                    
+                // Convert probability to logit scale
+                let pred_prob_clamped = pred_prob.clamp(1e-8, 1.0 - 1e-8); // Prevent numerical issues
+                let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
+                pgs_pred_logits.push(pred_logit);
+                pgs_preds.push(pred_prob); // Still keep the original probabilities for other tests
             }
-
-            // Calculate approximate slopes (derivatives) to measure the PGS effect
-            let mut pgs_slopes = Vec::new();
-            for i in 1..n_grid {
-                // For the derivative, we need to convert from probability to logit
-                let p1 = pgs_preds[i - 1];
-                let p2 = pgs_preds[i];
-                let logit1 = (p1 / (1.0 - p1)).ln();
-                let logit2 = (p2 / (1.0 - p2)).ln();
-
-                let slope = (logit2 - logit1) / (pgs_test[i] - pgs_test[i - 1]);
-                pgs_slopes.push(slope);
-            }
-
-            // Average slope should approximate the true PGS effect
-            let avg_pgs_slope = pgs_slopes.iter().sum::<f64>() / pgs_slopes.len() as f64;
-            println!(
-                "True PGS effect: {}, Average estimated PGS effect: {:.4}",
-                true_pgs_effect, avg_pgs_slope
+            
+            // Calculate RMSE between true and predicted logits
+            let pgs_squared_errors: f64 = pgs_test.iter().enumerate()
+                .map(|(i, _)| (true_pgs_logits[i] - pgs_pred_logits[i]).powi(2))
+                .sum();
+            let pgs_rmse = (pgs_squared_errors / pgs_test.len() as f64).sqrt();
+            
+            // Calculate correlation between true and predicted logits
+            let pgs_correlation = correlation_coefficient(
+                &Array1::from_vec(true_pgs_logits.clone()), 
+                &Array1::from_vec(pgs_pred_logits.clone())
             );
-
-            let pgs_error_ratio = (avg_pgs_slope - true_pgs_effect).abs() / true_pgs_effect.abs();
+            
+            println!("PGS main effect - RMSE between true and predicted logits: {:.4}", pgs_rmse);
+            println!("PGS main effect - Correlation between true and predicted logits: {:.4}", pgs_correlation);
+            
             assert!(
-                pgs_error_ratio < 0.3, // More relaxed threshold with randomized data
-                "Average PGS effect doesn't match true effect. True: {}, Estimated: {:.4}, Relative Error: {:.2}",
-                true_pgs_effect,
-                avg_pgs_slope,
-                pgs_error_ratio
+                pgs_rmse < 0.25,
+                "PGS main effect shape is not well approximated (RMSE too high): {:.4}",
+                pgs_rmse
+            );
+            
+            assert!(
+                pgs_correlation > 0.95,
+                "Learned PGS main effect does not correlate well with the true effect: {:.4}", 
+                pgs_correlation
             );
 
             // ----- VALIDATE INTERACTION EFFECT -----
 
-            // Create grid points to test interaction
-            let n_int = 10;
-            let pgs_pos = Array1::from_elem(n_int, 1.0); // Positive PGS values for interaction testing
-            let pgs_neg = Array1::from_elem(n_int, -1.0); // Negative PGS values for interaction testing
-            let pc_values = Array1::linspace(-1.0, 1.0, n_int);
-
-            // True interaction effect - derived from the hyperbolic tangent term
-            let true_interaction = 0.3;
-
-            // Convert PC array to 2D matrix format for each prediction
-            let pc_array = Array2::from_shape_fn((n_int, 1), |(i, _)| pc_values[i]);
-
-            // Get predictions for positive and negative PGS across PC values
-            let pred_pos_pgs = trained_model
-                .predict(pgs_pos.view(), pc_array.view())
-                .unwrap();
-            let pred_neg_pgs = trained_model
-                .predict(pgs_neg.view(), pc_array.view())
-                .unwrap();
-
-            // For interaction effect, compute difference in slopes between positive and negative PGS
-            let mut pos_pc_slopes = Vec::new();
-            let mut neg_pc_slopes = Vec::new();
-
-            for i in 1..n_int - 1 {
-                // Calculate slopes for positive PGS
-                let logit_pos_1 = (pred_pos_pgs[i - 1] / (1.0 - pred_pos_pgs[i - 1])).ln();
-                let logit_pos_2 = (pred_pos_pgs[i + 1] / (1.0 - pred_pos_pgs[i + 1])).ln();
-                let pos_slope = (logit_pos_2 - logit_pos_1) / (pc_values[i + 1] - pc_values[i - 1]);
-                pos_pc_slopes.push(pos_slope);
-
-                // Calculate slopes for negative PGS
-                let logit_neg_1 = (pred_neg_pgs[i - 1] / (1.0 - pred_neg_pgs[i - 1])).ln();
-                let logit_neg_2 = (pred_neg_pgs[i + 1] / (1.0 - pred_neg_pgs[i + 1])).ln();
-                let neg_slope = (logit_neg_2 - logit_neg_1) / (pc_values[i + 1] - pc_values[i - 1]);
-                neg_pc_slopes.push(neg_slope);
+            // Create a 2D grid to evaluate the full interaction surface
+            let int_grid_size = 15; // Reduced grid size for better numerical stability
+            let pgs_int_grid = Array1::linspace(-2.0, 2.0, int_grid_size);
+            let pc_int_grid = Array1::linspace(-1.0, 1.0, int_grid_size);
+            
+            // First, compute true interaction surface by isolating interaction term from true_function
+            let mut true_interaction_surface = Vec::with_capacity(int_grid_size * int_grid_size);
+            
+            // For each point on the grid, calculate the interaction component
+            for &pgs_val in pgs_int_grid.iter() {
+                for &pc_val in pc_int_grid.iter() {
+                    // Full function: true_function(pgs_val, pc_val)
+                    let full_logit = true_function(pgs_val, pc_val);
+                    
+                    // PGS main effect: true_function(pgs_val, 0.0)
+                    let pgs_main_logit = true_function(pgs_val, 0.0);
+                    
+                    // PC main effect: true_function(0.0, pc_val)
+                    let pc_main_logit = true_function(0.0, pc_val);
+                    
+                    // Intercept: true_function(0.0, 0.0)
+                    let intercept_logit = true_function(0.0, 0.0);
+                    
+                    // Interaction term = Full - PGS_main - PC_main + Intercept
+                    // We add the intercept because it gets subtracted twice in the main effects
+                    let interaction_term = full_logit - pgs_main_logit - pc_main_logit + intercept_logit;
+                    true_interaction_surface.push(interaction_term);
+                }
             }
-
-            // Average slopes
-            let avg_pos_slope = pos_pc_slopes.iter().sum::<f64>() / pos_pc_slopes.len() as f64;
-            let avg_neg_slope = neg_pc_slopes.iter().sum::<f64>() / neg_pc_slopes.len() as f64;
-
-            // The difference in slopes gives us the interaction effect per 2.0 units of PGS
-            let estimated_interaction = (avg_pos_slope - avg_neg_slope) / 2.0;
-
-            println!(
-                "True interaction effect: {}, Estimated: {:.4}",
-                true_interaction, estimated_interaction
+            
+            // Now, compute model's predicted interaction surface
+            let mut learned_interaction_surface = Vec::with_capacity(int_grid_size * int_grid_size);
+            
+            // Get intercept prediction once
+            let pgs_zero = Array1::from_elem(1, 0.0);
+            let pc_zero = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+            let pred_intercept_prob = trained_model.predict(pgs_zero.view(), pc_zero.view()).unwrap()[0];
+            let pred_intercept_prob_clamped = pred_intercept_prob.clamp(1e-8, 1.0 - 1e-8);
+            let pred_intercept_logit = (pred_intercept_prob_clamped / (1.0 - pred_intercept_prob_clamped)).ln();
+            
+            // For each point on the grid, calculate the learned interaction component
+            for &pgs_val in pgs_int_grid.iter() {
+                // Calculate PGS main effect once per PGS value
+                let pgs_main = Array1::from_elem(1, pgs_val);
+                let pred_pgs_main_prob = trained_model.predict(pgs_main.view(), pc_zero.view()).unwrap()[0];
+                let pred_pgs_main_prob_clamped = pred_pgs_main_prob.clamp(1e-8, 1.0 - 1e-8);
+                let pred_pgs_main_logit = (pred_pgs_main_prob_clamped / (1.0 - pred_pgs_main_prob_clamped)).ln();
+                
+                for &pc_val in pc_int_grid.iter() {
+                    // Calculate PC main effect
+                    let pc_main = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
+                    let pred_pc_main_prob = trained_model.predict(pgs_zero.view(), pc_main.view()).unwrap()[0];
+                    let pred_pc_main_prob_clamped = pred_pc_main_prob.clamp(1e-8, 1.0 - 1e-8);
+                    let pred_pc_main_logit = (pred_pc_main_prob_clamped / (1.0 - pred_pc_main_prob_clamped)).ln();
+                    
+                    // Calculate full effect
+                    let pred_full_prob = trained_model.predict(pgs_main.view(), pc_main.view()).unwrap()[0];
+                    let pred_full_prob_clamped = pred_full_prob.clamp(1e-8, 1.0 - 1e-8);
+                    let pred_full_logit = (pred_full_prob_clamped / (1.0 - pred_full_prob_clamped)).ln();
+                    
+                    // Interaction term = Full - PGS_main - PC_main + Intercept
+                    let pred_interaction_term = pred_full_logit - pred_pgs_main_logit - pred_pc_main_logit + pred_intercept_logit;
+                    learned_interaction_surface.push(pred_interaction_term);
+                }
+            }
+            
+            // Calculate RMSE between true and learned interaction surfaces
+            let interaction_squared_errors: f64 = true_interaction_surface.iter().zip(learned_interaction_surface.iter())
+                .map(|(true_val, learned_val)| (true_val - learned_val).powi(2))
+                .sum();
+            let interaction_rmse = (interaction_squared_errors / true_interaction_surface.len() as f64).sqrt();
+            
+            // Calculate correlation between true and learned interaction surfaces
+            let interaction_correlation = correlation_coefficient(
+                &Array1::from_vec(true_interaction_surface.clone()),
+                &Array1::from_vec(learned_interaction_surface.clone())
             );
-            let int_error_ratio =
-                (estimated_interaction - true_interaction).abs() / true_interaction.abs();
-
+            
+            println!("Interaction effect - RMSE between true and predicted surfaces: {:.4}", interaction_rmse);
+            println!("Interaction effect - Correlation between true and predicted surfaces: {:.4}", interaction_correlation);
+            
             assert!(
-                int_error_ratio < 0.4, // More relaxed threshold with randomized data
-                "Interaction effect doesn't match. True: {}, Estimated: {:.4}, Relative Error: {:.2}",
-                true_interaction,
-                estimated_interaction,
-                int_error_ratio
+                interaction_rmse < 0.20,
+                "Interaction surface is not well approximated (RMSE too high): {:.4}",
+                interaction_rmse
+            );
+            
+            assert!(
+                interaction_correlation > 0.85,
+                "Learned interaction surface does not correlate well with the true surface: {:.4}", 
+                interaction_correlation
             );
 
             // Calculate R² for the relationship between PC values and their effects
             // PC1 should have a strong relationship, PC2 should not
 
-            // Create grid points for evaluation
-            let pc1_grid = Array1::linspace(-1.5, 1.5, 50);
-            // Remove PC2 grid as we only have PC1
-            let _unused_var = 0; // Placeholder to maintain line numbers
+            // Create grid points for evaluation of PC1 main effect with a more limited range
+            let pc1_grid = Array1::linspace(-1.0, 1.0, 40); // Reduced range for more stability
             let pgs_fixed = Array1::from_elem(1, 0.0); // Set PGS to zero to isolate PC effects
 
-            // Get model's predictions for each PC
-            let pc1_effects = pc1_grid.mapv(|pc_val| {
-                let pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
-                trained_model.predict(pgs_fixed.view(), pc.view()).unwrap()[0]
-            });
+            // Calculate the true PC1 effect at PGS=0
+            let true_pc1_logits: Vec<f64> = pc1_grid.iter()
+                .map(|&pc_val| true_function(0.0, pc_val))
+                .collect();
 
-            // We only have PC1 in our model, so no need to test PC2
+            // Get model's predictions for each PC value
+            let mut pc1_pred_logits = Vec::with_capacity(pc1_grid.len());
+            let mut pc1_effects = Vec::with_capacity(pc1_grid.len()); // Keep probabilities for other tests
             
-            let pc1_corr = correlation_coefficient(&pc1_grid, &pc1_effects);
-            let pc1_r2 = pc1_corr * pc1_corr;
-
-            println!("PC1 R²: {:.6}", pc1_r2);
+            for &pc_val in pc1_grid.iter() {
+                let pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
+                let pred_prob = trained_model.predict(pgs_fixed.view(), pc.view()).unwrap()[0];
+                
+                // Convert to logit scale for comparison
+                let pred_prob_clamped = pred_prob.clamp(1e-8, 1.0 - 1e-8);
+                let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
+                
+                pc1_pred_logits.push(pred_logit);
+                pc1_effects.push(pred_prob);
+            }
+            
+            // Calculate RMSE between true and predicted PC1 effect
+            let pc1_squared_errors: f64 = pc1_grid.iter().enumerate()
+                .map(|(i, _)| (true_pc1_logits[i] - pc1_pred_logits[i]).powi(2))
+                .sum();
+            let pc1_rmse = (pc1_squared_errors / pc1_grid.len() as f64).sqrt();
+            
+            // Calculate correlation between true and predicted PC1 effect
+            let pc1_correlation = correlation_coefficient(
+                &Array1::from_vec(true_pc1_logits.clone()),
+                &Array1::from_vec(pc1_pred_logits.clone())
+            );
+            
+            println!("PC1 main effect - RMSE between true and predicted logits: {:.4}", pc1_rmse);
+            println!("PC1 main effect - Correlation between true and predicted logits: {:.4}", pc1_correlation);
+            
             assert!(
-                pc1_r2 > 0.4, // Relaxed threshold with randomized data
-                "PC1 effect should show relationship with PC1 values"
+                pc1_rmse < 0.25,
+                "PC1 main effect shape is not well approximated (RMSE too high): {:.4}",
+                pc1_rmse
+            );
+            
+            assert!(
+                pc1_correlation > 0.95,
+                "Learned PC1 main effect does not correlate well with the true effect: {:.4}", 
+                pc1_correlation
             );
         }
 
