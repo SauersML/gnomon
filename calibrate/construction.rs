@@ -685,33 +685,8 @@ pub struct StablePLSResult {
 /// * `Ok(f64::INFINITY)` - If the matrix is effectively singular (min_sv < 1e-12)
 /// * `Err` - If SVD computation fails
 pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, LinalgError> {
-    // For large matrices, use a faster heuristic before expensive SVD
-    let n = matrix.nrows();
-
-    // Quick check: if matrix is too large, use trace/determinant heuristic
-    if n > 100 {
-        // Check diagonal dominance as a fast proxy for conditioning
-        let mut min_diag = f64::INFINITY;
-        let mut max_diag = 0.0_f64;
-
-        for i in 0..n {
-            let diag_val = matrix[[i, i]].abs();
-            min_diag = min_diag.min(diag_val);
-            max_diag = max_diag.max(diag_val);
-        }
-
-        if min_diag < 1e-12 {
-            return Ok(f64::INFINITY);
-        }
-
-        // Simple heuristic: if diagonal ratio is bad, likely ill-conditioned
-        let diag_ratio = max_diag / min_diag;
-        if diag_ratio > 1e10 {
-            return Ok(diag_ratio);
-        }
-    }
-
-    // For smaller matrices or when heuristic is inconclusive, use SVD
+    // Use SVD for all matrices - the cost depends on number of coefficients (p), not samples (n)
+    // For typical GAMs, p is much smaller than n, making SVD computationally feasible and reliable
     let (_, s, _) = matrix.svd(false, false)?;
 
     // Get max and min singular values
