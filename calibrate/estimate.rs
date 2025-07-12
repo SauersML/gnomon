@@ -480,21 +480,26 @@ pub mod internal {
                     let log_det_s_lambda_pseudo = calculate_log_det_pseudo(&s_lambda)
                         .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
-                    // Calculate variance estimate using penalized deviance: σ² = Dp / (n - edf)
-                     let sigma_sq = penalized_deviance / (n - edf).max(1e-8);
+                    // Calculate variance estimate using unpenalized RSS: σ² = RSS / (n - edf)
+                    // This matches gradient computation and textbook p.298
+                     let sigma_sq = rss / (n - edf).max(1e-8);
+                     
+                     if n - edf < 1.0 {
+                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
+                     }
 
                     // Calculate saturated likelihood: ls(φ) = -n/2 * log(2πφ) 
                     // For Gaussian models, saturated deviance = 0 (μᵢ = yᵢ exactly), so no RSS term
                      let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
                     
                     // Calculate REML score with penalized deviance and saturated likelihood
-                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ + Mp/2*log(2π)
+                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ + Mp/2*log(2πσ²)
                     // Note: Mp is null space dimension (number of unpenalized coefficients)
                     let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
                     let reml = -(penalized_deviance / (2.0 * sigma_sq)) - ls_phi 
                     - 0.5 * log_det_xtx_plus_s 
                     + 0.5 * log_det_s_lambda_pseudo 
-                               + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
+                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
@@ -535,11 +540,13 @@ pub mod internal {
                         }
                     };
 
-                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2π)
-                    // Mp is null space dimension (number of unpenalized coefficients)  
-                     let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
-                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h 
-                              + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
+                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
+                    // Mp is null space dimension (number of unpenalized coefficients)
+                    // For logit, scale parameter is typically fixed at 1.0, but include for completeness
+                    let phi = 1.0; // Logit family typically has dispersion parameter = 1
+                    let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
+                    let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h 
+                    + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Return negative LAML score for minimization
                     Ok(-laml)
@@ -651,8 +658,15 @@ pub mod internal {
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-                        // Try to solve the system first with original Hessian
-                        let solve_result = pirls_result.penalized_hessian.solve(&s_col.to_owned());
+                        // Ensure Hessian is positive definite before solving
+                        let mut hessian_work = pirls_result.penalized_hessian.clone();
+                         let adjusted = ensure_positive_definite(&mut hessian_work);
+                         if adjusted {
+                             log::info!("Adjusted penalized Hessian for positive definiteness in EDF calculation");
+                         }
+                         
+                         // Try to solve the system with adjusted Hessian
+                         let solve_result = hessian_work.solve(&s_col.to_owned());
                         
                         if let Ok(h_inv_s_col) = solve_result {
                             trace_h_inv_s_lambda += h_inv_s_col[j];
@@ -752,8 +766,12 @@ pub mod internal {
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
-                            // Try normal solve first
-                            let solve_result = pirls_result.penalized_hessian.solve(&s_col.to_owned());
+                            // Ensure Hessian is positive definite before solving
+                            let mut hessian_work = pirls_result.penalized_hessian.clone(); 
+                             ensure_positive_definite(&mut hessian_work);
+                             
+                             // Try solve with adjusted Hessian
+                             let solve_result = hessian_work.solve(&s_col.to_owned());
                             
                             if let Ok(h_inv_s_col) = solve_result {
                                 trace_term_unscaled += h_inv_s_col[j];
@@ -787,10 +805,12 @@ pub mod internal {
                         let s_k_rotated = eigenvectors_s.t().dot(&s_k_full.dot(&eigenvectors_s));
 
                         // Compute the trace: tr(S_λ⁺ * S_k) = Σᵢ (1/λᵢ) * (U^T S_k U)ᵢᵢ
-                        let mut s_inv_trace_term = 0.0;
+                        let mut s_inv_trace_unscaled = 0.0;
                         for i in 0..s_lambda_for_pseudo.ncols() {
-                        s_inv_trace_term += pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
+                        s_inv_trace_unscaled += pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
                         }
+                         // Scale by λ_k for ∂log|S|/∂ρ_k = λ_k tr(S^+ S_k)  
+                         let s_inv_trace_term = lambdas[k] * s_inv_trace_unscaled;
                         
                         // --- Term 4: Scale dependency cross-term ---
                         // When scale parameter φ̂ is estimated (not fixed), we need the chain-rule term:
@@ -855,9 +875,9 @@ pub mod internal {
                          let scale_dependency_term = -cross_term_coeff * d_phi_d_rho_k;
                          
                          // The complete REML gradient including scale dependency:
-                         // ∂reml/∂ρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k) - tr(S_λ⁺S_k)) + scale_dependency_term
+                         // ∂reml/∂ρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k)) - 0.5*λ_k*tr(S_λ⁺S_k) + scale_dependency_term
                          // Based on Wood 2017 p.298: beta term positive, trace term positive, log|S| term negative
-                          gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled - s_inv_trace_term) + scale_dependency_term;
+                         gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled) - 0.5 * s_inv_trace_term + scale_dependency_term;
                     }
                 }
                 _ => {
@@ -1528,6 +1548,33 @@ pub mod internal {
         }
 
         s_lambda
+    }
+
+    /// Ensures a matrix is positive definite by adjusting negative eigenvalues
+    fn ensure_positive_definite(hess: &mut Array2<f64>) -> bool {
+        if let Ok((mut evals, evecs)) = hess.eigh(UPLO::Lower) {
+            let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
+            let mut adjusted = false;
+            
+            for eval in evals.iter_mut() {
+                if *eval < thresh {
+                    *eval = thresh;
+                    adjusted = true;
+                }
+            }
+            
+            if adjusted {
+                *hess = evecs.dot(&Array2::from_diag(&evals)).dot(&evecs.t());
+            }
+            
+            adjusted
+        } else {
+            // Fallback: add small ridge to diagonal
+            for i in 0..hess.nrows() {
+                hess[[i, i]] += 1e-6;
+            }
+            true
+        }
     }
 
     /// Helper to calculate log |S|+ robustly using eigendecomposition.
