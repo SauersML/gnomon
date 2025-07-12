@@ -1,4 +1,6 @@
 use crate::calibrate::basis::{self, create_bspline_basis};
+use crate::calibrate::construction::ModelLayout;
+use crate::calibrate::estimate::EstimationError;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -222,7 +224,7 @@ mod internal {
         }
 
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
-        
+
         // For interactions, use the constrained pgs_main_basis directly
         // Cannot reconstruct "full" basis due to dimensional reduction from constraints
 
@@ -634,7 +636,6 @@ mod tests {
     #[test]
     fn test_save_load_functionality() {
         use crate::calibrate::data::TrainingData;
-        use crate::calibrate::estimate;
 
         // Define the BasisConfig to use
         let pgs_basis_config = BasisConfig {
@@ -678,8 +679,11 @@ mod tests {
 
         // Generate the correct constraints and structure using the actual model-building code
         let (_, _, layout, constraints, knot_vectors) =
-            estimate::internal::build_design_and_penalty_matrices(&dummy_data, &model_config)
-                .expect("Failed to build model matrices");
+            crate::calibrate::construction::build_design_and_penalty_matrices(
+                &dummy_data,
+                &model_config,
+            )
+            .expect("Failed to build model matrices");
 
         // Now we can create a test model with the correct structure
         let original_model = TrainedModel {
@@ -895,57 +899,55 @@ mod tests {
     }
 }
 
-
-
 // MOVE THIS SOMEWHERE ELSE
-    /// Maps the flattened coefficient vector to a structured representation.
-    pub fn map_coefficients(
-        beta: &Array1<f64>,
-        layout: &ModelLayout,
-    ) -> Result<MappedCoefficients, EstimationError> {
-        let intercept = beta[layout.intercept_col];
-        let mut pcs = HashMap::new();
-        let mut pgs = vec![];
-        let mut interaction_effects = HashMap::new();
+/// Maps the flattened coefficient vector to a structured representation.
+pub fn map_coefficients(
+    beta: &Array1<f64>,
+    layout: &ModelLayout,
+) -> Result<MappedCoefficients, EstimationError> {
+    let intercept = beta[layout.intercept_col];
+    let mut pcs = HashMap::new();
+    let mut pgs = vec![];
+    let mut interaction_effects = HashMap::new();
 
-        // Extract the unpenalized PGS main effect coefficients
-        if layout.pgs_main_cols.len() > 0 {
-            pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
-        }
+    // Extract the unpenalized PGS main effect coefficients
+    if layout.pgs_main_cols.len() > 0 {
+        pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
+    }
 
-        for block in &layout.penalty_map {
-            let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
+    for block in &layout.penalty_map {
+        let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
 
-            // This logic is now driven entirely by the term_name established in the layout
-            match block.term_name.as_str() {
-                name if name.starts_with("f(PC") => {
-                    let pc_name = name.replace("f(", "").replace(")", "");
-                    pcs.insert(pc_name, coeffs);
+        // This logic is now driven entirely by the term_name established in the layout
+        match block.term_name.as_str() {
+            name if name.starts_with("f(PC") => {
+                let pc_name = name.replace("f(", "").replace(")", "");
+                pcs.insert(pc_name, coeffs);
+            }
+            name if name.starts_with("f(PGS_B") => {
+                let parts: Vec<_> = name.split(|c| c == ',' || c == ')').collect();
+                if parts.len() < 2 {
+                    continue;
                 }
-                name if name.starts_with("f(PGS_B") => {
-                    let parts: Vec<_> = name.split(|c| c == ',' || c == ')').collect();
-                    if parts.len() < 2 {
-                        continue;
-                    }
-                    let pgs_key = parts[0].replace("f(", "").to_string();
-                    let pc_name = parts[1].trim().to_string();
-                    interaction_effects
-                        .entry(pgs_key)
-                        .or_insert_with(HashMap::new)
-                        .insert(pc_name, coeffs);
-                }
-                _ => {
-                    return Err(EstimationError::LayoutError(format!(
-                        "Unknown term name in layout during coefficient mapping: {}",
-                        block.term_name
-                    )));
-                }
+                let pgs_key = parts[0].replace("f(", "").to_string();
+                let pc_name = parts[1].trim().to_string();
+                interaction_effects
+                    .entry(pgs_key)
+                    .or_insert_with(HashMap::new)
+                    .insert(pc_name, coeffs);
+            }
+            _ => {
+                return Err(EstimationError::LayoutError(format!(
+                    "Unknown term name in layout during coefficient mapping: {}",
+                    block.term_name
+                )));
             }
         }
-
-        Ok(MappedCoefficients {
-            intercept,
-            main_effects: MainEffects { pgs, pcs },
-            interaction_effects,
-        })
     }
+
+    Ok(MappedCoefficients {
+        intercept,
+        main_effects: MainEffects { pgs, pcs },
+        interaction_effects,
+    })
+}
