@@ -387,7 +387,7 @@ pub mod internal {
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
             // Use stable re-parameterization instead of naive summation
-            let (s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+            let (s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
 
             match self.config.link_function {
                 LinkFunction::Identity => {
@@ -662,7 +662,7 @@ pub mod internal {
                     let rss = pirls_result.deviance;
 
                     let num_params = beta.len() as f64;
-                    let (s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+                    let (s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
                     let mut trace_h_inv_s_lambda = 0.0;
 
                     for j in 0..s_lambda.ncols() {
@@ -857,7 +857,7 @@ pub mod internal {
                                 pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
                         }
                         // Scale by λ_k for ∂log|S|/∂ρ_k = λ_k tr(S^+ S_k)
-                        let _s_inv_trace_term = lambdas[k] * s_inv_trace_unscaled;
+                        // Scale by λ_k for ∂log|S|/∂ρ_k = λ_k tr(S^+ S_k) - not needed for final gradient
 
                         // Scale dependency is now handled in the complete gradient implementation above
 
@@ -936,7 +936,7 @@ pub mod internal {
 
                     // ---- PERFORMANCE OPTIMIZATION ----
                     // Construct S_λ using stable re-parameterization, outside the k-loop
-                    let (mut s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+                    let (mut s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
 
                     // Add small ridge regularization to prevent singularity issues
                     let ridge = 1e-8;
