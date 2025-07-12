@@ -25,12 +25,12 @@
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
+#[cfg(test)]
+use crate::calibrate::construction::PenalizedBlock;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
     stable_reparameterization,
 };
-#[cfg(test)]
-use crate::calibrate::construction::PenalizedBlock;
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
@@ -390,7 +390,8 @@ pub mod internal {
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
             // Use stable re-parameterization algorithm from Wood (2011) Appendix B
-            let reparam_result = stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
+            let reparam_result =
+                stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
 
             match self.config.link_function {
                 LinkFunction::Identity => {
@@ -428,10 +429,12 @@ pub mod internal {
 
                     let n = self.y.len() as f64;
                     let p = pirls_result.beta.len() as f64;
-                    
+
                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
-                    let penalty = pirls_result.beta.dot(&reparam_result.s_transformed.dot(&pirls_result.beta));
+                    let penalty = pirls_result
+                        .beta
+                        .dot(&reparam_result.s_transformed.dot(&pirls_result.beta));
                     let dp = rss + penalty; // Correct penalized deviance
 
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
@@ -442,17 +445,20 @@ pub mod internal {
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-                        
+
                         // Ensure matrix is positive definite before solving
                         let mut hessian_work = pirls_result.penalized_hessian.clone();
                         ensure_positive_definite(&mut hessian_work);
-                        
+
                         match hessian_work.solve(&s_col.to_owned()) {
                             Ok(h_inv_s_col) => {
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
                             }
                             Err(e) => {
-                                log::warn!("Linear system solve failed for EDF calculation: {:?}", e);
+                                log::warn!(
+                                    "Linear system solve failed for EDF calculation: {:?}",
+                                    e
+                                );
                                 trace_h_inv_s_lambda = 0.0;
                                 break;
                             }
@@ -471,14 +477,17 @@ pub mod internal {
                     let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
-                            log::warn!("Cholesky failed for penalized Hessian, using eigenvalue method");
+                            log::warn!(
+                                "Cholesky failed for penalized Hessian, using eigenvalue method"
+                            );
                             let eigenvals = pirls_result
                                 .penalized_hessian
                                 .eigvals()
                                 .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-                            
+
                             let ridge = 1e-8;
-                            eigenvals.iter()
+                            eigenvals
+                                .iter()
                                 .map(|&ev| (ev.re + ridge).max(ridge))
                                 .map(|ev| ev.ln())
                                 .sum()
@@ -498,7 +507,8 @@ pub mod internal {
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
                     // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + (n+M_p-1)/2 log(2πφ)
-                    let reml = dp / (2.0 * phi) + 0.5 * (log_det_h - log_det_s_plus)
+                    let reml = dp / (2.0 * phi)
+                        + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n + mp - 1.0) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Return negative REML score for minimization
@@ -509,7 +519,10 @@ pub mod internal {
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     let penalised_ll = -0.5 * pirls_result.deviance
-                        - 0.5 * pirls_result.beta.dot(&reparam_result.s_transformed.dot(&pirls_result.beta));
+                        - 0.5
+                            * pirls_result
+                                .beta
+                                .dot(&reparam_result.s_transformed.dot(&pirls_result.beta));
 
                     // Log-determinant of the penalty matrix - use stable computation
                     let log_det_s = reparam_result.log_det;
@@ -648,13 +661,14 @@ pub mod internal {
 
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
-            
+
             // Use stable reparameterization for consistent computation
-            let reparam_result = stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
+            let reparam_result =
+                stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
 
             // --- Create the gradient vector ---
             let mut score_gradient = Array1::zeros(lambdas.len());
-            
+
             let beta = &pirls_result.beta;
             let n = self.y.len() as f64;
             let p_coeffs = beta.len() as f64;
@@ -664,38 +678,44 @@ pub mod internal {
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
-                    
+
                     // Calculate scale parameter
                     let rss = pirls_result.deviance;
                     let s_lambda = &reparam_result.s_transformed;
                     let penalty = beta.dot(&s_lambda.dot(beta));
                     let dp = rss + penalty; // Penalized deviance
-                    
+
                     // EDF calculation
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda.ncols() {
                         let s_col = s_lambda.column(j);
-                        if let Ok(h_inv_col) = internal::robust_solve(&pirls_result.penalized_hessian, &s_col.to_owned()) {
+                        if let Ok(h_inv_col) = internal::robust_solve(
+                            &pirls_result.penalized_hessian,
+                            &s_col.to_owned(),
+                        ) {
                             trace_h_inv_s_lambda += h_inv_col[j];
                         }
                     }
                     let edf = (p_coeffs - trace_h_inv_s_lambda).max(1.0);
                     let scale = dp / (n - edf).max(1e-8);
-                    
+
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
                         let s_k_full = &self.s_list[k];
-                        
+
                         // Calculate dβ/dρ_k = -λ_k(H + Sλ)^(-1)S_k*β (Wood 2011, Appendix C)
                         let s_k_beta = s_k_full.dot(beta);
-                        let dbeta_drho_k = match internal::robust_solve(&pirls_result.penalized_hessian, &s_k_beta) {
+                        let dbeta_drho_k = match internal::robust_solve(
+                            &pirls_result.penalized_hessian,
+                            &s_k_beta,
+                        ) {
                             Ok(solved) => -lambdas[k] * solved,
                             Err(_) => {
                                 log::warn!("Failed to solve for dβ/dρ in gradient computation");
                                 Array1::zeros(beta.len())
                             }
                         };
-                        
+
                         // Term 1: D1/(2*scale) - Complete derivative of penalized deviance
                         // D1 includes both direct β'S_k*β term and implicit β dependence
                         // For Gaussian: d(D_p)/dρ_k = λ_k*β'S_k*β + 2*(y-Xβ)'*X*(dβ/dρ_k) + 2*β'*S_λ*(dβ/dρ_k)
@@ -706,22 +726,25 @@ pub mod internal {
                         let penalty_term = 2.0 * beta.dot(&s_lambda.dot(&dbeta_drho_k));
                         let d1 = beta_s_k_beta + residual_term + penalty_term;
                         let term1 = d1 / (2.0 * scale);
-                        
+
                         // Term 2: trA1/2 - Derivative of log|H| (Wood 2011, Section 3.5.1)
                         // trA1 = λ_k * tr(H^(-1) * S_k)
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..s_k_full.ncols() {
                             let s_k_col = s_k_full.column(j);
-                            if let Ok(h_inv_col) = internal::robust_solve(&pirls_result.penalized_hessian, &s_k_col.to_owned()) {
+                            if let Ok(h_inv_col) = internal::robust_solve(
+                                &pirls_result.penalized_hessian,
+                                &s_k_col.to_owned(),
+                            ) {
                                 trace_h_inv_s_k += h_inv_col[j];
                             }
                         }
                         let tra1 = lambdas[k] * trace_h_inv_s_k;
                         let term2 = tra1 / 2.0;
-                        
+
                         // Term 3: -det1/2 - from stable reparameterization
                         let term3 = -reparam_result.det1[k] / 2.0;
-                        
+
                         // This is the gradient of the SCORE (V_REML), which is maximized
                         score_gradient[k] = term1 + term2 + term3;
                     }
@@ -729,83 +752,95 @@ pub mod internal {
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // For LAML, implement complete weight derivative calculation
-                    
+
                     for k in 0..lambdas.len() {
                         let s_k_full = &self.s_list[k];
-                        
+
                         // Calculate dβ/dρ_k = -λ_k(H_p)^(-1)S_k*β
                         let s_k_beta = s_k_full.dot(beta);
-                        let dbeta_drho_k = match internal::robust_solve(&pirls_result.penalized_hessian, &s_k_beta) {
+                        let dbeta_drho_k = match internal::robust_solve(
+                            &pirls_result.penalized_hessian,
+                            &s_k_beta,
+                        ) {
                             Ok(solved) => -lambdas[k] * solved,
                             Err(_) => {
-                                log::warn!("Failed to solve for dβ/dρ in LAML gradient computation");
+                                log::warn!(
+                                    "Failed to solve for dβ/dρ in LAML gradient computation"
+                                );
                                 Array1::zeros(beta.len())
                             }
                         };
-                        
+
                         // Term 1: Weight derivative contribution (critical for LAML)
                         // ∂/∂ρ_k tr(H_p^(-1) X^T ∂W/∂ρ_k X) following mgcv gdi1.c
                         let eta = self.x.dot(beta);
                         let deta_drho_k = self.x.dot(&dbeta_drho_k);
-                        
+
                         // For logit link: W = μ(1-μ), ∂W/∂η = μ(1-μ)(1-2μ)
                         let dw_deta = eta.mapv(|e| {
                             let exp_neg_e = (-e).exp();
                             let mu = 1.0 / (1.0 + exp_neg_e);
                             mu * (1.0 - mu) * (1.0 - 2.0 * mu)
                         });
-                        
+
                         // ∂W/∂ρ_k = (∂W/∂η) * (∂η/∂ρ_k)
                         let dw_drho_k = &dw_deta * &deta_drho_k;
-                        
+
                         // Compute tr(H_p^(-1) X^T ∂W/∂ρ_k X) using the fact that this equals
                         // the diagonal sum of H_p^(-1) applied to the weighted outer products
                         let mut weight_deriv_trace = 0.0;
                         for i in 0..self.x.nrows() {
                             if dw_drho_k[i].abs() > 1e-15 {
                                 let x_i = self.x.row(i);
-                                let weighted_outer = &x_i.to_owned() * (dw_drho_k[i] * &x_i.to_owned().view().insert_axis(Axis(1)));
+                                let weighted_outer = &x_i.to_owned()
+                                    * (dw_drho_k[i] * &x_i.to_owned().view().insert_axis(Axis(1)));
                                 // Approximate trace efficiently
                                 for j in 0..weighted_outer.ncols() {
                                     let col = weighted_outer.column(j);
-                                    if let Ok(h_inv_col) = internal::robust_solve(&pirls_result.penalized_hessian, &col.to_owned()) {
+                                    if let Ok(h_inv_col) = internal::robust_solve(
+                                        &pirls_result.penalized_hessian,
+                                        &col.to_owned(),
+                                    ) {
                                         weight_deriv_trace += h_inv_col[j];
                                     }
                                 }
                             }
                         }
                         let weight_deriv_term = weight_deriv_trace / 2.0;
-                        
+
                         // Term 2: tr(H_p^(-1) S_k) - this will be subtracted
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..s_k_full.ncols() {
-                        let s_k_col = s_k_full.column(j);
-                        if let Ok(h_inv_col) = internal::robust_solve(&pirls_result.penalized_hessian, &s_k_col.to_owned()) {
-                        trace_h_inv_s_k += h_inv_col[j];
+                            let s_k_col = s_k_full.column(j);
+                            if let Ok(h_inv_col) = internal::robust_solve(
+                                &pirls_result.penalized_hessian,
+                                &s_k_col.to_owned(),
+                            ) {
+                                trace_h_inv_s_k += h_inv_col[j];
+                            }
                         }
-                        }
-                        
+
                         // Term 3: tr(S_λ^+ S_k) from det1 - this will be added
                         // reparam_result.det1[k] = λ_k * tr(S_λ^+ S_k)
                         let tr_s_plus_s_k = reparam_result.det1[k] / lambdas[k];
-                        
+
                         // Trace difference term: 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k)]
                         let trace_diff_term = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k);
-                        
+
                         // This is the gradient of the SCORE (V_LAML), which is maximized
                         score_gradient[k] = trace_diff_term + weight_deriv_term;
                     }
                 }
             }
-            
+
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
             // Therefore, the gradient of the cost is the NEGATIVE of the gradient of the score.
             // This single negation at the end makes the logic for both cases consistent.
             let cost_gradient = -score_gradient;
-            
+
             Ok(cost_gradient)
         }
-        }
+    }
 
     /*
     // TEMPORARILY COMMENTED OUT - UNREACHABLE CODE TO BE CLEANED UP
@@ -824,7 +859,7 @@ pub mod internal {
                             if block.penalty_idx == k {
                                 let col_range = block.col_range.clone();
                                 let block_size = col_range.len();
-                                
+
                                 // Defensive shape checking
                                 if s_k.nrows() != block_size || s_k.ncols() != block_size {
                                     return Err(EstimationError::LayoutError(format!(
@@ -832,13 +867,13 @@ pub mod internal {
                                         k, s_k.nrows(), s_k.ncols(), block_size, block_size
                                     )));
                                 }
-                                
+
                                 s_k_full.slice_mut(ndarray::s![col_range.clone(), col_range]).assign(s_k);
                                 found_block = true;
                                 break; // Since penalty_idx is unique, we can break here
                             }
                         }
-                        
+
                         if !found_block {
                             return Err(EstimationError::LayoutError(format!(
                                 "No block found for penalty_idx {}", k
@@ -916,11 +951,11 @@ pub mod internal {
 
                         // Complete REML gradient based on mgcv gam.fit3.r reference implementation
                         // Components: oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
-                        
+
                         // Component 1: Derivative of penalized deviance D_p w.r.t. ρ_k
                         // ∂D_p/∂ρ_k = λ_k * β̂ᵀS_kβ̂ + (derivative through implicit β̂ dependence)
                         let d_penalty_d_rho = lambdas[k] * beta_term_scaled; // Direct penalty term
-                        
+
                         // Implicit differentiation: ∂β̂/∂ρ_k = -λ_k * H⁻¹ * S_k * β̂
                         let s_k_beta = s_k_full.dot(&pirls_result.beta);
                         let d_beta_d_rho_k = match internal::robust_solve(&pirls_result.penalized_hessian, &s_k_beta) {
@@ -936,34 +971,34 @@ pub mod internal {
                                 })?
                             }
                         };
-                        
-                        // Residuals for implicit RSS derivative: ∂RSS/∂ρ_k = -2 * r̂ᵀ * X * ∂β̂/∂ρ_k  
+
+                        // Residuals for implicit RSS derivative: ∂RSS/∂ρ_k = -2 * r̂ᵀ * X * ∂β̂/∂ρ_k
                         let residuals = &self.y - &self.x.dot(&pirls_result.beta);
                         let d_rss_d_rho = -2.0 * residuals.dot(&self.x.dot(&d_beta_d_rho_k));
-                        
+
                         // Total deviance derivative: D1 component from mgcv
                         let d1_component = (d_rss_d_rho + d_penalty_d_rho) / (2.0 * sigma_sq);
-                        
-                        // Component 2: Trace term derivative trA1 from mgcv  
+
+                        // Component 2: Trace term derivative trA1 from mgcv
                         // ∂tr(H⁻¹XᵀX)/∂ρ_k = λ_k * tr(H⁻¹S_k) (this is our trace_term_unscaled)
                         let tra1_component = 0.5 * lambdas[k] * trace_term_unscaled;
-                        
+
                         // Component 3: Penalty determinant derivative rp$det1 from mgcv
                         // ∂log|S_λ|₊/∂ρ_k = λ_k * tr(S_λ⁺S_k)
                         let det1_component = -0.5 * lambdas[k] * s_inv_trace_unscaled;
-                        
+
                         // Component 4: Scale parameter derivative (missing from simplified version)
                         // From mgcv: when scale is estimated, add derivatives w.r.t. log(scale)
                         let d_edf_d_rho = -lambdas[k] * trace_term_unscaled; // ∂edf/∂ρ_k
                         let d_phi_d_rho = (d_rss_d_rho * (n - edf) - rss * d_edf_d_rho) / (n - edf).powi(2);
-                        
-                        // Scale dependency from REML score: -D_p/(2φ²) - Mp/(2φ) terms  
+
+                        // Scale dependency from REML score: -D_p/(2φ²) - Mp/(2φ) terms
                         let mp = self.layout.total_coeffs as f64 - s_lambda.svd(false, false)
                             .map(|(_, svals, _)| svals.iter().filter(|&&sv| sv > 1e-8).count())
                             .unwrap_or(self.layout.total_coeffs) as f64;
                         let scale_deriv_coeff = -dp / (2.0 * sigma_sq.powi(2)) - mp / (2.0 * sigma_sq);
                         let scale_dependency = scale_deriv_coeff * d_phi_d_rho;
-                        
+
                         // Final gradient: negative of REML gradient (for minimization)
                         // Based on mgcv structure: -(D1/(2*scale) + trA1/2 - det1/2 + scale_terms)
                         gradient[k] = -(d1_component + tra1_component + det1_component + scale_dependency);
@@ -1359,7 +1394,10 @@ pub mod internal {
 
     /// Robust solve using QR/SVD approach similar to mgcv's implementation
     /// This avoids the singularity issues that plague direct matrix inversion
-    fn robust_solve(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+    fn robust_solve(
+        matrix: &Array2<f64>,
+        rhs: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
         // Try standard solve first for well-conditioned matrices
         if let Ok(solution) = matrix.solve(rhs) {
             return Ok(solution);
@@ -1367,19 +1405,19 @@ pub mod internal {
 
         // If standard solve fails, use SVD-based pseudo-inverse approach
         log::debug!("Standard solve failed, using SVD pseudo-inverse");
-        
+
         match matrix.svd(true, true) {
             Ok((Some(u), s, Some(vt))) => {
                 let tolerance = s.iter().fold(0.0f64, |a, &b| a.max(b)) * 1e-12;
                 let mut pinv = Array2::zeros((matrix.ncols(), matrix.nrows()));
-                
+
                 // Construct pseudo-inverse: V * S^+ * U^T
                 for (i, &sigma) in s.iter().enumerate() {
                     if sigma > tolerance {
                         let u_col = u.column(i);
                         let v_col = vt.row(i);
                         let scale = 1.0 / sigma;
-                        
+
                         // Add outer product contribution: v_i * (1/σ_i) * u_i^T
                         for j in 0..pinv.nrows() {
                             for k in 0..pinv.ncols() {
@@ -1388,7 +1426,7 @@ pub mod internal {
                         }
                     }
                 }
-                
+
                 Ok(pinv.dot(rhs))
             }
             _ => {
@@ -1398,8 +1436,9 @@ pub mod internal {
                 for i in 0..regularized.nrows() {
                     regularized[[i, i]] += ridge;
                 }
-                
-                regularized.solve(rhs)
+
+                regularized
+                    .solve(rhs)
                     .map_err(EstimationError::LinearSystemSolveFailed)
             }
         }
@@ -1553,16 +1592,16 @@ pub mod internal {
         // ======== NUMERICAL GRADIENT HELPERS ========
         // These functions implement robust numerical gradient computation
         // to fix the issues identified in the gradient approximation tests
-        
+
         /// Computes adaptive step size for finite differences based on parameter scale and machine epsilon
         /// This prevents both cancellation errors (h too small) and truncation errors (h too large)
         fn adaptive_step_size(rho: f64) -> f64 {
             let eps = f64::EPSILON; // ~2e-16
             let scale = rho.abs().max(1.0); // Handle small rho values
-            
+
             // For REML cost functions, use more conservative step size due to high sensitivity
             let base_h = (eps.powf(1.0 / 3.0) * scale).max(1e-10);
-            
+
             // Scale down further for rho parameters since exp(rho) can be very sensitive
             (base_h * 0.01).min(1e-6).max(1e-10)
         }
@@ -1573,7 +1612,10 @@ pub mod internal {
             match reml_state.compute_cost(rho) {
                 Ok(cost) if cost.is_finite() => Some(cost),
                 Ok(_) => {
-                    eprintln!("Warning: compute_cost returned non-finite value for rho={:?}", rho);
+                    eprintln!(
+                        "Warning: compute_cost returned non-finite value for rho={:?}",
+                        rho
+                    );
                     None
                 }
                 Err(e) => {
@@ -1586,32 +1628,40 @@ pub mod internal {
         /// Robust numerical gradient computation with adaptive step size and error handling
         /// Returns None if computation fails
         fn compute_numerical_gradient_robust(
-            reml_state: &internal::RemlState, 
-            rho: &Array1<f64>, 
-            param_idx: usize
+            reml_state: &internal::RemlState,
+            rho: &Array1<f64>,
+            param_idx: usize,
         ) -> Option<f64> {
             let base_h = adaptive_step_size(rho[param_idx]);
-            
+
             // Try multiple step sizes and look for convergence
-            let step_sizes = [base_h * 10.0, base_h, base_h * 0.1, base_h * 0.01, 1e-8, 1e-9];
+            let step_sizes = [
+                base_h * 10.0,
+                base_h,
+                base_h * 0.1,
+                base_h * 0.01,
+                1e-8,
+                1e-9,
+            ];
             let mut results = Vec::new();
-            
+
             for &h in &step_sizes {
                 if let Some(grad) = try_numerical_gradient(reml_state, rho, param_idx, h) {
-                    if grad.is_finite() && grad.abs() < 1e6 { // Reasonable magnitude check
+                    if grad.is_finite() && grad.abs() < 1e6 {
+                        // Reasonable magnitude check
                         results.push((h, grad));
                     }
                 }
             }
-            
+
             if results.is_empty() {
                 return None;
             }
-            
+
             // If we have multiple results, prefer the one with mid-range step size
             // that gives a reasonable gradient magnitude
             results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            
+
             // Take the median result if we have multiple values
             if results.len() >= 3 {
                 Some(results[results.len() / 2].1)
@@ -1622,22 +1672,22 @@ pub mod internal {
 
         /// Helper function to try numerical gradient with a specific step size
         fn try_numerical_gradient(
-            reml_state: &internal::RemlState, 
-            rho: &Array1<f64>, 
-            param_idx: usize, 
-            h: f64
+            reml_state: &internal::RemlState,
+            rho: &Array1<f64>,
+            param_idx: usize,
+            h: f64,
         ) -> Option<f64> {
             let mut rho_plus = rho.clone();
             rho_plus[param_idx] += h;
-            
+
             let mut rho_minus = rho.clone();
             rho_minus[param_idx] -= h;
-            
+
             let cost_plus = safe_compute_cost(reml_state, &rho_plus)?;
             let cost_minus = safe_compute_cost(reml_state, &rho_minus)?;
-            
+
             let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
-            
+
             if numerical_grad.is_finite() {
                 Some(numerical_grad)
             } else {
@@ -1661,31 +1711,31 @@ pub mod internal {
             rho: &Array1<f64>,
             param_idx: usize,
             h: f64,
-            tolerance: f64
+            tolerance: f64,
         ) -> bool {
             let cost_start = match safe_compute_cost(reml_state, rho) {
                 Some(c) => c,
                 None => return false,
             };
-            
+
             let mut rho_plus = rho.clone();
             rho_plus[param_idx] += h;
             let cost_plus = match safe_compute_cost(reml_state, &rho_plus) {
                 Some(c) => c,
                 None => return false,
             };
-            
+
             let mut rho_minus = rho.clone();
             rho_minus[param_idx] -= h;
             let cost_minus = match safe_compute_cost(reml_state, &rho_minus) {
                 Some(c) => c,
                 None => return false,
             };
-            
+
             let forward_diff = cost_plus - cost_start;
             let backward_diff = cost_start - cost_minus;
             let asymmetry = (forward_diff - backward_diff).abs();
-            
+
             asymmetry < tolerance
         }
 
@@ -2529,9 +2579,9 @@ pub mod internal {
         ///    has flattened out, as expected near an optimum for a null term.
         #[test]
         fn test_gradient_convergence_behavior() {
+            use rand::Rng;
             use rand::SeedableRng;
             use rand::seq::SliceRandom;
-            use rand::Rng;
 
             // GOAL: Understand if gradient -> 0 expectation at finite λ is mathematically reasonable
             // Test the mathematical behavior: does gradient approach 0 as λ increases?
@@ -2557,19 +2607,21 @@ pub mod internal {
                 .map(|i| {
                     let pgs_val: f64 = p[i];
                     let pc1_val = pcs[[i, 0]];
-                    
+
                     // Complex non-linear relationship to prevent separation
-                    let signal = 0.3 + 0.4 * pgs_val.tanh() + 0.5 * (pc1_val * std::f64::consts::PI).sin() 
-                                + 0.2 * (pgs_val * pc1_val).tanh(); // NO PC2 term
-                    
+                    let signal = 0.3
+                        + 0.4 * pgs_val.tanh()
+                        + 0.5 * (pc1_val * std::f64::consts::PI).sin()
+                        + 0.2 * (pgs_val * pc1_val).tanh(); // NO PC2 term
+
                     // Add significant noise to prevent perfect separation
                     let noise = rng.gen_range(-0.8..0.8);
                     let logit: f64 = signal + noise;
-                    
+
                     // Clamp logit to prevent extreme probabilities
                     let clamped_logit = logit.clamp(-5.0, 5.0);
                     let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-                    
+
                     // Stochastic outcome based on probability (not deterministic threshold)
                     if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
@@ -2701,7 +2753,9 @@ pub mod internal {
             println!("4. At limit: gradient → 0.5*λ*(-tr(H⁻¹S_k)) ≠ 0");
             println!("   The gradient does NOT approach zero for finite λ!");
             println!();
-            println!("CONCLUSION: The test expectation gradient < 1e-3 at λ≈22k is mathematically incorrect.");
+            println!(
+                "CONCLUSION: The test expectation gradient < 1e-3 at λ≈22k is mathematically incorrect."
+            );
             println!("The gradient should approach a negative value proportional to λ, not zero.");
             println!("Instead, we should test that the cost function plateaus for high penalties.");
 
@@ -2731,16 +2785,16 @@ pub mod internal {
                 // Check that the cost function plateaus at high penalty
                 let high_rho_test = 10.0;
                 let very_high_rho_test = 11.0;
-                
+
                 let mut high_rho_vec = Array1::from_elem(layout.num_penalties, 0.0);
                 high_rho_vec[pc2_penalty_idx] = high_rho_test;
-                
+
                 let mut very_high_rho_vec = Array1::from_elem(layout.num_penalties, 0.0);
                 very_high_rho_vec[pc2_penalty_idx] = very_high_rho_test;
-                
+
                 if let (Ok(cost_high), Ok(cost_very_high)) = (
                     reml_state.compute_cost(&high_rho_vec),
-                    reml_state.compute_cost(&very_high_rho_vec)
+                    reml_state.compute_cost(&very_high_rho_vec),
                 ) {
                     let cost_plateau_change = (cost_high - cost_very_high).abs();
                     println!();
@@ -2748,7 +2802,7 @@ pub mod internal {
                     println!("Cost at rho=10: {:.6}", cost_high);
                     println!("Cost at rho=11: {:.6}", cost_very_high);
                     println!("Cost change: {:.6e}", cost_plateau_change);
-                    
+
                     // This is the correct test for null effect convergence
                     assert!(
                         cost_plateau_change < 1e-2,
@@ -2762,9 +2816,9 @@ pub mod internal {
 
         #[test]
         fn test_reml_shrinks_null_effect() {
+            use rand::Rng;
             use rand::SeedableRng;
             use rand::seq::SliceRandom;
-            use rand::Rng;
 
             // --- 1. Setup: Generate data where y depends on PC1 but has NO relationship with PC2 ---
             let n_samples = 300; // Increased for better conditioning
@@ -2792,18 +2846,18 @@ pub mod internal {
                     let pgs_val: f64 = p[i];
                     let pc1_val = pcs[[i, 0]];
                     // PC2 is not used in the model
-                    
+
                     // Complex non-linear signal to make relationship more realistic
                     let signal = 0.2 + 0.6 * pgs_val.tanh() + 0.7 * (pc1_val * 1.5_f64).sin(); // No PC2 term
-                    
+
                     // Add noise to prevent perfect separation
                     let noise = rng.gen_range(-0.9..0.9);
                     let logit: f64 = signal + noise;
-                    
+
                     // Clamp to prevent extreme values
                     let clamped_logit = logit.clamp(-6.0, 6.0);
                     let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-                    
+
                     // Stochastic outcome for more realistic data
                     if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
@@ -2973,7 +3027,7 @@ pub mod internal {
             // We should not assume it's always negative - it might be near an optimum.
             // Instead, we test that the magnitude is reasonable (not explosive).
             assert!(
-                grad_pc2_high.abs() < 1.0, // More lenient threshold 
+                grad_pc2_high.abs() < 1.0, // More lenient threshold
                 "Gradient magnitude should be reasonable at high penalty, indicating we're near an optimum. Got: {}",
                 grad_pc2_high
             );
@@ -3267,37 +3321,39 @@ pub mod internal {
             // Replicate the exact conditions that cause BFGS to fail
             // Using n_samples=250 to avoid over-parameterization
             let n_samples = 250;
-            
+
             // Create complex, non-separable data instead of perfectly separated halves
             use rand::prelude::*;
             let mut rng = rand::rngs::StdRng::seed_from_u64(123);
-            
+
             let p = Array::linspace(-2.0, 2.0, n_samples);
             let pcs = Array::linspace(-2.5, 2.5, n_samples)
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
-            
+
             // Generate complex non-separable binary outcomes
             let y = Array1::from_shape_fn(n_samples, |i| {
                 let pgs_val: f64 = p[i];
                 let pc_val = pcs[[i, 0]];
-                
+
                 // Complex non-linear relationship
-                let signal = 0.1 + 0.5 * (pgs_val * 0.8_f64).tanh() + 0.4 * (pc_val * 0.6_f64).sin()
-                            + 0.3 * (pgs_val * pc_val * 0.5_f64).tanh();
-                
+                let signal = 0.1
+                    + 0.5 * (pgs_val * 0.8_f64).tanh()
+                    + 0.4 * (pc_val * 0.6_f64).sin()
+                    + 0.3 * (pgs_val * pc_val * 0.5_f64).tanh();
+
                 // Add substantial noise to prevent separation
                 let noise = rng.gen_range(-1.2..1.2);
                 let logit: f64 = signal + noise;
-                
+
                 // Clamp and convert to probability
                 let clamped_logit = logit.clamp(-5.0, 5.0);
                 let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-                
+
                 // Stochastic outcome
                 if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
             });
-            
+
             let data = TrainingData { y, p, pcs };
 
             // Use the same config but smaller basis to speed up
@@ -3392,11 +3448,11 @@ pub mod internal {
         #[test]
         fn test_reml_gradient_component_isolation() {
             use crate::calibrate::construction::construct_s_lambda;
-            use rand::{prelude::*, rngs::StdRng, SeedableRng};
-            
+            use rand::{SeedableRng, prelude::*, rngs::StdRng};
+
             // Fixed seed for reproducibility
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             let n_samples = 50; // Increased from 20 for better conditioning
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
@@ -3567,21 +3623,32 @@ pub mod internal {
             println!("Analytical gradient: {:.6}", analytical_gradient);
 
             // === NUMERICAL GRADIENT FOR COMPARISON ===
-            let numerical_gradient = match compute_numerical_gradient_robust(&reml_state, &test_rho, 0) {
+            let numerical_gradient = match compute_numerical_gradient_robust(
+                &reml_state,
+                &test_rho,
+                0,
+            ) {
                 Some(grad) => grad,
                 None => {
-                    println!("Warning: Could not compute robust numerical gradient, falling back to manual computation");
+                    println!(
+                        "Warning: Could not compute robust numerical gradient, falling back to manual computation"
+                    );
                     // Fallback with adaptive step size
                     let h = adaptive_step_size(test_rho[0]);
                     let mut rho_plus = test_rho.clone();
                     rho_plus[0] += h;
                     let mut rho_minus = test_rho.clone();
                     rho_minus[0] -= h;
-                    
-                    match (safe_compute_cost(&reml_state, &rho_plus), safe_compute_cost(&reml_state, &rho_minus)) {
+
+                    match (
+                        safe_compute_cost(&reml_state, &rho_plus),
+                        safe_compute_cost(&reml_state, &rho_minus),
+                    ) {
                         (Some(cost_plus), Some(cost_minus)) => (cost_plus - cost_minus) / (2.0 * h),
                         _ => {
-                            println!("Error: Cannot compute numerical gradient due to cost computation failures");
+                            println!(
+                                "Error: Cannot compute numerical gradient due to cost computation failures"
+                            );
                             return; // Skip the test if we can't compute gradients
                         }
                     }
@@ -3591,14 +3658,14 @@ pub mod internal {
             println!();
             println!("=== Numerical Comparison ===");
             println!("Numerical gradient: {:.6}", numerical_gradient);
-            
+
             let error_metric = compute_error_metric(analytical_gradient, numerical_gradient);
             println!("Error metric: {:.6}", error_metric);
             println!(
                 "Absolute difference: {:.6}",
                 (analytical_gradient - numerical_gradient).abs()
             );
-            
+
             if numerical_gradient.abs() > 1e-6 {
                 println!(
                     "Relative difference: {:.6}",
@@ -3706,11 +3773,11 @@ pub mod internal {
 
         #[test]
         fn test_reml_gradient_on_well_conditioned_model() {
-            use rand::{prelude::*, rngs::StdRng, SeedableRng};
-            
+            use rand::{SeedableRng, prelude::*, rngs::StdRng};
+
             // Fixed seed for reproducibility
             let mut rng = StdRng::seed_from_u64(123);
-            
+
             // non-singular test: maximum numerical stability
             let n = 5000; // Increased from 2000 for even better conditioning
 
@@ -3819,11 +3886,7 @@ pub mod internal {
             };
             println!("  💰 Initial cost: {:.6}", cost);
             assert!(cost.is_finite(), "Cost is not finite");
-            assert!(
-                cost.abs() < 1e10,
-                "Cost magnitude too extreme: {}",
-                cost
-            );
+            assert!(cost.abs() < 1e10, "Cost magnitude too extreme: {}", cost);
 
             // Calculate analytical gradient - this should work for non-singular systems
             let analytical_grad = match reml_state.compute_gradient(&test_rho) {
@@ -3839,12 +3902,19 @@ pub mod internal {
             // Test ALL penalty gradients (not just first one)
             for i in 0..layout.num_penalties {
                 let analytical = analytical_grad[i];
-                
+
                 // Calculate numerical gradient for penalty i using robust method
-                let numerical_grad = match compute_numerical_gradient_robust(&reml_state, &test_rho, i) {
+                let numerical_grad = match compute_numerical_gradient_robust(
+                    &reml_state,
+                    &test_rho,
+                    i,
+                ) {
                     Some(grad) => grad,
                     None => {
-                        println!("  ⚠️  Warning: Could not compute robust numerical gradient for penalty {}, skipping", i);
+                        println!(
+                            "  ⚠️  Warning: Could not compute robust numerical gradient for penalty {}, skipping",
+                            i
+                        );
                         continue;
                     }
                 };
@@ -3859,7 +3929,10 @@ pub mod internal {
                 // Check symmetry of finite differences
                 let h = adaptive_step_size(test_rho[i]);
                 if !check_difference_symmetry(&reml_state, &test_rho, i, h, 1e-8) {
-                    println!("    ⚠️  Warning: Finite differences not symmetric for penalty {}", i);
+                    println!(
+                        "    ⚠️  Warning: Finite differences not symmetric for penalty {}",
+                        i
+                    );
                 }
 
                 // ULTRA-STRICT gradient validation
@@ -4183,12 +4256,14 @@ pub mod internal {
                         assert!(
                             analytical_grad.iter().all(|&g| g.is_finite()),
                             "Gradient for {:?} contains non-finite values: {:?}",
-                            link_function, analytical_grad
+                            link_function,
+                            analytical_grad
                         );
                         assert!(
                             analytical_grad.dot(&analytical_grad).sqrt() < 50.0,
                             "Gradient norm for {:?} is too large: {}",
-                            link_function, analytical_grad.dot(&analytical_grad).sqrt()
+                            link_function,
+                            analytical_grad.dot(&analytical_grad).sqrt()
                         );
 
                         println!(
@@ -4212,11 +4287,11 @@ pub mod internal {
 
         #[test]
         fn test_gradient_sign_and_magnitude() {
-            use rand::{prelude::*, rngs::StdRng, SeedableRng};
-            
+            use rand::{SeedableRng, prelude::*, rngs::StdRng};
+
             // Fixed seed for reproducibility
             let mut rng = StdRng::seed_from_u64(789);
-            
+
             // Test that compute_gradient returns the correct sign for BFGS minimization
             // BFGS minimizes cost function, so gradient should point uphill on cost surface
 
@@ -4279,10 +4354,17 @@ pub mod internal {
                 let analytical_grad = reml_state.compute_gradient(&test_rho).unwrap();
 
                 // Numerical gradient using robust finite differences
-                let numerical_grad = match compute_numerical_gradient_robust(&reml_state, &test_rho, 0) {
+                let numerical_grad = match compute_numerical_gradient_robust(
+                    &reml_state,
+                    &test_rho,
+                    0,
+                ) {
                     Some(grad) => grad,
                     None => {
-                        println!("Warning: Could not compute robust numerical gradient for rho={:.1}, skipping", rho);
+                        println!(
+                            "Warning: Could not compute robust numerical gradient for rho={:.1}, skipping",
+                            rho
+                        );
                         continue;
                     }
                 };
@@ -4306,14 +4388,20 @@ pub mod internal {
                 let cost_pos = match safe_compute_cost(&reml_state, &rho_pos_step) {
                     Some(c) => c,
                     None => {
-                        println!("Warning: Could not compute cost for positive step at rho={:.1}", rho);
+                        println!(
+                            "Warning: Could not compute cost for positive step at rho={:.1}",
+                            rho
+                        );
                         continue;
                     }
                 };
                 let cost_neg = match safe_compute_cost(&reml_state, &rho_neg_step) {
                     Some(c) => c,
                     None => {
-                        println!("Warning: Could not compute cost for negative step at rho={:.1}", rho);
+                        println!(
+                            "Warning: Could not compute cost for negative step at rho={:.1}",
+                            rho
+                        );
                         continue;
                     }
                 };
@@ -4344,11 +4432,11 @@ pub mod internal {
 
         #[test]
         fn test_gradient_calculation_against_numerical_approximation() {
-            use rand::{prelude::*, rngs::StdRng, SeedableRng};
-            
+            use rand::{SeedableRng, prelude::*, rngs::StdRng};
+
             // Fixed seed for reproducibility
             let mut rng = StdRng::seed_from_u64(456);
-            
+
             // --- 1. Function to test gradient for a specific link function ---
             let test_gradient_for_link = |link_function: LinkFunction, rng: &mut StdRng| {
                 // --- 2. Create a small, simple test dataset ---
@@ -4435,10 +4523,17 @@ pub mod internal {
                     .expect("Analytical gradient calculation failed");
 
                 // --- 9. Compute numerical gradient via robust central differences ---
-                let numerical_grad = match compute_numerical_gradient_robust(&reml_state, &test_rho, 0) {
+                let numerical_grad = match compute_numerical_gradient_robust(
+                    &reml_state,
+                    &test_rho,
+                    0,
+                ) {
                     Some(grad) => grad,
                     None => {
-                        println!("Warning: Could not compute robust numerical gradient for {:?}, skipping", link_function);
+                        println!(
+                            "Warning: Could not compute robust numerical gradient for {:?}, skipping",
+                            link_function
+                        );
                         return; // Skip this link function test
                     }
                 };
@@ -4452,15 +4547,15 @@ pub mod internal {
                     (analytical_grad[0] - numerical_grad).abs()
                 );
                 let error_metric = compute_error_metric(analytical_grad[0], numerical_grad);
-                println!(
-                    "  Error metric: {:.12}",
-                    error_metric
-                );
+                println!("  Error metric: {:.12}", error_metric);
 
                 // Check symmetry of finite differences
                 let h = adaptive_step_size(test_rho[0]);
                 if !check_difference_symmetry(&reml_state, &test_rho, 0, h, 1e-6) {
-                    println!("  Warning: Finite differences not symmetric for {:?}", link_function);
+                    println!(
+                        "  Warning: Finite differences not symmetric for {:?}",
+                        link_function
+                    );
                 }
 
                 // For highly non-linear surfaces, we need to verify that at least one direction of movement
@@ -4468,7 +4563,10 @@ pub mod internal {
                 let cost_start = match safe_compute_cost(&reml_state, &test_rho) {
                     Some(c) => c,
                     None => {
-                        println!("Warning: Could not compute start cost for {:?}, skipping verification", link_function);
+                        println!(
+                            "Warning: Could not compute start cost for {:?}, skipping verification",
+                            link_function
+                        );
                         return;
                     }
                 };
@@ -4481,7 +4579,10 @@ pub mod internal {
                 let cost_pos = match safe_compute_cost(&reml_state, &rho_pos) {
                     Some(c) => c,
                     None => {
-                        println!("Warning: Could not compute positive step cost for {:?}, skipping verification", link_function);
+                        println!(
+                            "Warning: Could not compute positive step cost for {:?}, skipping verification",
+                            link_function
+                        );
                         return;
                     }
                 };
@@ -4489,7 +4590,10 @@ pub mod internal {
                 let cost_neg = match safe_compute_cost(&reml_state, &rho_neg) {
                     Some(c) => c,
                     None => {
-                        println!("Warning: Could not compute negative step cost for {:?}, skipping verification", link_function);
+                        println!(
+                            "Warning: Could not compute negative step cost for {:?}, skipping verification",
+                            link_function
+                        );
                         return;
                     }
                 };
@@ -4524,12 +4628,15 @@ pub mod internal {
                 // Use reasonable tolerance considering numerical challenges in REML
                 if analytical_grad[0].abs() > 1e-6 && numerical_grad.abs() > 1e-6 {
                     // Log the error metric for debugging but only assert on extreme failures
-                    if error_metric > 2.0 { // Only fail on truly extreme discrepancies
-                        println!("Warning: Large gradient error for {:?}: analytical={:.6}, numerical={:.6}, error={:.2e}", 
-                                link_function, analytical_grad[0], numerical_grad, error_metric);
+                    if error_metric > 2.0 {
+                        // Only fail on truly extreme discrepancies
+                        println!(
+                            "Warning: Large gradient error for {:?}: analytical={:.6}, numerical={:.6}, error={:.2e}",
+                            link_function, analytical_grad[0], numerical_grad, error_metric
+                        );
                         println!("This may indicate numerical challenges in the cost function");
                     }
-                    
+
                     // Only assert on completely unreasonable values
                     assert!(
                         error_metric < 10.0, // Very loose bound to catch only severe issues
@@ -4665,7 +4772,7 @@ pub mod internal {
             // All matrices in s_list should be full-sized p×p matrices with embedded blocks
             for (i, s) in s_list.iter().enumerate() {
                 assert_eq!(s.nrows(), s.ncols(), "Penalty matrix {} is not square", i);
-                
+
                 // All penalty matrices should be full-sized (p × p)
                 assert_eq!(
                     s.nrows(),
@@ -4679,14 +4786,22 @@ pub mod internal {
                 );
 
                 // Find the corresponding block to verify the non-zero structure
-                let block = layout.penalty_map.iter()
+                let block = layout
+                    .penalty_map
+                    .iter()
                     .find(|b| b.penalty_idx == i)
-                    .expect(&format!("Could not find layout block for penalty index {}", i));
+                    .expect(&format!(
+                        "Could not find layout block for penalty index {}",
+                        i
+                    ));
 
                 // Verify the non-zero block is in the correct position
-                let block_submatrix = s.slice(ndarray::s![block.col_range.clone(), block.col_range.clone()]);
+                let block_submatrix = s.slice(ndarray::s![
+                    block.col_range.clone(),
+                    block.col_range.clone()
+                ]);
                 let non_zero_count = block_submatrix.iter().filter(|&&x| x.abs() > 1e-12).count();
-                
+
                 assert!(
                     non_zero_count > 0,
                     "Penalty matrix {} should have non-zero entries in block for term '{}'",
@@ -4703,7 +4818,7 @@ pub mod internal {
                         }
                     }
                 }
-                
+
                 assert!(
                     outside_block_non_zeros == 0,
                     "Penalty matrix {} should only have non-zero entries in its designated block, but found {} non-zero entries outside block for term '{}'",
@@ -4831,8 +4946,9 @@ pub mod internal {
 
                     // Verify that the penalty matrix has non-zero elements only in the appropriate block
                     use ndarray::s;
-                    let block_submatrix = penalty_matrix.slice(s![block.col_range.clone(), block.col_range.clone()]);
-                    
+                    let block_submatrix =
+                        penalty_matrix.slice(s![block.col_range.clone(), block.col_range.clone()]);
+
                     // The block diagonal should have some non-zero elements (penalty structure)
                     let block_sum = block_submatrix.iter().map(|&x| x.abs()).sum::<f64>();
                     assert!(
@@ -4886,7 +5002,10 @@ pub mod internal {
                 let p_total = layout.total_coeffs;
                 let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
                 pgs_penalty_full
-                    .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                    .slice_mut(ndarray::s![
+                        layout.pgs_main_cols.clone(),
+                        layout.pgs_main_cols.clone()
+                    ])
                     .assign(&pgs_penalty_small);
 
                 let new_s_list = vec![pgs_penalty_full];
@@ -5039,14 +5158,17 @@ pub mod internal {
                 let pgs_penalty_small =
                     crate::calibrate::basis::create_difference_penalty_matrix(pgs_main_coeffs, 2)
                         .unwrap();
-                
+
                 // Embed the small penalty matrix into a full-sized matrix
                 let p_total = layout.total_coeffs;
                 let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
                 pgs_penalty_full
-                    .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                    .slice_mut(ndarray::s![
+                        layout.pgs_main_cols.clone(),
+                        layout.pgs_main_cols.clone()
+                    ])
                     .assign(&pgs_penalty_small);
-                
+
                 let s_list_test = vec![pgs_penalty_full];
                 let layout_test = ModelLayout {
                     num_penalties: 1,
@@ -5143,14 +5265,17 @@ pub mod internal {
                 2,
             )
             .unwrap();
-            
+
             // Embed the small penalty matrix into a full-sized matrix
             let p_total = layout.total_coeffs;
             let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
             pgs_penalty_full
-                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .slice_mut(ndarray::s![
+                    layout.pgs_main_cols.clone(),
+                    layout.pgs_main_cols.clone()
+                ])
                 .assign(&pgs_penalty_small);
-            
+
             let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
@@ -5304,14 +5429,17 @@ pub mod internal {
                 2,
             )
             .unwrap();
-            
+
             // Embed the small penalty matrix into a full-sized matrix
             let p_total = layout.total_coeffs;
             let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
             pgs_penalty_full
-                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .slice_mut(ndarray::s![
+                    layout.pgs_main_cols.clone(),
+                    layout.pgs_main_cols.clone()
+                ])
                 .assign(&pgs_penalty_small);
-            
+
             let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
@@ -5382,14 +5510,17 @@ pub mod internal {
                 2,
             )
             .unwrap();
-            
+
             // Embed the small penalty matrix into a full-sized matrix
             let p_total = layout.total_coeffs;
             let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
             pgs_penalty_full
-                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .slice_mut(ndarray::s![
+                    layout.pgs_main_cols.clone(),
+                    layout.pgs_main_cols.clone()
+                ])
                 .assign(&pgs_penalty_small);
-            
+
             let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
@@ -5451,7 +5582,7 @@ pub mod internal {
             let mut config = create_test_config();
             config.link_function = LinkFunction::Identity;
             // Use many knots to force over-parameterization
-            config.pgs_basis_config.num_knots = 10; 
+            config.pgs_basis_config.num_knots = 10;
             config.pc_names = vec!["PC1".to_string()];
             config.pc_basis_configs = vec![BasisConfig {
                 num_knots: 8, // High knots to force singularity
@@ -5502,10 +5633,14 @@ pub mod internal {
                     use crate::calibrate::estimate::EstimationError;
                     match e {
                         EstimationError::LinearSystemSolveFailed(_) => {
-                            println!("✓ Test correctly verified that an over-parameterized model produces a LinearSystemSolveFailed error.");
+                            println!(
+                                "✓ Test correctly verified that an over-parameterized model produces a LinearSystemSolveFailed error."
+                            );
                         }
                         EstimationError::ModelIsIllConditioned { .. } => {
-                            println!("✓ Test correctly verified that an over-parameterized model produces an ill-conditioned error.");
+                            println!(
+                                "✓ Test correctly verified that an over-parameterized model produces an ill-conditioned error."
+                            );
                         }
                         _ => {
                             panic!(
