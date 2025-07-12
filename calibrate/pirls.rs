@@ -80,10 +80,11 @@ pub struct PirlsResult {
                 });
             }
 
-            // For weighted regression with X'WX, we multiply each row of X by the corresponding weight
-            // and then perform standard matrix multiplication
-            let x_weighted = &x.view() * &weights.view().insert_axis(Axis(1));
-            let xtwx = x.t().dot(&x_weighted);
+            // For weighted regression with X'WX, we need to scale the rows of X by sqrt(weights)
+            // to compute X'WX = (sqrt(W)X)'(sqrt(W)X)
+            let sqrt_weights = weights.mapv(|w| w.sqrt());
+            let x_weighted = &x * &sqrt_weights.view().insert_axis(Axis(1));
+            let xtwx = x_weighted.t().dot(&x_weighted);
             let mut penalized_hessian = xtwx + &s_lambda;
 
             // Add numerical ridge for stability
@@ -116,8 +117,9 @@ pub struct PirlsResult {
                 }
             }
 
-            // Right-hand side of the equation: X'Wz
-            let rhs = x.t().dot(&(weights * &z));
+            // Right-hand side of the equation: X'Wz = (sqrt(W)X)'(sqrt(W)z)
+            let z_weighted = &sqrt_weights * &z;
+            let rhs = x_weighted.t().dot(&z_weighted);
             beta = penalized_hessian
                 .solve_into(rhs)
                 .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -185,8 +187,9 @@ pub struct PirlsResult {
                 let (final_mu, final_weights, _) =
                     update_glm_vectors(y, &final_eta, config.link_function);
                 // Same X'WX calculation method for the final step
-                let final_x_weighted = &x.view() * &final_weights.view().insert_axis(Axis(1));
-                let final_xtwx = x.t().dot(&final_x_weighted);
+                let final_sqrt_weights = final_weights.mapv(|w| w.sqrt());
+                let final_x_weighted = &x * &final_sqrt_weights.view().insert_axis(Axis(1));
+                let final_xtwx = final_x_weighted.t().dot(&final_x_weighted);
                 let final_penalized_hessian = final_xtwx + &s_lambda;
 
                 return Ok(PirlsResult {
