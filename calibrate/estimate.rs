@@ -653,7 +653,7 @@ pub mod internal {
             let reparam_result = stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
 
             // --- Create the gradient vector ---
-            let mut gradient = Array1::zeros(lambdas.len());
+            let mut score_gradient = Array1::zeros(lambdas.len());
             
             let beta = &pirls_result.beta;
             let n = self.y.len() as f64;
@@ -722,7 +722,8 @@ pub mod internal {
                         // Term 3: -det1/2 - from stable reparameterization
                         let term3 = -reparam_result.det1[k] / 2.0;
                         
-                        gradient[k] = term1 + term2 + term3;
+                        // This is the gradient of the SCORE (V_REML), which is maximized
+                        score_gradient[k] = term1 + term2 + term3;
                     }
                 }
                 _ => {
@@ -773,7 +774,7 @@ pub mod internal {
                                 }
                             }
                         }
-                        let term1 = weight_deriv_trace / 2.0;
+                        let weight_deriv_term = weight_deriv_trace / 2.0;
                         
                         // Term 2: tr(H_p^(-1) S_k) - this will be subtracted
                         let mut trace_h_inv_s_k = 0.0;
@@ -788,20 +789,21 @@ pub mod internal {
                         // reparam_result.det1[k] = λ_k * tr(S_λ^+ S_k)
                         let tr_s_plus_s_k = reparam_result.det1[k] / lambdas[k];
                         
-                        // Assemble LAML gradient of the SCORE (to be maximized):
-                        // ∂V_R/∂ρ_k = 0.5 * λ_k * [tr(S_λ^+ S_k) - tr(H_p^(-1) S_k)] + 0.5 * tr(H_p^(-1) X^T(∂W/∂ρ_k)X)
-                        let score_gradient = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k) + term1;
-                         
-                         // Return gradient of COST function (-LAML score) for minimization
-                         gradient[k] = -score_gradient;
+                        // Trace difference term: 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k)]
+                        let trace_diff_term = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k);
+                        
+                        // This is the gradient of the SCORE (V_LAML), which is maximized
+                        score_gradient[k] = trace_diff_term + weight_deriv_term;
                     }
                 }
             }
             
-            // Return gradient as-is since it's already computed for minimization
-            // The components (term1, term2, term3) when summed already represent 
-            // the gradient of the negative REML/LAML score (the cost function)
-            Ok(gradient)
+            // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
+            // Therefore, the gradient of the cost is the NEGATIVE of the gradient of the score.
+            // This single negation at the end makes the logic for both cases consistent.
+            let cost_gradient = -score_gradient;
+            
+            Ok(cost_gradient)
         }
         }
 
