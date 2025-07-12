@@ -253,20 +253,24 @@ mod internal {
         }
 
         // Stack PC arrays into a matrix
-        if pc_arrays.is_empty() {
-            return Err(DataError::ColumnNotFound("No PC columns found".to_string()));
-        }
+        // Handle the case where num_pcs = 0 (no PC covariates)
+        let (pcs_flat, n_rows, n_cols) = if pc_arrays.is_empty() {
+            // No PCs requested - create empty matrix with correct number of rows
+            let n_rows = pgs.len();
+            (Vec::new(), n_rows, 0)
+        } else {
+            let n_rows = pc_arrays[0].len();
+            let n_cols = pc_arrays.len();
+            let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
 
-        let n_rows = pc_arrays[0].len();
-        let n_cols = pc_arrays.len();
-        let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
-
-        // Convert column vectors to row-major format
-        for row_idx in 0..n_rows {
-            for col_idx in 0..n_cols {
-                pcs_flat.push(pc_arrays[col_idx][row_idx]);
+            // Convert column vectors to row-major format
+            for row_idx in 0..n_rows {
+                for col_idx in 0..n_cols {
+                    pcs_flat.push(pc_arrays[col_idx][row_idx]);
+                }
             }
-        }
+            (pcs_flat, n_rows, n_cols)
+        };
 
         let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
             .expect("PC arrays should have consistent dimensions");

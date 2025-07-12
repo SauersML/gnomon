@@ -466,12 +466,9 @@ pub mod internal {
                     // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
                     let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
 
-                    // Calculate penalized deviance: Dp = D(β̂) + β̂ᵀS_λβ̂
-                    // For Gaussian models, D(β̂) is the RSS (residual sum of squares)
+                    // For REML, use unpenalized RSS in likelihood term (penalty handled via determinants)
+                    // Penalty should NOT be mixed into the likelihood part
                     let rss = pirls_result.deviance;
-                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
-                     let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
-                     let penalized_deviance = rss + penalty_term;
 
                     // n is the number of samples
                     let n = self.y.len() as f64;
@@ -495,8 +492,19 @@ pub mod internal {
                     // Calculate REML score with penalized deviance and saturated likelihood
                     // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ + Mp/2*log(2πσ²)
                     // Note: Mp is null space dimension (number of unpenalized coefficients)
-                    let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
-                    let reml = -(penalized_deviance / (2.0 * sigma_sq)) - ls_phi 
+                    
+                    // Compute null space dimension: p - rank(S_total)
+                    let s_total: Array2<f64> = self.s_list.iter()
+                        .zip(lambdas.iter())
+                        .map(|(s, &lambda)| s * lambda)
+                        .fold(Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs)), |acc, s| acc + s);
+                    
+                    let rank = match s_total.svd(false, false) {
+                        Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
+                        Err(_) => self.layout.total_coeffs, // fallback to full rank
+                    };
+                    let mp = (self.layout.total_coeffs - rank) as f64;
+                    let reml = -(rss / (2.0 * sigma_sq)) - ls_phi 
                     - 0.5 * log_det_xtx_plus_s 
                     + 0.5 * log_det_s_lambda_pseudo 
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
@@ -544,7 +552,18 @@ pub mod internal {
                     // Mp is null space dimension (number of unpenalized coefficients)
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
                     let phi = 1.0; // Logit family typically has dispersion parameter = 1
-                    let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
+                    
+                    // Compute null space dimension: p - rank(S_total)
+                    let s_total: Array2<f64> = self.s_list.iter()
+                        .zip(lambdas.iter())
+                        .map(|(s, &lambda)| s * lambda)
+                        .fold(Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs)), |acc, s| acc + s);
+                    
+                    let rank = match s_total.svd(false, false) {
+                        Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
+                        Err(_) => self.layout.total_coeffs, // fallback to full rank
+                    };
+                    let mp = (self.layout.total_coeffs - rank) as f64;
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h 
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
@@ -848,41 +867,48 @@ pub mod internal {
                          // ∂RSS/∂ρ_k = -2 * residualsᵀ * X * ∂β/∂ρ_k
                          let d_rss_d_rho_k = -2.0 * residuals.dot(&self.x.dot(&d_beta_d_rho_k));
                          
-                         // ∂(penalty_term)/∂ρ_k = ∂(βᵀS_λβ)/∂ρ_k 
-                         // = 2 * βᵀ * S_k * β * λ_k + 2 * βᵀ * S_λ * ∂β/∂ρ_k
-                         let d_penalty_d_rho_k = 2.0 * exp_rho_k * pirls_result.beta.dot(&s_k_beta) 
-                                                + 2.0 * pirls_result.beta.dot(&s_lambda.dot(&d_beta_d_rho_k));
+                         // Note: penalty term derivatives not needed for REML likelihood (only RSS matters)
                          
-                         // ∂Dp/∂ρ_k = ∂RSS/∂ρ_k + ∂(penalty_term)/∂ρ_k
-                         let d_dp_d_rho_k = d_rss_d_rho_k + d_penalty_d_rho_k;
+                         // For REML, only RSS matters in likelihood term (not penalized deviance)
+                         let d_dp_d_rho_k = d_rss_d_rho_k;
                          
                          // ∂edf/∂ρ_k = -∂tr(H⁻¹S_λ)/∂ρ_k = -tr(H⁻¹S_k)*λ_k - tr(H⁻¹ ∂H/∂ρ_k H⁻¹ S_λ)
                          // For simplicity, approximate: ∂edf/∂ρ_k ≈ -λ_k * tr(H⁻¹S_k)
                          let d_edf_d_rho_k = -exp_rho_k * trace_term_unscaled;
                          
-                         // ∂φ̂/∂ρ_k = [∂Dp/∂ρ_k * (n-edf) - Dp * ∂edf/∂ρ_k] / (n-edf)²
+                         // ∂φ̂/∂ρ_k = [∂RSS/∂ρ_k * (n-edf) - RSS * ∂edf/∂ρ_k] / (n-edf)²
                          let n_minus_edf = (n - edf).max(1e-8);
-                         let penalized_deviance = rss + pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
-                         let d_phi_d_rho_k = (d_dp_d_rho_k * n_minus_edf - penalized_deviance * d_edf_d_rho_k) / (n_minus_edf * n_minus_edf);
+                         let d_phi_d_rho_k = (d_dp_d_rho_k * n_minus_edf - rss * d_edf_d_rho_k) / (n_minus_edf * n_minus_edf);
                          
-                         // Cross-term coefficient: {Dp/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)}
+                         // Cross-term coefficient: {RSS/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)}
                          // For Gaussian: l's(φ̂) = -n/(2φ̂) + RSS/(2φ̂²)
-                         let mp = self.layout.total_coeffs as f64;
+                         
+                         // Compute null space dimension: p - rank(S_total)
+                         let s_total: Array2<f64> = self.s_list.iter()
+                             .zip(lambdas.iter())
+                             .map(|(s, &lambda)| s * lambda)
+                             .fold(Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs)), |acc, s| acc + s);
+                         
+                         let rank = match s_total.svd(false, false) {
+                             Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
+                             Err(_) => self.layout.total_coeffs, // fallback to full rank
+                         };
+                         let mp = (self.layout.total_coeffs - rank) as f64;
                          let ls_prime_phi = -n / (2.0 * sigma_sq) + rss / (2.0 * sigma_sq * sigma_sq);
-                         let cross_term_coeff = penalized_deviance / (2.0 * sigma_sq * sigma_sq) + ls_prime_phi + mp / (2.0 * sigma_sq);
+                         let cross_term_coeff = rss / (2.0 * sigma_sq * sigma_sq) + ls_prime_phi + mp / (2.0 * sigma_sq);
                          
                          // Add second-order cross terms per Wood 2011 full ∂²lr expression
                          // l''s(φ̂) = n/(2φ̂²) - RSS/φ̂³ for Gaussian
                           let ls_double_prime_phi = n / (2.0 * sigma_sq * sigma_sq) - rss / (sigma_sq * sigma_sq * sigma_sq);
-                          let second_order_cross = (penalized_deviance / (sigma_sq * sigma_sq * sigma_sq) - ls_double_prime_phi + mp / (2.0 * sigma_sq * sigma_sq)) * d_phi_d_rho_k * d_phi_d_rho_k;
+                          let second_order_cross = (rss / (sigma_sq * sigma_sq * sigma_sq) - ls_double_prime_phi + mp / (2.0 * sigma_sq * sigma_sq)) * d_phi_d_rho_k * d_phi_d_rho_k;
                           
                           // Full scale dependency contribution to gradient including 2nd order terms
                           let scale_dependency_term = -(d_dp_d_rho_k / (2.0 * sigma_sq * sigma_sq) + cross_term_coeff * d_phi_d_rho_k + second_order_cross * d_phi_d_rho_k);
                          
                          // The complete REML gradient including scale dependency:
-                         // ∂reml/∂ρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k)) - 0.5*λ_k*tr(S_λ⁺S_k) + scale_dependency_term
-                         // Based on Wood 2017 p.298: beta term positive, trace term positive, log|S| term negative
-                         gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled) - 0.5 * s_inv_trace_term + scale_dependency_term;
+                         // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ²) - 0.5*λ_k*tr(S_λ⁺S_k) + scale_dependency_term
+                         // Based on Wood 2017 p.298: should be DIFFERENCE (trace - beta), not sum
+                         gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled) - 0.5 * s_inv_trace_term + scale_dependency_term;
                     }
                 }
                 _ => {
@@ -1368,6 +1394,9 @@ pub mod internal {
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
         let (pgs_main_basis, pgs_z_transform) =
             basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
+            
+        // For interactions, use the constrained pgs_main_basis directly
+        // Cannot reconstruct "full" basis due to dimensional reduction from constraints
 
         // Save the PGS constraint transformation
         constraints.insert(
@@ -1484,8 +1513,12 @@ pub mod internal {
                         // Find PC index from name
                         let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                        // Use the UNCONSTRAINED PGS basis column as the weight
-                        let pgs_weight_col = pgs_basis_unc.column(m); // Note: no +1 offset here, using correct index
+                        // Use constrained PGS main basis (index m-1 since we exclude intercept)
+                        // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
+                        if m == 0 || m > pgs_main_basis.ncols() {
+                            continue; // Skip intercept and out-of-bounds
+                        }
+                        let pgs_weight_col = pgs_main_basis.column(m - 1);
 
                         // Use the CONSTRAINED PC basis matrix
                         let pc_constrained_basis = &pc_constrained_bases[pc_idx];
@@ -1605,8 +1638,10 @@ pub mod internal {
     }
     
     /// Recursive similarity transform for stable log determinant computation
+    /// Implements Wood (2017) Algorithm p.286 for numerical stability with disparate eigenvalues
     fn stable_log_det_recursive(s: &Array2<f64>) -> Result<f64, LinalgError> {
         const TOL: f64 = 1e-12;
+        const MAX_COND: f64 = 1e12; // Condition number threshold for recursion
         
         if s.nrows() <= 5 {
             // Base case: use direct eigendecomposition for small matrices
@@ -1618,29 +1653,68 @@ pub mod internal {
                 .sum());
         }
         
-        // Find the dominant component (largest Frobenius norm)
-        let frob_norm = (s * s).sum().sqrt();
-        if frob_norm < TOL {
+        // Check matrix condition via SVD (proper approach)
+        let condition_number = match calculate_condition_number(s) {
+            Ok(cond) => cond,
+            Err(_) => MAX_COND + 1.0, // Force partitioning if SVD fails
+        };
+        
+        // If well-conditioned, use direct eigendecomposition
+        if condition_number < MAX_COND {
+            let (eigenvalues, _) = s.eigh(UPLO::Lower)?;
+            return Ok(eigenvalues
+                .iter()
+                .filter(|&&eig| eig.abs() > TOL)
+                .map(|&eig| eig.ln())
+                .sum());
+        }
+        
+        // For ill-conditioned matrices, partition eigenspace
+        let (eigenvalues, eigenvectors) = s.eigh(UPLO::Lower)?;
+        let max_eig = eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b.abs()));
+        
+        if max_eig < TOL {
             return Ok(0.0); // Matrix is effectively zero
         }
         
-        // For simplicity in this optimization, use pivoted eigendecomposition
-        // In a full implementation, we would recursively partition as described in Wood p.286
-        let (eigenvalues, _) = s.eigh(UPLO::Lower)?;
+        // Partition eigenspace: separate large eigenvalues from small ones
+        let mut large_indices = Vec::new();
+        let mut small_indices = Vec::new();
+        let threshold = max_eig * TOL.sqrt(); // Adaptive threshold
         
-        let mut log_det = 0.0;
-        let mut rank = 0;
-        
-        for &eig in eigenvalues.iter() {
-            if eig.abs() > TOL {
-                log_det += eig.ln();
-                rank += 1;
+        for (i, &eig) in eigenvalues.iter().enumerate() {
+            if eig.abs() > threshold {
+                large_indices.push(i);
+            } else if eig.abs() > TOL {
+                small_indices.push(i);
             }
+            // eigenvalues below TOL are ignored (rank deficient part)
         }
         
-        // Log rank for debugging if needed
-        if rank < s.nrows() {
-            log::debug!("Rank deficient matrix: rank {} < dim {}", rank, s.nrows());
+        let mut log_det = 0.0;
+        
+        // Handle large eigenvalues directly
+        for &i in &large_indices {
+            log_det += eigenvalues[i].ln();
+        }
+        
+        // For small eigenvalues, use similarity transform to improve conditioning
+        if !small_indices.is_empty() {
+            // Extract eigenvectors corresponding to small eigenvalues
+            let u_small = eigenvectors.select(Axis(1), &small_indices);
+            
+            // Form reduced matrix: U_small^T * S * U_small
+            let s_reduced = u_small.t().dot(s).dot(&u_small);
+            
+            // Recursively compute log determinant of reduced system
+            log_det += stable_log_det_recursive(&s_reduced)?;
+        }
+        
+        // Log partitioning info for debugging
+        if large_indices.len() + small_indices.len() < s.nrows() {
+            log::debug!("Similarity transform: {} large, {} small, {} null eigenvalues", 
+                       large_indices.len(), small_indices.len(), 
+                       s.nrows() - large_indices.len() - small_indices.len());
         }
         
         Ok(log_det)

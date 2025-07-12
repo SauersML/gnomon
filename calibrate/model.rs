@@ -222,6 +222,9 @@ mod internal {
         }
 
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
+        
+        // For interactions, use the constrained pgs_main_basis directly
+        // Cannot reconstruct "full" basis due to dimensional reduction from constraints
 
         // This closure was not used - removed
         // Previously defined a helper to fetch Z transform from model
@@ -292,9 +295,12 @@ mod internal {
 
         // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
         for m in 1..=total_pgs_bases {
-            // Use the FULL unconstrained basis with column m (just like in estimate.rs)
-            // This ensures we skip the intercept at index 0 and use columns 1,2,3,...
-            let pgs_weight_col = pgs_basis_unc.column(m);
+            // Use constrained PGS main basis (index m-1 since we exclude intercept)
+            // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
+            if m == 0 || m > pgs_main_basis.ncols() {
+                continue; // Skip intercept and out-of-bounds
+            }
+            let pgs_weight_col = pgs_main_basis.column(m - 1);
 
             // Iterate through PC names in the canonical order
             for pc_name in &config.pc_names {
@@ -302,8 +308,8 @@ mod internal {
                 let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
                 let pc_basis_con = &pc_constrained_bases[pc_idx];
 
-                // Pure pre-centering approach: use constrained PC basis with unconstrained PGS
-                // PC basis is already constrained (sum-to-zero). No need to center PGS or apply further constraints.
+                // Pure interaction approach: use constrained PC basis with constrained PGS
+                // Both bases are constrained (sum-to-zero) to avoid linear dependencies
                 let interaction_term = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
 
                 for col in interaction_term.axis_iter(Axis(1)) {
