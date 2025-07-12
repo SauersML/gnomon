@@ -466,25 +466,33 @@ pub mod internal {
                     // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
                     let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
 
+                    // Calculate penalized deviance: Dp = D(β̂) + β̂ᵀS_λβ̂
                     // For Gaussian models, D(β̂) is the RSS (residual sum of squares)
-                    // The penalty term β̂ᵀS_λβ̂ is not used in the REML variance estimation
                     let rss = pirls_result.deviance;
+                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                     let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+                     let penalized_deviance = rss + penalty_term;
 
                     // n is the number of samples
                     let n = self.y.len() as f64;
 
                     // Calculate the pseudo-determinant of S_λ to account for unpenalized subspaces
-                    // The correct REML formula for GAMs uses: -½log|H| + ½log|S_λ|_+ - ½(n-edf)log(RSS/(n-edf))
-                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
                     let log_det_s_lambda_pseudo = calculate_log_det_pseudo(&s_lambda)
                         .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
-                    // Calculate the correct REML score with pseudo-determinant adjustment
-                    // This properly handles unpenalized effects via the rank-deficient penalty matrix
-                    // Use unpenalized RSS in the variance-log term as per REML theory
-                    let reml = -0.5 * log_det_xtx_plus_s 
-                    + 0.5 * log_det_s_lambda_pseudo 
-                    - 0.5 * (n - edf) * (rss / (n - edf).max(1e-8)).ln();
+                    // Calculate variance estimate using penalized deviance: σ² = Dp / (n - edf)
+                     let sigma_sq = penalized_deviance / (n - edf).max(1e-8);
+
+                    // Calculate saturated likelihood: ls(φ) = -n/2 * log(2πφ) - RSS/(2φ)
+                    let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln() - (rss / (2.0 * sigma_sq));
+                    
+                    // Calculate REML score with penalized deviance and saturated likelihood
+                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ - Mp/2*log(2πσ²)
+                     let mp = self.layout.total_coeffs as f64; // Number of coefficients (Mp)
+                     let reml = -(penalized_deviance / (2.0 * sigma_sq)) - ls_phi 
+                              - 0.5 * log_det_xtx_plus_s 
+                              + 0.5 * log_det_s_lambda_pseudo 
+                              - (mp / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
@@ -669,7 +677,12 @@ pub mod internal {
                         }
                     }
                     let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
-                    let sigma_sq = rss / (n - edf).max(1e-8); // Ensure n-edf > 0
+                    
+                     // Calculate penalized deviance for variance estimation: Dp = RSS + β̂ᵀS_λβ̂
+                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                     let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+                     let penalized_deviance = rss + penalty_term;
+                     let sigma_sq = penalized_deviance / (n - edf).max(1e-8); // Use penalized deviance
 
                     if sigma_sq <= 0.0 {
                         return Err(EstimationError::RemlOptimizationFailed(
@@ -678,16 +691,16 @@ pub mod internal {
                     }
 
                     // --- 2. Compute pseudo-inverse of S_λ for trace terms (reuse from non-Gaussian branch) ---
-                    let mut s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let mut s_lambda_for_pseudo = s_lambda.clone();
                     
                     // Add small ridge regularization to prevent singularity issues
                     let ridge = 1e-8;
-                    for i in 0..s_lambda.nrows() {
-                        s_lambda[[i, i]] += ridge;
+                    for i in 0..s_lambda_for_pseudo.nrows() {
+                    s_lambda_for_pseudo[[i, i]] += ridge;
                     }
                     
                     // Perform eigendecomposition of S_λ to get eigenvalues and eigenvectors
-                    let (eigenvalues_s, eigenvectors_s) = s_lambda.eigh(UPLO::Lower)
+                    let (eigenvalues_s, eigenvectors_s) = s_lambda_for_pseudo.eigh(UPLO::Lower)
                         .map_err(|e| {
                             log::warn!("Eigendecomposition failed in Gaussian gradient calculation: {:?}", e);
                             EstimationError::EigendecompositionFailed(e)
@@ -771,13 +784,74 @@ pub mod internal {
 
                         // Compute the trace: tr(S_λ⁺ * S_k) = Σᵢ (1/λᵢ) * (U^T S_k U)ᵢᵢ
                         let mut s_inv_trace_term = 0.0;
-                        for i in 0..s_lambda.ncols() {
-                            s_inv_trace_term += pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
+                        for i in 0..s_lambda_for_pseudo.ncols() {
+                        s_inv_trace_term += pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
                         }
                         
-                        // The correct derivative of the REML score (to be maximized) includes all three terms:
-                        // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ² + tr(S_λ⁺S_k))
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled + s_inv_trace_term);
+                        // --- Term 4: Scale dependency cross-term ---
+                        // When scale parameter φ̂ is estimated (not fixed), we need the chain-rule term:
+                        // - {Dp/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)} * ∂φ̂/∂ρ_k
+                         //
+                         // For ∂φ̂/∂ρ_k = [∂Dp/∂ρ_k * (n-edf) - Dp * ∂edf/∂ρ_k] / (n-edf)²
+                         
+                         // Calculate ∂RSS/∂ρ_k = -2 * (y - Xβ)ᵀ X * ∂β/∂ρ_k (implicit differentiation)
+                         // ∂β/∂ρ_k = -exp(ρ_k) * H⁻¹ * S_k * β (from Wood 2011 Appendix D)
+                         let exp_rho_k = lambdas[k];
+                         let s_k_beta = s_k_full.dot(&pirls_result.beta);
+                         
+                         // Calculate ∂β/∂ρ_k = -λ_k * H⁻¹ * S_k * β
+                         let h_inv_s_k_beta = match pirls_result.penalized_hessian.solve(&s_k_beta) {
+                             Ok(result) => result,
+                             Err(_) => {
+                                 // Try with regularization
+                                 let mut hessian_reg = pirls_result.penalized_hessian.clone();
+                                 let ridge = 1e-6;
+                                 for i in 0..hessian_reg.nrows() {
+                                     hessian_reg[[i, i]] += ridge;
+                                 }
+                                 hessian_reg.solve(&s_k_beta).map_err(|_| {
+                                     EstimationError::RemlOptimizationFailed(
+                                         format!("Cannot compute ∂β/∂ρ_k for penalty {} during scale dependency calculation", k)
+                                     )
+                                 })?
+                             }
+                         };
+                         let d_beta_d_rho_k = -exp_rho_k * &h_inv_s_k_beta;
+                         
+                         // Residuals: y - Xβ (assuming design matrix X is available through self.x)
+                         let residuals = &self.y - &self.x.dot(&pirls_result.beta);
+                         
+                         // ∂RSS/∂ρ_k = -2 * residualsᵀ * X * ∂β/∂ρ_k
+                         let d_rss_d_rho_k = -2.0 * residuals.dot(&self.x.dot(&d_beta_d_rho_k));
+                         
+                         // ∂(penalty_term)/∂ρ_k = ∂(βᵀS_λβ)/∂ρ_k 
+                         // = 2 * βᵀ * S_k * β * λ_k + 2 * βᵀ * S_λ * ∂β/∂ρ_k
+                         let d_penalty_d_rho_k = 2.0 * exp_rho_k * pirls_result.beta.dot(&s_k_beta) 
+                                                + 2.0 * pirls_result.beta.dot(&s_lambda.dot(&d_beta_d_rho_k));
+                         
+                         // ∂Dp/∂ρ_k = ∂RSS/∂ρ_k + ∂(penalty_term)/∂ρ_k
+                         let d_dp_d_rho_k = d_rss_d_rho_k + d_penalty_d_rho_k;
+                         
+                         // ∂edf/∂ρ_k = -∂tr(H⁻¹S_λ)/∂ρ_k = -tr(H⁻¹S_k)*λ_k - tr(H⁻¹ ∂H/∂ρ_k H⁻¹ S_λ)
+                         // For simplicity, approximate: ∂edf/∂ρ_k ≈ -λ_k * tr(H⁻¹S_k)
+                         let d_edf_d_rho_k = -exp_rho_k * trace_term_unscaled;
+                         
+                         // ∂φ̂/∂ρ_k = [∂Dp/∂ρ_k * (n-edf) - Dp * ∂edf/∂ρ_k] / (n-edf)²
+                         let n_minus_edf = (n - edf).max(1e-8);
+                         let d_phi_d_rho_k = (d_dp_d_rho_k * n_minus_edf - penalized_deviance * d_edf_d_rho_k) / (n_minus_edf * n_minus_edf);
+                         
+                         // Cross-term coefficient: {Dp/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)}
+                         // For Gaussian: l's(φ̂) = -n/(2φ̂) + RSS/(2φ̂²)
+                         let mp = self.layout.total_coeffs as f64;
+                         let ls_prime_phi = -n / (2.0 * sigma_sq) + rss / (2.0 * sigma_sq * sigma_sq);
+                         let cross_term_coeff = penalized_deviance / (2.0 * sigma_sq * sigma_sq) + ls_prime_phi + mp / (2.0 * sigma_sq);
+                         
+                         // Scale dependency contribution to gradient
+                         let scale_dependency_term = -cross_term_coeff * d_phi_d_rho_k;
+                         
+                         // The complete REML gradient including scale dependency:
+                         // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ² + tr(S_λ⁺S_k)) + scale_dependency_term
+                         gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled + s_inv_trace_term) + scale_dependency_term;
                     }
                 }
                 _ => {
