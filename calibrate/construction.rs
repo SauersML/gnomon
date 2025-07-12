@@ -201,13 +201,15 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create penalties for interaction effects only
     // The main effect of PGS is intentionally left unpenalized.
-    // We iterate through each constrained PGS basis function which will act as a weight.
-    // Use the CONSTRAINED basis dimensions to ensure consistency.
-    let num_pgs_interaction_weights = pgs_main_basis.ncols();
+    // CRITICAL FIX: Use the UNCONSTRAINED PGS basis count for interactions.
+    // This establishes the single source of truth for interaction dimensions.
+    let num_pgs_interaction_weights = pgs_main_basis_unc.ncols();
 
     for _ in 0..num_pgs_interaction_weights {
         for i in 0..pc_constrained_bases.len() {
             // Create penalty matrix for interaction basis using pure pre-centering
+            // The interaction term is a tensor product, so penalty size = PC basis size
+            // (The PGS component acts as a scalar multiplier for each observation)
             let interaction_basis_size = pc_constrained_bases[i].ncols();
             let s_interaction =
                 create_difference_penalty_matrix(interaction_basis_size, config.penalty_order)?;
@@ -333,9 +335,8 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Interaction effects - in order of PGS basis function index, then PC name
     // This matches exactly with the flattening logic in model.rs
-    // Use the *actual* number of basis functions from the constrained matrix.
-    // This ensures consistency with the penalty matrix creation above.
-    let total_pgs_bases = pgs_main_basis.ncols();
+    // CRITICAL FIX: Use the UNCONSTRAINED PGS basis count for consistency.
+    let total_pgs_bases = num_pgs_interaction_weights;
 
     for m in 1..=total_pgs_bases {
         for pc_name in &config.pc_names {
@@ -344,12 +345,12 @@ pub fn build_design_and_penalty_matrices(
                     // Find PC index from name
                     let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                    // Use constrained PGS main basis (index m-1 since we start from m=1)
-                    // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
-                    if m == 0 || m > pgs_main_basis.ncols() {
+                    // CRITICAL FIX: Use UNCONSTRAINED PGS basis for interaction weights
+                    // Note: pgs_main_basis_unc excludes intercept column, so m=1 maps to index 0
+                    if m == 0 || m > pgs_main_basis_unc.ncols() {
                         continue; // Skip out-of-bounds
                     }
-                    let pgs_weight_col = pgs_main_basis.column(m - 1);
+                    let pgs_weight_col = pgs_main_basis_unc.column(m - 1);
 
                     // Use the CONSTRAINED PC basis matrix
                     let pc_constrained_basis = &pc_constrained_bases[pc_idx];

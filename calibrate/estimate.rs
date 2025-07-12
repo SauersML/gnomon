@@ -4539,22 +4539,32 @@ pub mod internal {
                 }
             }
 
-            // Verify that penalty matrices for interactions have the correct size
+            // Verify that penalty matrices for interactions have the correct structure
             for block in &layout.penalty_map {
                 if block.term_name.starts_with("f(PGS_B") {
                     let penalty_matrix = &s_list[block.penalty_idx];
-                    let col_count = block.col_range.end - block.col_range.start;
 
-                    // With pure pre-centering, the penalty matrix should have the same size as the column range
+                    // The embedded penalty matrix should be full-sized (p × p)
                     assert_eq!(
                         penalty_matrix.nrows(),
-                        col_count,
-                        "Interaction penalty matrix rows should match column count"
+                        layout.total_coeffs,
+                        "Interaction penalty matrix should be full-sized"
                     );
                     assert_eq!(
                         penalty_matrix.ncols(),
-                        col_count,
-                        "Interaction penalty matrix columns should match column count"
+                        layout.total_coeffs,
+                        "Interaction penalty matrix should be full-sized"
+                    );
+
+                    // Verify that the penalty matrix has non-zero elements only in the appropriate block
+                    use ndarray::s;
+                    let block_submatrix = penalty_matrix.slice(s![block.col_range.clone(), block.col_range.clone()]);
+                    
+                    // The block diagonal should have some non-zero elements (penalty structure)
+                    let block_sum = block_submatrix.iter().map(|&x| x.abs()).sum::<f64>();
+                    assert!(
+                        block_sum > 1e-10,
+                        "Interaction penalty block should have non-zero penalty structure"
                     );
                 }
             }

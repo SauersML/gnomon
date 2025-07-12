@@ -293,18 +293,18 @@ mod internal {
         }
 
         // 4. Interaction effects
-        // Use the constrained PGS basis dimensions for consistency with construction.rs
-        // This must match the value used during training in build_design_and_penalty_matrices
-        let total_pgs_bases = pgs_main_basis.ncols();
+        // CRITICAL FIX: Use the SAVED empirical count from config for perfect consistency
+        // This ensures construct_design_matrix and flatten_coefficients use the same count
+        let total_pgs_bases = config.num_pgs_interaction_bases;
 
         // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
         for m in 1..=total_pgs_bases {
-            // Use constrained PGS main basis (index m-1 since we start from m=1)
-            // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
-            if m == 0 || m > pgs_main_basis.ncols() {
+            // CRITICAL FIX: Use UNCONSTRAINED PGS basis for interaction weights
+            // Note: pgs_main_basis_unc excludes intercept column, so m=1 maps to index 0
+            if m == 0 || m > pgs_main_basis_unc.ncols() {
                 continue; // Skip out-of-bounds
             }
-            let pgs_weight_col = pgs_main_basis.column(m - 1);
+            let pgs_weight_col = pgs_main_basis_unc.column(m - 1);
 
             // Iterate through PC names in the canonical order
             for pc_name in &config.pc_names {
