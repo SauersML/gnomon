@@ -293,13 +293,13 @@ mod internal {
         }
 
         // 4. Interaction effects
-        // CRITICAL FIX: Use the SAVED empirical count from config for perfect consistency
+        // Use the saved empirical count from config for consistency
         // This ensures construct_design_matrix and flatten_coefficients use the same count
         let total_pgs_bases = config.num_pgs_interaction_bases;
 
         // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
         for m in 1..=total_pgs_bases {
-            // CRITICAL FIX: Use UNCONSTRAINED PGS basis for interaction weights
+            // Use unconstrained PGS basis for interaction weights
             // Note: pgs_main_basis_unc excludes intercept column, so m=1 maps to index 0
             if m == 0 || m > pgs_main_basis_unc.ncols() {
                 continue; // Skip out-of-bounds
@@ -669,7 +669,7 @@ mod tests {
         };
 
         // Create a dummy dataset for generating the correct model structure
-        // FIX: Increase n_samples from 10 to 100 to avoid over-parameterization
+        // Using n_samples=100 to avoid over-parameterization
         let n_samples = 100;
         let dummy_data = TrainingData {
             y: Array1::linspace(0.0, 1.0, n_samples),

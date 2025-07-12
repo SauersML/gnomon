@@ -262,7 +262,7 @@ pub fn stable_penalized_least_squares(
     augmented.slice_mut(s![..r_rows, ..]).assign(&r_bar.slice(s![..r_rows, ..]));
     augmented.slice_mut(s![r_rows.., ..]).assign(&e_matrix);
     
-    let (_q_aug, r_final) = augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    let (_, r_final) = augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
     
     // Step 4: Handle negative weights using Q_bar from INITIAL QR (not q_aug)
     let neg_indices: Vec<usize> = weights.iter().enumerate()

@@ -201,7 +201,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create penalties for interaction effects only
     // The main effect of PGS is intentionally left unpenalized.
-    // CRITICAL FIX: Use the UNCONSTRAINED PGS basis count for interactions.
+    // Use the unconstrained PGS basis count for interactions.
     // This establishes the single source of truth for interaction dimensions.
     let num_pgs_interaction_weights = pgs_main_basis_unc.ncols();
 
@@ -335,7 +335,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Interaction effects - in order of PGS basis function index, then PC name
     // This matches exactly with the flattening logic in model.rs
-    // CRITICAL FIX: Use the UNCONSTRAINED PGS basis count for consistency.
+    // Use the unconstrained PGS basis count for consistency.
     let total_pgs_bases = num_pgs_interaction_weights;
 
     for m in 1..=total_pgs_bases {
@@ -345,7 +345,7 @@ pub fn build_design_and_penalty_matrices(
                     // Find PC index from name
                     let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                    // CRITICAL FIX: Use UNCONSTRAINED PGS basis for interaction weights
+                    // Use unconstrained PGS basis for interaction weights
                     // Note: pgs_main_basis_unc excludes intercept column, so m=1 maps to index 0
                     if m == 0 || m > pgs_main_basis_unc.ncols() {
                         continue; // Skip out-of-bounds
@@ -555,8 +555,7 @@ pub fn stable_reparameterization(
             qf.slice_mut(s![.., k_offset..k_offset+q_current]).assign(&qf_new);
         }
         
-        // Step 6: Extract range and null space eigenvectors
-        let _u_r = u_reordered.slice(s![.., ..r]);
+        // Step 6: Extract null space eigenvectors
         let u_n = u_reordered.slice(s![.., r..]);
         
         if u_n.ncols() == 0 {

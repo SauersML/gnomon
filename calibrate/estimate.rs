@@ -2536,7 +2536,7 @@ pub mod internal {
             // GOAL: Understand if gradient -> 0 expectation at finite λ is mathematically reasonable
             // Test the mathematical behavior: does gradient approach 0 as λ increases?
 
-            // FIX: Increase n_samples from 100 to 400 to avoid over-parameterization
+            // Using n_samples=400 to avoid over-parameterization
             let n_samples = 400;
 
             // Create PC1 (predictive) and PC2 (null)
@@ -2728,7 +2728,7 @@ pub mod internal {
                     println!("✗ Gradient should be negative for null effect");
                 }
 
-                // CORRECTED TEST: Check that the cost function plateaus at high penalty
+                // Check that the cost function plateaus at high penalty
                 let high_rho_test = 10.0;
                 let very_high_rho_test = 11.0;
                 
@@ -2744,7 +2744,7 @@ pub mod internal {
                 ) {
                     let cost_plateau_change = (cost_high - cost_very_high).abs();
                     println!();
-                    println!("CORRECTED CONVERGENCE TEST:");
+                    println!("CONVERGENCE TEST:");
                     println!("Cost at rho=10: {:.6}", cost_high);
                     println!("Cost at rho=11: {:.6}", cost_very_high);
                     println!("Cost change: {:.6e}", cost_plateau_change);
@@ -2958,7 +2958,7 @@ pub mod internal {
             println!("  Cost at rho=10: {:.6}", cost_high);
             println!("  Cost at rho=11: {:.6}", cost_very_high);
 
-            // CORRECTED MATHEMATICAL EXPECTATION:
+            // MATHEMATICAL EXPECTATION:
             // At high penalty, the cost function should be flat for the null effect.
             // The gradient with respect to ρ = log(λ) includes a factor of λ, so it may not vanish.
             // Instead, we test that the cost function has plateaued (is flat).
@@ -3163,7 +3163,7 @@ pub mod internal {
         fn test_pirls_nan_investigation() {
             // Test that P-IRLS remains stable with extreme values
             // Create conditions that might lead to NaN in P-IRLS
-            // FIX: Increase n_samples from 10 to 150 to avoid over-parameterization
+            // Using n_samples=150 to avoid over-parameterization
             let n_samples = 150;
 
             // Create non-separable data with overlap
@@ -3265,7 +3265,7 @@ pub mod internal {
         fn test_minimal_bfgs_failure_replication() {
             // Verify that the BFGS optimization doesn't fail with invalid cost values
             // Replicate the exact conditions that cause BFGS to fail
-            // FIX: Increase n_samples from 50 to 250 to avoid over-parameterization
+            // Using n_samples=250 to avoid over-parameterization
             let n_samples = 250;
             
             // Create complex, non-separable data instead of perfectly separated halves
@@ -4719,7 +4719,7 @@ pub mod internal {
             use crate::calibrate::model::BasisConfig;
             use approx::assert_abs_diff_eq;
             // Create a minimal test dataset
-            // FIX: Increase n_samples from 20 to 150 to avoid over-parameterization
+            // Using n_samples=150 to avoid over-parameterization
             let n_samples = 150;
             let y = Array1::zeros(n_samples);
             let p = Array1::linspace(0.0, 1.0, n_samples);
