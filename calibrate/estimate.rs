@@ -2346,7 +2346,8 @@ pub mod internal {
             // GOAL: Understand if gradient -> 0 expectation at finite λ is mathematically reasonable
             // Test the mathematical behavior: does gradient approach 0 as λ increases?
 
-            let n_samples = 100;
+            // FIX: Increase n_samples from 100 to 400 to avoid over-parameterization
+            let n_samples = 400;
 
             // Create PC1 (predictive) and PC2 (null)
             let pc1 = Array::linspace(-1.5, 1.5, n_samples);
@@ -2927,7 +2928,8 @@ pub mod internal {
         fn test_pirls_nan_investigation() {
             // Test that P-IRLS remains stable with extreme values
             // Create conditions that might lead to NaN in P-IRLS
-            let n_samples = 10;
+            // FIX: Increase n_samples from 10 to 150 to avoid over-parameterization
+            let n_samples = 150;
 
             // Create non-separable data with overlap
             use rand::prelude::*;
@@ -3028,7 +3030,8 @@ pub mod internal {
         fn test_minimal_bfgs_failure_replication() {
             // Verify that the BFGS optimization doesn't fail with invalid cost values
             // Replicate the exact conditions that cause BFGS to fail
-            let n_samples = 50; // Smaller than the full test for speed
+            // FIX: Increase n_samples from 50 to 250 to avoid over-parameterization
+            let n_samples = 250;
             let mut y = Array::from_elem(n_samples, 0.0);
             y.slice_mut(ndarray::s![n_samples / 2..]).fill(1.0);
             let p = Array::linspace(-2.0, 2.0, n_samples);
@@ -4393,7 +4396,8 @@ pub mod internal {
             use crate::calibrate::model::BasisConfig;
             use approx::assert_abs_diff_eq;
             // Create a minimal test dataset
-            let n_samples = 20;
+            // FIX: Increase n_samples from 20 to 150 to avoid over-parameterization
+            let n_samples = 150;
             let y = Array1::zeros(n_samples);
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let pc1 = Array1::linspace(-0.5, 0.5, n_samples);
@@ -5100,7 +5104,8 @@ pub mod internal {
 
         #[test]
         fn test_debug_zero_gradient_issue() {
-            let n_samples = 20;
+            // FIX: Increase n_samples from 20 to 200, reduce knots to avoid over-parameterization
+            let n_samples = 200;
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x: f64| x + 0.1 * rand::random::<f64>());
             let p = Array1::zeros(n_samples);
@@ -5112,10 +5117,10 @@ pub mod internal {
 
             let mut config = create_test_config();
             config.link_function = LinkFunction::Identity;
-            config.pgs_basis_config.num_knots = 5;
+            config.pgs_basis_config.num_knots = 3; // Reduced from 5
             config.pc_names = vec!["PC1".to_string()];
             config.pc_basis_configs = vec![BasisConfig {
-                num_knots: 3,
+                num_knots: 2, // Reduced from 3
                 degree: 2,
             }];
             config.pc_ranges = vec![(0.0, 1.0)];

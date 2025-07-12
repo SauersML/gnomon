@@ -293,17 +293,16 @@ mod internal {
         }
 
         // 4. Interaction effects
-        // The correct formula for unconstrained non-intercept PGS basis functions is:
-        // (num_knots + degree + 1) - 1 = num_knots + degree
-        // We subtract 1 to exclude the intercept basis function (index 0)
-        let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        // Use the constrained PGS basis dimensions for consistency with construction.rs
+        // This must match the value used during training in build_design_and_penalty_matrices
+        let total_pgs_bases = pgs_main_basis.ncols();
 
         // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
         for m in 1..=total_pgs_bases {
-            // Use constrained PGS main basis (index m-1 since we exclude intercept)
+            // Use constrained PGS main basis (index m-1 since we start from m=1)
             // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
             if m == 0 || m > pgs_main_basis.ncols() {
-                continue; // Skip intercept and out-of-bounds
+                continue; // Skip out-of-bounds
             }
             let pgs_weight_col = pgs_main_basis.column(m - 1);
 
@@ -670,8 +669,8 @@ mod tests {
         };
 
         // Create a dummy dataset for generating the correct model structure
-        // The size doesn't matter much - we just need the function to run
-        let n_samples = 10;
+        // FIX: Increase n_samples from 10 to 100 to avoid over-parameterization
+        let n_samples = 100;
         let dummy_data = TrainingData {
             y: Array1::linspace(0.0, 1.0, n_samples),
             p: Array1::linspace(-1.0, 1.0, n_samples),

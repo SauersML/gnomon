@@ -201,8 +201,9 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create penalties for interaction effects only
     // The main effect of PGS is intentionally left unpenalized.
-    // We iterate through each non-intercept PGS basis function which will act as a weight.
-    let num_pgs_interaction_weights = pgs_basis_unc.ncols() - 1;
+    // We iterate through each constrained PGS basis function which will act as a weight.
+    // Use the CONSTRAINED basis dimensions to ensure consistency.
+    let num_pgs_interaction_weights = pgs_main_basis.ncols();
 
     for _ in 0..num_pgs_interaction_weights {
         for i in 0..pc_constrained_bases.len() {
@@ -332,9 +333,9 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Interaction effects - in order of PGS basis function index, then PC name
     // This matches exactly with the flattening logic in model.rs
-    // Use the *actual* number of basis functions from the generated (unconstrained) matrix, excluding the intercept.
+    // Use the *actual* number of basis functions from the constrained matrix.
     // This ensures consistency with the penalty matrix creation above.
-    let total_pgs_bases = pgs_basis_unc.ncols() - 1;
+    let total_pgs_bases = pgs_main_basis.ncols();
 
     for m in 1..=total_pgs_bases {
         for pc_name in &config.pc_names {
@@ -343,10 +344,10 @@ pub fn build_design_and_penalty_matrices(
                     // Find PC index from name
                     let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
-                    // Use constrained PGS main basis (index m-1 since we exclude intercept)
+                    // Use constrained PGS main basis (index m-1 since we start from m=1)
                     // Note: pgs_main_basis excludes intercept column, so m=1 maps to index 0
                     if m == 0 || m > pgs_main_basis.ncols() {
-                        continue; // Skip intercept and out-of-bounds
+                        continue; // Skip out-of-bounds
                     }
                     let pgs_weight_col = pgs_main_basis.column(m - 1);
 
