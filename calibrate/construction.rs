@@ -2,8 +2,8 @@ use crate::calibrate::basis::{self, create_bspline_basis, create_difference_pena
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{Constraint, ModelConfig};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
-use ndarray_linalg::{SVD, QR, Cholesky, UPLO, Eigh, Solve, error::LinalgError};
+use ndarray::{Array1, Array2, Axis, s};
+use ndarray_linalg::{SVD, UPLO, Eigh, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -450,42 +450,46 @@ pub fn stable_reparameterization(
     let p = layout.total_coeffs;
     let m = s_list.len(); // Number of penalty matrices
     
-    // s_list contains full-sized p × p penalty matrices
-    let s_matrices = s_list.to_vec();
+    if m == 0 {
+        return Ok(ReparamResult {
+            s_transformed: Array2::zeros((p, p)),
+            log_det: 0.0,
+            det1: Array1::zeros(0),
+            qs: Array2::eye(p),
+            rs: vec![],
+        });
+    }
+
+    // Wood (2011) Appendix B: get_stableS algorithm - Transform-In-Place Architecture
+    let eps = f64::EPSILON.powf(1.0/3.0); // d_tol - group similar sized penalties
     
-    // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = f64::EPSILON.powf(1.0/3.0); // Cube root of machine precision
+    // Initialize global transformation matrix and working matrices
+    let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
+    let mut rs_current = s_list.to_vec(); // Working penalty matrices (will be transformed)
     
-    // Initialize: Qf = Identity(p,p), K=0, Q=p
-    let mut qf = Array2::eye(p); // Global transformation matrix
-    let mut k = 0_usize; // Number of parameters already processed
-    let mut q = p; // Size of current sub-problem
+    // Initialize iteration variables following get_stableS
+    let mut k_offset = 0_usize; // K: number of parameters already processed  
+    let mut q_current = p; // Q: size of current sub-problem
     let mut gamma: Vec<usize> = (0..m).collect(); // Active penalty indices
     
-    // Initialize penalty square roots for transformations (clone originals)
-    let mut rs = s_matrices.clone();
-    
-    // Initialize final S matrix  
-    let mut s_final = Array2::zeros((p, p));
-    
-    // Main iterative loop
+    // Main similarity transform loop - mirrors get_stableS structure
     let mut iteration = 0;
     loop {
         iteration += 1;
-        if gamma.is_empty() || q == 0 {
+        if gamma.is_empty() || q_current == 0 {
             break;
         }
         
-        // Step 1: Calculate scaled penalty measures Ω_i = ||R_i||_F * λ_i for i ∈ γ
-        let mut omegas = Vec::new();
+        // Step 1: Find Frobenius norms of penalties in current sub-problem (like get_stableS)
+        let mut frob_norms = Vec::new();
         let mut max_omega: f64 = 0.0;
         
         for &i in &gamma {
-            // Extract current active sub-problem block from the penalty matrix
-            let active_block = rs[i].slice(s![k..k+q, k..k+q]).to_owned();
-            let frobenius_norm = active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            let omega_i = frobenius_norm * lambdas[i];
-            omegas.push((i, omega_i));
+            // Extract current Q x Q active sub-block 
+            let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
+            let frob_norm = active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            let omega_i = frob_norm * lambdas[i];
+            frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
         }
         
@@ -493,13 +497,13 @@ pub fn stable_reparameterization(
             break; // All remaining penalties are numerically zero
         }
         
-        // Step 2: Partition into dominant α and subdominant γ' sets
-        let threshold = eps * max_omega;
-        let alpha: Vec<usize> = omegas.iter()
+        // Step 2: Partition into dominant α and subdominant γ' sets (like get_stableS)
+        let threshold = eps * max_omega; // d_tol threshold
+        let alpha: Vec<usize> = frob_norms.iter()
             .filter(|(_, omega)| *omega >= threshold)
             .map(|(i, _)| *i)
             .collect();
-        let gamma_prime: Vec<usize> = omegas.iter()
+        let gamma_prime: Vec<usize> = frob_norms.iter()
             .filter(|(_, omega)| *omega < threshold)
             .map(|(i, _)| *i)
             .collect();
@@ -508,133 +512,99 @@ pub fn stable_reparameterization(
             break;
         }
         
-        // Step 3: Form weighted sum of dominant penalties in current sub-problem
-        let mut s_alpha = Array2::zeros((q, q));
+        // Step 3: Form weighted sum of dominant penalties and eigendecompose (like get_stableS)
+        let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
-            let active_block = rs[i].slice(s![k..k+q, k..k+q]).to_owned();
-            s_alpha = s_alpha + &active_block * lambdas[i];
+            let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
+            sb.scaled_add(lambdas[i], &active_block);
         }
         
-        // Step 4: Eigendecomposition to find rank
-        let (eigenvalues, u): (Array1<f64>, Array2<f64>) = s_alpha.eigh(UPLO::Lower)
-            .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+        // Eigendecomposition to get rank and eigenvectors
+        let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb.eigh(UPLO::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
         
-        // Sort eigenvalues in descending order
+        // Sort eigenvalues in descending order and determine rank
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
         
-        // Determine rank r based on eigenvalue threshold
-        let rank_tolerance = 1e-8 * eigenvalues[sorted_indices[0]].max(1.0);
+        let r_tol = f64::EPSILON.powf(0.75); // Like get_stableS r_tol
+        let rank_tolerance = eigenvalues[sorted_indices[0]].max(1.0) * r_tol;
         let r = sorted_indices.iter()
             .take_while(|&&i| eigenvalues[i] > rank_tolerance)
             .count();
         
-        // Step 5: Check termination criterion
-        if r == q {
-            // Full rank case - assemble final diagonal block and terminate
-            let mut s_block = Array2::zeros((q, q));
-            for &i in &gamma {
-                let active_block = rs[i].slice(s![k..k+q, k..k+q]).to_owned();
-                s_block = s_block + &active_block * lambdas[i];
-            }
-            // Copy to final S matrix
-            s_final.slice_mut(s![k..k+q, k..k+q]).assign(&s_block);
-            break;
+        // Step 4: Check termination criterion (like get_stableS)
+        if r == q_current {
+            break; // Full rank - terminate
+        }
+        
+        // Step 5: Update global transformation matrix Qf (like get_stableS)
+        // Reorder eigenvectors by descending eigenvalues
+        let u_reordered = u.select(Axis(1), &sorted_indices);
+        
+        if iteration == 1 {
+            // First iteration: copy U to appropriate block of Qf
+            qf.slice_mut(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current])
+                .assign(&u_reordered);
+        } else {
+            // Subsequent iterations: multiply current Qf block by U
+            let qf_block = qf.slice(s![.., k_offset..k_offset+q_current]).to_owned();
+            let qf_new = qf_block.dot(&u_reordered);
+            qf.slice_mut(s![.., k_offset..k_offset+q_current]).assign(&qf_new);
         }
         
         // Step 6: Extract range and null space eigenvectors
-        let u_r = u.select(Axis(1), &sorted_indices[..r]);
-        let u_n = u.select(Axis(1), &sorted_indices[r..]);
+        let _u_r = u_reordered.slice(s![.., ..r]);
+        let u_n = u_reordered.slice(s![.., r..]);
         
         if u_n.ncols() == 0 {
             break;
         }
         
-        // Step 7: Update global transformation matrix Qf
-        // Qf_new = Qf_old * U_block where U_block = [U_r U_n]
-        if iteration == 1 {
-            // First iteration: copy U to the appropriate block of Qf
-            qf.slice_mut(s![k..k+q, k..k+q]).assign(&u);
-        } else {
-            // Subsequent iterations: multiply current Qf block by U
-            let qf_block = qf.slice(s![.., k..k+q]).to_owned();
-            let qf_new = qf_block.dot(&u);
-            qf.slice_mut(s![.., k..k+q]).assign(&qf_new);
-        }
+        // Step 7: Transform penalty components for next iteration (like get_stableS)
+        // Following the exact logic: sub-dominant penalties are transformed to null space for next iteration
+        let mut next_rs = vec![Array2::zeros((p, p)); m];
+        let next_q = u_n.ncols();
         
-        // Step 8: Update off-diagonal blocks of final S matrix  
-        if k > 0 {
-            for &i in &gamma {
-                // Extract off-diagonal block
-                let off_diag_block = rs[i].slice(s![..k, k..k+q]).to_owned();
-                // Transform: B_new = B_old * U
-                let b_new = off_diag_block.dot(&u);
-                // Copy back to S matrix (both upper and lower triangular parts)
-                s_final.slice_mut(s![..k, k..k+q]).assign(&b_new);
-                s_final.slice_mut(s![k..k+q, ..k]).assign(&b_new.t());
-            }
-        }
-        
-        // Step 9: Form new diagonal block for current iteration
-        // C = U'S_γU + D (where D contains dominant eigenvalues)
-        let mut s_gamma = Array2::zeros((q, q));
-        for &i in &gamma_prime {
-            let active_block = rs[i].slice(s![k..k+q, k..k+q]).to_owned();
-            s_gamma = s_gamma + &active_block * lambdas[i];
-        }
-        
-        let c_new = u.t().dot(&s_gamma.dot(&u));
-        // Add dominant eigenvalues to (1,1) block
-        for (idx, &i) in sorted_indices[..r].iter().enumerate() {
-            if idx < c_new.nrows() && idx < c_new.ncols() {
-                let current_val = c_new[[idx, idx]];
-                s_final[[k + idx, k + idx]] = current_val + eigenvalues[i];
-            }
-        }
-        
-        // Copy subdominant block to final S
-        if r < q {
-            let subdominant_block = c_new.slice(s![r..q, r..q]).to_owned();
-            s_final.slice_mut(s![k+r..k+q, k+r..k+q]).assign(&subdominant_block);
-        }
-        
-        // Step 10: Transform penalty matrices for next iteration
-        for penalty_idx in 0..rs.len() {
-            if alpha.contains(&penalty_idx) {
-                // Dominant penalties: project to range space and zero null space
-                let active_block = rs[penalty_idx].slice(s![k..k+q, k..k+q]).to_owned();
-                let transformed_block = u_r.t().dot(&active_block.dot(&u_r));
-                
-                // Update the penalty matrix - zero out null space part
-                rs[penalty_idx].slice_mut(s![k..k+r, k..k+r]).assign(&transformed_block);
-                
-                // Zero out the null space parts
-                if k + r < p {
-                    rs[penalty_idx].slice_mut(s![k+r..k+q, k..k+q]).fill(0.0);
-                    rs[penalty_idx].slice_mut(s![k..k+q, k+r..k+q]).fill(0.0);
-                }
-            } else if gamma_prime.contains(&penalty_idx) {
-                // Subdominant penalties: project to null space
-                let active_block = rs[penalty_idx].slice(s![k..k+q, k..k+q]).to_owned();
+        for i in 0..m {
+            if gamma_prime.contains(&i) {
+                // Sub-dominant penalties: transform to null space for next iteration's sub-problem
+                let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
                 let transformed_block = u_n.t().dot(&active_block.dot(&u_n));
                 
-                // Update penalty matrix to null space representation
-                let new_dim = u_n.ncols();
-                rs[penalty_idx].slice_mut(s![k+r..k+r+new_dim, k+r..k+r+new_dim])
+                // Place the transformed block in the next iteration's position
+                next_rs[i].slice_mut(s![k_offset+r..k_offset+r+next_q, k_offset+r..k_offset+r+next_q])
                     .assign(&transformed_block);
+            } else {
+                // Copy unchanged parts for non-active penalties
+                next_rs[i] = rs_current[i].clone();
             }
         }
         
-        // Step 11: Update loop variables for next iteration
-        k = k + r; // Number of dimensions dealt with
-        q = u_n.ncols(); // Size of remaining sub-problem
-        gamma = gamma_prime; // New active set is old subdominant set
+        // Update for next iteration
+        rs_current = next_rs;
+        k_offset = k_offset + r;
+        q_current = next_q;
+        gamma = gamma_prime;
     }
     
-    // Use the stable final S matrix
-    let s_transformed = s_final;
+    // AFTER LOOP: Apply final transformation to get consistent basis (Fix 3)
     
-    // Stable log-determinant computation
+    // Step 8: Calculate final transformed total penalty matrix using final Qf
+    let mut s_original_total = Array2::zeros((p, p));
+    for i in 0..m {
+        s_original_total.scaled_add(lambdas[i], &s_list[i]);
+    }
+    let s_transformed = qf.t().dot(&s_original_total.dot(&qf));
+    
+    // Step 9: Transform all component penalties using final Qf (for consistent derivative calculation)
+    let mut rs_transformed = Vec::with_capacity(m);
+    for i in 0..m {
+        let s_k_transformed = qf.t().dot(&s_list[i].dot(&qf));
+        rs_transformed.push(s_k_transformed);
+    }
+    
+    // Step 10: Calculate stable log-determinant
     use crate::calibrate::estimate::internal::calculate_log_det_pseudo;
     let log_det = calculate_log_det_pseudo(&s_transformed)
         .unwrap_or_else(|_| {
@@ -650,12 +620,12 @@ pub fn stable_reparameterization(
             }
         });
     
-    // Compute derivatives: d/dρ_k log|S_λ|_+ = λ_k * tr(S_λ^+ S_k)
+    // Step 11: Calculate derivatives with consistent basis (Fix 3)
     let mut det1 = Array1::zeros(lambdas.len());
     
-    // Compute pseudo-inverse of S_λ
+    // Compute pseudo-inverse of transformed total penalty
     let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed.eigh(UPLO::Lower)
-        .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+        .map_err(EstimationError::EigendecompositionFailed)?;
     
     let tolerance = 1e-12;
     let mut s_plus = Array2::zeros((p, p));
@@ -663,14 +633,14 @@ pub fn stable_reparameterization(
         if eigenval > tolerance {
             let v_i = s_eigenvectors.column(i);
             let outer_product = v_i.to_owned().insert_axis(Axis(1)).dot(&v_i.to_owned().insert_axis(Axis(0)));
-            s_plus = s_plus + &outer_product * (1.0 / eigenval);
+            s_plus.scaled_add(1.0 / eigenval, &outer_product);
         }
     }
     
-    // Calculate derivatives
+    // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed) - BOTH matrices in same basis
     for k in 0..lambdas.len() {
-        let s_plus_times_s_k = s_plus.dot(&s_matrices[k]);
-        let trace: f64 = s_plus_times_s_k.diag().sum();
+        let s_plus_times_s_k_transformed = s_plus.dot(&rs_transformed[k]);
+        let trace: f64 = s_plus_times_s_k_transformed.diag().sum();
         det1[k] = lambdas[k] * trace;
     }
     
@@ -679,7 +649,7 @@ pub fn stable_reparameterization(
         log_det,
         det1,
         qs: qf,
-        rs: s_matrices,
+        rs: rs_transformed, // Return the consistently transformed components
     })
 }
 
@@ -696,190 +666,8 @@ pub struct StablePLSResult {
     pub scale: f64,
 }
 
-/// Implements the stable penalized least squares solver from Wood (2011) Section 3.3
-/// Handles negative weights via SVD and uses pivoted QR for rank detection
-pub fn stable_penalized_least_squares(
-    x: ArrayView2<f64>,
-    y: ArrayView1<f64>,
-    weights: ArrayView1<f64>,
-    s_lambda: &Array2<f64>,
-    _reparam_result: &ReparamResult,
-) -> Result<StablePLSResult, EstimationError> {
-    let n = x.nrows();
-    let p = x.ncols();
-    
-    // Step 1: Split weights into positive and negative parts (Wood 2011, Section 3.3)
-    let mut w_pos = Array1::zeros(n);
-    let mut w_neg = Array1::zeros(n);
-    for i in 0..n {
-        if weights[i] >= 0.0 {
-            w_pos[i] = weights[i];
-        } else {
-            w_neg[i] = -weights[i];
-        }
-    }
-    
-    // Step 2: Initial QR decomposition on the positive part
-    // √W̄X = QR where W̄ has |w_i| on diagonal
-    let w_abs = weights.mapv(|w| w.abs());
-    let sqrt_w_abs = w_abs.mapv(|w| w.sqrt());
-    let x_weighted = &x * &sqrt_w_abs.view().insert_axis(Axis(1));
-    
-    // Perform QR decomposition
-    let (_q_initial, r_initial) = x_weighted.qr()
-        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-    
-    // Step 3: Form penalty square root matrix E where E^T E = S_λ
-    // Use Cholesky decomposition: S_λ = L L^T, so E = L
-    let e_matrix = match s_lambda.cholesky(UPLO::Lower) {
-        Ok(l) => l,
-        Err(_) => {
-            // Fallback: use eigendecomposition for semi-definite case
-            let (eigenvals, eigenvecs): (Array1<f64>, Array2<f64>) = s_lambda.eigh(UPLO::Lower)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-            
-            let mut e_temp = Array2::zeros((p, p));
-            for (i, &eval) in eigenvals.iter().enumerate() {
-                if eval > 1e-12 {
-                    let v_i = eigenvecs.column(i);
-                    let sqrt_eval = eval.sqrt();
-                    let outer = v_i.to_owned().insert_axis(Axis(1)) * sqrt_eval;
-                    e_temp = e_temp + &outer.dot(&v_i.to_owned().insert_axis(Axis(0)));
-                }
-            }
-            e_temp
-        }
-    };
-    
-    // Step 4: Form augmented matrix [R; E] and perform pivoted QR
-    let r_rows = r_initial.nrows().min(p);
-    let r_truncated = r_initial.slice(s![..r_rows, ..]).to_owned();
-    
-    let mut augmented = Array2::zeros((r_rows + p, p));
-    augmented.slice_mut(s![..r_rows, ..]).assign(&r_truncated);
-    augmented.slice_mut(s![r_rows.., ..]).assign(&e_matrix);
-    
-    // QR decomposition of augmented matrix
-    let (q_augmented, r_final) = augmented.qr()
-        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-    
-    // Step 5: Extract Q₁ (first q rows corresponding to negative weight indices)
-    let mut penalized_hessian = r_final.t().dot(&r_final); // R̄^T R̄
-    
-    // Step 6: Handle negative weights via SVD correction (Wood 2011, Section 3.3, Eq. 12)
-    // Extract correct Q₁ from the augmented QR decomposition
-    if w_neg.iter().any(|&w| w > 0.0) {
-        let neg_indices: Vec<usize> = (0..n).filter(|&i| weights[i] < 0.0).collect();
-        
-        if !neg_indices.is_empty() {
-            // Map negative weight rows to the Q matrix from augmented QR
-            // Q₁ consists of the first q rows of Q̄ (where q = number of negative weights)
-            let q = neg_indices.len().min(q_augmented.nrows());
-            let q1 = q_augmented.slice(s![..q, ..]).to_owned();
-            
-            // Form I^- matrix (diagonal matrix of negative weights)
-            let mut i_minus = Array2::zeros((q, q));
-            for (i, &orig_idx) in neg_indices.iter().enumerate().take(q) {
-                i_minus[[i, i]] = w_neg[orig_idx];
-            }
-            
-            // Compute I^- Q₁ as per Wood (2011) Eq. 12
-            let i_minus_q1 = i_minus.dot(&q1);
-            
-            // SVD of I^- Q₁ = U D V^T (Wood 2011, Eq. 12)
-            let (u, singular_values, vt) = i_minus_q1.svd(true, true)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-            
-            if let (Some(_u_mat), Some(vt_mat)) = (u, vt) {
-                // Form D^2 matrix from singular values
-                let mut d_squared = Array2::zeros((singular_values.len(), singular_values.len()));
-                for (i, &sv) in singular_values.iter().enumerate() {
-                    d_squared[[i, i]] = sv * sv;
-                }
-                
-                // Compute V D^2 V^T correction term
-                let v_mat = vt_mat.t();
-                let correction_term = v_mat.dot(&d_squared.dot(&v_mat.t()));
-                
-                // Apply Wood (2011) Eq. 12 similarity transform: H = R̄^T (I - 2 V D^2 V^T) R̄
-                let identity: Array2<f64> = Array2::eye(p);
-                let correction_matrix = &identity - &correction_term * 2.0;
-                
-                // Transform the penalized Hessian correctly
-                penalized_hessian = r_final.t().dot(&correction_matrix.dot(&r_final));
-            }
-        }
-    }
-    
-    // Step 6: Ensure positive definiteness with regularization
-    let ridge = 1e-8;
-    for i in 0..penalized_hessian.nrows() {
-        penalized_hessian[[i, i]] += ridge;
-    }
-    
-    // Step 7: Solve the system
-    // Construct right-hand side: X'Wz (for now, assume z = y for simplicity)
-    let sqrt_w = weights.mapv(|w| if w >= 0.0 { w.sqrt() } else { 0.0 });
-    let y_weighted = &sqrt_w * &y;
-    let x_weighted_pos = &x * &sqrt_w.view().insert_axis(Axis(1));
-    let rhs = x_weighted_pos.t().dot(&y_weighted);
-    
-    // Solve using Cholesky factorization
-    let beta = match penalized_hessian.cholesky(UPLO::Lower) {
-        Ok(chol) => {
-            chol.solve(&rhs)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?
-        }
-        Err(_) => {
-            // Fallback to regularized solve
-            let mut reg_hessian = penalized_hessian.clone();
-            let reg_factor = 1e-6;
-            for i in 0..reg_hessian.nrows() {
-                reg_hessian[[i, i]] += reg_factor;
-            }
-            reg_hessian.cholesky(UPLO::Lower)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?
-                .solve(&rhs)
-                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?
-        }
-    };
-    
-    // Calculate effective degrees of freedom
-    // edf = tr(H⁻¹X'WX) where H is the penalized Hessian
-    let mut edf: f64 = 0.0;
-    let w_diag = Array2::from_diag(&weights);
-    let xtwx_actual = x.t().dot(&w_diag.dot(&x));
-    for j in 0..p {
-        let xtwx_col = xtwx_actual.column(j);
-        match penalized_hessian.solve(&xtwx_col.to_owned()) {
-            Ok(h_inv_col) => {
-                edf += h_inv_col[j];
-            }
-            Err(_) => {
-                // If solve fails, use approximation based on penalty rank
-                let penalty_rank = s_lambda.svd(false, false)
-                    .map(|(_, svals, _)| svals.iter().filter(|&&sv| sv > 1e-8).count())
-                    .unwrap_or(p);
-                edf = (p as f64) - penalty_rank as f64;
-                break;
-            }
-        }
-    }
-    edf = edf.max(1.0);
-    
-    // Calculate scale parameter
-    let fitted = x.dot(&beta);
-    let residuals = &y - &fitted;
-    let rss = residuals.mapv(|x| x * x).sum();
-    let scale = rss / (n as f64 - edf).max(1.0);
-    
-    Ok(StablePLSResult {
-        beta,
-        penalized_hessian,
-        edf,
-        scale,
-    })
-}
+
+
 
 /// Calculate the condition number of a matrix using singular value decomposition (SVD).
 ///

@@ -2,7 +2,7 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
@@ -235,7 +235,7 @@ pub struct StablePLSResult {
 }
 
 /// Implements the exact stable penalized least squares solver from Wood (2011) Section 3.3
-/// Following the pls_fit1 algorithm with proper two-stage QR and SVD correction for negative weights
+/// Following the pls_fit1 algorithm with proper rank deficiency handling and SVD correction
 pub fn stable_penalized_least_squares(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
@@ -246,83 +246,102 @@ pub fn stable_penalized_least_squares(
     let p = x.ncols();
     
     use ndarray_linalg::{QR, SVD, Solve};
+    use ndarray::s;
     
-    // Step 1: Handle negative weights according to Wood (2011) Section 3.3
+    // Step 1: Initial QR decomposition of sqrt(|W|)X (Wood 2011, Section 3.3)
+    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
+    let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1)); // sqrt(|W|)X
+    let (q_bar, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    // Step 2: Get penalty square root E where E'E = S_lambda
+    let e_matrix = penalty_square_root(s_lambda)?;
+    
+    // Step 3: Form augmented matrix [R_bar; E] and perform QR decomposition
+    let r_rows = r_bar.nrows().min(p);
+    let mut augmented = Array2::zeros((r_rows + p, p));
+    augmented.slice_mut(s![..r_rows, ..]).assign(&r_bar.slice(s![..r_rows, ..]));
+    augmented.slice_mut(s![r_rows.., ..]).assign(&e_matrix);
+    
+    let (_q_aug, r_final) = augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    // Step 4: Handle negative weights using Q_bar from INITIAL QR (not q_aug)
     let neg_indices: Vec<usize> = weights.iter().enumerate()
         .filter(|(_, w)| **w < 0.0)
         .map(|(i, _)| i)
         .collect();
     
-    // Form sqrt(|W|)X and sqrt(|W|)z with sign correction
-    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
-    let mut z_tilde = &y * &sqrt_w_abs;
+    let final_hessian = if neg_indices.is_empty() {
+        // No negative weights: simple case
+        r_final.t().dot(&r_final)
+    } else {
+        // Apply SVD correction using Q_bar (the CORRECT Q matrix)
+        let q1_neg = q_bar.select(Axis(0), &neg_indices); // Select rows corresponding to negative weights
+        
+        // SVD of Q1_neg
+        let (_, sigma, vt_opt) = q1_neg.svd(false, true)
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        
+        if let Some(vt) = vt_opt {
+            // Form correction matrix (I - 2VD²V')
+            let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
+            for (i, &s) in sigma.iter().enumerate() {
+                d_squared[[i, i]] = s * s;
+            }
+            
+            let v = vt.t();
+            let correction = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
+            
+            // Apply correction: R_final'(I - 2VD²V')R_final
+            r_final.t().dot(&correction.dot(&r_final))
+        } else {
+            // Fallback
+            r_final.t().dot(&r_final)
+        }
+    };
     
-    // Flip sign for negative weight observations (Wood 2011)
+    // Step 5: Calculate RHS = X'Wz correctly (no complex correction needed)
+    // Form z_tilde with sign correction for negative weights
+    let mut z_tilde = &y * &sqrt_w_abs;
     for &i in &neg_indices {
-        z_tilde[i] = -z_tilde[i];
+        z_tilde[i] = -z_tilde[i]; // Flip sign for negative weights
     }
     
-    let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1));
+    // Stable RHS calculation using QR decomposition results
+    // RHS = R_bar' * Q_bar' * z_tilde
+    let q_t_z = q_bar.t().dot(&z_tilde.slice(s![..q_bar.nrows()]));
+    let rhs = r_bar.slice(s![..r_rows, ..]).t().dot(&q_t_z.slice(s![..r_rows]));
     
-    // Step 2: First QR decomposition of weighted model matrix: √|W|X = Q₁R₁
-    let (q1, r1) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    // Step 6: Solve the final system
+    let beta = final_hessian.solve(&rhs)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
     
-    // Step 3: Form augmented system [R₁; E] where E'E = S_λ
-    let e_matrix = penalty_square_root(s_lambda)?;
-    let r1_rows = r1.nrows().min(p);
-    let mut augmented = Array2::zeros((r1_rows + p, p));
-    augmented.slice_mut(s![..r1_rows, ..]).assign(&r1.slice(s![..r1_rows, ..]));
-    augmented.slice_mut(s![r1_rows.., ..]).assign(&e_matrix);
+    // Step 7: Calculate effective degrees of freedom
+    // EDF = tr(H⁻¹X'WX) where H = final_hessian
+    let mut xtwx_base = r_bar.slice(s![..r_rows, ..]).t().dot(&r_bar.slice(s![..r_rows, ..]));
     
-    // Step 4: Second QR decomposition of augmented system: [R₁; E] = Q₂R₂
-    let (_, r2) = augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    
-    // Step 5: Form base penalized Hessian H = R₂'R₂
-    let mut penalized_hessian = r2.t().dot(&r2);
-    
-    // Step 6: Apply SVD correction for negative weights if any exist
+    // Apply same correction to X'WX for EDF calculation if negative weights exist
     if !neg_indices.is_empty() {
-        // Extract rows of Q₁ corresponding to negative weights
-        let q1_neg = q1.select(Axis(0), &neg_indices);
-        
-        // Perform SVD on these rows: Q₁⁻ = UΣV'
-        if let Ok((u_opt, sigma, vt_opt)) = q1_neg.svd(true, true) {
-            if let (Some(_u), Some(vt)) = (u_opt, vt_opt) {
-                // Form correction matrix: I - 2VΣ²V'
-                let mut sigma_sq = Array2::zeros((sigma.len(), sigma.len()));
-                for (i, &s) in sigma.iter().enumerate() {
-                    sigma_sq[[i, i]] = s * s;
-                }
-                
-                let v = vt.t();
-                let correction = Array2::eye(p) - 2.0 * v.dot(&sigma_sq.dot(&v.t()));
-                
-                // Apply correction: H_corrected = R₂'(I - 2VΣ²V')R₂
-                penalized_hessian = r2.t().dot(&correction.dot(&r2));
+        let q1_neg = q_bar.select(Axis(0), &neg_indices);
+        if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
+            let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
+            for (i, &s) in sigma.iter().enumerate() {
+                d_squared[[i, i]] = s * s;
             }
+            let v = vt.t();
+            let correction = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
+            xtwx_base = xtwx_base.dot(&correction);
         }
     }
     
-    // Step 7: Solve for coefficients: Hβ = X'Wz
-    let rhs = x.t().dot(&(&weights * &y));
-    let beta = penalized_hessian.solve(&rhs)
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
-    
-    // Step 8: Calculate effective degrees of freedom
-    // EDF = tr(H⁻¹X'WX) where H = X'WX + S_λ
-    let mut edf = 0.0;
-    let weighted_x = &weights.view().insert_axis(Axis(1)) * &x;
-    let xtwx = x.t().dot(&weighted_x);
-    
-    // Calculate trace by solving H⁻¹ * xtwx column by column
+    let mut edf: f64 = 0.0;
     for j in 0..p {
-        if let Ok(h_inv_col) = penalized_hessian.solve(&xtwx.column(j).to_owned()) {
+        if let Ok(h_inv_col) = final_hessian.solve(&xtwx_base.column(j).to_owned()) {
             edf += h_inv_col[j];
         }
     }
     edf = edf.max(1.0);
     
-    // Step 9: Calculate scale parameter
+    // Step 8: Calculate scale parameter
     let fitted = x.dot(&beta);
     let residuals = &y - &fitted;
     let rss = residuals.mapv(|v| v * v).sum();
@@ -330,7 +349,7 @@ pub fn stable_penalized_least_squares(
     
     Ok(StablePLSResult {
         beta,
-        penalized_hessian,
+        penalized_hessian: final_hessian,
         edf,
         scale,
     })

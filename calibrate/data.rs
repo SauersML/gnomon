@@ -1,7 +1,7 @@
 //! # Data Loading and Validation Module
 //!
 //! This module serves as the exclusive entry point for user-provided data.
-//! Its primary responsibility is to read tabular data files (CSV/TSV),
+//! Its primary responsibility is to read tabular data files (TSV),
 //! validate them against a strict, predefined schema, and transform them
 //! into the clean `ndarray` structures required by the application's
 //! statistical core.
@@ -55,7 +55,7 @@ pub enum DataError {
     PolarsError(#[from] PolarsError),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("CSV parsing error: {0}")]
+    #[error("TSV parsing error: {0}")]
     CsvError(#[from] csv::Error),
     #[error(
         "The required column '{0}' was not found in the input file. Please check spelling and case."
