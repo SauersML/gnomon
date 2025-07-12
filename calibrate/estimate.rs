@@ -390,9 +390,9 @@ pub mod internal {
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
-                    // From Wood (2017), Chapter 6.10, Eq. 6.27:
-                    // l_R(λ) = -½ log|X'X + S_λ|_* - (n - edf)/2 * log(||y - Xβ̂||²) + C
-                    // where edf is the effective degrees of freedom
+                    // From Wood (2017), Chapter 6, Eq. 6.24:
+                    // V_r(λ) = D_p/(2φ) + (r/2φ) + ½log|X'X/φ + S_λ/φ| - ½log|S_λ/φ|_+
+                    // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
 
                     // Check condition number of penalized Hessian for numerical stability
                     const MAX_CONDITION_NUMBER: f64 = 1e10;
@@ -416,124 +416,84 @@ pub mod internal {
                         }
                     }
 
-                    // The log-determinant of the penalty matrix (XᵀX + S_λ)
-                    // Note: pirls_result.penalized_hessian contains exactly X'X + S_λ for Identity link
-                    let log_det_xtx_plus_s = match pirls_result
-                        .penalized_hessian
-                        .cholesky(UPLO::Lower)
-                    {
-                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                        Err(_) => {
-                            // Fallback to eigenvalue method if Cholesky fails
-                            log::warn!("Cholesky failed for X'X + S_λ, using eigenvalue method");
-
-                            // Compute eigenvalues and use only positive ones for log-determinant
-                            let eigenvals = pirls_result
-                                .penalized_hessian
-                                .eigvals()
-                                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-
-                            // Add a small ridge to ensure numerical stability
-                            let ridge = 1e-8;
-                            let stabilized_log_det: f64 = eigenvals
-                                .iter()
-                                .map(|&ev| (ev.re + ridge).max(ridge)) // Use only real part, ensure positive
-                                .map(|ev| ev.ln())
-                                .sum();
-
-                            stabilized_log_det
-                        }
-                    };
-
-                    // Calculate the effective degrees of freedom (EDF)
-                    // For Gaussian models, EDF = tr((X'X + Sλ)⁻¹X'X)
-                    // We use the identity EDF = p - tr((X'X + Sλ)⁻¹Sλ), where H_p = X'X + Sλ
-                    // and p is the total number of coefficients. This avoids an expensive direct
-                    // computation of tr(H_p⁻¹X'X). See Wood (2017), Section 6.7 for details.
-                    // where p is the total number of parameters
-
-                    let p = pirls_result.beta.len() as f64; // Total number of parameters
-
-                    // Calculate tr((X'X + Sλ)⁻¹Sλ) using column-wise approach
+                    let n = self.y.len() as f64;
+                    let p = pirls_result.beta.len() as f64;
+                    
+                    // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
+                    let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let penalty = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+                    let dp = rss + penalty; // Correct penalized deviance
+
+                    // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
                     let mut trace_h_inv_s_lambda = 0.0;
-
                     for j in 0..s_lambda.ncols() {
-                        // Extract column j of s_lambda
                         let s_col = s_lambda.column(j);
-
-                        // Skip if column is all zeros
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-
-                        // Solve (X'X + Sλ) * v = Sλ[:,j]
-                        match pirls_result.penalized_hessian.solve(&s_col.to_owned()) {
+                        
+                        // Ensure matrix is positive definite before solving
+                        let mut hessian_work = pirls_result.penalized_hessian.clone();
+                        ensure_positive_definite(&mut hessian_work);
+                        
+                        match hessian_work.solve(&s_col.to_owned()) {
                             Ok(h_inv_s_col) => {
-                                // Add diagonal element to trace
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
                             }
                             Err(e) => {
-                                log::warn!(
-                                    "Linear system solve failed for EDF calculation: {:?}",
-                                    e
-                                );
-                                // Fall back to simpler approximation if this fails
+                                log::warn!("Linear system solve failed for EDF calculation: {:?}", e);
                                 trace_h_inv_s_lambda = 0.0;
                                 break;
                             }
                         }
                     }
+                    let edf = (p - trace_h_inv_s_lambda).max(1.0);
 
-                    // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
-                    let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
-
-                    // For REML, use unpenalized RSS in likelihood term (penalty handled via determinants)
-                    // Penalty should NOT be mixed into the likelihood part
-                    let rss = pirls_result.deviance;
-
-                    // n is the number of samples
-                    let n = self.y.len() as f64;
-
-                    // Calculate the pseudo-determinant of S_λ to account for unpenalized subspaces
-                    let log_det_s_lambda_pseudo = calculate_log_det_pseudo(&s_lambda)
-                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-
-                    // Calculate variance estimate using unpenalized RSS: σ² = RSS / (n - edf)
-                    // This matches gradient computation and textbook p.298
-                    let sigma_sq = rss / (n - edf).max(1e-8);
+                    // Correct φ using penalized deviance: φ = D_p / (n - edf)
+                    let phi = dp / (n - edf).max(1e-8);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
 
-                    // Calculate saturated likelihood: ls(φ) = -n/2 * log(2πφ)
-                    // For Gaussian models, saturated deviance = 0 (μᵢ = yᵢ exactly), so no RSS term
-                    let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
-
-                    // Calculate REML score with penalized deviance and saturated likelihood
-                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ + Mp/2*log(2πσ²)
-                    // Note: Mp is null space dimension (number of unpenalized coefficients)
-
-                    // Compute null space dimension: p - rank(S_total)
-                    let s_total: Array2<f64> = self
-                        .s_list
-                        .iter()
-                        .zip(lambdas.iter())
-                        .map(|(s, &lambda)| s * lambda)
-                        .fold(
-                            Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs)),
-                            |acc, s| acc + s,
-                        );
-
-                    let rank = match s_total.svd(false, false) {
-                        Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
-                        Err(_) => self.layout.total_coeffs, // fallback to full rank
+                    // log |H| = log |X'X + S_λ|
+                    let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
+                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
+                        Err(_) => {
+                            log::warn!("Cholesky failed for penalized Hessian, using eigenvalue method");
+                            let eigenvals = pirls_result
+                                .penalized_hessian
+                                .eigvals()
+                                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                            
+                            let ridge = 1e-8;
+                            eigenvals.iter()
+                                .map(|&ev| (ev.re + ridge).max(ridge))
+                                .map(|ev| ev.ln())
+                                .sum()
+                        }
                     };
-                    let mp = (self.layout.total_coeffs - rank) as f64;
-                    let reml = -(rss / (2.0 * sigma_sq)) - ls_phi - 0.5 * log_det_xtx_plus_s
-                        + 0.5 * log_det_s_lambda_pseudo
-                        + (mp / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
+
+                    // log |S_λ|_+ (pseudo-determinant)
+                    let log_det_s_plus = stable_log_det_recursive(&s_lambda)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+
+                    // Null space dimension Mp = p - rank(S)
+                    let rank_s = match s_lambda.svd(false, false) {
+                        Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
+                        Err(_) => self.layout.total_coeffs, // fallback
+                    };
+                    let mp = (p as usize - rank_s) as f64;
+
+                    // Correct saturated log-likelihood including data-dependent term
+                    let y_sq_norm = self.y.dot(&self.y);
+                    let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * phi).ln() 
+                        - y_sq_norm / (2.0 * phi);
+
+                    // Full REML score: D_p/(2φ) - l_s(φ) + ½(log|H| - log|S_λ|_+) + (M_p/2)log(2πφ)
+                    let reml = dp / (2.0 * phi) - ls_phi + 0.5 * (log_det_h - log_det_s_plus)
+                        + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
@@ -797,20 +757,35 @@ pub mod internal {
                         let s_k = &self.s_list[k];
 
                         // Embed S_k into a full-sized matrix for matrix-vector products
-                        // Note: Multiple blocks can share the same penalty_idx for interaction terms
+                        // Each penalty_idx is unique (verified in construction.rs), so exactly one block matches
                         let mut s_k_full = Array2::zeros((
                             pirls_result.penalized_hessian.nrows(),
                             pirls_result.penalized_hessian.ncols(),
                         ));
+                        let mut found_block = false;
                         for block in &self.layout.penalty_map {
                             if block.penalty_idx == k {
                                 let col_range = block.col_range.clone();
-                                // Accumulate penalty contributions instead of overwriting
-                                s_k_full
-                                    .slice_mut(s![col_range.clone(), col_range])
-                                    .scaled_add(1.0, s_k);
-                                // Don't break - continue to find all blocks with this penalty_idx
+                                let block_size = col_range.len();
+                                
+                                // Defensive shape checking
+                                if s_k.nrows() != block_size || s_k.ncols() != block_size {
+                                    return Err(EstimationError::LayoutError(format!(
+                                        "Shape mismatch: S_k[{}] has shape {}x{} but block expects {}x{}",
+                                        k, s_k.nrows(), s_k.ncols(), block_size, block_size
+                                    )));
+                                }
+                                
+                                s_k_full.slice_mut(s![col_range.clone(), col_range]).assign(s_k);
+                                found_block = true;
+                                break; // Since penalty_idx is unique, we can break here
                             }
+                        }
+                        
+                        if !found_block {
+                            return Err(EstimationError::LayoutError(format!(
+                                "No block found for penalty_idx {}", k
+                            )));
                         }
 
                         // --- Term 1: (β'S_kβ / σ²) ---
@@ -970,11 +945,13 @@ pub mod internal {
                             + cross_term_coeff * d_phi_d_rho_k
                             + second_order_cross * d_phi_d_rho_k);
 
-                        // The complete REML gradient including scale dependency:
-                        // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ²) - 0.5*λ_k*tr(S_λ⁺S_k) + scale_dependency_term
-                        // Based on Wood 2017 p.298: should be DIFFERENCE (trace - beta), not sum
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled)
-                            - 0.5 * s_inv_trace_term
+                        // The complete REML gradient for minimization of -REML:
+                        // Based on mgcv gam.fit3.r: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
+                        // This shows beta_term and trace_term are ADDED in the gradient of REML (to maximize)
+                        // d(REML)/dρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k)) - 0.5*λ_k*tr(S_λ⁺S_k)
+                        // Since we minimize -REML: d(-REML)/dρ_k = -d(REML)/dρ_k
+                        gradient[k] = -0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled)
+                            + 0.5 * s_inv_trace_term
                             + scale_dependency_term;
                     }
                 }
@@ -3399,15 +3376,16 @@ pub mod internal {
             println!("Score gradient (analytical): {:.6}", score_gradient);
             println!("Cost gradient (numerical): {:.6}", cost_gradient_numerical);
 
-            // Both gradients are cost gradients and should have same sign
+            // score_gradient is gradient of SCORE (to maximize), cost_gradient is gradient of COST (to minimize)
+            // They should have OPPOSITE signs since cost = -score
             if score_gradient.abs() > 1e-6 && cost_gradient_numerical.abs() > 1e-6 {
                 assert!(
-                    score_gradient * cost_gradient_numerical > 0.0,
-                    "Both are cost gradients and should have same sign: analytical={:.6}, numerical={:.6}",
+                    score_gradient * cost_gradient_numerical < 0.0,
+                    "Score gradient and cost gradient should have opposite signs: score_grad={:.6}, cost_grad={:.6}",
                     score_gradient,
                     cost_gradient_numerical
                 );
-                println!("✓ Gradients have same sign as expected");
+                println!("✓ Score and cost gradients have opposite signs as expected");
             } else {
                 println!("⚠ One or both gradients are near zero, skipping sign test");
             }

@@ -250,10 +250,9 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Interaction effects - in order of PGS basis function index, then PC name
     // This matches exactly with the flattening logic in model.rs
-    // The correct formula for unconstrained non-intercept PGS bases is:
-    // (num_knots + degree + 1) - 1 = num_knots + degree
-    // We subtract 1 to exclude the intercept basis function (index 0)
-    let total_pgs_bases = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+    // Use the *actual* number of basis functions from the generated (unconstrained) matrix, excluding the intercept.
+    // This ensures consistency with the penalty matrix creation above (line 203).
+    let total_pgs_bases = pgs_basis_unc.ncols() - 1;
 
     for m in 1..=total_pgs_bases {
         for pc_name in &config.pc_names {
