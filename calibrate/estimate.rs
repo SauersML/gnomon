@@ -2342,6 +2342,7 @@ pub mod internal {
         fn test_gradient_convergence_behavior() {
             use rand::SeedableRng;
             use rand::seq::SliceRandom;
+            use rand::Rng;
 
             // GOAL: Understand if gradient -> 0 expectation at finite λ is mathematically reasonable
             // Test the mathematical behavior: does gradient approach 0 as λ increases?
@@ -2361,14 +2362,27 @@ pub mod internal {
 
             let p = Array::linspace(-2.0, 2.0, n_samples);
 
-            // Generate y that depends only on PC1, not PC2
+            // Generate y that depends only on PC1, not PC2 with complex non-separable relationship
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
                     let pgs_val = p[i];
                     let pc1_val = pcs[[i, 0]];
-                    let logit = 0.5 + 0.8 * pgs_val + 0.6 * pc1_val; // NO PC2 term
-                    let prob = 1.0 / (1.0 + f64::exp(-logit));
-                    if prob > 0.5 { 1.0 } else { 0.0 }
+                    
+                    // Complex non-linear relationship to prevent separation
+                    let signal = 0.3 + 0.4 * pgs_val.tanh() + 0.5 * (pc1_val * std::f64::consts::PI).sin() 
+                                + 0.2 * (pgs_val * pc1_val).tanh(); // NO PC2 term
+                    
+                    // Add significant noise to prevent perfect separation
+                    let noise = rng.gen_range(-0.8..0.8);
+                    let logit = signal + noise;
+                    
+                    // Clamp logit to prevent extreme probabilities
+                    let clamped_logit = logit.clamp(-5.0, 5.0);
+                    let prob = 1.0 / (1.0 + (-clamped_logit).exp());
+                    
+                    // Stochastic outcome based on probability (not deterministic threshold)
+                    if rng.gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
                 .collect();
 
@@ -2550,17 +2564,27 @@ pub mod internal {
             // Create PGS values
             let p = Array::linspace(-2.0, 2.0, n_samples);
 
-            // Generate binary outcomes based on a model that only depends on PC1 (not PC2):
-            // logit(p(y=1)) = 0.5 + 0.8*PGS + 0.6*PC1 + 0.0*PC2
+            // Generate binary outcomes based on a complex model that only depends on PC1 (not PC2):
+            // Prevent perfect separation with noise and complex relationships
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
                     let pgs_val = p[i];
                     let pc1_val = pcs[[i, 0]];
                     // PC2 is not used in the model
-                    let logit = 0.5 + 0.8 * pgs_val + 0.6 * pc1_val; // No PC2 term
-                    let prob = 1.0 / (1.0 + f64::exp(-logit));
-                    // Deterministic assignment for reproducibility
-                    if prob > 0.5 { 1.0 } else { 0.0 }
+                    
+                    // Complex non-linear signal to make relationship more realistic
+                    let signal = 0.2 + 0.6 * pgs_val.tanh() + 0.7 * (pc1_val * 1.5).sin(); // No PC2 term
+                    
+                    // Add noise to prevent perfect separation
+                    let noise = rng.gen_range(-0.9..0.9);
+                    let logit = signal + noise;
+                    
+                    // Clamp to prevent extreme values
+                    let clamped_logit = logit.clamp(-6.0, 6.0);
+                    let prob = 1.0 / (1.0 + (-clamped_logit).exp());
+                    
+                    // Stochastic outcome for more realistic data
+                    if rng.gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
                 .collect();
 
