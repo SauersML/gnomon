@@ -348,43 +348,31 @@ mod internal {
         b[0] = 1.0;
 
         // Iteratively compute values for higher degrees using Cox-de Boor recursion
+        // The Cox-de-Boor recursion formula is:
+        // B_{i,d}(x) = (x - t_i)/(t_{i+d} - t_i) * B_{i,d-1}(x) + (t_{i+d+1} - x)/(t_{i+d+1} - t_{i+1}) * B_{i+1,d-1}(x)
         for d in 1..=degree {
             let b_old = b.clone();
             b.fill(0.0);
 
             for j in 0..=d {
-                // Calculate i based on the current recursion level `d`, not the final degree
-                // This is the correct implementation of the Cox-de Boor formula
-                // Ensure we don't underflow with unsigned subtraction
-                let i_isize = mu as isize + j as isize - d as isize;
-
-                // First term: contribution from B_{i,d-1}(x)
-                if j > 0
-                    && j - 1 < b_old.len()
-                    && (b_old[j - 1] as f64).abs() > 1e-12
-                    && i_isize >= 0
-                {
-                    let i = i_isize as usize;
-                    // Check bounds first to prevent subtraction with overflow
-                    if i + d < knots.len() {
-                        let den = knots[i + d] - knots[i];
-                        if den > 1e-12 {
-                            let alpha = (x_clamped - knots[i]) / den;
-                            b[j] += alpha * b_old[j - 1];
-                        }
+                // Calculate the global basis function index i for this local index j
+                let i = mu - degree + j;
+                
+                // First term: (x - t_i)/(t_{i+d} - t_i) * B_{i,d-1}(x)
+                if j > 0 && j - 1 < b_old.len() && i + d < knots.len() {
+                    let den = knots[i + d] - knots[i];
+                    if den > 1e-12 {
+                        let alpha = (x_clamped - knots[i]) / den;
+                        b[j] += alpha * b_old[j - 1];
                     }
                 }
-
-                // Second term: contribution from B_{i+1,d-1}(x)
-                if j < b_old.len() && (b_old[j] as f64).abs() > 1e-12 && i_isize + 1 >= 0 {
-                    let i_plus_1 = (i_isize + 1) as usize;
-                    // Check bounds first to prevent subtraction with overflow
-                    if i_plus_1 + d < knots.len() {
-                        let den = knots[i_plus_1 + d] - knots[i_plus_1];
-                        if den > 1e-12 {
-                            let beta = (knots[i_plus_1 + d] - x_clamped) / den;
-                            b[j] += beta * b_old[j];
-                        }
+                
+                // Second term: (t_{i+d+1} - x)/(t_{i+d+1} - t_{i+1}) * B_{i+1,d-1}(x)
+                if j < b_old.len() && i + 1 < knots.len() && i + d + 1 < knots.len() {
+                    let den = knots[i + d + 1] - knots[i + 1];
+                    if den > 1e-12 {
+                        let beta = (knots[i + d + 1] - x_clamped) / den;
+                        b[j] += beta * b_old[j];
                     }
                 }
             }
