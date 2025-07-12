@@ -869,6 +869,70 @@ mod tests {
         }
     }
 
+    /// Validates the basis functions against Example 1 in Starkey's "Cox-deBoor" notes.
+    ///
+    /// This example is a linear spline (degree=1, order=2) with a uniform knot vector.
+    /// We test the values of the blending functions at specific points to ensure they
+    /// match the manually derived formulas in the literature.
+    ///
+    /// Reference: Denbigh Starkey, "Cox-deBoor Equations for B-Splines", pg. 8.
+    #[test]
+    fn test_starkey_notes_example_1() {
+        let degree = 1;
+        // The book uses knot vector (0, 1, 2, 3, 4, 5).
+        // Our setup requires boundary knots. For num_internal_knots = 4, range (0,5),
+        // we get internal knots {1,2,3,4}, full vector {0,0, 1,2,3,4, 5,5}.
+        let knots = array![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 5.0];
+        let num_basis = knots.len() - degree - 1; // 8 - 1 - 1 = 6 basis functions
+
+        // The book analyzes B_1,2(u) (Starkey's order=2 notation), which is our B_1,1(u) (degree=1).
+        // It's non-zero on the interval [u_1, u_3], which is [0, 2] in our knot vector.
+        // The second blending function (B_1,1) should be a "tent" centered over knot u_2=1.0,
+        // running from u_1=0.0 to u_3=2.0.
+        // The third (B_2,1) should be a tent over u_3=2.0, from u_2=1.0 to u_4=3.0.
+
+        // Let's test u = 1.5. This is in the span [1, 2].
+        // The non-zero basis functions will be B_2,1 and B_3,1.
+        // B_2,1(1.5) should be (2.0 - 1.5) / (2.0 - 1.0) = 0.5
+        // B_3,1(1.5) should be (1.5 - 1.0) / (2.0 - 1.0) = 0.5
+        let basis_at_1_5 = internal::evaluate_splines_at_point(1.5, degree, knots.view());
+        println!("Basis at x=1.5: {:?}", basis_at_1_5);
+        assert_eq!(basis_at_1_5.len(), num_basis);
+        assert_abs_diff_eq!(basis_at_1_5.sum(), 1.0, epsilon = 1e-9);
+        
+        // Find the non-zero elements and their indices
+        for (i, &val) in basis_at_1_5.iter().enumerate() {
+            if val > 1e-12 {
+                println!("Basis[{}] = {}", i, val);
+            }
+        }
+        
+        // The non-zero basis functions should sum to 1.0 and have value 0.5 each
+        let non_zero_count = basis_at_1_5.iter().filter(|&&x| x > 1e-12).count();
+        assert_eq!(non_zero_count, 2, "Should have exactly 2 non-zero basis functions");
+        
+        // Find the actual indices with non-zero values
+        let non_zero_indices: Vec<usize> = basis_at_1_5.iter().enumerate()
+            .filter(|(_, &val)| val > 1e-12)
+            .map(|(i, _)| i)
+            .collect();
+        
+        // Check that both non-zero values are 0.5
+        for &idx in &non_zero_indices {
+            assert_abs_diff_eq!(basis_at_1_5[idx], 0.5, epsilon = 1e-9);
+        }
+
+        // Let's test u = 2.5. This is in the span [2, 3].
+        // The non-zero basis functions will be B_3,1 and B_4,1.
+        // B_3,1(2.5) should be (3.0 - 2.5) / (3.0 - 2.0) = 0.5
+        // B_4,1(2.5) should be (2.5 - 2.0) / (3.0 - 2.0) = 0.5
+        let basis_at_2_5 = internal::evaluate_splines_at_point(2.5, degree, knots.view());
+        assert_eq!(basis_at_2_5.len(), num_basis);
+        assert_abs_diff_eq!(basis_at_2_5.sum(), 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(basis_at_2_5[3], 0.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(basis_at_2_5[4], 0.5, epsilon = 1e-9);
+    }
+
     #[test]
     fn test_error_conditions() {
         match create_bspline_basis(array![].view(), None, (0.0, 10.0), 5, 0).unwrap_err() {

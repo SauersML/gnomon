@@ -4336,23 +4336,54 @@ pub mod internal {
             );
 
             // Verify that S matrices have correct dimensions
+            // All matrices in s_list should be full-sized p×p matrices with embedded blocks
             for (i, s) in s_list.iter().enumerate() {
                 assert_eq!(s.nrows(), s.ncols(), "Penalty matrix {} is not square", i);
+                
+                // All penalty matrices should be full-sized (p × p)
+                assert_eq!(
+                    s.nrows(),
+                    layout.total_coeffs,
+                    "Penalty matrix {} should be full-sized ({} × {}), got {} × {}",
+                    i,
+                    layout.total_coeffs,
+                    layout.total_coeffs,
+                    s.nrows(),
+                    s.ncols()
+                );
 
-                // Find the corresponding block in the layout to get the expected size
+                // Find the corresponding block to verify the non-zero structure
                 let block = layout.penalty_map.iter()
                     .find(|b| b.penalty_idx == i)
                     .expect(&format!("Could not find layout block for penalty index {}", i));
 
-                let expected_dim = block.col_range.len();
+                // Verify the non-zero block is in the correct position
+                let block_submatrix = s.slice(ndarray::s![block.col_range.clone(), block.col_range.clone()]);
+                let non_zero_count = block_submatrix.iter().filter(|&&x| x.abs() > 1e-12).count();
+                
+                assert!(
+                    non_zero_count > 0,
+                    "Penalty matrix {} should have non-zero entries in block for term '{}'",
+                    i,
+                    block.term_name
+                );
 
-                assert_eq!(
-                    s.nrows(),
-                    expected_dim,
-                    "Penalty for term '{}' has wrong dimensions. Expected {}, got {}",
-                    block.term_name,
-                    expected_dim,
-                    s.nrows()
+                // Verify areas outside the block are mostly zero
+                let mut outside_block_non_zeros = 0;
+                for (row, col) in ndarray::indices(s.dim()) {
+                    if !block.col_range.contains(&row) || !block.col_range.contains(&col) {
+                        if s[[row, col]].abs() > 1e-12 {
+                            outside_block_non_zeros += 1;
+                        }
+                    }
+                }
+                
+                assert!(
+                    outside_block_non_zeros == 0,
+                    "Penalty matrix {} should only have non-zero entries in its designated block, but found {} non-zero entries outside block for term '{}'",
+                    i,
+                    outside_block_non_zeros,
+                    block.term_name
                 );
             }
         }
@@ -4508,13 +4539,20 @@ pub mod internal {
                 // The model has one penalized term: the PGS main effect.
                 // Let's manually add a penalty for the PGS main effect for this test.
                 let pgs_main_coeffs_count = layout.pgs_main_cols.len();
-                let pgs_penalty = crate::calibrate::basis::create_difference_penalty_matrix(
+                let pgs_penalty_small = crate::calibrate::basis::create_difference_penalty_matrix(
                     pgs_main_coeffs_count,
                     config.penalty_order,
                 )
                 .unwrap();
 
-                let new_s_list = vec![pgs_penalty];
+                // Embed the small penalty matrix into a full-sized matrix
+                let p_total = layout.total_coeffs;
+                let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
+                pgs_penalty_full
+                    .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                    .assign(&pgs_penalty_small);
+
+                let new_s_list = vec![pgs_penalty_full];
 
                 let new_layout = ModelLayout {
                     num_penalties: new_s_list.len(),
@@ -4661,10 +4699,18 @@ pub mod internal {
                 let (x_matrix, _, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config).unwrap();
                 let pgs_main_coeffs = layout.pgs_main_cols.len();
-                let pgs_penalty =
+                let pgs_penalty_small =
                     crate::calibrate::basis::create_difference_penalty_matrix(pgs_main_coeffs, 2)
                         .unwrap();
-                let s_list_test = vec![pgs_penalty];
+                
+                // Embed the small penalty matrix into a full-sized matrix
+                let p_total = layout.total_coeffs;
+                let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
+                pgs_penalty_full
+                    .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                    .assign(&pgs_penalty_small);
+                
+                let s_list_test = vec![pgs_penalty_full];
                 let layout_test = ModelLayout {
                     num_penalties: 1,
                     penalty_map: vec![PenalizedBlock {
@@ -4755,12 +4801,20 @@ pub mod internal {
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Create single penalty manually
-            let pgs_penalty = crate::calibrate::basis::create_difference_penalty_matrix(
+            let pgs_penalty_small = crate::calibrate::basis::create_difference_penalty_matrix(
                 layout.pgs_main_cols.len(),
                 2,
             )
             .unwrap();
-            let s_list_test = vec![pgs_penalty];
+            
+            // Embed the small penalty matrix into a full-sized matrix
+            let p_total = layout.total_coeffs;
+            let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
+            pgs_penalty_full
+                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .assign(&pgs_penalty_small);
+            
+            let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
                 penalty_map: vec![PenalizedBlock {
@@ -4908,12 +4962,20 @@ pub mod internal {
             let (x_matrix, _, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
-            let pgs_penalty = crate::calibrate::basis::create_difference_penalty_matrix(
+            let pgs_penalty_small = crate::calibrate::basis::create_difference_penalty_matrix(
                 layout.pgs_main_cols.len(),
                 2,
             )
             .unwrap();
-            let s_list_test = vec![pgs_penalty];
+            
+            // Embed the small penalty matrix into a full-sized matrix
+            let p_total = layout.total_coeffs;
+            let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
+            pgs_penalty_full
+                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .assign(&pgs_penalty_small);
+            
+            let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
                 penalty_map: vec![PenalizedBlock {
@@ -4978,12 +5040,20 @@ pub mod internal {
             let (x_matrix, _, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
-            let pgs_penalty = crate::calibrate::basis::create_difference_penalty_matrix(
+            let pgs_penalty_small = crate::calibrate::basis::create_difference_penalty_matrix(
                 layout.pgs_main_cols.len(),
                 2,
             )
             .unwrap();
-            let s_list_test = vec![pgs_penalty];
+            
+            // Embed the small penalty matrix into a full-sized matrix
+            let p_total = layout.total_coeffs;
+            let mut pgs_penalty_full = Array2::zeros((p_total, p_total));
+            pgs_penalty_full
+                .slice_mut(ndarray::s![layout.pgs_main_cols.clone(), layout.pgs_main_cols.clone()])
+                .assign(&pgs_penalty_small);
+            
+            let s_list_test = vec![pgs_penalty_full];
             let layout_test = ModelLayout {
                 num_penalties: 1,
                 penalty_map: vec![PenalizedBlock {
