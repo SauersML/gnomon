@@ -299,37 +299,33 @@ mod internal {
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses a numerically stable implementation of the Cox-de Boor algorithm.
+    /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
+    /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
     ) -> Array1<f64> {
         let num_knots = knots.len();
-        // The number of B-spline basis functions is num_knots - degree - 1.
         let num_basis = num_knots - degree - 1;
 
-        // Clamp x to the valid domain defined by the knots to handle boundary conditions.
-        // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`.
+        // Clamp x to the valid domain defined by the knots.
+        // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`
+        // where n is the number of basis functions.
         let x_clamped = x.clamp(knots[degree], knots[num_basis]);
 
-        // In the Cox-de Boor algorithm, we need to determine the knot span [tᵢ, tᵢ₊₁)
-        // containing x_clamped. This span is half-open, EXCEPT at the upper boundary
-        // where we use a closed interval [t_{m-p-1}, t_{m-p}].
-
-        // Find the knot span `mu` such that knots[degree + mu] <= x < knots[degree + mu + 1].
-        // This is the standard, robust way to find the span. It correctly handles
-        // the half-open interval convention and boundary conditions.
+        // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
+        // This search is robust and correctly handles the half-open interval convention
+        // and the special case for the upper boundary.
         let mu = {
+            // Special case for the upper boundary, where the interval is closed.
             if x_clamped >= knots[num_basis] {
                 // If x is at or beyond the last knot of the spline's support,
                 // it belongs to the last valid span. num_basis = (num_knots - degree - 1)
-                // The last valid span is [ t_{num_basis-1}, t_{num_basis} ].
                 num_basis - 1
             } else {
-                // Search for the span in the relevant part of the knot vector
-                // The active knots for a degree `d` spline start at index `d`.
-                // We are looking for an index `i` such that knots[i] <= x < knots[i+1].
+                // Search for the span in the relevant part of the knot vector.
+                // Can be optimized with binary search, but linear is fine and robust.
                 let mut span = degree;
                 while span < num_basis && x_clamped >= knots[span + 1] {
                     span += 1;
@@ -338,48 +334,36 @@ mod internal {
             }
         };
 
-        // The result should always be a valid knot span index
-        debug_assert!(mu < num_basis, "Knot span index out of bounds");
-
-        // `b` will store the non-zero basis function values for the current degree.
+        // `n` will store the non-zero basis function values.
         // At any point x, at most `degree + 1` basis functions are non-zero.
-        let mut b = Array1::zeros(degree + 1);
-        // Base case (d=0): For degree 0, only one basis function is non-zero (=1) in the interval.
-        b[0] = 1.0;
+        let mut n = Array1::zeros(degree + 1);
+        let mut left = Array1::zeros(degree + 1);
+        let mut right = Array1::zeros(degree + 1);
 
-        // Iteratively compute values for higher degrees using Cox-de Boor recursion
-        // The Cox-de-Boor recursion formula is:
-        // B_{i,d}(x) = (x - t_i)/(t_{i+d} - t_i) * B_{i,d-1}(x) + (t_{i+d+1} - x)/(t_{i+d+1} - t_{i+1}) * B_{i+1,d-1}(x)
+        // Base case (d=0)
+        n[0] = 1.0;
+
+        // Iteratively compute values for higher degrees (d=1 to degree)
         for d in 1..=degree {
-            let b_old = b.clone();
-            b.fill(0.0);
-
-            for j in 0..=d {
-                // Calculate the global basis function index i for this local index j
-                let i = mu - degree + j;
+            left[d] = x_clamped - knots[mu + 1 - d];
+            right[d] = knots[mu + d] - x_clamped;
+            
+            let mut saved = 0.0;
+            
+            for r in 0..d {
+                // This is an in-place update. n[r] on input is a value for degree d-1.
+                let den = right[r + 1] + left[d - r];
+                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
                 
-                // First term: (x - t_i)/(t_{i+d} - t_i) * B_{i,d-1}(x)
-                if j > 0 && j - 1 < b_old.len() && i + d < knots.len() {
-                    let den = knots[i + d] - knots[i];
-                    if den > 1e-12 {
-                        let alpha = (x_clamped - knots[i]) / den;
-                        b[j] += alpha * b_old[j - 1];
-                    }
-                }
-                
-                // Second term: (t_{i+d+1} - x)/(t_{i+d+1} - t_{i+1}) * B_{i+1,d-1}(x)
-                if j < b_old.len() && i + 1 < knots.len() && i + d + 1 < knots.len() {
-                    let den = knots[i + d + 1] - knots[i + 1];
-                    if den > 1e-12 {
-                        let beta = (knots[i + d + 1] - x_clamped) / den;
-                        b[j] += beta * b_old[j];
-                    }
-                }
+                // On output, n[r] will be a value for degree d.
+                n[r] = saved + right[r + 1] * temp;
+                saved = left[d - r] * temp;
             }
+            n[d] = saved;
         }
 
-        // `b` now contains the values of the `degree + 1` potentially non-zero basis functions.
-        // These correspond to B_{mu-degree, degree}, ..., B_{mu, degree}.
+        // `n` now contains the values of the `degree + 1` non-zero basis functions.
+        // n[j] corresponds to B_{mu-degree+j, degree}.
         // Place them in the correct locations in the final full basis vector.
         let mut basis_values = Array1::zeros(num_basis);
         let start_index = mu.saturating_sub(degree);
@@ -387,7 +371,7 @@ mod internal {
         for i in 0..=degree {
             let global_idx = start_index + i;
             if global_idx < num_basis {
-                basis_values[global_idx] = b[i];
+                basis_values[global_idx] = n[i];
             }
         }
 
