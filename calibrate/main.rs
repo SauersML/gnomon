@@ -13,6 +13,7 @@
 
 use basis::BasisConfig;
 use data::{load_prediction_data, load_training_data};
+use std::collections::HashMap;
 use estimate::train_model;
 use model::{LinkFunction, ModelConfig, TrainedModel};
 
@@ -229,6 +230,9 @@ fn train_command(
         pgs_range,
         pc_ranges,
         pc_names,
+        constraints: HashMap::new(), // Will be filled during training
+        knot_vectors: HashMap::new(), // Will be filled during training  
+        num_pgs_interaction_bases: 0, // Will be set during training
     };
 
     // --- Train the model using REML ---
@@ -616,6 +620,7 @@ mod tests {
             pc_names,
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
+            num_pgs_interaction_bases: 0, // Will be set during training
         };
         
         // 5. Train models

@@ -138,6 +138,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         pc_names,
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
+        num_pgs_interaction_bases: 0, // Will be set during training
     };
 
     // Train the final model

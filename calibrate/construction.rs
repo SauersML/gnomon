@@ -15,6 +15,9 @@ pub struct ModelLayout {
     pub penalty_map: Vec<PenalizedBlock>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
+    /// Number of PGS basis functions (excluding intercept) for interaction terms
+    /// This is the empirical value from the actual generated basis matrix
+    pub num_pgs_interaction_bases: usize,
 }
 
 /// Information about a single penalized block of coefficients.
@@ -31,6 +34,7 @@ impl ModelLayout {
         config: &ModelConfig,
         pc_constrained_basis_ncols: &[usize],
         pgs_main_basis_ncols: usize,
+        num_pgs_interaction_bases: usize,
     ) -> Result<Self, EstimationError> {
         let mut penalty_map = Vec::new();
         let mut current_col = 0;
@@ -63,12 +67,9 @@ impl ModelLayout {
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
         // Interaction effects
-        // Use the correct number of unconstrained PGS basis functions (excluding intercept).
-        // The total number of unconstrained B-spline basis functions is (num_knots + degree + 1).
-        // We exclude the first basis function (intercept) so we have (num_knots + degree + 1 - 1) = num_knots + degree
-        // This ensures that interactions use columns from the unconstrained basis.
-        let num_pgs_basis_funcs =
-            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree;
+        // Use the EMPIRICAL number of PGS basis functions from the actual generated matrix.
+        // This ensures perfect consistency with the design matrix construction in build_design_and_penalty_matrices.
+        let num_pgs_basis_funcs = num_pgs_interaction_bases;
 
         // NOTE: This is NOT a mistake regarding penalty sharing. The code correctly assigns
         // a unique penalty_idx to each interaction term. While some GAM implementations share
@@ -102,6 +103,7 @@ impl ModelLayout {
             penalty_map,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
+            num_pgs_interaction_bases,
         })
     }
 }
@@ -214,7 +216,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Define the model layout based on final basis dimensions
     let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
-    let layout = ModelLayout::new(config, &pc_basis_ncols, pgs_main_basis.ncols())?;
+    let layout = ModelLayout::new(config, &pc_basis_ncols, pgs_main_basis.ncols(), num_pgs_interaction_weights)?;
 
     if s_list.len() != layout.num_penalties {
         return Err(EstimationError::LayoutError(format!(

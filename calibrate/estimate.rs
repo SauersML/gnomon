@@ -263,6 +263,7 @@ pub fn train_model(
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
+    config_with_constraints.num_pgs_interaction_bases = layout.num_pgs_interaction_bases;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -385,7 +386,8 @@ pub mod internal {
             }
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
-            let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+            // Use stable re-parameterization instead of naive summation
+            let (s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
 
             match self.config.link_function {
                 LinkFunction::Identity => {
@@ -660,7 +662,7 @@ pub mod internal {
                     let rss = pirls_result.deviance;
 
                     let num_params = beta.len() as f64;
-                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    let (s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
                     let mut trace_h_inv_s_lambda = 0.0;
 
                     for j in 0..s_lambda.ncols() {
@@ -711,9 +713,11 @@ pub mod internal {
                     }
                     let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
 
-                    // For gradient computation, use unpenalized RSS for variance estimate
-                    // This matches textbook p.298 where terms are divided by φ = RSS/(n-edf)
-                    let sigma_sq = rss / (n - edf).max(1e-8); // Use unpenalized RSS for gradient
+                    // For gradient computation, use penalized deviance for variance estimate  
+                    // This aligns with the corrected cost function using D_p
+                    let penalty = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+                    let dp = rss + penalty; // Penalized deviance
+                    let sigma_sq = dp / (n - edf).max(1e-8); // Use penalized deviance for consistency
 
                     if sigma_sq <= 0.0 {
                         return Err(EstimationError::RemlOptimizationFailed(
@@ -853,106 +857,63 @@ pub mod internal {
                                 pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
                         }
                         // Scale by λ_k for ∂log|S|/∂ρ_k = λ_k tr(S^+ S_k)
-                        let s_inv_trace_term = lambdas[k] * s_inv_trace_unscaled;
+                        let _s_inv_trace_term = lambdas[k] * s_inv_trace_unscaled;
 
-                        // --- Term 4: Scale dependency cross-term ---
-                        // When scale parameter φ̂ is estimated (not fixed), we need the chain-rule term:
-                        // - {Dp/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)} * ∂φ̂/∂ρ_k
-                        //
-                        // For ∂φ̂/∂ρ_k = [∂Dp/∂ρ_k * (n-edf) - Dp * ∂edf/∂ρ_k] / (n-edf)²
+                        // Scale dependency is now handled in the complete gradient implementation above
 
-                        // Calculate ∂RSS/∂ρ_k = -2 * (y - Xβ)ᵀ X * ∂β/∂ρ_k (implicit differentiation)
-                        // ∂β/∂ρ_k = -exp(ρ_k) * H⁻¹ * S_k * β (from Wood 2011 Appendix D)
-                        let exp_rho_k = lambdas[k];
+                        // Complete REML gradient based on mgcv gam.fit3.r reference implementation
+                        // Components: oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
+                        
+                        // Component 1: Derivative of penalized deviance D_p w.r.t. ρ_k
+                        // ∂D_p/∂ρ_k = λ_k * β̂ᵀS_kβ̂ + (derivative through implicit β̂ dependence)
+                        let d_penalty_d_rho = lambdas[k] * beta_term_scaled; // Direct penalty term
+                        
+                        // Implicit differentiation: ∂β̂/∂ρ_k = -λ_k * H⁻¹ * S_k * β̂
                         let s_k_beta = s_k_full.dot(&pirls_result.beta);
-
-                        // Calculate ∂β/∂ρ_k = -λ_k * H⁻¹ * S_k * β
-                        let h_inv_s_k_beta = match pirls_result.penalized_hessian.solve(&s_k_beta) {
-                            Ok(result) => result,
+                        let d_beta_d_rho_k = match pirls_result.penalized_hessian.solve(&s_k_beta) {
+                            Ok(result) => -lambdas[k] * result,
                             Err(_) => {
-                                // Try with regularization
+                                // Use regularized Hessian
                                 let mut hessian_reg = pirls_result.penalized_hessian.clone();
-                                let ridge = 1e-6;
-                                for i in 0..hessian_reg.nrows() {
-                                    hessian_reg[[i, i]] += ridge;
-                                }
-                                hessian_reg.solve(&s_k_beta).map_err(|_| {
-                                     EstimationError::RemlOptimizationFailed(
-                                         format!("Cannot compute ∂β/∂ρ_k for penalty {} during scale dependency calculation", k)
-                                     )
-                                 })?
+                                ensure_positive_definite(&mut hessian_reg);
+                                -lambdas[k] * hessian_reg.solve(&s_k_beta).map_err(|_| {
+                                    EstimationError::RemlOptimizationFailed(
+                                        format!("Cannot compute ∂β/∂ρ_k for penalty {}", k)
+                                    )
+                                })?
                             }
                         };
-                        let d_beta_d_rho_k = -exp_rho_k * &h_inv_s_k_beta;
-
-                        // Residuals: y - Xβ (assuming design matrix X is available through self.x)
+                        
+                        // Residuals for implicit RSS derivative: ∂RSS/∂ρ_k = -2 * r̂ᵀ * X * ∂β̂/∂ρ_k  
                         let residuals = &self.y - &self.x.dot(&pirls_result.beta);
-
-                        // ∂RSS/∂ρ_k = -2 * residualsᵀ * X * ∂β/∂ρ_k
-                        let d_rss_d_rho_k = -2.0 * residuals.dot(&self.x.dot(&d_beta_d_rho_k));
-
-                        // Note: penalty term derivatives not needed for REML likelihood (only RSS matters)
-
-                        // For REML, only RSS matters in likelihood term (not penalized deviance)
-                        let d_dp_d_rho_k = d_rss_d_rho_k;
-
-                        // ∂edf/∂ρ_k = -∂tr(H⁻¹S_λ)/∂ρ_k = -tr(H⁻¹S_k)*λ_k - tr(H⁻¹ ∂H/∂ρ_k H⁻¹ S_λ)
-                        // For simplicity, approximate: ∂edf/∂ρ_k ≈ -λ_k * tr(H⁻¹S_k)
-                        let d_edf_d_rho_k = -exp_rho_k * trace_term_unscaled;
-
-                        // ∂φ̂/∂ρ_k = [∂RSS/∂ρ_k * (n-edf) - RSS * ∂edf/∂ρ_k] / (n-edf)²
-                        let n_minus_edf = (n - edf).max(1e-8);
-                        let d_phi_d_rho_k = (d_dp_d_rho_k * n_minus_edf - rss * d_edf_d_rho_k)
-                            / (n_minus_edf * n_minus_edf);
-
-                        // Cross-term coefficient: {RSS/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)}
-                        // For Gaussian: l's(φ̂) = -n/(2φ̂) + RSS/(2φ̂²)
-
-                        // Compute null space dimension: p - rank(S_total)
-                        let s_total: Array2<f64> = self
-                            .s_list
-                            .iter()
-                            .zip(lambdas.iter())
-                            .map(|(s, &lambda)| s * lambda)
-                            .fold(
-                                Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs)),
-                                |acc, s| acc + s,
-                            );
-
-                        let rank = match s_total.svd(false, false) {
-                            Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
-                            Err(_) => self.layout.total_coeffs, // fallback to full rank
-                        };
-                        let mp = (self.layout.total_coeffs - rank) as f64;
-                        let ls_prime_phi =
-                            -n / (2.0 * sigma_sq) + rss / (2.0 * sigma_sq * sigma_sq);
-                        let cross_term_coeff = rss / (2.0 * sigma_sq * sigma_sq)
-                            + ls_prime_phi
-                            + mp / (2.0 * sigma_sq);
-
-                        // Add second-order cross terms per Wood 2011 full ∂²lr expression
-                        // l''s(φ̂) = n/(2φ̂²) - RSS/φ̂³ for Gaussian
-                        let ls_double_prime_phi = n / (2.0 * sigma_sq * sigma_sq)
-                            - rss / (sigma_sq * sigma_sq * sigma_sq);
-                        let second_order_cross = (rss / (sigma_sq * sigma_sq * sigma_sq)
-                            - ls_double_prime_phi
-                            + mp / (2.0 * sigma_sq * sigma_sq))
-                            * d_phi_d_rho_k
-                            * d_phi_d_rho_k;
-
-                        // Full scale dependency contribution to gradient including 2nd order terms
-                        let scale_dependency_term = -(d_dp_d_rho_k / (2.0 * sigma_sq * sigma_sq)
-                            + cross_term_coeff * d_phi_d_rho_k
-                            + second_order_cross * d_phi_d_rho_k);
-
-                        // The complete REML gradient for minimization of -REML:
-                        // Based on mgcv gam.fit3.r: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
-                        // This shows beta_term and trace_term are ADDED in the gradient of REML (to maximize)
-                        // d(REML)/dρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k)) - 0.5*λ_k*tr(S_λ⁺S_k)
-                        // Since we minimize -REML: d(-REML)/dρ_k = -d(REML)/dρ_k
-                        gradient[k] = -0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled)
-                            + 0.5 * s_inv_trace_term
-                            + scale_dependency_term;
+                        let d_rss_d_rho = -2.0 * residuals.dot(&self.x.dot(&d_beta_d_rho_k));
+                        
+                        // Total deviance derivative: D1 component from mgcv
+                        let d1_component = (d_rss_d_rho + d_penalty_d_rho) / (2.0 * sigma_sq);
+                        
+                        // Component 2: Trace term derivative trA1 from mgcv  
+                        // ∂tr(H⁻¹XᵀX)/∂ρ_k = λ_k * tr(H⁻¹S_k) (this is our trace_term_unscaled)
+                        let tra1_component = 0.5 * lambdas[k] * trace_term_unscaled;
+                        
+                        // Component 3: Penalty determinant derivative rp$det1 from mgcv
+                        // ∂log|S_λ|₊/∂ρ_k = λ_k * tr(S_λ⁺S_k)
+                        let det1_component = -0.5 * lambdas[k] * s_inv_trace_unscaled;
+                        
+                        // Component 4: Scale parameter derivative (missing from simplified version)
+                        // From mgcv: when scale is estimated, add derivatives w.r.t. log(scale)
+                        let d_edf_d_rho = -lambdas[k] * trace_term_unscaled; // ∂edf/∂ρ_k
+                        let d_phi_d_rho = (d_rss_d_rho * (n - edf) - rss * d_edf_d_rho) / (n - edf).powi(2);
+                        
+                        // Scale dependency from REML score: -D_p/(2φ²) - Mp/(2φ) terms  
+                        let mp = self.layout.total_coeffs as f64 - s_lambda.svd(false, false)
+                            .map(|(_, svals, _)| svals.iter().filter(|&&sv| sv > 1e-8).count())
+                            .unwrap_or(self.layout.total_coeffs) as f64;
+                        let scale_deriv_coeff = -dp / (2.0 * sigma_sq.powi(2)) - mp / (2.0 * sigma_sq);
+                        let scale_dependency = scale_deriv_coeff * d_phi_d_rho;
+                        
+                        // Final gradient: negative of REML gradient (for minimization)
+                        // Based on mgcv structure: -(D1/(2*scale) + trA1/2 - det1/2 + scale_terms)
+                        gradient[k] = -(d1_component + tra1_component + det1_component + scale_dependency);
                     }
                 }
                 _ => {
@@ -974,8 +935,8 @@ pub mod internal {
                     // While β̂ optimizes the penalized likelihood l_p = l(β) - ½βᵀS_λβ, it does NOT optimize V_R directly.
 
                     // ---- PERFORMANCE OPTIMIZATION ----
-                    // Construct S_λ and compute its eigendecomposition once, outside the k-loop
-                    let mut s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    // Construct S_λ using stable re-parameterization, outside the k-loop
+                    let (mut s_lambda, _reparameterization) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
 
                     // Add small ridge regularization to prevent singularity issues
                     let ridge = 1e-8;
@@ -1343,6 +1304,170 @@ pub mod internal {
         }
     }
 
+    /// Implements the stable re-parameterization algorithm from Wood (2011) Appendix B
+    /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
+    /// to avoid "dominant machine zero leakage" between penalty components
+    fn stable_construct_s_lambda(
+        lambdas: &Array1<f64>,
+        s_list: &[Array2<f64>],
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+        if s_list.is_empty() {
+            return Err(EstimationError::LayoutError("Empty penalty list".to_string()));
+        }
+
+        let q = s_list[0].nrows();
+        let m = lambdas.len();
+        
+        // Tolerance parameters from Wood (2011)
+        let eps: f64 = 2.220446e-16_f64.cbrt(); // Cube root of machine precision
+        let eps_prime: f64 = 2.220446e-16_f64.powf(0.8); // For rank determination
+
+        // Step 0: Initial null space transformation if needed
+        let (s_transformed, initial_q) = initial_null_space_transform(s_list)?;
+        
+        // Initialize recursion
+        let mut k = 0;
+        let mut q_current = initial_q;
+        let mut gamma: Vec<usize> = (0..m).collect(); // Active penalty indices
+        let mut s_hat = s_transformed.clone();
+        let mut cumulative_q = Array2::eye(q);
+
+        loop {
+            // Step 1: Calculate Frobenius norms
+            let mut omegas = Vec::new();
+            for &i in &gamma {
+                let norm_f = s_hat[i].mapv(|x| x * x).sum().sqrt();
+                omegas.push(lambdas[i] * norm_f);
+            }
+
+            if omegas.is_empty() {
+                break;
+            }
+
+            let max_omega = omegas.iter().fold(0.0_f64, |a: f64, &b| a.max(b));
+
+            // Step 2: Identify dominant and subdominant groups
+            let mut alpha = Vec::new(); // Dominant indices
+            let mut gamma_prime = Vec::new(); // Subdominant indices
+
+            for (idx, &i) in gamma.iter().enumerate() {
+                if omegas[idx] >= eps * max_omega {
+                    alpha.push(i);
+                } else {
+                    gamma_prime.push(i);
+                }
+            }
+
+            // Step 3: Check rank of dominant sum
+            let mut s_dominant_sum: Array2<f64> = Array2::zeros((q_current, q_current));
+            for &i in &alpha {
+                let norm_f = s_hat[i].mapv(|x| x * x).sum().sqrt();
+                if norm_f > 1e-15 {
+                    s_dominant_sum = s_dominant_sum + &s_hat[i] / norm_f;
+                }
+            }
+
+            let eigenvals = s_dominant_sum.eigh(UPLO::Lower)
+                .map_err(|e| EstimationError::EigendecompositionFailed(e))?.0;
+            
+            let max_eig = eigenvals.iter().fold(0.0_f64, |a: f64, &b| a.max(b));
+            let r = eigenvals.iter().filter(|&&e| e > eps_prime * max_eig).count();
+
+            // Step 4: Termination check
+            if r == q_current {
+                break;
+            }
+
+            // Step 5: Eigendecomposition of dominant weighted sum
+            let mut s_dominant_weighted = Array2::zeros((q_current, q_current));
+            for &i in &alpha {
+                s_dominant_weighted = s_dominant_weighted + &s_hat[i] * lambdas[i];
+            }
+
+            let (evals, evecs): (Array1<f64>, Array2<f64>) = s_dominant_weighted.eigh(UPLO::Lower)
+                .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+
+            // Sort eigenvalues in descending order
+            let mut sorted_indices: Vec<usize> = (0..evals.len()).collect();
+            sorted_indices.sort_by(|&i, &j| evals[j].partial_cmp(&evals[i]).unwrap());
+
+            let u_r = evecs.select(Axis(1), &sorted_indices[..r]);
+            let u_n = evecs.select(Axis(1), &sorted_indices[r..]);
+
+            // Step 6-8: Apply similarity transforms
+            for &i in &alpha {
+                s_hat[i] = u_r.t().dot(&s_hat[i]).dot(&u_r);
+            }
+
+            for &i in &gamma_prime {
+                s_hat[i] = u_n.t().dot(&s_hat[i]).dot(&u_n);
+            }
+
+            // Update transformation matrix
+            let mut block_transform = Array2::eye(q);
+            block_transform.slice_mut(s![k..k+q_current, k..k+q_current]).assign(&evecs);
+            cumulative_q = cumulative_q.dot(&block_transform);
+
+            // Step 9: Update loop variables
+            k += r;
+            q_current -= r;
+            gamma = gamma_prime;
+        }
+
+        // Construct final S_λ in transformed space
+        let mut s_final = Array2::zeros((q, q));
+        for (i, &lambda) in lambdas.iter().enumerate() {
+            s_final = s_final + &s_hat[i] * lambda;
+        }
+
+        // Transform back to original space
+        let s_lambda = cumulative_q.dot(&s_final).dot(&cumulative_q.t());
+
+        Ok((s_lambda, cumulative_q))
+    }
+
+    /// Initial null space transformation for full rank condition
+    fn initial_null_space_transform(
+        s_list: &[Array2<f64>],
+    ) -> Result<(Vec<Array2<f64>>, usize), EstimationError> {
+        let q = s_list[0].nrows();
+        
+        // Form sum of normalized penalty matrices
+        let mut s_sum = Array2::zeros((q, q));
+        for s in s_list {
+            let norm_f = s.mapv(|x| x * x).sum().sqrt();
+            if norm_f > 1e-15 {
+                s_sum = s_sum + s / norm_f;
+            }
+        }
+
+        // Eigendecomposition
+        let (evals, evecs) = s_sum.eigh(UPLO::Lower)
+            .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+
+        // Find positive eigenvalues
+        let positive_indices: Vec<usize> = evals.iter().enumerate()
+            .filter(|&(_, &e)| e > 1e-12)
+            .map(|(i, _)| i)
+            .collect();
+
+        if positive_indices.len() == q {
+            // Already full rank
+            return Ok((s_list.to_vec(), q));
+        }
+
+        // Apply transformation
+        let u_plus = evecs.select(Axis(1), &positive_indices);
+        let mut s_transformed = Vec::new();
+
+        for s in s_list {
+            let s_new = u_plus.t().dot(s).dot(&u_plus);
+            s_transformed.push(s_new);
+        }
+
+        Ok((s_transformed, positive_indices.len()))
+    }
+
     /// Helper to calculate log |S|+ robustly using similarity transforms to handle disparate eigenvalues
     fn calculate_log_det_pseudo(s: &Array2<f64>) -> Result<f64, LinalgError> {
         if s.nrows() == 0 {
@@ -1480,6 +1605,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0, // Will be set during training
             }
         }
 
@@ -2382,6 +2508,7 @@ pub mod internal {
                 pgs_range: (-2.5, 2.5),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             let (x_matrix, s_list, layout, _, _) =
@@ -2574,6 +2701,7 @@ pub mod internal {
                 pgs_range: (-2.5, 2.5),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             // --- 3. Build Model Structure: Stop before running the optimizer ---
@@ -2956,6 +3084,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             // Test with extreme lambda values that might cause issues
@@ -3038,6 +3167,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -3145,6 +3275,7 @@ pub mod internal {
                 }],
                 total_coeffs: x_matrix.ncols(),
                 num_penalties: 1,
+                num_pgs_interaction_bases: 0, // No interactions in this test
             };
 
             let mut config = create_test_config();
@@ -3718,6 +3849,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             println!(
@@ -3922,6 +4054,7 @@ pub mod internal {
                 }],
                 total_coeffs: x_matrix.ncols(),
                 num_penalties: 1,
+                num_pgs_interaction_bases: 0, // No interactions in this test
             };
 
             let mut config = create_test_config();
@@ -4059,6 +4192,7 @@ pub mod internal {
                     }],
                     total_coeffs: x_matrix.ncols(),
                     num_penalties: 1,
+                    num_pgs_interaction_bases: 0, // No interactions in this test
                 };
 
                 // --- 5. Create a config with the specified link function ---
@@ -4230,6 +4364,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+                num_pgs_interaction_bases: 0,
             };
 
             let (x, s_list, layout, _, _) =
@@ -4366,6 +4501,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
+                num_pgs_interaction_bases: 0,
             };
 
             // Build design and penalty matrices
