@@ -152,18 +152,13 @@ pub fn train_model(
                         }
 
                         // --- STABILITY ENHANCEMENT 3: Handling Non-Finite Gradients ---
-                        // Final safeguard. If any component of the gradient is still not finite,
-                        // replace it with a small value to prevent the optimizer from crashing.
-                        let mut has_non_finite = false;
-                        grad.iter_mut().for_each(|g| {
-                            if !g.is_finite() {
-                                has_non_finite = true;
-                                *g = 0.5; // Smaller value than 1.0, but not 0.0 to avoid false convergence
-                            }
-                        });
+                        // Final safeguard. If any component of the gradient is not finite,
+                        // force line search backtracking instead of replacing with arbitrary values
+                        let has_non_finite = grad.iter().any(|&g| !g.is_finite());
                         
                         if has_non_finite {
-                            log::warn!("Non-finite gradient components were replaced.");
+                            log::warn!("Non-finite gradient components detected. Forcing line search backtracking.");
+                            return (f64::INFINITY, Array1::zeros(rho_bfgs.len()));
                         }
                         
                         // Handle non-finite cost with large finite value to help line search
@@ -386,6 +381,23 @@ pub mod internal {
                     // l_R(λ) = -½ log|X'X + S_λ|_* - (n - edf)/2 * log(||y - Xβ̂||²) + C
                     // where edf is the effective degrees of freedom
 
+                    // Check condition number of penalized Hessian for numerical stability
+                    const MAX_CONDITION_NUMBER: f64 = 1e10;
+                    match calculate_condition_number(&pirls_result.penalized_hessian) {
+                        Ok(condition_number) => {
+                            if condition_number > MAX_CONDITION_NUMBER {
+                                log::warn!(
+                                    "Penalized Hessian is ill-conditioned in cost computation: condition number = {:.2e}",
+                                    condition_number
+                                );
+                                return Err(EstimationError::ModelIsIllConditioned { condition_number });
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to compute condition number in cost computation: {:?}", e);
+                        }
+                    }
+
                     // The log-determinant of the penalty matrix (XᵀX + S_λ)
                     // Note: pirls_result.penalized_hessian contains exactly X'X + S_λ for Identity link
                     let log_det_xtx_plus_s = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
@@ -454,9 +466,11 @@ pub mod internal {
                     // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
                     let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
 
-                    // Calculate the residual sum of squares ||y - Xβ̂||²
-                    // Note: For Gaussian models, pirls_result.deviance is exactly the RSS
+                    // Calculate the penalized deviance: Dp = D(β̂) + β̂ᵀS_λβ̂
+                    // For Gaussian models, D(β̂) is the RSS, and we need to add the penalty term
                     let rss = pirls_result.deviance;
+                    let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
+                    let penalized_deviance = rss + penalty_term;
 
                     // n is the number of samples
                     let n = self.y.len() as f64;
@@ -469,9 +483,10 @@ pub mod internal {
 
                     // Calculate the correct REML score with pseudo-determinant adjustment
                     // This properly handles unpenalized effects via the rank-deficient penalty matrix
+                    // Use penalized deviance in the score computation
                     let reml = -0.5 * log_det_xtx_plus_s 
                                + 0.5 * log_det_s_lambda_pseudo 
-                               - 0.5 * (n - edf) * (rss / (n - edf).max(1e-8)).ln();
+                               - 0.5 * (n - edf) * (penalized_deviance / (n - edf).max(1e-8)).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
@@ -664,7 +679,33 @@ pub mod internal {
                         ));
                     }
 
-                    // --- 2. Calculate the gradient for each rho_k ---
+                    // --- 2. Compute pseudo-inverse of S_λ for trace terms (reuse from non-Gaussian branch) ---
+                    let mut s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                    
+                    // Add small ridge regularization to prevent singularity issues
+                    let ridge = 1e-8;
+                    for i in 0..s_lambda.nrows() {
+                        s_lambda[[i, i]] += ridge;
+                    }
+                    
+                    // Perform eigendecomposition of S_λ to get eigenvalues and eigenvectors
+                    let (eigenvalues_s, eigenvectors_s) = s_lambda.eigh(UPLO::Lower)
+                        .map_err(|e| {
+                            log::warn!("Eigendecomposition failed in Gaussian gradient calculation: {:?}", e);
+                            EstimationError::EigendecompositionFailed(e)
+                        })?;
+                    
+                    // Create an array of pseudo-inverse eigenvalues
+                    let mut pseudo_inverse_eigenvalues = Array1::zeros(eigenvalues_s.len());
+                    let tolerance = 1e-12;
+                    
+                    for (i, &eig) in eigenvalues_s.iter().enumerate() {
+                        if eig.abs() > tolerance {
+                            pseudo_inverse_eigenvalues[i] = 1.0 / eig;
+                        }
+                    }
+
+                    // --- 3. Calculate the gradient for each rho_k ---
                     for k in 0..lambdas.len() {
                         // This is S_k, the penalty matrix for the k-th smooth term
                         let s_k = &self.s_list[k];
@@ -725,11 +766,20 @@ pub mod internal {
                                 }
                             }
                         }
+
+                        // --- Term 3: λ_k * tr(S_λ⁺ S_k) from ∂log|S_λ|₊/∂ρ_k ---
+                        // Rotate S_k into eigenvector space: U^T * S_k * U
+                        let s_k_rotated = eigenvectors_s.t().dot(&s_k_full.dot(&eigenvectors_s));
+
+                        // Compute the trace: tr(S_λ⁺ * S_k) = Σᵢ (1/λᵢ) * (U^T S_k U)ᵢᵢ
+                        let mut s_inv_trace_term = 0.0;
+                        for i in 0..s_lambda.ncols() {
+                            s_inv_trace_term += pseudo_inverse_eigenvalues[i] * s_k_rotated[[i, i]];
+                        }
                         
-                        // The correct derivative of the REML score (to be maximized) is `0.5*λ*(tr(H⁻¹Sₖ) - β̂ᵀSₖβ̂/σ²)`.
-                        // We compute this score gradient. The final gradient.mapv_inplace(|v| -v) at the end of the
-                        // function will correctly convert it to the cost gradient needed by the minimizer.
-                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled);
+                        // The correct derivative of the REML score (to be maximized) includes all three terms:
+                        // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ² + tr(S_λ⁺S_k))
+                        gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled + s_inv_trace_term);
                     }
                 }
                 _ => {
