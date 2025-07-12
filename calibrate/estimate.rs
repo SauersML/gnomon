@@ -466,11 +466,9 @@ pub mod internal {
                     // Effective degrees of freedom: EDF = p - tr((X'X + Sλ)⁻¹Sλ)
                     let edf = (p - trace_h_inv_s_lambda).max(1.0); // Ensure EDF is at least 1
 
-                    // Calculate the penalized deviance: Dp = D(β̂) + β̂ᵀS_λβ̂
-                    // For Gaussian models, D(β̂) is the RSS, and we need to add the penalty term
+                    // For Gaussian models, D(β̂) is the RSS (residual sum of squares)
+                    // The penalty term β̂ᵀS_λβ̂ is not used in the REML variance estimation
                     let rss = pirls_result.deviance;
-                    let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
-                    let penalized_deviance = rss + penalty_term;
 
                     // n is the number of samples
                     let n = self.y.len() as f64;
@@ -483,10 +481,10 @@ pub mod internal {
 
                     // Calculate the correct REML score with pseudo-determinant adjustment
                     // This properly handles unpenalized effects via the rank-deficient penalty matrix
-                    // Use penalized deviance in the score computation
+                    // Use unpenalized RSS in the variance-log term as per REML theory
                     let reml = -0.5 * log_det_xtx_plus_s 
-                               + 0.5 * log_det_s_lambda_pseudo 
-                               - 0.5 * (n - edf) * (penalized_deviance / (n - edf).max(1e-8)).ln();
+                    + 0.5 * log_det_s_lambda_pseudo 
+                    - 0.5 * (n - edf) * (rss / (n - edf).max(1e-8)).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
