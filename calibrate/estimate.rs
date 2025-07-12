@@ -483,16 +483,18 @@ pub mod internal {
                     // Calculate variance estimate using penalized deviance: σ² = Dp / (n - edf)
                      let sigma_sq = penalized_deviance / (n - edf).max(1e-8);
 
-                    // Calculate saturated likelihood: ls(φ) = -n/2 * log(2πφ) - RSS/(2φ)
-                    let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln() - (rss / (2.0 * sigma_sq));
+                    // Calculate saturated likelihood: ls(φ) = -n/2 * log(2πφ) 
+                    // For Gaussian models, saturated deviance = 0 (μᵢ = yᵢ exactly), so no RSS term
+                     let ls_phi = -(n / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
                     
                     // Calculate REML score with penalized deviance and saturated likelihood
-                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ - Mp/2*log(2πσ²)
-                     let mp = self.layout.total_coeffs as f64; // Number of coefficients (Mp)
-                     let reml = -(penalized_deviance / (2.0 * sigma_sq)) - ls_phi 
-                              - 0.5 * log_det_xtx_plus_s 
-                              + 0.5 * log_det_s_lambda_pseudo 
-                              - (mp / 2.0) * (2.0 * std::f64::consts::PI * sigma_sq).ln();
+                    // Full formula: -Dp/(2σ²) - ls(φ) - ½log|H| + ½log|S_λ|_+ + Mp/2*log(2π)
+                    // Note: Mp is null space dimension (number of unpenalized coefficients)
+                    let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
+                    let reml = -(penalized_deviance / (2.0 * sigma_sq)) - ls_phi 
+                    - 0.5 * log_det_xtx_plus_s 
+                    + 0.5 * log_det_s_lambda_pseudo 
+                               + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
 
                     // Return negative REML score for minimization
                     Ok(-reml)
@@ -533,8 +535,11 @@ pub mod internal {
                         }
                     };
 
-                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H|
-                    let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h;
+                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2π)
+                    // Mp is null space dimension (number of unpenalized coefficients)  
+                     let mp = self.layout.total_coeffs as f64; // TODO: should be null space dimension
+                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h 
+                              + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
 
                     // Return negative LAML score for minimization
                     Ok(-laml)
@@ -678,11 +683,9 @@ pub mod internal {
                     }
                     let edf = (num_params - trace_h_inv_s_lambda).max(1.0);
                     
-                     // Calculate penalized deviance for variance estimation: Dp = RSS + β̂ᵀS_λβ̂
-                     let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
-                     let penalty_term = pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
-                     let penalized_deviance = rss + penalty_term;
-                     let sigma_sq = penalized_deviance / (n - edf).max(1e-8); // Use penalized deviance
+                     // For gradient computation, use unpenalized RSS for variance estimate  
+                     // This matches textbook p.298 where terms are divided by φ = RSS/(n-edf)
+                     let sigma_sq = rss / (n - edf).max(1e-8); // Use unpenalized RSS for gradient
 
                     if sigma_sq <= 0.0 {
                         return Err(EstimationError::RemlOptimizationFailed(
@@ -691,7 +694,8 @@ pub mod internal {
                     }
 
                     // --- 2. Compute pseudo-inverse of S_λ for trace terms (reuse from non-Gaussian branch) ---
-                    let mut s_lambda_for_pseudo = s_lambda.clone();
+                    let s_lambda = construct_s_lambda(&lambdas, &self.s_list, self.layout);
+                     let mut s_lambda_for_pseudo = s_lambda.clone();
                     
                     // Add small ridge regularization to prevent singularity issues
                     let ridge = 1e-8;
@@ -838,6 +842,7 @@ pub mod internal {
                          
                          // ∂φ̂/∂ρ_k = [∂Dp/∂ρ_k * (n-edf) - Dp * ∂edf/∂ρ_k] / (n-edf)²
                          let n_minus_edf = (n - edf).max(1e-8);
+                         let penalized_deviance = rss + pirls_result.beta.dot(&s_lambda.dot(&pirls_result.beta));
                          let d_phi_d_rho_k = (d_dp_d_rho_k * n_minus_edf - penalized_deviance * d_edf_d_rho_k) / (n_minus_edf * n_minus_edf);
                          
                          // Cross-term coefficient: {Dp/(2φ̂²) + l's(φ̂) + Mp/(2φ̂)}
@@ -850,8 +855,9 @@ pub mod internal {
                          let scale_dependency_term = -cross_term_coeff * d_phi_d_rho_k;
                          
                          // The complete REML gradient including scale dependency:
-                         // ∂reml/∂ρ_k = 0.5*λ_k*(tr(H⁻¹S_k) - β̂ᵀS_kβ̂/σ² + tr(S_λ⁺S_k)) + scale_dependency_term
-                         gradient[k] = 0.5 * lambdas[k] * (trace_term_unscaled - beta_term_scaled + s_inv_trace_term) + scale_dependency_term;
+                         // ∂reml/∂ρ_k = 0.5*λ_k*(β̂ᵀS_kβ̂/σ² + tr(H⁻¹S_k) - tr(S_λ⁺S_k)) + scale_dependency_term
+                         // Based on Wood 2017 p.298: beta term positive, trace term positive, log|S| term negative
+                          gradient[k] = 0.5 * lambdas[k] * (beta_term_scaled + trace_term_unscaled - s_inv_trace_term) + scale_dependency_term;
                     }
                 }
                 _ => {
