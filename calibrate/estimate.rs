@@ -72,6 +72,9 @@ pub enum EstimationError {
         "Model is ill-conditioned with condition number {condition_number:.2e}. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization."
     )]
     ModelIsIllConditioned { condition_number: f64 },
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// The main entry point for model training. Orchestrates the REML/BFGS optimization.
@@ -387,7 +390,7 @@ pub mod internal {
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
             // Use stable re-parameterization instead of naive summation
-            let (s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+            let (s_lambda, _) = stable_construct_s_lambda(&self.s_list, lambdas.as_slice().unwrap())?;
 
             match self.config.link_function {
                 LinkFunction::Identity => {
@@ -662,7 +665,7 @@ pub mod internal {
                     let rss = pirls_result.deviance;
 
                     let num_params = beta.len() as f64;
-                    let (s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+                    let (s_lambda, _) = stable_construct_s_lambda(&self.s_list, lambdas.as_slice().unwrap())?;
                     let mut trace_h_inv_s_lambda = 0.0;
 
                     for j in 0..s_lambda.ncols() {
@@ -936,7 +939,7 @@ pub mod internal {
 
                     // ---- PERFORMANCE OPTIMIZATION ----
                     // Construct S_λ using stable re-parameterization, outside the k-loop
-                    let (mut s_lambda, _) = stable_construct_s_lambda(&lambdas, &self.s_list)?;
+                    let (mut s_lambda, _) = stable_construct_s_lambda(&self.s_list, lambdas.as_slice().unwrap())?;
 
                     // Add small ridge regularization to prevent singularity issues
                     let ridge = 1e-8;
@@ -1308,11 +1311,13 @@ pub mod internal {
     /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
     /// to avoid "dominant machine zero leakage" between penalty components
     fn stable_construct_s_lambda(
-        lambdas: &Array1<f64>,
         s_list: &[Array2<f64>],
+        lambdas: &[f64],
     ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-        if s_list.is_empty() {
-            return Err(EstimationError::LayoutError("Empty penalty list".to_string()));
+        if s_list.is_empty() || lambdas.is_empty() {
+            return Err(EstimationError::InvalidInput(
+                "Empty penalty matrices or lambdas".to_string(),
+            ));
         }
 
         let q = s_list[0].nrows();
@@ -1324,6 +1329,9 @@ pub mod internal {
 
         // Step 0: Initial null space transformation if needed
         let (s_transformed, initial_q) = initial_null_space_transform(s_list)?;
+        
+        // Track block structure: each element is (matrix_index, block_start, block_size)
+        let mut block_info: Vec<(usize, usize, usize)> = Vec::new();
         
         // Initialize recursion
         let mut k = 0;
@@ -1375,6 +1383,10 @@ pub mod internal {
 
             // Step 4: Termination check
             if r == q_current {
+                // Final block - record block info for all remaining matrices
+                for &i in &gamma {
+                    block_info.push((i, k, q_current));
+                }
                 break;
             }
 
@@ -1394,13 +1406,15 @@ pub mod internal {
             let u_r = evecs.select(Axis(1), &sorted_indices[..r]);
             let u_n = evecs.select(Axis(1), &sorted_indices[r..]);
 
-            // Step 6-8: Apply similarity transforms
+            // Step 6-8: Apply similarity transforms and record block info
             for &i in &alpha {
                 s_hat[i] = u_r.t().dot(&s_hat[i]).dot(&u_r);
+                block_info.push((i, k, r));
             }
 
             for &i in &gamma_prime {
                 s_hat[i] = u_n.t().dot(&s_hat[i]).dot(&u_n);
+                // These will be processed in the next iteration
             }
 
             // Update transformation matrix
@@ -1414,19 +1428,27 @@ pub mod internal {
             gamma = gamma_prime;
         }
 
-        // Construct final S_λ in transformed space
-        let mut s_final = Array2::zeros((q, q));
-        for (i, &lambda) in lambdas.iter().enumerate() {
-            s_final = s_final + &s_hat[i] * lambda;
+        // Construct final S_λ in transformed space using block structure
+        let mut s_final = Array2::zeros((initial_q, initial_q));
+        for &(matrix_idx, block_start, block_size) in &block_info {
+            // Place each transformed matrix in its correct block position
+            let block_slice = s![block_start..block_start+block_size, block_start..block_start+block_size];
+            s_final.slice_mut(block_slice).scaled_add(lambdas[matrix_idx], &s_hat[matrix_idx]);
         }
 
-        // Transform back to original space
-        let s_lambda = cumulative_q.dot(&s_final).dot(&cumulative_q.t());
+        // If initial null space transform was applied, we need to embed back
+        let mut s_lambda_full = Array2::zeros((q, q));
+        if initial_q < q {
+            // Embed the transformed result in the full space
+            let transform_back = cumulative_q.slice(s![.., ..initial_q]);
+            s_lambda_full = transform_back.dot(&s_final).dot(&transform_back.t());
+        } else {
+            // Transform back to original space
+            s_lambda_full = cumulative_q.dot(&s_final).dot(&cumulative_q.t());
+        }
 
-        Ok((s_lambda, cumulative_q))
+        Ok((s_lambda_full, cumulative_q))
     }
-
-    /// Initial null space transformation for full rank condition
     fn initial_null_space_transform(
         s_list: &[Array2<f64>],
     ) -> Result<(Vec<Array2<f64>>, usize), EstimationError> {
