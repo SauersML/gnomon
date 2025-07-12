@@ -188,45 +188,35 @@ fn main() {
 
 // This function manually checks for unused variables in the current file
 fn manually_check_for_unused_variables() {
-    // Use grep to search for patterns that might indicate unused variables
-    let pattern = r"\blet\s+([^_][a-zA-Z0-9_]+)\s*="; // Look for variable declarations
-    let matcher = RegexMatcher::new_line_matcher(pattern).unwrap();
-    let mut searcher = Searcher::new();
-
+    // Force compilation to fail with unused_variables lint
+    // This ensures build.rs itself follows the strict no-unused-variables policy
     let build_path = Path::new("build.rs");
-    let file_content = std::fs::read_to_string(build_path).unwrap();
+    let status = std::process::Command::new("rustc")
+        .args(&[
+            "--edition", "2021",
+            "-D", "unused_variables",
+            "--crate-type", "bin",
+            "--error-format", "human",
+            build_path.to_str().unwrap()
+        ])
+        .output();
 
-    // Collect all variable declarations
-    let mut collector = ViolationCollector::new(build_path);
-    searcher
-        .search_path(&matcher, build_path, &mut collector)
-        .unwrap();
-
-    // For each declared variable, check if it's used elsewhere in the file
-    for line in &collector.violations {
-        // Extract variable name from the violation line
-        if let Some(var_name_start) = line.find("let ") {
-            if let Some(var_name_end) = line[var_name_start + 4..].find('=') {
-                let var_name = line[var_name_start + 4..var_name_start + 4 + var_name_end].trim();
-
-                // Count occurrences of this variable name in the file
-                // (should be more than 1 if it's used after declaration)
-                let count = file_content.matches(var_name).count();
-
-                if count <= 1 {
-                    // If variable appears only once (its declaration), it's unused
-                    eprintln!(
-                        "\n❌ ERROR: Unused variable detected in build.rs: {}",
-                        var_name
-                    );
-                    eprintln!("   {}", line);
-                    eprintln!("\n⚠️ Unused variables are not allowed in this project.");
-                    eprintln!(
-                        "   Either use the variable or prefix it with an underscore to explicitly mark it as unused."
-                    );
+    match status {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("unused variable") {
+                    eprintln!("\n❌ ERROR: Unused variables detected in build.rs!");
+                    eprintln!("{}", stderr);
+                    eprintln!("\n⚠️ Unused variables are STRICTLY FORBIDDEN in this project.");
+                    eprintln!("   Either use the variable or remove it completely. Underscore prefixes are NOT allowed.");
                     std::process::exit(1);
                 }
             }
+        }
+        Err(_) => {
+            // If rustc command fails, fallback to warning but don't fail the build
+            eprintln!("cargo:warning=Could not check for unused variables in build.rs");
         }
     }
 }
