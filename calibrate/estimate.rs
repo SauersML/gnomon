@@ -4339,22 +4339,21 @@ pub mod internal {
             for (i, s) in s_list.iter().enumerate() {
                 assert_eq!(s.nrows(), s.ncols(), "Penalty matrix {} is not square", i);
 
-                if i == 0 {
-                    // PC main effect penalty
-                    assert_eq!(
-                        s.nrows(),
-                        pc_n_constrained_basis,
-                        "PC main effect penalty has wrong dimensions"
-                    );
-                } else {
-                    // Interaction penalties with pure pre-centering should match PC basis dimensions
-                    assert_eq!(
-                        s.nrows(),
-                        pc_n_constrained_basis,
-                        "Interaction penalty {} has wrong dimensions",
-                        i
-                    );
-                }
+                // Find the corresponding block in the layout to get the expected size
+                let block = layout.penalty_map.iter()
+                    .find(|b| b.penalty_idx == i)
+                    .expect(&format!("Could not find layout block for penalty index {}", i));
+
+                let expected_dim = block.col_range.len();
+
+                assert_eq!(
+                    s.nrows(),
+                    expected_dim,
+                    "Penalty for term '{}' has wrong dimensions. Expected {}, got {}",
+                    block.term_name,
+                    expected_dim,
+                    s.nrows()
+                );
             }
         }
         /// Tests that the design matrix is correctly built using pure pre-centering for the interaction terms.
