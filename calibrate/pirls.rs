@@ -99,40 +99,124 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
+        // Store current beta before update
+        let beta_current = beta.clone();
+
         // Use stable solver for P-IRLS inner loop (robust iteration)
         let stable_result =
             stable_penalized_least_squares(x.view(), z.view(), weights.view(), &s_lambda)?;
 
-        beta = stable_result.beta;
+        let beta_proposal = stable_result.beta;
 
-        if !beta.iter().all(|x| x.is_finite()) {
-            log::error!("Non-finite beta values at iteration {}: {:?}", iter, beta);
+        if !beta_proposal.iter().all(|x| x.is_finite()) {
+            log::error!(
+                "Non-finite beta values at iteration {}: {:?}",
+                iter,
+                beta_proposal
+            );
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
                 last_change: f64::NAN,
             });
         }
 
-        // FIX: Recompute eta, mu, weights, z, and deviance AFTER updating beta
-        // This ensures the deviance reflects the new fit for accurate convergence checking
+        // Implement step halving with backtracking line search
+        let delta_beta = &beta_proposal - &beta_current;
+        let mut step_size = 1.0;
+        let mut halving_attempts = 0;
+        const MAX_HALVINGS: usize = 10;
+        const MIN_STEP_SIZE: f64 = 1e-8;
+
+        let mut beta_trial;
+        let mut deviance;
+
+        loop {
+            // Calculate trial coefficients
+            beta_trial = &beta_current + &(&delta_beta * step_size);
+
+            // Calculate new deviance using trial beta
+            let eta_trial = x.dot(&beta_trial);
+            let (mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function);
+            deviance = calculate_deviance(y, &mu_trial, config.link_function);
+
+            if !deviance.is_finite() {
+                log::error!(
+                    "Non-finite deviance at iteration {} with step size {}: {}",
+                    iter,
+                    step_size,
+                    deviance
+                );
+                return Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: config.max_iterations,
+                    last_change: f64::NAN,
+                });
+            }
+
+            // Check if step is acceptable (deviance decreased)
+            if deviance < last_deviance || step_size <= MIN_STEP_SIZE {
+                break;
+            }
+
+            // Step was too large, halve it and retry
+            step_size *= 0.5;
+            halving_attempts += 1;
+
+            if halving_attempts > MAX_HALVINGS {
+                log::error!(
+                    "Step halving failed after {} attempts at iteration {}",
+                    MAX_HALVINGS,
+                    iter
+                );
+                return Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: config.max_iterations,
+                    last_change: last_deviance - deviance,
+                });
+            }
+
+            log::debug!(
+                "Deviance increased from {:.6} to {:.6}; halving step size to {:.6} (attempt {})",
+                last_deviance,
+                deviance,
+                step_size,
+                halving_attempts
+            );
+            eprintln!(
+                "    [Step Halving] Attempt {}: deviance {:.6} -> {:.6}, step size: {:.6}",
+                halving_attempts, last_deviance, deviance, step_size
+            );
+        }
+
+        // Accept the trial beta
+        beta = beta_trial;
+
+        if halving_attempts > 0 {
+            log::debug!(
+                "Step halving successful after {} attempts, final step size: {:.6}",
+                halving_attempts,
+                step_size
+            );
+            eprintln!(
+                "    [Step Halving] SUCCESS after {} attempts, final step size: {:.6}",
+                halving_attempts, step_size
+            );
+        }
+
+        // Update GLM vectors with the accepted beta
         eta = x.dot(&beta);
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
-        let deviance = calculate_deviance(y, &mu, config.link_function);
-        if !deviance.is_finite() {
-            log::error!("Non-finite deviance at iteration {}: {}", iter, deviance);
-            return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: config.max_iterations,
-                last_change: f64::NAN,
-            });
-        }
 
         // FIX: Compute deviance_change safely (always finite after first iter)
         let deviance_change = (last_deviance - deviance).abs();
 
         // A more detailed, real-time print for each inner-loop iteration
+        let step_info = if halving_attempts > 0 {
+            format!(" | Step Halving: {} attempts", halving_attempts)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "    [P-IRLS Iteration #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}",
-            iter, deviance, deviance_change
+            "    [P-IRLS Iteration #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}{}",
+            iter, deviance, deviance_change, step_info
         );
 
         if !deviance_change.is_finite() {
