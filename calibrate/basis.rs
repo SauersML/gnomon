@@ -347,14 +347,14 @@ mod internal {
         for d in 1..=degree {
             left[d] = x_clamped - knots[mu + 1 - d];
             right[d] = knots[mu + d] - x_clamped;
-            
+
             let mut saved = 0.0;
-            
+
             for r in 0..d {
                 // This is an in-place update. n[r] on input is a value for degree d-1.
                 let den = right[r + 1] + left[d - r];
                 let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
-                
+
                 // On output, n[r] will be a value for degree d.
                 n[r] = saved + right[r + 1] * temp;
                 saved = left[d - r] * temp;
@@ -890,11 +890,14 @@ mod tests {
         let basis_at_1_5 = internal::evaluate_splines_at_point(1.5, degree, knots.view());
         assert_eq!(basis_at_1_5.len(), num_basis);
         assert_abs_diff_eq!(basis_at_1_5.sum(), 1.0, epsilon = 1e-9);
-        
+
         // Validate that exactly 2 basis functions are non-zero with value 0.5 each
         let non_zero_count = basis_at_1_5.iter().filter(|&&x| x > 1e-12).count();
-        assert_eq!(non_zero_count, 2, "Should have exactly 2 non-zero basis functions at x=1.5");
-        
+        assert_eq!(
+            non_zero_count, 2,
+            "Should have exactly 2 non-zero basis functions at x=1.5"
+        );
+
         // Check that the non-zero values are at indices 1 and 2 (as determined empirically)
         // and both have value 0.5 (from linear interpolation)
         assert_abs_diff_eq!(basis_at_1_5[1], 0.5, epsilon = 1e-9);
@@ -905,11 +908,14 @@ mod tests {
         let basis_at_2_5 = internal::evaluate_splines_at_point(2.5, degree, knots.view());
         assert_eq!(basis_at_2_5.len(), num_basis);
         assert_abs_diff_eq!(basis_at_2_5.sum(), 1.0, epsilon = 1e-9);
-        
+
         // Validate that exactly 2 basis functions are non-zero with value 0.5 each
         let non_zero_count_2_5 = basis_at_2_5.iter().filter(|&&x| x > 1e-12).count();
-        assert_eq!(non_zero_count_2_5, 2, "Should have exactly 2 non-zero basis functions at x=2.5");
-        
+        assert_eq!(
+            non_zero_count_2_5, 2,
+            "Should have exactly 2 non-zero basis functions at x=2.5"
+        );
+
         // Check that the non-zero values are at indices 2 and 3 (as determined empirically)
         // and both have value 0.5 (from linear interpolation)
         assert_abs_diff_eq!(basis_at_2_5[2], 0.5, epsilon = 1e-9);

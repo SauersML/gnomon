@@ -3,7 +3,7 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{Constraint, ModelConfig};
 use ndarray::{Array1, Array2, Axis, s};
-use ndarray_linalg::{SVD, UPLO, Eigh, error::LinalgError};
+use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -45,7 +45,8 @@ impl ModelLayout {
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
         let p_pgs_main = pgs_main_basis_ncols;
         let p_pc_main: usize = pc_constrained_basis_ncols.iter().sum();
-        let p_interactions = num_pgs_interaction_bases * pc_constrained_basis_ncols.iter().sum::<usize>();
+        let p_interactions =
+            num_pgs_interaction_bases * pc_constrained_basis_ncols.iter().sum::<usize>();
         let calculated_total_coeffs = 1 + p_pgs_main + p_pc_main + p_interactions;
 
         let intercept_col = current_col;
@@ -194,7 +195,7 @@ pub fn build_design_and_penalty_matrices(
         let s_unconstrained =
             create_difference_penalty_matrix(pc_basis_unc.ncols(), config.penalty_order)?;
         let s_constrained = z_transform.t().dot(&s_unconstrained.dot(&z_transform));
-        
+
         // Embed into full-sized p × p matrix (will be determined after layout is created)
         s_list.push(s_constrained);
     }
@@ -219,7 +220,12 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Define the model layout based on final basis dimensions
     let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
-    let layout = ModelLayout::new(config, &pc_basis_ncols, pgs_main_basis.ncols(), num_pgs_interaction_weights)?;
+    let layout = ModelLayout::new(
+        config,
+        &pc_basis_ncols,
+        pgs_main_basis.ncols(),
+        num_pgs_interaction_weights,
+    )?;
 
     if s_list.len() != layout.num_penalties {
         return Err(EstimationError::LayoutError(format!(
@@ -233,46 +239,55 @@ pub fn build_design_and_penalty_matrices(
     // This ensures all matrices in s_list are compatible for linear algebra operations
     let p = layout.total_coeffs;
     let mut s_list_full = Vec::new();
-    
+
     // Validate that s_list length matches penalty_map length
     if s_list.len() != layout.penalty_map.len() {
         return Err(EstimationError::LayoutError(format!(
             "Penalty matrix count mismatch: s_list has {} matrices but penalty_map has {} blocks",
-            s_list.len(), layout.penalty_map.len()
+            s_list.len(),
+            layout.penalty_map.len()
         )));
     }
-    
+
     for (k, s_k) in s_list.iter().enumerate() {
         let mut s_k_full = Array2::zeros((p, p));
-        
+
         // Find the block for this penalty index and embed the matrix
         let mut found_block = false;
         for block in &layout.penalty_map {
             if block.penalty_idx == k {
                 let col_range = block.col_range.clone();
                 let block_size = col_range.len();
-                
+
                 // Validate dimensions
                 if s_k.nrows() != block_size || s_k.ncols() != block_size {
                     return Err(EstimationError::LayoutError(format!(
                         "Penalty matrix {} (term {}) has size {}×{} but block expects {}×{}",
-                        k, block.term_name, s_k.nrows(), s_k.ncols(), block_size, block_size
+                        k,
+                        block.term_name,
+                        s_k.nrows(),
+                        s_k.ncols(),
+                        block_size,
+                        block_size
                     )));
                 }
-                
+
                 // Embed the block-sized penalty into the full-sized matrix
-                s_k_full.slice_mut(s![col_range.clone(), col_range]).assign(s_k);
+                s_k_full
+                    .slice_mut(s![col_range.clone(), col_range])
+                    .assign(s_k);
                 found_block = true;
                 break;
             }
         }
-        
+
         if !found_block {
             return Err(EstimationError::LayoutError(format!(
-                "No block found for penalty matrix index {}", k
+                "No block found for penalty matrix index {}",
+                k
             )));
         }
-        
+
         s_list_full.push(s_k_full);
     }
 
@@ -289,24 +304,26 @@ pub fn build_design_and_penalty_matrices(
             if block.term_name == format!("f({})", pc_name) {
                 let col_range = block.col_range.clone();
                 let pc_basis = &pc_constrained_bases[pc_idx];
-                
+
                 // Validate dimensions before assignment
                 if pc_basis.nrows() != n_samples {
                     return Err(EstimationError::LayoutError(format!(
                         "PC basis {} has {} rows but expected {} samples",
-                        pc_name, pc_basis.nrows(), n_samples
+                        pc_name,
+                        pc_basis.nrows(),
+                        n_samples
                     )));
                 }
                 if pc_basis.ncols() != col_range.len() {
                     return Err(EstimationError::LayoutError(format!(
                         "PC basis {} has {} columns but layout expects {} columns",
-                        pc_name, pc_basis.ncols(), col_range.len()
+                        pc_name,
+                        pc_basis.ncols(),
+                        col_range.len()
                     )));
                 }
-                
-                x_matrix
-                    .slice_mut(s![.., col_range])
-                    .assign(pc_basis);
+
+                x_matrix.slice_mut(s![.., col_range]).assign(pc_basis);
                 break;
             }
         }
@@ -314,21 +331,23 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Main PGS effect - directly use the layout range
     let pgs_range = layout.pgs_main_cols.clone();
-    
+
     // Validate dimensions before assignment
     if pgs_main_basis.nrows() != n_samples {
         return Err(EstimationError::LayoutError(format!(
             "PGS main basis has {} rows but expected {} samples",
-            pgs_main_basis.nrows(), n_samples
+            pgs_main_basis.nrows(),
+            n_samples
         )));
     }
     if pgs_main_basis.ncols() != pgs_range.len() {
         return Err(EstimationError::LayoutError(format!(
             "PGS main basis has {} columns but layout expects {} columns",
-            pgs_main_basis.ncols(), pgs_range.len()
+            pgs_main_basis.ncols(),
+            pgs_range.len()
         )));
     }
-    
+
     x_matrix
         .slice_mut(s![.., pgs_range])
         .assign(&pgs_main_basis);
@@ -364,13 +383,19 @@ pub fn build_design_and_penalty_matrices(
                     if interaction_term.nrows() != n_samples {
                         return Err(EstimationError::LayoutError(format!(
                             "Interaction term PGS_B{} × {} has {} rows but expected {} samples",
-                            m, pc_name, interaction_term.nrows(), n_samples
+                            m,
+                            pc_name,
+                            interaction_term.nrows(),
+                            n_samples
                         )));
                     }
                     if interaction_term.ncols() != col_range.len() {
                         return Err(EstimationError::LayoutError(format!(
                             "Interaction term PGS_B{} × {} has {} columns but layout expects {} columns",
-                            m, pc_name, interaction_term.ncols(), col_range.len()
+                            m,
+                            pc_name,
+                            interaction_term.ncols(),
+                            col_range.len()
                         )));
                     }
 
@@ -424,7 +449,7 @@ pub struct ReparamResult {
     pub rs: Vec<Array2<f64>>,
 }
 
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 
 /// Helper to construct the summed, weighted penalty matrix S_lambda.
 /// This version works with full-sized p × p penalty matrices from s_list.
@@ -435,33 +460,44 @@ pub fn construct_s_lambda(
 ) -> Array2<f64> {
     let p = layout.total_coeffs;
     let mut s_lambda = Array2::zeros((p, p));
-    
+
     let total = s_list.len();
     if total > 0 {
-        eprintln!("    [Construction] Building S_lambda from {} penalty matrices...", total);
+        eprintln!(
+            "    [Construction] Building S_lambda from {} penalty matrices...",
+            total
+        );
     }
-    
+
     // Simple weighted sum since all matrices are now p × p
     // But now with a progress bar
     for (i, s_k) in s_list.iter().enumerate() {
         s_lambda.scaled_add(lambdas[i], s_k);
-        
+
         // Update progress bar every matrix addition
-        if total > 3 { // Only show progress bar if we have enough matrices to make it worthwhile
+        if total > 3 {
+            // Only show progress bar if we have enough matrices to make it worthwhile
             let progress = (i + 1) * 20 / total;
             let bar = "#".repeat(progress);
             let space = " ".repeat(20 - progress);
-            eprint!("\r    [Construction] [{}>{}] {}/{} penalties (λ_{}={:.2e})    ", 
-                    bar, space, i+1, total, i, lambdas[i]);
+            eprint!(
+                "\r    [Construction] [{}>{}] {}/{} penalties (λ_{}={:.2e})    ",
+                bar,
+                space,
+                i + 1,
+                total,
+                i,
+                lambdas[i]
+            );
             let _ = stdout().flush();
         }
     }
-    
+
     if total > 3 {
         // End the progress bar with a newline
         eprintln!();
     }
-    
+
     s_lambda
 }
 
@@ -472,10 +508,13 @@ pub fn stable_reparameterization(
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
-    eprintln!("    [Debug] Performing stable reparameterization for {} penalties...", lambdas.len());
+    eprintln!(
+        "    [Debug] Performing stable reparameterization for {} penalties...",
+        lambdas.len()
+    );
     let p = layout.total_coeffs;
     let m = s_list.len(); // Number of penalty matrices
-    
+
     if m == 0 {
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
@@ -487,17 +526,17 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm - Transform-In-Place Architecture
-    let eps = f64::EPSILON.powf(1.0/3.0); // d_tol - group similar sized penalties
-    
+    let eps = f64::EPSILON.powf(1.0 / 3.0); // d_tol - group similar sized penalties
+
     // Initialize global transformation matrix and working matrices
     let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
     let mut rs_current = s_list.to_vec(); // Working penalty matrices (will be transformed)
-    
+
     // Initialize iteration variables following get_stableS
     let mut k_offset = 0_usize; // K: number of parameters already processed  
     let mut q_current = p; // Q: size of current sub-problem
     let mut gamma: Vec<usize> = (0..m).collect(); // Active penalty indices
-    
+
     // Main similarity transform loop - mirrors get_stableS structure
     let mut iteration = 0;
     loop {
@@ -505,170 +544,193 @@ pub fn stable_reparameterization(
         if gamma.is_empty() || q_current == 0 {
             break;
         }
-        
+
         // Step 1: Find Frobenius norms of penalties in current sub-problem (like get_stableS)
         let mut frob_norms = Vec::new();
         let mut max_omega: f64 = 0.0;
-        
+
         for &i in &gamma {
-            // Extract current Q x Q active sub-block 
-            let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
+            // Extract current Q x Q active sub-block
+            let active_block = rs_current[i].slice(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]);
             let frob_norm = active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
             let omega_i = frob_norm * lambdas[i];
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
         }
-        
+
         if max_omega < 1e-15 {
             break; // All remaining penalties are numerically zero
         }
-        
+
         // Step 2: Partition into dominant α and subdominant γ' sets (like get_stableS)
         let threshold = eps * max_omega; // d_tol threshold
-        let alpha: Vec<usize> = frob_norms.iter()
+        let alpha: Vec<usize> = frob_norms
+            .iter()
             .filter(|(_, omega)| *omega >= threshold)
             .map(|(i, _)| *i)
             .collect();
-        let gamma_prime: Vec<usize> = frob_norms.iter()
+        let gamma_prime: Vec<usize> = frob_norms
+            .iter()
             .filter(|(_, omega)| *omega < threshold)
             .map(|(i, _)| *i)
             .collect();
-        
+
         if alpha.is_empty() {
             break;
         }
-        
+
         // Step 3: Form weighted sum of dominant penalties and eigendecompose (like get_stableS)
         let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
-            let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
+            let active_block = rs_current[i].slice(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]);
             sb.scaled_add(lambdas[i], &active_block);
         }
-        
+
         // Eigendecomposition to get rank and eigenvectors
-        let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb.eigh(UPLO::Lower)
+        let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb
+            .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        
+
         // Sort eigenvalues in descending order and determine rank
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
-        
+
         let r_tol = f64::EPSILON.powf(0.75); // Like get_stableS r_tol
         let rank_tolerance = eigenvalues[sorted_indices[0]].max(1.0) * r_tol;
-        let r = sorted_indices.iter()
+        let r = sorted_indices
+            .iter()
             .take_while(|&&i| eigenvalues[i] > rank_tolerance)
             .count();
-        
+
         // Step 4: Check termination criterion (like get_stableS)
         if r == q_current {
             break; // Full rank - terminate
         }
-        
+
         // Step 5: Update global transformation matrix Qf (like get_stableS)
         // Reorder eigenvectors by descending eigenvalues
         let u_reordered = u.select(Axis(1), &sorted_indices);
-        
+
         if iteration == 1 {
             // First iteration: copy U to appropriate block of Qf
-            qf.slice_mut(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current])
-                .assign(&u_reordered);
+            qf.slice_mut(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ])
+            .assign(&u_reordered);
         } else {
             // Subsequent iterations: multiply current Qf block by U
-            let qf_block = qf.slice(s![.., k_offset..k_offset+q_current]).to_owned();
+            let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
             let qf_new = qf_block.dot(&u_reordered);
-            qf.slice_mut(s![.., k_offset..k_offset+q_current]).assign(&qf_new);
+            qf.slice_mut(s![.., k_offset..k_offset + q_current])
+                .assign(&qf_new);
         }
-        
+
         // Step 6: Extract null space eigenvectors
         let u_n = u_reordered.slice(s![.., r..]);
-        
+
         if u_n.ncols() == 0 {
             break;
         }
-        
+
         // Step 7: Transform penalty components for next iteration (like get_stableS)
         // Following the exact logic: sub-dominant penalties are transformed to null space for next iteration
         let mut next_rs = vec![Array2::zeros((p, p)); m];
         let next_q = u_n.ncols();
-        
+
         for i in 0..m {
             if gamma_prime.contains(&i) {
                 // Sub-dominant penalties: transform to null space for next iteration's sub-problem
-                let active_block = rs_current[i].slice(s![k_offset..k_offset+q_current, k_offset..k_offset+q_current]);
+                let active_block = rs_current[i].slice(s![
+                    k_offset..k_offset + q_current,
+                    k_offset..k_offset + q_current
+                ]);
                 let transformed_block = u_n.t().dot(&active_block.dot(&u_n));
-                
+
                 // Place the transformed block in the next iteration's position
-                next_rs[i].slice_mut(s![k_offset+r..k_offset+r+next_q, k_offset+r..k_offset+r+next_q])
+                next_rs[i]
+                    .slice_mut(s![
+                        k_offset + r..k_offset + r + next_q,
+                        k_offset + r..k_offset + r + next_q
+                    ])
                     .assign(&transformed_block);
             } else {
                 // Copy unchanged parts for non-active penalties
                 next_rs[i] = rs_current[i].clone();
             }
         }
-        
+
         // Update for next iteration
         rs_current = next_rs;
         k_offset = k_offset + r;
         q_current = next_q;
         gamma = gamma_prime;
     }
-    
+
     // AFTER LOOP: Apply final transformation to get consistent basis (Fix 3)
-    
+
     // Step 8: Calculate final transformed total penalty matrix using final Qf
     let mut s_original_total = Array2::zeros((p, p));
     for i in 0..m {
         s_original_total.scaled_add(lambdas[i], &s_list[i]);
     }
     let s_transformed = qf.t().dot(&s_original_total.dot(&qf));
-    
+
     // Step 9: Transform all component penalties using final Qf (for consistent derivative calculation)
     let mut rs_transformed = Vec::with_capacity(m);
     for i in 0..m {
         let s_k_transformed = qf.t().dot(&s_list[i].dot(&qf));
         rs_transformed.push(s_k_transformed);
     }
-    
+
     // Step 10: Calculate stable log-determinant
     use crate::calibrate::estimate::internal::calculate_log_det_pseudo;
-    let log_det = calculate_log_det_pseudo(&s_transformed)
-        .unwrap_or_else(|_| {
-            // Fallback: eigenvalue computation
-            match s_transformed.eigh(UPLO::Lower) {
-                Ok((eigenvalues, _)) => {
-                    eigenvalues.iter()
-                        .filter(|&&ev| ev > 1e-12)
-                        .map(|&ev| ev.ln())
-                        .sum()
-                }
-                Err(_) => 0.0
-            }
-        });
-    
+    let log_det = calculate_log_det_pseudo(&s_transformed).unwrap_or_else(|_| {
+        // Fallback: eigenvalue computation
+        match s_transformed.eigh(UPLO::Lower) {
+            Ok((eigenvalues, _)) => eigenvalues
+                .iter()
+                .filter(|&&ev| ev > 1e-12)
+                .map(|&ev| ev.ln())
+                .sum(),
+            Err(_) => 0.0,
+        }
+    });
+
     // Step 11: Calculate derivatives with consistent basis (Fix 3)
     let mut det1 = Array1::zeros(lambdas.len());
-    
+
     // Compute pseudo-inverse of transformed total penalty
-    let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed.eigh(UPLO::Lower)
+    let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
+        .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    
+
     let tolerance = 1e-12;
     let mut s_plus = Array2::zeros((p, p));
     for (i, &eigenval) in s_eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
             let v_i = s_eigenvectors.column(i);
-            let outer_product = v_i.to_owned().insert_axis(Axis(1)).dot(&v_i.to_owned().insert_axis(Axis(0)));
+            let outer_product = v_i
+                .to_owned()
+                .insert_axis(Axis(1))
+                .dot(&v_i.to_owned().insert_axis(Axis(0)));
             s_plus.scaled_add(1.0 / eigenval, &outer_product);
         }
     }
-    
+
     // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed) - BOTH matrices in same basis
     for k in 0..lambdas.len() {
         let s_plus_times_s_k_transformed = s_plus.dot(&rs_transformed[k]);
         let trace: f64 = s_plus_times_s_k_transformed.diag().sum();
         det1[k] = lambdas[k] * trace;
     }
-    
+
     Ok(ReparamResult {
         s_transformed,
         log_det,
@@ -690,9 +752,6 @@ pub struct StablePLSResult {
     /// Scale parameter estimate
     pub scale: f64,
 }
-
-
-
 
 /// Calculate the condition number of a matrix using singular value decomposition (SVD).
 ///

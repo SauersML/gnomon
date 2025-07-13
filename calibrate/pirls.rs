@@ -37,12 +37,14 @@ pub fn fit_model_for_fixed_rho(
     let lambdas = rho_vec.mapv(f64::exp);
 
     // Show calculated lambda values
-    eprintln!("    [Debug] Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]", 
-             lambdas[0], 
-             lambdas.get(1).unwrap_or(&0.0), 
-             lambdas.get(2).unwrap_or(&0.0), 
-             lambdas.get(3).unwrap_or(&0.0), 
-             lambdas.get(4).unwrap_or(&0.0));
+    eprintln!(
+        "    [Debug] Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]",
+        lambdas[0],
+        lambdas.get(1).unwrap_or(&0.0),
+        lambdas.get(2).unwrap_or(&0.0),
+        lambdas.get(3).unwrap_or(&0.0),
+        lambdas.get(4).unwrap_or(&0.0)
+    );
 
     // Use simple S_lambda construction for P-IRLS (stable reparameterization used elsewhere)
     use crate::calibrate::construction::construct_s_lambda;
@@ -122,7 +124,7 @@ pub fn fit_model_for_fixed_rho(
         } else {
             (last_deviance - deviance).abs()
         };
-        
+
         // A more detailed, real-time print for each inner-loop iteration
         eprintln!(
             "    [P-IRLS Iteration #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}",
@@ -161,7 +163,7 @@ pub fn fit_model_for_fixed_rho(
 
         if absolute_converged || relative_converged {
             eprintln!("    P-IRLS Converged."); // ADD THIS LINE
-            
+
             let final_eta = x.dot(&beta);
             let (final_mu, final_weights, _) =
                 update_glm_vectors(y, &final_eta, config.link_function);
@@ -180,8 +182,11 @@ pub fn fit_model_for_fixed_rho(
         last_change = deviance_change;
     }
 
-    eprintln!("    P-IRLS FAILED to converge after {} iterations.", config.max_iterations); // ADD THIS LINE
-    
+    eprintln!(
+        "    P-IRLS FAILED to converge after {} iterations.",
+        config.max_iterations
+    ); // ADD THIS LINE
+
     Err(EstimationError::PirlsDidNotConverge {
         max_iterations: config.max_iterations,
         last_change,

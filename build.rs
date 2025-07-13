@@ -193,11 +193,15 @@ fn manually_check_for_unused_variables() {
     let build_path = Path::new("build.rs");
     let status = std::process::Command::new("rustc")
         .args(&[
-            "--edition", "2021",
-            "-D", "unused_variables",
-            "--crate-type", "bin",
-            "--error-format", "human",
-            build_path.to_str().unwrap()
+            "--edition",
+            "2021",
+            "-D",
+            "unused_variables",
+            "--crate-type",
+            "bin",
+            "--error-format",
+            "human",
+            build_path.to_str().unwrap(),
         ])
         .output();
 
@@ -209,7 +213,9 @@ fn manually_check_for_unused_variables() {
                     eprintln!("\n❌ ERROR: Unused variables detected in build.rs!");
                     eprintln!("{}", stderr);
                     eprintln!("\n⚠️ Unused variables are STRICTLY FORBIDDEN in this project.");
-                    eprintln!("   Either use the variable or remove it completely. Underscore prefixes are NOT allowed.");
+                    eprintln!(
+                        "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
+                    );
                     std::process::exit(1);
                 }
             }

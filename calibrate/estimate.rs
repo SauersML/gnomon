@@ -22,7 +22,6 @@
 //! robust fit.
 
 // External Crate for Optimization
-use indicatif::{ProgressBar, ProgressStyle};
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
@@ -38,7 +37,8 @@ use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Cholesky, EigVals, Eigh, Solve, UPLO};
+use ndarray_linalg::{Cholesky, Diag, EigVals, Eigh, Solve, SolveTriangular, UPLO};
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -343,6 +343,74 @@ pub mod internal {
     use super::*;
     use ndarray_linalg::SVD;
     use ndarray_linalg::error::LinalgError;
+
+    /// Robust solver that provides fallback mechanisms for maximum numerical stability
+    enum RobustSolver {
+        Cholesky(Array2<f64>), // Store matrix, will use Cholesky decomposition
+        Fallback(Array2<f64>), // Store matrix, will use existing robust_solve
+    }
+
+    impl RobustSolver {
+        /// Create a solver with automatic fallback: Cholesky → robust_solve
+        fn new(matrix: &Array2<f64>) -> Result<Self, EstimationError> {
+            // First, try Cholesky decomposition to test if matrix is positive-definite
+            match matrix.cholesky(UPLO::Lower) {
+                Ok(_) => {
+                    log::debug!("Using Cholesky decomposition for matrix solving");
+                    Ok(RobustSolver::Cholesky(matrix.clone()))
+                }
+                Err(_) => {
+                    // Fallback to existing robust_solve method
+                    log::warn!(
+                        "Cholesky failed, will fall back to robust_solve for individual operations"
+                    );
+                    Ok(RobustSolver::Fallback(matrix.clone()))
+                }
+            }
+        }
+
+        /// Solve the linear system Ax = b
+        fn solve(
+            &self,
+            _matrix: &Array2<f64>,
+            rhs: &Array1<f64>,
+        ) -> Result<Array1<f64>, EstimationError> {
+            match self {
+                RobustSolver::Cholesky(stored_matrix) => {
+                    // Use Cholesky decomposition for solving
+                    let chol = stored_matrix
+                        .cholesky(UPLO::Lower)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                    chol.solve(rhs)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))
+                }
+                RobustSolver::Fallback(stored_matrix) => robust_solve(stored_matrix, rhs),
+            }
+        }
+
+        /// Solve triangular system (only available for Cholesky)
+        fn solve_triangular(
+            &self,
+            _matrix: &Array2<f64>,
+            rhs: &Array1<f64>,
+        ) -> Result<Array1<f64>, EstimationError> {
+            match self {
+                RobustSolver::Cholesky(stored_matrix) => {
+                    // Use Cholesky decomposition for triangular solving
+                    let chol = stored_matrix
+                        .cholesky(UPLO::Lower)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+                    chol.solve_triangular(UPLO::Lower, Diag::NonUnit, rhs)
+                        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))
+                }
+                RobustSolver::Fallback(stored_matrix) => {
+                    // For fallback, use full robust solve
+                    log::debug!("Fallback: using robust_solve instead of triangular solve");
+                    robust_solve(stored_matrix, rhs)
+                }
+            }
+        }
+    }
 
     /// Holds the state for the outer REML optimization. Implements `CostFunction`
     /// and `Gradient` for the `argmin` library.
@@ -794,179 +862,88 @@ pub mod internal {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // For LAML, implement complete weight derivative calculation
 
-                    let start_time = std::time::Instant::now();
-                    eprintln!(
-                        "    [Debug] Starting gradient computation loop for {} params...",
-                        lambdas.len()
+                    log::debug!("Pre-computing for gradient calculation...");
+                    let h_chol_start = std::time::Instant::now();
+
+                    // --- Pre-computation: Do this ONCE per gradient evaluation ---
+                    // 1. Create a robust solver for the penalized Hessian H = (X'WX + S).
+                    //    Try Cholesky first (fastest), then fall back to LU if needed.
+                    let solver = RobustSolver::new(&pirls_result.penalized_hessian)?;
+
+                    log::debug!(
+                        "Cholesky decomp took: {:.3}ms",
+                        h_chol_start.elapsed().as_secs_f64() * 1000.0
                     );
+                    let hat_diag_start = std::time::Instant::now();
+
+                    // 2. Compute the diagonal of the "hat matrix" X * H⁻¹ * Xᵀ. This is the expensive part.
+                    //    We do it efficiently and IN PARALLEL without forming H⁻¹ explicitly.
+                    //    For each row x_i of X, we solve the system and compute ||solution||².
+                    //    Collect rows first, then use rayon for parallel processing.
+                    let rows: Vec<_> = self.x.axis_iter(Axis(0)).collect();
+                    let hat_diag_results: Vec<f64> = rows
+                        .into_par_iter() // <--- Parallel iteration using rayon
+                        .map(|row| -> Result<f64, EstimationError> {
+                            // For each row x_i of X, solve the triangular system if possible
+                            let c_i = solver.solve_triangular(
+                                &pirls_result.penalized_hessian,
+                                &row.to_owned(),
+                            )?;
+                            // The diagonal element is ||c_i||²
+                            Ok(c_i.dot(&c_i))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let hat_diag = Array1::from(hat_diag_results);
+
+                    log::debug!(
+                        "Hat matrix diagonal took: {:.3}ms",
+                        hat_diag_start.elapsed().as_secs_f64() * 1000.0
+                    );
+
+                    // --- Now, loop through the penalties (this part is now extremely fast) ---
                     for k in 0..lambdas.len() {
-                        let param_start = std::time::Instant::now();
                         let s_k_full = &self.s_list[k];
 
-                        // Calculate dβ/dρ_k = -λ_k(H_p)^(-1)S_k*β
+                        // Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         let s_k_beta = s_k_full.dot(beta);
-                        let dbeta_drho_k = match internal::robust_solve(
-                            &pirls_result.penalized_hessian,
-                            &s_k_beta,
-                        ) {
-                            Ok(solved) => -lambdas[k] * solved,
-                            Err(_) => {
-                                log::warn!(
-                                    "Failed to solve for dβ/dρ in LAML gradient computation"
-                                );
-                                Array1::zeros(beta.len())
-                            }
-                        };
+                        // Use the robust solver (automatically handles Cholesky or robust_solve fallback)
+                        let dbeta_drho_k = -lambdas[k]
+                            * solver.solve(&pirls_result.penalized_hessian, &s_k_beta)?;
 
-                        // Term 1: Weight derivative contribution (critical for LAML)
-                        // ∂/∂ρ_k tr(H_p^(-1) X^T ∂W/∂ρ_k X) following mgcv gdi1.c
-                        let eta = self.x.dot(beta);
+                        // Your existing logic for these derivatives is correct and fast
+                        let eta = self.x.dot(beta); // Re-calculate eta inside loop if needed, it's fast
                         let deta_drho_k = self.x.dot(&dbeta_drho_k);
-
-                        // For logit link: W = μ(1-μ), ∂W/∂η = μ(1-μ)(1-2μ)
                         let dw_deta = eta.mapv(|e| {
-                            let exp_neg_e = (-e).exp();
-                            let mu = 1.0 / (1.0 + exp_neg_e);
+                            let mu = 1.0 / (1.0 + (-e).exp());
                             mu * (1.0 - mu) * (1.0 - 2.0 * mu)
                         });
-
-                        // ∂W/∂ρ_k = (∂W/∂η) * (∂η/∂ρ_k)
                         let dw_drho_k = &dw_deta * &deta_drho_k;
 
-                        // Compute tr(H_p^(-1) X^T ∂W/∂ρ_k X) using the fact that this equals
-                        // the diagonal sum of H_p^(-1) applied to the weighted outer products
-                        eprintln!("    [Debug] Starting weight derivative trace computation...");
-                        let loop_start = std::time::Instant::now();
-                        let mut solve_count = 0;
-                        let mut solve_failures = 0;
-                        let mut weight_deriv_trace = 0.0;
+                        // The catastrophically slow nested loop is replaced by a single dot product.
+                        // This is the vectorized, O(N) calculation of tr(H⁻¹Xᵀ(∂W/∂ρ)X).
+                        let weight_deriv_term = 0.5 * dw_drho_k.dot(&hat_diag);
 
-                        // Create progress bar for data points
-                        let pb = ProgressBar::new(self.x.nrows() as u64);
-                        pb.set_style(ProgressStyle::default_bar()
-                            .template("    [Data Points] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                            .unwrap()
-                            .progress_chars("#>-"));
-
-                        for i in 0..self.x.nrows() {
-                            pb.inc(1);
-                            //eprintln!("    [Debug] Checking dw_drho_k[{}] = {}", i, dw_drho_k[i]);
-                            if dw_drho_k[i].abs() > 1e-15 {
-                                //eprintln!(
-                                //    "    [Debug] dw_drho_k[{}] passes threshold, processing...",
-                                //    i
-                                //);
-                                let x_i = self.x.row(i);
-                                //eprintln!(
-                                //    "    [Debug] Got x_i for row {}, shape: {:?}",
-                                //    i,
-                                //    x_i.shape()
-                                //);
-                                let weighted_outer = &x_i.to_owned()
-                                    * (dw_drho_k[i] * &x_i.to_owned().view().insert_axis(Axis(1)));
-                                //eprintln!(
-                                //    "    [Debug] Created weighted_outer, shape: {:?}",
-                                //    weighted_outer.shape()
-                                //);
-                                // Approximate trace efficiently
-                                //eprintln!(
-                                //    "    [Debug] Starting inner loop for {} columns",
-                                //    weighted_outer.ncols()
-                                //);
-                                for j in 0..weighted_outer.ncols() {
-                                    if j % 50 == 0 {
-                                        //eprintln!(
-                                        //    "    [Debug] Processing column {}/{}",
-                                        //    j,
-                                        //    weighted_outer.ncols()
-                                        //);
-                                    }
-                                    solve_count += 1;
-                                    let col = weighted_outer.column(j);
-                                    // eprintln!(
-                                    //    "    [Debug] About to call robust_solve for column {}",
-                                    //    j
-                                    //);
-                                    match internal::robust_solve(
-                                        &pirls_result.penalized_hessian,
-                                        &col.to_owned(),
-                                    ) {
-                                        Ok(h_inv_col) => {
-                                            //eprintln!(
-                                            //    "    [Debug] robust_solve succeeded for column {}",
-                                            //    j
-                                            //);
-                                            weight_deriv_trace += h_inv_col[j];
-                                        }
-                                        Err(_) => {
-                                            eprintln!(
-                                                "    [Debug] robust_solve failed for column {}",
-                                                j
-                                            );
-                                            solve_failures += 1;
-                                        }
-                                    }
-                                }
-                                //eprintln!("    [Debug] Finished inner loop for data point {}", i);
-                            } else {
-                                eprintln!("    [Debug] dw_drho_k[{}] below threshold, skipping", i);
-                            }
-                        }
-
-                        pb.finish_with_message("    [Data Points] Processing complete");
-
-                        let loop_elapsed = loop_start.elapsed();
-                        eprintln!("    [Debug] Weight derivative computation completed:");
-                        eprintln!("    [Debug]   - Total solve calls: {}", solve_count);
-                        eprintln!("    [Debug]   - Failed solves: {}", solve_failures);
-                        eprintln!(
-                            "    [Debug]   - Time elapsed: {:.2}s",
-                            loop_elapsed.as_secs_f64()
-                        );
-                        if loop_elapsed.as_secs_f64() > 0.0 {
-                            eprintln!(
-                                "    [Debug]   - Solves per second: {:.1}",
-                                solve_count as f64 / loop_elapsed.as_secs_f64()
-                            );
-                        }
-
-                        let weight_deriv_term = weight_deriv_trace / 2.0;
-
-                        // Term 2: tr(H_p^(-1) S_k) - this will be subtracted
+                        // Term 2: tr(H⁻¹ * S_k). This is also fast.
+                        // We need to solve for each column and sum the diagonal elements
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..s_k_full.ncols() {
                             let s_k_col = s_k_full.column(j);
-                            if let Ok(h_inv_col) = internal::robust_solve(
-                                &pirls_result.penalized_hessian,
-                                &s_k_col.to_owned(),
-                            ) {
-                                trace_h_inv_s_k += h_inv_col[j];
-                            }
+                            let h_inv_col = solver
+                                .solve(&pirls_result.penalized_hessian, &s_k_col.to_owned())?;
+                            trace_h_inv_s_k += h_inv_col[j];
                         }
 
-                        // Term 3: tr(S_λ^+ S_k) from det1 - this will be added
-                        // reparam_result.det1[k] = λ_k * tr(S_λ^+ S_k)
+                        // Term 3: tr(S_λ⁺ S_k) from the reparameterization result.
                         let tr_s_plus_s_k = reparam_result.det1[k] / lambdas[k];
 
-                        // Trace difference term: 0.5 * λ_k * [tr(S_λ⁺ S_k) - tr(H_p⁻¹ S_k)]
+                        // Assemble the gradient component for the score (which we maximize)
                         let trace_diff_term = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k);
-
-                        // This is the gradient of the SCORE (V_LAML), which is maximized
                         score_gradient[k] = trace_diff_term + weight_deriv_term;
-
-                        eprintln!(
-                            "    [Debug] Penalty parameter {} completed in {:.2}s",
-                            k + 1,
-                            param_start.elapsed().as_secs_f64()
-                        );
                     }
-
-                    let total_elapsed = start_time.elapsed();
-                    eprintln!(
-                        "    [Debug] Total gradient computation time: {:.2}s",
-                        total_elapsed.as_secs_f64()
-                    );
-                    eprintln!("    [Debug] Gradient computation loop finished.");
+                    log::debug!("Gradient computation loop finished.");
+                    // =========================================================================
+                    // =================== END OF NEW FAST IMPLEMENTATION ======================
+                    // =========================================================================
                 }
             }
 
