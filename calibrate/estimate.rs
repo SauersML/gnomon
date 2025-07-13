@@ -87,10 +87,14 @@ pub fn train_model(
         data.y.len()
     );
 
+    eprintln!("\n[STAGE 1/3] Constructing model structure...");
+    
     // 1. Build the one-time matrices and define the model structure.
     let (x_matrix, s_list, layout, constraints, knot_vectors) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
+    
+    eprintln!("[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}", layout.total_coeffs, layout.num_penalties);
 
     // 2. Set up the REML optimization problem.
     let reml_state =
@@ -118,10 +122,22 @@ pub fn train_model(
     }
     log::info!("Initial REML cost: {:.6}", initial_cost);
 
+    eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
+    
     // 5. Run the BFGS optimizer with the wolfe_bfgs library
     // Create a clone of reml_state_arc for the closure
     let reml_state_for_closure = reml_state_arc.clone();
+    
+    // Add counter for BFGS evaluations
+    let current_eval = std::cell::RefCell::new(0);
+    
     let cost_and_grad = move |rho_bfgs: &Array1<f64>| -> (f64, Array1<f64>) {
+        // Increment the evaluation counter
+        let eval_num = {
+            let mut counter = current_eval.borrow_mut();
+            *counter += 1;
+            *counter
+        };
         // --- STABILITY ENHANCEMENT 1: Parameter Bounding ---
         // The `wolfe_bfgs` library does not support box constraints. To prevent the
         // optimizer from stepping into extreme regions where `exp(rho)` could
@@ -182,6 +198,15 @@ pub fn train_model(
                             );
                             return (1e10, Array1::zeros(rho_bfgs.len())); // Help line search avoid Inf
                         }
+
+                        // Calculate gradient norm for logging
+                        let grad_norm = grad.dot(&grad).sqrt();
+                        
+                        // This print now serves as a header for the P-IRLS output that follows
+                        eprintln!(
+                            "\n[BFGS Eval #{:<3}] Cost: {:<13.7} | Grad Norm: {:<12.6e}",
+                            eval_num, cost, grad_norm
+                        );
 
                         // Return the true cost and the true gradient.
                         (cost, grad)
@@ -249,6 +274,8 @@ pub fn train_model(
         "Final estimated smoothing parameters (lambda): {:?}",
         &final_lambda.to_vec()
     );
+
+    eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
 
     // Fit the model one last time with the optimal lambdas to get final coefficients.
     let final_fit = pirls::fit_model_for_fixed_rho(
@@ -354,6 +381,9 @@ pub mod internal {
             if let Some(cached_result) = self.cache.borrow().get(&key) {
                 return Ok(cached_result.clone());
             }
+
+            // ADD THIS LINE to show when the expensive inner loop is being called
+            eprintln!("  -> Solving inner P-IRLS loop for this evaluation...");
 
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),

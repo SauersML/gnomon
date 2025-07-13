@@ -4,7 +4,6 @@ use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
-
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
 ///
 /// # Fields
@@ -36,7 +35,7 @@ pub fn fit_model_for_fixed_rho(
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
-    
+
     // Use simple S_lambda construction for P-IRLS (stable reparameterization used elsewhere)
     use crate::calibrate::construction::construct_s_lambda;
     let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
@@ -47,17 +46,32 @@ pub fn fit_model_for_fixed_rho(
     let mut last_change = f64::INFINITY;
 
     // Validate dimensions
-    assert_eq!(x.ncols(), layout.total_coeffs, "X matrix columns must match total coefficients");
-    assert_eq!(s_lambda.nrows(), layout.total_coeffs, "S_lambda rows must match total coefficients");
-    assert_eq!(s_lambda.ncols(), layout.total_coeffs, "S_lambda columns must match total coefficients");
+    assert_eq!(
+        x.ncols(),
+        layout.total_coeffs,
+        "X matrix columns must match total coefficients"
+    );
+    assert_eq!(
+        s_lambda.nrows(),
+        layout.total_coeffs,
+        "S_lambda rows must match total coefficients"
+    );
+    assert_eq!(
+        s_lambda.ncols(),
+        layout.total_coeffs,
+        "S_lambda columns must match total coefficients"
+    );
 
     for iter in 1..=config.max_iterations {
         let eta = x.dot(&beta);
         let (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
 
         // Check for non-finite values
-        if !eta.iter().all(|x| x.is_finite()) || !mu.iter().all(|x| x.is_finite()) ||
-           !weights.iter().all(|x| x.is_finite()) || !z.iter().all(|x| x.is_finite()) {
+        if !eta.iter().all(|x| x.is_finite())
+            || !mu.iter().all(|x| x.is_finite())
+            || !weights.iter().all(|x| x.is_finite())
+            || !z.iter().all(|x| x.is_finite())
+        {
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
                 last_change: f64::NAN,
@@ -65,13 +79,9 @@ pub fn fit_model_for_fixed_rho(
         }
 
         // Use stable solver for P-IRLS inner loop (robust iteration)
-        let stable_result = stable_penalized_least_squares(
-            x.view(),
-            z.view(),
-            weights.view(),
-            &s_lambda,
-        )?;
-        
+        let stable_result =
+            stable_penalized_least_squares(x.view(), z.view(), weights.view(), &s_lambda)?;
+
         beta = stable_result.beta;
 
         if !beta.iter().all(|x| x.is_finite()) {
@@ -101,6 +111,12 @@ pub fn fit_model_for_fixed_rho(
         } else {
             (last_deviance - deviance).abs()
         };
+        
+        // A more detailed, real-time print for each inner-loop iteration
+        eprintln!(
+            "    [P-IRLS Iter #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}",
+            iter, deviance, deviance_change
+        );
 
         if !deviance_change.is_finite() {
             log::error!(
@@ -133,13 +149,15 @@ pub fn fit_model_for_fixed_rho(
         let relative_converged = relative_change < 1e-3; // 0.1% relative change is tight enough
 
         if absolute_converged || relative_converged {
+            eprintln!("    P-IRLS Converged."); // ADD THIS LINE
+            
             let final_eta = x.dot(&beta);
             let (final_mu, final_weights, _) =
                 update_glm_vectors(y, &final_eta, config.link_function);
 
             // For the final result, compute the penalized Hessian properly
             let penalized_hessian = compute_penalized_hessian(x, &final_weights, &s_lambda)?;
-            
+
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
@@ -151,6 +169,8 @@ pub fn fit_model_for_fixed_rho(
         last_change = deviance_change;
     }
 
+    eprintln!("    P-IRLS FAILED to converge after {} iterations.", config.max_iterations); // ADD THIS LINE
+    
     Err(EstimationError::PirlsDidNotConverge {
         max_iterations: config.max_iterations,
         last_change,
@@ -244,53 +264,60 @@ pub fn stable_penalized_least_squares(
 ) -> Result<StablePLSResult, EstimationError> {
     let n = x.nrows();
     let p = x.ncols();
-    
-    use ndarray_linalg::{QR, SVD, Solve};
+
     use ndarray::s;
-    
+    use ndarray_linalg::{QR, SVD, Solve};
+
     // Step 1: Initial QR decomposition of sqrt(|W|)X (Wood 2011, Section 3.3)
     let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
     let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1)); // sqrt(|W|)X
     let (q_bar, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    
+
     // Step 2: Get penalty square root E where E'E = S_lambda
     let e_matrix = penalty_square_root(s_lambda)?;
-    
+
     // Step 3: Form augmented matrix [R_bar; E] and perform QR decomposition
     let r_rows = r_bar.nrows().min(p);
     let mut augmented = Array2::zeros((r_rows + p, p));
-    augmented.slice_mut(s![..r_rows, ..]).assign(&r_bar.slice(s![..r_rows, ..]));
+    augmented
+        .slice_mut(s![..r_rows, ..])
+        .assign(&r_bar.slice(s![..r_rows, ..]));
     augmented.slice_mut(s![r_rows.., ..]).assign(&e_matrix);
-    
-    let (_, r_final) = augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    
+
+    let (_, r_final) = augmented
+        .qr()
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+
     // Step 4: Handle negative weights using Q_bar from INITIAL QR (not q_aug)
-    let neg_indices: Vec<usize> = weights.iter().enumerate()
+    let neg_indices: Vec<usize> = weights
+        .iter()
+        .enumerate()
         .filter(|(_, w)| **w < 0.0)
         .map(|(i, _)| i)
         .collect();
-    
+
     let final_hessian = if neg_indices.is_empty() {
         // No negative weights: simple case
         r_final.t().dot(&r_final)
     } else {
         // Apply SVD correction using Q_bar (the CORRECT Q matrix)
         let q1_neg = q_bar.select(Axis(0), &neg_indices); // Select rows corresponding to negative weights
-        
+
         // SVD of Q1_neg
-        let (_, sigma, vt_opt) = q1_neg.svd(false, true)
+        let (_, sigma, vt_opt) = q1_neg
+            .svd(false, true)
             .map_err(EstimationError::LinearSystemSolveFailed)?;
-        
+
         if let Some(vt) = vt_opt {
             // Form correction matrix (I - 2VD²V')
             let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
             for (i, &s) in sigma.iter().enumerate() {
                 d_squared[[i, i]] = s * s;
             }
-            
+
             let v = vt.t();
             let correction = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
-            
+
             // Apply correction: R_final'(I - 2VD²V')R_final
             r_final.t().dot(&correction.dot(&r_final))
         } else {
@@ -298,27 +325,34 @@ pub fn stable_penalized_least_squares(
             r_final.t().dot(&r_final)
         }
     };
-    
+
     // Step 5: Calculate RHS = X'Wz correctly (no complex correction needed)
     // Form z_tilde with sign correction for negative weights
     let mut z_tilde = &y * &sqrt_w_abs;
     for &i in &neg_indices {
         z_tilde[i] = -z_tilde[i]; // Flip sign for negative weights
     }
-    
+
     // Stable RHS calculation using QR decomposition results
     // RHS = R_bar' * Q_bar' * z_tilde
     let q_t_z = q_bar.t().dot(&z_tilde.slice(s![..q_bar.nrows()]));
-    let rhs = r_bar.slice(s![..r_rows, ..]).t().dot(&q_t_z.slice(s![..r_rows]));
-    
+    let rhs = r_bar
+        .slice(s![..r_rows, ..])
+        .t()
+        .dot(&q_t_z.slice(s![..r_rows]));
+
     // Step 6: Solve the final system
-    let beta = final_hessian.solve(&rhs)
+    let beta = final_hessian
+        .solve(&rhs)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
-    
+
     // Step 7: Calculate effective degrees of freedom
     // EDF = tr(H⁻¹X'WX) where H = final_hessian
-    let mut xtwx_base = r_bar.slice(s![..r_rows, ..]).t().dot(&r_bar.slice(s![..r_rows, ..]));
-    
+    let mut xtwx_base = r_bar
+        .slice(s![..r_rows, ..])
+        .t()
+        .dot(&r_bar.slice(s![..r_rows, ..]));
+
     // Apply same correction to X'WX for EDF calculation if negative weights exist
     if !neg_indices.is_empty() {
         let q1_neg = q_bar.select(Axis(0), &neg_indices);
@@ -332,7 +366,7 @@ pub fn stable_penalized_least_squares(
             xtwx_base = xtwx_base.dot(&correction);
         }
     }
-    
+
     let mut edf: f64 = 0.0;
     for j in 0..p {
         if let Ok(h_inv_col) = final_hessian.solve(&xtwx_base.column(j).to_owned()) {
@@ -340,13 +374,13 @@ pub fn stable_penalized_least_squares(
         }
     }
     edf = edf.max(1.0);
-    
+
     // Step 8: Calculate scale parameter
     let fitted = x.dot(&beta);
     let residuals = &y - &fitted;
     let rss = residuals.mapv(|v| v * v).sum();
     let scale = rss / (n as f64 - edf).max(1.0);
-    
+
     Ok(StablePLSResult {
         beta,
         penalized_hessian: final_hessian,
@@ -354,7 +388,6 @@ pub fn stable_penalized_least_squares(
         scale,
     })
 }
-
 
 /// Compute penalized Hessian matrix X'WX + S_λ
 /// Used after P-IRLS convergence for final result
@@ -366,27 +399,28 @@ fn compute_penalized_hessian(
     // Form weighted design matrix √W X
     let sqrt_w = weights.mapv(|w| w.abs().sqrt());
     let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
-    
+
     // Form X'WX + S_λ
     let xtwx = wx.t().dot(&wx);
     let penalized_hessian = &xtwx + s_lambda;
-    
+
     Ok(penalized_hessian)
 }
 
 /// Helper function to compute penalty square root E where E^T E = S
 fn penalty_square_root(s: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    use ndarray_linalg::{Cholesky, UPLO, Eigh};
-    
+    use ndarray_linalg::{Cholesky, Eigh, UPLO};
+
     // Try Cholesky first
     if let Ok(l) = s.cholesky(UPLO::Lower) {
         return Ok(l);
     }
-    
+
     // Fallback to eigendecomposition for semi-definite matrices
-    let (eigenvals, eigenvecs): (Array1<f64>, Array2<f64>) = s.eigh(UPLO::Lower)
+    let (eigenvals, eigenvecs): (Array1<f64>, Array2<f64>) = s
+        .eigh(UPLO::Lower)
         .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
-    
+
     let mut e = Array2::zeros(s.dim());
     for (i, &eval) in eigenvals.iter().enumerate() {
         if eval > 1e-12 {
@@ -399,6 +433,6 @@ fn penalty_square_root(s: &Array2<f64>) -> Result<Array2<f64>, EstimationError> 
             }
         }
     }
-    
+
     Ok(e)
 }
