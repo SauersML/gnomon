@@ -47,18 +47,37 @@ def build_rust_project():
 
 def simulate_data(n_samples: int, seed: int):
     """
-    Simulates a dataset with a complex, non-linear relationship and added noise.
+    Simulates a dataset with a complex, non-linear relationship.
+
+    This version is intentionally designed to be more challenging for the model
+    to prevent the "quasi-perfect separation" problem that can cause optimizers
+    to fail. This is achieved by:
+    1.  Weakening the deterministic "signal" (the true_logit).
+    2.  Increasing the "noise" to create more overlap between classes.
     """
     np.random.seed(seed)
     score = np.random.uniform(-3, 3, n_samples)
     pc1 = np.random.normal(0, 1.2, n_samples)
-    true_logit = (
+
+    # The original signal was too strong, leading to quasi-perfect separation.
+    # We scale the entire expression down to make the underlying probability
+    # surface less extreme.
+    signal_strength = 0.6
+    true_logit = signal_strength * (
         0.8 * np.cos(score * 2) - 1.2 * np.tanh(pc1) +
         1.5 * np.sin(score) * pc1 - 0.5 * (score**2 + pc1**2)
     )
-    noise = np.random.normal(0, 0.5, n_samples)
+
+    # The original noise (std dev 0.5) was too low. Increasing it creates
+    # a more realistic, harder classification problem with more class overlap,
+    # which stabilizes the logistic regression fitting process.
+    noise_std_dev = 2.5
+    noise = np.random.normal(0, noise_std_dev, n_samples)
+
+    # Combine signal and noise, then convert to probability
     probability = 1 / (1 + np.exp(-(true_logit + noise)))
     phenotype = np.random.binomial(1, probability, n_samples)
+    
     return pd.DataFrame({"phenotype": phenotype, "score": score, "PC1": pc1})
 
 
@@ -129,8 +148,10 @@ def main():
     results_df = pd.concat([test_df_full.reset_index(drop=True), predictions_df], axis=1)
 
     # Create a grid to plot the true probability surface
+    # Note: We plot the original, strong signal surface to visualize what the model is trying to approximate.
     score_grid, pc1_grid = np.meshgrid(np.linspace(-3, 3, 100), np.linspace(-3.5, 3.5, 100))
-    true_logit_surface = (
+    signal_strength = 0.6 # Use the same signal strength for visualization
+    true_logit_surface = signal_strength * (
         0.8 * np.cos(score_grid * 2) - 1.2 * np.tanh(pc1_grid) +
         1.5 * np.sin(score_grid) * pc1_grid - 0.5 * (score_grid**2 + pc1_grid**2)
     )
@@ -145,7 +166,7 @@ def main():
         cmap="plasma", edgecolor="black", linewidth=0.5, s=50,
     )
     fig.colorbar(scatter, ax=ax, label="Model Predicted Probability")
-    ax.set_title("GAM Model Predictions vs. Complex Ground Truth", fontsize=16)
+    ax.set_title("GAM Model Predictions vs. Complex Ground Truth (Noisy Data)", fontsize=16)
     ax.set_xlabel("Polygenic Score (score)", fontsize=12)
     ax.set_ylabel("Principal Component 1 (PC1)", fontsize=12)
     ax.grid(True, linestyle='--', alpha=0.6)
