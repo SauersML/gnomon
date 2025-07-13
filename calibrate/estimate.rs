@@ -850,52 +850,52 @@ pub mod internal {
 
                         for i in 0..self.x.nrows() {
                             pb.inc(1);
-                            eprintln!("    [Debug] Checking dw_drho_k[{}] = {}", i, dw_drho_k[i]);
+                            //eprintln!("    [Debug] Checking dw_drho_k[{}] = {}", i, dw_drho_k[i]);
                             if dw_drho_k[i].abs() > 1e-15 {
-                                eprintln!(
-                                    "    [Debug] dw_drho_k[{}] passes threshold, processing...",
-                                    i
-                                );
+                                //eprintln!(
+                                //    "    [Debug] dw_drho_k[{}] passes threshold, processing...",
+                                //    i
+                                //);
                                 let x_i = self.x.row(i);
-                                eprintln!(
-                                    "    [Debug] Got x_i for row {}, shape: {:?}",
-                                    i,
-                                    x_i.shape()
-                                );
+                                //eprintln!(
+                                //    "    [Debug] Got x_i for row {}, shape: {:?}",
+                                //    i,
+                                //    x_i.shape()
+                                //);
                                 let weighted_outer = &x_i.to_owned()
                                     * (dw_drho_k[i] * &x_i.to_owned().view().insert_axis(Axis(1)));
-                                eprintln!(
-                                    "    [Debug] Created weighted_outer, shape: {:?}",
-                                    weighted_outer.shape()
-                                );
+                                //eprintln!(
+                                //    "    [Debug] Created weighted_outer, shape: {:?}",
+                                //    weighted_outer.shape()
+                                //);
                                 // Approximate trace efficiently
-                                eprintln!(
-                                    "    [Debug] Starting inner loop for {} columns",
-                                    weighted_outer.ncols()
-                                );
+                                //eprintln!(
+                                //    "    [Debug] Starting inner loop for {} columns",
+                                //    weighted_outer.ncols()
+                                //);
                                 for j in 0..weighted_outer.ncols() {
                                     if j % 50 == 0 {
-                                        eprintln!(
-                                            "    [Debug] Processing column {}/{}",
-                                            j,
-                                            weighted_outer.ncols()
-                                        );
+                                        //eprintln!(
+                                        //    "    [Debug] Processing column {}/{}",
+                                        //    j,
+                                        //    weighted_outer.ncols()
+                                        //);
                                     }
                                     solve_count += 1;
                                     let col = weighted_outer.column(j);
-                                    eprintln!(
-                                        "    [Debug] About to call robust_solve for column {}",
-                                        j
-                                    );
+                                    // eprintln!(
+                                    //    "    [Debug] About to call robust_solve for column {}",
+                                    //    j
+                                    //);
                                     match internal::robust_solve(
                                         &pirls_result.penalized_hessian,
                                         &col.to_owned(),
                                     ) {
                                         Ok(h_inv_col) => {
-                                            eprintln!(
-                                                "    [Debug] robust_solve succeeded for column {}",
-                                                j
-                                            );
+                                            //eprintln!(
+                                            //    "    [Debug] robust_solve succeeded for column {}",
+                                            //    j
+                                            //);
                                             weight_deriv_trace += h_inv_col[j];
                                         }
                                         Err(_) => {
@@ -907,7 +907,7 @@ pub mod internal {
                                         }
                                     }
                                 }
-                                eprintln!("    [Debug] Finished inner loop for data point {}", i);
+                                //eprintln!("    [Debug] Finished inner loop for data point {}", i);
                             } else {
                                 eprintln!("    [Debug] dw_drho_k[{}] below threshold, skipping", i);
                             }
@@ -1012,11 +1012,11 @@ pub mod internal {
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        eprintln!(
-            "    [Debug] ENTERING robust_solve - matrix shape: {:?}, rhs len: {}",
-            matrix.shape(),
-            rhs.len()
-        );
+        //eprintln!(
+        //    "    [Debug] ENTERING robust_solve - matrix shape: {:?}, rhs len: {}",
+        //    matrix.shape(),
+        //    rhs.len()
+        //);
         // Try standard solve first for well-conditioned matrices
         if let Ok(solution) = matrix.solve(rhs) {
             return Ok(solution);
