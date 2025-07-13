@@ -114,7 +114,7 @@ pub fn fit_model_for_fixed_rho(
         
         // A more detailed, real-time print for each inner-loop iteration
         eprintln!(
-            "    [P-IRLS Iter #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}",
+            "    [P-IRLS Iteration #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}",
             iter, deviance, deviance_change
         );
 
