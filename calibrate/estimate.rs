@@ -611,6 +611,8 @@ pub mod internal {
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
+                    eprintln!("    [Debug] LAML score calculated: {:.6}", laml);
+
                     // Return negative LAML score for minimization
                     Ok(-laml)
                 }
@@ -788,6 +790,7 @@ pub mod internal {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // For LAML, implement complete weight derivative calculation
 
+                    eprintln!("    [Debug] Starting gradient computation loop for {} params...", lambdas.len());
                     for k in 0..lambdas.len() {
                         let s_k_full = &self.s_list[k];
 
@@ -865,6 +868,7 @@ pub mod internal {
                         // This is the gradient of the SCORE (V_LAML), which is maximized
                         score_gradient[k] = trace_diff_term + weight_deriv_term;
                     }
+                    eprintln!("    [Debug] Gradient computation loop finished.");
                 }
             }
 

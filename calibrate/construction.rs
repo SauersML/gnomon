@@ -472,6 +472,7 @@ pub fn stable_reparameterization(
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
+    eprintln!("    [Debug] Performing stable reparameterization for {} penalties...", lambdas.len());
     let p = layout.total_coeffs;
     let m = s_list.len(); // Number of penalty matrices
     
