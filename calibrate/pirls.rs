@@ -55,7 +55,12 @@ pub fn fit_model_for_fixed_rho(
 
     // Initialize beta as zero vector
     let mut beta = Array1::zeros(layout.total_coeffs);
-    let mut last_deviance = f64::INFINITY;
+
+    // FIX: Compute INITIAL eta, mu, and deviance BEFORE the loop
+    // This gives a finite starting point for last_deviance
+    let mut eta = x.dot(&beta);
+    let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
+    let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut last_change = f64::INFINITY;
 
     // Validate dimensions
@@ -75,10 +80,13 @@ pub fn fit_model_for_fixed_rho(
         "S_lambda columns must match total coefficients"
     );
 
-    for iter in 1..=config.max_iterations {
-        let eta = x.dot(&beta);
-        let (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
+    // FIX: Add minimum iterations based on link function
+    let min_iterations = match config.link_function {
+        LinkFunction::Logit => 3, // Ensure at least some refinement for non-Gaussian
+        LinkFunction::Identity => 1, // Gaussian may converge faster
+    };
 
+    for iter in 1..=config.max_iterations {
         // Check for non-finite values
         if !eta.iter().all(|x| x.is_finite())
             || !mu.iter().all(|x| x.is_finite())
@@ -105,6 +113,10 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
+        // FIX: Recompute eta, mu, weights, z, and deviance AFTER updating beta
+        // This ensures the deviance reflects the new fit for accurate convergence checking
+        eta = x.dot(&beta);
+        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
         let deviance = calculate_deviance(y, &mu, config.link_function);
         if !deviance.is_finite() {
             log::error!("Non-finite deviance at iteration {}: {}", iter, deviance);
@@ -114,16 +126,8 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        let deviance_change = if last_deviance.is_infinite() {
-            // First iteration with infinite last_deviance
-            if deviance.is_finite() {
-                1e10 // Large but finite value to continue iteration
-            } else {
-                f64::INFINITY
-            }
-        } else {
-            (last_deviance - deviance).abs()
-        };
+        // FIX: Compute deviance_change safely (always finite after first iter)
+        let deviance_change = (last_deviance - deviance).abs();
 
         // A more detailed, real-time print for each inner-loop iteration
         eprintln!(
@@ -147,35 +151,26 @@ pub fn fit_model_for_fixed_rho(
             break;
         }
 
-        // Check for convergence using both absolute and relative criteria
-        // The relative criterion is especially important for binary data with
-        // perfect or near-perfect separation, where convergence slows dramatically
-        let relative_change = if last_deviance.abs() > 1e-10 {
-            deviance_change / last_deviance.abs()
-        } else {
-            // If last_deviance is very close to zero, just use the absolute change
-            1.0
-        };
+        // FIX: Robust convergence check
+        // - Skip if below min_iterations
+        // - Use combined relative/absolute: change < tol * (deviance + offset) to handle small deviances
+        // - Offset=0.1 is common (avoids div-by-zero; can tune if needed)
+        let reltol_offset = 0.1;
+        let relative_threshold = config.convergence_tolerance * (deviance.abs() + reltol_offset);
+        let converged = iter >= min_iterations
+            && deviance_change < relative_threshold.max(config.convergence_tolerance);
 
-        // Consider converged if either absolute or relative criterion is met
-        let absolute_converged = deviance_change < config.convergence_tolerance;
-        let relative_converged = relative_change < 1e-3; // 0.1% relative change is tight enough
-
-        if absolute_converged || relative_converged {
+        if converged {
             eprintln!("    P-IRLS Converged."); // ADD THIS LINE
 
-            let final_eta = x.dot(&beta);
-            let (final_mu, final_weights, _) =
-                update_glm_vectors(y, &final_eta, config.link_function);
-
             // For the final result, compute the penalized Hessian properly
-            let penalized_hessian = compute_penalized_hessian(x, &final_weights, &s_lambda)?;
+            let penalized_hessian = compute_penalized_hessian(x, &weights, &s_lambda)?;
 
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
-                deviance: calculate_deviance(y, &final_mu, config.link_function),
-                final_weights,
+                deviance, // Now guaranteed to be the final, converged value
+                final_weights: weights,
             });
         }
         last_deviance = deviance;

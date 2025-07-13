@@ -21,7 +21,7 @@ TEST_DATA_PATH = PROJECT_ROOT / "test_data.tsv"
 
 
 # --- Simulation Configuration ---
-N_SAMPLES_TRAIN = 50000
+N_SAMPLES_TRAIN = 5000
 N_SAMPLES_TEST = 1000
 NUM_PCS = 1  # Simulate 1 PC for easy 2D visualization
 
@@ -115,7 +115,7 @@ def main():
     train_command = [
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", str(NUM_PCS),
-        "--pgs-knots", "2", "--pc-knots", "2",
+        "--pgs-knots", "6", "--pc-knots", "6",
         "--pgs-degree", "2", "--pc-degree", "2",
         str(TRAIN_DATA_PATH)  # Use absolute path
     ]

@@ -165,7 +165,7 @@ pub fn train_model(
         let is_main_step = {
             let last = last_rho.borrow();
             // Compare norms to check for equality, allowing for float precision issues.
-            (rho_bfgs - &*last).mapv(|x| x*x).sum().sqrt() < 1e-9
+            (rho_bfgs - &*last).mapv(|x| x * x).sum().sqrt() < 1e-9
         };
 
         if is_main_step {
@@ -184,7 +184,7 @@ pub fn train_model(
         if eval_num == 1 {
             eprintln!("  -> BFGS optimizer has started its first evaluation.");
         }
-        
+
         // 1. Attempt to compute the cost (the negative REML/LAML score).
         let cost_result = reml_state_for_closure.compute_cost(&safe_rho);
 
@@ -204,14 +204,20 @@ pub fn train_model(
 
                         // Update our flight recorder
                         if is_main_step {
-                            println!("[BFGS Main Step Result] Cost: {:<13.7} | Grad Norm: {:<12.6e}", cost, grad_norm);
+                            println!(
+                                "[BFGS Main Step Result] Cost: {:<13.7} | Grad Norm: {:<12.6e}",
+                                cost, grad_norm
+                            );
                             // This was a successful main step, so update our "flight recorder"
                             *last_rho.borrow_mut() = rho_bfgs.clone();
                             *last_cost.borrow_mut() = cost;
                             *last_grad.borrow_mut() = grad.clone();
                             *last_grad_norm.borrow_mut() = grad_norm;
                         } else {
-                            println!("[BFGS Line Search Result] -> SUCCESS. Cost is finite: {:.6e}", cost);
+                            println!(
+                                "[BFGS Line Search Result] -> SUCCESS. Cost is finite: {:.6e}",
+                                cost
+                            );
                         }
 
                         // Return the true cost and the true gradient.
@@ -224,7 +230,10 @@ pub fn train_model(
                             &safe_rho,
                             e
                         );
-                        println!("[BFGS Line Search Result] -> GRADIENT FAILED for rho={:?}. Reason: {:?}. Returning Infinity.", &safe_rho, e);
+                        println!(
+                            "[BFGS Line Search Result] -> GRADIENT FAILED for rho={:?}. Reason: {:?}. Returning Infinity.",
+                            &safe_rho, e
+                        );
                         (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
                     }
                 }
@@ -239,10 +248,16 @@ pub fn train_model(
                 );
                 match cost_result {
                     Ok(cost) => {
-                        println!("[BFGS Line Search Result] -> COST FAILED. compute_cost returned a non-finite value: {}. Returning Infinity.", cost);
+                        println!(
+                            "[BFGS Line Search Result] -> COST FAILED. compute_cost returned a non-finite value: {}. Returning Infinity.",
+                            cost
+                        );
                     }
                     Err(e) => {
-                        println!("[BFGS Line Search Result] -> COST FAILED. compute_cost returned an error: {:?}. Returning Infinity.", e);
+                        println!(
+                            "[BFGS Line Search Result] -> COST FAILED. compute_cost returned an error: {:?}. Returning Infinity.",
+                            e
+                        );
                     }
                 }
                 (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
@@ -464,7 +479,10 @@ pub mod internal {
             );
 
             if let Err(e) = &pirls_result {
-                println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {:?}", e);
+                println!(
+                    "[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {:?}",
+                    e
+                );
             }
 
             let pirls_result = pirls_result?; // Propagate error if it occurred
@@ -479,7 +497,10 @@ pub mod internal {
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-            println!("[GNOMON COST] ==> Received rho from optimizer: {:?}", p.to_vec());
+            println!(
+                "[GNOMON COST] ==> Received rho from optimizer: {:?}",
+                p.to_vec()
+            );
 
             let pirls_result = self.execute_pirls_if_needed(p)?;
             let mut lambdas = p.mapv(f64::exp);
@@ -685,7 +706,12 @@ pub mod internal {
 
                     println!("[GNOMON COST] LAML Breakdown:");
                     println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
-                    println!("  - Penalty Term (β'Sβ) : {:.6e}", pirls_result.beta.dot(&reparam_result.s_transformed.dot(&pirls_result.beta)));
+                    println!(
+                        "  - Penalty Term (β'Sβ) : {:.6e}",
+                        pirls_result
+                            .beta
+                            .dot(&reparam_result.s_transformed.dot(&pirls_result.beta))
+                    );
                     println!("  - Penalized LogLik    : {:.6e}", penalised_ll);
                     println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
                     println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
@@ -699,9 +725,15 @@ pub mod internal {
                     if let Some(eigs) = eigenvals {
                         let min_eig = eigs.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
                         let max_eig = eigs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b.re));
-                        println!("    -> (Hessian Eigenvalues: min={:.3e}, max={:.3e})", min_eig, max_eig);
+                        println!(
+                            "    -> (Hessian Eigenvalues: min={:.3e}, max={:.3e})",
+                            min_eig, max_eig
+                        );
                     }
-                    println!("[GNOMON COST] <== Final LAML score: {:.6e} (Cost to minimize: {:.6e})", laml, -laml);
+                    println!(
+                        "[GNOMON COST] <== Final LAML score: {:.6e} (Cost to minimize: {:.6e})",
+                        laml, -laml
+                    );
 
                     eprintln!("    [Debug] LAML score calculated: {:.6}", laml);
 
@@ -1175,6 +1207,7 @@ pub mod internal {
         use crate::calibrate::model::BasisConfig;
         use approx::assert_abs_diff_eq;
         use ndarray::{Array, array};
+        use rand;
 
         fn create_test_config() -> ModelConfig {
             ModelConfig {
@@ -5264,6 +5297,296 @@ pub mod internal {
                     return; // Exit early on expected error
                 }
             }
+
+            // Test moved to module level (see below)
         }
     }
+}
+
+/// Test that verifies the behavior of BFGS optimization with different configurations.
+/// This test intentionally creates conditions where line search failures may occur,
+/// and verifies that our diagnostics correctly capture gradient information.
+#[test]
+fn test_debug_line_search_failure_simple() {
+    use crate::calibrate::model::{ModelConfig, BasisConfig, LinkFunction};
+    use crate::calibrate::data::TrainingData;
+    use crate::calibrate::estimate::{train_model, EstimationError};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use ndarray::Array1;
+    use std::collections::HashMap;
+    use std::time::Instant;
+    
+    println!("=== DEBUGGING LINE SEARCH FAILURE - SIMPLE TEST ===");
+    
+    // Structure to collect test diagnostics
+    #[derive(Default)]
+    struct TestDiagnostics {
+        test1_result: Option<Result<(), String>>,
+        test2_result: Option<Result<(), String>>,
+        test3_result: Option<Result<(), String>>,
+        timings: Vec<(String, std::time::Duration)>,
+        gradient_norms: Vec<(String, f64)>,
+    }
+    
+    let mut diagnostics = TestDiagnostics::default();
+    
+    // Record time for performance analysis
+    let test_start = Instant::now();
+
+    // Use the exact same data that causes failure
+    let n_samples = 2000;
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..=2.0));
+    let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..=1.5));
+    let pcs = pc1_values.into_shape_with_order((n_samples, 1)).unwrap();
+
+    let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
+        let term1 = (pgs_val * 0.5).sin() * 0.4;
+        let term2 = 0.4 * pc_val.powi(2);
+        let term3 = 0.15 * (pgs_val * pc_val).tanh();
+        0.3 + term1 + term2 + term3
+    };
+
+    const PROB_EPS: f64 = 1e-6;
+    let y: Array1<f64> = (0..n_samples)
+        .map(|i| {
+            let pgs_val: f64 = p[i];
+            let pc_val = pcs[[i, 0]];
+            let logit = true_function(pgs_val, pc_val);
+            let prob = 1.0 / (1.0 + f64::exp(-logit));
+            let prob = prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            if rng.gen_range(0.0..1.0) < prob {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Create the test data
+    let data = TrainingData { y, p, pcs };
+
+    // Create a standard test configuration
+    fn create_test_config() -> ModelConfig {
+        ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6, // Reasonable tolerance for accuracy
+            max_iterations: 150,         // Generous iterations for complex spline models
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 15,
+            pgs_basis_config: BasisConfig {
+                num_knots: 3, // Good balance for test data
+                degree: 3,
+            },
+            pc_basis_configs: vec![BasisConfig {
+                num_knots: 3, // Good balance for test data
+                degree: 3,
+            }],
+            pgs_range: (-3.0, 3.0),
+            pc_ranges: vec![(-3.0, 3.0)],
+            pc_names: vec!["PC1".to_string()],
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            num_pgs_interaction_bases: 0, // Will be set during training
+        }
+    }
+    
+    // Helper to extract gradient norm from error messages
+    fn extract_gradient_norm(err: &EstimationError) -> Option<f64> {
+        match err {
+            EstimationError::RemlOptimizationFailed(msg) => {
+                // Try to extract the gradient norm from the log output
+                if let Some(start) = msg.find("Grad Norm:") {
+                    let remaining = &msg[start + "Grad Norm:".len()..];
+                    if let Some(end) = remaining.find("\n") {
+                        let norm_str = &remaining[..end].trim();
+                        if let Ok(norm) = norm_str.parse::<f64>() {
+                            return Some(norm);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    
+    // Test 1: Simple configuration
+    let test1_start = Instant::now();
+    println!("\n--- Test 1: Minimal knots ---");
+    let mut config1 = create_test_config();
+    config1.pgs_basis_config.num_knots = 2;
+    config1.pc_basis_configs[0].num_knots = 2;
+    config1.reml_max_iterations = 20;
+    config1.pgs_range = (-2.0, 2.0);
+    config1.pc_ranges = vec![(-1.5, 1.5)];
+
+    match train_model(&data, &config1) {
+        Ok(_) => {
+            println!("SUCCESS: Minimal knots worked");
+            diagnostics.test1_result = Some(Ok(()));
+        },
+        Err(e) => {
+            println!("FAILED: Minimal knots failed: {:?}", e);
+            
+            // Extract gradient norm if available
+            if let Some(norm) = extract_gradient_norm(&e) {
+                diagnostics.gradient_norms.push(("Test 1".to_string(), norm));
+            }
+            
+            // The minimal knots should work, failure is a diagnostic concern
+            diagnostics.test1_result = Some(Err(format!("Minimal knots config failed: {:?}", e)))
+        },
+    }
+    diagnostics.timings.push(("Test 1".to_string(), test1_start.elapsed()));
+
+    // Test 2: Failing configuration
+    let test2_start = Instant::now();
+    println!("\n--- Test 2: Failing configuration ---");
+    let mut config2 = create_test_config();
+    config2.pgs_basis_config.num_knots = 4;
+    config2.pc_basis_configs[0].num_knots = 4;
+    config2.pgs_basis_config.degree = 2;
+    config2.pc_basis_configs[0].degree = 2;
+    config2.reml_max_iterations = 15; // Reduced to fail faster
+    config2.reml_convergence_tolerance = 1e-4;
+    config2.pgs_range = (-2.0, 2.0);
+    config2.pc_ranges = vec![(-1.5, 1.5)];
+
+    match train_model(&data, &config2) {
+        Ok(_) => {
+            println!("UNEXPECTED: Failing config succeeded");
+            diagnostics.test2_result = Some(Err("Expected LineSearchFailed error but model training succeeded".to_string()));
+        },
+        Err(EstimationError::RemlOptimizationFailed(msg)) => {
+            if msg.contains("LineSearchFailed") {
+                println!("CONFIRMED: LineSearchFailed error reproduced");
+                println!("Error message: {}", msg);
+                diagnostics.test2_result = Some(Ok(()));
+                
+                // Try to extract gradient norm information
+                if let Some(norm) = extract_gradient_norm(&EstimationError::RemlOptimizationFailed(msg.clone())) {
+                    diagnostics.gradient_norms.push(("Test 2".to_string(), norm));
+                }
+            } else {
+                println!("Different REML error: {}", msg);
+                diagnostics.test2_result = Some(Err(format!("Expected LineSearchFailed but got different error: {}", msg)));
+            }
+        },
+        Err(e) => {
+            println!("Different error type: {:?}", e);
+            diagnostics.test2_result = Some(Err(format!("Expected RemlOptimizationFailed but got: {:?}", e)));
+        },
+    }
+    diagnostics.timings.push(("Test 2".to_string(), test2_start.elapsed()));
+
+    // Test 3: Much looser tolerance
+    let test3_start = Instant::now();
+    println!("\n--- Test 3: Looser tolerance ---");
+    let mut config3 = create_test_config();
+    config3.pgs_basis_config.num_knots = 4;
+    config3.pc_basis_configs[0].num_knots = 4;
+    config3.pgs_basis_config.degree = 2;
+    config3.pc_basis_configs[0].degree = 2;
+    config3.reml_max_iterations = 15;
+    config3.reml_convergence_tolerance = 1e-2; // Much looser
+    config3.pgs_range = (-2.0, 2.0);
+    config3.pc_ranges = vec![(-1.5, 1.5)];
+
+    match train_model(&data, &config3) {
+        Ok(_) => {
+            println!("SUCCESS: Looser tolerance worked");
+            diagnostics.test3_result = Some(Ok(()));
+        },
+        Err(e) => {
+            println!("FAILED: Even looser tolerance failed: {:?}", e);
+            
+            // Extract gradient norm if available
+            if let Some(norm) = extract_gradient_norm(&e) {
+                diagnostics.gradient_norms.push(("Test 3".to_string(), norm));
+            }
+            
+            // Looser tolerance should work, failure is a diagnostic concern
+            diagnostics.test3_result = Some(Err(format!("Expected looser tolerance to work but failed: {:?}", e)))
+        },
+    }
+    diagnostics.timings.push(("Test 3".to_string(), test3_start.elapsed()));
+    
+    // Report test summary
+    println!("\n=== TEST SUMMARY ===");
+    println!("Total test duration: {:?}", test_start.elapsed());
+    
+    for (name, duration) in &diagnostics.timings {
+        println!("  {} time: {:?}", name, duration);
+    }
+    
+    println!("\nGradient norms:");
+    for (name, norm) in &diagnostics.gradient_norms {
+        println!("  {}: {:.6e}", name, norm);
+        
+        // Analyze the gradient norms
+        if *norm < 1.0 {
+            println!("  WARNING: {} gradient norm is very small ({:.6e}) - may indicate convergence issues", name, norm);
+        } else if *norm > 10.0 {
+            println!("  WARNING: {} gradient norm is very large ({:.6e}) - may indicate poor conditioning", name, norm);
+        }
+    }
+    
+    println!("\nTest results:");
+    let mut failures = Vec::new();
+    
+    if let Some(result) = &diagnostics.test1_result {
+        match result {
+            Ok(_) => println!("  Test 1: PASS"),
+            Err(msg) => {
+                println!("  Test 1: FAIL - {}", msg);
+                failures.push(format!("Test 1: {}", msg));
+            }
+        }
+    }
+    
+    if let Some(result) = &diagnostics.test2_result {
+        match result {
+            Ok(_) => println!("  Test 2: PASS"),
+            Err(msg) => {
+                println!("  Test 2: FAIL - {}", msg);
+                failures.push(format!("Test 2: {}", msg));
+            }
+        }
+    }
+    
+    if let Some(result) = &diagnostics.test3_result {
+        match result {
+            Ok(_) => println!("  Test 3: PASS"),
+            Err(msg) => {
+                println!("  Test 3: FAIL - {}", msg);
+                failures.push(format!("Test 3: {}", msg));
+            }
+        }
+    }
+    
+    // Fail at the end with all diagnostics
+    let max_gradient_norm = diagnostics.gradient_norms.iter().map(|(_, norm)| *norm).fold(0.0, f64::max);
+    let avg_time = diagnostics.timings.iter().map(|(_, time)| time.as_secs_f64()).sum::<f64>() / diagnostics.timings.len() as f64;
+    
+    // Create diagnostic failure message
+    let mut diagnostic_msg = format!("BFGS LINE SEARCH DIAGNOSTIC FAILURE:\n");
+    diagnostic_msg.push_str(&format!("- Maximum gradient norm: {:.6e}\n", max_gradient_norm));
+    diagnostic_msg.push_str(&format!("- Average computation time: {:.2}s\n", avg_time));
+    diagnostic_msg.push_str("- Individual test failures:\n");
+    
+    for failure in &failures {
+        diagnostic_msg.push_str(&format!("  * {}\n", failure));
+    }
+    
+    // Recommendation based on diagnostics
+    if max_gradient_norm > 5.0 {
+        diagnostic_msg.push_str("\nRECOMMENDATION: Large gradient norms suggest poor conditioning.\n");
+        diagnostic_msg.push_str("  - Try reducing the number of knots\n");
+        diagnostic_msg.push_str("  - Check for potential rank deficiency in the design matrix\n");
+    }
+    
+    panic!("{}", diagnostic_msg);
 }
