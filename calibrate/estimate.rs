@@ -138,6 +138,11 @@ pub fn train_model(
             *counter += 1;
             *counter
         };
+        
+        // Print message on first evaluation
+        if eval_num == 1 {
+            eprintln!("  -> BFGS optimizer has started its first evaluation.");
+        }
         // --- STABILITY ENHANCEMENT 1: Parameter Bounding ---
         // The `wolfe_bfgs` library does not support box constraints. To prevent the
         // optimizer from stepping into extreme regions where `exp(rho)` could

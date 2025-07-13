@@ -40,6 +40,9 @@ pub fn fit_model_for_fixed_rho(
     use crate::calibrate::construction::construct_s_lambda;
     let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
 
+    // Print setup complete message
+    eprintln!("    [Setup] Inner loop setup complete. Starting iterations...");
+
     // Initialize beta as zero vector
     let mut beta = Array1::zeros(layout.total_coeffs);
     let mut last_deviance = f64::INFINITY;
