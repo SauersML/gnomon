@@ -115,8 +115,8 @@ def main():
     train_command = [
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", str(NUM_PCS),
-        "--pgs-knots", "12", "--pc-knots", "8",
-        "--pgs-degree", "3", "--pc-degree", "3",
+        "--pgs-knots", "6", "--pc-knots", "6",
+        "--pgs-degree", "2", "--pc-degree", "2",
         str(TRAIN_DATA_PATH)  # Use absolute path
     ]
     run_subprocess(train_command, cwd=PROJECT_ROOT)
