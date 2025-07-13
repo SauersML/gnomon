@@ -449,7 +449,7 @@ pub struct ReparamResult {
     pub rs: Vec<Array2<f64>>,
 }
 
-use std::io::{Write, stdout};
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Helper to construct the summed, weighted penalty matrix S_lambda.
 /// This version works with full-sized p × p penalty matrices from s_list.
@@ -462,42 +462,36 @@ pub fn construct_s_lambda(
     let mut s_lambda = Array2::zeros((p, p));
 
     let total = s_list.len();
-    if total > 0 {
-        eprintln!(
-            "    [Construction] Building S_lambda from {} penalty matrices...",
-            total
-        );
+    if total == 0 {
+        return s_lambda;
     }
-
+    
+    // Create a progress bar
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "    [Construction] [{bar:20.cyan/blue}] {pos}/{len} penalties (λ_{pos.minus(1)}={msg})"
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  ")
+    );
+    
     // Simple weighted sum since all matrices are now p × p
-    // But now with a progress bar
     for (i, s_k) in s_list.iter().enumerate() {
+        // Format lambda value in scientific notation
+        let lambda_formatted = format!("{:.2e}", lambdas[i]);
+        pb.set_message(lambda_formatted);
+        
+        // Add weighted penalty matrix
         s_lambda.scaled_add(lambdas[i], s_k);
-
-        // Update progress bar every matrix addition
-        if total > 3 {
-            // Only show progress bar if we have enough matrices to make it worthwhile
-            let progress = (i + 1) * 20 / total;
-            let bar = "#".repeat(progress);
-            let space = " ".repeat(20 - progress);
-            eprint!(
-                "\r    [Construction] [{}>{}] {}/{} penalties (λ_{}={:.2e})    ",
-                bar,
-                space,
-                i + 1,
-                total,
-                i,
-                lambdas[i]
-            );
-            let _ = stdout().flush();
-        }
+        
+        // Update progress
+        pb.inc(1);
     }
-
-    if total > 3 {
-        // End the progress bar with a newline
-        eprintln!();
-    }
-
+    
+    // Finish progress bar
+    pb.finish_and_clear();
+    
     s_lambda
 }
 
