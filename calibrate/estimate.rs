@@ -152,7 +152,7 @@ pub fn train_model(
         // Update the evaluation count in our flight recorder too
         *eval_count.borrow_mut() = eval_num;
 
-        // --- FIX: Parameter Bounding Guardrail ---
+        // Parameter Bounding Guardrail
         // The `wolfe_bfgs` library is an unconstrained optimizer. It can propose
         // any rho value. We must add this guardrail to prevent it from stepping
         // into extreme regions where exp(rho) could overflow/underflow,

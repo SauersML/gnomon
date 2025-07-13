@@ -56,7 +56,7 @@ pub fn fit_model_for_fixed_rho(
     // Initialize beta as zero vector
     let mut beta = Array1::zeros(layout.total_coeffs);
 
-    // FIX: Compute INITIAL eta, mu, and deviance BEFORE the loop
+    // Compute INITIAL eta, mu, and deviance BEFORE the loop
     // This gives a finite starting point for last_deviance
     let mut eta = x.dot(&beta);
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
@@ -80,7 +80,7 @@ pub fn fit_model_for_fixed_rho(
         "S_lambda columns must match total coefficients"
     );
 
-    // FIX: Add minimum iterations based on link function
+    // Add minimum iterations based on link function
     let min_iterations = match config.link_function {
         LinkFunction::Logit => 3, // Ensure at least some refinement for non-Gaussian
         LinkFunction::Identity => 1, // Gaussian may converge faster
@@ -205,7 +205,7 @@ pub fn fit_model_for_fixed_rho(
         eta = x.dot(&beta);
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
 
-        // FIX: Compute deviance_change safely (always finite after first iter)
+        // Compute deviance_change safely (always finite after first iter)
         let deviance_change = (last_deviance - deviance).abs();
 
         // A more detailed, real-time print for each inner-loop iteration
@@ -235,7 +235,7 @@ pub fn fit_model_for_fixed_rho(
             break;
         }
 
-        // FIX: Robust convergence check
+        // Robust convergence check
         // - Skip if below min_iterations
         // - Use combined relative/absolute: change < tol * (deviance + offset) to handle small deviances
         // - Offset=0.1 is common (avoids div-by-zero; can tune if needed)

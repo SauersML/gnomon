@@ -115,7 +115,7 @@ def main():
     train_command = [
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", str(NUM_PCS),
-        "--pgs-knots", "6", "--pc-knots", "6",
+        "--pgs-knots", "3", "--pc-knots", "3",
         "--pgs-degree", "2", "--pc-degree", "2",
         str(TRAIN_DATA_PATH)  # Use absolute path
     ]
