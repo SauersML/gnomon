@@ -36,6 +36,14 @@ pub fn fit_model_for_fixed_rho(
 ) -> Result<PirlsResult, EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
 
+    // Show calculated lambda values
+    eprintln!("    [Debug] Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]", 
+             lambdas[0], 
+             lambdas.get(1).unwrap_or(&0.0), 
+             lambdas.get(2).unwrap_or(&0.0), 
+             lambdas.get(3).unwrap_or(&0.0), 
+             lambdas.get(4).unwrap_or(&0.0));
+
     // Use simple S_lambda construction for P-IRLS (stable reparameterization used elsewhere)
     use crate::calibrate::construction::construct_s_lambda;
     let s_lambda = construct_s_lambda(&lambdas, s_list, layout);
