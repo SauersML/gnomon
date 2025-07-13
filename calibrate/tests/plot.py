@@ -21,8 +21,8 @@ TEST_DATA_PATH = PROJECT_ROOT / "test_data.tsv"
 
 
 # --- Simulation Configuration ---
-N_SAMPLES_TRAIN = 2000
-N_SAMPLES_TEST = 500
+N_SAMPLES_TRAIN = 5000
+N_SAMPLES_TEST = 1000
 NUM_PCS = 1  # Simulate 1 PC for easy 2D visualization
 
 # --- Helper Functions ---
