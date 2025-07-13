@@ -370,11 +370,7 @@ pub mod internal {
         }
 
         /// Solve the linear system Ax = b
-        fn solve(
-            &self,
-            _matrix: &Array2<f64>,
-            rhs: &Array1<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
+        fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             match self {
                 RobustSolver::Cholesky(stored_matrix) => {
                     // Use Cholesky decomposition for solving
@@ -389,11 +385,7 @@ pub mod internal {
         }
 
         /// Solve triangular system (only available for Cholesky)
-        fn solve_triangular(
-            &self,
-            _matrix: &Array2<f64>,
-            rhs: &Array1<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
+        fn solve_triangular(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             match self {
                 RobustSolver::Cholesky(stored_matrix) => {
                     // Use Cholesky decomposition for triangular solving
@@ -885,10 +877,7 @@ pub mod internal {
                         .into_par_iter() // <--- Parallel iteration using rayon
                         .map(|row| -> Result<f64, EstimationError> {
                             // For each row x_i of X, solve the triangular system if possible
-                            let c_i = solver.solve_triangular(
-                                &pirls_result.penalized_hessian,
-                                &row.to_owned(),
-                            )?;
+                            let c_i = solver.solve_triangular(&row.to_owned())?;
                             // The diagonal element is ||c_i||²
                             Ok(c_i.dot(&c_i))
                         })
@@ -907,8 +896,7 @@ pub mod internal {
                         // Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         let s_k_beta = s_k_full.dot(beta);
                         // Use the robust solver (automatically handles Cholesky or robust_solve fallback)
-                        let dbeta_drho_k = -lambdas[k]
-                            * solver.solve(&pirls_result.penalized_hessian, &s_k_beta)?;
+                        let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
 
                         // Your existing logic for these derivatives is correct and fast
                         let eta = self.x.dot(beta); // Re-calculate eta inside loop if needed, it's fast
@@ -928,8 +916,7 @@ pub mod internal {
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..s_k_full.ncols() {
                             let s_k_col = s_k_full.column(j);
-                            let h_inv_col = solver
-                                .solve(&pirls_result.penalized_hessian, &s_k_col.to_owned())?;
+                            let h_inv_col = solver.solve(&s_k_col.to_owned())?;
                             trace_h_inv_s_k += h_inv_col[j];
                         }
 
