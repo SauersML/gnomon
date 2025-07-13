@@ -152,6 +152,15 @@ pub fn train_model(
         // Update the evaluation count in our flight recorder too
         *eval_count.borrow_mut() = eval_num;
 
+        // --- FIX: Parameter Bounding Guardrail ---
+        // The `wolfe_bfgs` library is an unconstrained optimizer. It can propose
+        // any rho value. We must add this guardrail to prevent it from stepping
+        // into extreme regions where exp(rho) could overflow/underflow,
+        // causing the P-IRLS loop to fail and return an infinite cost.
+        // A range of [-15, 15] corresponds to lambdas from ~3e-7 to ~3e6,
+        // which is a very wide and sufficient range for most problems.
+        let safe_rho = rho_bfgs.mapv(|v| v.clamp(-15.0, 15.0));
+
         // Check if this is a main step or line search trial
         let is_main_step = {
             let last = last_rho.borrow();
@@ -175,68 +184,16 @@ pub fn train_model(
         if eval_num == 1 {
             eprintln!("  -> BFGS optimizer has started its first evaluation.");
         }
-        // --- STABILITY ENHANCEMENT 1: Parameter Bounding ---
-        // The `wolfe_bfgs` library does not support box constraints. To prevent the
-        // optimizer from stepping into extreme regions where `exp(rho)` could
-        // overflow or underflow, we clamp the input `rho` values.
-        // A range of [-15, 15] corresponds to lambdas from ~3e-7 to ~3e6,
-        // which is a very wide and sufficient range for most problems.
-        let safe_rho = rho_bfgs.mapv(|v| v.clamp(-15.0, 15.0));
-
+        
         // 1. Attempt to compute the cost (the negative REML/LAML score).
         let cost_result = reml_state_for_closure.compute_cost(&safe_rho);
 
         match cost_result {
             // Case 1: Success. Cost is finite and valid.
             Ok(cost) if cost.is_finite() => {
-                // Even with a finite cost, the gradient calculation might fail due to
-                // numerical issues like matrix singularity in an over-parameterized model.
-                // We need to handle this case gracefully.
+                // Now that cost is valid, compute the gradient.
                 match reml_state_for_closure.compute_gradient(&safe_rho) {
-                    Ok(mut grad) => {
-                        // --- STABILITY ENHANCEMENT 2: Gradient Scaling ---
-                        // A large gradient can cause the BFGS algorithm to propose a huge step,
-                        // leading to immediate line search failure. Scaling the gradient if its norm
-                        // is excessive acts as an adaptive maximum step size, giving the line
-                        // search a much better chance to find a valid point. While this slightly
-                        // perturbs the theoretical basis for the Hessian update, it is a
-                        // vital pragmatic choice for numerical stability.
-                        let grad_norm = grad.dot(&grad).sqrt();
-                        // Use a more conservative gradient scaling factor to improve numerical stability
-                        // for complex non-linear models with potential extreme gradients
-                        // Adaptive max gradient norm based on number of parameters
-                        let max_grad_norm = 50.0 + (rho_bfgs.len() as f64).sqrt();
-                        if grad_norm > max_grad_norm {
-                            log::debug!(
-                                "Gradient norm is large ({:.2}). Scaling down to {:.2}.",
-                                grad_norm,
-                                max_grad_norm
-                            );
-                            grad.mapv_inplace(|g| g * max_grad_norm / grad_norm);
-                        }
-
-                        // --- STABILITY ENHANCEMENT 3: Handling Non-Finite Gradients ---
-                        // Final safeguard. If any component of the gradient is not finite,
-                        // force line search backtracking instead of replacing with arbitrary values
-                        let has_non_finite = grad.iter().any(|&g| !g.is_finite());
-
-                        if has_non_finite {
-                            log::warn!(
-                                "Non-finite gradient components detected. Forcing line search backtracking."
-                            );
-                            return (f64::INFINITY, Array1::zeros(rho_bfgs.len()));
-                        }
-
-                        // Handle non-finite cost with large finite value to help line search
-                        if !cost.is_finite() {
-                            log::warn!(
-                                "Non-finite cost for rho={:?}; returning large finite value",
-                                safe_rho
-                            );
-                            return (1e10, Array1::zeros(rho_bfgs.len())); // Help line search avoid Inf
-                        }
-
-                        // Calculate gradient norm for logging
+                    Ok(grad) => {
                         let grad_norm = grad.dot(&grad).sqrt();
 
                         // This print now serves as a header for the P-IRLS output that follows
@@ -274,13 +231,8 @@ pub fn train_model(
             }
             // Case 2: Failure. Cost is non-finite (Inf/NaN) or an error occurred.
             _ => {
-                // The step taken by the optimizer was invalid. We must signal this clearly.
-                // Return an infinite cost. The line search is designed to handle this
-                // by rejecting the step and trying a smaller one.
-                // The gradient returned alongside an infinite cost is not used for the
-                // Hessian update, so its value is less critical, but returning a zero
-                // vector is the safest option to prevent any unexpected side effects or
-                // false convergence checks if the library's internal logic were to change.
+                // The step taken by the optimizer was invalid. We must signal this clearly
+                // by returning an infinite cost, which the line search is designed to handle.
                 log::warn!(
                     "Cost computation for rho={:?} resulted in a non-finite value or error. Line search will backtrack.",
                     &safe_rho
