@@ -132,6 +132,12 @@ pub fn train_model(
     // Create a clone of reml_state_arc for the closure
     let reml_state_for_closure = reml_state_arc.clone();
 
+    let last_rho = std::cell::RefCell::new(initial_rho.clone());
+    let last_cost = std::cell::RefCell::new(initial_cost);
+    let last_grad = std::cell::RefCell::new(Array1::<f64>::zeros(0)); // Initially empty
+    let last_grad_norm = std::cell::RefCell::new(0.0);
+    let eval_count = std::cell::RefCell::new(0);
+
     // Add counter for BFGS evaluations
     let current_eval = std::cell::RefCell::new(0);
 
@@ -142,6 +148,28 @@ pub fn train_model(
             *counter += 1;
             *counter
         };
+
+        // Update the evaluation count in our flight recorder too
+        *eval_count.borrow_mut() = eval_num;
+
+        // Check if this is a main step or line search trial
+        let is_main_step = {
+            let last = last_rho.borrow();
+            // Compare norms to check for equality, allowing for float precision issues.
+            (rho_bfgs - &*last).mapv(|x| x*x).sum().sqrt() < 1e-9
+        };
+
+        if is_main_step {
+            println!("\n[BFGS Main Step #{}]", *eval_count.borrow());
+        } else {
+            let last_rho_val = last_rho.borrow();
+            let step_vector = rho_bfgs - &*last_rho_val;
+            let step_size = step_vector.dot(&step_vector).sqrt();
+            println!("\n[BFGS Line Search Trial #{}]", *eval_count.borrow());
+            println!("  - Last Good Cost: {:.6e}", *last_cost.borrow());
+            println!("  - Last Good Grad Norm: {:.6e}", *last_grad_norm.borrow());
+            println!("  - Trying step of size: {:.6e}", step_size);
+        }
 
         // Print message on first evaluation
         if eval_num == 1 {
@@ -217,6 +245,18 @@ pub fn train_model(
                             eval_num, cost, grad_norm
                         );
 
+                        // Update our flight recorder
+                        if is_main_step {
+                            println!("[BFGS Main Step Result] Cost: {:<13.7} | Grad Norm: {:<12.6e}", cost, grad_norm);
+                            // This was a successful main step, so update our "flight recorder"
+                            *last_rho.borrow_mut() = rho_bfgs.clone();
+                            *last_cost.borrow_mut() = cost;
+                            *last_grad.borrow_mut() = grad.clone();
+                            *last_grad_norm.borrow_mut() = grad_norm;
+                        } else {
+                            println!("[BFGS Line Search Result] -> SUCCESS. Cost is finite: {:.6e}", cost);
+                        }
+
                         // Return the true cost and the true gradient.
                         (cost, grad)
                     }
@@ -227,6 +267,7 @@ pub fn train_model(
                             &safe_rho,
                             e
                         );
+                        println!("[BFGS Line Search Result] -> GRADIENT FAILED for rho={:?}. Reason: {:?}. Returning Infinity.", &safe_rho, e);
                         (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
                     }
                 }
@@ -244,6 +285,14 @@ pub fn train_model(
                     "Cost computation for rho={:?} resulted in a non-finite value or error. Line search will backtrack.",
                     &safe_rho
                 );
+                match cost_result {
+                    Ok(cost) => {
+                        println!("[BFGS Line Search Result] -> COST FAILED. compute_cost returned a non-finite value: {}. Returning Infinity.", cost);
+                    }
+                    Err(e) => {
+                        println!("[BFGS Line Search Result] -> COST FAILED. compute_cost returned an error: {:?}. Returning Infinity.", e);
+                    }
+                }
                 (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
             }
         }
@@ -451,8 +500,7 @@ pub mod internal {
                 return Ok(cached_result.clone());
             }
 
-            // ADD THIS LINE to show when the expensive inner loop is being called
-            eprintln!("  -> Solving inner P-IRLS loop for this evaluation...");
+            println!("  -> Solving inner P-IRLS loop for this evaluation...");
 
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
@@ -461,7 +509,13 @@ pub mod internal {
                 &self.s_list,
                 self.layout,
                 self.config,
-            )?;
+            );
+
+            if let Err(e) = &pirls_result {
+                println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {:?}", e);
+            }
+
+            let pirls_result = pirls_result?; // Propagate error if it occurred
 
             self.cache.borrow_mut().insert(key, pirls_result.clone());
             Ok(pirls_result)
@@ -473,6 +527,8 @@ pub mod internal {
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
+            println!("[GNOMON COST] ==> Received rho from optimizer: {:?}", p.to_vec());
+
             let pirls_result = self.execute_pirls_if_needed(p)?;
             let mut lambdas = p.mapv(f64::exp);
 
@@ -674,6 +730,26 @@ pub mod internal {
                     let mp = (self.layout.total_coeffs - rank) as f64;
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+
+                    println!("[GNOMON COST] LAML Breakdown:");
+                    println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
+                    println!("  - Penalty Term (β'Sβ) : {:.6e}", pirls_result.beta.dot(&reparam_result.s_transformed.dot(&pirls_result.beta)));
+                    println!("  - Penalized LogLik    : {:.6e}", penalised_ll);
+                    println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
+                    println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
+
+                    // Check if we used eigenvalues for the Hessian determinant
+                    let eigenvals = match pirls_result.penalized_hessian.eigvals() {
+                        Ok(eigs) => Some(eigs),
+                        Err(_) => None,
+                    };
+
+                    if let Some(eigs) = eigenvals {
+                        let min_eig = eigs.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                        let max_eig = eigs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b.re));
+                        println!("    -> (Hessian Eigenvalues: min={:.3e}, max={:.3e})", min_eig, max_eig);
+                    }
+                    println!("[GNOMON COST] <== Final LAML score: {:.6e} (Cost to minimize: {:.6e})", laml, -laml);
 
                     eprintln!("    [Debug] LAML score calculated: {:.6}", laml);
 
