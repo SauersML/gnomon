@@ -22,6 +22,7 @@
 //! robust fit.
 
 // External Crate for Optimization
+use indicatif::{ProgressBar, ProgressStyle};
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
@@ -88,13 +89,16 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    
+
     // 1. Build the one-time matrices and define the model structure.
     let (x_matrix, s_list, layout, constraints, knot_vectors) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
-    
-    eprintln!("[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}", layout.total_coeffs, layout.num_penalties);
+
+    eprintln!(
+        "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
+        layout.total_coeffs, layout.num_penalties
+    );
 
     // 2. Set up the REML optimization problem.
     let reml_state =
@@ -123,14 +127,14 @@ pub fn train_model(
     log::info!("Initial REML cost: {:.6}", initial_cost);
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
-    
+
     // 5. Run the BFGS optimizer with the wolfe_bfgs library
     // Create a clone of reml_state_arc for the closure
     let reml_state_for_closure = reml_state_arc.clone();
-    
+
     // Add counter for BFGS evaluations
     let current_eval = std::cell::RefCell::new(0);
-    
+
     let cost_and_grad = move |rho_bfgs: &Array1<f64>| -> (f64, Array1<f64>) {
         // Increment the evaluation counter
         let eval_num = {
@@ -138,7 +142,7 @@ pub fn train_model(
             *counter += 1;
             *counter
         };
-        
+
         // Print message on first evaluation
         if eval_num == 1 {
             eprintln!("  -> BFGS optimizer has started its first evaluation.");
@@ -206,7 +210,7 @@ pub fn train_model(
 
                         // Calculate gradient norm for logging
                         let grad_norm = grad.dot(&grad).sqrt();
-                        
+
                         // This print now serves as a header for the P-IRLS output that follows
                         eprintln!(
                             "\n[BFGS Eval #{:<3}] Cost: {:<13.7} | Grad Norm: {:<12.6e}",
@@ -790,8 +794,13 @@ pub mod internal {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // For LAML, implement complete weight derivative calculation
 
-                    eprintln!("    [Debug] Starting gradient computation loop for {} params...", lambdas.len());
+                    let start_time = std::time::Instant::now();
+                    eprintln!(
+                        "    [Debug] Starting gradient computation loop for {} params...",
+                        lambdas.len()
+                    );
                     for k in 0..lambdas.len() {
+                        let param_start = std::time::Instant::now();
                         let s_k_full = &self.s_list[k];
 
                         // Calculate dβ/dρ_k = -λ_k(H_p)^(-1)S_k*β
@@ -826,24 +835,101 @@ pub mod internal {
 
                         // Compute tr(H_p^(-1) X^T ∂W/∂ρ_k X) using the fact that this equals
                         // the diagonal sum of H_p^(-1) applied to the weighted outer products
+                        eprintln!("    [Debug] Starting weight derivative trace computation...");
+                        let loop_start = std::time::Instant::now();
+                        let mut solve_count = 0;
+                        let mut solve_failures = 0;
                         let mut weight_deriv_trace = 0.0;
+
+                        // Create progress bar for data points
+                        let pb = ProgressBar::new(self.x.nrows() as u64);
+                        pb.set_style(ProgressStyle::default_bar()
+                            .template("    [Data Points] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                            .unwrap()
+                            .progress_chars("#>-"));
+
                         for i in 0..self.x.nrows() {
+                            pb.inc(1);
+                            eprintln!("    [Debug] Checking dw_drho_k[{}] = {}", i, dw_drho_k[i]);
                             if dw_drho_k[i].abs() > 1e-15 {
+                                eprintln!(
+                                    "    [Debug] dw_drho_k[{}] passes threshold, processing...",
+                                    i
+                                );
                                 let x_i = self.x.row(i);
+                                eprintln!(
+                                    "    [Debug] Got x_i for row {}, shape: {:?}",
+                                    i,
+                                    x_i.shape()
+                                );
                                 let weighted_outer = &x_i.to_owned()
                                     * (dw_drho_k[i] * &x_i.to_owned().view().insert_axis(Axis(1)));
+                                eprintln!(
+                                    "    [Debug] Created weighted_outer, shape: {:?}",
+                                    weighted_outer.shape()
+                                );
                                 // Approximate trace efficiently
+                                eprintln!(
+                                    "    [Debug] Starting inner loop for {} columns",
+                                    weighted_outer.ncols()
+                                );
                                 for j in 0..weighted_outer.ncols() {
+                                    if j % 50 == 0 {
+                                        eprintln!(
+                                            "    [Debug] Processing column {}/{}",
+                                            j,
+                                            weighted_outer.ncols()
+                                        );
+                                    }
+                                    solve_count += 1;
                                     let col = weighted_outer.column(j);
-                                    if let Ok(h_inv_col) = internal::robust_solve(
+                                    eprintln!(
+                                        "    [Debug] About to call robust_solve for column {}",
+                                        j
+                                    );
+                                    match internal::robust_solve(
                                         &pirls_result.penalized_hessian,
                                         &col.to_owned(),
                                     ) {
-                                        weight_deriv_trace += h_inv_col[j];
+                                        Ok(h_inv_col) => {
+                                            eprintln!(
+                                                "    [Debug] robust_solve succeeded for column {}",
+                                                j
+                                            );
+                                            weight_deriv_trace += h_inv_col[j];
+                                        }
+                                        Err(_) => {
+                                            eprintln!(
+                                                "    [Debug] robust_solve failed for column {}",
+                                                j
+                                            );
+                                            solve_failures += 1;
+                                        }
                                     }
                                 }
+                                eprintln!("    [Debug] Finished inner loop for data point {}", i);
+                            } else {
+                                eprintln!("    [Debug] dw_drho_k[{}] below threshold, skipping", i);
                             }
                         }
+
+                        pb.finish_with_message("    [Data Points] Processing complete");
+
+                        let loop_elapsed = loop_start.elapsed();
+                        eprintln!("    [Debug] Weight derivative computation completed:");
+                        eprintln!("    [Debug]   - Total solve calls: {}", solve_count);
+                        eprintln!("    [Debug]   - Failed solves: {}", solve_failures);
+                        eprintln!(
+                            "    [Debug]   - Time elapsed: {:.2}s",
+                            loop_elapsed.as_secs_f64()
+                        );
+                        if loop_elapsed.as_secs_f64() > 0.0 {
+                            eprintln!(
+                                "    [Debug]   - Solves per second: {:.1}",
+                                solve_count as f64 / loop_elapsed.as_secs_f64()
+                            );
+                        }
+
                         let weight_deriv_term = weight_deriv_trace / 2.0;
 
                         // Term 2: tr(H_p^(-1) S_k) - this will be subtracted
@@ -867,7 +953,19 @@ pub mod internal {
 
                         // This is the gradient of the SCORE (V_LAML), which is maximized
                         score_gradient[k] = trace_diff_term + weight_deriv_term;
+
+                        eprintln!(
+                            "    [Debug] Penalty parameter {} completed in {:.2}s",
+                            k + 1,
+                            param_start.elapsed().as_secs_f64()
+                        );
                     }
+
+                    let total_elapsed = start_time.elapsed();
+                    eprintln!(
+                        "    [Debug] Total gradient computation time: {:.2}s",
+                        total_elapsed.as_secs_f64()
+                    );
                     eprintln!("    [Debug] Gradient computation loop finished.");
                 }
             }
@@ -914,12 +1012,18 @@ pub mod internal {
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
+        eprintln!(
+            "    [Debug] ENTERING robust_solve - matrix shape: {:?}, rhs len: {}",
+            matrix.shape(),
+            rhs.len()
+        );
         // Try standard solve first for well-conditioned matrices
         if let Ok(solution) = matrix.solve(rhs) {
             return Ok(solution);
         }
 
         // If standard solve fails, use SVD-based pseudo-inverse approach
+        eprintln!("    [Debug] Standard solve failed, using expensive SVD pseudo-inverse");
         log::debug!("Standard solve failed, using SVD pseudo-inverse");
 
         match matrix.svd(true, true) {
