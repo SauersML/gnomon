@@ -11,12 +11,12 @@ gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarr
 
 Run a local score:
 ```
-./gnomon/target/release/gnomon --score "score.txt" arrays
+./gnomon/target/release/gnomon score --score "score.txt" arrays
 ```
 
 Or use a score from PGS catalog:
 ```
-./gnomon/target/release/gnomon --score "PGS003725" arrays
+./gnomon/target/release/gnomon score --score "PGS003725" arrays
 ```
 
 Optionally, use a keep file:
@@ -25,12 +25,12 @@ awk '{print $2}' arrays.fam | head -n 256 > keep.txt
 ```
 
 ```
-./gnomon/target/release/gnomon --score "PGS003725" --keep keep.txt arrays
+./gnomon/target/release/gnomon score --score "PGS003725" --keep keep.txt arrays
 ```
 
 #### Example:
 ```
-./target/release/gnomon --score ./ci_workdir/PGS004696_hmPOS_GRCh38.txt ./ci_workdir/gnomon_native_data
+./target/release/gnomon score --score ./ci_workdir/PGS004696_hmPOS_GRCh38.txt ./ci_workdir/gnomon_native_data
 ```
 
 #### Debug:
