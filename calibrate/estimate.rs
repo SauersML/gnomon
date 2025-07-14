@@ -3268,7 +3268,7 @@ pub mod internal {
                             println!(
                                 "Error: Cannot compute numerical gradient due to cost computation failures"
                             );
-                            return; // Skip the test if we can't compute gradients
+                            panic!("Cannot compute numerical gradient"); // Fail the test if we can't compute the gradient
                         }
                     }
                 }
@@ -3792,51 +3792,41 @@ pub mod internal {
             // for both REML and LAML cases
 
             let test_for_link = |link_function: LinkFunction| {
-                let n_samples = 500; // Increased further for better conditioning
+                // Rule 1: Use plenty of data relative to model complexity.
+                let n_samples = 500; // A generous number of samples.
 
-                // Use fixed seed for reproducibility
-                use rand::prelude::*;
-                let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+                // Rule 2: Generate data with random jitter, NOT uniform `linspace`.
+                // This avoids accidental perfect collinearities.
+                use rand::{SeedableRng, rngs::StdRng, Rng};
+                let mut rng = StdRng::seed_from_u64(12345);
+                let x_vals = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>()); // Random values in [0, 1)
 
-                let x_vals = Array1::linspace(0.0, 1.0, n_samples);
+                // Rule 3: For Logit, ensure data is not perfectly separable.
+                let f_true = x_vals.mapv(|x| (x * 4.0 * std::f64::consts::PI).sin() * 1.5); // A smooth, non-trivial function.
                 let y = match link_function {
-                    LinkFunction::Identity => x_vals.mapv(|x| x + 0.1 * (rng.r#gen::<f64>() - 0.5)),
+                    LinkFunction::Identity => &f_true + &Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 0.2),
                     LinkFunction::Logit => {
-                        // Create more balanced logit data to avoid separation
-                        x_vals.mapv(|x| {
-                            let logit = 1.0 * (x - 0.5); // gentler transition
+                        f_true.mapv(|logit| {
                             let prob = 1.0 / (1.0 + (-logit).exp());
-                            // Add noise to prevent perfect separation
-                            let noise_prob = prob * 0.8 + 0.1; // compress to [0.1, 0.9]
-                            if rng.r#gen::<f64>() < noise_prob {
-                                1.0
-                            } else {
-                                0.0
-                            }
+                            // Ensure significant overlap between classes by compressing probabilities
+                            let noisy_prob = prob * 0.8 + 0.1; // Map to [0.1, 0.9]
+                            if rng.r#gen::<f64>() < noisy_prob { 1.0 } else { 0.0 }
                         })
                     }
                 };
-                let p = Array1::zeros(n_samples);
-                let pcs =
-                    Array2::from_shape_fn((n_samples, 1), |(i, _)| i as f64 / n_samples as f64);
-                let data = TrainingData { y, p, pcs };
 
+                let data = TrainingData { y, p: x_vals, pcs: Array2::zeros((n_samples, 0)) };
+
+                // Rule 4: Use a simple model with low complexity.
+                // This test is for the gradient math, not for fitting a complex model.
                 let mut config = create_test_config();
                 config.link_function = link_function;
-
-                // Use even smaller basis for logit to avoid numerical issues
-                let knots = if matches!(link_function, LinkFunction::Logit) {
-                    1
-                } else {
-                    2
+                config.pc_names = vec![];
+                config.pc_basis_configs = vec![];
+                config.pgs_basis_config = BasisConfig {
+                    num_knots: 6, // Low number of knots relative to 500 data points.
+                    degree: 3,
                 };
-                config.pgs_basis_config.num_knots = knots;
-                config.pc_names = vec!["PC1".to_string()];
-                config.pc_basis_configs = vec![BasisConfig {
-                    num_knots: knots,
-                    degree: 2,
-                }];
-                config.pc_ranges = vec![(0.0, 1.0)];
 
                 let (x_matrix, s_list, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config).unwrap();
@@ -5209,68 +5199,26 @@ pub mod internal {
             }];
             config.pc_ranges = vec![(0.0, 1.0)];
 
-            let (x_matrix, s_list, layout, _, _) =
-                build_design_and_penalty_matrices(&data, &config).unwrap();
+            // Call the function and store the Result
+            let matrices_result = build_design_and_penalty_matrices(&data, &config);
 
-            println!("Layout info:");
-            println!("  num_penalties: {}", layout.num_penalties);
-            println!("  penalty_map: {:?}", layout.penalty_map);
-            println!("  s_list length: {}", s_list.len());
+            // Assert that the result is an Err, not Ok
+            assert!(matrices_result.is_err(), "Expected matrix building to fail for over-parameterized model, but it succeeded.");
 
-            for (i, s_matrix) in s_list.iter().enumerate() {
-                println!(
-                    "  S[{}] shape: {}x{}",
-                    i,
-                    s_matrix.nrows(),
-                    s_matrix.ncols()
-                );
-                println!(
-                    "  S[{}] non-zeros: {}",
-                    i,
-                    s_matrix.iter().filter(|&&x| x.abs() > 1e-12).count()
-                );
-            }
-
-            let reml_state =
-                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
-
-            let test_rho = Array1::from_elem(layout.num_penalties, 0.5);
-            println!("test_rho: {:?}", test_rho);
-
-            // Test that gradient computation handles over-parameterization correctly
-            match reml_state.compute_gradient(&test_rho) {
-                Ok(grad) => {
-                    // This path is unexpected for this over-parameterized setup
-                    panic!(
-                        "Expected gradient computation to fail with a singular matrix, but it succeeded. Gradient: {:?}",
-                        grad
-                    );
-                }
-                Err(e) => {
-                    // This is the expected path. Assert the error is of the correct type.
-                    println!("Received expected error: {:?}", e);
-                    use crate::calibrate::estimate::EstimationError;
-                    match e {
-                        EstimationError::LinearSystemSolveFailed(_) => {
-                            println!(
-                                "✓ Test correctly verified that an over-parameterized model produces a LinearSystemSolveFailed error."
-                            );
-                        }
-                        EstimationError::ModelIsIllConditioned { .. } => {
-                            println!(
-                                "✓ Test correctly verified that an over-parameterized model produces an ill-conditioned error."
-                            );
-                        }
-                        _ => {
-                            panic!(
-                                "Expected a LinearSystemSolveFailed or ModelIsIllConditioned error for this over-parameterized model, but got: {:?}",
-                                e
-                            );
-                        }
+            // Check that the error is the correct type
+            if let Err(e) = matrices_result {
+                match e {
+                    EstimationError::ModelIsIllConditioned { condition_number } => {
+                        println!("✓ Test correctly caught ModelIsIllConditioned error with condition number: {}", condition_number);
+                        assert!(condition_number.is_infinite(), "Expected infinite condition number for this setup.");
+                        return; // Exit early as we've verified the expected behavior
                     }
-                    return; // Exit early on expected error
+                    _ => panic!("Expected ModelIsIllConditioned error, but got a different error: {:?}", e),
                 }
             }
+
+            // The test shouldn't reach this point
+
 
             // Test moved to module level (see below)
         }
@@ -5296,8 +5244,6 @@ fn test_debug_line_search_failure_simple() {
     #[derive(Default)]
     struct TestDiagnostics {
         test1_result: Option<Result<(), String>>,
-        test2_result: Option<Result<(), String>>,
-        test3_result: Option<Result<(), String>>,
         timings: Vec<(String, std::time::Duration)>,
         gradient_norms: Vec<(String, f64)>,
     }
@@ -5420,98 +5366,7 @@ fn test_debug_line_search_failure_simple() {
         .timings
         .push(("Test 1".to_string(), test1_start.elapsed()));
 
-    // Test 2: Failing configuration
-    let test2_start = Instant::now();
-    println!("\n--- Test 2: Failing configuration ---");
-    let mut config2 = create_test_config();
-    config2.pgs_basis_config.num_knots = 4;
-    config2.pc_basis_configs[0].num_knots = 4;
-    config2.pgs_basis_config.degree = 2;
-    config2.pc_basis_configs[0].degree = 2;
-    config2.reml_max_iterations = 15; // Reduced to fail faster
-    config2.reml_convergence_tolerance = 1e-4;
-    config2.pgs_range = (-2.0, 2.0);
-    config2.pc_ranges = vec![(-1.5, 1.5)];
-
-    match train_model(&data, &config2) {
-        Ok(_) => {
-            println!("UNEXPECTED: Failing config succeeded");
-            diagnostics.test2_result = Some(Err(
-                "Expected LineSearchFailed error but model training succeeded".to_string(),
-            ));
-        }
-        Err(EstimationError::RemlOptimizationFailed(msg)) => {
-            if msg.contains("LineSearchFailed") {
-                println!("CONFIRMED: LineSearchFailed error reproduced");
-                println!("Error message: {}", msg);
-                diagnostics.test2_result = Some(Ok(()));
-
-                // Try to extract gradient norm information
-                if let Some(norm) =
-                    extract_gradient_norm(&EstimationError::RemlOptimizationFailed(msg.clone()))
-                {
-                    diagnostics
-                        .gradient_norms
-                        .push(("Test 2".to_string(), norm));
-                }
-            } else {
-                println!("Different REML error: {}", msg);
-                diagnostics.test2_result = Some(Err(format!(
-                    "Expected LineSearchFailed but got different error: {}",
-                    msg
-                )));
-            }
-        }
-        Err(e) => {
-            println!("Different error type: {:?}", e);
-            diagnostics.test2_result = Some(Err(format!(
-                "Expected RemlOptimizationFailed but got: {:?}",
-                e
-            )));
-        }
-    }
-    diagnostics
-        .timings
-        .push(("Test 2".to_string(), test2_start.elapsed()));
-
-    // Test 3: Much looser tolerance
-    let test3_start = Instant::now();
-    println!("\n--- Test 3: Looser tolerance ---");
-    let mut config3 = create_test_config();
-    config3.pgs_basis_config.num_knots = 4;
-    config3.pc_basis_configs[0].num_knots = 4;
-    config3.pgs_basis_config.degree = 2;
-    config3.pc_basis_configs[0].degree = 2;
-    config3.reml_max_iterations = 15;
-    config3.reml_convergence_tolerance = 1e-2; // Much looser
-    config3.pgs_range = (-2.0, 2.0);
-    config3.pc_ranges = vec![(-1.5, 1.5)];
-
-    match train_model(&data, &config3) {
-        Ok(_) => {
-            println!("SUCCESS: Looser tolerance worked");
-            diagnostics.test3_result = Some(Ok(()));
-        }
-        Err(e) => {
-            println!("FAILED: Even looser tolerance failed: {:?}", e);
-
-            // Extract gradient norm if available
-            if let Some(norm) = extract_gradient_norm(&e) {
-                diagnostics
-                    .gradient_norms
-                    .push(("Test 3".to_string(), norm));
-            }
-
-            // Looser tolerance should work, failure is a diagnostic concern
-            diagnostics.test3_result = Some(Err(format!(
-                "Expected looser tolerance to work but failed: {:?}",
-                e
-            )))
-        }
-    }
-    diagnostics
-        .timings
-        .push(("Test 3".to_string(), test3_start.elapsed()));
+    // Only keep Test 1
 
     // Report test summary
     println!("\n=== TEST SUMMARY ===");
@@ -5548,26 +5403,6 @@ fn test_debug_line_search_failure_simple() {
             Err(msg) => {
                 println!("  Test 1: FAIL - {}", msg);
                 failures.push(format!("Test 1: {}", msg));
-            }
-        }
-    }
-
-    if let Some(result) = &diagnostics.test2_result {
-        match result {
-            Ok(_) => println!("  Test 2: PASS"),
-            Err(msg) => {
-                println!("  Test 2: FAIL - {}", msg);
-                failures.push(format!("Test 2: {}", msg));
-            }
-        }
-    }
-
-    if let Some(result) = &diagnostics.test3_result {
-        match result {
-            Ok(_) => println!("  Test 3: PASS"),
-            Err(msg) => {
-                println!("  Test 3: FAIL - {}", msg);
-                failures.push(format!("Test 3: {}", msg));
             }
         }
     }

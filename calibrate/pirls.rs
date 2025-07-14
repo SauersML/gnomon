@@ -266,10 +266,56 @@ pub fn fit_model_for_fixed_rho(
         config.max_iterations
     ); // ADD THIS LINE
 
-    Err(EstimationError::PirlsDidNotConverge {
-        max_iterations: config.max_iterations,
-        last_change,
-    })
+    // In pirls.rs, inside fit_model_for_fixed_rho, at the end of the `for` loop...
+
+    // This code REPLACES the existing `Err(EstimationError::PirlsDidNotConverge { ... })`
+    // It is executed ONLY if the loop finishes without meeting the deviance convergence criteria.
+
+    eprintln!(
+        "    [P-IRLS STALLED] Hit max iterations. Performing final check to see if stalled state is a valid minimum."
+    );
+
+    // We are here because the loop timed out. The variables `beta`, `mu`, `weights`,
+    // and `s_lambda` hold the values from the last, stalled iteration.
+
+    // Check 1: Is the gradient of the penalized deviance close to zero?
+    // The gradient is g = XᵀW(z - η) - S_λβ = Xᵀ(y - μ) - S_λβ
+    let penalized_deviance_gradient = x.t().dot(&(&y.view() - &mu)) - s_lambda.dot(&beta);
+    let gradient_norm = penalized_deviance_gradient.dot(&penalized_deviance_gradient).sqrt();
+    let is_gradient_zero = gradient_norm < 1e-4; // Use a reasonable tolerance for the gradient norm
+
+    // Check 2: Is the penalized Hessian positive-definite?
+    let penalized_hessian = compute_penalized_hessian(x, &weights, &s_lambda)?;
+    use ndarray_linalg::{Cholesky, UPLO};
+    let is_positive_definite = match penalized_hessian.cholesky(UPLO::Lower) {
+        Ok(_) => true, // Cholesky decomposition only succeeds for positive-definite matrices.
+        Err(_) => false, // Failed, so it's not positive-definite.
+    };
+
+    // Final Decision: Is the stall "good enough"?
+    if is_gradient_zero && is_positive_definite {
+        eprintln!(
+            "    ✓ STALL ACCEPTED: A valid minimum was found (gradient_norm={:.2e}, Hessian is PD).",
+            gradient_norm
+        );
+        // The stall is acceptable. Return Ok() as if it had converged normally.
+        return Ok(PirlsResult {
+            beta,
+            penalized_hessian,
+            deviance: last_deviance,
+            final_weights: weights,
+        });
+    } else {
+        // The stall is NOT at a valid minimum. This is a true failure.
+        eprintln!(
+            "    ✗ STALL REJECTED: Not a valid minimum (gradient_norm={:.2e}, Hessian_PD={}). Reporting true convergence failure.",
+            gradient_norm, is_positive_definite
+        );
+        return Err(EstimationError::PirlsDidNotConverge {
+            max_iterations: config.max_iterations,
+            last_change,
+        });
+    }
 }
 
 // Pseudo-inverse functionality is handled directly in compute_gradient
