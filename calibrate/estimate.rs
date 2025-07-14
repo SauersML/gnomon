@@ -89,192 +89,32 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-
-    // 1. Build the one-time matrices and define the model structure.
     let (x_matrix, s_list, layout, constraints, knot_vectors) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
-
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
         layout.total_coeffs, layout.num_penalties
     );
 
-    // 2. Set up the REML optimization problem.
+    // --- Setup the unified state and computation object ---
+    // This now encapsulates everything needed for the optimization.
     let reml_state =
         internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, config);
 
-    // 3. Set up the REML state for optimization
-    use std::sync::Arc;
-    let reml_state_arc = Arc::new(reml_state);
-
-    // 4. Define the initial guess for log-smoothing parameters (rho).
-    // A rho of 0.0 corresponds to lambda = 1.0, which gives roughly equal weight
-    // to the data likelihood and the penalty. Starting near this neutral ground
-    // is a robust default. For complex functions with non-linearities, we use
-    // a more conservative starting point with stronger regularization to improve
-    // numerical stability of the optimization process.
-    let initial_rho = Array1::from_elem(layout.num_penalties, 1.0); // λ ≈ 2.72, increased from 0.5
-
-    // 4a. Check that the initial cost is finite before starting BFGS
-    let initial_cost = reml_state_arc.compute_cost(&initial_rho)?;
-    if !initial_cost.is_finite() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "Initial cost is not finite: {}. Cannot start BFGS optimization.",
-            initial_cost
-        )));
-    }
-    log::info!("Initial REML cost: {:.6}", initial_cost);
+    // Define the initial guess for log-smoothing parameters (rho)
+    let initial_rho = Array1::from_elem(layout.num_penalties, 1.0);
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
 
-    // 5. Run the BFGS optimizer with the wolfe_bfgs library
-    // Create a clone of reml_state_arc for the closure
-    let reml_state_for_closure = reml_state_arc.clone();
-
-    let last_rho = std::cell::RefCell::new(initial_rho.clone());
-    let last_cost = std::cell::RefCell::new(initial_cost);
-    let last_grad = std::cell::RefCell::new(Array1::<f64>::zeros(0)); // Initially empty
-    let last_grad_norm = std::cell::RefCell::new(0.0);
-    let eval_count = std::cell::RefCell::new(0);
-
-    // Add counter for BFGS evaluations
-    let current_eval = std::cell::RefCell::new(0);
-
-    let cost_and_grad = move |rho_bfgs: &Array1<f64>| -> (f64, Array1<f64>) {
-        // Increment the evaluation counter
-        let eval_num = {
-            let mut counter = current_eval.borrow_mut();
-            *counter += 1;
-            *counter
-        };
-
-        // Update the evaluation count in our flight recorder too
-        *eval_count.borrow_mut() = eval_num;
-
-        // Parameter Bounding Guardrail
-        // The `wolfe_bfgs` library is an unconstrained optimizer. It can propose
-        // any rho value. We must add this guardrail to prevent it from stepping
-        // into extreme regions where exp(rho) could overflow/underflow,
-        // causing the P-IRLS loop to fail and return an infinite cost.
-        // A range of [-15, 15] corresponds to lambdas from ~3e-7 to ~3e6,
-        // which is a very wide and sufficient range for most problems.
-        let safe_rho = rho_bfgs.mapv(|v| v.clamp(-15.0, 15.0));
-
-        // Check if this is a main step or line search trial
-        let is_main_step = {
-            let last = last_rho.borrow();
-            // Compare norms to check for equality, allowing for float precision issues.
-            (rho_bfgs - &*last).mapv(|x| x * x).sum().sqrt() < 1e-9
-        };
-
-        if is_main_step {
-            println!("\n[BFGS Main Step #{}]", *eval_count.borrow());
-        } else {
-            let last_rho_val = last_rho.borrow();
-            let step_vector = rho_bfgs - &*last_rho_val;
-            let step_size = step_vector.dot(&step_vector).sqrt();
-            println!("\n[BFGS Line Search Trial #{}]", *eval_count.borrow());
-            println!("  - Last Good Cost: {:.6e}", *last_cost.borrow());
-            println!("  - Last Good Grad Norm: {:.6e}", *last_grad_norm.borrow());
-            println!("  - Trying step of size: {:.6e}", step_size);
-        }
-
-        // Print message on first evaluation
-        if eval_num == 1 {
-            eprintln!("  -> BFGS optimizer has started its first evaluation.");
-        }
-
-        // 1. Attempt to compute the cost (the negative REML/LAML score).
-        let cost_result = reml_state_for_closure.compute_cost(&safe_rho);
-
-        match cost_result {
-            // Case 1: Success. Cost is finite and valid.
-            Ok(cost) if cost.is_finite() => {
-                // Now that cost is valid, compute the gradient.
-                match reml_state_for_closure.compute_gradient(&safe_rho) {
-                    Ok(grad) => {
-                        let grad_norm = grad.dot(&grad).sqrt();
-
-                        // This print now serves as a header for the P-IRLS output that follows
-                        eprintln!(
-                            "\n[BFGS Eval #{:<3}] Cost: {:<13.7} | Grad Norm: {:<12.6e}",
-                            eval_num, cost, grad_norm
-                        );
-
-                        // Update our flight recorder
-                        if is_main_step {
-                            println!(
-                                "[BFGS Main Step Result] Cost: {:<13.7} | Grad Norm: {:<12.6e}",
-                                cost, grad_norm
-                            );
-                            // This was a successful main step, so update our "flight recorder"
-                            *last_rho.borrow_mut() = rho_bfgs.clone();
-                            *last_cost.borrow_mut() = cost;
-                            *last_grad.borrow_mut() = grad.clone();
-                            *last_grad_norm.borrow_mut() = grad_norm;
-                        } else {
-                            println!(
-                                "[BFGS Line Search Result] -> SUCCESS. Cost is finite: {:.6e}",
-                                cost
-                            );
-                        }
-
-                        // Return the true cost and the true gradient.
-                        (cost, grad)
-                    }
-                    Err(e) => {
-                        // Gradient failed even though cost was finite. Treat as an invalid step.
-                        log::warn!(
-                            "Gradient computation for rho={:?} failed: {:?}. Line search will backtrack.",
-                            &safe_rho,
-                            e
-                        );
-                        println!(
-                            "[BFGS Line Search Result] -> GRADIENT FAILED for rho={:?}. Reason: {:?}. Returning Infinity.",
-                            &safe_rho, e
-                        );
-                        (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
-                    }
-                }
-            }
-            // Case 2: Failure. Cost is non-finite (Inf/NaN) or an error occurred.
-            _ => {
-                // The step taken by the optimizer was invalid. We must signal this clearly
-                // by returning an infinite cost, which the line search is designed to handle.
-                log::warn!(
-                    "Cost computation for rho={:?} resulted in a non-finite value or error. Line search will backtrack.",
-                    &safe_rho
-                );
-                match cost_result {
-                    Ok(cost) => {
-                        println!(
-                            "[BFGS Line Search Result] -> COST FAILED. compute_cost returned a non-finite value: {}. Returning Infinity.",
-                            cost
-                        );
-                    }
-                    Err(e) => {
-                        println!(
-                            "[BFGS Line Search Result] -> COST FAILED. compute_cost returned an error: {:?}. Returning Infinity.",
-                            e
-                        );
-                    }
-                }
-                (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
-            }
-        }
-    };
-
-    eprintln!(
-        "Starting BFGS optimization with {} parameters...",
-        initial_rho.len()
-    );
+    // --- Run the BFGS Optimizer ---
+    // The closure is now a simple, robust method call.
     let BfgsSolution {
         final_point: final_rho,
         final_value,
         iterations,
         ..
-    } = Bfgs::new(initial_rho, cost_and_grad)
+    } = Bfgs::new(initial_rho, |rho| reml_state.cost_and_grad(rho))
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
         .run()
@@ -282,18 +122,17 @@ pub fn train_model(
 
     if !final_value.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
-            "BFGS optimization did not find a finite solution, final value: {}. This often indicates a singular or poorly-conditioned model.",
+            "BFGS optimization did not find a finite solution, final value: {}",
             final_value
         )));
     }
     eprintln!(
-        "BFGS optimization completed in {} iterations with final value: {:.6}",
+        "\nBFGS optimization completed in {} iterations with final value: {:.6}",
         iterations, final_value
     );
-
     log::info!("REML optimization completed successfully");
 
-    // 6. Extract the final results.
+    // --- Finalize the Model (same as before) ---
     let final_lambda = final_rho.mapv(f64::exp);
     log::info!(
         "Final estimated smoothing parameters (lambda): {:?}",
@@ -301,20 +140,16 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
-
-    // Fit the model one last time with the optimal lambdas to get final coefficients.
     let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
-        x_matrix.view(),
-        data.y.view(),
-        &reml_state_arc.s_list,
+        reml_state.x, // Use from reml_state
+        reml_state.y,
+        &reml_state.s_list,
         &layout,
         config,
     )?;
 
     let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_fit.beta, &layout)?;
-
-    // Create updated config with constraints
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
@@ -437,7 +272,9 @@ pub mod internal {
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
         cache: RefCell<HashMap<Vec<u64>, PirlsResult>>,
-        last_good_gradient: RefCell<Option<Array1<f64>>>,
+        eval_count: RefCell<u64>,
+        last_cost: RefCell<f64>,
+        last_grad_norm: RefCell<f64>,
     }
 
     impl<'a> RemlState<'a> {
@@ -455,7 +292,9 @@ pub mod internal {
                 layout,
                 config,
                 cache: RefCell::new(HashMap::new()),
-                last_good_gradient: RefCell::new(None),
+                eval_count: RefCell::new(0),
+                last_cost: RefCell::new(f64::INFINITY),
+                last_grad_norm: RefCell::new(f64::INFINITY),
             }
         }
 
@@ -764,6 +603,59 @@ pub mod internal {
             }
         }
 
+        /// The state-aware closure method for the BFGS optimizer.
+        pub fn cost_and_grad(&self, rho_bfgs: &Array1<f64>) -> (f64, Array1<f64>) {
+            let eval_num = {
+                let mut count = self.eval_count.borrow_mut();
+                *count += 1;
+                *count
+            };
+
+            let safe_rho = rho_bfgs.mapv(|v| v.clamp(-15.0, 15.0));
+
+            // Attempt to compute the cost and gradient.
+            let cost_result = self.compute_cost(&safe_rho);
+
+            match cost_result {
+                Ok(cost) if cost.is_finite() => {
+                    match self.compute_gradient(&safe_rho) {
+                        Ok(grad) => {
+                            let grad_norm = grad.dot(&grad).sqrt();
+
+                            // --- Robust Logging and Unconditional State Update ---
+                            if eval_num == 1 {
+                                println!("\n[BFGS Initial Point]");
+                                println!("  -> Cost: {:.7} | Grad Norm: {:.6e}", cost, grad_norm);
+                            } else if cost < *self.last_cost.borrow() {
+                                println!("\n[BFGS Progress Step #{}]", eval_num);
+                                println!("  -> Old Cost: {:.7} | New Cost: {:.7} (IMPROVEMENT)", *self.last_cost.borrow(), cost);
+                                println!("  -> Grad Norm: {:.6e}", grad_norm);
+                            } else {
+                                println!("\n[BFGS Trial Step #{}]", eval_num);
+                                println!("  -> Last Good Cost: {:.7}", *self.last_cost.borrow());
+                                println!("  -> Trial Cost:     {:.7} (NO IMPROVEMENT)", cost);
+                            }
+
+                            // ALWAYS update the "last known good state" if this evaluation was successful.
+                            // The optimizer's line search guarantees it won't proceed with a worse point.
+                            *self.last_cost.borrow_mut() = cost;
+                            *self.last_grad_norm.borrow_mut() = grad_norm;
+
+                            (cost, grad)
+                        }
+                        Err(e) => {
+                            println!("\n[BFGS FAILED Step #{}] -> Gradient calculation error: {:?}", eval_num, e);
+                            (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
+                        }
+                    }
+                }
+                // Cost was non-finite or an error occurred.
+                _ => {
+                    println!("\n[BFGS FAILED Step #{}] -> Cost is non-finite or errored. Optimizer will backtrack.", eval_num);
+                    (f64::INFINITY, Array1::zeros(rho_bfgs.len()))
+                }
+            }
+        }
         /// Compute the gradient for BFGS optimization of smoothing parameters.
         ///
         /// This method handles two distinct statistical criteria for marginal likelihood optimization:
@@ -851,14 +743,10 @@ pub mod internal {
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
 
                 if min_eig <= 0.0 {
-                    let retreat_grad = match *self.last_good_gradient.borrow() {
-                        Some(ref grad) => -grad * 10.0, // Negative of last good grad, scaled up to strongly retreat
-                        None => Array1::from_elem(p.len(), 1.0), // Fallback: arbitrary positive direction if no prior grad
-                    };
                     log::warn!(
                         "Indefinite Hessian detected in gradient; returning retreat gradient."
                     );
-                    return Ok(retreat_grad);
+                    return Ok(Array1::from_elem(p.len(), 1.0));
                 }
             }
 
@@ -1040,11 +928,6 @@ pub mod internal {
             // Therefore, the gradient of the cost is the NEGATIVE of the gradient of the score.
             // This single negation at the end makes the logic for both cases consistent.
             let cost_gradient = -score_gradient;
-
-            // NEW: If we reach here, this is a successful gradient; cache it as "last good"
-            self.last_good_gradient
-                .borrow_mut()
-                .replace(cost_gradient.clone());
 
             Ok(cost_gradient)
         }
