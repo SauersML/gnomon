@@ -5,13 +5,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 
-# --- Required Libraries ---
-# This script requires scikit-learn for model evaluation and baseline model.
-# Please install it if you haven't already:
-# pip install scikit-learn
-
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, confusion_matrix, r2_score
+from sklearn.metrics import roc_auc_score, brier_score_loss, confusion_matrix, r2_score
 from sklearn.calibration import calibration_curve
 
 # --- Path Configuration ---
@@ -20,7 +15,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Navigate up to the project root directory
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
-# Define all paths relative to the project root. These are now absolute Path objects.
+# Define all paths relative to the project root
 EXECUTABLE_NAME = "gnomon"
 EXECUTABLE_PATH = PROJECT_ROOT / "target" / "release" / EXECUTABLE_NAME
 MODEL_PATH = PROJECT_ROOT / "model.toml"
@@ -56,8 +51,8 @@ def build_rust_project():
 
 def simulate_data(n_samples: int, seed: int):
     """
-    Simulates a dataset and returns both the final phenotype and the true
-    underlying probability for robust metric calculation.
+    Simulates a dataset with heteroscedastic noise (noise level varies with PC1).
+    Returns both the final phenotype and the true, noise-free underlying probability.
     """
     np.random.seed(seed)
     score = np.random.uniform(-3, 3, n_samples)
@@ -69,25 +64,27 @@ def simulate_data(n_samples: int, seed: int):
         1.5 * np.sin(score) * pc1 - 0.5 * (score**2 + pc1**2)
     )
     
-    # Calculate the "true" probability before adding noise (our ground truth for fit)
+    # Calculate the "true" probability before adding noise
     true_probability = 1 / (1 + np.exp(-true_logit))
 
-    noise_std_dev = 2.5
-    noise = np.random.normal(0, noise_std_dev, n_samples)
+    # --- HETEROSCEDASTIC NOISE MODEL ---
+    # The noise level is no longer constant. It has a base level and increases
+    # as the value of PC1 increases, making predictions more uncertain at high PC1 values.
+    base_noise_std = 2.0
+    pc1_noise_factor = 0.75 # How much PC1 affects noise
+    # Noise standard deviation is now a vector, different for each sample
+    dynamic_noise_std = base_noise_std + pc1_noise_factor * np.maximum(0, pc1)
+    
+    noise = np.random.normal(0, dynamic_noise_std, n_samples)
 
     # Final probability for generating the observable outcome
     final_probability = 1 / (1 + np.exp(-(true_logit + noise)))
     phenotype = np.random.binomial(1, final_probability, n_samples)
     
     df = pd.DataFrame({"phenotype": phenotype, "score": score, "PC1": pc1})
-    # Add the true probability and logit as new columns for metric calculation
+    # Add the true probability for Oracle model calculation
     df['true_prob'] = true_probability
     
-    # Add a small epsilon to prevent log(0) errors in logit calculation
-    epsilon = 1e-9
-    p_clamped = np.clip(df['true_prob'], epsilon, 1 - epsilon)
-    df['true_logit'] = np.log(p_clamped / (1 - p_clamped))
-
     return df
 
 
@@ -103,72 +100,91 @@ def run_subprocess(command, cwd):
         print(f"\n--- A command FAILED (Exit Code: {e.returncode}) ---")
         sys.exit(1)
 
-def print_accuracy_metrics(df_results, model_name, prob_col_name):
-    """Calculates and prints a report of model performance metrics."""
+def generate_performance_report(df_results):
+    """Calculates and prints a side-by-side comparison of model metrics."""
     
     y_true = df_results['phenotype']
-    y_prob = df_results[prob_col_name]
     
-    print(f"\n" + "="*45)
-    print(f"  Model Performance Metrics: {model_name}")
-    print("="*45)
+    models = {
+        "GAM (gnomon)": df_results['prediction'],
+        "Baseline (Logistic)": df_results['baseline_prediction'],
+        "Oracle (Theoretical Best)": df_results['true_prob']
+    }
+    
+    print("\n" + "="*60)
+    print("      Model Performance Comparison on Test Set")
+    print("="*60)
+    
+    # --- AUC ---
+    print("\n[Discrimination: AUC (Area Under ROC Curve)]")
+    print("Higher is better. Measures ability to distinguish classes.")
+    for name, y_prob in models.items():
+        auc = roc_auc_score(y_true, y_prob)
+        print(f"  - {name:<28}: {auc:.4f}")
+        
+    # --- Brier Score ---
+    print("\n[Probabilistic Accuracy: Brier Score]")
+    print("Lower is better. Measures accuracy of the predicted probabilities.")
+    for name, y_prob in models.items():
+        brier = brier_score_loss(y_true, y_prob)
+        print(f"  - {name:<28}: {brier:.4f}")
+        
+    # --- R-squared ---
+    print("\n[Goodness of Fit: Pseudo R-squared]")
+    print("Measures variance in the binary outcome explained by the probabilities.")
+    for name, y_prob in models.items():
+        r2 = r2_score(y_true, y_prob)
+        print(f"  - {name:<28}: {r2:.4f}")
+        
+    # --- ECE ---
+    print("\n[Calibration: Expected Calibration Error (ECE)]")
+    print("Lower is better. Measures how trustworthy the probabilities are.")
+    for name, y_prob in models.items():
+        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='uniform')
+        ece = np.mean(np.abs(prob_true - prob_pred))
+        print(f"  - {name:<28}: {ece:.4f}")
 
-    # --- Discrimination Metric ---
-    auc = roc_auc_score(y_true, y_prob)
-    print(f"\n[Discrimination]")
-    print(f"  AUC (Area Under ROC Curve): {auc:.4f}")
+    # --- Confusion Matrices ---
+    print("\n[Confusion Matrices (at threshold=0.5)]")
+    for name, y_prob in models.items():
+        y_pred_class = (y_prob > 0.5).astype(int)
+        cm = confusion_matrix(y_true, y_pred_class)
+        cm_proportions = cm / cm.sum()
+        print(f"\n  --- {name} ---")
+        print(f"  (Proportions of total data)")
+        print(f"             Predicted 0   Predicted 1")
+        print(f"    True 0     {cm_proportions[0,0]:<12.3f}  {cm_proportions[0,1]:<12.3f}")
+        print(f"    True 1     {cm_proportions[1,0]:<12.3f}  {cm_proportions[1,1]:<12.3f}")
     
-    # --- Confusion Matrix (at 0.5 threshold) ---
-    y_pred_class = (y_prob > 0.5).astype(int)
-    cm = confusion_matrix(y_true, y_pred_class)
-    cm_proportions = cm / cm.sum()
+    print("\n" + "="*60)
     
-    print(f"\n[Confusion Matrix (at threshold=0.5)]")
-    print(f"  (Proportions of total data)")
-    print(f"           Predicted 0   Predicted 1")
-    print(f"  True 0     {cm_proportions[0,0]:<12.3f}  {cm_proportions[0,1]:<12.3f}")
-    print(f"  True 1     {cm_proportions[1,0]:<12.3f}  {cm_proportions[1,1]:<12.3f}")
 
-    # --- Calibration & Probabilistic Accuracy Metrics ---
-    brier = brier_score_loss(y_true, y_prob)
-    logloss = log_loss(y_true, y_prob)
-    print(f"\n[Calibration & Probabilistic Accuracy]")
-    print(f"  Brier Score Loss:           {brier:.4f} (Lower is better)")
-    print(f"  Log Loss (Cross-Entropy):   {logloss:.4f} (Lower is better)")
-    
-    # --- R-squared on Logit Scale ---
-    # Convert predicted probabilities to logits, clamping to avoid infinity
-    epsilon = 1e-9
-    p_clamped = np.clip(y_prob, epsilon, 1 - epsilon)
-    predicted_logit = np.log(p_clamped / (1 - p_clamped))
-    
-    r2 = r2_score(df_results['true_logit'], predicted_logit)
-    print(f"\n[Goodness of Fit]")
-    print(f"  R-squared (Logit scale):    {r2:.4f} (Measures fit to true function)")
-    
-    print("-" * 45 + "\n")
-
-def create_analysis_plots(results_df, baseline_probs, true_prob_surface, score_grid, pc1_grid):
+def create_analysis_plots(results_df, baseline_probs, oracle_probs, true_prob_surface, score_grid, pc1_grid):
     """Generates a 2x2 grid of plots for model analysis."""
     
     fig, axes = plt.subplots(2, 2, figsize=(18, 16))
-    fig.suptitle("Comprehensive GAM Model Analysis vs. Baseline", fontsize=22, y=0.98)
+    fig.suptitle("Comprehensive GAM Model Analysis vs. Baseline and Oracle", fontsize=22, y=0.98)
+    
+    # --- Define a consistent color range for the first two plots ---
+    # Find the global min/max across the true surface and GAM predictions to unify the scale
+    vmin = min(true_prob_surface.min(), results_df["prediction"].min())
+    vmax = max(true_prob_surface.max(), results_df["prediction"].max())
 
     # --- 1. Top-Left: Ground Truth Surface ---
     ax1 = axes[0, 0]
-    contour1 = ax1.contourf(score_grid, pc1_grid, true_prob_surface, levels=20, cmap="viridis")
+    contour1 = ax1.contourf(score_grid, pc1_grid, true_prob_surface, levels=20, cmap="viridis", vmin=vmin, vmax=vmax)
     fig.colorbar(contour1, ax=ax1, label="True Probability")
     ax1.set_title("1. Ground Truth Probability Surface", fontsize=16)
     ax1.set_xlabel("Polygenic Score (score)")
     ax1.set_ylabel("Principal Component 1 (PC1)")
     ax1.grid(True, linestyle='--', alpha=0.5)
 
-    # --- 2. Top-Right: GAM Model's Learned Surface ---
+    # --- 2. Top-Right: GAM Model's Predictions ---
     ax2 = axes[0, 1]
+    # Use the same colormap and vmin/vmax to ensure the color scales are identical
     scatter = ax2.scatter(
         results_df["score"], results_df["PC1"], c=results_df["prediction"],
-        cmap="plasma", edgecolor="k", linewidth=0.5, s=40,
-        label="GAM Predictions"
+        cmap="viridis", edgecolor="k", linewidth=0.5, s=40, vmin=vmin, vmax=vmax
     )
     fig.colorbar(scatter, ax=ax2, label="GAM Predicted Probability")
     ax2.set_title("2. GAM Predictions on Test Data", fontsize=16)
@@ -180,6 +196,10 @@ def create_analysis_plots(results_df, baseline_probs, true_prob_surface, score_g
     ax3 = axes[1, 0]
     y_true = results_df['phenotype']
     
+    # Oracle Calibration
+    prob_true_oracle, prob_pred_oracle = calibration_curve(y_true, oracle_probs, n_bins=10, strategy='uniform')
+    ece_oracle = np.mean(np.abs(prob_true_oracle - prob_pred_oracle))
+    
     # GAM Calibration
     prob_true_gam, prob_pred_gam = calibration_curve(y_true, results_df['prediction'], n_bins=10, strategy='uniform')
     ece_gam = np.mean(np.abs(prob_true_gam - prob_pred_gam))
@@ -188,9 +208,10 @@ def create_analysis_plots(results_df, baseline_probs, true_prob_surface, score_g
     prob_true_base, prob_pred_base = calibration_curve(y_true, baseline_probs, n_bins=10, strategy='uniform')
     ece_base = np.mean(np.abs(prob_true_base - prob_pred_base))
 
-    ax3.plot(prob_pred_gam, prob_true_gam, "s-", label=f"GAM (ECE = {ece_gam:.3f})", color='blue')
-    ax3.plot(prob_pred_base, prob_true_base, "o--", label=f"Baseline (ECE = {ece_base:.3f})", color='red')
-    ax3.plot([0, 1], [0, 1], "k:", label="Perfect Calibration")
+    ax3.plot(prob_pred_oracle, prob_true_oracle, "D-", label=f"Oracle (ECE = {ece_oracle:.3f})", color='gold', zorder=4)
+    ax3.plot(prob_pred_gam, prob_true_gam, "s-", label=f"GAM (ECE = {ece_gam:.3f})", color='blue', zorder=3)
+    ax3.plot(prob_pred_base, prob_true_base, "o--", label=f"Baseline (ECE = {ece_base:.3f})", color='red', zorder=2)
+    ax3.plot([0, 1], [0, 1], "k:", label="Perfect Calibration", zorder=1)
     ax3.set_title("3. Calibration Curve (Lower ECE is Better)", fontsize=16)
     ax3.set_xlabel("Mean Predicted Probability (per bin)")
     ax3.set_ylabel("Observed Frequency of Positives (per bin)")
@@ -213,7 +234,6 @@ def create_analysis_plots(results_df, baseline_probs, true_prob_surface, score_g
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     print("\nPlot generated. Close the plot window to finish the script.")
     plt.show()
-
 
 # --- Main Script Logic ---
 
@@ -281,13 +301,12 @@ def main():
         return
 
     predictions_df = pd.read_csv(PREDICTIONS_PATH, sep="\t")
-    # Combine the full test data with predictions from both models
+    # Combine the full test data with predictions from all models
     results_df = pd.concat([test_df_full.reset_index(drop=True), predictions_df], axis=1)
     results_df['baseline_prediction'] = baseline_probs
 
-    # Print metrics for both models
-    print_accuracy_metrics(results_df, model_name="GAM (gnomon)", prob_col_name="prediction")
-    print_accuracy_metrics(results_df, model_name="Baseline (Logistic Regression)", prob_col_name="baseline_prediction")
+    # Print the new side-by-side performance report
+    generate_performance_report(results_df)
     
     # Create the grid for the surface plot
     score_grid, pc1_grid = np.meshgrid(np.linspace(-3, 3, 100), np.linspace(-3.5, 3.5, 100))
@@ -298,8 +317,15 @@ def main():
     )
     true_prob_surface = 1 / (1 + np.exp(-true_logit_surface))
 
-    # Call the new plotting function
-    create_analysis_plots(results_df, baseline_probs, true_prob_surface, score_grid, pc1_grid)
+    # Call the plotting function
+    create_analysis_plots(
+        results_df, 
+        results_df['baseline_prediction'], 
+        results_df['true_prob'], 
+        true_prob_surface, 
+        score_grid, 
+        pc1_grid
+    )
 
 if __name__ == "__main__":
     main()
