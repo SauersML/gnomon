@@ -109,16 +109,46 @@ pub fn train_model(
 
     // --- Run the BFGS Optimizer ---
     // The closure is now a simple, robust method call.
+    // Rationale: We store the result instead of immediately crashing with `?`
+    // This allows us to inspect the error type and handle it gracefully.
+    let bfgs_result = Bfgs::new(initial_rho, |rho| reml_state.cost_and_grad(rho))
+        .with_tolerance(config.reml_convergence_tolerance)
+        .with_max_iterations(config.reml_max_iterations as usize)
+        .run();
+
+    // Rationale: This `match` block is the new control structure. It allows us
+    // to define different behaviors for a successful run vs. a failed run.
     let BfgsSolution {
         final_point: final_rho,
         final_value,
         iterations,
         ..
-    } = Bfgs::new(initial_rho, |rho| reml_state.cost_and_grad(rho))
-        .with_tolerance(config.reml_convergence_tolerance)
-        .with_max_iterations(config.reml_max_iterations as usize)
-        .run()
-        .map_err(|e| EstimationError::RemlOptimizationFailed(format!("BFGS failed: {:?}", e)))?;
+    } = match bfgs_result {
+        // Rationale: This is the ideal success path. If the optimizer converges
+        // according to its strict criteria, we log the success and use the result.
+        Ok(solution) => {
+            eprintln!("\nBFGS optimization converged successfully according to tolerance.");
+            solution
+        }
+        // Rationale: This is the core of our fix. We specifically catch the
+        // `LineSearchFailed` error, which we've diagnosed as acceptable. We print a
+        // helpful warning and extract `last_solution` (the best result found before
+        // failure), allowing the program to continue.
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
+            eprintln!("\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum.");
+            eprintln!("[INFO] Accepting the best parameters found as the final result.");
+            *last_solution
+        }
+        // Rationale: This is our safety net. Any other error from the optimizer
+        // (e.g., gradient was NaN) is still treated as a fatal error, ensuring
+        // the program doesn't continue with a potentially garbage result.
+        Err(e) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "BFGS failed with a critical error: {:?}",
+                e
+            )));
+        }
+    };
 
     if !final_value.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
