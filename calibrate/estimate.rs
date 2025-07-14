@@ -140,11 +140,12 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
+    // Use accessor views to avoid direct field access of private fields
     let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
-        reml_state.x, // Use from reml_state
-        reml_state.y,
-        &reml_state.s_list,
+        reml_state.x(), // Use accessor method instead of direct field access
+        reml_state.y(), 
+        reml_state.s_list_ref(), // Use accessor method instead of direct field access
         &layout,
         config,
     )?;
@@ -296,6 +297,19 @@ pub mod internal {
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
             }
+        }
+        
+        // Accessor methods for private fields
+        pub(super) fn x(&self) -> ArrayView2<'a, f64> {
+            self.x
+        }
+        
+        pub(super) fn y(&self) -> ArrayView1<'a, f64> {
+            self.y
+        }
+        
+        pub(super) fn s_list_ref(&self) -> &Vec<Array2<f64>> {
+            &self.s_list
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
