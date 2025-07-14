@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+A test script to simulate data, train a GAM model using the 'gnomon' Rust
+executable, evaluate its performance against a baseline, and generate
+a comprehensive set of analysis plots.
+"""
+
 import subprocess
 import pandas as pd
 import numpy as np
@@ -13,14 +20,14 @@ from sklearn.calibration import calibration_curve
 # --- Path Configuration ---
 # Get the absolute path of the directory containing this script
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Navigate up to the project root directory
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
+# Navigate up to the project root directory (assumes tests/ is under calibrate/)
+PROJECT_ROOT = SCRIPT_DIR.parent
 
 # Define all paths relative to the project root
 EXECUTABLE_NAME = "gnomon"
 EXECUTABLE_PATH = PROJECT_ROOT / "target" / "release" / EXECUTABLE_NAME
 MODEL_PATH = PROJECT_ROOT / "model.toml"
-PREDICTIONS_PATH = PROJECT_ROOT / "predictions.tsv" # The fixed output file for the tool
+PREDICTIONS_PATH = PROJECT_ROOT / "predictions.tsv"  # The fixed output file for the tool
 TRAIN_DATA_PATH = PROJECT_ROOT / "training_data.tsv"
 TEST_DATA_PATH = PROJECT_ROOT / "test_data.tsv"
 GRID_DATA_PATH = PROJECT_ROOT / "grid_data_for_surface.tsv"
@@ -30,6 +37,8 @@ GRID_DATA_PATH = PROJECT_ROOT / "grid_data_for_surface.tsv"
 N_SAMPLES_TRAIN = 5000
 N_SAMPLES_TEST = 1000
 NUM_PCS = 1  # Simulate 1 PC for easy 2D visualization
+SIMULATION_SIGNAL_STRENGTH = 0.6 # The coefficient for the true logit function
+
 
 # --- Helper Functions ---
 
@@ -38,6 +47,8 @@ def build_rust_project():
     if not EXECUTABLE_PATH.is_file():
         print("--- Executable not found. Compiling Rust Project... ---")
         try:
+            # Assumes the script is run from a location where `cargo` is in the PATH
+            # and the project structure is correct.
             subprocess.run(
                 ["cargo", "build", "--release", "--bin", EXECUTABLE_NAME],
                 check=True, text=True, cwd=PROJECT_ROOT
@@ -45,56 +56,64 @@ def build_rust_project():
             print("--- Compilation successful. ---")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"\n--- ERROR: Rust compilation failed: {e} ---")
-            print("Please ensure Rust/Cargo is installed and in your PATH.")
+            print("Please ensure Rust/Cargo is installed and in your PATH,")
+            print(f"and that the project root is correctly set to: {PROJECT_ROOT}")
             sys.exit(1)
     else:
-        print(f"--- Found existing executable. Skipping build. ---")
+        print("--- Found existing executable. Skipping build. ---")
 
 
 def simulate_data(n_samples: int, seed: int):
     """
     Simulates a dataset with heteroscedastic noise.
-    Returns phenotype, covariates, the pure signal probability, and the final oracle probability.
-    """
+
+    Args:
+        n_samples: The number of samples to generate.
+        seed: The random seed for reproducibility.
+
+    Returns:
+        A pandas DataFrame with columns for 'phenotype', 'score', 'PC1',
+        the pure 'signal_prob', and the final 'oracle_prob'.
     """
     np.random.seed(seed)
     score = np.random.uniform(-3, 3, n_samples)
     pc1 = np.random.normal(0, 1.2, n_samples)
 
-    signal_strength = 0.6
-    true_logit = signal_strength * (
+    # The true, noise-free relationship between features and the outcome logit
+    true_logit = SIMULATION_SIGNAL_STRENGTH * (
         0.8 * np.cos(score * 2) - 1.2 * np.tanh(pc1) +
         1.5 * np.sin(score) * pc1 - 0.5 * (score**2 + pc1**2)
     )
-    
-    # Calculate the "signal" probability (noise-free)
+
+    # Calculate the "signal" probability (the ideal, noise-free probability)
     signal_probability = 1 / (1 + np.exp(-true_logit))
 
     # --- HETEROSCEDASTIC NOISE MODEL ---
+    # The noise level depends on the value of PC1
     base_noise_std = 2.0
     pc1_noise_factor = 0.75
     dynamic_noise_std = base_noise_std + pc1_noise_factor * np.maximum(0, pc1)
     noise = np.random.normal(0, dynamic_noise_std, n_samples)
 
-    # Final "oracle" probability for generating the observable outcome
+    # Final "oracle" probability (signal + instance-specific noise) for generating the outcome
     oracle_probability = 1 / (1 + np.exp(-(true_logit + noise)))
     phenotype = np.random.binomial(1, oracle_probability, n_samples)
-    
+
     df = pd.DataFrame({"phenotype": phenotype, "score": score, "PC1": pc1})
-    # Add both the pure signal and the final oracle probabilities
+    # Add both the pure signal and the final oracle probabilities for evaluation
     df['signal_prob'] = signal_probability
     df['oracle_prob'] = oracle_probability
-    
+
     return df
 
 
 def run_subprocess(command, cwd):
-    """Runs a subprocess and handles KeyboardInterrupt cleanly."""
+    """Runs a subprocess and handles common errors cleanly."""
     try:
         print(f"Executing: {' '.join(map(str, command))}\n")
         subprocess.run(command, check=True, text=True, cwd=cwd)
     except KeyboardInterrupt:
-        print("\n--- Process interrupted by user (Ctrl+C). ---")
+        print("\n--- Process interrupted by user (Ctrl+C). Cleaning up. ---")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         print(f"\n--- A command FAILED (Exit Code: {e.returncode}) ---")
@@ -117,57 +136,60 @@ def nagelkerkes_r2(y_true, y_prob):
     y_prob = np.asarray(y_prob)
     epsilon = 1e-15
     y_prob = np.clip(y_prob, epsilon, 1 - epsilon)
+
+    # Log-likelihood of the model with only an intercept (null model)
     p_mean = np.mean(y_true)
     log_likelihood_null = np.sum(y_true * np.log(p_mean) + (1 - y_true) * np.log(1 - p_mean))
+
+    # Log-likelihood of the full model
     log_likelihood_model = np.sum(y_true * np.log(y_prob) + (1 - y_true) * np.log(1 - y_prob))
+
     n = len(y_true)
     r2_cs = 1 - np.exp((2/n) * (log_likelihood_null - log_likelihood_model))
     max_r2_cs = 1 - np.exp((2/n) * log_likelihood_null)
-    if max_r2_cs == 0:
-        return 0.0
-    return r2_cs / max_r2_cs
+    
+    return r2_cs / max_r2_cs if max_r2_cs > 0 else 0.0
 
 
 def generate_performance_report(df_results):
     """Calculates and prints a side-by-side comparison of model metrics."""
     y_true = df_results['phenotype']
-    
+
     models = {
         "GAM (gnomon)": df_results['prediction'],
         "Baseline (Logistic)": df_results['baseline_prediction'],
         "Signal Model (Noise-Free)": df_results['signal_prob'],
         "Oracle (Instance Best)": df_results['oracle_prob']
     }
-    
+
     print("\n" + "="*60)
     print("      Model Performance Comparison on Test Set")
     print("="*60)
-    
+
     print("\n[Discrimination: AUC (Area Under ROC Curve)]")
     print("Higher is better. Measures ability to distinguish classes.")
     for name, y_prob in models.items():
         auc = roc_auc_score(y_true, y_prob)
         print(f"  - {name:<28}: {auc:.4f}")
-        
+
     print("\n[Probabilistic Accuracy: Brier Score]")
     print("Lower is better. Measures accuracy of the predicted probabilities.")
     for name, y_prob in models.items():
         brier = brier_score_loss(y_true, y_prob)
         print(f"  - {name:<28}: {brier:.4f}")
-        
+
     print("\n[Fit: Nagelkerke's R-squared]")
     print("Higher is better (0-1). Likelihood-based, common in PGS literature.")
     for name, y_prob in models.items():
-        stable_prob = np.clip(y_prob, 1e-15, 1 - 1e-15)
-        r2_n = nagelkerkes_r2(y_true, stable_prob)
+        r2_n = nagelkerkes_r2(y_true, y_prob)
         print(f"  - {name:<28}: {r2_n:.4f}")
-        
+
     print("\n[Separation: Tjur's R-squared]")
     print("Higher is better (0-1). The mean difference in prediction between classes.")
     for name, y_prob in models.items():
         r2_t = tjurs_r2(y_true, y_prob)
         print(f"  - {name:<28}: {r2_t:.4f}")
-        
+
     print("\n[Calibration: Expected Calibration Error (ECE)]")
     print("Lower is better. Measures how trustworthy the probabilities are.")
     for name, y_prob in models.items():
@@ -175,18 +197,17 @@ def generate_performance_report(df_results):
         ece = np.mean(np.abs(prob_true - prob_pred))
         print(f"  - {name:<28}: {ece:.4f}")
 
-
     print("\n[Confusion Matrices (at threshold=0.5)]")
     for name, y_prob in models.items():
         y_pred_class = (y_prob > 0.5).astype(int)
         cm = confusion_matrix(y_true, y_pred_class)
         cm_proportions = cm / cm.sum()
         print(f"\n  --- {name} ---")
-        print(f"  (Proportions of total data)")
+        print("  (Proportions of total data)")
         print(f"             Predicted 0   Predicted 1")
         print(f"    True 0     {cm_proportions[0,0]:<12.3f}  {cm_proportions[0,1]:<12.3f}")
         print(f"    True 1     {cm_proportions[1,0]:<12.3f}  {cm_proportions[1,1]:<12.3f}")
-    
+
     print("\n" + "="*60)
 
 
@@ -194,7 +215,7 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     """Generates a 2x2 grid of plots for model analysis."""
     fig, axes = plt.subplots(2, 2, figsize=(18, 16))
     fig.suptitle("Comprehensive GAM Model Analysis vs. Baseline and Oracle", fontsize=22, y=0.98)
-    
+
     vmin = min(signal_surface.min(), gam_surface.min())
     vmax = max(signal_surface.max(), gam_surface.max())
 
@@ -213,7 +234,8 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     fig.colorbar(contour2, ax=ax2, label="GAM Predicted Probability")
     ax2.scatter(
         results_df["score"], results_df["PC1"], c=results_df["prediction"],
-        cmap="viridis", edgecolor="k", linewidth=0.5, s=40, vmin=vmin, vmax=vmax
+        cmap="viridis", edgecolor="k", linewidth=0.5, s=40, vmin=vmin, vmax=vmax,
+        alpha=0.8
     )
     ax2.set_title("2. GAM's Learned Surface with Predictions Overlay", fontsize=16)
     ax2.set_xlabel("Polygenic Score (score)")
@@ -251,12 +273,11 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     ax4.set_ylabel("Density")
     ax4.legend()
     ax4.grid(True, linestyle='--', alpha=0.6)
-    
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     print("\nPlot generated. Close the plot window to finish the script.")
     plt.show()
 
-# --- Main Script Logic ---
 
 def main():
     """Main function to run the end-to-end simulation and plotting."""
@@ -285,10 +306,10 @@ def main():
             str(TRAIN_DATA_PATH)
         ]
         run_subprocess(train_command, cwd=PROJECT_ROOT)
-        print(f"\nGAM model training complete. Model saved to '{MODEL_PATH}'\n")
+        print(f"\nGAM model training complete. Model saved to '{MODEL_PATH}'")
 
         # 4. Simulate and prepare test data
-        print(f"--- Simulating {N_SAMPLES_TEST} samples for inference ---")
+        print(f"\n--- Simulating {N_SAMPLES_TEST} samples for inference ---")
         test_df_full = simulate_data(N_SAMPLES_TEST, seed=101)
         test_df_full[['score', 'PC1']].to_csv(TEST_DATA_PATH, sep="\t", index=False)
         print(f"Saved test data to '{TEST_DATA_PATH}'")
@@ -297,7 +318,7 @@ def main():
         print("\n--- Generating predictions with Baseline Model ---")
         baseline_probs = baseline_model.predict_proba(test_df_full[['score', 'PC1']])[:, 1]
         
-        # 6. Run 'infer' for GAM on TEST DATA and load results
+        # 6. Run 'infer' for GAM on test data and load results
         print("\n--- Running 'infer' command for GAM model on test data ---")
         infer_command = [str(EXECUTABLE_PATH), "infer", "--model", str(MODEL_PATH), str(TEST_DATA_PATH)]
         run_subprocess(infer_command, cwd=PROJECT_ROOT)
@@ -310,39 +331,38 @@ def main():
         results_df['baseline_prediction'] = baseline_probs
         generate_performance_report(results_df)
         
-        # 8. Generate GAM surface plot data
+        # 8. Generate a grid of data points to visualize the model's learned surface
         print("\n--- Generating GAM surface plot data ---")
         score_grid, pc1_grid = np.meshgrid(np.linspace(-3, 3, 100), np.linspace(-3.5, 3.5, 100))
         grid_df = pd.DataFrame({'score': score_grid.ravel(), 'PC1': pc1_grid.ravel()})
         grid_df.to_csv(GRID_DATA_PATH, sep='\t', index=False)
         
-        # FIX: Run 'infer' on the grid data. This will OVERWRITE 'predictions.tsv'.
-        # This is the correct behavior as the tool does not support a custom output path.
-        print("\n--- Running 'infer' command on grid data for surface plot ---")
+        # NOTE: The 'gnomon' tool uses a fixed output file. The following command
+        # will overwrite 'predictions.tsv' with the results from the grid data.
+        print("\n--- Running 'infer' on grid data for surface plot ---")
         infer_grid_command = [str(EXECUTABLE_PATH), "infer", "--model", str(MODEL_PATH), str(GRID_DATA_PATH)]
         run_subprocess(infer_grid_command, cwd=PROJECT_ROOT)
         
-        # FIX: Load the newly-overwritten 'predictions.tsv' file.
+        # Load the newly-overwritten 'predictions.tsv' file for the surface plot
         grid_preds_df = pd.read_csv(PREDICTIONS_PATH, sep="\t")
         gam_surface = grid_preds_df['prediction'].values.reshape(score_grid.shape)
         print("GAM surface data generated.")
 
-        # 9. Calculate the true signal surface for plotting
-        signal_strength = 0.6
-        true_logit_surface = signal_strength * (
+        # 9. Calculate the true signal surface for comparison in the plot
+        true_logit_surface = SIMULATION_SIGNAL_STRENGTH * (
             0.8 * np.cos(score_grid * 2) - 1.2 * np.tanh(pc1_grid) +
             1.5 * np.sin(score_grid) * pc1_grid - 0.5 * (score_grid**2 + pc1_grid**2)
         )
         signal_surface = 1 / (1 + np.exp(-true_logit_surface))
 
-        # 10. Call the master plotting function
+        # 10. Generate and display the final analysis plots
         create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid)
 
     finally:
-        # Clean up temporary files
+        # Clean up temporary files created during the run
         print("\n--- Cleaning up temporary files ---")
-        # FIX: Removed GRID_PREDICTIONS_PATH as it's never created.
-        for f in [TRAIN_DATA_PATH, TEST_DATA_PATH, GRID_DATA_PATH, PREDICTIONS_PATH]:
+        files_to_clean = [TRAIN_DATA_PATH, TEST_DATA_PATH, GRID_DATA_PATH, PREDICTIONS_PATH]
+        for f in files_to_clean:
             if os.path.exists(f):
                 try:
                     os.remove(f)
