@@ -1589,7 +1589,7 @@ mod tests {
         // 4. Non-linear effects in the generating model
         
         // ======================================================================
-        // SECTION 1: BASIC VALIDATION CHECKS
+        // Section 1: Basic validation checks
         // ======================================================================
         
         println!("\n1. RUNNING BASIC PREDICTION VALIDATION CHECKS...");
@@ -1743,7 +1743,7 @@ mod tests {
         assert!(mae < 0.15, "Mean absolute error too high: {}", mae);
         
         // ======================================================================
-        // SECTION 2: ASSESSING MODEL DISCRIMINATION (AUC/ROC)
+        // Section 2: Assessing model discrimination (AUC/ROC)
         // ======================================================================
         println!("\n2. ASSESSING MODEL DISCRIMINATION...");
         
@@ -1823,7 +1823,7 @@ mod tests {
         }
         
         // ======================================================================
-        // SECTION 3: PGS EFFECT SIZE ASSESSMENT
+        // Section 3: PGS effect size assessment
         // ======================================================================
         println!("\n3. VALIDATING PGS EFFECT SIZE AND DIRECTION...");
         
@@ -1878,7 +1878,7 @@ mod tests {
         println!("✓ Fold increase (highest/lowest decile): {:.2}x", fold_increase);
         
         // ======================================================================
-        // SECTION 4: INTERACTION EFFECT VALIDATION
+        // Section 4: Interaction effect validation
         // ======================================================================
         println!("\n4. VALIDATING INTERACTION EFFECTS...");
         
@@ -1993,7 +1993,7 @@ mod tests {
         assert!(interaction_tests_passed, "Failed to detect any expected interaction effects");
         
         // ======================================================================
-        // SECTION 5: CALIBRATION ASSESSMENT
+        // Section 5: Calibration assessment
         // ======================================================================
         println!("\n5. VALIDATING MODEL CALIBRATION...");
         

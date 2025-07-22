@@ -988,7 +988,7 @@ pub mod internal {
                     }
                     log::debug!("Gradient computation loop finished.");
                     // =========================================================================
-                    // =================== END OF NEW FAST IMPLEMENTATION ======================
+                    // ================= End of optimized implementation =====================
                     // =========================================================================
                 }
             }
@@ -1258,7 +1258,7 @@ pub mod internal {
             }
         }
 
-        // ======== NUMERICAL GRADIENT HELPERS ========
+        // ======== Numerical gradient helpers ========
         // These functions implement robust numerical gradient computation
         // to fix the issues identified in the gradient approximation tests
 
@@ -1424,12 +1424,11 @@ pub mod internal {
                 .unwrap();
 
             // Define a simple function for generating the data
-            let simple_function = |x: f64, _pc: f64| -> f64 { 2.0 * x + 1.0 };
+            let simple_function = |x: f64| -> f64 { 2.0 * x + 1.0 };
 
             // Generate non-separable binary data
             // Create logits from p
-            let logits =
-                Array1::from_iter((0..n_samples).map(|i| simple_function(p[i], pcs[[i, 0]])));
+            let logits = Array1::from_iter((0..n_samples).map(|i| simple_function(p[i])));
             let y = generate_y_from_logit(&logits, &mut rng);
             let data = TrainingData { y, p, pcs };
 
@@ -2006,7 +2005,7 @@ pub mod internal {
                 ));
             }
 
-            // ----- VALIDATE INTERACTION EFFECT -----
+            // ----- Validate interaction effect -----
 
             // Create a 2D grid to evaluate the full interaction surface
             let int_grid_size = 25; // Increased grid size for better resolution now that other stability issues are fixed
@@ -2693,7 +2692,7 @@ pub mod internal {
             println!("  Cost at rho=10: {:.6}", cost_high);
             println!("  Cost at rho=11: {:.6}", cost_very_high);
 
-            // MATHEMATICAL EXPECTATION:
+            // Mathematical expectation:
             // At high penalty, the cost function should be flat for the null effect.
             // The gradient with respect to ρ = log(λ) includes a factor of λ, so it may not vanish.
             // Instead, we test that the cost function has plateaued (is flat).
@@ -3298,7 +3297,7 @@ pub mod internal {
             println!("Trace solve failures: {}", trace_solve_failures);
             println!();
 
-            // === FINAL GRADIENT ===
+            // === Final gradient ===
             let analytical_gradient = 0.5 * lambdas[0] * (beta_term_normalized - trace_term);
 
             println!("=== Final Gradient Assembly ===");
@@ -3309,7 +3308,7 @@ pub mod internal {
             );
             println!("Analytical gradient: {:.6}", analytical_gradient);
 
-            // === NUMERICAL GRADIENT FOR COMPARISON ===
+            // === Numerical gradient for comparison ===
             let numerical_gradient = match compute_numerical_gradient_robust(
                 &reml_state,
                 &test_rho,
@@ -3366,7 +3365,7 @@ pub mod internal {
                 println!("Warning: Finite differences are not symmetric - function may be noisy");
             }
 
-            // === DETAILED COMPONENT-WISE VERIFICATION ===
+            // === Detailed component-wise verification ===
 
             // Check if β̂ᵀS_kβ̂ calculation is consistent
             let beta_block = beta.slice(ndarray::s![layout.penalty_map[0].col_range.clone()]);

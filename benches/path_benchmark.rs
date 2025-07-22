@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//        GNOMON COMPUTE PATH PERFORMANCE BENCHMARK (MULTI-DIMENSIONAL)
+//        Gnomon compute path performance benchmark (multi-dimensional)
 //
 // ========================================================================================
 //
@@ -58,7 +58,7 @@ fn setup_benchmark_context(
     let flip_mask_matrix = vec![0u8; matrix_size];
     let variant_to_scores_map = vec![vec![ScoreColumnIndex(0)]; num_variants];
 
-    // --- SUBSET LOGIC ---
+    // --- Subset logic ---
     let num_people_to_score = ((total_num_people as f32) * subset_percentage).round() as usize;
 
     let (person_subset, final_person_iids, output_idx_to_fam_idx) = if subset_percentage >= 1.0 {
@@ -92,7 +92,7 @@ fn setup_benchmark_context(
     for (output_idx, &fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
         person_fam_to_output_idx[fam_idx as usize] = Some(output_idx as u32);
     }
-    // --- END SUBSET LOGIC ---
+    // --- End subset logic ---
 
     let prep_result = PreparationResult::new(
         weights_matrix,
@@ -164,7 +164,7 @@ fn benchmark_the_works(c: &mut Criterion) {
         for &num_scores in NUM_SCORES_TO_TEST.iter() {
             for &subset_pct in SUBSET_PERCENTAGES.iter() {
                 for &freq in ALLELE_FREQUENCIES_TO_TEST.iter() {
-                    // --- SETUP FOR THIS SCENARIO ---
+                    // --- Setup for this scenario ---
                     let id_str = format!(
                         "N={}_K={}_Subset={:.0}%_Freq={:.3}",
                         total_people,
@@ -186,7 +186,7 @@ fn benchmark_the_works(c: &mut Criterion) {
 
                     group.throughput(Throughput::Elements(num_people_to_score as u64));
 
-                    // --- 1. BENCHMARK VARIANT-MAJOR (NO-PIVOT) PATH ---
+                    // --- 1. Benchmark variant-major (no-pivot) path ---
                     let variant_data = generate_variant_data_hwe(total_people, freq);
                     group.bench_function(
                         BenchmarkId::new(format!("No-Pivot__{}", id_str), freq),
@@ -204,7 +204,7 @@ fn benchmark_the_works(c: &mut Criterion) {
                         },
                     );
 
-                    // --- 2. BENCHMARK PERSON-MAJOR (PIVOT) PATH ---
+                    // --- 2. Benchmark person-major (pivot) path ---
                     let tile_pool = Arc::new(ArrayQueue::new(4));
                     let sparse_index_pool = Arc::new(batch::SparseIndexPool::new());
                     let mut batch_variant_data = Vec::with_capacity(

@@ -904,7 +904,7 @@ mod tests {
     }
 }
 
-// MOVE THIS SOMEWHERE ELSE
+// TODO: Move this somewhere else
 /// Maps the flattened coefficient vector to a structured representation.
 pub fn map_coefficients(
     beta: &Array1<f64>,

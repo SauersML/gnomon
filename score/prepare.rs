@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               THE PREPARATION "COMPILER"
+//               The preparation "compiler"
 //
 // ========================================================================================
 //
@@ -30,7 +30,7 @@ use std::time::Instant;
 const LANE_COUNT: usize = 8;
 
 // ========================================================================================
-//              TYPE-DRIVEN DOMAIN MODEL FOR STREAMING
+//              Type-driven domain model for streaming
 // ========================================================================================
 
 /// The primitive, sortable key used for all merge-join operations.
@@ -149,7 +149,7 @@ enum ReconciliationOutcome<'a, 'arena> {
 }
 
 // ========================================================================================
-//                                  PUBLIC API
+//                                  Public API
 // ========================================================================================
 
 /// A struct to hold all necessary information to debug a merge-join failure.
@@ -201,7 +201,7 @@ pub fn prepare_for_computation(
     sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
 ) -> Result<PreparationResult, PrepError> {
-    // --- STAGE 1: INITIAL SETUP ---
+    // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
     let fam_path = fileset_prefixes[0].with_extension("fam");
     let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
@@ -212,7 +212,7 @@ pub fn prepare_for_computation(
     let num_people_to_score = final_person_iids.len();
     let total_variants_in_bim = count_total_variants(fileset_prefixes)?;
 
-    // --- STAGE 2: GLOBAL METADATA DISCOVERY ---
+    // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
     let score_names = parse_score_file_headers_only(sorted_score_files)?;
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
@@ -221,7 +221,7 @@ pub fn prepare_for_computation(
         .map(|(i, s)| (s.clone(), ScoreColumnIndex(i)))
         .collect();
 
-    // --- STAGE 3: SINGLE-PASS DATA COLLECTION ---
+    // --- Stage 3: Single-pass data collection ---
     eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
@@ -416,7 +416,7 @@ pub fn prepare_for_computation(
         );
     }
 
-    // --- STAGE 4: IN-MEMORY PROCESSING AND MATRIX CONSTRUCTION ---
+    // --- Stage 4: In-memory processing and matrix construction ---
     eprintln!("> Stage 4: Verifying data and building final matrices...");
 
     // The "lifetime escape hatch": convert the temporary, borrowed complex rule data
@@ -507,7 +507,7 @@ pub fn prepare_for_computation(
         }
     }
 
-    // --- STAGE 5: FINAL ASSEMBLY ---
+    // --- Stage 5: Final assembly ---
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
@@ -547,7 +547,7 @@ pub fn prepare_for_computation(
 }
 
 // ========================================================================================
-//                             PRIVATE IMPLEMENTATION HELPERS
+//                             Private implementation helpers
 // ========================================================================================
 
 /// Extracts the malformed chromosome name from a `PrepError::Parse` message.
@@ -1067,7 +1067,7 @@ pub fn parse_score_file_headers_only(score_files: &[PathBuf]) -> Result<Vec<Stri
 }
 
 // ========================================================================================
-//                                    ERROR HANDLING
+//                                    Error handling
 // ========================================================================================
 
 impl Display for PrepError {

@@ -486,7 +486,7 @@ mod tests {
         let s = create_difference_penalty_matrix(5, 2).unwrap();
         assert_eq!(s.shape(), &[5, 5]);
         // D_2 for n=5 is [[1, -2, 1, 0, 0], [0, 1, -2, 1, 0], [0, 0, 1, -2, 1]]
-        // S = D_2' * D_2
+        // s = d_2' * d_2
         let expected_s = array![
             [1., -2., 1., 0., 0.],
             [-2., 5., -4., 1., 0.],

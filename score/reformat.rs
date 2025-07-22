@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               PGS CATALOG SCORE FILE DIAGNOSTICS & REFORMATTING
+//               PGS catalog score file diagnostics & reformatting
 //
 // ========================================================================================
 
@@ -14,7 +14,7 @@ use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 
 // ========================================================================================
-//                                   PUBLIC API
+//                                   Public API
 // ========================================================================================
 
 /// Checks if a file appears to be in the gnomon-native format by inspecting its header.
@@ -411,7 +411,7 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
 }
 
 // ========================================================================================
-//                        PRIVATE TYPES AND HELPERS
+//                        Private types and helpers
 // ========================================================================================
 
 struct SortableLine {

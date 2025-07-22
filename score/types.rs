@@ -84,14 +84,14 @@ pub enum PersonSubset {
 /// compute engine will execute.
 #[derive(Debug)]
 pub struct PreparationResult {
-    // --- PRIVATE, COMPILED DATA MATRICES ---
+    // --- Private, compiled data matrices ---
     // These fields are private to guarantee their invariants. They are created once
     // by the `prepare` module and can only be read by downstream modules.
     weights_matrix: Vec<f32>,
     flip_mask_matrix: Vec<u8>,
     stride: usize,
 
-    // --- PUBLIC METADATA & LOOKUP TABLES ---
+    // --- Public metadata & lookup tables ---
     /// The sorted list of original `.bim` row indices for the "fast path."
     /// This is used by the I/O producer to filter the `.bed` file for all
     /// simple, unambiguous variants. The indices are global across all filesets.

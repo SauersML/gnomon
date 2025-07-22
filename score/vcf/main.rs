@@ -1,15 +1,15 @@
 /*
 ----------------------------------------------------------------------------------------------------
-// 1. EXECUTIVE SUMMARY
+// 1. Executive Summary
 ----------------------------------------------------------------------------------------------------
 //
-//  PROBLEM:
+//  Problem:
 //      We have a linear prediction model built from thousands of binary variables. Some of these
 //      variables are imputed, and we have a confidence score (a probability `p`) for each
 //      imputation. We must decide how to incorporate these uncertain variables into the final
 //      patient score.
 //
-//  TWO COMPETING STRATEGIES:
+//  Two competing strategies:
 //      A) The Filtering Method (`S_F`): Set a confidence threshold. Discard all variables below
 //         the threshold, treating their contribution as zero.
 //      B) The Expectation Method (`S_E`): Use all variables, but weight the effect size of each
@@ -20,17 +20,17 @@
 //      method. It is the most accurate predictor that can be constructed from our model and data.
 //
 ----------------------------------------------------------------------------------------------------
-// 2. FORMAL PROBLEM DEFINITION
+// 2. Formal Problem Definition
 ----------------------------------------------------------------------------------------------------
 //
-//  OBJECTIVE:
+//  Objective:
 //      To construct a predictor, `S`, that is the most accurate possible estimate of a patient's
 //      true, underlying value, `Y_true`. Accuracy is formally defined by minimizing the
 //      Mean Squared Error (MSE).
 //
 //      Minimize: E[(S - Y_true)²]
 //
-//  MODEL DEFINITION:
+//  Model Definition:
 //      The true value `Y_true` is determined by a linear combination of binary variables.
 //
 //      Y_true = β₀ + Σᵢ βᵢxᵢ
@@ -41,7 +41,7 @@
 //          * `βᵢ`: The known, pre-trained weight (effect size) for variable `i`.
 //          * `xᵢ`: The true, unknown binary state (0 or 1) of variable `i`.
 //
-//  AVAILABLE DATA:
+//  Available Data:
 //      For each variable `i`, we do not know `xᵢ` with certainty. Instead, we have a
 //      probability derived from our imputation model:
 //
@@ -51,17 +51,17 @@
 //      data for the patient. For non-imputed variables, `pᵢ` is either 0 or 1.
 //
 ----------------------------------------------------------------------------------------------------
-// 3. MATHEMATICAL DEFINITION OF THE COMPETING METHODS
+// 3. Mathematical Definition of the Competing Methods
 ----------------------------------------------------------------------------------------------------
 //
-//  METHOD E: THE EXPECTATION SCORE (S_E)
+//  Method E: The Expectation Score (S_E)
 //      This score is the mathematical expectation of `Y_true`, conditioned on the available data.
 //      S_E = E[Y_true | Data] = E[β₀ + Σᵢ βᵢxᵢ | Data] = β₀ + Σᵢ βᵢ * E[xᵢ | Data]
 //      Since E[xᵢ | Data] = pᵢ, the formula is:
 //
 //      S_E = β₀ + Σᵢ βᵢpᵢ
 //
-//  METHOD F: THE FILTERING SCORE (S_F)
+//  Method F: The Filtering Score (S_F)
 //      This score is based on a confidence threshold `τ`. We partition all variables `I` into
 //      a high-confidence set `I_H` and a low-confidence set `I_L`, which is discarded.
 //
@@ -73,7 +73,7 @@
 //      S_F = β₀ + Σ_{i ∈ I_H} βᵢx̂ᵢ
 //
 ----------------------------------------------------------------------------------------------------
-// 4. MINIMIZATION OF MEAN SQUARED ERROR
+// 4. Minimization of Mean Squared Error
 ----------------------------------------------------------------------------------------------------
 //
 //  We will now prove that MSE(S_E) ≤ MSE(S_F) for any choice of threshold `τ`.
@@ -133,12 +133,12 @@
 //
 //  This term is a square and is therefore ALWAYS greater than or equal to zero.
 //
-//      => MSE(S_F) ≥ MSE(S_E)
+//      => MSE(S_f) ≥ MSE(S_e)
 //
-//  Q.E.D.
+//  Quod erat demonstrandum.
 //
 ----------------------------------------------------------------------------------------------------
-// 5. REFUTATION OF COMMON COUNTER-ARGUMENTS
+// 5. Refutation of Common Counter-Arguments
 ----------------------------------------------------------------------------------------------------
 //
 //  FALLACY 1: "The Expectation Score is too 'timid' and has low variance. A score needs
@@ -164,7 +164,7 @@
 //  Score is the optimal predictor for both the genetic score and the final clinical outcome.
 //
 ----------------------------------------------------------------------------------------------------
-// 6. FINAL IMPLEMENTATION DIRECTIVE
+// 6. Final Implementation Directive
 ----------------------------------------------------------------------------------------------------
 //
 //  The correct, optimal, and required implementation is the Expectation-Based Method.

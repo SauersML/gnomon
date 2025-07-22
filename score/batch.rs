@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//               A TILED, CACHE-AWARE, CONTENTION-FREE COMPUTE ENGINE
+//               A tiled, cache-aware, contention-free compute engine
 //
 // ========================================================================================
 //
@@ -73,7 +73,7 @@ pub struct SparseIndexBuilder<'a, State> {
 }
 
 // ========================================================================================
-//                             SPARSE INDEX BUILDER (TYPESTATE)
+//                             Sparse index builder (typestate)
 // ========================================================================================
 
 impl<'a> SparseIndexBuilder<'a, ReadyData<'a>> {
@@ -299,7 +299,7 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
 
 // ========================================================================================
-//                                   PUBLIC API
+//                                   Public API
 // ========================================================================================
 
 /// Processes one dense, pre-filtered batch of variant-major data using the person-major
@@ -326,7 +326,7 @@ pub fn run_person_major_path(
         )));
     }
 
-    // === SEQUENTIAL COMPUTE WITHIN A SINGLE PARALLEL TASK ===
+    // === Sequential compute within a single parallel task ===
     // This main loop is intentionally sequential. The outer pipeline (in pipeline.rs)
     // is responsible for parallelism by calling this function for different batches
     // on different threads. This avoids thread pool exhaustion and is highly
@@ -389,7 +389,7 @@ pub fn run_person_major_path(
 }
 
 // ========================================================================================
-//                            PRIVATE IMPLEMENTATION
+//                            Private implementation
 // ========================================================================================
 
 /// Processes a single block of individuals.

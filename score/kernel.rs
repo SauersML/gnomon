@@ -1,6 +1,6 @@
 // ========================================================================================
 //
-//                      THE KERNEL: A PURE SIMD EXECUTION ENGINE
+//                      The kernel: A pure SIMD execution engine
 //
 // ========================================================================================
 //
@@ -17,7 +17,7 @@ pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LEN;
 
 // ========================================================================================
-//                            PUBLIC API & TYPE DEFINITIONS
+//                            Public API & type definitions
 // ========================================================================================
 
 /// A validated, type-safe, zero-cost view over a slice representing a padded,
@@ -113,7 +113,7 @@ impl<'a> PaddedInterleavedFlags<'a> {
 }
 
 // ========================================================================================
-//                              THE KERNEL IMPLEMENTATION
+//                              The kernel implementation
 // ========================================================================================
 /// This constant defines the maximum number of score columns the kernel can handle.
 /// It is used to size the kernel's internal accumulator buffer on the stack.

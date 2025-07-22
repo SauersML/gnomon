@@ -165,7 +165,7 @@ impl Heuristic {
         }
     }
 
-    /// **Heuristic 2 (NEW):** Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
+    /// **Heuristic 2:** Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
     /// exactly one interpretation is composed solely of standard alleles found
     /// in the score file, while others use non-standard/complex alleles.
     fn resolve_unambiguous_genotype(&self, context: &ResolutionContext) -> Option<Resolution> {

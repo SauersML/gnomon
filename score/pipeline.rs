@@ -34,7 +34,7 @@ const DENSE_BATCH_SIZE: usize = 256;
 const BUFFER_POOL_SIZE: usize = 16384;
 
 // ========================================================================================
-//                          PUBLIC API, CONTEXT & ERROR HANDLING
+//                          Public API, context & error handling
 // ========================================================================================
 
 /// An iterator that pulls items from a channel and groups them into batches.
@@ -150,7 +150,7 @@ pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineEr
 }
 
 // ========================================================================================
-//                        PIPELINE STAGE IMPLEMENTATIONS
+//                        Pipeline stage implementations
 // ========================================================================================
 
 /// The pipeline implementation for the common single-fileset case.

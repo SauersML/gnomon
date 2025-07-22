@@ -18,6 +18,12 @@ struct ForbiddenCommentCollector {
     check_stars_in_doc_comments: bool,
 }
 
+// A custom collector for checking if all alphabetic characters are uppercase
+struct CustomUppercaseCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 impl ViolationCollector {
     fn new(file_path: &Path) -> Self {
         Self {
@@ -79,10 +85,44 @@ impl ForbiddenCommentCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', or 'FIX' are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', 'FIX', 'NEW', 'CHANGED', 'MODIFIED', or 'UPDATED' are STRICTLY FORBIDDEN in this project.\n");
         error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
+        error_msg.push_str(
+            "   Comments containing only uppercase alphabetic characters are not allowed.\n",
+        );
         error_msg.push_str("   Please remove these patterns before committing.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl CustomUppercaseCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} comments with all uppercase alphabetic characters in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str("\n⚠️ Comments where all alphabetic characters are uppercase are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("   STRONGLY CONSIDER deleting the comment completely.\n");
 
         Some(error_msg)
     }
@@ -150,6 +190,10 @@ impl Sink for ForbiddenCommentCollector {
             && !line_text.contains("FIXED")
             && !line_text.contains("CORRECTED")
             && !line_text.contains("FIX")
+            && !line_text.contains("NEW")
+            && !line_text.contains("CHANGED")
+            && !line_text.contains("MODIFIED")
+            && !line_text.contains("UPDATED")
         {
             // Skip this match, it's just ** in a doc comment
             return Ok(true);
@@ -157,6 +201,48 @@ impl Sink for ForbiddenCommentCollector {
 
         // Format the violation string
         self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
+// Implement the Sink trait for the uppercase character collector
+impl Sink for CustomUppercaseCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Check if it's a comment line
+        if !line_text.trim_start().starts_with("//")
+            && !line_text.contains("/*")
+            && !line_text.starts_with("///")
+        {
+            return Ok(true); // Not a comment, skip
+        }
+
+        // Extract just the comment part (remove the // or /* prefix)
+        let comment_text = if line_text.trim_start().starts_with("///") {
+            line_text.trim_start()[3..].trim()
+        } else if line_text.trim_start().starts_with("//") {
+            line_text.trim_start()[2..].trim()
+        } else if let Some(idx) = line_text.find("/*") {
+            match line_text[idx + 2..].find("*/") {
+                Some(end) => line_text[idx + 2..idx + 2 + end].trim(),
+                None => line_text[idx + 2..].trim(),
+            }
+        } else {
+            return Ok(true); // Not a comment we can parse, skip
+        };
+
+        // Find all alphabetic characters
+        let alpha_chars: Vec<char> = comment_text.chars().filter(|c| c.is_alphabetic()).collect();
+
+        // Check if we have any alphabetic chars and if all are uppercase
+        if !alpha_chars.is_empty() && alpha_chars.iter().all(|c| c.is_uppercase()) {
+            self.violations.push(format!("{line_number}:{line_text}"));
+        }
 
         Ok(true)
     }
@@ -284,11 +370,14 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
 
-    // Split into two separate patterns for clarity and reliability
+    // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
-    let forbidden_words_pattern = r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX)";
+    let forbidden_words_pattern =
+        r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|NEW|CHANGED|MODIFIED|UPDATED)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
+    // 3. Pattern to catch comments where all alphabetic characters are uppercase
+    let all_caps_pattern = r"(//|/\*|///).*";
 
     // First check for forbidden words
     let forbidden_matcher = RegexMatcher::new_line_matcher(forbidden_words_pattern)?;
@@ -330,6 +419,26 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
         searcher.search_path(&stars_matcher, path, &mut collector)?;
 
         if let Some(error_message) = collector.check_and_get_error_message() {
+            return Err(error_message.into());
+        }
+    }
+
+    // Check for comments where all alphabetic characters are uppercase
+    let all_caps_matcher = RegexMatcher::new_line_matcher(all_caps_pattern)?;
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !e.path().starts_with("./target"))
+        .filter(|e| e.file_name() != "build.rs")
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+
+        let mut custom_collector = CustomUppercaseCollector::new(path);
+        searcher.search_path(&all_caps_matcher, path, &mut custom_collector)?;
+
+        if let Some(error_message) = custom_collector.check_and_get_error_message() {
             return Err(error_message.into());
         }
     }

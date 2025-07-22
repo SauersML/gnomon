@@ -53,14 +53,18 @@ pub fn fit_model_for_fixed_rho(
     let lambdas = rho_vec.mapv(f64::exp);
 
     // Show calculated lambda values
-    eprintln!(
-        "    [Debug] Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]",
-        lambdas[0],
-        lambdas.get(1).unwrap_or(&0.0),
-        lambdas.get(2).unwrap_or(&0.0),
-        lambdas.get(3).unwrap_or(&0.0),
-        lambdas.get(4).unwrap_or(&0.0)
-    );
+    if lambdas.is_empty() {
+        eprintln!("    [Debug] Lambdas calculated: [none] (model is unpenalized)");
+    } else {
+        eprintln!(
+            "    [Debug] Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]",
+            lambdas.get(0).unwrap_or(&0.0),
+            lambdas.get(1).unwrap_or(&0.0),
+            lambdas.get(2).unwrap_or(&0.0),
+            lambdas.get(3).unwrap_or(&0.0),
+            lambdas.get(4).unwrap_or(&0.0)
+        );
+    }
 
     // Use simple S_lambda construction for P-IRLS (stable reparameterization used elsewhere)
     use crate::calibrate::construction::construct_s_lambda;
@@ -69,11 +73,8 @@ pub fn fit_model_for_fixed_rho(
     // Print setup complete message
     eprintln!("    [Setup] Inner loop setup complete. Starting iterations...");
 
-    // Initialize beta as zero vector
+    // Initialize state variables that will be updated throughout the loop
     let mut beta = Array1::zeros(layout.total_coeffs);
-
-    // Compute INITIAL eta, mu, and deviance BEFORE the loop
-    // This gives a finite starting point for last_deviance
     let mut eta = x.dot(&beta);
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
@@ -103,6 +104,10 @@ pub fn fit_model_for_fixed_rho(
     };
 
     for iter in 1..=config.max_iterations {
+        // --- Store the state from the START of the iteration ---
+        let beta_current = beta.clone();
+        let deviance_current = last_deviance;
+
         // Check for non-finite values
         if !eta.iter().all(|x| x.is_finite())
             || !mu.iter().all(|x| x.is_finite())
@@ -114,9 +119,6 @@ pub fn fit_model_for_fixed_rho(
                 last_change: f64::NAN,
             });
         }
-
-        // Store current beta before update
-        let beta_current = beta.clone();
 
         // Use stable solver for P-IRLS inner loop (robust iteration)
         let stable_result =
@@ -135,73 +137,73 @@ pub fn fit_model_for_fixed_rho(
         // Implement step halving with backtracking line search
         let delta_beta = &beta_proposal - &beta_current;
         let mut step_size = 1.0;
-        let mut halving_attempts = 0;
-        const MAX_HALVINGS: usize = 10;
-        const MIN_STEP_SIZE: f64 = 1e-8;
+        const MAX_HALVINGS: usize = 12;
 
-        let mut beta_trial;
-        let mut deviance;
+        let mut step_accepted = false;
+        let mut final_halving_attempts = 0; // Variable to store the number of attempts
 
-        loop {
-            // Calculate trial coefficients
-            beta_trial = &beta_current + &(&delta_beta * step_size);
-
-            // Calculate new deviance using trial beta
+        for attempt in 0..=MAX_HALVINGS {
+            final_halving_attempts = attempt; // Keep track of attempts
+            let beta_trial = &beta_current + (step_size * &delta_beta);
             let eta_trial = x.dot(&beta_trial);
+
+            if !eta_trial.iter().all(|v| v.is_finite()) {
+                step_size *= 0.5;
+                continue;
+            }
+
             let (mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function);
-            deviance = calculate_deviance(y, &mu_trial, config.link_function);
+            let deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
 
-            if !deviance.is_finite() {
+            if !deviance_trial.is_finite() {
                 log::error!(
-                    "Non-finite deviance at iteration {iter} with step size {step_size}: {deviance}"
+                    "Non-finite deviance at iteration {iter} with step size {step_size}: {deviance_trial}"
                 );
-                return Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: config.max_iterations,
-                    last_change: f64::NAN,
-                });
+                step_size *= 0.5;
+                continue;
             }
 
-            // Check if step is acceptable (deviance decreased)
-            if deviance < last_deviance || step_size <= MIN_STEP_SIZE {
-                break;
+            // SUCCESS CONDITION: The new point is strictly better.
+            if deviance_trial < deviance_current {
+                // Atomic state update
+                beta = beta_trial;
+                eta = eta_trial;
+                last_deviance = deviance_trial;
+                (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
+                // End atomic state update
+
+                step_accepted = true;
+                if attempt > 0 {
+                    log::debug!(
+                        "Step halving successful after {attempt} attempts, final step size: {step_size:.6}"
+                    );
+                    eprintln!(
+                        "    [Step Halving] SUCCESS after {attempt} attempts, final step size: {step_size:.6}"
+                    );
+                }
+                break; // Exit line search loop
             }
 
-            // Step was too large, halve it and retry
+            // Step was not an improvement. Halve and retry.
+            if attempt < MAX_HALVINGS {
+                eprintln!(
+                    "    [Step Halving] Attempt {}: deviance {:.6} -> {:.6}, halving step to {:.6e}",
+                    attempt + 1,
+                    deviance_current,
+                    deviance_trial,
+                    step_size * 0.5
+                );
+            }
             step_size *= 0.5;
-            halving_attempts += 1;
-
-            if halving_attempts > MAX_HALVINGS {
-                log::error!(
-                    "Step halving failed after {MAX_HALVINGS} attempts at iteration {iter}"
-                );
-                return Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: config.max_iterations,
-                    last_change: last_deviance - deviance,
-                });
-            }
-
-            log::debug!(
-                "Deviance increased from {last_deviance:.6} to {deviance:.6}; halving step size to {step_size:.6} (attempt {halving_attempts})"
-            );
-            eprintln!(
-                "    [Step Halving] Attempt {halving_attempts}: deviance {last_deviance:.6} -> {deviance:.6}, step size: {step_size:.6}"
-            );
         }
 
-        // Accept the trial beta
-        beta = beta_trial;
-
-        if halving_attempts > 0 {
-            log::debug!(
-                "Step halving successful after {halving_attempts} attempts, final step size: {step_size:.6}"
+        if !step_accepted {
+            log::warn!(
+                "P-IRLS step-halving failed to reduce deviance at iteration {iter}. The fit for this rho has stalled."
             );
-            eprintln!(
-                "    [Step Halving] SUCCESS after {halving_attempts} attempts, final step size: {step_size:.6}"
-            );
+            eprintln!("    [P-IRLS STALLED] Step halving failed. Terminating inner loop.");
+            break; // Exit the main `for` loop and proceed to the final check.
         }
-
-        // Update GLM vectors with the accepted beta
-        eta = x.dot(&beta);
 
         // Monitor the maximum absolute value of eta - the root cause of perfect separation
         max_abs_eta = eta
@@ -222,7 +224,7 @@ pub fn fit_model_for_fixed_rho(
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
-                deviance,
+                deviance: last_deviance,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
                 iteration: iter,
@@ -230,24 +232,22 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
-
-        // Compute deviance_change safely (always finite after first iter)
-        let deviance_change = (last_deviance - deviance).abs();
-
-        // A more detailed, real-time print for each inner-loop iteration
-        let step_info = if halving_attempts > 0 {
-            format!(" | Step Halving: {halving_attempts} attempts")
+        // Compute deviance_change safely
+        let deviance_change = (deviance_current - last_deviance).abs();
+        let step_info = if final_halving_attempts > 0 {
+            format!(" | Step Halving: {} attempts", final_halving_attempts)
         } else {
             String::new()
         };
+
+        // A more detailed, real-time print for each inner-loop iteration
         eprintln!(
-            "    [P-IRLS Iteration #{iter:<2}] Deviance: {deviance:<13.7} | Change: {deviance_change:>12.6e}{step_info}"
+            "    [P-IRLS Iteration #{iter:<2}] Deviance: {last_deviance:<13.7} | Change: {deviance_change:>12.6e}{step_info}"
         );
 
         if !deviance_change.is_finite() {
             log::error!(
-                "Non-finite deviance_change at iteration {iter}: {deviance_change} (last: {last_deviance}, current: {deviance})"
+                "Non-finite deviance_change at iteration {iter}: {deviance_change} (last: {deviance_current}, current: {last_deviance})"
             );
             // Non-finite deviance change is a critical error
             return Err(EstimationError::PirlsDidNotConverge {
@@ -265,7 +265,8 @@ pub fn fit_model_for_fixed_rho(
         // - Use combined relative/absolute: change < tol * (deviance + offset) to handle small deviances
         // - Offset=0.1 is common (avoids div-by-zero; can tune if needed)
         let reltol_offset = 0.1;
-        let relative_threshold = config.convergence_tolerance * (deviance.abs() + reltol_offset);
+        let relative_threshold =
+            config.convergence_tolerance * (last_deviance.abs() + reltol_offset);
         let converged = iter >= min_iterations
             && deviance_change < relative_threshold.max(config.convergence_tolerance);
 
@@ -278,15 +279,14 @@ pub fn fit_model_for_fixed_rho(
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
-                deviance, // Now guaranteed to be the final, converged value
+                deviance: last_deviance, // Now guaranteed to be the final, converged value
                 final_weights: weights,
                 status: PirlsStatus::Converged,
                 iteration: iter,
                 max_abs_eta,
             });
         }
-        last_deviance = deviance;
-        // Don't need to store last_change anymore since it's only used for convergence checks
+        // No need to update last_deviance here - it's already updated in the line search when a step is accepted
     }
 
     eprintln!(
