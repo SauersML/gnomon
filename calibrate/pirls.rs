@@ -34,9 +34,9 @@ pub struct PirlsResult {
     pub deviance: f64,
     #[allow(dead_code)]
     pub final_weights: Array1<f64>,
-    pub status: PirlsStatus, // <-- NEW FIELD
-    pub iteration: usize,    // <-- NEW FIELD
-    pub max_abs_eta: f64,    // <-- NEW FIELD
+    pub status: PirlsStatus,
+    pub iteration: usize,
+    pub max_abs_eta: f64,
 }
 
 /// Stable penalized least squares solver implementing the exact pls_fit1 algorithm
@@ -77,7 +77,6 @@ pub fn fit_model_for_fixed_rho(
     let mut eta = x.dot(&beta);
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
-    // Removed unused `last_change` variable
     let mut max_abs_eta = 0.0;
 
     // Validate dimensions
@@ -210,7 +209,6 @@ pub fn fit_model_for_fixed_rho(
             .map(|v| v.abs())
             .fold(f64::NEG_INFINITY, f64::max);
 
-        // --- START OF NEW MONITORING LOGIC ---
         // A very large eta value is a strong sign of separation.
         // This threshold is chosen because exp(100) is astronomically large.
         const ETA_STABILITY_THRESHOLD: f64 = 100.0;
@@ -231,7 +229,6 @@ pub fn fit_model_for_fixed_rho(
                 max_abs_eta,
             });
         }
-        // --- END OF NEW MONITORING LOGIC ---
 
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
 

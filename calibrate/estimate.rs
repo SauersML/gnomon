@@ -375,7 +375,6 @@ pub mod internal {
 
             let pirls_result = pirls_result?; // Propagate error if it occurred
 
-            // --- START OF NEW HANDLING LOGIC ---
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
@@ -399,7 +398,6 @@ pub mod internal {
                     })
                 }
             }
-            // --- END OF NEW HANDLING LOGIC ---
         }
     }
 
@@ -415,7 +413,7 @@ pub mod internal {
 
             let pirls_result = self.execute_pirls_if_needed(p)?;
 
-            // NEW: Check indefiniteness BEFORE proceeding with cost calculation
+            // Check indefiniteness BEFORE proceeding with cost calculation
             // Use Cholesky decomposition as it's fastest and fails if and only if matrix is not positive-definite
             if pirls_result
                 .penalized_hessian
@@ -800,7 +798,7 @@ pub mod internal {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
 
-            // NEW: If penalized Hessian is indefinite, return retreat gradient
+            // If penalized Hessian is indefinite, return retreat gradient
             if pirls_result
                 .penalized_hessian
                 .cholesky(UPLO::Lower)
