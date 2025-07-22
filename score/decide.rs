@@ -71,7 +71,7 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
         RunStrategy::UseSimpleTree
     } else if ctx.n_cohort <= 2_236.0677_f32 {
         RunStrategy::UseSimpleTree
-    } else if ctx.n_cohort <= 7_071.0670_f32 {
+    } else if ctx.n_cohort <= 7_071.067_f32 {
         if ctx.subset_frac <= 0.7500_f32 {
             RunStrategy::UseSimpleTree
         } else if ctx.k_scores <= 15.8114_f32 {
@@ -80,7 +80,7 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
             RunStrategy::UseSimpleTree
         }
     } else if ctx.subset_frac <= 0.7500_f32 {
-        if ctx.n_cohort <= 20_000.0026_f32 {
+        if ctx.n_cohort <= 20_000.002_f32 {
             if ctx.k_scores <= 15.8114_f32 {
                 RunStrategy::UseComplexTree
             } else {
@@ -91,7 +91,7 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
         } else {
             RunStrategy::UseComplexTree
         }
-    } else if ctx.n_cohort <= 20_000.0026_f32 {
+    } else if ctx.n_cohort <= 20_000.002_f32 {
         if ctx.k_scores <= 15.8114_f32 {
             RunStrategy::UseComplexTree
         } else {
@@ -109,7 +109,7 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
 /// overhead of calculating frequency
 #[inline(always)]
 pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
-    if ctx.n_cohort <= 20_000.0026_f32 {
+    if ctx.n_cohort <= 20_000.002_f32 {
         if ctx.freq <= 0.0894_f32 {
             if ctx.freq <= 0.0045_f32 {
                 if ctx.n_cohort <= 10.0000_f32 {
@@ -121,7 +121,7 @@ pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
                 } else {
                     ComputePath::NoPivot
                 }
-            } else if ctx.n_cohort <= 7_071.0670_f32 {
+            } else if ctx.n_cohort <= 7_071.067_f32 {
                 if ctx.n_cohort <= 10.0000_f32 {
                     if ctx.subset_frac <= 0.2750_f32 {
                         ComputePath::Pivot
@@ -138,7 +138,7 @@ pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
             } else {
                 ComputePath::NoPivot
             }
-        } else if ctx.n_cohort <= 7_071.0670_f32 {
+        } else if ctx.n_cohort <= 7_071.067_f32 {
             if ctx.k_scores <= 15.8114_f32 {
                 if ctx.subset_frac <= 0.7500_f32 {
                     if ctx.n_cohort <= 10.0000_f32 {
@@ -203,8 +203,8 @@ pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
 /// leaf nodes, the decision is based on the majority class from the training data.
 #[inline(always)]
 pub fn decide_path_without_freq(ctx: &DecisionContext) -> ComputePath {
-    if ctx.n_cohort <= 20_000.0026_f32 {
-        if ctx.n_cohort <= 7_071.0670_f32 {
+    if ctx.n_cohort <= 20_000.002_f32 {
+        if ctx.n_cohort <= 7_071.067_f32 {
             if ctx.k_scores <= 15.8114_f32 {
                 if ctx.subset_frac <= 0.7500_f32 {
                     if ctx.n_cohort <= 10.0000_f32 {

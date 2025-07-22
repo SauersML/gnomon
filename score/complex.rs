@@ -286,6 +286,12 @@ pub struct ResolverPipeline {
     heuristics: Vec<Heuristic>,
 }
 
+impl Default for ResolverPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ResolverPipeline {
     /// Creates a new pipeline with the heuristics in their correct order of priority.
     pub fn new() -> Self {
@@ -369,7 +375,7 @@ pub fn resolve_complex_variants(
         return Ok(());
     }
 
-    eprintln!("> Resolving {} complex variant rules...", num_rules);
+    eprintln!("> Resolving {num_rules} complex variant rules...");
 
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
@@ -476,7 +482,7 @@ pub fn resolve_complex_variants(
                                 for score_info in &group_rule.score_applications {
                                     // Performance: Filter interpretations to only those relevant to the current score.
                                     let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
-                                        &score_info.effect_allele == &context.1 || &score_info.effect_allele == &context.2
+                                        score_info.effect_allele == context.1 || score_info.effect_allele == context.2
                                     }).collect();
                                     // If no interpretations match this score's alleles, skip to the next score.
                                     if matching_interpretations.is_empty() {
@@ -563,7 +569,7 @@ pub fn resolve_complex_variants(
                     "---------------------------------------------------------------------------------"
                 );
             }
-            eprintln!("{}", format_critical_integrity_warning(&info));
+            eprintln!("{}", format_critical_integrity_warning(info));
         }
 
         if collected_critical_warnings.len() > MAX_WARNINGS_TO_PRINT {
@@ -599,10 +605,10 @@ fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
     // Helper to interpret genotype bits and alleles into a human-readable string.
     let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
         match bits {
-            0b00 => format!("{}/{}", a1, a1),
+            0b00 => format!("{a1}/{a1}"),
             0b01 => "Missing".to_string(),
-            0b10 => format!("{}/{}", a1, a2),
-            0b11 => format!("{}/{}", a2, a2),
+            0b10 => format!("{a1}/{a2}"),
+            0b11 => format!("{a2}/{a2}"),
             _ => "Invalid Bits".to_string(),
         }
     };
@@ -647,8 +653,7 @@ fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
         );
         writeln!(
             report,
-            "    Genotype Bits:   {} (Interpreted as {})",
-            bits_str, interpretation
+            "    Genotype Bits:   {bits_str} (Interpreted as {interpretation})"
         )
         .unwrap();
     }
@@ -665,10 +670,10 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     // Helper to interpret genotype bits and alleles into a human-readable string.
     let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
         match bits {
-            0b00 => format!("{}/{}", a1, a1),
+            0b00 => format!("{a1}/{a1}"),
             0b01 => "Missing".to_string(),
-            0b10 => format!("{}/{}", a1, a2),
-            0b11 => format!("{}/{}", a2, a2),
+            0b10 => format!("{a1}/{a2}"),
+            0b11 => format!("{a2}/{a2}"),
             _ => "Invalid Bits".to_string(),
         }
     };
@@ -686,15 +691,15 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     match &data.resolution_method {
         ResolutionMethod::ConsistentDosage { dosage } => {
             writeln!(report, "  Method: 'Consistent Dosage' Heuristic").unwrap();
-            writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {}, so computation continued.", dosage).unwrap();
+            writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {dosage}, so computation continued.").unwrap();
         }
         ResolutionMethod::PreferHeterozygous { chosen_dosage } => {
             writeln!(report, "  Method: 'Prefer Heterozygous' Heuristic").unwrap();
-            writeln!(report, "  Outcome: A single heterozygous call was chosen over conflicting homozygous call(s), yielding a dosage of {}.", chosen_dosage).unwrap();
+            writeln!(report, "  Outcome: A single heterozygous call was chosen over conflicting homozygous call(s), yielding a dosage of {chosen_dosage}.").unwrap();
         }
         ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage } => {
             writeln!(report, "  Method: 'Exact Score Allele Match' Heuristic").unwrap();
-            writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {}.", chosen_dosage).unwrap();
+            writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {chosen_dosage}.").unwrap();
         }
         ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage } => {
             writeln!(
@@ -702,7 +707,7 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
                 "  Method: 'Prioritize Unambiguous Genotype' Heuristic"
             )
             .unwrap();
-            writeln!(report, "  Outcome: A single interpretation was chosen because its alleles matched the score file's allele better than alternatives, yielding a dosage of {}.", chosen_dosage).unwrap();
+            writeln!(report, "  Outcome: A single interpretation was chosen because its alleles matched the score file's allele better than alternatives, yielding a dosage of {chosen_dosage}.").unwrap();
         }
     }
 

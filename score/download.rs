@@ -72,16 +72,13 @@ pub fn resolve_and_download_scores(
 
     // Check for existing files: final .gnomon.tsv or intermediate .txt.gz
     for id in &requested_pgs_ids {
-        let native_path = scores_dir.join(format!("{}.gnomon.tsv", id));
-        let temp_gz_path = scores_dir.join(format!("{}.txt.gz", id));
+        let native_path = scores_dir.join(format!("{id}.gnomon.tsv"));
+        let temp_gz_path = scores_dir.join(format!("{id}.txt.gz"));
 
         if native_path.exists() {
             existing_native_paths.push(native_path);
         } else if temp_gz_path.exists() {
-            eprintln!(
-                "> Found existing downloaded file for {}. Skipping download.",
-                id
-            );
+            eprintln!("> Found existing downloaded file for {id}. Skipping download.");
             files_to_reformat.push((temp_gz_path, native_path));
         } else {
             ids_to_download.push(id.clone());
@@ -155,14 +152,13 @@ impl Display for DownloadError {
             DownloadError::Io(e, path) => {
                 write!(f, "I/O error for '{}': {}", path.display(), e)
             }
-            DownloadError::Network(s) => write!(f, "Network download failed: {}", s),
+            DownloadError::Network(s) => write!(f, "Network download failed: {s}"),
             DownloadError::InvalidId(s) => write!(
                 f,
-                "Invalid ID format for '{}'. All IDs must start with 'PGS'.",
-                s
+                "Invalid ID format for '{s}'. All IDs must start with 'PGS'."
             ),
-            DownloadError::Reformat(e) => write!(f, "{}", e),
-            DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {}", e),
+            DownloadError::Reformat(e) => write!(f, "{e}"),
+            DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {e}"),
         }
     }
 }
@@ -202,13 +198,12 @@ fn download_missing_files(
         for id in pgs_ids {
             // Use the reliable HTTPS endpoint for downloads.
             let url = format!(
-                "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{id}/ScoringFiles/Harmonized/{id}_hmPOS_GRCh38.txt.gz",
-                id = id
+                "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{id}/ScoringFiles/Harmonized/{id}_hmPOS_GRCh38.txt.gz"
             );
             // The compressed file is an intermediate artifact.
-            let temp_gz_path = target_dir.join(format!("{}.txt.gz", id));
+            let temp_gz_path = target_dir.join(format!("{id}.txt.gz"));
             // This is the final, desired output file.
-            let final_native_path = target_dir.join(format!("{}.gnomon.tsv", id));
+            let final_native_path = target_dir.join(format!("{id}.gnomon.tsv"));
 
             let file_to_download = DLFile::new()
                 .with_url(&url)

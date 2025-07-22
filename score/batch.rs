@@ -497,7 +497,7 @@ fn process_tile<'a>(
     }
 
     let stride = prep_result.stride();
-    let num_accumulator_lanes = (num_scores + SIMD_LANES - 1) / SIMD_LANES;
+    let num_accumulator_lanes = num_scores.div_ceil(SIMD_LANES);
 
     for variant_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =

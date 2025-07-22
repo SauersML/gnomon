@@ -84,7 +84,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Auto-detect link function based on phenotype
     let link_function = detect_link_function(&data.y);
-    println!("Auto-detected link function: {:?}", link_function);
+    println!("Auto-detected link function: {link_function:?}");
 
     // Calculate data ranges for basis construction
     let pgs_range = calculate_range(data.p.view());
@@ -104,7 +104,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Generate PC names
-    let pc_names: Vec<String> = (1..=args.num_pcs).map(|i| format!("PC{}", i)).collect();
+    let pc_names: Vec<String> = (1..=args.num_pcs).map(|i| format!("PC{i}")).collect();
 
     // Create basis configurations
     let pgs_basis_config = BasisConfig {
@@ -148,7 +148,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Save model to hardcoded output path
     let output_path = "model.toml";
     trained_model.save(output_path)?;
-    println!("Model saved to: {}", output_path);
+    println!("Model saved to: {output_path}");
 
     Ok(())
 }
@@ -160,7 +160,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     let model = TrainedModel::load(&args.model)?;
     let num_pcs = model.config.pc_names.len();
 
-    println!("Model expects {} PCs", num_pcs);
+    println!("Model expects {num_pcs} PCs");
 
     // Load test data
     println!("Loading test data from: {}", args.test_data);
@@ -174,7 +174,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Save predictions to hardcoded output path
     let output_path = "predictions.tsv";
     save_predictions(&predictions, output_path)?;
-    println!("Predictions saved to: {}", output_path);
+    println!("Predictions saved to: {output_path}");
 
     Ok(())
 }
@@ -204,7 +204,7 @@ fn save_predictions(predictions: &Array1<f64>, output_path: &str) -> Result<(), 
     writeln!(file, "prediction")?;
 
     for &pred in predictions.iter() {
-        writeln!(file, "{:.6}", pred)?;
+        writeln!(file, "{pred:.6}")?;
     }
 
     Ok(())
@@ -266,7 +266,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        eprintln!("Error: {e}");
         process::exit(1);
     }
 }

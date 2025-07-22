@@ -354,7 +354,7 @@ mod internal {
         // CRITICAL: Use the empirical value saved during training to ensure consistency.
         let total_pgs_bases = config.num_pgs_interaction_bases;
         for m in 1..=total_pgs_bases {
-            let pgs_key = format!("PGS_B{}", m);
+            let pgs_key = format!("PGS_B{m}");
             if let Some(pc_map) = coeffs.interaction_effects.get(&pgs_key) {
                 for pc_name in &config.pc_names {
                     if let Some(c) = pc_map.get(pc_name) {
@@ -916,7 +916,7 @@ pub fn map_coefficients(
     let mut interaction_effects = HashMap::new();
 
     // Extract the unpenalized PGS main effect coefficients
-    if layout.pgs_main_cols.len() > 0 {
+    if !layout.pgs_main_cols.is_empty() {
         pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
     }
 
@@ -930,7 +930,7 @@ pub fn map_coefficients(
                 pcs.insert(pc_name, coeffs);
             }
             name if name.starts_with("f(PGS_B") => {
-                let parts: Vec<_> = name.split(|c| c == ',' || c == ')').collect();
+                let parts: Vec<_> = name.split([',', ')']).collect();
                 if parts.len() < 2 {
                     continue;
                 }

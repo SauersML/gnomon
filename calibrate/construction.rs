@@ -90,8 +90,7 @@ impl ModelLayout {
         // Verify that our calculation matches the actual column count
         if current_col != calculated_total_coeffs {
             return Err(EstimationError::LayoutError(format!(
-                "ModelLayout dimension calculation error: calculated total_coeffs={} but actual current_col={}",
-                calculated_total_coeffs, current_col
+                "ModelLayout dimension calculation error: calculated total_coeffs={calculated_total_coeffs} but actual current_col={current_col}"
             )));
         }
 
@@ -283,8 +282,7 @@ pub fn build_design_and_penalty_matrices(
 
         if !found_block {
             return Err(EstimationError::LayoutError(format!(
-                "No block found for penalty matrix index {}",
-                k
+                "No block found for penalty matrix index {k}"
             )));
         }
 
@@ -301,7 +299,7 @@ pub fn build_design_and_penalty_matrices(
     // 2. Main PC effects - iterate through PC bases in order of config.pc_names
     for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
         for block in &layout.penalty_map {
-            if block.term_name == format!("f({})", pc_name) {
+            if block.term_name == format!("f({pc_name})") {
                 let col_range = block.col_range.clone();
                 let pc_basis = &pc_constrained_bases[pc_idx];
 
@@ -360,7 +358,7 @@ pub fn build_design_and_penalty_matrices(
     for m in 1..=total_pgs_bases {
         for pc_name in &config.pc_names {
             for block in &layout.penalty_map {
-                if block.term_name == format!("f(PGS_B{}, {})", m, pc_name) {
+                if block.term_name == format!("f(PGS_B{m}, {pc_name})") {
                     // Find PC index from name
                     let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
 
@@ -403,7 +401,7 @@ pub fn build_design_and_penalty_matrices(
                     let z_int = Array2::<f64>::eye(interaction_term.ncols());
 
                     // Cache for prediction
-                    let key = format!("INT_P{}_{}", m, pc_name);
+                    let key = format!("INT_P{m}_{pc_name}");
                     constraints.insert(key, Constraint { z_transform: z_int });
 
                     // Copy into X
@@ -421,11 +419,7 @@ pub fn build_design_and_penalty_matrices(
     let n_samples = data.y.len();
     let n_coeffs = x_matrix.ncols();
     if n_coeffs > n_samples {
-        log::warn!(
-            "Model is over-parameterized: {} coefficients for {} samples",
-            n_coeffs,
-            n_samples
-        );
+        log::warn!("Model is over-parameterized: {n_coeffs} coefficients for {n_samples} samples");
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
@@ -465,7 +459,7 @@ pub fn construct_s_lambda(
     if total == 0 {
         return s_lambda;
     }
-    
+
     // Create a progress bar
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
@@ -475,23 +469,23 @@ pub fn construct_s_lambda(
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏  ")
     );
-    
+
     // Simple weighted sum since all matrices are now p × p
     for (i, s_k) in s_list.iter().enumerate() {
         // Format lambda value in scientific notation
         let lambda_formatted = format!("{:.2e}", lambdas[i]);
         pb.set_message(lambda_formatted);
-        
+
         // Add weighted penalty matrix
         s_lambda.scaled_add(lambdas[i], s_k);
-        
+
         // Update progress
         pb.inc(1);
     }
-    
+
     // Finish progress bar
     pb.finish_and_clear();
-    
+
     s_lambda
 }
 
@@ -662,7 +656,7 @@ pub fn stable_reparameterization(
 
         // Update for next iteration
         rs_current = next_rs;
-        k_offset = k_offset + r;
+        k_offset += r;
         q_current = next_q;
         gamma = gamma_prime;
     }

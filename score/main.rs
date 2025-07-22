@@ -16,7 +16,6 @@ use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::PreparationResult;
 use natord::compare;
-use ryu;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -60,7 +59,7 @@ fn main() {
     if let Err(e) = run_gnomon() {
         eprintln!("Gnomon failed.");
         eprintln!("--------------------------------------------------");
-        eprintln!("{}", e);
+        eprintln!("{e}");
         eprintln!("--------------------------------------------------");
         eprintln!("Due to this fatal error, no output file was generated.");
         std::process::exit(1);
@@ -342,7 +341,7 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
     let mut bed_files: Vec<PathBuf> = fs::read_dir(path)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "bed"))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "bed"))
         .collect();
 
     if bed_files.is_empty() {
@@ -384,13 +383,13 @@ fn write_scores_to_file(
     // Write the new, more descriptive, and correctly tab-separated header.
     write!(writer, "#IID")?;
     for name in score_names {
-        write!(writer, "\t{}_AVG\t{}_MISSING_PCT", name, name)?;
+        write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
     }
     writeln!(writer)?;
 
     let mut line_buffer = String::with_capacity(
         person_iids
-            .get(0)
+            .first()
             .map_or(128, |s| s.len() + num_scores * 24),
     );
     let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
@@ -413,7 +412,7 @@ fn write_scores_to_file(
         })?;
 
         line_buffer.clear();
-        write!(&mut line_buffer, "{}", iid).unwrap();
+        write!(&mut line_buffer, "{iid}").unwrap();
 
         for i in 0..num_scores {
             let final_sum_score = person_sum_scores[i];
@@ -445,7 +444,7 @@ fn write_scores_to_file(
             )
             .unwrap();
         }
-        writeln!(writer, "{}", line_buffer)?;
+        writeln!(writer, "{line_buffer}")?;
     }
 
     writer.flush()

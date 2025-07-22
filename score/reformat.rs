@@ -72,7 +72,7 @@ impl Display for ReformatError {
         match self {
             ReformatError::Io(e) => {
                 writeln!(f, "Reason:       An I/O error occurred.")?;
-                writeln!(f, "Details:      {}", e)?;
+                writeln!(f, "Details:      {e}")?;
             }
             ReformatError::NotPgsFormat { path } => {
                 writeln!(f, "File:         {}", path.display())?;
@@ -92,13 +92,12 @@ impl Display for ReformatError {
                 missing_column_name,
             } => {
                 writeln!(f, "File:         {}", path.display())?;
-                writeln!(f, "Line Number:  {}", line_number)?;
+                writeln!(f, "Line Number:  {line_number}")?;
                 writeln!(f, "Line Content: \"{}\"", line_content.trim())?;
                 writeln!(f, "Reason:       A required column or its data is missing.")?;
                 writeln!(
                     f,
-                    "Details:      Expected to find column '{}', but it was not found in the header or data for this line.",
-                    missing_column_name
+                    "Details:      Expected to find column '{missing_column_name}', but it was not found in the header or data for this line."
                 )?;
             }
             ReformatError::Parse {
@@ -108,13 +107,13 @@ impl Display for ReformatError {
                 details,
             } => {
                 writeln!(f, "File:         {}", path.display())?;
-                writeln!(f, "Line Number:  {}", line_number)?;
+                writeln!(f, "Line Number:  {line_number}")?;
                 writeln!(f, "Line Content: \"{}\"", line_content.trim())?;
                 writeln!(
                     f,
                     "Reason:       A value in the line could not be parsed correctly."
                 )?;
-                writeln!(f, "Details:      {}", details)?;
+                writeln!(f, "Details:      {details}")?;
             }
         }
         write!(
@@ -161,8 +160,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
     // --- Open file and handle potential GZIP compression ---
     let file = File::open(input_path)?;
-    let a_reader: Box<dyn Read + Send> = if input_path.extension().map_or(false, |ext| ext == "gz")
-    {
+    let a_reader: Box<dyn Read + Send> = if input_path.extension().is_some_and(|ext| ext == "gz") {
         Box::new(MultiGzDecoder::new(file))
     } else {
         Box::new(file)
@@ -250,12 +248,12 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         let fields: Vec<&str> = line.split('\t').collect();
 
         let get_key = |c_idx: Option<usize>, p_idx: Option<usize>| -> Option<(u8, u32)> {
-            if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx) {
-                if let (Some(&chr), Some(&pos)) = (fields.get(chr_idx), fields.get(pos_idx)) {
-                    if !chr.is_empty() && !pos.is_empty() {
-                        return parse_key(chr, pos).ok();
-                    }
-                }
+            if let (Some(chr_idx), Some(pos_idx)) = (c_idx, p_idx)
+                && let (Some(&chr), Some(&pos)) = (fields.get(chr_idx), fields.get(pos_idx))
+                && !chr.is_empty()
+                && !pos.is_empty()
+            {
+                return parse_key(chr, pos).ok();
             }
             None
         };
@@ -274,10 +272,10 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         let Some(key) = key else { return Ok(None) };
 
         // Safely extract other mandatory fields.
-        let Some(ea_str) = fields.get(column_indices.ea).map(|s| *s) else {
+        let Some(ea_str) = fields.get(column_indices.ea).copied() else {
             return Ok(None);
         };
-        let Some(weight_str) = fields.get(column_indices.ew).map(|s| *s) else {
+        let Some(weight_str) = fields.get(column_indices.ew).copied() else {
             return Ok(None);
         };
         let oa_str = column_indices
@@ -286,7 +284,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
             .map_or("N", |s| if s.is_empty() { "N" } else { *s });
 
         let variant_id = format!("{}:{}", key.0, key.1);
-        let line_data = format!("{}\t{}\t{}\t{}", variant_id, ea_str, oa_str, weight_str);
+        let line_data = format!("{variant_id}\t{ea_str}\t{oa_str}\t{weight_str}");
 
         Ok(Some(SortableLine { key, line_data }))
     };
@@ -320,8 +318,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
     let mut writer = BufWriter::with_capacity(1 << 20, out_file);
     writeln!(
         writer,
-        "variant_id\teffect_allele\tother_allele\t{}",
-        score_label
+        "variant_id\teffect_allele\tother_allele\t{score_label}"
     )?;
     for item in lines_to_sort {
         writeln!(writer, "{}", item.line_data)?;
@@ -403,9 +400,9 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
     let mut writer = BufWriter::new(out_file);
     // Write back any metadata lines that were present.
     for meta_line in header_lines {
-        writeln!(writer, "{}", meta_line)?;
+        writeln!(writer, "{meta_line}")?;
     }
-    writeln!(writer, "{}", header)?;
+    writeln!(writer, "{header}")?;
     for item in lines_to_sort {
         writeln!(writer, "{}", item.line_data)?;
     }
@@ -427,19 +424,19 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
     if chr_str.eq_ignore_ascii_case("X") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
         return Ok((23, pos_num));
     }
     if chr_str.eq_ignore_ascii_case("Y") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
         return Ok((24, pos_num));
     }
     if chr_str.eq_ignore_ascii_case("MT") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
         return Ok((25, pos_num));
     }
 
@@ -453,14 +450,13 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
     // Now, parse the remaining part.
     let chr_num: u8 = number_part.parse().map_err(|_| {
         format!(
-            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
-            chr_str
+            "Invalid chromosome format '{chr_str}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix."
         )
     })?;
 
     let pos_num: u32 = pos_str
         .parse()
-        .map_err(|e: ParseIntError| format!("Invalid position '{}': {}", pos_str, e))?;
+        .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
 
     Ok((chr_num, pos_num))
 }

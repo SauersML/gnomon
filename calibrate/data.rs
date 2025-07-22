@@ -107,7 +107,7 @@ mod internal {
         include_phenotype: bool,
     ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>), DataError> {
         // --- 1. Generate the exact list of required column names ---
-        let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{}", i)).collect();
+        let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
         if include_phenotype {
             required_cols.push("phenotype".to_string());
@@ -116,7 +116,7 @@ mod internal {
         required_cols.extend_from_slice(&pc_names);
 
         // --- 2. Read and validate the DataFrame using Polars ---
-        println!("Loading data from '{}'", path);
+        println!("Loading data from '{path}'");
 
         // Use the Polars CsvReader for efficiency
         let df = CsvReader::new(File::open(Path::new(path))?)
@@ -148,7 +148,7 @@ mod internal {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-        println!("All required columns found: {:?}", required_cols);
+        println!("All required columns found: {required_cols:?}");
 
         // --- 3. Convert columns efficiently to ndarray structures ---
 

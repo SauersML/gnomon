@@ -4,6 +4,19 @@ use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
+/// The status of the P-IRLS convergence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PirlsStatus {
+    /// Converged successfully within tolerance.
+    Converged,
+    /// Reached maximum iterations but the gradient and Hessian indicate a valid minimum.
+    StalledAtValidMinimum,
+    /// Reached maximum iterations without converging.
+    MaxIterationsReached,
+    /// Fitting process became unstable, likely due to perfect separation.
+    Unstable,
+}
+
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
 ///
 /// # Fields
@@ -21,6 +34,9 @@ pub struct PirlsResult {
     pub deviance: f64,
     #[allow(dead_code)]
     pub final_weights: Array1<f64>,
+    pub status: PirlsStatus, // <-- NEW FIELD
+    pub iteration: usize,    // <-- NEW FIELD
+    pub max_abs_eta: f64,    // <-- NEW FIELD
 }
 
 /// Stable penalized least squares solver implementing the exact pls_fit1 algorithm
@@ -61,7 +77,8 @@ pub fn fit_model_for_fixed_rho(
     let mut eta = x.dot(&beta);
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
-    let mut last_change = f64::INFINITY;
+    // Removed unused `last_change` variable
+    let mut max_abs_eta = 0.0;
 
     // Validate dimensions
     assert_eq!(
@@ -109,11 +126,7 @@ pub fn fit_model_for_fixed_rho(
         let beta_proposal = stable_result.beta;
 
         if !beta_proposal.iter().all(|x| x.is_finite()) {
-            log::error!(
-                "Non-finite beta values at iteration {}: {:?}",
-                iter,
-                beta_proposal
-            );
+            log::error!("Non-finite beta values at iteration {iter}: {beta_proposal:?}");
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
                 last_change: f64::NAN,
@@ -141,10 +154,7 @@ pub fn fit_model_for_fixed_rho(
 
             if !deviance.is_finite() {
                 log::error!(
-                    "Non-finite deviance at iteration {} with step size {}: {}",
-                    iter,
-                    step_size,
-                    deviance
+                    "Non-finite deviance at iteration {iter} with step size {step_size}: {deviance}"
                 );
                 return Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: config.max_iterations,
@@ -163,9 +173,7 @@ pub fn fit_model_for_fixed_rho(
 
             if halving_attempts > MAX_HALVINGS {
                 log::error!(
-                    "Step halving failed after {} attempts at iteration {}",
-                    MAX_HALVINGS,
-                    iter
+                    "Step halving failed after {MAX_HALVINGS} attempts at iteration {iter}"
                 );
                 return Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: config.max_iterations,
@@ -174,15 +182,10 @@ pub fn fit_model_for_fixed_rho(
             }
 
             log::debug!(
-                "Deviance increased from {:.6} to {:.6}; halving step size to {:.6} (attempt {})",
-                last_deviance,
-                deviance,
-                step_size,
-                halving_attempts
+                "Deviance increased from {last_deviance:.6} to {deviance:.6}; halving step size to {step_size:.6} (attempt {halving_attempts})"
             );
             eprintln!(
-                "    [Step Halving] Attempt {}: deviance {:.6} -> {:.6}, step size: {:.6}",
-                halving_attempts, last_deviance, deviance, step_size
+                "    [Step Halving] Attempt {halving_attempts}: deviance {last_deviance:.6} -> {deviance:.6}, step size: {step_size:.6}"
             );
         }
 
@@ -191,18 +194,45 @@ pub fn fit_model_for_fixed_rho(
 
         if halving_attempts > 0 {
             log::debug!(
-                "Step halving successful after {} attempts, final step size: {:.6}",
-                halving_attempts,
-                step_size
+                "Step halving successful after {halving_attempts} attempts, final step size: {step_size:.6}"
             );
             eprintln!(
-                "    [Step Halving] SUCCESS after {} attempts, final step size: {:.6}",
-                halving_attempts, step_size
+                "    [Step Halving] SUCCESS after {halving_attempts} attempts, final step size: {step_size:.6}"
             );
         }
 
         // Update GLM vectors with the accepted beta
         eta = x.dot(&beta);
+
+        // Monitor the maximum absolute value of eta - the root cause of perfect separation
+        max_abs_eta = eta
+            .iter()
+            .map(|v| v.abs())
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        // --- START OF NEW MONITORING LOGIC ---
+        // A very large eta value is a strong sign of separation.
+        // This threshold is chosen because exp(100) is astronomically large.
+        const ETA_STABILITY_THRESHOLD: f64 = 100.0;
+        if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function == LinkFunction::Logit {
+            log::warn!(
+                "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
+            );
+
+            // Don't fail here. Just return the current state with a status flag.
+            let penalized_hessian = compute_penalized_hessian(x, &weights, &s_lambda)?;
+            return Ok(PirlsResult {
+                beta,
+                penalized_hessian,
+                deviance,
+                final_weights: weights,
+                status: PirlsStatus::Unstable,
+                iteration: iter,
+                max_abs_eta,
+            });
+        }
+        // --- END OF NEW MONITORING LOGIC ---
+
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
 
         // Compute deviance_change safely (always finite after first iter)
@@ -210,29 +240,27 @@ pub fn fit_model_for_fixed_rho(
 
         // A more detailed, real-time print for each inner-loop iteration
         let step_info = if halving_attempts > 0 {
-            format!(" | Step Halving: {} attempts", halving_attempts)
+            format!(" | Step Halving: {halving_attempts} attempts")
         } else {
             String::new()
         };
         eprintln!(
-            "    [P-IRLS Iteration #{:<2}] Deviance: {:<13.7} | Change: {:>12.6e}{}",
-            iter, deviance, deviance_change, step_info
+            "    [P-IRLS Iteration #{iter:<2}] Deviance: {deviance:<13.7} | Change: {deviance_change:>12.6e}{step_info}"
         );
 
         if !deviance_change.is_finite() {
             log::error!(
-                "Non-finite deviance_change at iteration {}: {} (last: {}, current: {})",
-                iter,
-                deviance_change,
-                last_deviance,
-                deviance
+                "Non-finite deviance_change at iteration {iter}: {deviance_change} (last: {last_deviance}, current: {deviance})"
             );
-            last_change = if deviance_change.is_nan() {
-                f64::NAN
-            } else {
-                f64::INFINITY
-            };
-            break;
+            // Non-finite deviance change is a critical error
+            return Err(EstimationError::PirlsDidNotConverge {
+                max_iterations: config.max_iterations,
+                last_change: if deviance_change.is_nan() {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                },
+            });
         }
 
         // Robust convergence check
@@ -255,10 +283,13 @@ pub fn fit_model_for_fixed_rho(
                 penalized_hessian,
                 deviance, // Now guaranteed to be the final, converged value
                 final_weights: weights,
+                status: PirlsStatus::Converged,
+                iteration: iter,
+                max_abs_eta,
             });
         }
         last_deviance = deviance;
-        last_change = deviance_change;
+        // Don't need to store last_change anymore since it's only used for convergence checks
     }
 
     eprintln!(
@@ -281,40 +312,48 @@ pub fn fit_model_for_fixed_rho(
     // Check 1: Is the gradient of the penalized deviance close to zero?
     // The gradient is g = XᵀW(z - η) - S_λβ = Xᵀ(y - μ) - S_λβ
     let penalized_deviance_gradient = x.t().dot(&(&y.view() - &mu)) - s_lambda.dot(&beta);
-    let gradient_norm = penalized_deviance_gradient.dot(&penalized_deviance_gradient).sqrt();
+    let gradient_norm = penalized_deviance_gradient
+        .dot(&penalized_deviance_gradient)
+        .sqrt();
     let is_gradient_zero = gradient_norm < 1e-4; // Use a reasonable tolerance for the gradient norm
 
     // Check 2: Is the penalized Hessian positive-definite?
     let penalized_hessian = compute_penalized_hessian(x, &weights, &s_lambda)?;
     use ndarray_linalg::{Cholesky, UPLO};
-    let is_positive_definite = match penalized_hessian.cholesky(UPLO::Lower) {
-        Ok(_) => true, // Cholesky decomposition only succeeds for positive-definite matrices.
-        Err(_) => false, // Failed, so it's not positive-definite.
-    };
+    let is_positive_definite = penalized_hessian.cholesky(UPLO::Lower).is_ok();
 
     // Final Decision: Is the stall "good enough"?
     if is_gradient_zero && is_positive_definite {
         eprintln!(
-            "    ✓ STALL ACCEPTED: A valid minimum was found (gradient_norm={:.2e}, Hessian is PD).",
-            gradient_norm
+            "    ✓ STALL ACCEPTED: A valid minimum was found (gradient_norm={gradient_norm:.2e}, Hessian is PD)."
         );
         // The stall is acceptable. Return Ok() as if it had converged normally.
-        return Ok(PirlsResult {
+        Ok(PirlsResult {
             beta,
             penalized_hessian,
             deviance: last_deviance,
             final_weights: weights,
-        });
+            status: PirlsStatus::StalledAtValidMinimum,
+            iteration: config.max_iterations,
+            max_abs_eta,
+        })
     } else {
-        // The stall is NOT at a valid minimum. This is a true failure.
+        // The stall is NOT at a valid minimum. Instead of failing, report the status.
         eprintln!(
-            "    ✗ STALL REJECTED: Not a valid minimum (gradient_norm={:.2e}, Hessian_PD={}). Reporting true convergence failure.",
-            gradient_norm, is_positive_definite
+            "    ✗ STALL REJECTED: Not a valid minimum (gradient_norm={gradient_norm:.2e}, Hessian_PD={is_positive_definite}). Reporting max iterations reached."
         );
-        return Err(EstimationError::PirlsDidNotConverge {
-            max_iterations: config.max_iterations,
-            last_change,
-        });
+
+        // We don't need to calculate last deviance change anymore as we're just returning the status
+
+        Ok(PirlsResult {
+            beta,
+            penalized_hessian,
+            deviance: last_deviance,
+            final_weights: weights,
+            status: PirlsStatus::MaxIterationsReached,
+            iteration: config.max_iterations,
+            max_abs_eta,
+        })
     }
 }
 
@@ -560,7 +599,7 @@ fn penalty_square_root(s: &Array2<f64>) -> Result<Array2<f64>, EstimationError> 
     // Fallback to eigendecomposition for semi-definite matrices
     let (eigenvals, eigenvecs): (Array1<f64>, Array2<f64>) = s
         .eigh(UPLO::Lower)
-        .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+        .map_err(EstimationError::EigendecompositionFailed)?;
 
     let mut e = Array2::zeros(s.dim());
     for (i, &eval) in eigenvals.iter().enumerate() {

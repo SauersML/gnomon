@@ -44,7 +44,7 @@ impl<'a> PaddedInterleavedWeights<'a> {
         // The stride is the width of a single row's data, rounded up to the
         // nearest multiple of the SIMD vector width. This padding is the
         // key to enabling branch-free, "no scalar fallback" SIMD.
-        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+        let stride = num_scores.div_ceil(LANE_COUNT) * LANE_COUNT;
         if slice.len() != num_rows * stride {
             return Err(
                 "Mismatched matrix data: slice.len() does not equal num_rows * calculated_stride",
@@ -92,7 +92,7 @@ impl<'a> PaddedInterleavedFlags<'a> {
     /// Creates a new, validated `PaddedInterleavedFlags` view over a slice.
     #[inline]
     pub fn new(slice: &'a [u8], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
-        let stride = (num_scores + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+        let stride = num_scores.div_ceil(LANE_COUNT) * LANE_COUNT;
         if slice.len() != num_rows * stride {
             return Err(
                 "Mismatched flag matrix data: slice.len() does not equal num_rows * calculated_stride",
@@ -117,7 +117,7 @@ impl<'a> PaddedInterleavedFlags<'a> {
 // ========================================================================================
 /// This constant defines the maximum number of score columns the kernel can handle.
 /// It is used to size the kernel's internal accumulator buffer on the stack.
-const MAX_KERNEL_ACCUMULATOR_LANES: usize = (100 + LANE_COUNT - 1) / LANE_COUNT;
+const MAX_KERNEL_ACCUMULATOR_LANES: usize = 100_usize.div_ceil(LANE_COUNT);
 
 /// Calculates the score *adjustments* for a single person over a mini-batch of variants.
 /// This kernel is self-contained: it creates its own accumulators, performs the
@@ -137,7 +137,7 @@ pub fn accumulate_adjustments_for_person(
     g2_indices: &[usize],
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     let num_scores = weights.num_scores();
-    let num_accumulator_lanes = (num_scores + LANE_COUNT - 1) / LANE_COUNT;
+    let num_accumulator_lanes = num_scores.div_ceil(LANE_COUNT);
 
     // A stack-allocated buffer for this person's mini-batch score adjustments.
     let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];

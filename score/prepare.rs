@@ -257,13 +257,12 @@ pub fn prepare_for_computation(
             Ok(rec) => rec.key,
             Err(_) => match bim_iter.next().unwrap().unwrap_err() {
                 PrepError::Parse(msg) => {
-                    if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
-                        if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
-                            eprintln!(
-                                "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.",
-                                chr_name
-                            );
-                        }
+                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                        && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                    {
+                        eprintln!(
+                            "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                        );
                     }
                     continue;
                 }
@@ -275,13 +274,12 @@ pub fn prepare_for_computation(
             Ok(rec) => rec.key,
             Err(_) => match score_iter.next().unwrap().unwrap_err() {
                 PrepError::Parse(msg) => {
-                    if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
-                        if seen_invalid_score_chrs.insert(chr_name.to_string()) {
-                            eprintln!(
-                                "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.",
-                                chr_name
-                            );
-                        }
+                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                        && seen_invalid_score_chrs.insert(chr_name.to_string())
+                    {
+                        eprintln!(
+                            "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
+                        );
                     }
                     continue;
                 }
@@ -313,13 +311,12 @@ pub fn prepare_for_computation(
                     match bim_iter.next().unwrap() {
                         Ok(item) => bim_group.push(item),
                         Err(PrepError::Parse(msg)) => {
-                            if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
-                                if seen_invalid_bim_chrs.insert(chr_name.to_string()) {
-                                    eprintln!(
-                                        "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{}'.",
-                                        chr_name
-                                    );
-                                }
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                                && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                            {
+                                eprintln!(
+                                    "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                                );
                             }
                         }
                         Err(e) => return Err(e),
@@ -335,13 +332,12 @@ pub fn prepare_for_computation(
                     match score_iter.next().unwrap() {
                         Ok(item) => score_group.push(item),
                         Err(PrepError::Parse(msg)) => {
-                            if let Some(chr_name) = extract_chr_from_parse_error(&msg) {
-                                if seen_invalid_score_chrs.insert(chr_name.to_string()) {
-                                    eprintln!(
-                                        "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{}'.",
-                                        chr_name
-                                    );
-                                }
+                            if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                                && seen_invalid_score_chrs.insert(chr_name.to_string())
+                            {
+                                eprintln!(
+                                    "Warning: Skipping variant(s) in score file due to unparsable chromosome name: '{chr_name}'."
+                                );
                             }
                         }
                         Err(e) => return Err(e),
@@ -416,8 +412,7 @@ pub fn prepare_for_computation(
 
     if total_malformed_lines > 0 {
         eprintln!(
-            "> Warning: Skipped {} lines from score files due to missing columns (variant_id, effect_allele, other_allele).",
-            total_malformed_lines
+            "> Warning: Skipped {total_malformed_lines} lines from score files due to missing columns (variant_id, effect_allele, other_allele)."
         );
     }
 
@@ -472,7 +467,7 @@ pub fn prepare_for_computation(
     let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
     let num_reconciled_variants = required_bim_indices.len();
 
-    let stride = (score_names.len() + LANE_COUNT - 1) / LANE_COUNT * LANE_COUNT;
+    let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
@@ -513,7 +508,7 @@ pub fn prepare_for_computation(
     }
 
     // --- STAGE 5: FINAL ASSEMBLY ---
-    let bytes_per_variant = (total_people_in_fam as u64 + 3) / 4;
+    let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
 
@@ -557,10 +552,10 @@ pub fn prepare_for_computation(
 
 /// Extracts the malformed chromosome name from a `PrepError::Parse` message.
 fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
-    if let Some(rest) = msg.strip_prefix("Invalid chromosome format '") {
-        if let Some(end_pos) = rest.find('\'') {
-            return Some(&rest[..end_pos]);
-        }
+    if let Some(rest) = msg.strip_prefix("Invalid chromosome format '")
+        && let Some(end_pos) = rest.find('\'')
+    {
+        return Some(&rest[..end_pos]);
     }
     None
 }
@@ -586,19 +581,19 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
     if chr_str.eq_ignore_ascii_case("X") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
         return Ok((23, pos_num));
     }
     if chr_str.eq_ignore_ascii_case("Y") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
         return Ok((24, pos_num));
     }
     if chr_str.eq_ignore_ascii_case("MT") {
         let pos_num: u32 = pos_str
             .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
         return Ok((25, pos_num));
     }
 
@@ -612,14 +607,13 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
     // Now, parse the remaining part.
     let chr_num: u8 = number_part.parse().map_err(|_| {
         PrepError::Parse(format!(
-            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
-            chr_str
+            "Invalid chromosome format '{chr_str}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix."
         ))
     })?;
 
     let pos_num: u32 = pos_str
         .parse()
-        .map_err(|e| PrepError::Parse(format!("Invalid position '{}': {}", pos_str, e)))?;
+        .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
 
     Ok((chr_num, pos_num))
 }
@@ -777,9 +771,7 @@ impl<'arena> KWayMergeIterator<'arena> {
         };
 
         for i in 0..iter.streams.len() {
-            if let Err(e) = iter.replenish_from_stream(i) {
-                return Err(e);
-            }
+            iter.replenish_from_stream(i)?
         }
 
         Ok(iter)
@@ -857,10 +849,10 @@ impl<'arena> KWayMergeIterator<'arena> {
         stream.current_line_info = Some((key, effect_allele, other_allele));
 
         for (i, weight_str) in parts.enumerate() {
-            if let Ok(weight) = weight_str.trim().parse::<f32>() {
-                if let Some(&score_column_index) = column_map.get(i) {
-                    stream.line_buffer.push_back((weight, score_column_index));
-                }
+            if let Ok(weight) = weight_str.trim().parse::<f32>()
+                && let Some(&score_column_index) = column_map.get(i)
+            {
+                stream.line_buffer.push_back((weight, score_column_index));
             }
         }
         Ok(!stream.line_buffer.is_empty())
@@ -1082,9 +1074,9 @@ impl Display for PrepError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             PrepError::Io(e, path) => write!(f, "I/O Error for file {}: {}", path.display(), e),
-            PrepError::Parse(s) => write!(f, "Parse Error: {}", s),
-            PrepError::Header(s) => write!(f, "Invalid Header: {}", s),
-            PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {}", s),
+            PrepError::Parse(s) => write!(f, "Parse Error: {s}"),
+            PrepError::Header(s) => write!(f, "Invalid Header: {s}"),
+            PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {s}"),
             PrepError::NoOverlappingVariants(diag) => {
                 writeln!(
                     f,
@@ -1132,7 +1124,7 @@ impl Display for PrepError {
                     "\nTIP: Please check for inconsistencies between your files."
                 )
             }
-            PrepError::AmbiguousReconciliation(s) => write!(f, "{}", s),
+            PrepError::AmbiguousReconciliation(s) => write!(f, "{s}"),
         }
     }
 }
@@ -1148,12 +1140,12 @@ impl Error for PrepError {
 
 impl From<ParseFloatError> for PrepError {
     fn from(err: ParseFloatError) -> Self {
-        PrepError::Parse(format!("Could not parse numeric value: {}", err))
+        PrepError::Parse(format!("Could not parse numeric value: {err}"))
     }
 }
 
 impl From<Utf8Error> for PrepError {
     fn from(err: Utf8Error) -> Self {
-        PrepError::Parse(format!("Invalid UTF-8 sequence in score file: {}", err))
+        PrepError::Parse(format!("Invalid UTF-8 sequence in score file: {err}"))
     }
 }

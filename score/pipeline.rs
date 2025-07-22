@@ -104,9 +104,9 @@ pub enum PipelineError {
 impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipelineError::Compute(e) => write!(f, "{}", e),
-            PipelineError::Io(e) => write!(f, "I/O error during pipeline execution: {}", e),
-            PipelineError::Producer(e) => write!(f, "The data producer thread failed: {}", e),
+            PipelineError::Compute(e) => write!(f, "{e}"),
+            PipelineError::Io(e) => write!(f, "I/O error during pipeline execution: {e}"),
+            PipelineError::Producer(e) => write!(f, "The data producer thread failed: {e}"),
         }
     }
 }
@@ -203,7 +203,7 @@ fn run_single_file_pipeline(
         freq: 0.0,
     };
     let strategy = decide::RunStrategy::UseComplexTree;
-    eprintln!("> Decision Engine Strategy: {:?}", strategy);
+    eprintln!("> Decision Engine Strategy: {strategy:?}");
 
     let num_scores = prep_result.score_names.len();
     let stride = prep_result.stride();
@@ -386,7 +386,7 @@ fn run_multi_file_pipeline(
         freq: 0.0,
     };
     let strategy = decide::RunStrategy::UseComplexTree;
-    eprintln!("> Decision Engine Strategy: {:?}", strategy);
+    eprintln!("> Decision Engine Strategy: {strategy:?}");
     let master_baseline = {
         let num_scores = prep_result.score_names.len();
         let stride = prep_result.stride();

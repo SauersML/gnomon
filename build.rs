@@ -41,7 +41,7 @@ impl ViolationCollector {
         );
 
         for violation in &self.violations {
-            error_msg.push_str(&format!("   {}\n", violation));
+            error_msg.push_str(&format!("   {violation}\n"));
         }
 
         error_msg
@@ -76,7 +76,7 @@ impl ForbiddenCommentCollector {
         );
 
         for violation in &self.violations {
-            error_msg.push_str(&format!("   {}\n", violation));
+            error_msg.push_str(&format!("   {violation}\n"));
         }
 
         error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', or 'FIX' are STRICTLY FORBIDDEN in this project.\n");
@@ -127,8 +127,7 @@ impl Sink for ViolationCollector {
         }
 
         // Format the violation string exactly as the `rg -n` command would.
-        self.violations
-            .push(format!("{}:{}", line_number, line_text));
+        self.violations.push(format!("{line_number}:{line_text}"));
 
         // Return `Ok(true)` to continue searching for more matches in the same file.
         Ok(true)
@@ -157,8 +156,7 @@ impl Sink for ForbiddenCommentCollector {
         }
 
         // Format the violation string
-        self.violations
-            .push(format!("{}:{}", line_number, line_text));
+        self.violations.push(format!("{line_number}:{line_text}"));
 
         Ok(true)
     }
@@ -175,13 +173,13 @@ fn main() {
     if let Err(e) = scan_for_underscore_prefixes() {
         // Print the formatted error and fail the build.
         // The `eprintln!` here is crucial for showing the error in `cargo`'s output.
-        eprintln!("{}", e);
+        eprintln!("{e}");
         std::process::exit(1);
     }
 
     // Scan Rust source files for forbidden comment patterns and fail if found.
     if let Err(e) = scan_for_forbidden_comment_patterns() {
-        eprintln!("{}", e);
+        eprintln!("{e}");
         std::process::exit(1);
     }
 }
@@ -192,7 +190,7 @@ fn manually_check_for_unused_variables() {
     // This ensures build.rs itself follows the strict no-unused-variables policy
     let build_path = Path::new("build.rs");
     let status = std::process::Command::new("rustc")
-        .args(&[
+        .args([
             "--edition",
             "2021",
             "-D",
@@ -211,7 +209,7 @@ fn manually_check_for_unused_variables() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr.contains("unused variable") {
                     eprintln!("\n❌ ERROR: Unused variables detected in build.rs!");
-                    eprintln!("{}", stderr);
+                    eprintln!("{stderr}");
                     eprintln!("\n⚠️ Unused variables are STRICTLY FORBIDDEN in this project.");
                     eprintln!(
                         "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
@@ -241,7 +239,7 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .filter_map(|e| e.ok()) // Ignore any errors during directory traversal.
         .filter(|e| !e.path().starts_with("./target")) // Exclude the target directory.
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
     // Keep only .rs files.
     {
         let path = entry.path();
@@ -255,7 +253,7 @@ fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
         // Add debug info for estimate.rs to help diagnose the underscore variable detection
         let is_estimate_rs = path
             .to_str()
-            .map_or(false, |p| p.ends_with("calibrate/estimate.rs"));
+            .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
         if is_estimate_rs {
             println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
         }
@@ -301,7 +299,7 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
         .filter_map(|e| e.ok())
         .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
         .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
     {
         let path = entry.path();
 
@@ -322,7 +320,7 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
         .filter_map(|e| e.ok())
         .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
         .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
     {
         let path = entry.path();
 
