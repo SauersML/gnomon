@@ -85,7 +85,7 @@ impl ForbiddenCommentCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', 'FIX', 'NEW', 'CHANGED', 'MODIFIED', or 'UPDATED' are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
         error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str(
@@ -190,10 +190,17 @@ impl Sink for ForbiddenCommentCollector {
             && !line_text.contains("FIXED")
             && !line_text.contains("CORRECTED")
             && !line_text.contains("FIX")
+            && !line_text.contains("FIXES")
             && !line_text.contains("NEW")
             && !line_text.contains("CHANGED")
+            && !line_text.contains("CHANGES")
+            && !line_text.contains("CHANGE")
             && !line_text.contains("MODIFIED")
+            && !line_text.contains("MODIFIES")
+            && !line_text.contains("MODIFY")
             && !line_text.contains("UPDATED")
+            && !line_text.contains("UPDATES")
+            && !line_text.contains("UPDATE")
         {
             // Skip this match, it's just ** in a doc comment
             return Ok(true);
@@ -373,7 +380,7 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
     // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
     let forbidden_words_pattern =
-        r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|NEW|CHANGED|MODIFIED|UPDATED)";
+        r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
     // 3. Pattern to catch comments where all alphabetic characters are uppercase

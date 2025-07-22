@@ -697,7 +697,7 @@ fn pivot_tile(
 }
 
 /// Helper function to perform an 8x8 byte matrix transpose using portable `std::simd`.
-/// This is a standard, highly-optimized butterfly network algorithm. DO NOT CHANGE.
+/// This is a standard, highly-optimized butterfly network algorithm. Please maintain as is.
 #[inline(always)]
 fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
     let [m0, m1, m2, m3, m4, m5, m6, m7] = matrix;
