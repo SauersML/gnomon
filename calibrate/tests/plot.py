@@ -22,10 +22,12 @@ from sklearn.calibration import calibration_curve
 SCRIPT_DIR = Path(__file__).resolve().parent
 # Navigate up to the project root directory (assumes tests/ is under calibrate/)
 PROJECT_ROOT = SCRIPT_DIR.parent
+# Get the workspace root (one level up from the calibrate directory)
+WORKSPACE_ROOT = PROJECT_ROOT.parent
 
 # Define all paths relative to the project root
 EXECUTABLE_NAME = "gnomon"
-EXECUTABLE_PATH = PROJECT_ROOT / "target" / "release" / EXECUTABLE_NAME
+EXECUTABLE_PATH = WORKSPACE_ROOT / "target" / "release" / EXECUTABLE_NAME
 MODEL_PATH = PROJECT_ROOT / "model.toml"
 PREDICTIONS_PATH = PROJECT_ROOT / "predictions.tsv"  # The fixed output file for the tool
 TRAIN_DATA_PATH = PROJECT_ROOT / "training_data.tsv"
@@ -51,13 +53,17 @@ def build_rust_project():
             # and the project structure is correct.
             subprocess.run(
                 ["cargo", "build", "--release", "--bin", EXECUTABLE_NAME],
-                check=True, text=True, cwd=PROJECT_ROOT
+                check=True, text=True, cwd=WORKSPACE_ROOT
             )
             print("--- Compilation successful. ---")
+            
+            # Verify the executable was actually created
+            if not EXECUTABLE_PATH.is_file():
+                raise FileNotFoundError(f"Compilation succeeded but executable not found at {EXECUTABLE_PATH}")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"\n--- ERROR: Rust compilation failed: {e} ---")
             print("Please ensure Rust/Cargo is installed and in your PATH,")
-            print(f"and that the project root is correctly set to: {PROJECT_ROOT}")
+            print(f"and that the workspace root is correctly set to: {WORKSPACE_ROOT}")
             sys.exit(1)
     else:
         print("--- Found existing executable. Skipping build. ---")
