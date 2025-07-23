@@ -616,3 +616,121 @@ fn penalty_square_root(s: &Array2<f64>) -> Result<Array2<f64>, EstimationError> 
 
     Ok(e)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr1, arr2};
+    use ndarray_linalg::Solve;
+
+    /// This single, comprehensive test robustly verifies the correctness of the penalty
+    /// square root calculation and its effect on the penalized least squares solver.
+    /// It does so without external dependencies by generating a ground truth internally.
+    #[test]
+    fn test_penalized_solver_and_sqrt_correctness() {
+        // ---
+        // SCENARIO 1: Positive-Definite, Non-Diagonal Penalty (Tests the Cholesky Path)
+        // ---
+        // This is the most critical scenario. It uses a non-diagonal penalty matrix, which
+        // would cause the buggy implementation to fail. We verify both the penalty square
+        // root directly and the final beta solution.
+
+        println!("--- Testing Scenario 1: Non-Diagonal SPD Penalty ---");
+
+        // SETUP: A simple, well-conditioned problem.
+        let x = arr2(&[[1.0, 2.0], [1.0, 3.0], [1.0, 5.0]]);
+        let y = arr1(&[4.1, 6.2, 9.8]);
+        let weights = arr1(&[1.0, 1.0, 1.0]); // Use identity weights to simplify ground truth
+
+        // A non-diagonal Symmetric-Positive-Definite (SPD) penalty matrix.
+        let s1 = arr2(&[[4.0, 2.0], [2.0, 5.0]]);
+
+        // ACTION 1.1: Directly test the penalty_square_root function.
+        let e1 = penalty_square_root(&s1).expect("S1: Decomposition failed");
+
+        // VERIFY 1.1: The function's core contract is E'E = S.
+        let s1_reconstructed = e1.t().dot(&e1);
+        
+        // Manual verification with tolerance
+        let tol = 1e-9;
+        for i in 0..s1.nrows() {
+            for j in 0..s1.ncols() {
+                let diff = (s1[[i, j]] - s1_reconstructed[[i, j]]).abs();
+                let scale = s1[[i, j]].abs().max(1e-9);
+                assert!(diff < tol * scale, 
+                    "Matrices differ at [{}, {}]: {} vs {} (diff: {}, relative: {})", 
+                    i, j, s1[[i, j]], s1_reconstructed[[i, j]], diff, diff / scale);
+            }
+        }
+
+        // ACTION 1.2: Generate the ground truth beta by solving the normal equations directly.
+        // The solution to the penalized least squares problem is the solution to:
+        // (X'WX + S) * beta = X'Wz
+        // For identity weights, W=I and z=y, so this simplifies to (X'X + S) * beta = X'y.
+        let xtx = x.t().dot(&x);
+        let hessian_truth = &xtx + &s1;
+        let rhs_truth = x.t().dot(&y);
+        let beta_truth1 = hessian_truth.solve_into(rhs_truth).expect("S1: Ground truth solve failed");
+
+        // ACTION 1.3: Run the function under test.
+        let result1 = stable_penalized_least_squares(
+            x.view(), y.view(), weights.view(), &s1
+        ).expect("S1: stable_penalized_least_squares failed");
+
+        // VERIFY 1.2: The beta from our complex solver must match the ground truth.
+        for i in 0..result1.beta.len() {
+            let diff = (result1.beta[i] - beta_truth1[i]).abs();
+            let scale = beta_truth1[i].abs().max(1e-9);
+            assert!(diff < tol * scale, 
+                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})", 
+                i, result1.beta[i], beta_truth1[i], diff, diff / scale);
+        }
+
+
+        // ---
+        // SCENARIO 2: Rank-Deficient Penalty (Tests the Eigendecomposition Path)
+        // ---
+        // This scenario ensures the fallback path for semi-definite matrices is also correct.
+        // Cholesky decomposition will fail on this input, forcing the eigh() path.
+
+        println!("--- Testing Scenario 2: Rank-Deficient Penalty ---");
+
+        // SETUP: A rank-deficient (singular) penalty matrix.
+        let s2 = arr2(&[[1.0, 1.0], [1.0, 1.0]]);
+
+        // ACTION 2.1: Directly test penalty_square_root on the semi-definite matrix.
+        let e2 = penalty_square_root(&s2).expect("S2: Decomposition failed");
+
+        // VERIFY 2.1: The core contract must still hold for the fallback path.
+        let s2_reconstructed = e2.t().dot(&e2);
+        
+        // Manual verification with tolerance for second scenario
+        for i in 0..s2.nrows() {
+            for j in 0..s2.ncols() {
+                let diff = (s2[[i, j]] - s2_reconstructed[[i, j]]).abs();
+                let scale = s2[[i, j]].abs().max(1e-9);
+                assert!(diff < tol * scale, 
+                    "Matrices differ at [{}, {}]: {} vs {} (diff: {}, relative: {})", 
+                    i, j, s2[[i, j]], s2_reconstructed[[i, j]], diff, diff / scale);
+            }
+        }
+
+        // ACTION 2.2: Generate the ground truth beta for this new penalty.
+        let hessian_truth2 = &xtx + &s2;
+        let beta_truth2 = hessian_truth2.solve_into(x.t().dot(&y)).expect("S2: Ground truth solve failed");
+
+        // ACTION 2.3: Run the function under test with the new penalty.
+        let result2 = stable_penalized_least_squares(
+            x.view(), y.view(), weights.view(), &s2
+        ).expect("S2: stable_penalized_least_squares failed");
+
+        // VERIFY 2.2: The beta for this path must also match its ground truth.
+        for i in 0..result2.beta.len() {
+            let diff = (result2.beta[i] - beta_truth2[i]).abs();
+            let scale = beta_truth2[i].abs().max(1e-9);
+            assert!(diff < tol * scale, 
+                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})", 
+                i, result2.beta[i], beta_truth2[i], diff, diff / scale);
+        }
+    }
+}
