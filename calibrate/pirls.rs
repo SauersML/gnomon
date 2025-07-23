@@ -378,9 +378,9 @@ pub fn update_glm_vectors(
             // Prevent extreme values in working response z
             let residual = &y.view() - &mu;
             let z_adj = &residual / &weights;
-            // Use a more reasonable clamping range (1e4 instead of 1e6) to prevent numerical instability
+            // Use a more reasonable clamping range (1000 instead of 1e4) to prevent numerical instability
             // while still allowing for reasonable convergence steps
-            let z_clamped = z_adj.mapv(|v| v.clamp(-1e4, 1e4));
+            let z_clamped = z_adj.mapv(|v| v.clamp(-1000.0, 1000.0));
             let z = &eta_clamped + &z_clamped;
 
             (mu, weights, z)
@@ -590,7 +590,10 @@ fn penalty_square_root(s: &Array2<f64>) -> Result<Array2<f64>, EstimationError> 
 
     // Try Cholesky first
     if let Ok(l) = s.cholesky(UPLO::Lower) {
-        return Ok(l);
+        // For penalty matrix S = LL' (Cholesky decomposition), 
+        // we need matrix E where E'E = S.
+        // By setting E = L', we get E'E = (L')'(L') = LL' = S.
+        return Ok(l.t().to_owned());
     }
 
     // Fallback to eigendecomposition for semi-definite matrices
