@@ -499,10 +499,12 @@ pub fn stable_penalized_least_squares(
     // RHS = R_bar' * Q_bar' * z_tilde
     let r_rows = r_bar.nrows().min(p);
     let q_t_z = q_bar.t().dot(&z_tilde.slice(s![..q_bar.nrows()]));
+    // Ensure we're using the correct slice dimensions for q_t_z
+    let q_t_z_rows = r_rows.min(q_t_z.len());
     let rhs = r_bar
         .slice(s![..r_rows, ..])
         .t()
-        .dot(&q_t_z.slice(s![..r_rows]));
+        .dot(&q_t_z.slice(s![..q_t_z_rows]));
 
     // Step 8: Solve the final system
     let beta = final_hessian
@@ -591,13 +593,17 @@ fn compute_corrected_data_hessian(
         // SVD of Q1_neg
         if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
             // Form correction matrix (I - 2VD²V')
-            let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
+            let mut d = Array2::zeros((sigma.len(), sigma.len()));
             for (i, &s) in sigma.iter().enumerate() {
-                d_squared[[i, i]] = s * s;
+                d[[i, i]] = s;
             }
 
             let v = vt.t();
-            let c = Array2::eye(v.nrows()) - 2.0 * v.dot(&d_squared.dot(&v.t()));
+            // More stable computation of the correction term
+            let vd = v.dot(&d);
+            let correction_term = 2.0 * vd.dot(&vd.t());
+
+            let c = Array2::eye(v.nrows()) - &correction_term;
 
             // Apply correction using correct sandwich form: R_bar' * C * R_bar
             let r_bar_slice = r_bar.slice(s![..r_rows, ..]);
