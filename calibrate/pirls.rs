@@ -552,8 +552,8 @@ pub fn stable_penalized_least_squares(
     // Step 10: Calculate scale parameter
     let fitted = x.dot(&beta);
     let residuals = &y - &fitted;
-    let rss = residuals.mapv(|v| v * v).sum();
-    let scale = rss / (n as f64 - edf).max(1.0);
+    let weighted_rss: f64 = weights.iter().zip(residuals.iter()).map(|(&w, &r)| w * r * r).sum();
+    let scale = weighted_rss / (n as f64 - edf).max(1.0);
 
     Ok(StablePLSResult {
         beta,
@@ -597,7 +597,7 @@ fn compute_corrected_data_hessian(
             }
 
             let v = vt.t();
-            let c = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
+            let c = Array2::eye(v.nrows()) - 2.0 * v.dot(&d_squared.dot(&v.t()));
 
             // Apply correction using correct sandwich form: R_bar' * C * R_bar
             let r_bar_slice = r_bar.slice(s![..r_rows, ..]);
