@@ -593,14 +593,16 @@ fn compute_corrected_data_hessian(
         // SVD of Q1_neg
         if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
             // Form correction matrix (I - 2VD²V')
-            let mut d = Array2::zeros((sigma.len(), sigma.len()));
-            for (i, &s) in sigma.iter().enumerate() {
-                d[[i, i]] = s;
-            }
+            let v = vt.t(); // v is n x n (e.g., 3x3)
+            let k = sigma.len(); // Number of singular values (e.g., 1)
 
-            let v = vt.t();
-            // More stable computation of the correction term
-            let vd = v.dot(&d);
+            // Robustly compute V*D by scaling the first k columns of V
+            // by the singular values in sigma.
+            let v_k = v.slice(s![.., ..k]);
+            // Use broadcasting to scale the columns of v_k by sigma
+            let vd = &v_k * &sigma;
+
+            // The correction term is dimensionally correct
             let correction_term = 2.0 * vd.dot(&vd.t());
 
             let c = Array2::eye(v.nrows()) - &correction_term;
