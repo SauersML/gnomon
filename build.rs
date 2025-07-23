@@ -379,8 +379,7 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
 
     // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
-    let forbidden_words_pattern =
-        r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
+    let forbidden_words_pattern = r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
     // 3. Pattern to catch comments where all alphabetic characters are uppercase

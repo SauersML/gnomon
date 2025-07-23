@@ -2546,7 +2546,7 @@ pub mod internal {
             // Use fixed seed for reproducible test results
             let mut rng = StdRng::seed_from_u64(123);
 
-            let n_samples = 40;
+            let n_samples = 400;
 
             // Create predictor variables
             let p = Array::linspace(-1.0, 1.0, n_samples);
@@ -2916,7 +2916,7 @@ pub mod internal {
             // Fixed seed for reproducibility
             let mut rng = StdRng::seed_from_u64(42);
 
-            let n_samples = 50; // Increased from 20 for better conditioning
+            let n_samples = 500; // Increased from 20 for better conditioning
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
 
@@ -3337,7 +3337,7 @@ pub mod internal {
         #[test]
         fn test_detects_singular_model_gracefully() {
             // Create a small dataset that will force singularity after basis construction
-            let n_samples = 20; // Increased to allow quantile knot placement
+            let n_samples = 200; // Increased to allow quantile knot placement
             let y = Array1::from_shape_fn(n_samples, |i| i as f64 * 0.1);
             let p = Array1::zeros(n_samples);
             let pcs = Array1::linspace(-1.0, 1.0, n_samples)
@@ -3902,7 +3902,7 @@ pub mod internal {
 
         #[test]
         fn test_layout_and_matrix_construction() {
-            let n_samples = 50;
+            let n_samples = 500;
             let pgs = Array::linspace(0.0, 1.0, n_samples);
             let pcs = Array::linspace(0.1, 0.9, n_samples)
                 .into_shape_with_order((n_samples, 1))
@@ -4211,7 +4211,7 @@ pub mod internal {
 
             let test_for_link = |link_function: LinkFunction| {
                 // 1. Create simple data without perfect separation
-                let n_samples = 50;
+                let n_samples = 50; // Do not increase
                 // Use a single RNG instance for consistency
                 let mut rng = StdRng::seed_from_u64(42);
 
@@ -4391,7 +4391,7 @@ pub mod internal {
 
             let verify_descent_for_link = |link_function: LinkFunction| {
                 // 1. Setup a well-posed, non-trivial problem.
-                let n_samples = 60;
+                let n_samples = 600;
                 let p = Array1::linspace(-1.0, 1.0, n_samples);
                 let y = match link_function {
                     LinkFunction::Identity => {
@@ -4675,7 +4675,7 @@ pub mod internal {
 
         #[test]
         fn test_cost_function_meaning_investigation() {
-            let n_samples = 20;
+            let n_samples = 200;
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.clone();
             let pcs = Array2::zeros((n_samples, 0));
@@ -4756,7 +4756,7 @@ pub mod internal {
 
         #[test]
         fn test_gradient_vs_cost_relationship() {
-            let n_samples = 20;
+            let n_samples = 200;
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.mapv(|x| x * x); // Quadratic relationship
             let pcs = Array2::zeros((n_samples, 0));
@@ -4836,7 +4836,7 @@ pub mod internal {
         #[test]
         fn test_debug_zero_gradient_issue() {
             // Use small n_samples to deliberately provoke over-parameterization
-            let n_samples = 20;
+            let n_samples = 20; // DO NOT increase
             let x_vals = Array1::linspace(0.0, 1.0, n_samples);
             let y = x_vals.mapv(|x: f64| x + 0.1 * rand::random::<f64>());
             let p = Array1::zeros(n_samples);
@@ -4900,7 +4900,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
     use std::collections::HashMap;
 
     // 1. Create a perfectly separated dataset
-    let n_samples = 40;
+    let n_samples = 400;
     let p = Array1::linspace(-1.0, 1.0, n_samples);
     let y = p.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 }); // Perfect separation by PGS
     let pcs = Array2::zeros((n_samples, 0)); // No PCs for simplicity
@@ -4966,7 +4966,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
     println!("=== TESTING INDEFINITE HESSIAN DETECTION FUNCTIONALITY ===");
 
     // Create a minimal dataset
-    let n_samples = 10;
+    let n_samples = 100;
     let y = Array1::from_shape_fn(n_samples, |i| i as f64 * 0.1);
     let p = Array1::zeros(n_samples);
     let pcs = Array2::zeros((n_samples, 1));
