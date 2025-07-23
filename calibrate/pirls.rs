@@ -79,6 +79,8 @@ pub fn fit_model_for_fixed_rho(
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut max_abs_eta = 0.0;
+    let mut last_iter = 0;
+    let mut broke_early = false;
 
     // Validate dimensions
     assert_eq!(
@@ -104,6 +106,7 @@ pub fn fit_model_for_fixed_rho(
     };
 
     for iter in 1..=config.max_iterations {
+        last_iter = iter; // Update on every iteration
         // --- Store the state from the START of the iteration ---
         let beta_current = beta.clone();
         let deviance_current = last_deviance;
@@ -176,7 +179,8 @@ pub fn fit_model_for_fixed_rho(
                 if attempt > 0 {
                     log::debug!(
                         "Step halving successful after {} attempts, final step size: {:.6}",
-                        attempt, step_size
+                        attempt,
+                        step_size
                     );
                 }
                 break; // Exit line search loop
@@ -201,6 +205,8 @@ pub fn fit_model_for_fixed_rho(
                 iter
             );
             log::info!("P-IRLS STALLED: Step halving failed. Terminating inner loop.");
+            last_iter = iter;
+            broke_early = true;
             break; // Exit the main `for` loop and proceed to the final check.
         }
 
@@ -219,10 +225,9 @@ pub fn fit_model_for_fixed_rho(
             );
 
             // Don't fail here. Just return the current state with a status flag.
-            // Reuse the penalized Hessian from the stable_result that was already computed
-            // for this iteration, avoiding redundant computation
-            let penalized_hessian = stable_result.penalized_hessian;
-            
+            // Recompute the penalized Hessian with the final weights for consistency.
+            let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
+
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
@@ -245,7 +250,10 @@ pub fn fit_model_for_fixed_rho(
         // A more detailed, real-time log for each inner-loop iteration
         log::debug!(
             "P-IRLS Iteration #{:<2} | Deviance: {:<13.7} | Change: {:>12.6e}{}",
-            iter, last_deviance, deviance_change, step_info
+            iter,
+            last_deviance,
+            deviance_change,
+            step_info
         );
 
         if !deviance_change.is_finite() {
@@ -276,11 +284,12 @@ pub fn fit_model_for_fixed_rho(
         if converged {
             log::info!("P-IRLS Converged.");
 
-            // Get the penalized Hessian from the last stable solver call
-            // instead of recomputing it
+            // Recompute the penalized Hessian with the final weights for consistency
+            let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
+
             return Ok(PirlsResult {
                 beta,
-                penalized_hessian: stable_result.penalized_hessian,
+                penalized_hessian,
                 deviance: last_deviance, // Now guaranteed to be the final, converged value
                 final_weights: weights,
                 status: PirlsStatus::Converged,
@@ -291,19 +300,21 @@ pub fn fit_model_for_fixed_rho(
         // No need to update last_deviance here - it's already updated in the line search when a step is accepted
     }
 
-    log::warn!(
-        "P-IRLS FAILED to converge after {} iterations.",
-        config.max_iterations
-    );
+    log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
 
-    // In pirls.rs, inside fit_model_for_fixed_rho, at the end of the `for` loop...
+    // This code is executed ONLY if the loop finishes without meeting the deviance convergence criteria.
 
-    // This code REPLACES the existing `Err(EstimationError::PirlsDidNotConverge { ... })`
-    // It is executed ONLY if the loop finishes without meeting the deviance convergence criteria.
-
-    log::info!(
-        "P-IRLS STALLED: Hit max iterations. Performing final check to see if stalled state is a valid minimum."
-    );
+    if broke_early {
+        log::info!(
+            "P-IRLS STALLED: Step halving failed at iteration {}. Performing final check to see if stalled state is a valid minimum.",
+            last_iter
+        );
+    } else {
+        log::info!(
+            "P-IRLS STALLED: Hit max iterations ({}). Performing final check to see if stalled state is a valid minimum.",
+            config.max_iterations
+        );
+    }
 
     // We are here because the loop timed out. The variables `beta`, `mu`, `weights`,
     // and `s_lambda` hold the values from the last, stalled iteration.
@@ -316,12 +327,13 @@ pub fn fit_model_for_fixed_rho(
         .sqrt();
     let is_gradient_zero = gradient_norm < 1e-4; // Use a reasonable tolerance for the gradient norm
 
-    // Reuse the Hessian from the last stable solver call
-    // Store this outside the loop to maintain state across iterations
-    let last_stable_result = 
-        stable_penalized_least_squares(x.view(), z.view(), weights.view(), &s_lambda)?;
-    let penalized_hessian = last_stable_result.penalized_hessian;
-    
+    // Compute the penalized Hessian for the final check
+    // We need to compute the Hessian using the final weights to ensure consistency
+    // with the returned beta and weights. This is more efficient than running the full
+    // stable_penalized_least_squares solver again.
+    log::debug!("Computing final Hessian for stalled state using current weights.");
+    let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
+
     // Check 2: Is the penalized Hessian positive-definite?
     use ndarray_linalg::{Cholesky, UPLO};
     let is_positive_definite = penalized_hessian.cholesky(UPLO::Lower).is_ok();
@@ -339,7 +351,7 @@ pub fn fit_model_for_fixed_rho(
             deviance: last_deviance,
             final_weights: weights,
             status: PirlsStatus::StalledAtValidMinimum,
-            iteration: config.max_iterations,
+            iteration: last_iter,
             max_abs_eta,
         })
     } else {
@@ -358,7 +370,7 @@ pub fn fit_model_for_fixed_rho(
             deviance: last_deviance,
             final_weights: weights,
             status: PirlsStatus::MaxIterationsReached,
-            iteration: config.max_iterations,
+            iteration: last_iter,
             max_abs_eta,
         })
     }
@@ -410,13 +422,15 @@ pub fn calculate_deviance(y: ArrayView1<f64>, mu: &Array1<f64>, link: LinkFuncti
         LinkFunction::Logit => {
             let total_residual = ndarray::Zip::from(y).and(mu).fold(0.0, |acc, &yi, &mui| {
                 let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                // More numerically stable formulation: use difference of logs instead of log of ratio
                 let term1 = if yi > EPS {
-                    yi * (yi / mui_c).ln()
+                    yi * (yi.ln() - mui_c.ln())
                 } else {
                     0.0
                 };
+                // More numerically stable formulation: use difference of logs instead of log of ratio
                 let term2 = if yi < 1.0 - EPS {
-                    (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
+                    (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
                 } else {
                     0.0
                 };
@@ -469,12 +483,7 @@ pub fn stable_penalized_least_squares(
         .collect();
 
     // Step 5: Get corrected data Hessian using the single source of truth
-    let corrected_data_hessian = compute_corrected_data_hessian(
-        p,
-        &neg_indices,
-        &q_bar,
-        &r_bar,
-    )?;
+    let corrected_data_hessian = compute_corrected_data_hessian(p, &neg_indices, &q_bar, &r_bar)?;
 
     // Step 6: Form final penalized Hessian by adding penalty to corrected data term
     let final_hessian = &corrected_data_hessian + s_lambda;
@@ -508,7 +517,7 @@ pub fn stable_penalized_least_squares(
     // For large parameter spaces (p > 100), consider the direct matrix inverse approach
     // For smaller spaces or ill-conditioned matrices, use the column-by-column solve method
     let mut edf: f64 = 0.0;
-    
+
     // Option 1: Direct matrix inverse (faster for large p but potentially less stable)
     if p > 100 {
         use ndarray_linalg::Inverse;
@@ -519,7 +528,9 @@ pub fn stable_penalized_least_squares(
             log::debug!("EDF calculated using direct matrix inverse: {:.2}", edf);
         } else {
             // Fall back to column-by-column approach if matrix inversion fails
-            log::warn!("Matrix inversion failed for EDF calculation, falling back to column-by-column method");
+            log::warn!(
+                "Matrix inversion failed for EDF calculation, falling back to column-by-column method"
+            );
             for j in 0..p {
                 if let Ok(h_inv_col) = final_hessian.solve(&xtwx_base.column(j).to_owned()) {
                     edf += h_inv_col[j];
@@ -534,7 +545,7 @@ pub fn stable_penalized_least_squares(
             }
         }
     }
-    
+
     // EDF cannot be less than 1 if an intercept is present
     edf = edf.max(1.0);
 
@@ -552,8 +563,6 @@ pub fn stable_penalized_least_squares(
     })
 }
 
-
-
 /// Internal helper to compute the corrected data Hessian X'WX, handling negative weights.
 /// This is the single source of truth for this calculation.
 fn compute_corrected_data_hessian(
@@ -564,21 +573,21 @@ fn compute_corrected_data_hessian(
 ) -> Result<Array2<f64>, EstimationError> {
     use ndarray::s;
     use ndarray_linalg::SVD;
-    
+
     // The number of rows in the R factor to use (min of rows or columns)
     let r_rows = r_bar.nrows().min(p);
-    
+
     // Step 1: Compute the uncorrected data Hessian X'|W|X = R_bar' * R_bar
     let data_hessian = r_bar
         .slice(s![..r_rows, ..])
         .t()
         .dot(&r_bar.slice(s![..r_rows, ..]));
-    
+
     // Step 2: Apply correction for negative weights if necessary
     if !neg_indices.is_empty() {
         // Get Q rows for negative weights
         let q1_neg = q_bar.select(ndarray::Axis(0), neg_indices);
-        
+
         // SVD of Q1_neg
         if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
             // Form correction matrix (I - 2VD²V')
@@ -586,14 +595,14 @@ fn compute_corrected_data_hessian(
             for (i, &s) in sigma.iter().enumerate() {
                 d_squared[[i, i]] = s * s;
             }
-            
+
             let v = vt.t();
             let c = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
-            
+
             // Apply correction using correct sandwich form: R_bar' * C * R_bar
             let r_bar_slice = r_bar.slice(s![..r_rows, ..]);
             let corrected = r_bar_slice.t().dot(&c.dot(&r_bar_slice));
-            
+
             Ok(corrected)
         } else {
             // Fallback if SVD fails
@@ -613,14 +622,14 @@ pub fn compute_final_penalized_hessian(
     s_lambda: &Array2<f64>,
 ) -> Result<Array2<f64>, EstimationError> {
     use ndarray_linalg::QR;
-    
+
     let p = x.ncols();
-    
+
     // Step 1: Perform the QR decomposition of sqrt(|W|)X
     let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
     let wx = &x * &sqrt_w_abs.view().insert_axis(ndarray::Axis(1));
     let (q_bar, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    
+
     // Step 2: Identify negative weights
     let neg_indices: Vec<usize> = weights
         .iter()
@@ -628,18 +637,13 @@ pub fn compute_final_penalized_hessian(
         .filter(|(_, w)| **w < 0.0)
         .map(|(i, _)| i)
         .collect();
-    
+
     // Step 3: Call the single-source-of-truth helper function
-    let data_hessian = compute_corrected_data_hessian(
-        p,
-        &neg_indices,
-        &q_bar,
-        &r_bar,
-    )?;
-    
+    let data_hessian = compute_corrected_data_hessian(p, &neg_indices, &q_bar, &r_bar)?;
+
     // Step 4: Add the penalty term
     let penalized_hessian = &data_hessian + s_lambda;
-    
+
     Ok(penalized_hessian)
 }
 
@@ -648,7 +652,7 @@ mod tests {
     use super::*;
     use ndarray::{arr1, arr2};
     use ndarray_linalg::Solve;
-    
+
     /// This test explicitly verifies that the Hessian calculation is consistent between
     /// the stable_penalized_least_squares function and compute_final_penalized_hessian function
     /// when dealing with negative weights.
@@ -657,7 +661,7 @@ mod tests {
         // SETUP: Create a proper test case with consistent dimensions
         let n_samples = 10; // Number of samples/rows
         let n_features = 3; // Number of features/columns
-        
+
         // Create a design matrix X with reasonable values
         let mut x_data = Vec::with_capacity(n_samples * n_features);
         for i in 0..n_samples {
@@ -666,42 +670,50 @@ mod tests {
             x_data.push(((i as f64) / n_samples as f64).powi(2)); // Feature 2
         }
         let x = Array2::from_shape_vec((n_samples, n_features), x_data).unwrap();
-        
+
         // Create a reasonable response vector y
         let y = Array1::from_vec((0..n_samples).map(|i| (i as f64) * 0.5 + 2.0).collect());
-        
+
         // Create weights with a negative value to test the correction
         let mut weights = Array1::ones(n_samples);
         weights[3] = -0.5; // Set one weight to be negative
-        
+
         // Create a simple penalty matrix
         let mut s_lambda = Array2::zeros((n_features, n_features));
         for i in 0..n_features {
             s_lambda[[i, i]] = 0.1; // Simple diagonal penalty
         }
-        
+
         // ACTION 1: Compute the Hessian using the full stable solver
-        let stable_result = stable_penalized_least_squares(
-            x.view(), y.view(), weights.view(), &s_lambda
-        ).expect("Stable solver failed");
+        let stable_result =
+            stable_penalized_least_squares(x.view(), y.view(), weights.view(), &s_lambda)
+                .expect("Stable solver failed");
         let hessian_from_solver = stable_result.penalized_hessian;
-        
+
         // ACTION 2: Compute the Hessian using the public utility function
-        let hessian_from_util = compute_final_penalized_hessian(
-            x.view(), &weights, &s_lambda
-        ).expect("Utility function failed");
-        
+        let hessian_from_util = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)
+            .expect("Utility function failed");
+
         // VERIFY: The two matrices must be identical, element-wise
         let tolerance = 1e-10;
-        assert_eq!(hessian_from_solver.shape(), hessian_from_util.shape(), 
-                   "Hessian matrices have different shapes");
-                   
+        assert_eq!(
+            hessian_from_solver.shape(),
+            hessian_from_util.shape(),
+            "Hessian matrices have different shapes"
+        );
+
         for i in 0..hessian_from_solver.nrows() {
             for j in 0..hessian_from_solver.ncols() {
                 let diff = (hessian_from_solver[[i, j]] - hessian_from_util[[i, j]]).abs();
-                assert!(diff < tolerance, 
+                assert!(
+                    diff < tolerance,
                     "Hessian matrices differ at [{}, {}]: {} vs {} (diff: {})",
-                    i, j, hessian_from_solver[[i, j]], hessian_from_util[[i, j]], diff);
+                    i,
+                    j,
+                    hessian_from_solver[[i, j]],
+                    hessian_from_util[[i, j]],
+                    diff
+                );
             }
         }
     }
@@ -728,47 +740,61 @@ mod tests {
         let xtx = x.t().dot(&x);
         let hessian_truth = &xtx + &s1;
         let rhs_truth = x.t().dot(&y);
-        let beta_truth1 = hessian_truth.solve_into(rhs_truth).expect("S1: Ground truth solve failed");
+        let beta_truth1 = hessian_truth
+            .solve_into(rhs_truth)
+            .expect("S1: Ground truth solve failed");
 
         // ACTION 1.2: Run the function under test.
-        let result1 = stable_penalized_least_squares(
-            x.view(), y.view(), weights.view(), &s1
-        ).expect("S1: stable_penalized_least_squares failed");
+        let result1 = stable_penalized_least_squares(x.view(), y.view(), weights.view(), &s1)
+            .expect("S1: stable_penalized_least_squares failed");
 
         // VERIFY 1.1: The beta from our complex solver must match the ground truth.
         let tol = 1e-9;
         for i in 0..result1.beta.len() {
             let diff = (result1.beta[i] - beta_truth1[i]).abs();
             let scale = beta_truth1[i].abs().max(1e-9);
-            assert!(diff < tol * scale, 
-                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})", 
-                i, result1.beta[i], beta_truth1[i], diff, diff / scale);
+            assert!(
+                diff < tol * scale,
+                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})",
+                i,
+                result1.beta[i],
+                beta_truth1[i],
+                diff,
+                diff / scale
+            );
         }
 
         // ---
         // SCENARIO 2: Rank-Deficient Penalty
         // ---
         // Test rank-deficient penalty matrix
-        
+
         // SETUP: A rank-deficient (singular) penalty matrix.
         let s2 = arr2(&[[1.0, 1.0], [1.0, 1.0]]);
 
         // ACTION 2.1: Generate the ground truth beta for this new penalty.
         let hessian_truth2 = &xtx + &s2;
-        let beta_truth2 = hessian_truth2.solve_into(x.t().dot(&y)).expect("S2: Ground truth solve failed");
+        let beta_truth2 = hessian_truth2
+            .solve_into(x.t().dot(&y))
+            .expect("S2: Ground truth solve failed");
 
         // ACTION 2.2: Run the function under test with the new penalty.
-        let result2 = stable_penalized_least_squares(
-            x.view(), y.view(), weights.view(), &s2
-        ).expect("S2: stable_penalized_least_squares failed");
+        let result2 = stable_penalized_least_squares(x.view(), y.view(), weights.view(), &s2)
+            .expect("S2: stable_penalized_least_squares failed");
 
         // VERIFY 2.2: The beta for this path must also match its ground truth.
         for i in 0..result2.beta.len() {
             let diff = (result2.beta[i] - beta_truth2[i]).abs();
             let scale = beta_truth2[i].abs().max(1e-9);
-            assert!(diff < tol * scale, 
-                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})", 
-                i, result2.beta[i], beta_truth2[i], diff, diff / scale);
+            assert!(
+                diff < tol * scale,
+                "Beta vectors differ at [{}]: {} vs {} (diff: {}, relative: {})",
+                i,
+                result2.beta[i],
+                beta_truth2[i],
+                diff,
+                diff / scale
+            );
         }
     }
 }
