@@ -219,7 +219,10 @@ pub fn fit_model_for_fixed_rho(
             );
 
             // Don't fail here. Just return the current state with a status flag.
-            let penalized_hessian = compute_penalized_hessian(x, &weights, &s_lambda)?;
+            // Reuse the penalized Hessian from the stable_result that was already computed
+            // for this iteration, avoiding redundant computation
+            let penalized_hessian = stable_result.penalized_hessian;
+            
             return Ok(PirlsResult {
                 beta,
                 penalized_hessian,
@@ -450,16 +453,12 @@ pub fn stable_penalized_least_squares(
     let p = x.ncols();
 
     use ndarray::s;
-    use ndarray_linalg::{QR, SVD, Solve};
+    use ndarray_linalg::{QR, Solve};
 
     // Step 1: Initial QR decomposition of sqrt(|W|)X (Wood 2011, Section 3.3)
     let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
     let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1)); // sqrt(|W|)X
     let (q_bar, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    let r_rows = r_bar.nrows().min(p);
-
-    // No need to calculate a penalty square root factor
-    // We'll add s_lambda directly to the corrected data hessian
 
     // Step 3: Identify indices of negative weights
     let neg_indices: Vec<usize> = weights
@@ -469,41 +468,15 @@ pub fn stable_penalized_least_squares(
         .map(|(i, _)| i)
         .collect();
 
-    // Step 4: Compute the data term Hessian X'|W|X
-    let data_hessian = r_bar
-        .slice(s![..r_rows, ..])
-        .t()
-        .dot(&r_bar.slice(s![..r_rows, ..]));
+    // Step 5: Get corrected data Hessian using the single source of truth
+    let corrected_data_hessian = compute_corrected_data_hessian(
+        p,
+        &neg_indices,
+        &q_bar,
+        &r_bar,
+    )?;
 
-    // Step 5: Apply correction to data term if negative weights exist
-    let corrected_data_hessian = if !neg_indices.is_empty() {
-        // Get Q rows for negative weights
-        let q1_neg = q_bar.select(Axis(0), &neg_indices);
-        
-        // SVD of Q1_neg
-        if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
-            // Form correction matrix (I - 2VD²V')
-            let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
-            for (i, &s) in sigma.iter().enumerate() {
-                d_squared[[i, i]] = s * s;
-            }
-            
-            let v = vt.t();
-            let c = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
-            
-            // Apply correction using correct sandwich form: R_bar' * C * R_bar
-            let r_bar_slice = r_bar.slice(s![..r_rows, ..]);
-            r_bar_slice.t().dot(&c.dot(&r_bar_slice))
-        } else {
-            // Fallback if SVD fails
-            data_hessian.clone()
-        }
-    } else {
-        // No correction needed
-        data_hessian.clone()
-    };
-
-    // Step 6: Form final penalized Hessian by adding penalty to (corrected) data term
+    // Step 6: Form final penalized Hessian by adding penalty to corrected data term
     let final_hessian = &corrected_data_hessian + s_lambda;
 
     // Step 7: Calculate RHS = X'Wz correctly (no complex correction needed)
@@ -515,6 +488,7 @@ pub fn stable_penalized_least_squares(
 
     // Stable RHS calculation using QR decomposition results
     // RHS = R_bar' * Q_bar' * z_tilde
+    let r_rows = r_bar.nrows().min(p);
     let q_t_z = q_bar.t().dot(&z_tilde.slice(s![..q_bar.nrows()]));
     let rhs = r_bar
         .slice(s![..r_rows, ..])
@@ -578,32 +552,159 @@ pub fn stable_penalized_least_squares(
     })
 }
 
-/// Compute penalized Hessian matrix X'WX + S_λ
+
+
+/// Internal helper to compute the corrected data Hessian X'WX, handling negative weights.
+/// This is the single source of truth for this calculation.
+fn compute_corrected_data_hessian(
+    p: usize,
+    neg_indices: &[usize],
+    q_bar: &Array2<f64>,
+    r_bar: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    use ndarray::s;
+    use ndarray_linalg::SVD;
+    
+    // The number of rows in the R factor to use (min of rows or columns)
+    let r_rows = r_bar.nrows().min(p);
+    
+    // Step 1: Compute the uncorrected data Hessian X'|W|X = R_bar' * R_bar
+    let data_hessian = r_bar
+        .slice(s![..r_rows, ..])
+        .t()
+        .dot(&r_bar.slice(s![..r_rows, ..]));
+    
+    // Step 2: Apply correction for negative weights if necessary
+    if !neg_indices.is_empty() {
+        // Get Q rows for negative weights
+        let q1_neg = q_bar.select(ndarray::Axis(0), neg_indices);
+        
+        // SVD of Q1_neg
+        if let Ok((_, sigma, Some(vt))) = q1_neg.svd(false, true) {
+            // Form correction matrix (I - 2VD²V')
+            let mut d_squared = Array2::zeros((sigma.len(), sigma.len()));
+            for (i, &s) in sigma.iter().enumerate() {
+                d_squared[[i, i]] = s * s;
+            }
+            
+            let v = vt.t();
+            let c = Array2::eye(p) - 2.0 * v.dot(&d_squared.dot(&v.t()));
+            
+            // Apply correction using correct sandwich form: R_bar' * C * R_bar
+            let r_bar_slice = r_bar.slice(s![..r_rows, ..]);
+            let corrected = r_bar_slice.t().dot(&c.dot(&r_bar_slice));
+            
+            Ok(corrected)
+        } else {
+            // Fallback if SVD fails
+            Ok(data_hessian)
+        }
+    } else {
+        // No correction needed
+        Ok(data_hessian)
+    }
+}
+
+/// Compute penalized Hessian matrix X'WX + S_λ correctly handling negative weights
 /// Used after P-IRLS convergence for final result
-fn compute_penalized_hessian(
+pub fn compute_final_penalized_hessian(
     x: ArrayView2<f64>,
     weights: &Array1<f64>,
     s_lambda: &Array2<f64>,
 ) -> Result<Array2<f64>, EstimationError> {
-    // Form weighted design matrix √|W| X
-    // Use abs() to ensure the data Hessian is positive semi-definite, matching the
-    // method in the stable PLS solver, which handles negative weight corrections separately.
-    let sqrt_w = weights.mapv(|w| w.abs().sqrt());
-    let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
-
-    // Form X'WX + S_λ
-    let xtwx = wx.t().dot(&wx);
-    let penalized_hessian = &xtwx + s_lambda;
-
+    use ndarray_linalg::QR;
+    
+    let p = x.ncols();
+    
+    // Step 1: Perform the QR decomposition of sqrt(|W|)X
+    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
+    let wx = &x * &sqrt_w_abs.view().insert_axis(ndarray::Axis(1));
+    let (q_bar, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    // Step 2: Identify negative weights
+    let neg_indices: Vec<usize> = weights
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w < 0.0)
+        .map(|(i, _)| i)
+        .collect();
+    
+    // Step 3: Call the single-source-of-truth helper function
+    let data_hessian = compute_corrected_data_hessian(
+        p,
+        &neg_indices,
+        &q_bar,
+        &r_bar,
+    )?;
+    
+    // Step 4: Add the penalty term
+    let penalized_hessian = &data_hessian + s_lambda;
+    
     Ok(penalized_hessian)
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::{arr1, arr2};
     use ndarray_linalg::Solve;
+    
+    /// This test explicitly verifies that the Hessian calculation is consistent between
+    /// the stable_penalized_least_squares function and compute_final_penalized_hessian function
+    /// when dealing with negative weights.
+    #[test]
+    fn test_hessian_consistency_with_negative_weights() {
+        // SETUP: Create a proper test case with consistent dimensions
+        let n_samples = 10; // Number of samples/rows
+        let n_features = 3; // Number of features/columns
+        
+        // Create a design matrix X with reasonable values
+        let mut x_data = Vec::with_capacity(n_samples * n_features);
+        for i in 0..n_samples {
+            x_data.push(1.0); // Intercept
+            x_data.push((i as f64) / n_samples as f64); // Feature 1
+            x_data.push(((i as f64) / n_samples as f64).powi(2)); // Feature 2
+        }
+        let x = Array2::from_shape_vec((n_samples, n_features), x_data).unwrap();
+        
+        // Create a reasonable response vector y
+        let y = Array1::from_vec((0..n_samples).map(|i| (i as f64) * 0.5 + 2.0).collect());
+        
+        // Create weights with a negative value to test the correction
+        let mut weights = Array1::ones(n_samples);
+        weights[3] = -0.5; // Set one weight to be negative
+        
+        // Create a simple penalty matrix
+        let mut s_lambda = Array2::zeros((n_features, n_features));
+        for i in 0..n_features {
+            s_lambda[[i, i]] = 0.1; // Simple diagonal penalty
+        }
+        
+        // ACTION 1: Compute the Hessian using the full stable solver
+        let stable_result = stable_penalized_least_squares(
+            x.view(), y.view(), weights.view(), &s_lambda
+        ).expect("Stable solver failed");
+        let hessian_from_solver = stable_result.penalized_hessian;
+        
+        // ACTION 2: Compute the Hessian using the public utility function
+        let hessian_from_util = compute_final_penalized_hessian(
+            x.view(), &weights, &s_lambda
+        ).expect("Utility function failed");
+        
+        // VERIFY: The two matrices must be identical, element-wise
+        let tolerance = 1e-10;
+        assert_eq!(hessian_from_solver.shape(), hessian_from_util.shape(), 
+                   "Hessian matrices have different shapes");
+                   
+        for i in 0..hessian_from_solver.nrows() {
+            for j in 0..hessian_from_solver.ncols() {
+                let diff = (hessian_from_solver[[i, j]] - hessian_from_util[[i, j]]).abs();
+                assert!(diff < tolerance, 
+                    "Hessian matrices differ at [{}, {}]: {} vs {} (diff: {})",
+                    i, j, hessian_from_solver[[i, j]], hessian_from_util[[i, j]], diff);
+            }
+        }
+    }
 
     /// This test robustly verifies the correctness of the stable penalized least squares solver
     /// using both a positive-definite and a rank-deficient penalty matrix.
