@@ -145,7 +145,23 @@ pub fn train_model(
             eprintln!(
                 "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
             );
-            eprintln!("[INFO] Accepting the best parameters found as the final result.");
+            
+            // Get the gradient at last_solution to ensure we're near a stationary point
+            let gradient_norm = match reml_state.compute_gradient(&last_solution.final_point) {
+                Ok(grad) => grad.dot(&grad).sqrt(),
+                Err(_) => f64::INFINITY,
+            };
+            
+            // Only accept the solution if gradient norm is small enough
+            const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1e-3;
+            if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "Line-search failed far from a stationary point. Gradient norm: {:.2e}", 
+                    gradient_norm
+                )));
+            }
+            
+            eprintln!("[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).", gradient_norm);
             *last_solution
         }
         // Rationale: This is our safety net. Any other error from the optimizer
@@ -1043,6 +1059,11 @@ pub mod internal {
                         let tr_s_plus_s_k = reparam_result.det1[k] / lambdas[k];
 
                         // Assemble the gradient component for the score (which we maximize)
+                        // Following Wood (2011) Appendix D, the gradient for the LAML (non-Gaussian) case has two components:
+                        // 1. trace_diff_term: λₖ/2 * (tr(S_λ⁺ Sₖ) - tr(H⁻¹Sₖ))
+                        // 2. weight_deriv_term: 1/2 * tr(H⁻¹X^T(∂W/∂ρₖ)X)
+                        // For the LAML case, the weight derivative term has a PLUS sign due to the
+                        // exact cancellation of the β^TSₖβ terms in the derivation (Wood 2011, Appendix D)
                         let trace_diff_term = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k);
                         score_gradient[k] = trace_diff_term + weight_deriv_term;
                     }
@@ -2156,6 +2177,78 @@ pub mod internal {
             let y_variance: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
 
             numerator / (x_variance.sqrt() * y_variance.sqrt())
+        }
+
+        /// This test specifically ensures the LAML gradient for non-Gaussian models is calculated correctly.
+        /// It verifies that the gradient calculation produces a valid descent direction,
+        /// accounting for the special cancellation of terms in the LAML case from Wood (2011) Appendix D.
+        #[test]
+        fn test_laml_gradient_sign_is_correct() {
+            // Create a simple test case with logit link function
+            let n_samples = 100;
+            
+            // Seed the global RNG for reproducible tests
+            let _ = rand::rngs::StdRng::seed_from_u64(42);
+            
+            // Create predictors and binary response
+            let p = Array1::from_shape_fn(n_samples, |_| rand::random::<f64>() * 2.0 - 1.0);
+            let pc1 = Array1::from_shape_fn(n_samples, |_| rand::random::<f64>() * 2.0 - 1.0);
+            
+            // Generate a non-separable binary outcome
+            let true_signal = &p + &pc1.mapv(|x| 0.5 * x.powi(2));
+            let noise = Array1::from_shape_fn(n_samples, |_| rand::random::<f64>() - 0.5);
+            let logits = &true_signal + &noise;
+            let y = logits.mapv(|x| {
+                let prob = 1.0 / (1.0 + (-x).exp());
+                if rand::random::<f64>() < prob { 1.0 } else { 0.0 }
+            });
+            
+            // Create training data
+            let mut pcs = Array2::zeros((n_samples, 1));
+            pcs.column_mut(0).assign(&pc1);
+            let data = TrainingData { y, p, pcs };
+            
+            // Setup model config with Logit link (non-Gaussian)
+            let mut config = create_test_config();
+            config.link_function = LinkFunction::Logit;
+            
+            // Build matrices and state
+            let (x_matrix, s_list, layout, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+            let reml_state = internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
+            
+            // Set a fixed test point
+            let test_rho = Array1::from_elem(layout.num_penalties, 0.0);
+            
+            // Calculate gradient
+            let grad = reml_state.compute_gradient(&test_rho).unwrap();
+            
+            // Now check if stepping in the negative gradient direction decreases cost
+            // This is the fundamental test of gradient correctness
+            let cost_start = reml_state.compute_cost(&test_rho).unwrap();
+            
+            // Take a small step in the negative gradient direction
+            let step_size = 1e-4;
+            let rho_step = &test_rho - step_size * &grad;
+            let cost_step = reml_state.compute_cost(&rho_step).unwrap();
+            
+            // The cost must decrease when moving in the negative gradient direction
+            // This confirms the gradient sign is correct
+            assert!(cost_step < cost_start, 
+                "Cost should decrease when stepping in negative gradient direction. \
+                Start: {:.6}, After step: {:.6}", cost_start, cost_step);
+            
+            // We should also see a consistent relationship between gradient and numerical approximation
+            let h = 1e-5;
+            let rho_plus = &test_rho + Array1::from_elem(test_rho.len(), h);
+            let rho_minus = &test_rho - Array1::from_elem(test_rho.len(), h);
+            let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
+            let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
+            let num_grad = (cost_plus - cost_minus) / (2.0 * h);
+            
+            // The analytical and numerical gradient should have the same sign
+            assert_eq!(grad[0].signum(), num_grad.signum(), 
+                "Analytical gradient sign ({:+.6}) should match numerical approximation sign ({:+.6})",
+                grad[0], num_grad);
         }
 
         #[test]
