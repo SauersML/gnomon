@@ -824,30 +824,59 @@ pub mod internal {
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = self.execute_pirls_if_needed(p)?;
+            self.compute_gradient_with_pirls_result(p, &pirls_result)
+        }
+        
+        /// Helper function that computes gradient using an existing PIRLS result
+        /// This allows reusing the same logic with a stabilized Hessian when needed
+        fn compute_gradient_with_pirls_result(&self, p: &Array1<f64>, pirls_result: &PirlsResult) -> Result<Array1<f64>, EstimationError> {
 
-            // If penalized Hessian is indefinite, return retreat gradient
+            // If penalized Hessian is indefinite, check if it's due to numerical noise or a real issue
             if pirls_result
                 .penalized_hessian
                 .cholesky(UPLO::Lower)
                 .is_err()
             {
-                // Cholesky failed, check eigenvalues to confirm indefiniteness
+                // Cholesky failed, check eigenvalues to determine severity
                 let eigenvals = pirls_result
                     .penalized_hessian
                     .eigvals()
                     .map_err(EstimationError::EigendecompositionFailed)?;
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                
+                const NUMERICAL_TOLERANCE: f64 = -1e-8; // Threshold for numerical noise vs. real indefiniteness
 
-                if min_eig <= 0.0 {
+                if min_eig < NUMERICAL_TOLERANCE {
+                    // True indefiniteness detected - a serious problem requiring retreat
                     log::warn!(
-                        "Indefinite Hessian detected in gradient; returning more robust retreat gradient."
+                        "Truly indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
+                        min_eig
                     );
                     // For better convergence behavior when costs are infinite,
                     // use the original parameter values to generate a more informed retreat direction
                     // This helps guide the optimizer away from problematic regions more effectively
                     let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
                     return Ok(retreat_grad);
+                } else if min_eig < 0.0 {
+                    // Minor numerical noise that can be stabilized
+                    log::debug!(
+                        "Slightly negative eigenvalue detected (min_eig={:.2e}); stabilizing Hessian for gradient calculation.",
+                        min_eig
+                    );
+                    // Create a stabilized copy of the Hessian
+                    let mut stable_hessian = pirls_result.penalized_hessian.clone();
+                    ensure_positive_definite(&mut stable_hessian);
+                    
+                    // Use the stabilized Hessian for subsequent calculations
+                    // We'll replace the original Hessian with the stabilized one in a clone of pirls_result
+                    let mut stable_pirls = pirls_result.clone();
+                    stable_pirls.penalized_hessian = stable_hessian;
+                    
+                    // Continue with the stabilized Hessian
+                    return self.compute_gradient_with_pirls_result(p, &stable_pirls);
                 }
+                // If min_eig >= 0 but Cholesky failed, it might be due to other numerical issues
+                // We'll proceed with the original matrix as it's technically positive semi-definite
             }
 
             // --- Extract common components ---
