@@ -3028,29 +3028,26 @@ pub mod internal {
                 }
             };
 
-            println!();
-            println!("=== Numerical Comparison ===");
-            println!("Numerical gradient: {:.6}", numerical_gradient);
-
+            // === VERIFY: Replace println! statements with a formal assertion ===
+            
+            // Calculate error metric with protection against division by zero
             let error_metric = compute_error_metric(analytical_gradient, numerical_gradient);
-            println!("Error metric: {:.6}", error_metric);
-            println!(
-                "Absolute difference: {:.6}",
-                (analytical_gradient - numerical_gradient).abs()
+            let tolerance = 1e-4; // A reasonable tolerance for this complex calculation
+            
+            // Assert the assembled components match the numerical result
+            assert!(
+                error_metric < tolerance,
+                "The analytical gradient assembled from isolated components does not match the numerical gradient.\n\
+                 Analytical: {:.6e}, Numerical: {:.6e}, Relative Error: {:.4}",
+                analytical_gradient, numerical_gradient, error_metric
             );
-
-            if numerical_gradient.abs() > 1e-6 {
-                println!(
-                    "Relative difference: {:.6}",
-                    (analytical_gradient - numerical_gradient).abs() / numerical_gradient.abs()
-                );
-            }
-
+            
             // Check symmetry of finite differences
             let h = adaptive_step_size(test_rho[0]);
-            if !check_difference_symmetry(&reml_state, &test_rho, 0, h, 1e-6) {
-                println!("Warning: Finite differences are not symmetric - function may be noisy");
-            }
+            assert!(
+                check_difference_symmetry(&reml_state, &test_rho, 0, h, 1e-6),
+                "Finite differences are not symmetric - function may be noisy"
+            );
 
             // === Detailed component-wise verification ===
 
@@ -3385,86 +3382,43 @@ pub mod internal {
                 &config,
             );
 
-            // Test at multiple penalty levels
-            let test_rhos = vec![-1.0, 0.0, 1.0];
+            // ACTION: Test at multiple points to ensure the property holds generally
+            for &rho_val in &[-1.0, 0.0, 1.0] {
+                let rho_start = array![rho_val];
+                
+                // Calculate cost and gradient at the starting point
+                let cost_start = safe_compute_cost(&reml_state, &rho_start)
+                    .expect(&format!("Cost calculation failed at start for rho={}", rho_val));
+                    
+                let grad_start = reml_state.compute_gradient(&rho_start)
+                    .expect(&format!("Gradient calculation failed at start for rho={}", rho_val));
 
-            for &rho in &test_rhos {
-                let test_rho = array![rho];
-                let analytical_grad = reml_state.compute_gradient(&test_rho).unwrap();
+                // Skip if we are already at a minimum
+                if grad_start[0].abs() < 1e-6 {
+                    continue;
+                }
 
-                // Numerical gradient using robust finite differences
-                let numerical_grad = match compute_numerical_gradient_robust(
-                    &reml_state,
-                    &test_rho,
-                    0,
-                ) {
-                    Some(grad) => grad,
-                    None => {
-                        println!(
-                            "Warning: Could not compute robust numerical gradient for rho={:.1}, skipping",
-                            rho
-                        );
-                        continue;
-                    }
-                };
+                // Take a small step in the direction of the negative gradient
+                let step_size = 1e-7; // A small, fixed step size is sufficient for this test
+                let rho_next = &rho_start - step_size * &grad_start;
 
-                // With our fixed gradient sign, the comparison should be different
-                // For this test, just print the values so we can see what's happening
-                println!(
-                    "At rho={:.1}: analytical={:.6}, numerical={:.6}",
-                    rho, analytical_grad[0], numerical_grad
-                );
+                // Calculate the cost at the new point
+                let cost_next = safe_compute_cost(&reml_state, &rho_next)
+                    .expect(&format!("Cost calculation failed after step for rho={}", rho_val));
 
-                // For highly non-linear surfaces, we need to verify that at least one direction of movement
-                // (either along the gradient or opposite to it) decreases the cost
-                let cost_start = reml_state.compute_cost(&test_rho).unwrap();
-
-                // Try both positive and negative steps to handle any numerical issues
-                let step_size = adaptive_step_size(rho) * 0.1; // Use adaptive step size scaled down
-                let rho_pos_step = &test_rho + step_size * &analytical_grad;
-                let rho_neg_step = &test_rho - step_size * &analytical_grad;
-
-                let cost_pos = match safe_compute_cost(&reml_state, &rho_pos_step) {
-                    Some(c) => c,
-                    None => {
-                        println!(
-                            "Warning: Could not compute cost for positive step at rho={:.1}",
-                            rho
-                        );
-                        continue;
-                    }
-                };
-                let cost_neg = match safe_compute_cost(&reml_state, &rho_neg_step) {
-                    Some(c) => c,
-                    None => {
-                        println!(
-                            "Warning: Could not compute cost for negative step at rho={:.1}",
-                            rho
-                        );
-                        continue;
-                    }
-                };
-
-                println!("Cost at start: {:.10}", cost_start);
-                println!("Cost after positive step: {:.10}", cost_pos);
-                println!("Cost after negative step: {:.10}", cost_neg);
-
-                // At least one of the directions should decrease the cost
-                let min_cost = cost_pos.min(cost_neg);
-
+                // VERIFY: Assert that the cost has decreased
                 assert!(
-                    min_cost < cost_start,
-                    "Taking a step in either direction should decrease cost. Start: {:.6}, Min cost: {:.6}",
-                    cost_start,
-                    min_cost
+                    cost_next < cost_start,
+                    "At rho={:.1}, taking a step in the negative gradient direction should decrease the cost.\n\
+                     Start Cost: {:.8e}, Next Cost: {:.8e}, Gradient: {:.6e}",
+                    rho_val, cost_start, cost_next, grad_start[0]
                 );
-
-                // For highly non-linear functions, we also want to check that the gradient magnitude
-                // is meaningful (not too small)
+                
+                // Also check that the gradient magnitude is meaningful (not too small)
                 assert!(
-                    analytical_grad[0].abs() > 1e-5,
-                    "Gradient magnitude should be significant: {:.6}",
-                    analytical_grad[0]
+                    grad_start[0].abs() > 1e-5,
+                    "Gradient magnitude should be significant: {:.6e}",
+                    grad_start[0]
                 );
             }
         }
@@ -3575,117 +3529,50 @@ pub mod internal {
                     }
                 };
 
-                // --- 10. Compare the gradients ---
-                println!("Link function: {:?}", link_function);
-                println!("  Analytical gradient: {:.12}", analytical_grad[0]);
-                println!("  Numerical gradient:  {:.12}", numerical_grad);
-                println!(
-                    "  Absolute difference: {:.12}",
-                    (analytical_grad[0] - numerical_grad).abs()
-                );
+                // --- 10. VERIFY: Assert that the gradients match within a reasonable tolerance ---
+                let tolerance = 1e-4; // Appropriate tolerance for numerical vs. analytical comparison
                 let error_metric = compute_error_metric(analytical_grad[0], numerical_grad);
-                println!("  Error metric: {:.12}", error_metric);
-
-                // Check symmetry of finite differences
+                
+                assert!(
+                    error_metric < tolerance,
+                    "Gradient mismatch for {:?}.\n\
+                     Analytical: {:.8e}, Numerical: {:.8e}, Relative Error: {:.4}",
+                    link_function, analytical_grad[0], numerical_grad, error_metric
+                );
+                
+                // Check symmetry of finite differences to ensure the numerical approximation is valid
                 let h = adaptive_step_size(test_rho[0]);
-                if !check_difference_symmetry(&reml_state, &test_rho, 0, h, 1e-6) {
-                    println!(
-                        "  Warning: Finite differences not symmetric for {:?}",
-                        link_function
-                    );
-                }
-
-                // For highly non-linear surfaces, we need to verify that at least one direction of movement
-                // (either along the gradient or opposite to it) decreases the cost
-                let cost_start = match safe_compute_cost(&reml_state, &test_rho) {
-                    Some(c) => c,
-                    None => {
-                        println!(
-                            "Warning: Could not compute start cost for {:?}, skipping verification",
-                            link_function
-                        );
-                        return;
-                    }
-                };
-
-                // Try both directions with adaptive step size
-                let step_size = adaptive_step_size(test_rho[0]) * 0.1;
-                let rho_pos = &test_rho + step_size * &analytical_grad;
-                let rho_neg = &test_rho - step_size * &analytical_grad;
-
-                let cost_pos = match safe_compute_cost(&reml_state, &rho_pos) {
-                    Some(c) => c,
-                    None => {
-                        println!(
-                            "Warning: Could not compute positive step cost for {:?}, skipping verification",
-                            link_function
-                        );
-                        return;
-                    }
-                };
-
-                let cost_neg = match safe_compute_cost(&reml_state, &rho_neg) {
-                    Some(c) => c,
-                    None => {
-                        println!(
-                            "Warning: Could not compute negative step cost for {:?}, skipping verification",
-                            link_function
-                        );
-                        return;
-                    }
-                };
-
-                println!(
-                    "\n--- Verifying Gradient Properties for {:?} ---",
+                assert!(
+                    check_difference_symmetry(&reml_state, &test_rho, 0, h, 1e-6),
+                    "Finite differences are not symmetric for {:?} - function may be noisy or have discontinuities",
                     link_function
                 );
-                println!("Cost at start:      {:.12}", cost_start);
-                println!("Cost after +step:   {:.12}", cost_pos);
-                println!("Cost after -step:   {:.12}", cost_neg);
 
-                // At least one direction should decrease the cost
-                let min_cost = cost_pos.min(cost_neg);
-
+                // Also verify that taking a step in the negative gradient direction decreases the cost
+                let cost_start = safe_compute_cost(&reml_state, &test_rho)
+                    .expect("Cost calculation failed at start");
+                    
+                // Take a small step in the negative gradient direction
+                let step_size = 1e-7; // Small fixed step size for stability
+                let rho_next = &test_rho - step_size * &analytical_grad;
+                
+                let cost_next = safe_compute_cost(&reml_state, &rho_next)
+                    .expect("Cost calculation failed after step");
+                
                 assert!(
-                    min_cost < cost_start,
-                    "For {:?}, taking a step in either direction should decrease the cost. Start: {:.12}, Min: {:.12}",
-                    link_function,
-                    cost_start,
-                    min_cost
+                    cost_next < cost_start,
+                    "For {:?}, taking a step in the negative gradient direction should decrease the cost.\n\
+                     Start Cost: {:.8e}, Next Cost: {:.8e}",
+                    link_function, cost_start, cost_next
                 );
 
-                // Verify the gradient is significant
+                // Verify the gradient is significant and not near zero
                 assert!(
                     analytical_grad[0].abs() > 1e-6,
-                    "For {:?}, gradient magnitude should be significant: {:.12}",
+                    "For {:?}, gradient magnitude should be significant but was too small: {:.8e}",
                     link_function,
                     analytical_grad[0].abs()
                 );
-
-                // Use reasonable tolerance considering numerical challenges in REML
-                if analytical_grad[0].abs() > 1e-6 && numerical_grad.abs() > 1e-6 {
-                    // Log the error metric for debugging but only assert on extreme failures
-                    if error_metric > 2.0 {
-                        // Only fail on truly extreme discrepancies
-                        println!(
-                            "Warning: Large gradient error for {:?}: analytical={:.6}, numerical={:.6}, error={:.2e}",
-                            link_function, analytical_grad[0], numerical_grad, error_metric
-                        );
-                        println!("This may indicate numerical challenges in the cost function");
-                    }
-
-                    // Only assert on completely unreasonable values
-                    assert!(
-                        error_metric < 10.0, // Very loose bound to catch only severe issues
-                        "Extreme gradient error for {:?}: analytical={:.6}, numerical={:.6}, error={:.2e}",
-                        link_function,
-                        analytical_grad[0],
-                        numerical_grad,
-                        error_metric
-                    );
-                }
-
-                println!("✓ Gradient verification successful for {:?}", link_function);
             };
 
             // --- 11. Test both link functions ---
@@ -4081,18 +3968,32 @@ pub mod internal {
                     .compute_gradient(&rho_start)
                     .unwrap_or_else(|e| panic!("Gradient failed for {:?}: {:?}", link_function, e));
 
-                // 5. Assert the gradient is significant (non-zero)
+                // VERIFY: Assert that the gradient is negative, which means the cost decreases as rho increases
+                // This indicates the optimizer will correctly push towards more smoothing
                 let grad_pgs = grad[0];
-                println!(
-                    "Gradient for {:?} with near-zero penalty: {:.6}",
-                    link_function, grad_pgs
-                );
-
+                
                 assert!(
-                    grad_pgs.abs() > 1.0, // Use a threshold to ensure it's significantly non-zero
-                    "For {:?}, gradient at rho=-10 should be large and non-zero, but was {:.6}",
-                    link_function,
-                    grad_pgs
+                    grad_pgs < -0.1, // Check that it's not just negative, but meaningfully so
+                    "For an overly flexible model, the gradient should be strongly negative, indicating a need for more smoothing.\n\
+                     Got: {:.6e} for {:?} link function",
+                    grad_pgs, link_function
+                );
+                
+                // Also verify that taking a step in the direction of increasing rho (more smoothing)
+                // actually decreases the cost function value
+                let step_size = 0.1; // A small but meaningful step size
+                let rho_more_smoothing = &rho_start + Array1::from_elem(new_layout.num_penalties, step_size);
+                
+                let cost_start = safe_compute_cost(&reml_state, &rho_start)
+                    .expect("Cost calculation failed at start point");
+                let cost_more_smoothing = safe_compute_cost(&reml_state, &rho_more_smoothing)
+                    .expect("Cost calculation failed after step");
+                    
+                assert!(
+                    cost_more_smoothing < cost_start,
+                    "For an overly flexible model with {:?} link, increasing smoothing should decrease cost.\n\
+                     Start (rho={:.1}): {:.6e}, After more smoothing (rho={:.1}): {:.6e}",
+                    link_function, rho_start[0], cost_start, rho_more_smoothing[0], cost_more_smoothing
                 );
             };
 
@@ -4402,70 +4303,47 @@ pub mod internal {
                 }
             };
 
-            // 1. What does compute_cost return?
-            let cost_0 = compute_cost_safe(&rho_test);
-            println!("Cost at test point: {:.6}", cost_0);
+            // --- 1. Calculate the cost at two very different smoothing levels ---
+            
+            // A low smoothing level (high flexibility)
+            let rho_low_smoothing = Array1::from_elem(layout_test.num_penalties, -5.0); // lambda ~ 0.007
+            let cost_low_smoothing = compute_cost_safe(&rho_low_smoothing);
 
-            // 2. What does compute_gradient return?
-            let grad_0 = compute_gradient_safe(&rho_test);
-            println!("Gradient at test point: {:.6}", grad_0[0]);
-
-            // 3. Manual perturbation: what happens when we increase rho slightly?
-            let h = 1e-6;
-            let rho_plus = &rho_test + h;
-            let cost_plus = compute_cost_safe(&rho_plus);
-
-            let rho_minus = &rho_test - h;
-            let cost_minus = compute_cost_safe(&rho_minus);
-
-            println!("Cost at rho+h: {:.10}", cost_plus);
-            println!("Cost at rho-h: {:.10}", cost_minus);
-
-            let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
-            println!("Numerical gradient: {:.6}", numerical_grad);
-
-            // 4. Forward difference for verification
-            let forward_grad = (cost_plus - cost_0) / h;
-            println!("Forward difference: {:.6}", forward_grad);
-
-            // 5. What direction should we step to decrease cost?
-            println!("\n=== STEP DIRECTION ANALYSIS ===");
-
-            // If gradient is positive, we should step negative to decrease cost
-            // If gradient is negative, we should step positive to decrease cost
-            let predicted_direction = if grad_0[0] > 0.0 {
-                "negative"
-            } else {
-                "positive"
-            };
-            let actual_direction = if cost_plus < cost_0 {
-                "positive"
-            } else {
-                "negative"
-            };
-
-            println!("Analytical gradient: {:.6}", grad_0[0]);
-            println!(
-                "Predicted step direction to decrease cost: {}",
-                predicted_direction
+            // A high smoothing level (low flexibility, approaching a linear fit)
+            let rho_high_smoothing = Array1::from_elem(layout_test.num_penalties, 5.0); // lambda ~ 148
+            let cost_high_smoothing = compute_cost_safe(&rho_high_smoothing);
+            
+            // --- 2. Calculate gradient at a mid point ---
+            let rho_mid = Array1::from_elem(layout_test.num_penalties, 0.0); // lambda = 1.0
+            let grad_mid = compute_gradient_safe(&rho_mid);
+            
+            // --- 3. VERIFY: Assert that the costs are different ---
+            // This confirms that the smoothing parameter has a non-zero effect on the model's fit
+            let difference = (cost_low_smoothing - cost_high_smoothing).abs();
+            assert!(
+                difference > 1e-6,
+                "The cost function should be responsive to smoothing parameter changes, but was nearly flat.\n\
+                 Cost at low smoothing (rho=-5): {:.6}\n\
+                 Cost at high smoothing (rho=5): {:.6}\n\
+                 Difference: {:.6e}",
+                cost_low_smoothing, cost_high_smoothing, difference
             );
-            println!("Actual direction that decreases cost: {}", actual_direction);
-            println!("Do they match? {}", predicted_direction == actual_direction);
-
-            // 6. Test the fundamental descent property
-            println!("\n=== DESCENT PROPERTY TEST ===");
+            
+            // --- 4. VERIFY: Assert that taking a step in the negative gradient direction decreases cost ---
+            // Test the fundamental descent property
             let step_size = 1e-5;
-            let step_direction = -grad_0[0]; // Standard gradient descent direction
-            let rho_step = &rho_test + step_size * step_direction;
+            let rho_step = &rho_mid - step_size * &grad_mid; // Standard gradient descent step
+            let cost_mid = compute_cost_safe(&rho_mid);
             let cost_step = compute_cost_safe(&rho_step);
-
-            println!("Original cost: {:.10}", cost_0);
-            println!("Cost after -gradient step: {:.10}", cost_step);
-            println!("Change in cost: {:.2e}", cost_step - cost_0);
-            println!("Did cost decrease? {}", cost_step < cost_0);
-
-            // Add a minimal assertion to ensure the test has some validity check
-            assert!(cost_0.is_finite(), "Initial cost must be finite");
+            
+            assert!(
+                cost_step < cost_mid,
+                "Taking a small step in the negative gradient direction should decrease the cost.\n\
+                 Original cost: {:.10}\n\
+                 Cost after gradient descent step: {:.10}\n\
+                 Change in cost: {:.2e}",
+                cost_mid, cost_step, cost_step - cost_mid
+            );
         }
 
         #[test]
@@ -4521,32 +4399,52 @@ pub mod internal {
                 &config,
             );
 
-            println!("Data setup:");
-            println!("  n_samples: {}", n_samples);
-            println!("  y: {:?}", data.y);
-            println!(
-                "  X matrix shape: {}x{}",
-                x_matrix.nrows(),
-                x_matrix.ncols()
-            );
-            println!("  Number of penalties: {}", layout_test.num_penalties);
-
-            // Test at different penalty levels
+            // --- VERIFY: Test that the cost function responds appropriately to different smoothing levels ---
+            
+            // Calculate cost at different smoothing levels
+            let mut costs = Vec::new();
             for rho in [-2.0f64, -1.0, 0.0, 1.0, 2.0] {
                 let rho_array = Array1::from_elem(1, rho);
-                let lambda = rho.exp();
-
+                
                 match reml_state.compute_cost(&rho_array) {
-                    Ok(cost) => {
-                        println!("rho={:.1}, lambda={:.3}, cost={:.6}", rho, lambda, cost);
-                    }
-                    Err(e) => {
-                        println!("rho={:.1}, lambda={:.3}, ERROR: {:?}", rho, lambda, e);
-                    }
+                    Ok(cost) => costs.push((rho, cost)),
+                    Err(e) => panic!("Cost calculation failed at rho={}: {:?}", rho, e),
                 }
             }
-
-            // No assertions - purely investigative
+            
+            // Verify that costs differ significantly between different smoothing levels
+            let &(_, lowest_cost) = costs.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .expect("Should have at least one valid cost");
+            let &(_, highest_cost) = costs.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .expect("Should have at least one valid cost");
+                
+            assert!(
+                (highest_cost - lowest_cost).abs() > 1e-6,
+                "Cost function should vary meaningfully with different smoothing levels.\n\
+                 Lowest cost: {:.6e}, Highest cost: {:.6e}, Difference: {:.6e}",
+                lowest_cost, highest_cost, (highest_cost - lowest_cost).abs()
+            );
+            
+            // Verify that the cost function produces a reasonable curve (not chaotic)
+            // Costs should be roughly monotonic or have at most one minimum/maximum
+            // This checks that adjacent smoothing levels have similar costs
+            for i in 1..costs.len() {
+                let (rho1, cost1) = costs[i-1];
+                let (rho2, cost2) = costs[i];
+                
+                // Check that the cost doesn't jump wildly between adjacent smoothing levels
+                let delta_rho = (rho2 - rho1).abs();
+                let delta_cost = (cost2 - cost1).abs();
+                
+                assert!(
+                    delta_cost < 100.0 * delta_rho, // Allow reasonable change but not extreme jumps
+                    "Cost function should change smoothly with smoothing parameter.\n\
+                     At rho={:.1}, cost={:.6e}\n\
+                     At rho={:.1}, cost={:.6e}\n\
+                     Cost jumped by {:.6e} for a rho change of only {:.1}",
+                    rho1, cost1, rho2, cost2, delta_cost, delta_rho
+                );
+            }
         }
 
         #[test]
@@ -4602,30 +4500,44 @@ pub mod internal {
                 &config,
             );
 
-            println!("Testing gradient-cost relationship at different points:");
-
-            for rho_val in [-1.0, 0.0, 1.0] {
+            // Test points at different smoothing levels
+            let test_points = [-1.0, 0.0, 1.0];
+            let mut all_tests_passed = true;
+            let tolerance = 1e-4;
+            
+            for &rho_val in &test_points {
                 let rho = Array1::from_elem(1, rho_val);
 
+                // Calculate analytical gradient at this point
                 let cost_0 = reml_state.compute_cost(&rho).unwrap();
-                let grad_0 = reml_state.compute_gradient(&rho).unwrap();
+                let analytical_grad = reml_state.compute_gradient(&rho).unwrap()[0];
 
-                // Small positive step
-                let h = 1e-6;
+                // Calculate numerical gradient using central difference
+                let h = 1e-6; // Small step size for numerical approximation
                 let rho_plus = &rho + h;
+                let rho_minus = &rho - h;
                 let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
-
-                let slope = (cost_plus - cost_0) / h;
-
-                println!(
-                    "rho={:.1}: cost={:.6}, gradient={:.6}, actual_slope={:.6}",
-                    rho_val, cost_0, grad_0[0], slope
-                );
-                println!(
-                    "  Gradient matches slope? {}",
-                    (grad_0[0] - slope).abs() < 1e-4
-                );
+                let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
+                let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
+                
+                // Calculate error between analytical and numerical gradients
+                let error_metric = compute_error_metric(analytical_grad, numerical_grad);
+                let test_passed = error_metric < tolerance;
+                all_tests_passed = all_tests_passed && test_passed;
+                
+                println!("Test at rho={:.1}:", rho_val);
+                println!("  Cost: {:.6e}", cost_0);
+                println!("  Analytical gradient: {:.6e}", analytical_grad);
+                println!("  Numerical gradient:  {:.6e}", numerical_grad);
+                println!("  Error: {:.6e}", error_metric);
+                println!("  Test passed: {}", test_passed);
             }
+            
+            // Final assertion to ensure test actually fails if any comparison failed
+            assert!(
+                all_tests_passed,
+                "The analytical gradient should match the numerical approximation at all test points."
+            );
         }
 
         #[test]
