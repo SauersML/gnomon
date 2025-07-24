@@ -195,17 +195,35 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
-    // Use accessor views to avoid direct field access of private fields
-    let final_fit = pirls::fit_model_for_fixed_rho(
+
+    // 1. Perform the stable reparameterization for the FINAL optimal lambdas.
+    //    We need the results (especially the transformation matrix Qs) *before* the fit.
+    let reparam_result = stable_reparameterization(
+        reml_state.s_list_ref(),
+        final_lambda.as_slice().unwrap(),
+        &layout
+    )?;
+
+    // 2. Transform the design matrix X into the stable basis using Qs.
+    let x_transformed = reml_state.x().dot(&reparam_result.qs);
+
+    // 3. Call the STABLE P-IRLS solver with the transformed matrices.
+    let final_fit_transformed = pirls::fit_model_for_fixed_rho_stable(
         final_rho.view(),
-        reml_state.x(), // Use accessor method instead of direct field access
+        x_transformed.view(),         // Use transformed X
         reml_state.y(),
-        reml_state.s_list_ref(), // Use accessor method instead of direct field access
+        &reparam_result.s_transformed, // Pass transformed S
         &layout,
         config,
     )?;
 
-    let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_fit.beta, &layout)?;
+    // 4. IMPORTANT: The returned beta is in the transformed basis.
+    //    We must transform it back to the original basis for interpretation and storage.
+    //    beta_original = Qs * beta_transformed
+    let final_beta_original = reparam_result.qs.dot(&final_fit_transformed.beta);
+
+    // 5. Map the CORRECTED coefficients from the original basis.
+    let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
@@ -215,6 +233,7 @@ pub fn train_model(
         config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
+        transformation_matrix: Some(reparam_result.qs),
     })
 }
 
@@ -359,12 +378,26 @@ pub mod internal {
             }
 
             println!("  -> Solving inner P-IRLS loop for this evaluation...");
-
-            let pirls_result = pirls::fit_model_for_fixed_rho(
-                rho.view(),
-                self.x,
-                self.y,
+            
+            // Convert rho to lambda
+            let lambdas = rho.mapv(f64::exp);
+            
+            // 1. First perform stable reparameterization
+            let reparam_result = stable_reparameterization(
                 &self.s_list,
+                lambdas.as_slice().unwrap(),
+                self.layout
+            )?;
+            
+            // 2. Transform design matrix to the stable basis
+            let x_transformed = self.x.dot(&reparam_result.qs);
+            
+            // 3. Run P-IRLS with transformed matrices
+            let pirls_result = pirls::fit_model_for_fixed_rho_stable(
+                rho.view(),
+                x_transformed.view(),
+                self.y,
+                &reparam_result.s_transformed,
                 self.layout,
                 self.config,
             );
@@ -859,53 +892,44 @@ pub mod internal {
             p: &Array1<f64>,
             pirls_result: &PirlsResult,
         ) -> Result<Array1<f64>, EstimationError> {
-            // If penalized Hessian is indefinite, check if it's due to numerical noise or a real issue
-            if pirls_result
-                .penalized_hessian
-                .cholesky(UPLO::Lower)
-                .is_err()
-            {
-                // Cholesky failed, check eigenvalues to determine severity
-                let eigenvals = pirls_result
-                    .penalized_hessian
-                    .eigvals()
-                    .map_err(EstimationError::EigendecompositionFailed)?;
-                let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+            // --- Proactive Hessian Stabilization ---
+            // Create a mutable copy of the Hessian to work with.
+            let mut hessian = pirls_result.penalized_hessian.clone();
 
-                const NUMERICAL_TOLERANCE: f64 = -1e-8; // Threshold for numerical noise vs. real indefiniteness
-
-                if min_eig < NUMERICAL_TOLERANCE {
-                    // True indefiniteness detected - a serious problem requiring retreat
-                    log::warn!(
-                        "Truly indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
-                        min_eig
-                    );
-                    // For better convergence behavior when costs are infinite,
-                    // use the original parameter values to generate a more informed retreat direction
-                    // This helps guide the optimizer away from problematic regions more effectively
-                    let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
-                    return Ok(retreat_grad);
-                } else if min_eig < 0.0 {
-                    // Minor numerical noise that can be stabilized
-                    log::debug!(
-                        "Slightly negative eigenvalue detected (min_eig={:.2e}); stabilizing Hessian for gradient calculation.",
-                        min_eig
-                    );
-                    // Create a stabilized copy of the Hessian
-                    let mut stable_hessian = pirls_result.penalized_hessian.clone();
-                    ensure_positive_definite(&mut stable_hessian);
-
-                    // Use the stabilized Hessian for subsequent calculations
-                    // We'll replace the original Hessian with the stabilized one in a clone of pirls_result
-                    let mut stable_pirls = pirls_result.clone();
-                    stable_pirls.penalized_hessian = stable_hessian;
-
-                    // Continue with the stabilized Hessian
-                    return self.compute_gradient_with_pirls_result(p, &stable_pirls);
-                }
-                // If min_eig >= 0 but Cholesky failed, it might be due to other numerical issues
-                // We'll proceed with the original matrix as it's technically positive semi-definite
+            // Proactively check and stabilize the Hessian using the existing helper function.
+            // This function returns true if any adjustments were made.
+            let was_adjusted = ensure_positive_definite(&mut hessian);
+            if was_adjusted {
+                log::warn!(
+                    "Hessian was stabilized before gradient calculation to ensure positive-definiteness."
+                );
             }
+            // All subsequent code will now use the GUARANTEED STABLE `hessian` matrix.
+
+            // If the Hessian needed extreme adjustments, this suggests a problematic region
+            // Let's check if we should return a retreat gradient instead
+            if was_adjusted {
+                // Get the minimum eigenvalue to assess how problematic the original matrix was
+                if let Ok(eigenvals) = pirls_result.penalized_hessian.eigvals() {
+                    let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                    
+                    const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
+                    if min_eig < SEVERE_INDEFINITENESS {
+                        // The matrix was severely indefinite - signal a need to retreat
+                        log::warn!(
+                            "Severely indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
+                            min_eig
+                        );
+                        // Generate an informed retreat direction based on current parameters
+                        let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                        return Ok(retreat_grad);
+                    }
+                }
+            }
+            
+            // Use the stabilized Hessian for subsequent calculations
+            let mut stable_pirls = pirls_result.clone();
+            stable_pirls.penalized_hessian = hessian;
 
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
@@ -916,7 +940,7 @@ pub mod internal {
             // the formula directly computes the cost gradient.
             let mut cost_gradient = Array1::zeros(lambdas.len());
 
-            let beta = &pirls_result.beta;
+            let beta = &stable_pirls.beta;
             let n = self.y.len() as f64;
             let p_coeffs = beta.len() as f64;
 
@@ -932,7 +956,7 @@ pub mod internal {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
                     // Calculate scale parameter
-                    let rss = pirls_result.deviance;
+                    let rss = stable_pirls.deviance;
                     let s_lambda = &reparam_result.s_transformed;
                     let penalty = beta.dot(&s_lambda.dot(beta));
                     let dp = rss + penalty; // Penalized deviance
@@ -942,7 +966,7 @@ pub mod internal {
                     for j in 0..s_lambda.ncols() {
                         let s_col = s_lambda.column(j);
                         if let Ok(h_inv_col) = internal::robust_solve(
-                            &pirls_result.penalized_hessian,
+                            &stable_pirls.penalized_hessian, // Use stabilized Hessian
                             &s_col.to_owned(),
                         ) {
                             trace_h_inv_s_lambda += h_inv_col[j];
@@ -980,7 +1004,7 @@ pub mod internal {
                         for j in 0..reparam_result.rs[k].ncols() {
                             let s_k_col = reparam_result.rs[k].column(j);
                             if let Ok(h_inv_col) = internal::robust_solve(
-                                &pirls_result.penalized_hessian,
+                                &stable_pirls.penalized_hessian, // Use stabilized Hessian
                                 &s_k_col.to_owned(),
                             ) {
                                 trace_h_inv_s_k += h_inv_col[j];
@@ -1009,7 +1033,7 @@ pub mod internal {
                     log::debug!("Pre-computing for gradient calculation (LAML)...");
 
                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
-                    let solver = RobustSolver::new(&pirls_result.penalized_hessian)?;
+                    let solver = RobustSolver::new(&stable_pirls.penalized_hessian)?; // Use stabilized Hessian
 
                     // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
                     let rows: Vec<_> = self.x.axis_iter(Axis(0)).collect();
@@ -1025,7 +1049,7 @@ pub mod internal {
                     let hat_diag = Array1::from_vec(hat_diag_par);
 
                     // 2. Compute dW/dη, which depends on the link function.
-                    let eta = self.x.dot(beta);
+                    let eta = self.x.dot(beta); // beta is already from stable_pirls
                     let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
                         self.y,
                         &eta,
@@ -2784,6 +2808,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 config: model_config,
                 coefficients: coeffs,
                 lambdas: fixed_rho.mapv(f64::exp).to_vec(),
+                transformation_matrix: None,
             };
 
             // Create test points at different ends of the predictor range.
