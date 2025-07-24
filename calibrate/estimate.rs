@@ -606,9 +606,9 @@ pub mod internal {
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
                     let phi = 1.0; // Logit family typically has dispersion parameter = 1
 
-                    // Compute null space dimension: p - rank(S_total)
-                    let s_total: Array2<f64> = self
-                        .s_list
+                    // Compute null space dimension using transformed penalties
+                    let s_total: Array2<f64> = reparam_result
+                        .rs
                         .iter()
                         .zip(lambdas.iter())
                         .map(|(s, &lambda)| s * lambda)
@@ -910,10 +910,6 @@ pub mod internal {
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
 
-            // Use stable reparameterization for consistent computation
-            let reparam_result =
-                stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
-
             // --- Create the gradient vector ---
             // This variable holds the gradient of the COST function (-V_REML or -V_LAML),
             // which the optimizer minimizes. Due to sign conventions in the term calculations,
@@ -926,6 +922,11 @@ pub mod internal {
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
+            
+            // Use stable reparameterization for consistent computation across both branches
+            let reparam_result =
+                stable_reparameterization(&self.s_list, lambdas.as_slice().unwrap(), self.layout)?;
+                
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
@@ -955,7 +956,9 @@ pub mod internal {
                         // We'll calculate s_k_beta for all cases, as it's needed for both paths
                         // For Identity link, this is all we need due to envelope theorem
                         // For other links, we'll use it to compute dβ/dρ_k
-                        let s_k_beta = self.s_list[k].dot(beta);
+                        
+                        // Use transformed penalty matrix for consistent gradient calculation
+                        let s_k_beta = reparam_result.rs[k].dot(beta);
 
                         // Term 1: Derivative of the penalized deviance component: ∂/∂ρₖ [ D_p / (2φ) ]
                         // D_p = ||y - Xβ̂||² + β̂ᵀS(ρ)β̂ is the penalized deviance
@@ -974,8 +977,8 @@ pub mod internal {
                         // ½ · tr(H⁻¹ · ∂H/∂ρₖ) = ½ · tr(H⁻¹ · λₖSₖ) = ½ · λₖ · tr(H⁻¹Sₖ)
                         // Computing tr(H⁻¹Sₖ) efficiently using column-by-column approach
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..self.s_list[k].ncols() {
-                            let s_k_col = self.s_list[k].column(j);
+                        for j in 0..reparam_result.rs[k].ncols() {
+                            let s_k_col = reparam_result.rs[k].column(j);
                             if let Ok(h_inv_col) = internal::robust_solve(
                                 &pirls_result.penalized_hessian,
                                 &s_k_col.to_owned(),
@@ -1037,7 +1040,8 @@ pub mod internal {
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
-                        let s_k_beta = self.s_list[k].dot(beta);
+                        // Use transformed penalty matrix for consistency
+                        let s_k_beta = reparam_result.rs[k].dot(beta);
                         let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
@@ -1051,8 +1055,8 @@ pub mod internal {
 
                         // d. Calculate tr(H⁻¹ * S_k)
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..self.s_list[k].ncols() {
-                            let s_k_col = self.s_list[k].column(j);
+                        for j in 0..reparam_result.rs[k].ncols() {
+                            let s_k_col = reparam_result.rs[k].column(j);
                             let h_inv_col = solver.solve(&s_k_col.to_owned())?;
                             trace_h_inv_s_k += h_inv_col[j];
                         }
