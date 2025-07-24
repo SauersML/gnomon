@@ -828,10 +828,10 @@ pub mod internal {
         //          involves the derivative of W.  The direct part still contributes −½ λₖ β̂ᵀ Sₖ β̂.
         //          The two quadratic terms are equal in magnitude and opposite in sign, so they cancel
         //          exactly.  After cancellation the gradient reduces to
-        //            0.5 λₖ [ tr(S_λ⁺ Sₖ) − tr(H_p⁻¹ Sₖ) ]  +  0.5 tr(H_p⁻¹ Xᵀ ∂W/∂λₖ X).
+        //            0.5 λₖ [ tr(S_λ⁺ Sₖ) − tr(H_p⁻¹ Sₖ) ]  -  0.5 tr(H_p⁻¹ Xᵀ ∂W/∂λₖ X).
         //          No β̂ᵀ Sₖ β̂ term remains.  The non-Gaussian branch therefore leaves the beta_term code
         //          commented out and assembles
-        //          gradient[k] = 0.5 * λₖ * (s_inv_trace_term − trace_term) + 0.5 * weight_deriv_term.
+        //          gradient[k] = 0.5 * λₖ * (s_inv_trace_term − trace_term) - 0.5 * weight_deriv_term.
         //
         // 3.  The sign of ∂β̂/∂λₖ matters.  From the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
