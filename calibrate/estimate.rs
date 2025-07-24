@@ -939,28 +939,51 @@ pub mod internal {
                     for k in 0..lambdas.len() {
                         let s_k_full = &self.s_list[k];
 
-                        // Calculate dβ/dρ_k = -λ_k(H + Sλ)^(-1)S_k*β (Wood 2011, Appendix C)
+                        // We'll calculate s_k_beta for all cases, as it's needed for both paths
+                        // For Identity link, this is all we need due to envelope theorem
+                        // For other links, we'll use it to compute dβ/dρ_k
                         let s_k_beta = s_k_full.dot(beta);
-                        let dbeta_drho_k = match internal::robust_solve(
-                            &pirls_result.penalized_hessian,
-                            &s_k_beta,
-                        ) {
-                            Ok(solved) => -lambdas[k] * solved,
-                            Err(_) => {
-                                log::warn!("Failed to solve for dβ/dρ in gradient computation");
-                                Array1::zeros(beta.len())
-                            }
-                        };
 
                         // Term 1: D1/(2*scale) - Complete derivative of penalized deviance
                         // D1 includes both direct β'S_k*β term and implicit β dependence
                         // For Gaussian: d(D_p)/dρ_k = λ_k*β'S_k*β + 2*(y-Xβ)'*X*(dβ/dρ_k) + 2*β'*S_λ*(dβ/dρ_k)
-                        let fitted = self.x.dot(beta);
-                        let residuals = &self.y - &fitted;
+                        // For Identity link we don't need fitted values or residuals
+                        // For other links, we'll calculate them in the conditional branch
+                        // For REML/Gaussian case with Identity link
+                        // By the envelope theorem, the indirect derivative components
+                        // (residual_term and penalty_term) sum to zero at the optimum β̂.
+                        // We only need the direct partial derivative: λ_k * β'S_kβ
                         let beta_s_k_beta = lambdas[k] * beta.dot(&s_k_beta);
-                        let residual_term = 2.0 * residuals.dot(&self.x.dot(&dbeta_drho_k));
-                        let penalty_term = 2.0 * beta.dot(&s_lambda.dot(&dbeta_drho_k));
-                        let d1 = beta_s_k_beta + residual_term + penalty_term;
+                        
+                        // Calculate the full derivative for non-Gaussian models
+                        let d1 = if self.config.link_function == LinkFunction::Identity {
+                            // For Gaussian/Identity, use only the direct derivative
+                            beta_s_k_beta // Direct derivative only
+                        } else {
+                            // For non-Gaussian models (Logit, etc.), compute the full derivative
+                            // including both direct and indirect terms
+                            
+                            // Calculate dβ/dρ_k = -λ_k(H + Sλ)^(-1)S_k*β (Wood 2011, Appendix C)
+                            let dbeta_drho_k = match internal::robust_solve(
+                                &pirls_result.penalized_hessian,
+                                &s_k_beta,
+                            ) {
+                                Ok(solved) => -lambdas[k] * solved,
+                                Err(_) => {
+                                    log::warn!("Failed to solve for dβ/dρ in gradient computation");
+                                    Array1::zeros(beta.len())
+                                }
+                            };
+                            
+                            // Calculate the full derivative with all terms
+                            // Including direct beta_s_k_beta term and indirect terms
+                            let fitted = self.x.dot(beta);
+                            let residuals = &self.y - &fitted;
+                            let residual_term = 2.0 * residuals.dot(&self.x.dot(&dbeta_drho_k));
+                            let penalty_term = 2.0 * beta.dot(&s_lambda.dot(&dbeta_drho_k));
+                            
+                            beta_s_k_beta + residual_term + penalty_term
+                        };
                         let term1 = d1 / (2.0 * scale);
 
                         // Term 2: trA1/2 - Derivative of log|H| (Wood 2011, Section 3.5.1)
@@ -2540,6 +2563,7 @@ pub mod internal {
 
             // Create minimal config for stable testing
             let mut config = create_test_config();
+            // Use default LinkFunction::Logit as per original test
             config.pgs_basis_config.num_knots = 1; // Absolute minimum basis size
             config.pc_basis_configs[0].num_knots = 1; // Absolute minimum basis size
 
@@ -4297,6 +4321,8 @@ pub mod internal {
             let pcs = pc1.to_shape((n_samples, 1)).unwrap().to_owned();
             // Use the robust helper function to generate non-separable binary outcomes
             // The key is using a moderate `steepness` and a high `noise_level` to ensure class overlap.
+            // Use the robust helper function to generate non-separable binary outcomes
+            // The key is using a moderate `steepness` and a high `noise_level` to ensure class overlap.
             let y = generate_realistic_binary_data(
                 &p,      // Use the PGS as the main predictor for simplicity
                 2.0,     // A gentle slope for the logistic curve
@@ -4306,7 +4332,7 @@ pub mod internal {
             );
             let data = TrainingData { y, p, pcs };
             let mut config = create_test_config();
-            config.link_function = LinkFunction::Logit;
+            config.link_function = LinkFunction::Logit; // Original test used Logit
             config.pgs_basis_config.num_knots = 5;
             config.pc_names = vec!["PC1".to_string()];
             config.pc_basis_configs = vec![BasisConfig {
