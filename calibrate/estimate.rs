@@ -145,23 +145,26 @@ pub fn train_model(
             eprintln!(
                 "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
             );
-            
+
             // Get the gradient at last_solution to ensure we're near a stationary point
             let gradient_norm = match reml_state.compute_gradient(&last_solution.final_point) {
                 Ok(grad) => grad.dot(&grad).sqrt(),
                 Err(_) => f64::INFINITY,
             };
-            
+
             // Only accept the solution if gradient norm is small enough
             const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1e-3;
             if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "Line-search failed far from a stationary point. Gradient norm: {:.2e}", 
+                    "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
                     gradient_norm
                 )));
             }
-            
-            eprintln!("[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).", gradient_norm);
+
+            eprintln!(
+                "[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).",
+                gradient_norm
+            );
             *last_solution
         }
         // Rationale: This is our safety net. Any other error from the optimizer
@@ -285,25 +288,6 @@ pub mod internal {
                         .map_err(EstimationError::LinearSystemSolveFailed)
                 }
                 RobustSolver::Fallback(stored_matrix) => robust_solve(stored_matrix, rhs),
-            }
-        }
-
-        /// Solve triangular system (only available for Cholesky)
-        fn solve_triangular(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-            match self {
-                RobustSolver::Cholesky(stored_matrix) => {
-                    // Use Cholesky decomposition for triangular solving
-                    let chol = stored_matrix
-                        .cholesky(UPLO::Lower)
-                        .map_err(EstimationError::LinearSystemSolveFailed)?;
-                    chol.solve_triangular(UPLO::Lower, Diag::NonUnit, rhs)
-                        .map_err(EstimationError::LinearSystemSolveFailed)
-                }
-                RobustSolver::Fallback(stored_matrix) => {
-                    // For fallback, use full robust solve
-                    log::debug!("Fallback: using robust_solve instead of triangular solve");
-                    robust_solve(stored_matrix, rhs)
-                }
             }
         }
     }
@@ -842,11 +826,14 @@ pub mod internal {
             let pirls_result = self.execute_pirls_if_needed(p)?;
             self.compute_gradient_with_pirls_result(p, &pirls_result)
         }
-        
+
         /// Helper function that computes gradient using an existing PIRLS result
         /// This allows reusing the same logic with a stabilized Hessian when needed
-        fn compute_gradient_with_pirls_result(&self, p: &Array1<f64>, pirls_result: &PirlsResult) -> Result<Array1<f64>, EstimationError> {
-
+        fn compute_gradient_with_pirls_result(
+            &self,
+            p: &Array1<f64>,
+            pirls_result: &PirlsResult,
+        ) -> Result<Array1<f64>, EstimationError> {
             // If penalized Hessian is indefinite, check if it's due to numerical noise or a real issue
             if pirls_result
                 .penalized_hessian
@@ -859,7 +846,7 @@ pub mod internal {
                     .eigvals()
                     .map_err(EstimationError::EigendecompositionFailed)?;
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
-                
+
                 const NUMERICAL_TOLERANCE: f64 = -1e-8; // Threshold for numerical noise vs. real indefiniteness
 
                 if min_eig < NUMERICAL_TOLERANCE {
@@ -882,12 +869,12 @@ pub mod internal {
                     // Create a stabilized copy of the Hessian
                     let mut stable_hessian = pirls_result.penalized_hessian.clone();
                     ensure_positive_definite(&mut stable_hessian);
-                    
+
                     // Use the stabilized Hessian for subsequent calculations
                     // We'll replace the original Hessian with the stabilized one in a clone of pirls_result
                     let mut stable_pirls = pirls_result.clone();
                     stable_pirls.penalized_hessian = stable_hessian;
-                    
+
                     // Continue with the stabilized Hessian
                     return self.compute_gradient_with_pirls_result(p, &stable_pirls);
                 }
@@ -940,7 +927,6 @@ pub mod internal {
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
-
                         // We'll calculate s_k_beta for all cases, as it's needed for both paths
                         // For Identity link, this is all we need due to envelope theorem
                         // For other links, we'll use it to compute dβ/dρ_k
@@ -956,7 +942,7 @@ pub mod internal {
                         // (residual_term and penalty_term) sum to zero at the optimum β̂.
                         // We only need the direct partial derivative: λ_k * β'S_kβ
                         let beta_s_k_beta = lambdas[k] * beta.dot(&s_k_beta);
-                        
+
                         // Calculate the full derivative for non-Gaussian models
                         // For REML/Gaussian case with Identity link
                         // By the envelope theorem, the indirect derivative components
@@ -990,53 +976,53 @@ pub mod internal {
                 }
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
-                    // For LAML, implement complete weight derivative calculation
-
-                    log::debug!("Pre-computing for gradient calculation...");
-                    let h_chol_start = std::time::Instant::now();
+                    log::debug!("Pre-computing for gradient calculation (LAML)...");
 
                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
-                    // 1. Create a robust solver for the penalized Hessian H = (X'WX + S).
-                    //    Try Cholesky first (fastest), then fall back to LU if needed.
                     let solver = RobustSolver::new(&pirls_result.penalized_hessian)?;
 
-                    log::debug!(
-                        "Cholesky decomp took: {:.3}ms",
-                        h_chol_start.elapsed().as_secs_f64() * 1000.0
-                    );
-                    let hat_diag_start = std::time::Instant::now();
-
-                    // 2. Compute the diagonal of the "hat matrix" X * H⁻¹ * Xᵀ. This is the expensive part.
-                    //    We do it efficiently and IN PARALLEL without forming H⁻¹ explicitly.
-                    //    For each row x_i of X, we solve the system and compute ||solution||².
-                    //    Collect rows first, then use rayon for parallel processing.
+                    // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
                     let rows: Vec<_> = self.x.axis_iter(Axis(0)).collect();
-                    rows
-                        .into_par_iter() // <--- Parallel iteration using rayon
+                    let hat_diag_par: Vec<f64> = rows
+                        .into_par_iter()
                         .map(|row| -> Result<f64, EstimationError> {
-                            // For each row x_i of X, solve the triangular system if possible
-                            let c_i = solver.solve_triangular(&row.to_owned())?;
-                            // The diagonal element is ||c_i||²
-                            Ok(c_i.dot(&c_i))
+                            // Solve H c_i = x_iᵀ to get c_i = H⁻¹ x_iᵀ
+                            let c_i = solver.solve(&row.to_owned())?;
+                            // The diagonal element is x_i * c_i = x_i H⁻¹ x_iᵀ
+                            Ok(row.dot(&c_i))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                    let hat_diag = Array1::from_vec(hat_diag_par);
 
-                    log::debug!(
-                        "Hat matrix diagonal took: {:.3}ms",
-                        hat_diag_start.elapsed().as_secs_f64() * 1000.0
+                    // 2. Compute dW/dη, which depends on the link function.
+                    let eta = self.x.dot(beta);
+                    let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
+                        self.y,
+                        &eta,
+                        self.config.link_function,
                     );
+                    let dw_deta = match self.config.link_function {
+                        LinkFunction::Logit => &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu),
+                        // Fallback for Identity, though this branch shouldn't be taken for Identity link
+                        LinkFunction::Identity => Array1::zeros(self.y.len()),
+                    };
 
-                    // --- Now, loop through the penalties (this part is now extremely fast) ---
+                    // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
-
-                        // Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
+                        // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         let s_k_beta = self.s_list[k].dot(beta);
-                        // Use the robust solver (automatically handles Cholesky or robust_solve fallback)
                         let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
 
+                        // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
+                        let eta1_k = self.x.dot(&dbeta_drho_k);
 
-                        // Term 2: tr(H⁻¹ * S_k). This is also fast.
-                        // We need to solve for each column and sum the diagonal elements
+                        // c. Calculate the weight derivative term: tr(H⁻¹ Xᵀ (∂W/∂ρₖ) X)
+                        //    = sum(diag(X H⁻¹ Xᵀ) * diag(∂W/∂ρₖ))
+                        //    diag(∂W/∂ρₖ)_ii = (∂w_i/∂η_i) * (∂η_i/∂ρ_k)
+                        let dwdrho_k_diag = &dw_deta * &eta1_k;
+                        let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag);
+
+                        // d. Calculate tr(H⁻¹ * S_k)
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..self.s_list[k].ncols() {
                             let s_k_col = self.s_list[k].column(j);
@@ -1044,67 +1030,14 @@ pub mod internal {
                             trace_h_inv_s_k += h_inv_col[j];
                         }
 
-                        // Term 3: tr(S_λ⁺ S_k) from the reparameterization result.
-
-                        // For non-Gaussian models (Logit, etc.), we must compute the full total derivative
-                        // of the penalized deviance as the indirect terms do not cancel out in the same simple way.
-                        
-                        // Calculate the three components of the penalized deviance derivative
-                        let beta_s_k_beta = lambdas[k] * beta.dot(&s_k_beta);
-                        
-                        // Calculate the linear predictor
-                        let eta = self.x.dot(beta);
-                        
-                        // For non-Gaussian models (Logit), calculate the fitted values (mu) 
-                        // using the inverse link function
-                        let mu = match self.config.link_function {
-                            LinkFunction::Logit => {
-                                // Apply inverse logit transform: μ = 1/(1+exp(-η))
-                                let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-                                eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()))
-                            },
-                            LinkFunction::Identity => eta.clone(),
-                            // Add other link functions here if needed
-                        };
-                        
-                        // Calculate residuals as y - μ (not y - η)
-                        let residuals = &self.y - &mu;
-                        
-                        // Calculate the residual term: 2 * (y - Xβ)' * X * (dβ/dρ_k)
-                        let residual_term = 2.0 * residuals.dot(&self.x.dot(&dbeta_drho_k));
-                        
-                        // Calculate the penalty term: 2 * β' * S_λ * (dβ/dρ_k)
-                        let s_lambda = &reparam_result.s_transformed;
-                        let penalty_term = 2.0 * beta.dot(&s_lambda.dot(&dbeta_drho_k));
-                        
-                        // This is the full total derivative of the penalized deviance
-                        let d1 = beta_s_k_beta + residual_term + penalty_term;
-                        
-                        // --- Now assemble the final gradient using the UNIFIED 3-term structure ---
-                        
-                        // Term 1: Derivative of the penalized deviance
-                        // For Logit, scale is fixed at 1.0
-                        let scale = 1.0;
-                        let term1 = d1 / (2.0 * scale);
-                        
-                        // Term 2: Derivative of log|H|
-                        // We've already calculated trace_h_inv_s_k above
-                        let term2 = (lambdas[k] * trace_h_inv_s_k) / 2.0;
-                        
-                        // Term 3: Derivative of log|S|
-                        let term3 = -reparam_result.det1[k] / 2.0;
-                        
-                        // This is the gradient of the COST function (-V_LAML).
-                        // Due to sign conventions in the term calculations, the sum is already -∇V_LAML.
-                        cost_gradient[k] = term1 + term2 + term3;
-                        
-                        // NOTE: This implementation is mathematically equivalent to the previous one
-                        // but has a unified structure with the Identity case for better clarity.
+                        // e. Assemble the gradient of the cost function (-V_LAML)
+                        // ∇V_LAML = 0.5 * (λₖ * tr(S⁺Sₖ) - λₖ * tr(H⁻¹Sₖ) - weight_deriv_term)
+                        // cost_grad = -∇V_LAML
+                        cost_gradient[k] = -0.5 * reparam_result.det1[k]
+                            + 0.5 * lambdas[k] * trace_h_inv_s_k
+                            + 0.5 * weight_deriv_term;
                     }
-                    log::debug!("Gradient computation loop finished.");
-                    // =========================================================================
-                    // ================= End of optimized implementation =====================
-                    // =========================================================================
+                    log::debug!("LAML gradient computation finished.");
                 }
             }
 
@@ -1400,7 +1333,7 @@ pub mod internal {
                 if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
             })
         }
-        
+
         /// Generates stable, well-posed synthetic data for testing GAM fitting.
         ///
         /// # Arguments
@@ -1421,13 +1354,13 @@ pub mod internal {
 
             // Predictor 1 (PC1): Has a clear, smooth signal.
             let pc1 = Array1::linspace(-1.5, 1.5, n_samples);
-            
+
             // Predictor 2 (PC2): Pure, uncorrelated noise.
             let mut pc2_vec: Vec<f64> = (0..n_samples).map(|_| rng.gen_range(-1.5..1.5)).collect();
             use rand::seq::SliceRandom;
             pc2_vec.shuffle(&mut rng);
             let pc2 = Array1::from(pc2_vec);
-            
+
             // Assemble PC matrix
             let mut pcs = Array2::zeros((n_samples, 2));
             pcs.column_mut(0).assign(&pc1);
@@ -1435,8 +1368,9 @@ pub mod internal {
 
             // True underlying relationship depends ONLY on PC1.
             let true_signal = pc1.mapv(|x| signal_strength * (x * std::f64::consts::PI).sin());
-            let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.0..1.0) * noise_level);
-            
+            let noise =
+                Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.0..1.0) * noise_level);
+
             let y = match link_function {
                 LinkFunction::Logit => {
                     let logits = &true_signal + &noise;
@@ -1445,7 +1379,7 @@ pub mod internal {
                 }
                 LinkFunction::Identity => &true_signal + &noise,
             };
-            
+
             // Dummy PGS data (not used in this test's logic)
             let p = Array1::zeros(n_samples);
 
@@ -1455,8 +1389,14 @@ pub mod internal {
                 link_function,
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 pc_basis_configs: vec![
-                    BasisConfig { num_knots: 4, degree: 3 }, // PC1
-                    BasisConfig { num_knots: 4, degree: 3 }, // PC2
+                    BasisConfig {
+                        num_knots: 4,
+                        degree: 3,
+                    }, // PC1
+                    BasisConfig {
+                        num_knots: 4,
+                        degree: 3,
+                    }, // PC2
                 ],
                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
                 // Other fields can be filled with defaults as in create_test_config()
@@ -1465,7 +1405,10 @@ pub mod internal {
                 max_iterations: 150,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
-                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
                 pgs_range: (-3.0, 3.0),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
@@ -1649,7 +1592,6 @@ pub mod internal {
 
             asymmetry < tolerance
         }
-
 
         /// Tests the inner P-IRLS fitting mechanism with fixed smoothing parameters.
         /// This test verifies that the coefficient estimation is correct for a known dataset
@@ -2225,7 +2167,7 @@ pub mod internal {
             let n_samples = 400; // More samples for stability
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
             let p = Array1::linspace(-2.0, 2.0, n_samples);
-            
+
             // Use a helper that ensures non-perfect separation by adding substantial noise
             // Generate smooth signal with sine wave to avoid perfect separation
             let true_signal = p.mapv(|x| (x * std::f64::consts::PI * 0.5).sin());
@@ -2235,8 +2177,12 @@ pub mod internal {
                 let prob = 1.0 / (1.0 + (-x).exp());
                 if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
             });
-            
-            let data = TrainingData { y, p, pcs: Array2::zeros((n_samples, 0)) };
+
+            let data = TrainingData {
+                y,
+                p,
+                pcs: Array2::zeros((n_samples, 0)),
+            };
 
             // 2. Setup a simpler, more stable model config
             let mut config = create_test_config();
@@ -2249,7 +2195,8 @@ pub mod internal {
             // 3. Build matrices and state (as before, but will now be well-conditioned)
             let (x_matrix, s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            let reml_state = internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
+            let reml_state =
+                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
 
             // 4. Use a test point that is not at the minimum
             let test_rho = Array1::from_elem(layout.num_penalties, 0.0);
@@ -2257,17 +2204,26 @@ pub mod internal {
             // 5. Compute initial cost and gradient, handling potential errors gracefully
             let cost_start = match reml_state.compute_cost(&test_rho) {
                 Ok(cost) => cost,
-                Err(e) => panic!("Initial cost calculation failed even with stable data: {:?}", e),
+                Err(e) => panic!(
+                    "Initial cost calculation failed even with stable data: {:?}",
+                    e
+                ),
             };
             let grad = match reml_state.compute_gradient(&test_rho) {
                 Ok(g) => g,
-                Err(e) => panic!("Initial gradient calculation failed even with stable data: {:?}", e),
+                Err(e) => panic!(
+                    "Initial gradient calculation failed even with stable data: {:?}",
+                    e
+                ),
             };
 
             // 6. Take a small, ADAPTIVE step in the negative gradient direction
             // This is crucial for volatile surfaces.
             let grad_norm = grad.dot(&grad).sqrt();
-            assert!(grad_norm > 1e-6, "Gradient is near zero; test is uninformative.");
+            assert!(
+                grad_norm > 1e-6,
+                "Gradient is near zero; test is uninformative."
+            );
             let step_size = 1e-5 / grad_norm; // Smaller step for larger gradient
             let rho_step = &test_rho - step_size * &grad;
 
@@ -2276,19 +2232,20 @@ pub mod internal {
                 Ok(cost) => cost,
                 Err(e) => panic!("Cost calculation after step failed: {:?}", e),
             };
-            
+
             // 8. The core assertion, which should now pass on a well-behaved surface
             assert!(
                 cost_step < cost_start,
                 "Cost should decrease when stepping in negative gradient direction. Start: {:.6}, After step: {:.6}",
-                cost_start, cost_step
+                cost_start,
+                cost_step
             );
-            
+
             // 9. Additional verification with numerical gradient
             let h = 1e-5;
             let rho_plus = &test_rho + Array1::from_elem(test_rho.len(), h);
             let rho_minus = &test_rho - Array1::from_elem(test_rho.len(), h);
-            
+
             // Handle potential errors in the numerical approximation
             let cost_plus = match reml_state.compute_cost(&rho_plus) {
                 Ok(cost) => cost,
@@ -2298,15 +2255,15 @@ pub mod internal {
                 Ok(cost) => cost,
                 Err(e) => panic!("Cost- calculation failed: {:?}", e),
             };
-            
+
             let num_grad = (cost_plus - cost_minus) / (2.0 * h);
-            
+
             // The analytical and numerical gradient should have the same sign
             assert_eq!(
-                grad[0].signum(), 
-                num_grad.signum(), 
+                grad[0].signum(),
+                num_grad.signum(),
                 "Analytical gradient sign ({:+.6}) should match numerical approximation sign ({:+.6})",
-                grad[0], 
+                grad[0],
                 num_grad
             );
         }
@@ -2320,12 +2277,12 @@ pub mod internal {
             // the REML/LAML gradient will push the optimizer to penalize the noise term (PC2)
             // more heavily than the signal term (PC1). This is a key feature that enables
             // automatic variable selection in the model.
-            
+
             // Using a simplified version of the previous test with known-stable structure
-            
+
             // --- 1. Setup: Generate data where y depends on PC1 but has NO relationship with PC2 ---
             let n_samples = 100; // Reduced for better numerical stability
-            
+
             // Use a fixed seed for reproducibility
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
@@ -2352,7 +2309,7 @@ pub mod internal {
                 let pc1_val = pcs[[i, 0]];
                 // Simple linear function of PC1 with small noise for stability
                 let signal = 0.2 + 0.5 * pc1_val;
-                let noise = rng.gen_range(-0.05..0.05); 
+                let noise = rng.gen_range(-0.05..0.05);
                 signal + noise
             });
 
@@ -2363,23 +2320,29 @@ pub mod internal {
                 link_function: LinkFunction::Identity, // More stable
                 penalty_order: 2,
                 convergence_tolerance: 1e-4, // Relaxed tolerance for better convergence
-                max_iterations: 100, // Reasonable number of iterations
+                max_iterations: 100,         // Reasonable number of iterations
                 reml_convergence_tolerance: 1e-2,
                 reml_max_iterations: 20,
                 pgs_basis_config: BasisConfig {
                     num_knots: 2, // Fewer knots for stability
-                    degree: 2, // Lower degree for stability
+                    degree: 2,    // Lower degree for stability
                 },
                 pc_basis_configs: vec![
-                    BasisConfig { num_knots: 2, degree: 2 }, // PC1 - simplified
-                    BasisConfig { num_knots: 2, degree: 2 }, // PC2 - same basis size as PC1
+                    BasisConfig {
+                        num_knots: 2,
+                        degree: 2,
+                    }, // PC1 - simplified
+                    BasisConfig {
+                        num_knots: 2,
+                        degree: 2,
+                    }, // PC2 - same basis size as PC1
                 ],
                 pc_ranges: vec![(-2.0, 2.0), (-1.5, 1.5)],
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 pgs_range: (-2.5, 2.5),
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
-                num_pgs_interaction_bases: 0,  // Important: no interactions for stability
+                num_pgs_interaction_bases: 0, // Important: no interactions for stability
             };
 
             // --- 3. Build Model Structure ---
@@ -2392,7 +2355,7 @@ pub mod internal {
                 .iter()
                 .position(|b| b.term_name == "f(PC1)")
                 .expect("PC1 penalty not found");
-                
+
             let pc2_penalty_idx = layout
                 .penalty_map
                 .iter()
@@ -2403,20 +2366,15 @@ pub mod internal {
             // This is a more robust approach that avoids potential issues with P-IRLS convergence
 
             // Create a reml_state that we'll use to evaluate costs
-            let reml_state = internal::RemlState::new(
-                data.y.view(), 
-                x_matrix.view(), 
-                s_list, 
-                &layout, 
-                &config
-            );
+            let reml_state =
+                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
 
             println!("Comparing costs when penalizing signal term (PC1) vs. noise term (PC2)");
 
             // --- 6. Compare the cost at different points ---
             // First, create a baseline with minimal penalties for both terms
             let baseline_rho = Array1::from_elem(layout.num_penalties, -2.0); // λ ≈ 0.135
-            
+
             // Get baseline cost or skip test if it fails
             let baseline_cost = match reml_state.compute_cost(&baseline_rho) {
                 Ok(cost) => cost,
@@ -2432,7 +2390,7 @@ pub mod internal {
             // 1. Penalize PC1 heavily, PC2 lightly
             let mut pc1_heavy_rho = baseline_rho.clone();
             pc1_heavy_rho[pc1_penalty_idx] = 2.0; // λ ≈ 7.4 for PC1 (signal)
-            
+
             // 2. Penalize PC2 heavily, PC1 lightly
             let mut pc2_heavy_rho = baseline_rho.clone();
             pc2_heavy_rho[pc2_penalty_idx] = 2.0; // λ ≈ 7.4 for PC2 (noise)
@@ -2441,21 +2399,33 @@ pub mod internal {
             let pc1_heavy_cost = match reml_state.compute_cost(&pc1_heavy_rho) {
                 Ok(cost) => cost,
                 Err(e) => {
-                    println!("Failed to compute cost when penalizing PC1 heavily: {:?}", e);
-                    f64::MAX // Use MAX as a sentinel value
-                }
-            };
-            
-            let pc2_heavy_cost = match reml_state.compute_cost(&pc2_heavy_rho) {
-                Ok(cost) => cost,
-                Err(e) => {
-                    println!("Failed to compute cost when penalizing PC2 heavily: {:?}", e);
+                    println!(
+                        "Failed to compute cost when penalizing PC1 heavily: {:?}",
+                        e
+                    );
                     f64::MAX // Use MAX as a sentinel value
                 }
             };
 
-            println!("Cost when penalizing PC1 (signal) heavily: {:.6}", pc1_heavy_cost);
-            println!("Cost when penalizing PC2 (noise) heavily: {:.6}", pc2_heavy_cost);
+            let pc2_heavy_cost = match reml_state.compute_cost(&pc2_heavy_rho) {
+                Ok(cost) => cost,
+                Err(e) => {
+                    println!(
+                        "Failed to compute cost when penalizing PC2 heavily: {:?}",
+                        e
+                    );
+                    f64::MAX // Use MAX as a sentinel value
+                }
+            };
+
+            println!(
+                "Cost when penalizing PC1 (signal) heavily: {:.6}",
+                pc1_heavy_cost
+            );
+            println!(
+                "Cost when penalizing PC2 (noise) heavily: {:.6}",
+                pc2_heavy_cost
+            );
 
             // --- 7. Key assertion: Penalizing noise (PC2) should reduce cost more than penalizing signal (PC1) ---
             // If either cost is MAX, we can't make a valid comparison
@@ -2467,27 +2437,34 @@ pub mod internal {
                     pc1_heavy_cost,
                     pc2_heavy_cost
                 );
-                
-                println!("✓ Test passed! Penalizing noise (PC2) reduces cost more than penalizing signal (PC1)");
+
+                println!(
+                    "✓ Test passed! Penalizing noise (PC2) reduces cost more than penalizing signal (PC1)"
+                );
             } else {
                 // At least one cost computation failed - test is inconclusive
                 println!("Test inconclusive: could not compute costs for both scenarios");
             }
-            
+
             // Additional informative test: Both penalties should be better than no penalty
             if pc1_heavy_cost != f64::MAX && pc2_heavy_cost != f64::MAX {
                 // Try a test point with no penalties
                 let no_penalty_rho = Array1::from_elem(layout.num_penalties, -6.0); // λ ≈ 0.0025
                 match reml_state.compute_cost(&no_penalty_rho) {
                     Ok(no_penalty_cost) => {
-                        println!("Cost with minimal penalties (lambda ≈ 0.0025): {:.6}", no_penalty_cost);
+                        println!(
+                            "Cost with minimal penalties (lambda ≈ 0.0025): {:.6}",
+                            no_penalty_cost
+                        );
                         if no_penalty_cost > pc2_heavy_cost && no_penalty_cost > pc1_heavy_cost {
                             println!("✓ Both penalty scenarios improve over minimal penalties");
                         } else {
-                            println!("! Unexpected: Some penalties perform worse than minimal penalties");
+                            println!(
+                                "! Unexpected: Some penalties perform worse than minimal penalties"
+                            );
                         }
-                    },
-                    Err(_) => println!("Could not compute cost for minimal penalties")
+                    }
+                    Err(_) => println!("Could not compute cost for minimal penalties"),
                 }
             }
         }
@@ -2510,7 +2487,7 @@ pub mod internal {
             let mut pc2_vec: Vec<f64> = Array::linspace(-1.5, 1.5, n_samples).to_vec();
             pc2_vec.shuffle(&mut rng);
             let pc2 = Array1::from_vec(pc2_vec);
-            
+
             // Assemble predictors
             let mut pcs = Array2::zeros((n_samples, 2));
             pcs.column_mut(0).assign(&pc1);
@@ -2528,12 +2505,18 @@ pub mod internal {
             config.pc_names = vec!["PC1".to_string(), "PC2".to_string()];
             config.pgs_basis_config.num_knots = 0; // Disable PGS
             config.pc_basis_configs = vec![
-                BasisConfig { num_knots: 3, degree: 2 }, // Simpler basis for better conditioning
-                BasisConfig { num_knots: 3, degree: 2 }, // Simpler basis for better conditioning
+                BasisConfig {
+                    num_knots: 3,
+                    degree: 2,
+                }, // Simpler basis for better conditioning
+                BasisConfig {
+                    num_knots: 3,
+                    degree: 2,
+                }, // Simpler basis for better conditioning
             ];
             config.pc_ranges = vec![(-1.5, 1.5), (-1.5, 1.5)];
             config.num_pgs_interaction_bases = 0; // CRITICAL: Disable interactions
-            
+
             // Use looser convergence criteria
             config.reml_convergence_tolerance = 1e-2;
             config.reml_max_iterations = 50;
@@ -2541,31 +2524,36 @@ pub mod internal {
             // --- 3. Run the FULL training pipeline ---
             let trained_model = train_model(&data, &config)
                 .expect("Model training should succeed for this well-posed problem");
-            
+
             // --- 4. Assert the final smoothing parameters ---
             let (_, _, layout, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
-            
-            let pc1_penalty_idx = layout.penalty_map.iter()
+
+            let pc1_penalty_idx = layout
+                .penalty_map
+                .iter()
                 .position(|b| b.term_name == "f(PC1)")
                 .expect("PC1 penalty not found");
-            
-            let pc2_penalty_idx = layout.penalty_map.iter()
+
+            let pc2_penalty_idx = layout
+                .penalty_map
+                .iter()
                 .position(|b| b.term_name == "f(PC2)")
                 .expect("PC2 penalty not found");
 
             // Extract the final, optimized lambdas
             let lambda_pc1 = trained_model.lambdas[pc1_penalty_idx];
             let lambda_pc2 = trained_model.lambdas[pc2_penalty_idx];
-            
+
             println!("\n--- FINAL OPTIMIZED SMOOTHING PARAMETERS ---");
             println!("Lambda for signal term (PC1):   {:.6e}", lambda_pc1);
             println!("Lambda for noise term (PC2):    {:.6e}", lambda_pc2);
-            
+
             // THE CRITICAL ASSERTION: The penalty for the noise term should be orders of magnitude larger.
             assert!(
                 lambda_pc2 > 10.0 * lambda_pc1, // Reduced magnitude difference for test stability
                 "The smoothing penalty for the noise term (PC2) should be larger than for the signal term (PC1). PC2 Lambda: {}, PC1 Lambda: {}",
-                lambda_pc2, lambda_pc1
+                lambda_pc2,
+                lambda_pc1
             );
         }
 
@@ -2588,9 +2576,7 @@ pub mod internal {
             let combined_predictor = &p + &pc1;
             let y = generate_realistic_binary_data(&combined_predictor, 2.0, 0.0, 1.0, &mut rng);
 
-            let pcs = pc1
-                .into_shape_with_order((n_samples, 1))
-                .unwrap();
+            let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
 
             let data = TrainingData {
                 y,
@@ -2649,13 +2635,28 @@ pub mod internal {
             let test_pc_dummy = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
 
             // Get model predictions
-            let low_prob = trained_model.predict(test_pgs_low.view(), test_pc_dummy.view()).unwrap()[0];
-            let high_prob = trained_model.predict(test_pgs_high.view(), test_pc_dummy.view()).unwrap()[0];
+            let low_prob = trained_model
+                .predict(test_pgs_low.view(), test_pc_dummy.view())
+                .unwrap()[0];
+            let high_prob = trained_model
+                .predict(test_pgs_high.view(), test_pc_dummy.view())
+                .unwrap()[0];
 
             // Assert that the predictions are sensible
-            assert!(low_prob < 0.5, "Prediction for low input should be < 0.5, got {}", low_prob);
-            assert!(high_prob > 0.5, "Prediction for high input should be > 0.5, got {}", high_prob);
-            assert!(high_prob > low_prob, "High prediction should be greater than low prediction");
+            assert!(
+                low_prob < 0.5,
+                "Prediction for low input should be < 0.5, got {}",
+                low_prob
+            );
+            assert!(
+                high_prob > 0.5,
+                "Prediction for high input should be > 0.5, got {}",
+                high_prob
+            );
+            assert!(
+                high_prob > low_prob,
+                "High prediction should be greater than low prediction"
+            );
         }
 
         #[test]
@@ -4310,11 +4311,11 @@ pub mod internal {
             // Use the robust helper function to generate non-separable binary outcomes
             // The key is using a moderate `steepness` and a high `noise_level` to ensure class overlap.
             let y = generate_realistic_binary_data(
-                &p,      // Use the PGS as the main predictor for simplicity
-                1.0,     // Reduced slope to prevent perfect separation
-                0.0,     // A centered intercept
-                2.0,     // Increased noise to guarantee class overlap
-                &mut rng
+                &p,  // Use the PGS as the main predictor for simplicity
+                1.0, // Reduced slope to prevent perfect separation
+                0.0, // A centered intercept
+                2.0, // Increased noise to guarantee class overlap
+                &mut rng,
             );
             let data = TrainingData { y, p, pcs };
             let mut config = create_test_config();
@@ -4374,13 +4375,13 @@ pub mod internal {
             let verify_descent_for_link = |link_function: LinkFunction| {
                 use rand::SeedableRng;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(42); // Fixed seed for reproducibility
-                
+
                 // 1. Setup a well-posed, non-trivial problem.
                 let n_samples = 600;
-                
+
                 // Use random jitter to prevent perfect separation and improve numerical stability
                 let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.9..0.9));
-                
+
                 let y = match link_function {
                     LinkFunction::Identity => {
                         p.mapv(|x: f64| x.sin() + 0.1 * rng.gen_range(-0.5..0.5))
@@ -4388,15 +4389,15 @@ pub mod internal {
                     LinkFunction::Logit => {
                         // Use our helper function with controlled parameters to prevent separation
                         generate_realistic_binary_data(
-                            &p,                // predictor values 
-                            1.5,               // moderate steepness
-                            0.0,               // zero intercept
-                            2.0,               // substantial noise for class overlap
-                            &mut rng
+                            &p,  // predictor values
+                            1.5, // moderate steepness
+                            0.0, // zero intercept
+                            2.0, // substantial noise for class overlap
+                            &mut rng,
                         )
                     }
                 };
-                
+
                 let pcs = Array2::zeros((n_samples, 0));
                 let data = TrainingData { y, p, pcs };
 
@@ -4405,7 +4406,7 @@ pub mod internal {
                 config.pc_basis_configs = vec![];
                 config.pc_names = vec![];
                 config.pc_ranges = vec![];
-                
+
                 // Use a simple basis with fewer knots to reduce complexity
                 config.pgs_basis_config.num_knots = 3;
 
@@ -4455,24 +4456,31 @@ pub mod internal {
                 let cost_start = match reml_state.compute_cost(&rho_start) {
                     Ok(cost) => cost,
                     Err(EstimationError::PirlsDidNotConverge { .. }) => {
-                        println!("P-IRLS did not converge for {:?} - skipping this test case", link_function);
+                        println!(
+                            "P-IRLS did not converge for {:?} - skipping this test case",
+                            link_function
+                        );
                         return; // Skip this test case
-                    },
+                    }
                     Err(e) => panic!("Unexpected error: {:?}", e),
                 };
-                
+
                 let grad_start = match reml_state.compute_gradient(&rho_start) {
                     Ok(grad) => grad,
                     Err(EstimationError::PirlsDidNotConverge { .. }) => {
-                        println!("P-IRLS did not converge for gradient calculation - skipping this test case");
+                        println!(
+                            "P-IRLS did not converge for gradient calculation - skipping this test case"
+                        );
                         return; // Skip this test case
-                    },
+                    }
                     Err(e) => panic!("Unexpected error in gradient calculation: {:?}", e),
                 };
-                
+
                 // Make sure gradient is significant enough to test
                 if grad_start[0].abs() < 1e-8 {
-                    println!("Warning: Gradient too small to test descent property at starting point");
+                    println!(
+                        "Warning: Gradient too small to test descent property at starting point"
+                    );
                     return; // Skip this test case rather than fail with meaningless assertion
                 }
 
@@ -4488,18 +4496,22 @@ pub mod internal {
                 let cost_neg_step = match reml_state.compute_cost(&rho_neg_step) {
                     Ok(cost) => cost,
                     Err(EstimationError::PirlsDidNotConverge { .. }) => {
-                        println!("P-IRLS did not converge for negative step - skipping this test case");
+                        println!(
+                            "P-IRLS did not converge for negative step - skipping this test case"
+                        );
                         return; // Skip this test case
-                    },
+                    }
                     Err(e) => panic!("Unexpected error in negative step: {:?}", e),
                 };
-                
+
                 let cost_pos_step = match reml_state.compute_cost(&rho_pos_step) {
                     Ok(cost) => cost,
                     Err(EstimationError::PirlsDidNotConverge { .. }) => {
-                        println!("P-IRLS did not converge for positive step - skipping this test case");
+                        println!(
+                            "P-IRLS did not converge for positive step - skipping this test case"
+                        );
                         return; // Skip this test case
-                    },
+                    }
                     Err(e) => panic!("Unexpected error in positive step: {:?}", e),
                 };
 
@@ -4519,7 +4531,7 @@ pub mod internal {
                 let relative_change = (cost_next - cost_start) / (cost_start.abs() + 1e-10);
                 let is_decrease = cost_next < cost_start;
                 let is_stationary = relative_change.abs() < 1e-6;
-                
+
                 assert!(
                     is_decrease || is_stationary,
                     "For {:?}, neither direction decreased cost and point is not stationary. \nStart: {:.8}, Neg step: {:.8}, Pos step: {:.8}, \nGradient: {:.8}, Relative change: {:.8e}",
@@ -4538,7 +4550,7 @@ pub mod internal {
                     let numerical_grad = (cost_pos_step - cost_neg_step) / (2.0 * h);
                     println!("Analytical gradient: {:.8}", grad_start[0]);
                     println!("Numerical gradient:  {:.8}", numerical_grad);
-                    
+
                     // For a high-level correctness check, just verify sign consistency
                     if numerical_grad.abs() > 1e-8 && grad_start[0].abs() > 1e-8 {
                         let signs_match = numerical_grad.signum() == grad_start[0].signum();

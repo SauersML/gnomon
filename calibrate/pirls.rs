@@ -110,7 +110,7 @@ pub fn fit_model_for_fixed_rho(
         // --- Store the state from the START of the iteration ---
         let beta_current = beta.clone();
         let deviance_current = last_deviance;
-        
+
         // Calculate the penalty for the current beta
         let penalty_current = beta_current.dot(&s_lambda.dot(&beta_current));
         // This is the true objective function value at the start of the iteration
@@ -170,7 +170,7 @@ pub fn fit_model_for_fixed_rho(
                 step_size *= 0.5;
                 continue;
             }
-            
+
             // Calculate the penalty for the trial beta
             let penalty_trial = beta_trial.dot(&s_lambda.dot(&beta_trial));
             // This is the true objective function value for the trial step
@@ -252,7 +252,7 @@ pub fn fit_model_for_fixed_rho(
         // Calculate the current penalized deviance
         let penalty_new = beta.dot(&s_lambda.dot(&beta));
         let penalized_deviance_new = last_deviance + penalty_new;
-        
+
         // Compute penalized deviance change safely
         let deviance_change = (penalized_deviance_current - penalized_deviance_new).abs();
         let step_info = if final_halving_attempts > 0 {
@@ -568,7 +568,11 @@ pub fn stable_penalized_least_squares(
     // Step 10: Calculate scale parameter
     let fitted = x.dot(&beta);
     let residuals = &y - &fitted;
-    let weighted_rss: f64 = weights.iter().zip(residuals.iter()).map(|(&w, &r)| w * r * r).sum();
+    let weighted_rss: f64 = weights
+        .iter()
+        .zip(residuals.iter())
+        .map(|(&w, &r)| w * r * r)
+        .sum();
     let scale = weighted_rss / (n as f64 - edf).max(1.0);
 
     Ok(StablePLSResult {
