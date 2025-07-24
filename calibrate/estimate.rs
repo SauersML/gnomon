@@ -1053,9 +1053,23 @@ pub mod internal {
                         // Calculate the three components of the penalized deviance derivative
                         let beta_s_k_beta = lambdas[k] * beta.dot(&s_k_beta);
                         
-                        // Calculate the fitted values and residuals
+                        // Calculate the linear predictor
                         let eta = self.x.dot(beta);
-                        let residuals = &self.y - &eta;
+                        
+                        // For non-Gaussian models (Logit), calculate the fitted values (mu) 
+                        // using the inverse link function
+                        let mu = match self.config.link_function {
+                            LinkFunction::Logit => {
+                                // Apply inverse logit transform: μ = 1/(1+exp(-η))
+                                let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+                                eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()))
+                            },
+                            LinkFunction::Identity => eta.clone(),
+                            // Add other link functions here if needed
+                        };
+                        
+                        // Calculate residuals as y - μ (not y - η)
+                        let residuals = &self.y - &mu;
                         
                         // Calculate the residual term: 2 * (y - Xβ)' * X * (dβ/dρ_k)
                         let residual_term = 2.0 * residuals.dot(&self.x.dot(&dbeta_drho_k));
@@ -2453,7 +2467,7 @@ pub mod internal {
         }
 
         #[test]
-        #[ignore] // This test requires further stabilization - marked as ignored for now
+        // Previously ignored, now enabled after fixing the gradient calculation
         fn test_optimizer_converges_to_penalize_noise_term() {
             use rand::seq::SliceRandom;
             use rand::{Rng, SeedableRng};
@@ -2543,14 +2557,8 @@ pub mod internal {
             // Create predictor variables
             let p = Array::linspace(-1.0, 1.0, n_samples);
 
-            // Generate non-separable binary data
-            // Create logits with a clearer signal for test predictions
-            let logits = p.mapv(|x| 1.5 * x);
-            
-            // Generate binary outcomes from these logits
-            // Since we're using a low slope of 1.5, we avoid perfect separation while
-            // still maintaining a clear relationship between predictors and outcomes
-            let y = generate_y_from_logit(&logits, &mut rng);
+            // Use the robust helper to generate non-separable binary data
+            let y = generate_realistic_binary_data(&p, 2.0, 0.0, 1.0, &mut rng);
             let p = Array::linspace(-1.0, 1.0, n_samples);
             let pcs = Array::linspace(-1.0, 1.0, n_samples)
                 .into_shape_with_order((n_samples, 1))
@@ -2607,45 +2615,19 @@ pub mod internal {
                 lambdas: fixed_rho.mapv(f64::exp).to_vec(),
             };
 
-            // Verify the model structure is correct
-            assert!(!trained_model.coefficients.main_effects.pgs.is_empty());
-            assert!(
-                trained_model
-                    .coefficients
-                    .main_effects
-                    .pcs
-                    .contains_key("PC1")
-            );
-            assert!(!trained_model.lambdas.is_empty());
+            // Create test points at different ends of the predictor range.
+            let test_pgs_low = array![-0.5];
+            let test_pgs_high = array![0.5];
+            let test_pc_dummy = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
 
-            // Instead of checking predictions which are sensitive to data generation,
-            // let's verify the basic model structure and coefficients directly
-            println!("Verifying model structure and coefficient mapping...");
-            
-            // Verify the model structure is correct
-            assert!(!trained_model.coefficients.main_effects.pgs.is_empty(),
-                   "Model should have PGS main effects");
-            
-            // Verify PC main effects are present
-            assert!(trained_model.coefficients.main_effects.pcs.contains_key("PC1"),
-                   "Model should have PC1 main effects");
-            
-            // Verify smoothing parameters are present
-            assert!(!trained_model.lambdas.is_empty(), "Model should have smoothing parameters");
-            
-            // Check model has the right number of penalties based on layout
-            assert_eq!(trained_model.lambdas.len(), layout.num_penalties,
-                      "Number of lambdas should match number of penalties in layout");
-            
-            // Check that coefficients were properly mapped from the beta vector
-            // Skip flatten_coefficients test as it's internal to model.rs
-            
-            // Check that coefficients from mapping have reasonable values
-            // (they should not be NaN or infinite)
-            assert!(trained_model.coefficients.intercept.is_finite(), 
-                   "Intercept should have a finite value");
-            
-            println!("✓ Basic model estimation test passed with proper structure verification");
+            // Get model predictions
+            let low_prob = trained_model.predict(test_pgs_low.view(), test_pc_dummy.view()).unwrap()[0];
+            let high_prob = trained_model.predict(test_pgs_high.view(), test_pc_dummy.view()).unwrap()[0];
+
+            // Assert that the predictions are sensible
+            assert!(low_prob < 0.5, "Prediction for low input should be < 0.5, got {}", low_prob);
+            assert!(high_prob > 0.5, "Prediction for high input should be > 0.5, got {}", high_prob);
+            assert!(high_prob > low_prob, "High prediction should be greater than low prediction");
         }
 
         #[test]
