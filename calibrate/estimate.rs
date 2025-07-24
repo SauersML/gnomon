@@ -1062,10 +1062,10 @@ pub mod internal {
                         // Following Wood (2011) Appendix D, the gradient for the LAML (non-Gaussian) case has two components:
                         // 1. trace_diff_term: λₖ/2 * (tr(S_λ⁺ Sₖ) - tr(H⁻¹Sₖ))
                         // 2. weight_deriv_term: 1/2 * tr(H⁻¹X^T(∂W/∂ρₖ)X)
-                        // For the LAML case, the weight derivative term has a PLUS sign due to the
-                        // exact cancellation of the β^TSₖβ terms in the derivation (Wood 2011, Appendix D)
+                        // Since we're maximizing the score, the log-determinant term -½log|H| gets a minus sign
+                        // in its derivative, resulting in a negative weight derivative term
                         let trace_diff_term = 0.5 * lambdas[k] * (tr_s_plus_s_k - trace_h_inv_s_k);
-                        score_gradient[k] = trace_diff_term + weight_deriv_term;
+                        score_gradient[k] = trace_diff_term - weight_deriv_term;
                     }
                     log::debug!("Gradient computation loop finished.");
                     // =========================================================================
@@ -2179,9 +2179,9 @@ pub mod internal {
             numerator / (x_variance.sqrt() * y_variance.sqrt())
         }
 
-        /// This test specifically ensures the LAML gradient for non-Gaussian models is calculated correctly.
-        /// It verifies that the gradient calculation produces a valid descent direction,
-        /// accounting for the special cancellation of terms in the LAML case from Wood (2011) Appendix D.
+        /// This test specifically ensures the LAML gradient sign for the weight derivative term is correct.
+        /// It checks that the gradient calculation for non-Gaussian models correctly subtracts (not adds)
+        /// the weight derivative term, as per Wood (2011) Appendix D.
         #[test]
         fn test_laml_gradient_sign_is_correct() {
             // Create a simple test case with logit link function
