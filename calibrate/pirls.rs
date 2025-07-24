@@ -110,6 +110,11 @@ pub fn fit_model_for_fixed_rho(
         // --- Store the state from the START of the iteration ---
         let beta_current = beta.clone();
         let deviance_current = last_deviance;
+        
+        // Calculate the penalty for the current beta
+        let penalty_current = beta_current.dot(&s_lambda.dot(&beta_current));
+        // This is the true objective function value at the start of the iteration
+        let penalized_deviance_current = deviance_current + penalty_current;
 
         // Check for non-finite values
         if !eta.iter().all(|x| x.is_finite())
@@ -165,9 +170,14 @@ pub fn fit_model_for_fixed_rho(
                 step_size *= 0.5;
                 continue;
             }
+            
+            // Calculate the penalty for the trial beta
+            let penalty_trial = beta_trial.dot(&s_lambda.dot(&beta_trial));
+            // This is the true objective function value for the trial step
+            let penalized_deviance_trial = deviance_trial + penalty_trial;
 
-            // SUCCESS CONDITION: The new point is strictly better.
-            if deviance_trial < deviance_current {
+            // SUCCESS CONDITION: The new point is strictly better in terms of penalized deviance.
+            if penalized_deviance_trial < penalized_deviance_current {
                 // Atomic state update
                 beta = beta_trial;
                 eta = eta_trial;
@@ -189,10 +199,10 @@ pub fn fit_model_for_fixed_rho(
             // Step was not an improvement. Halve and retry.
             if attempt < MAX_HALVINGS {
                 log::debug!(
-                    "Step Halving Attempt {}: deviance {:.6} -> {:.6}, halving step to {:.6e}",
+                    "Step Halving Attempt {}: penalized deviance {:.6} -> {:.6}, halving step to {:.6e}",
                     attempt + 1,
-                    deviance_current,
-                    deviance_trial,
+                    penalized_deviance_current,
+                    penalized_deviance_trial,
                     step_size * 0.5
                 );
             }
@@ -201,7 +211,7 @@ pub fn fit_model_for_fixed_rho(
 
         if !step_accepted {
             log::warn!(
-                "P-IRLS step-halving failed to reduce deviance at iteration {}. The fit for this rho has stalled.",
+                "P-IRLS step-halving failed to reduce penalized deviance at iteration {}. The fit for this rho has stalled.",
                 iter
             );
             log::info!("P-IRLS STALLED: Step halving failed. Terminating inner loop.");
@@ -239,8 +249,12 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        // Compute deviance_change safely
-        let deviance_change = (deviance_current - last_deviance).abs();
+        // Calculate the current penalized deviance
+        let penalty_new = beta.dot(&s_lambda.dot(&beta));
+        let penalized_deviance_new = last_deviance + penalty_new;
+        
+        // Compute penalized deviance change safely
+        let deviance_change = (penalized_deviance_current - penalized_deviance_new).abs();
         let step_info = if final_halving_attempts > 0 {
             format!(" | Step Halving: {} attempts", final_halving_attempts)
         } else {
@@ -249,16 +263,16 @@ pub fn fit_model_for_fixed_rho(
 
         // A more detailed, real-time log for each inner-loop iteration
         log::debug!(
-            "P-IRLS Iteration #{:<2} | Deviance: {:<13.7} | Change: {:>12.6e}{}",
+            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
             iter,
-            last_deviance,
+            penalized_deviance_new,
             deviance_change,
             step_info
         );
 
         if !deviance_change.is_finite() {
             log::error!(
-                "Non-finite deviance_change at iteration {iter}: {deviance_change} (last: {deviance_current}, current: {last_deviance})"
+                "Non-finite penalized deviance change at iteration {iter}: {deviance_change} (last: {penalized_deviance_current}, current: {penalized_deviance_new})"
             );
             // Non-finite deviance change is a critical error
             return Err(EstimationError::PirlsDidNotConverge {
@@ -277,7 +291,7 @@ pub fn fit_model_for_fixed_rho(
         // - Offset=0.1 is common (avoids div-by-zero; can tune if needed)
         let reltol_offset = 0.1;
         let relative_threshold =
-            config.convergence_tolerance * (last_deviance.abs() + reltol_offset);
+            config.convergence_tolerance * (penalized_deviance_new.abs() + reltol_offset);
         let converged = iter >= min_iterations
             && deviance_change < relative_threshold.max(config.convergence_tolerance);
 
