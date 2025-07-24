@@ -2554,13 +2554,15 @@ pub mod internal {
 
             let n_samples = 40;
 
-            // Create predictor variables
-            let p = Array::linspace(-1.0, 1.0, n_samples);
+            // Create INDEPENDENT predictor variables to avoid collinearity
+            let p = Array::from_shape_fn(n_samples, |_| rng.gen_range(-1.0..1.0));
+            let pc1 = Array::from_shape_fn(n_samples, |_| rng.gen_range(-1.0..1.0));
 
-            // Use the robust helper to generate non-separable binary data
-            let y = generate_realistic_binary_data(&p, 2.0, 0.0, 1.0, &mut rng);
-            let p = Array::linspace(-1.0, 1.0, n_samples);
-            let pcs = Array::linspace(-1.0, 1.0, n_samples)
+            // Generate response based on a combination of predictors
+            let combined_predictor = &p + &pc1;
+            let y = generate_realistic_binary_data(&combined_predictor, 2.0, 0.0, 1.0, &mut rng);
+
+            let pcs = pc1
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
 
