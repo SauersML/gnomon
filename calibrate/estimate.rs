@@ -2102,7 +2102,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     
                     assert!(
                         model_rmse < rmse_threshold,
-                        "Model RMSE ({:.6}) is significantly worse than the Oracle model's RMSE ({:.6}). Threshold was {:.6}",
+                        "Model RMSE ({:.6}) is significantly worse than the Oracle's RMSE of {:.6}. The allowed threshold was {:.6}",
                         model_rmse, oracle_rmse, rmse_threshold
                     );
                     
@@ -2120,7 +2120,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     
                     assert!(
                         model_corr > corr_threshold,
-                        "Model correlation with true probabilities ({:.6}) is too low compared to Oracle ({:.6}). Threshold was {:.6}",
+                        "Model correlation with true probabilities ({:.6}) is too low compared to the Oracle's correlation of {:.6}. The required threshold was {:.6}",
                         model_corr, oracle_corr, corr_threshold
                     );
                 },
@@ -2236,11 +2236,18 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // Calculate Oracle correlation with true PGS effect
                 let oracle_pgs_correlation = correlation_coefficient(
                     &Array1::from_vec(true_pgs_logits.clone()),
-                    &Array1::from_vec(oracle_pgs_logits),
+                    &Array1::from_vec(oracle_pgs_logits.clone()),
+                );
+                
+                // Add direct comparison between model and oracle shapes
+                let model_vs_oracle_corr = correlation_coefficient(
+                    &Array1::from_vec(pgs_pred_logits.clone()),
+                    &Array1::from_vec(oracle_pgs_logits.clone()),
                 );
                 
                 println!("Oracle Model PGS effect correlation: {:.4}", oracle_pgs_correlation);
                 println!("Actual Model PGS effect correlation: {:.4}", pgs_correlation);
+                println!("Model vs Oracle direct shape correlation: {:.4}", model_vs_oracle_corr);
                 
                 // The noisy model should achieve a high percentage of the Oracle's performance.
                 let pgs_safety_margin = 0.90; // Require at least 90% of oracle performance
@@ -2253,6 +2260,14 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     return Err(format!(
                         "Learned PGS shape correlation ({:.4}) did not meet dynamic threshold ({:.4}) set by Oracle model ({:.4})",
                         pgs_correlation, pgs_dynamic_threshold, oracle_pgs_correlation
+                    ));
+                }
+                
+                // Add strong assertion that model's shape should be very similar to the Oracle's shape
+                if model_vs_oracle_corr < 0.98 {
+                    return Err(format!(
+                        "Model's learned PGS effect shape (corr: {:.4}) deviates too much from the ideal Oracle shape",
+                        model_vs_oracle_corr
                     ));
                 }
             } else {
@@ -2274,49 +2289,29 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let pc_int_grid = Array1::linspace(-1.5, 1.5, int_grid_size); // Consistent with training data range
 
             // First, compute true interaction surface by isolating interaction term from true_function
-            // We'll work in probability space for numerical stability
-            let mut true_interaction_surface_prob =
+            // We'll work in LOGIT space which is the correct domain for additive effects in a GAM
+            let mut true_interaction_surface_logit =
                 Vec::with_capacity(int_grid_size * int_grid_size);
 
-            // Helper function to convert logit to probability
-            let logit_to_prob = |logit: f64| -> f64 {
-                let prob = 1.0 / (1.0 + (-logit).exp());
-                prob.clamp(PROB_EPS, 1.0 - PROB_EPS) // Apply consistent clamping
-            };
-
-            // For each point on the grid, calculate the interaction component
+            // For each point on the grid, calculate the interaction component in LOGIT SPACE
             for &pgs_val in pgs_int_grid.iter() {
                 for &pc_val in pc_int_grid.iter() {
-                    // Full function: true_function(pgs_val, pc_val)
+                    // Calculate all components in logit space
                     let full_logit = true_function(pgs_val, pc_val).clamp(-10.0, 10.0);
-                    let full_prob = logit_to_prob(full_logit);
-
-                    // PGS main effect: true_function(pgs_val, 0.0)
                     let pgs_main_logit = true_function(pgs_val, 0.0).clamp(-10.0, 10.0);
-                    let pgs_main_prob = logit_to_prob(pgs_main_logit);
-
-                    // PC main effect: true_function(0.0, pc_val)
                     let pc_main_logit = true_function(0.0, pc_val).clamp(-10.0, 10.0);
-                    let pc_main_prob = logit_to_prob(pc_main_logit);
-
-                    // Intercept: true_function(0.0, 0.0)
                     let intercept_logit = true_function(0.0, 0.0).clamp(-10.0, 10.0);
-                    let intercept_prob = logit_to_prob(intercept_logit);
 
-                    // To isolate interaction in probability space, we need an approximation
-                    // We'll calculate interaction effect as a residual in probability space
-                    // Interaction ≈ Full - (PGS_main + PC_main - Intercept)
-                    let main_effects_prob = pgs_main_prob + pc_main_prob - intercept_prob;
-                    let main_effects_prob_clamped =
-                        main_effects_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    let interaction_effect_prob = full_prob - main_effects_prob_clamped;
-
-                    true_interaction_surface_prob.push(interaction_effect_prob);
+                    // Calculate interaction effect in logit space
+                    // Interaction = Full - (PGS_main + PC_main - Intercept)
+                    let true_interaction_logit = full_logit - (pgs_main_logit + pc_main_logit - intercept_logit);
+                    
+                    true_interaction_surface_logit.push(true_interaction_logit);
                 }
             }
 
-            // Now, compute model's predicted interaction surface in probability space
-            let mut learned_interaction_surface_prob =
+            // Now, compute model's predicted interaction surface in logit space
+            let mut model_interaction_surface_logit =
                 Vec::with_capacity(int_grid_size * int_grid_size);
 
             // Get intercept prediction once
@@ -2326,6 +2321,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 .predict(pgs_zero.view(), pc_zero.view())
                 .unwrap()[0];
             let pred_intercept_prob_clamped = pred_intercept_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            // Convert to logit scale
+            let pred_intercept_logit = (pred_intercept_prob_clamped / (1.0 - pred_intercept_prob_clamped)).ln();
 
             // For each point on the grid, calculate the learned interaction component
             for &pgs_val in pgs_int_grid.iter() {
@@ -2335,6 +2332,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     .predict(pgs_main.view(), pc_zero.view())
                     .unwrap()[0];
                 let pred_pgs_main_prob_clamped = pred_pgs_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                // Convert to logit scale
+                let pred_pgs_main_logit = (pred_pgs_main_prob_clamped / (1.0 - pred_pgs_main_prob_clamped)).ln();
 
                 for &pc_val in pc_int_grid.iter() {
                     // Calculate PC main effect
@@ -2344,29 +2343,29 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                         .unwrap()[0];
                     let pred_pc_main_prob_clamped =
                         pred_pc_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    // Convert to logit scale
+                    let pred_pc_main_logit = (pred_pc_main_prob_clamped / (1.0 - pred_pc_main_prob_clamped)).ln();
 
                     // Calculate full effect
                     let pred_full_prob = trained_model
                         .predict(pgs_main.view(), pc_main.view())
                         .unwrap()[0];
                     let pred_full_prob_clamped = pred_full_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    // Convert to logit scale
+                    let pred_full_logit = (pred_full_prob_clamped / (1.0 - pred_full_prob_clamped)).ln();
 
-                    // Calculate interaction in probability space - similar to true interaction
-                    let pred_main_effects_prob = pred_pgs_main_prob_clamped
-                        + pred_pc_main_prob_clamped
-                        - pred_intercept_prob_clamped;
-                    let pred_main_effects_prob_clamped =
-                        pred_main_effects_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    let pred_interaction_effect_prob =
-                        pred_full_prob_clamped - pred_main_effects_prob_clamped;
+                    // Calculate interaction in LOGIT SPACE
+                    // Interaction = Full - (PGS_main + PC_main - Intercept)
+                    let model_interaction_logit = pred_full_logit - 
+                        (pred_pgs_main_logit + pred_pc_main_logit - pred_intercept_logit);
 
-                    learned_interaction_surface_prob.push(pred_interaction_effect_prob);
+                    model_interaction_surface_logit.push(model_interaction_logit);
                 }
             }
 
             // Add finite checks before calculating metrics
-            let all_finite_true = true_interaction_surface_prob.iter().all(|&x| x.is_finite());
-            let all_finite_pred = learned_interaction_surface_prob
+            let all_finite_true = true_interaction_surface_logit.iter().all(|&x| x.is_finite());
+            let all_finite_pred = model_interaction_surface_logit
                 .iter()
                 .all(|&x| x.is_finite());
 
@@ -2377,23 +2376,23 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 return Err("Predicted interaction surface contains non-finite values".to_string());
             }
 
-            // Calculate RMSE between true and learned interaction surfaces in probability space
-            let interaction_squared_errors: f64 = true_interaction_surface_prob
+            // Calculate RMSE between true and learned interaction surfaces in logit space
+            let interaction_squared_errors: f64 = true_interaction_surface_logit
                 .iter()
-                .zip(learned_interaction_surface_prob.iter())
+                .zip(model_interaction_surface_logit.iter())
                 .map(|(true_val, learned_val)| (true_val - learned_val).powi(2))
                 .sum();
             let interaction_rmse =
-                (interaction_squared_errors / true_interaction_surface_prob.len() as f64).sqrt();
+                (interaction_squared_errors / true_interaction_surface_logit.len() as f64).sqrt();
 
             // Calculate correlation between true and learned interaction surfaces
             let interaction_correlation = correlation_coefficient(
-                &Array1::from_vec(true_interaction_surface_prob.clone()),
-                &Array1::from_vec(learned_interaction_surface_prob.clone()),
+                &Array1::from_vec(true_interaction_surface_logit.clone()),
+                &Array1::from_vec(model_interaction_surface_logit.clone()),
             );
 
             println!(
-                "Interaction effect - RMSE between true and predicted surfaces: {:.4}",
+                "Interaction effect - RMSE between true and predicted surfaces (logit scale): {:.4}",
                 interaction_rmse
             );
             println!(
@@ -2401,14 +2400,15 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 interaction_correlation
             );
 
-            if interaction_rmse >= 0.20 {
+            // Adjust thresholds for the logit scale which has different properties
+            if interaction_rmse >= 0.15 {
                 return Err(format!(
                     "Interaction surface is not well approximated (RMSE too high): {:.4}",
                     interaction_rmse
                 ));
             }
 
-            if interaction_correlation <= 0.85 {
+            if interaction_correlation <= 0.90 {
                 return Err(format!(
                     "Learned interaction surface does not correlate well with the true surface: {:.4}",
                     interaction_correlation
