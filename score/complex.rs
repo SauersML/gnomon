@@ -797,7 +797,6 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
         ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
             method_name = "'Prefer Matching Allele Structure' Heuristic";
-            // This now works because the 'is_chosen' logic from Fix #1 is correct.
             if let Some(c) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
                 // Re-interpret the genotype to get the person's actual alleles for the rationale.
                 let (pa1, pa2) = Heuristic::interpret_person_alleles(c.genotype_bits, &c.alleles.0, &c.alleles.1);
