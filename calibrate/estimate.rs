@@ -997,38 +997,26 @@ pub mod internal {
                         // Use transformed penalty matrix for consistent gradient calculation
                         let s_k_beta = reparam_result.rs[k].dot(beta);
 
-                        // Term 1: Derivative of the penalized deviance component: d/dρₖ [ D_p / (2φ) ]
-                        // D_p = ||y - Xβ̂||² + β̂ᵀS(ρ)β̂ is the penalized deviance.
-                        // For Gaussian REML, the derivative must be calculated using the full chain rule,
-                        // as the envelope theorem does not apply to individual components of the objective.
-                        // d(D_p)/dρₖ = [∂D/∂β]ᵀ[dβ/dρₖ] + ∂(Penalty)/∂ρₖ
+                        // ---
+                        // Component 1: Derivative of the Penalized Deviance
+                        // R/C Counterpart: `oo$D1/(2*scale*gamma)`
+                        // ---
 
-                        // 1. Calculate d(β)/d(ρ_k) using the Implicit Function Theorem:
-                        //    dβ/dρₖ = -H⁻¹ * (∂H/∂ρₖ) * β = -H⁻¹ * (λₖSₖβ)
                         let dbeta_drho_k = -lambdas[k] * internal::robust_solve(
-                            &stable_pirls.penalized_hessian, // This is H
+                            &stable_pirls.penalized_hessian,
                             &s_k_beta,
                         )?;
 
-                        // 2. Calculate the indirect derivative of the deviance via the chain rule:
-                        //    d(Deviance)/dρₖ = [∂D/∂β]ᵀ * [dβ/dρₖ]
                         let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k);
-
-                        // 3. Calculate the direct partial derivative of the penalty term:
-                        //    ∂(Penalty)/∂ρₖ = λₖ * βᵀSₖβ
                         let d_penalty_d_rho_k = lambdas[k] * beta.dot(&s_k_beta);
 
-                        // 4. Combine to get the TOTAL derivative of the penalized deviance, d(D_p)/d(ρ_k).
-                        //    This corresponds to `oo$D1` in the mgcv reference implementation.
-                        let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k;
-
+                        let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k; // Corresponds to oo$D1
                         let penalized_deviance_grad_term = d1 / (2.0 * scale);
 
-                        // Term 2: Derivative of the penalized Hessian determinant: ∂/∂ρₖ [ ½log|H(ρ)| ]
-                        // H(ρ) = XᵀX + S(ρ) is the penalized Hessian matrix
-                        // Using the matrix calculus identity d(log|A|)/dx = tr(A⁻¹ · dA/dx), this becomes:
-                        // ½ · tr(H⁻¹ · ∂H/∂ρₖ) = ½ · tr(H⁻¹ · λₖSₖ) = ½ · λₖ · tr(H⁻¹Sₖ)
-                        // Computing tr(H⁻¹Sₖ) efficiently using column-by-column approach
+                        // ---
+                        // Component 2: Derivative of the Penalized Hessian Determinant
+                        // R/C Counterpart: `oo$trA1/2`
+                        // ---
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..reparam_result.rs[k].ncols() {
                             let s_k_col = reparam_result.rs[k].column(j);
@@ -1039,22 +1027,26 @@ pub mod internal {
                                 trace_h_inv_s_k += h_inv_col[j];
                             }
                         }
-                        let tra1 = lambdas[k] * trace_h_inv_s_k;
+                        let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                         let log_det_h_grad_term = tra1 / 2.0;
 
-                        // Term 3: Derivative of the penalty pseudo-determinant: -∂/∂ρₖ [ ½log|S(ρ)|_+ ]
-                        // The term `reparam_result.det1[k]` is ∂(log|S(ρ)|_+)/∂ρₖ, computed via a numerically
-                        // stable algorithm (see Wood 2011, Appendix B). The formula requires subtracting this derivative.
-                        let log_det_s_grad_term = -reparam_result.det1[k] / 2.0;
+                        // ---
+                        // Component 3: Derivative of the Penalty Pseudo-Determinant
+                        // R/C Counterpart: `rp$det1/2`
+                        // NOTE: The variable name is now positive, matching the R term `rp$det1`.
+                        // The negative sign is applied during final assembly, just like in the R code.
+                        // ---
+                        let log_det_s_grad_term = reparam_result.det1[k] / 2.0;
 
-                        // The final gradient component for the cost function (-V_REML) is the sum of these three parts.
-                        // This calculation corresponds to the formula in the R reference implementation `gam.fit3.R`
-                        // (around line 821): `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`, where our terms
-                        // correspond to D1, trA1, and det1 respectively. The signs match because we are minimizing
-                        // the negative log-likelihood.
-                        cost_gradient[k] = penalized_deviance_grad_term 
-                                         + log_det_h_grad_term 
-                                         + log_det_s_grad_term;
+                        // ---
+                        // Final Gradient Assembly for the MINIMIZER
+                        // This calculation now DIRECTLY AND LITERALLY matches the formula for `REML1`
+                        // in `gam.fit3.R`, which is the gradient of the cost function that `newton` MINIMIZES.
+                        // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`
+                        // ---
+                        cost_gradient[k] = penalized_deviance_grad_term  // Corresponds to `+ oo$D1/...`
+                                         + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
+                                         - log_det_s_grad_term;          // Corresponds to `- rp$det1/2`
                     }
                 }
                 _ => {
