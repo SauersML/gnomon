@@ -354,8 +354,9 @@ struct CriticalIntegrityWarningInfo {
     locus_chr_pos: (String, u32),
     score_name: String,
     conflicts: Vec<ConflictSource>,
-    /// The specific heuristic that was successfully applied and its outcome.
     resolution_method: ResolutionMethod,
+    score_effect_allele: String,
+    score_other_allele: String,
 }
 
 // The "slow path" resolver for complex variants.
@@ -517,6 +518,8 @@ pub fn resolve_complex_variants(
                                             score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
                                             conflicts,
                                             resolution_method,
+                                            score_effect_allele: score_info.effect_allele.clone(),
+                                            score_other_allele: score_info.other_allele.clone(),
                                         });
 
                                     } else {
