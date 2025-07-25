@@ -546,7 +546,16 @@ pub fn stable_penalized_least_squares(
         }
     }
     
-    // Step E: Solve the truncated system if rank < p
+    // Create list of dropped columns (unpivoted indices)
+    let mut computed_dropped_cols = Vec::new();
+    for i in rank..p {
+        if i < pivot.len() {
+            computed_dropped_cols.push(pivot[i]);
+        }
+    }
+
+    // Step E: Solve the system using the stable QR-based method.
+    // This single function handles both full-rank and rank-deficient cases correctly.
     let (beta_full, penalized_hessian_full) = if rank < p {
         solve_truncated_system(
             x,
@@ -554,6 +563,7 @@ pub fn stable_penalized_least_squares(
             weights,
             &pivot,
             rank,
+            &computed_dropped_cols,
             rs_transformed,
             lambdas,
             &q_bar,
@@ -671,6 +681,7 @@ fn solve_truncated_system(
     weights: ArrayView1<f64>,
     pivot: &[usize],
     rank: usize,
+    dropped_cols: &[usize], // List of column indices that were dropped due to rank deficiency
     rs_transformed: &[Array2<f64>],
     lambdas: &[f64],
     q_bar: &Array2<f64>,
@@ -712,23 +723,33 @@ fn solve_truncated_system(
         ).map_err(|_| EstimationError::LayoutError("Failed to concatenate penalty roots".to_string()))?
     };
     
-    // Step 4: Truncate E to include only rows corresponding to kept coefficients
+    // Step 4: Build the truncated penalty square root matrix E_trunc.
+    // This matrix will have dimensions `e_cols x rank`.
     let e_cols = e_full.ncols();
-    let mut e_trunc = Array2::zeros((e_cols, rank));
-    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-        // For each kept column, use the corresponding row from the penalty matrix
-        e_trunc.column_mut(j_trunc).assign(&e_full.row(j_orig));
+    // It is constructed such that its columns correspond to the kept coefficients.
+    
+    // Use the dropped_cols parameter to identify which columns to exclude
+    // Alternatively, we can just use the first `rank` columns from the pivot
+    let mut e_trunc_rows = Vec::with_capacity(rank);
+    
+    // This code uses the dropped_cols parameter to double-check our pivot selection
+    // If a column index is in dropped_cols, we should skip it
+    for &j_orig in pivot.iter().take(rank) {
+        // Verify this column isn't in dropped_cols (defensive programming)
+        if !dropped_cols.contains(&j_orig) {
+            e_trunc_rows.push(e_full.row(j_orig));
+        } else {
+            log::warn!("Column {} found in both pivot[:rank] and dropped_cols", j_orig);
+        }
     }
-    
-    // Step 5: Form augmented matrix by stacking R1 and E
-    let nr = r_rows + e_cols; // Total rows in augmented matrix
+    let e_trunc = ndarray::stack(Axis(0), &e_trunc_rows)
+        .map_err(|_| EstimationError::LayoutError("Failed to stack truncated E rows".to_string()))?;
+
+    // Step 5: Form the augmented matrix by stacking R1_trunc and E_trunc.
+    let nr = r_rows + e_cols;
     let mut r_augmented = Array2::zeros((nr, rank));
-    
-    // Copy R1 to the top part
     r_augmented.slice_mut(s![..r_rows, ..]).assign(&r1_trunc);
-    
-    // Copy E to the bottom part
-    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc);
+    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc.t()); // Transpose E_trunc to align
     
     // Step 6: Perform QR decomposition on the augmented matrix
     let (q_aug, r_aug) = r_augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
