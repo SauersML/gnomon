@@ -598,8 +598,8 @@ pub mod internal {
                         + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n + mp - 1.0) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    // Return negative REML score for minimization
-                    Ok(-reml)
+                    // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
+                    Ok(reml)
                 }
                 _ => {
                     // For non-Gaussian GLMs, use the LAML approximation
