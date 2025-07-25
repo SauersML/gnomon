@@ -681,42 +681,51 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
     };
 
+    // A helper to determine if a given conflict was the one chosen by the heuristic.
+    let is_chosen = |method: &ResolutionMethod, conflict: &ConflictSource, score_ea: &str, score_oa: &str| -> bool {
+        let bim_a1 = &conflict.alleles.0;
+        let bim_a2 = &conflict.alleles.1;
+
+        match method {
+            ResolutionMethod::ExactScoreAlleleMatch {..} => {
+                (bim_a1 == score_ea && bim_a2 == score_oa) || (bim_a1 == score_oa && bim_a2 == score_ea)
+            }
+            ResolutionMethod::PrioritizeUnambiguousGenotype {..} => {
+                let is_a1_valid = bim_a1 == score_ea || bim_a1 == score_oa;
+                let is_a2_valid = bim_a2 == score_ea || bim_a2 == score_oa;
+                is_a1_valid && is_a2_valid
+            }
+            ResolutionMethod::PreferHeterozygous {..} => conflict.genotype_bits == 0b10,
+            // The consistent dosage rule applies to all conflicts equally.
+            ResolutionMethod::ConsistentDosage {..} => true,
+        }
+    };
+
+
     // Build the final report string.
     writeln!(report, "Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
-    writeln!(
-        report,
-        "  Locus:  {}:{}",
-        data.locus_chr_pos.0, data.locus_chr_pos.1
-    )
-    .unwrap();
+    writeln!(report, "  Locus:  {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
     writeln!(report, "  Score:  {}", data.score_name).unwrap();
 
-    match &data.resolution_method {
-        ResolutionMethod::ConsistentDosage { dosage } => {
-            writeln!(report, "  Method: 'Consistent Dosage' Heuristic").unwrap();
-            writeln!(report, "  Outcome: All conflicting sources yielded a consistent dosage of {dosage}, so computation continued.").unwrap();
-        }
-        ResolutionMethod::PreferHeterozygous { chosen_dosage } => {
-            writeln!(report, "  Method: 'Prefer Heterozygous' Heuristic").unwrap();
-            writeln!(report, "  Outcome: A single heterozygous call was chosen over conflicting homozygous call(s), yielding a dosage of {chosen_dosage}.").unwrap();
-        }
-        ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage } => {
-            writeln!(report, "  Method: 'Exact Score Allele Match' Heuristic").unwrap();
-            writeln!(report, "  Outcome: A single BIM entry's alleles matched the score file perfectly, yielding a dosage of {chosen_dosage}.").unwrap();
-        }
-        ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage } => {
-            writeln!(
-                report,
-                "  Method: 'Prioritize Unambiguous Genotype' Heuristic"
-            )
-            .unwrap();
-            writeln!(report, "  Outcome: A single interpretation was chosen because its alleles matched the score file's allele better than alternatives, yielding a dosage of {chosen_dosage}.").unwrap();
-        }
-    }
+    let (method_name, rationale) = match &data.resolution_method {
+        ResolutionMethod::ConsistentDosage { dosage } => ("'Consistent Dosage' Heuristic", format!("All conflicting sources yielded a consistent dosage of {dosage}, so computation continued.")),
+        ResolutionMethod::PreferHeterozygous { .. } => ("'Prefer Heterozygous' Heuristic", "A single heterozygous call was chosen over conflicting homozygous call(s).".to_string()),
+        ResolutionMethod::ExactScoreAlleleMatch { .. } => ("'Exact Score Allele Match' Heuristic", "A single BIM entry's alleles matched the score file perfectly.".to_string()),
+        ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => ("'Prioritize Unambiguous Genotype' Heuristic", "A single interpretation was chosen because its alleles matched the score file's standard alleles.".to_string()),
+    };
+    writeln!(report, "  Method: {}", method_name).unwrap();
+    writeln!(report, "  Score File requires: Effect={}, Other={}", data.score_effect_allele, data.score_other_allele).unwrap();
 
-    writeln!(report, "  \n  Conflicting Sources Found:").unwrap();
+
+    writeln!(report, "\n  Conflicting Sources Considered:").unwrap();
 
     for conflict in &data.conflicts {
+        let prefix = if is_chosen(&data.resolution_method, conflict, &data.score_effect_allele, &data.score_other_allele) {
+            "-> Chosen:  "
+        } else {
+            "   Rejected:"
+        };
+
         let interpretation = interpret_genotype(
             conflict.genotype_bits,
             &conflict.alleles.0,
@@ -724,7 +733,8 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         );
         writeln!(
             report,
-            "    - BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+            "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+            prefix,
             conflict.bim_row.0,
             conflict.alleles.0,
             conflict.alleles.1,
@@ -733,6 +743,9 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         )
         .unwrap();
     }
+
+    writeln!(report, "\n  Rationale: {}", rationale).unwrap();
+
 
     report.trim_end().to_string()
 }
