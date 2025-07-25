@@ -439,11 +439,56 @@ pub struct ReparamResult {
     pub det1: Array1<f64>,
     /// Orthogonal transformation matrix Qs
     pub qs: Array2<f64>,
-    /// Transformed penalty components rS
-    pub rs: Vec<Array2<f64>>,
+    /// Transformed penalty square roots rS (each is p x rank_k)
+    pub rs_transformed: Vec<Array2<f64>>,
+    /// Balanced penalty square root for rank detection (rank x p matrix)
+    pub eb: Array2<f64>,
 }
 
 use indicatif::{ProgressBar, ProgressStyle};
+
+/// Computes penalty square roots from full penalty matrices using eigendecomposition
+/// Returns "skinny" matrices of dimension p x rank_k where rank_k is the rank of each penalty
+pub fn compute_penalty_square_roots(s_list: &[Array2<f64>]) -> Result<Vec<Array2<f64>>, EstimationError> {
+    let mut rs_list = Vec::with_capacity(s_list.len());
+    
+    for s in s_list {
+        let p = s.nrows();
+        
+        // Use eigendecomposition for symmetric positive semi-definite matrices
+        let (eigenvalues, eigenvectors) = s.eigh(UPLO::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        
+        // Count positive eigenvalues to determine rank
+        let tolerance = 1e-12;
+        let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+        
+        if rank_k == 0 {
+            // Zero penalty matrix - return p x 0 matrix
+            rs_list.push(Array2::zeros((p, 0)));
+            continue;
+        }
+        
+        // Create skinny square root matrix: rS = V * diag(sqrt(λ))
+        // Only include eigenvectors corresponding to positive eigenvalues
+        let mut rs = Array2::zeros((p, rank_k));
+        let mut col_idx = 0;
+        
+        for (i, &eigenval) in eigenvalues.iter().enumerate() {
+            if eigenval > tolerance {
+                let sqrt_eigenval = eigenval.sqrt();
+                let eigenvec = eigenvectors.column(i);
+                // Each column of rs is sqrt(eigenvalue) * eigenvector
+                rs.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+                col_idx += 1;
+            }
+        }
+        
+        rs_list.push(rs);
+    }
+    
+    Ok(rs_list)
+}
 
 /// Helper to construct the summed, weighted penalty matrix S_lambda.
 /// This version works with full-sized p × p penalty matrices from s_list.
@@ -491,8 +536,10 @@ pub fn construct_s_lambda(
 
 /// Implements the exact stable reparameterization algorithm from Wood (2011) Appendix B
 /// This follows the complete recursive similarity transformation procedure
+/// Now accepts penalty square roots (rS) instead of full penalty matrices
+/// Each rs_list[i] is a p x rank_i matrix where rank_i is the rank of penalty i
 pub fn stable_reparameterization(
-    s_list: &[Array2<f64>],
+    rs_list: &[Array2<f64>],  // penalty square roots (each is p x rank_i)
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
@@ -501,7 +548,7 @@ pub fn stable_reparameterization(
         lambdas.len()
     );
     let p = layout.total_coeffs;
-    let m = s_list.len(); // Number of penalty matrices
+    let m = rs_list.len(); // Number of penalty square roots
 
     if m == 0 {
         return Ok(ReparamResult {
@@ -509,16 +556,20 @@ pub fn stable_reparameterization(
             log_det: 0.0,
             det1: Array1::zeros(0),
             qs: Array2::eye(p),
-            rs: vec![],
+            rs_transformed: vec![],
+            eb: Array2::zeros((0, p)), // rank x p matrix
         });
     }
 
-    // Wood (2011) Appendix B: get_stableS algorithm - Transform-In-Place Architecture
+    // Wood (2011) Appendix B: get_stableS algorithm
     let eps = f64::EPSILON.powf(1.0 / 3.0); // d_tol - group similar sized penalties
+    let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 
     // Initialize global transformation matrix and working matrices
     let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
-    let mut rs_current = s_list.to_vec(); // Working penalty matrices (will be transformed)
+    
+    // Clone penalty square roots - we'll transform these in-place
+    let mut rs_current = rs_list.to_vec();
 
     // Initialize iteration variables following get_stableS
     let mut k_offset = 0_usize; // K: number of parameters already processed  
@@ -526,24 +577,24 @@ pub fn stable_reparameterization(
     let mut gamma: Vec<usize> = (0..m).collect(); // Active penalty indices
 
     // Main similarity transform loop - mirrors get_stableS structure
-    let mut iteration = 0;
     loop {
-        iteration += 1;
         if gamma.is_empty() || q_current == 0 {
             break;
         }
 
-        // Step 1: Find Frobenius norms of penalties in current sub-problem (like get_stableS)
+        // Step 1: Find Frobenius norms of penalties in current sub-problem
+        // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
         let mut frob_norms = Vec::new();
         let mut max_omega: f64 = 0.0;
 
         for &i in &gamma {
-            // Extract current Q x Q active sub-block
-            let active_block = rs_current[i].slice(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]);
-            let frob_norm = active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            // Extract active rows from penalty square root (columns stay the same)
+            let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
+            
+            // Form the active sub-block of full penalty matrix S_i = rS_i * rS_i^T
+            let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
+            
+            let frob_norm = s_active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
             let omega_i = frob_norm * lambdas[i];
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
@@ -553,8 +604,8 @@ pub fn stable_reparameterization(
             break; // All remaining penalties are numerically zero
         }
 
-        // Step 2: Partition into dominant α and subdominant γ' sets (like get_stableS)
-        let threshold = eps * max_omega; // d_tol threshold
+        // Step 2: Partition into dominant α and subdominant γ' sets
+        let threshold = eps * max_omega;
         let alpha: Vec<usize> = frob_norms
             .iter()
             .filter(|(_, omega)| *omega >= threshold)
@@ -570,14 +621,12 @@ pub fn stable_reparameterization(
             break;
         }
 
-        // Step 3: Form weighted sum of dominant penalties and eigendecompose (like get_stableS)
+        // Step 3: Form weighted sum of dominant penalties and eigendecompose
         let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
-            let active_block = rs_current[i].slice(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]);
-            sb.scaled_add(lambdas[i], &active_block);
+            let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
+            let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
+            sb.scaled_add(lambdas[i], &s_active_block);
         }
 
         // Eigendecomposition to get rank and eigenvectors
@@ -589,117 +638,119 @@ pub fn stable_reparameterization(
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
 
-        let r_tol = f64::EPSILON.powf(0.75); // Like get_stableS r_tol
         let rank_tolerance = eigenvalues[sorted_indices[0]].max(1.0) * r_tol;
         let r = sorted_indices
             .iter()
             .take_while(|&&i| eigenvalues[i] > rank_tolerance)
             .count();
 
-        // Step 4: Check termination criterion (like get_stableS)
+        // Step 4: Check termination criterion
         if r == q_current {
             break; // Full rank - terminate
         }
 
-        // Step 5: Update global transformation matrix Qf (like get_stableS)
-        // Reorder eigenvectors by descending eigenvalues
+        // Step 5: Update global transformation matrix Qf
         let u_reordered = u.select(Axis(1), &sorted_indices);
 
-        if iteration == 1 {
-            // First iteration: copy U to appropriate block of Qf
-            qf.slice_mut(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ])
-            .assign(&u_reordered);
-        } else {
-            // Subsequent iterations: multiply current Qf block by U
-            let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
-            let qf_new = qf_block.dot(&u_reordered);
-            qf.slice_mut(s![.., k_offset..k_offset + q_current])
-                .assign(&qf_new);
-        }
+        // Update the appropriate block of Qf
+        let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
+        let qf_new = qf_block.dot(&u_reordered);
+        qf.slice_mut(s![.., k_offset..k_offset + q_current])
+            .assign(&qf_new);
 
-        // Step 6: Extract null space eigenvectors
-        let u_n = u_reordered.slice(s![.., r..]);
-
-        if u_n.ncols() == 0 {
-            break;
-        }
-
-        // Step 7: Transform penalty components for next iteration (like get_stableS)
-        // Following the exact logic: sub-dominant penalties are transformed to null space for next iteration
-        let mut next_rs = vec![Array2::zeros((p, p)); m];
-        let next_q = u_n.ncols();
-
-        for i in 0..m {
-            if gamma_prime.contains(&i) {
-                // Sub-dominant penalties: transform to null space for next iteration's sub-problem
-                let active_block = rs_current[i].slice(s![
-                    k_offset..k_offset + q_current,
-                    k_offset..k_offset + q_current
-                ]);
-                let transformed_block = u_n.t().dot(&active_block.dot(&u_n));
-
-                // Place the transformed block in the next iteration's position
-                next_rs[i]
-                    .slice_mut(s![
-                        k_offset + r..k_offset + r + next_q,
-                        k_offset + r..k_offset + r + next_q
-                    ])
-                    .assign(&transformed_block);
-            } else {
-                // Copy unchanged parts for non-active penalties
-                next_rs[i] = rs_current[i].clone();
+        // Step 6: Transform penalty square roots for both alpha and gamma_prime sets
+        // This is the critical in-place transformation following mgcv's get_stableS
+        for &i in gamma.iter() {
+            // Number of columns in this penalty root - used for transformation
+            
+            // Extract active rows
+            let c_matrix = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]).to_owned();
+            
+            if alpha.contains(&i) {
+                // Dominant penalties: transform with U_r (first r eigenvectors)
+                let u_r = u_reordered.slice(s![.., ..r]);
+                let b_matrix = u_r.t().dot(&c_matrix); // r x rank_i
+                
+                // Copy transformed part back
+                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..])
+                    .assign(&b_matrix);
+                
+                // Zero out the null space part
+                if k_offset + r < k_offset + q_current {
+                    rs_current[i].slice_mut(s![k_offset + r..k_offset + q_current, ..])
+                        .fill(0.0);
+                }
+            } else if gamma_prime.contains(&i) {
+                // Sub-dominant penalties: transform with U_n (null space eigenvectors)
+                let u_n = u_reordered.slice(s![.., r..]);
+                let b_matrix = u_n.t().dot(&c_matrix); // (q_current - r) x rank_i
+                
+                // Zero out the range space part
+                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..])
+                    .fill(0.0);
+                
+                // Copy transformed part to null space rows
+                rs_current[i].slice_mut(s![k_offset + r..k_offset + q_current, ..])
+                    .assign(&b_matrix);
             }
         }
 
         // Update for next iteration
-        rs_current = next_rs;
         k_offset += r;
-        q_current = next_q;
+        q_current -= r;
         gamma = gamma_prime;
     }
 
-    // AFTER LOOP: Apply final transformation to get consistent basis (Fix 3)
+    // AFTER LOOP: Generate final outputs from the transformed penalty roots
 
-    // Step 8: Calculate final transformed total penalty matrix using final Qf
-    let mut s_original_total = Array2::zeros((p, p));
-    for i in 0..m {
-        s_original_total.scaled_add(lambdas[i], &s_list[i]);
-    }
-    let s_transformed = qf.t().dot(&s_original_total.dot(&qf));
+    // Step 1: The loop has finished - rs_current now contains the fully transformed penalty roots
+    let final_rs_transformed = rs_current;
 
-    // Step 9: Transform all component penalties using final Qf (for consistent derivative calculation)
-    let mut rs_transformed = Vec::with_capacity(m);
+    // Step 2: Construct the final transformed total penalty matrix
+    let mut s_transformed = Array2::zeros((p, p));
     for i in 0..m {
-        let s_k_transformed = qf.t().dot(&s_list[i].dot(&qf));
-        rs_transformed.push(s_k_transformed);
+        // Form full penalty from transformed root: S_k = rS_k * rS_k^T
+        let s_k_transformed = final_rs_transformed[i].dot(&final_rs_transformed[i].t());
+        s_transformed.scaled_add(lambdas[i], &s_k_transformed);
     }
 
-    // Step 10: Calculate stable log-determinant
-    use crate::calibrate::estimate::internal::calculate_log_det_pseudo;
-    let log_det = calculate_log_det_pseudo(&s_transformed).unwrap_or_else(|_| {
-        // Fallback: eigenvalue computation
-        match s_transformed.eigh(UPLO::Lower) {
-            Ok((eigenvalues, _)) => eigenvalues
-                .iter()
-                .filter(|&&ev| ev > 1e-12)
-                .map(|&ev| ev.ln())
-                .sum(),
-            Err(_) => 0.0,
-        }
-    });
-
-    // Step 11: Calculate derivatives with consistent basis (Fix 3)
-    let mut det1 = Array1::zeros(lambdas.len());
-
-    // Compute pseudo-inverse of transformed total penalty
+    // Step 3: Compute the balanced penalty square root (Eb) from s_transformed
+    // Use eigendecomposition: if S = V*D*V^T, then sqrt(S) = V*sqrt(D)*V^T
     let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
         .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-
+    
+    // Count non-zero eigenvalues to determine the rank
     let tolerance = 1e-12;
+    let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+    
+    // Construct Eb as the matrix square root, keeping only non-zero eigenvalues
+    let mut eb = Array2::zeros((p, penalty_rank));
+    let mut col_idx = 0;
+    for (i, &eigenval) in s_eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let sqrt_eigenval = eigenval.sqrt();
+            let eigenvec = s_eigenvectors.column(i);
+            // Each column of Eb is sqrt(eigenvalue) * eigenvector
+            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+            col_idx += 1;
+        }
+    }
+    
+    // Eb should be transposed to be penalty_rank x p (matching mgcv's convention)
+    let eb = eb.t().to_owned();
+
+    // Step 4: Calculate log-determinant from the eigenvalues we already computed
+    let log_det: f64 = s_eigenvalues
+        .iter()
+        .filter(|&&ev| ev > tolerance)
+        .map(|&ev| ev.ln())
+        .sum();
+
+    // Step 5: Calculate derivatives using the correct transformed matrices
+    let mut det1 = Array1::zeros(lambdas.len());
+    
+    // Compute pseudo-inverse of transformed total penalty
     let mut s_plus = Array2::zeros((p, p));
     for (i, &eigenval) in s_eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
@@ -712,10 +763,11 @@ pub fn stable_reparameterization(
         }
     }
 
-    // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed) - BOTH matrices in same basis
+    // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
     for k in 0..lambdas.len() {
-        let s_plus_times_s_k_transformed = s_plus.dot(&rs_transformed[k]);
-        let trace: f64 = s_plus_times_s_k_transformed.diag().sum();
+        let s_k_transformed = final_rs_transformed[k].dot(&final_rs_transformed[k].t());
+        let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
+        let trace: f64 = s_plus_times_s_k.diag().sum();
         det1[k] = lambdas[k] * trace;
     }
 
@@ -724,7 +776,8 @@ pub fn stable_reparameterization(
         log_det,
         det1,
         qs: qf,
-        rs: rs_transformed, // Return the consistently transformed components
+        rs_transformed: final_rs_transformed,
+        eb,
     })
 }
 
