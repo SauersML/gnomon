@@ -984,15 +984,45 @@ pub mod internal {
                         // Use transformed penalty matrix for consistent gradient calculation
                         let s_k_beta = reparam_result.rs[k].dot(beta);
 
-                        // Term 1: Derivative of the penalized deviance component: ∂/∂ρₖ [ D_p / (2φ) ]
-                        // D_p = ||y - Xβ̂||² + β̂ᵀS(ρ)β̂ is the penalized deviance
-                        // Due to the envelope theorem for Gaussian REML, the derivatives from the β̂ dependency on ρ
-                        // cancel out, leaving only the direct partial derivative with respect to ρ:
-                        // ∂(D_p/∂ρₖ) = ∂(λₖβ̂ᵀSₖβ̂)/∂ρₖ = λₖ * β̂ᵀSₖβ̂
-                        // where Sₖ is the kth penalty matrix and λₖ = exp(ρₖ) is the kth smoothing parameter
-                        let beta_s_k_beta = lambdas[k] * beta.dot(&s_k_beta);
+                    // Pre-computation for the gradient of the unpenalized deviance (RSS)
+                    // This is ∂D/∂β = -2 * Xᵀ(y - Xβ), which is needed for the chain rule.
+                    // IMPORTANT: Must use the transformed design matrix to match the transformed beta.
+                    let qs = &reparam_result.qs;
+                    let x_transformed = self.x().dot(qs);
+                    let eta = x_transformed.dot(beta);
+                    let residuals = &self.y() - &eta;
+                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&residuals);
 
-                        let d1 = beta_s_k_beta;
+                    // Three-term gradient computation following mgcv gdi1
+                    for k in 0..lambdas.len() {
+                        // Use transformed penalty matrix for consistent gradient calculation
+                        let s_k_beta = reparam_result.rs[k].dot(beta);
+
+                        // Term 1: Derivative of the penalized deviance component: d/dρₖ [ D_p / (2φ) ]
+                        // D_p = ||y - Xβ̂||² + β̂ᵀS(ρ)β̂ is the penalized deviance.
+                        // For Gaussian REML, the derivative must be calculated using the full chain rule,
+                        // as the envelope theorem does not apply to individual components of the objective.
+                        // d(D_p)/dρₖ = [∂D/∂β]ᵀ[dβ/dρₖ] + ∂(Penalty)/∂ρₖ
+
+                        // 1. Calculate d(β)/d(ρ_k) using the Implicit Function Theorem:
+                        //    dβ/dρₖ = -H⁻¹ * (∂H/∂ρₖ) * β = -H⁻¹ * (λₖSₖβ)
+                        let dbeta_drho_k = -lambdas[k] * internal::robust_solve(
+                            &stable_pirls.penalized_hessian, // This is H
+                            &s_k_beta,
+                        )?;
+
+                        // 2. Calculate the indirect derivative of the deviance via the chain rule:
+                        //    d(Deviance)/dρₖ = [∂D/∂β]ᵀ * [dβ/dρₖ]
+                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k);
+
+                        // 3. Calculate the direct partial derivative of the penalty term:
+                        //    ∂(Penalty)/∂ρₖ = λₖ * βᵀSₖβ
+                        let d_penalty_d_rho_k = lambdas[k] * beta.dot(&s_k_beta);
+
+                        // 4. Combine to get the TOTAL derivative of the penalized deviance, d(D_p)/d(ρ_k).
+                        //    This corresponds to `oo$D1` in the mgcv reference implementation.
+                        let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k;
+
                         let penalized_deviance_grad_term = d1 / (2.0 * scale);
 
                         // Term 2: Derivative of the penalized Hessian determinant: ∂/∂ρₖ [ ½log|H(ρ)| ]
