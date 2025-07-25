@@ -976,13 +976,13 @@ pub mod internal {
                     let scale = dp / (n - edf).max(1e-8);
 
                     // Three-term gradient computation following mgcv gdi1
-                    for k in 0..lambdas.len() {
-                        // We'll calculate s_k_beta for all cases, as it's needed for both paths
-                        // For Identity link, this is all we need due to envelope theorem
-                        // For other links, we'll use it to compute dβ/dρ_k
+                    // for k in 0..lambdas.len() {
+                    //   We'll calculate s_k_beta for all cases, as it's needed for both paths
+                    //   For Identity link, this is all we need due to envelope theorem
+                    //   For other links, we'll use it to compute dβ/dρ_k
                         
-                        // Use transformed penalty matrix for consistent gradient calculation
-                        let s_k_beta = reparam_result.rs[k].dot(beta);
+                    //   Use transformed penalty matrix for consistent gradient calculation
+                    //   let s_k_beta = reparam_result.rs[k].dot(beta);
 
                     // Pre-computation for the gradient of the unpenalized deviance (RSS)
                     // This is ∂D/∂β = -2 * Xᵀ(y - Xβ), which is needed for the chain rule.
