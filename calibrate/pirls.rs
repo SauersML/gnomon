@@ -546,14 +546,6 @@ pub fn stable_penalized_least_squares(
         }
     }
     
-    // Create list of dropped columns (unpivoted indices)
-    let mut dropped_cols = Vec::new();
-    for i in rank..p {
-        if i < pivot.len() {
-            dropped_cols.push(pivot[i]);
-        }
-    }
-
     // Step E: Solve the truncated system if rank < p
     let (beta_full, penalized_hessian_full) = if rank < p {
         solve_truncated_system(
@@ -562,7 +554,6 @@ pub fn stable_penalized_least_squares(
             weights,
             &pivot,
             rank,
-            &dropped_cols,
             rs_transformed,
             lambdas,
             &q_bar,
@@ -664,6 +655,15 @@ fn pivoted_qr(matrix: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>, Vec<usi
 }
 
 /// Solve the truncated system for rank-deficient case
+/// 
+/// This implements the numerically stable QR-based approach from mgcv's C function `pls_fit1`,
+/// which avoids forming the normal equations directly. Instead, it:
+/// 1. Works with QR factors directly
+/// 2. Truncates both R from QR(sqrt(W)X) and the penalty square root E
+/// 3. Forms an augmented system by stacking these truncated matrices
+/// 4. Performs another QR decomposition and solves via back-substitution
+///
+/// This is much more numerically stable as it never explicitly forms X'WX.
 #[allow(clippy::too_many_arguments)]
 fn solve_truncated_system(
     x: ArrayView2<f64>,
@@ -671,18 +671,113 @@ fn solve_truncated_system(
     weights: ArrayView1<f64>,
     pivot: &[usize],
     rank: usize,
-    _dropped_cols: &[usize],
     rs_transformed: &[Array2<f64>],
     lambdas: &[f64],
     q_bar: &Array2<f64>,
     r_bar: &Array2<f64>,
     neg_indices: &[usize],
 ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-    use ndarray_linalg::Solve;
+    use ndarray::s;
+    use ndarray_linalg::QR;
     
     let p = x.ncols();
+
+    // Step 1: Extract the R factor from sqrt(W)X decomposition
+    // r_bar is already the R factor from QR decomposition of sqrt(W)X
+    let r_rows = r_bar.nrows().min(p);
+    let r_bar_active = r_bar.slice(s![..r_rows, ..]).to_owned();
     
-    // Step 1: Build the full p x p penalty matrix S_lambda
+    // Step 2: Create truncated R1 by dropping columns according to pivot
+    let mut r1_trunc = Array2::zeros((r_rows, rank));
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        r1_trunc.column_mut(j_trunc).assign(&r_bar_active.column(j_orig));
+    }
+    
+    // Step 3: Build the combined penalty square root E
+    // First, create the full penalty matrix's square root
+    let mut scaled_roots = Vec::new();
+    for (k, &lambda) in lambdas.iter().enumerate() {
+        if k < rs_transformed.len() && lambda > 1e-12 { // Use a tolerance
+            let sqrt_lambda = lambda.sqrt();
+            scaled_roots.push(&rs_transformed[k] * sqrt_lambda);
+        }
+    }
+    
+    let e_full = if scaled_roots.is_empty() {
+        Array2::zeros((p, 0))
+    } else {
+        ndarray::concatenate(
+            Axis(1),
+            &scaled_roots.iter().map(|m| m.view()).collect::<Vec<_>>(),
+        ).map_err(|_| EstimationError::LayoutError("Failed to concatenate penalty roots".to_string()))?
+    };
+    
+    // Step 4: Truncate E to include only rows corresponding to kept coefficients
+    let e_cols = e_full.ncols();
+    let mut e_trunc = Array2::zeros((e_cols, rank));
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        // For each kept column, use the corresponding row from the penalty matrix
+        e_trunc.column_mut(j_trunc).assign(&e_full.row(j_orig));
+    }
+    
+    // Step 5: Form augmented matrix by stacking R1 and E
+    let nr = r_rows + e_cols; // Total rows in augmented matrix
+    let mut r_augmented = Array2::zeros((nr, rank));
+    
+    // Copy R1 to the top part
+    r_augmented.slice_mut(s![..r_rows, ..]).assign(&r1_trunc);
+    
+    // Copy E to the bottom part
+    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc);
+    
+    // Step 6: Perform QR decomposition on the augmented matrix
+    let (q_aug, r_aug) = r_augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    // Step 7: Create augmented right-hand-side (sqrt(W)z for the top, zeros for the bottom)
+    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
+    let sqrt_w_z = &sqrt_w_abs * &y;
+    
+    // Transform the RHS using Q from first QR decomposition (sqrt(W)X = QR)
+    let y_transformed = q_bar.t().dot(&sqrt_w_z);
+    
+    // Keep only the first r_rows elements that correspond to R1
+    let y_trunc = if y_transformed.len() > r_rows {
+        y_transformed.slice(s![..r_rows]).to_owned()
+    } else {
+        y_transformed.clone()
+    };
+    
+    // Create augmented RHS with zeros for the penalty part
+    let mut rhs_aug = Array1::zeros(nr);
+    rhs_aug.slice_mut(s![..r_rows]).assign(&y_trunc);
+    
+    // Step 8: Apply Q' from the augmented QR decomposition
+    let y_aug = q_aug.t().dot(&rhs_aug);
+    
+    // Step 9: Back-substitution to solve R * beta_trunc = y_aug
+    let mut beta_trunc = Array1::zeros(rank);
+    
+    // Perform back substitution manually for maximum control and stability
+    for k in (0..rank).rev() {
+        let mut sum = 0.0;
+        for j in (k + 1)..rank {
+            sum += r_aug[[k, j]] * beta_trunc[j];
+        }
+        beta_trunc[k] = (y_aug[k] - sum) / r_aug[[k, k]];
+    }
+    
+    // Step 10: Re-inflate to full dimensions with zeros for dropped columns
+    let mut beta_full = Array1::zeros(p);
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        beta_full[j_orig] = beta_trunc[j_trunc];
+    }
+    
+    // Step 11: Compute the full penalized Hessian for consistency
+    // Unlike in the original function, we must reconstruct it from scratch
+    // since we never formed it explicitly during the solution process
+    let data_hessian_full = compute_corrected_data_hessian(p, neg_indices, q_bar, r_bar)?;
+    
+    // Build the full penalty matrix S_lambda
     let mut s_lambda = Array2::zeros((p, p));
     for (k, &lambda) in lambdas.iter().enumerate() {
         if k < rs_transformed.len() {
@@ -691,45 +786,6 @@ fn solve_truncated_system(
         }
     }
     
-    // Step 2: Extract rank x rank sub-matrix of S_lambda using kept indices
-    let mut s_lambda_trunc = Array2::zeros((rank, rank));
-    for (i_trunc, &i_orig) in pivot.iter().take(rank).enumerate() {
-        for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-            s_lambda_trunc[[i_trunc, j_trunc]] = s_lambda[[i_orig, j_orig]];
-        }
-    }
-    
-    // Step 3: Form truncated penalized Hessian using the corrected data Hessian
-    let data_hessian_full = compute_corrected_data_hessian(p, neg_indices, q_bar, r_bar)?;
-    
-    let mut data_hessian_trunc = Array2::zeros((rank, rank));
-    for (i_trunc, &i_orig) in pivot.iter().take(rank).enumerate() {
-        for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-            data_hessian_trunc[[i_trunc, j_trunc]] = data_hessian_full[[i_orig, j_orig]];
-        }
-    }
-    
-    let h_trunc = data_hessian_trunc + s_lambda_trunc;
-    
-    // Step 4: Form truncated RHS (X'Wz)
-    let w_z = &weights * &y;
-    let rhs_full = x.t().dot(&w_z);
-    
-    let mut rhs_trunc = Array1::zeros(rank);
-    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-        rhs_trunc[j_trunc] = rhs_full[j_orig];
-    }
-    
-    // Step 5: Solve truncated system
-    let beta_trunc = h_trunc.solve(&rhs_trunc).map_err(EstimationError::LinearSystemSolveFailed)?;
-    
-    // Step 6: Re-inflate to full dimensions
-    let mut beta_full = Array1::zeros(p);
-    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-        beta_full[j_orig] = beta_trunc[j_trunc];
-    }
-    
-    // Step 7: The full penalized Hessian is the corrected data Hessian plus full penalty
     let h_full = data_hessian_full + s_lambda;
     
     Ok((beta_full, h_full))
