@@ -208,11 +208,11 @@ pub fn train_model(
     let x_transformed = reml_state.x().dot(&reparam_result.qs);
 
     // 3. Call the STABLE P-IRLS solver with the transformed matrices.
-    let final_fit_transformed = pirls::fit_model_for_fixed_rho_stable(
+    let final_fit_transformed = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_transformed.view(),         // Use transformed X
         reml_state.y(),
-        &reparam_result.s_transformed, // Pass transformed S
+        &reparam_result.rs, // Use the transformed component penalties
         &layout,
         config,
     )?;
@@ -222,7 +222,7 @@ pub fn train_model(
     //    beta_original = Qs * beta_transformed
     let final_beta_original = reparam_result.qs.dot(&final_fit_transformed.beta);
 
-    // 5. Map the CORRECTED coefficients from the original basis.
+    // 5. Map the coefficients from the original basis.
     let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
@@ -233,7 +233,6 @@ pub fn train_model(
         config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
-        transformation_matrix: Some(reparam_result.qs),
     })
 }
 
@@ -393,11 +392,11 @@ pub mod internal {
             let x_transformed = self.x.dot(&reparam_result.qs);
             
             // 3. Run P-IRLS with transformed matrices
-            let pirls_result = pirls::fit_model_for_fixed_rho_stable(
+            let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 x_transformed.view(),
                 self.y,
-                &reparam_result.s_transformed,
+                &reparam_result.rs, // Use the transformed component penalties
                 self.layout,
                 self.config,
             );
@@ -2838,7 +2837,6 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 config: model_config,
                 coefficients: coeffs,
                 lambdas: fixed_rho.mapv(f64::exp).to_vec(),
-                transformation_matrix: None,
             };
 
             // Create test points at different ends of the predictor range.
