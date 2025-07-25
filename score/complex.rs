@@ -537,8 +537,8 @@ pub fn resolve_complex_variants(
                                         conflicting_interpretations: &matching_interpretations,
                                     };
 
-                                    // Collect conflict details once before branching.
-                                    let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                    // Collect conflict details from the original, unfiltered list.
+                                    let conflicts: Vec<_> = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
                                         bim_row: ctx.0,
                                         alleles: (ctx.1.clone(), ctx.2.clone()),
                                         genotype_bits: *bits,
