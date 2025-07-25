@@ -120,6 +120,8 @@ pub enum Heuristic {
     ExactScoreAlleleMatch,
     /// Tries to find one interpretation composed ONLY of score file alleles.
     PrioritizeUnambiguousGenotype,
+    /// Prefers an interpretation where allele lengths match the score file.
+    PreferMatchingAlleleStructure,
     /// Checks if all conflicting interpretations result in the same dosage.
     ConsistentDosage,
     /// As a last resort, prefers a single heterozygous call over homozygous ones.
@@ -133,12 +135,13 @@ impl Heuristic {
         match self {
             Heuristic::ExactScoreAlleleMatch => self.resolve_exact_match(context),
             Heuristic::PrioritizeUnambiguousGenotype => self.resolve_unambiguous_genotype(context),
+            Heuristic::PreferMatchingAlleleStructure => self.resolve_prefer_matching_allele_structure(context),
             Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
             Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
         }
     }
 
-    /// **Heuristic 1:** The most stringent rule. Succeeds only if exactly one
+    /// Heuristic 1: The most stringent rule. Succeeds only if exactly one
     /// BIM entry's alleles are identical to the score file's alleles.
     fn resolve_exact_match(&self, context: &ResolutionContext) -> Option<Resolution> {
         let score_eff_allele = &context.score_info.effect_allele;
@@ -165,7 +168,44 @@ impl Heuristic {
         }
     }
 
-    /// **Heuristic 2:** Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
+    /// Heuristic 3: Solves conflicts by preferring the interpretation whose allele
+    /// lengths match the allele lengths from the score file.
+    fn resolve_prefer_matching_allele_structure(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let score_a1_len = context.score_info.effect_allele.len();
+        let score_a2_len = context.score_info.other_allele.len();
+
+        let matching_structure_interpretations: Vec<_> = context
+            .conflicting_interpretations
+            .iter()
+            .filter(|(_, (_, bim_a1, bim_a2))| {
+                let bim_a1_len = bim_a1.len();
+                let bim_a2_len = bim_a2.len();
+
+                // Check for a match in either direction to handle swapped alleles
+                (bim_a1_len == score_a1_len && bim_a2_len == score_a2_len)
+                    || (bim_a1_len == score_a2_len && bim_a2_len == score_a1_len)
+            })
+            .collect();
+
+        // If we found exactly one interpretation with a matching allele structure, it's our winner.
+        if matching_structure_interpretations.len() == 1 {
+            let (packed_geno, (_, bim_a1, bim_a2)) = matching_structure_interpretations[0];
+            let dosage = Self::calculate_dosage(
+                *packed_geno,
+                bim_a1,
+                bim_a2,
+                &context.score_info.effect_allele,
+            );
+            Some(Resolution {
+                chosen_dosage: dosage,
+                method_used: *self,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Heuristic 2: Solves the `A/A` vs `AGA/AGA` conflict. Succeeds if
     /// exactly one interpretation is composed solely of standard alleles found
     /// in the score file, while others use non-standard/complex alleles.
     fn resolve_unambiguous_genotype(&self, context: &ResolutionContext) -> Option<Resolution> {
@@ -195,7 +235,7 @@ impl Heuristic {
         }
     }
 
-    /// **Heuristic 3:** Succeeds if all conflicting interpretations, despite
+    /// Heuristic 3: Succeeds if all conflicting interpretations, despite
     /// having different allele definitions, coincidentally result in the same
     /// final effect allele dosage.
     fn resolve_consistent_dosage(&self, context: &ResolutionContext) -> Option<Resolution> {
@@ -223,7 +263,7 @@ impl Heuristic {
         }
     }
 
-    /// **Heuristic 4:** A final tie-breaker that prefers a single heterozygous
+    /// Heuristic 4: A final tie-breaker that prefers a single heterozygous
     /// call if it conflicts with one or more homozygous calls.
     fn resolve_prefer_het(&self, context: &ResolutionContext) -> Option<Resolution> {
         let heterozygous_calls: Vec<_> = context
@@ -299,6 +339,7 @@ impl ResolverPipeline {
         let heuristics = vec![
             Heuristic::ExactScoreAlleleMatch,
             Heuristic::PrioritizeUnambiguousGenotype,
+            Heuristic::PreferMatchingAlleleStructure,
             Heuristic::ConsistentDosage,
             Heuristic::PreferHeterozygous,
         ];
@@ -345,6 +386,7 @@ pub enum ResolutionMethod {
     ExactScoreAlleleMatch { chosen_dosage: f64 },
     /// A single interpretation was composed of standard alleles from the score file.
     PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
+    PreferMatchingAlleleStructure { chosen_dosage: f64 },
 }
 
 /// A private struct holding the data for a critical but non-fatal integrity warning.
@@ -508,6 +550,7 @@ pub fn resolve_complex_variants(
                                         let resolution_method = match resolution.method_used {
                                             Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
                                             Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
                                             Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
                                             Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
                                         };
@@ -605,7 +648,7 @@ fn format_fatal_ambiguity_report(data: &FatalAmbiguityData) -> String {
     use std::fmt::Write;
     let mut report = String::with_capacity(512);
 
-    // Helper to interpret genotype bits and alleles into a human-readable string.
+    // Helper to interpret genotype bits is still useful.
     let interpret_genotype = |bits: u8, a1: &str, a2: &str| -> String {
         match bits {
             0b00 => format!("{a1}/{a1}"),
@@ -681,42 +724,71 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
     };
 
-    // A helper to determine if a given conflict was the one chosen by the heuristic.
+    // Update the `is_chosen` helper
     let is_chosen = |method: &ResolutionMethod, conflict: &ConflictSource, score_ea: &str, score_oa: &str| -> bool {
         let bim_a1 = &conflict.alleles.0;
         let bim_a2 = &conflict.alleles.1;
-
         match method {
-            ResolutionMethod::ExactScoreAlleleMatch {..} => {
-                (bim_a1 == score_ea && bim_a2 == score_oa) || (bim_a1 == score_oa && bim_a2 == score_ea)
-            }
-            ResolutionMethod::PrioritizeUnambiguousGenotype {..} => {
-                let is_a1_valid = bim_a1 == score_ea || bim_a1 == score_oa;
-                let is_a2_valid = bim_a2 == score_ea || bim_a2 == score_oa;
-                is_a1_valid && is_a2_valid
+            ResolutionMethod::ExactScoreAlleleMatch {..} => (bim_a1 == score_ea && bim_a2 == score_oa) || (bim_a1 == score_oa && bim_a2 == score_ea),
+            ResolutionMethod::PrioritizeUnambiguousGenotype {..} => (bim_a1 == score_ea || bim_a1 == score_oa) && (bim_a2 == score_ea || bim_a2 == score_oa),
+            ResolutionMethod::PreferMatchingAlleleStructure {..} => {
+                let s1_len = score_ea.len();
+                let s2_len = score_oa.len();
+                let b1_len = conflict.alleles.0.len();
+                let b2_len = conflict.alleles.1.len();
+                (b1_len == s1_len && b2_len == s2_len) || (b1_len == s2_len && b2_len == s1_len)
             }
             ResolutionMethod::PreferHeterozygous {..} => conflict.genotype_bits == 0b10,
-            // The consistent dosage rule applies to all conflicts equally.
             ResolutionMethod::ConsistentDosage {..} => true,
         }
     };
+    
+    // ... (initial report writing) ...
 
+    // Update the rationale generation
+    let method_name: &str;
+    let mut rationale = String::new();
 
-    // Build the final report string.
-    writeln!(report, "Ambiguity Resolved for Individual '{}'", data.iid).unwrap();
-    writeln!(report, "  Locus:  {}:{}", data.locus_chr_pos.0, data.locus_chr_pos.1).unwrap();
-    writeln!(report, "  Score:  {}", data.score_name).unwrap();
-
-    let (method_name, rationale) = match &data.resolution_method {
-        ResolutionMethod::ConsistentDosage { dosage } => ("'Consistent Dosage' Heuristic", format!("All conflicting sources yielded a consistent dosage of {dosage}, so computation continued.")),
-        ResolutionMethod::PreferHeterozygous { .. } => ("'Prefer Heterozygous' Heuristic", "A single heterozygous call was chosen over conflicting homozygous call(s).".to_string()),
-        ResolutionMethod::ExactScoreAlleleMatch { .. } => ("'Exact Score Allele Match' Heuristic", "A single BIM entry's alleles matched the score file perfectly.".to_string()),
-        ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => ("'Prioritize Unambiguous Genotype' Heuristic", "A single interpretation was chosen because its alleles matched the score file's standard alleles.".to_string()),
+    match &data.resolution_method {
+        ResolutionMethod::ExactScoreAlleleMatch { .. } => {
+            method_name = "'Exact Score Allele Match' Heuristic";
+            if let Some(chosen) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+                write!(rationale, "The interpretation with alleles ({}, {}) was chosen because it perfectly matches the score file.", chosen.alleles.0, chosen.alleles.1).unwrap();
+            }
+        }
+        ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => {
+            method_name = "'Prioritize Unambiguous Genotype' Heuristic";
+             if let Some(chosen) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+                write!(rationale, "The interpretation with alleles ({}, {}) was chosen because both alleles are present in the score file's required set.", chosen.alleles.0, chosen.alleles.1).unwrap();
+            }
+        }
+        ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
+            method_name = "'Prefer Matching Allele Structure' Heuristic";
+            let chosen = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele));
+            
+            if let Some(c) = chosen {
+                 write!(rationale, "The interpretation with alleles ({}, {}) was chosen because its allele lengths ({}, {}) structurally match the alleles from the score file.", c.alleles.0, c.alleles.1, c.alleles.0.len(), c.alleles.1.len()).unwrap();
+            }
+        }
+        ResolutionMethod::PreferHeterozygous { .. } => {
+            method_name = "'Prefer Heterozygous' Heuristic";
+            let chosen = data.conflicts.iter().find(|c| c.genotype_bits == 0b10);
+            let rejected = data.conflicts.iter().find(|c| c.genotype_bits != 0b10);
+             if let (Some(c), Some(r)) = (chosen, rejected) {
+                let chosen_geno = interpret_genotype(c.genotype_bits, &c.alleles.0, &c.alleles.1);
+                let rejected_geno = interpret_genotype(r.genotype_bits, &r.alleles.0, &r.alleles.1);
+                write!(rationale, "The heterozygous interpretation ({}) was chosen over a conflicting homozygous interpretation ({}).", chosen_geno, rejected_geno).unwrap();
+            }
+        }
+        ResolutionMethod::ConsistentDosage { dosage } => {
+            method_name = "'Consistent Dosage' Heuristic";
+            write!(rationale, "All conflicting sources yielded a consistent effect allele dosage of {}, so computation continued.", dosage).unwrap();
+        }
     };
+
     writeln!(report, "  Method: {}", method_name).unwrap();
     writeln!(report, "  Score File requires: Effect={}, Other={}", data.score_effect_allele, data.score_other_allele).unwrap();
-
-
+    
     writeln!(report, "\n  Conflicting Sources Considered:").unwrap();
 
     for conflict in &data.conflicts {
@@ -725,27 +797,17 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         } else {
             "   Rejected:"
         };
-
-        let interpretation = interpret_genotype(
-            conflict.genotype_bits,
-            &conflict.alleles.0,
-            &conflict.alleles.1,
-        );
+        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
         writeln!(
-            report,
-            "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
-            prefix,
-            conflict.bim_row.0,
-            conflict.alleles.0,
-            conflict.alleles.1,
-            conflict.genotype_bits,
-            interpretation
-        )
-        .unwrap();
+            report, "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+            prefix, conflict.bim_row.0, conflict.alleles.0, conflict.alleles.1,
+            conflict.genotype_bits, interpretation
+        ).unwrap();
     }
 
-    writeln!(report, "\n  Rationale: {}", rationale).unwrap();
-
-
+    if !rationale.is_empty() {
+        writeln!(report, "\n  Rationale: {}", rationale).unwrap();
+    }
+    
     report.trim_end().to_string()
 }
