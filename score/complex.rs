@@ -168,8 +168,8 @@ impl Heuristic {
         }
     }
 
-    /// Heuristic 3: Solves conflicts by preferring the interpretation whose allele
-    /// lengths match the allele lengths from the score file.
+    /// Heuristic 3: Solves conflicts by preferring an interpretation where the resulting
+    /// genotype's allele lengths match the allele lengths from the score file.
     fn resolve_prefer_matching_allele_structure(&self, context: &ResolutionContext) -> Option<Resolution> {
         let score_a1_len = context.score_info.effect_allele.len();
         let score_a2_len = context.score_info.other_allele.len();
@@ -177,13 +177,20 @@ impl Heuristic {
         let matching_structure_interpretations: Vec<_> = context
             .conflicting_interpretations
             .iter()
-            .filter(|(_, (_, bim_a1, bim_a2))| {
-                let bim_a1_len = bim_a1.len();
-                let bim_a2_len = bim_a2.len();
+            .filter(|(packed_geno, (_, bim_a1, bim_a2))| {
+                // CHANGE: Interpret the person's actual alleles first.
+                let (person_allele_1, person_allele_2) = Self::interpret_person_alleles(*packed_geno, bim_a1, bim_a2);
 
-                // Check for a match in either direction to handle swapped alleles
-                (bim_a1_len == score_a1_len && bim_a2_len == score_a2_len)
-                    || (bim_a1_len == score_a2_len && bim_a2_len == score_a1_len)
+                // Get the lengths of the person's alleles.
+                let person_a1_len = person_allele_1.len();
+                let person_a2_len = person_allele_2.len();
+
+                // If the genotype was invalid/missing, the lengths will be 0, so this will not match.
+                if person_a1_len == 0 { return false; }
+
+                // Check for a match in either direction to handle swapped alleles.
+                (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
+                    || (person_a1_len == score_a2_len && person_a2_len == score_a1_len)
             })
             .collect();
 
@@ -317,6 +324,17 @@ impl Heuristic {
         } else {
             // Case 3: The effect allele is neither A1 nor A2. The dosage must be 0.
             0.0
+        }
+    }
+
+    /// A private helper to determine a person's actual alleles from their genotype bits.
+    #[inline(always)]
+    pub fn interpret_person_alleles(packed_geno: u8, bim_a1: &str, bim_a2: &str) -> (&str, &str) {
+        match packed_geno {
+            0b00 => (bim_a1, bim_a1), // Homozygous for A1
+            0b10 => (bim_a1, bim_a2), // Heterozygous (one A1, one A2)
+            0b11 => (bim_a2, bim_a2), // Homozygous for A2
+            _ => ("", ""),           // Represents a missing or invalid genotype
         }
     }
 }
@@ -522,6 +540,13 @@ pub fn resolve_complex_variants(
                                 }
                             }
                             _ => {
+                                // MOVE the creation of `conflicts` outside the loop.
+                                let conflicts: Vec<_> = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                    bim_row: ctx.0,
+                                    alleles: (ctx.1.clone(), ctx.2.clone()),
+                                    genotype_bits: *bits,
+                                }).collect();
+
                                 for score_info in &group_rule.score_applications {
                                     // Performance: Filter interpretations to only those relevant to the current score.
                                     let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
@@ -536,13 +561,6 @@ pub fn resolve_complex_variants(
                                         score_info,
                                         conflicting_interpretations: &matching_interpretations,
                                     };
-
-                                    // Collect conflict details from the original, unfiltered list.
-                                    let conflicts: Vec<_> = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                        bim_row: ctx.0,
-                                        alleles: (ctx.1.clone(), ctx.2.clone()),
-                                        genotype_bits: *bits,
-                                    }).collect();
 
                                     if let Some(resolution) = pipeline.resolve(&context) {
                                         person_scores_slice[score_info.score_column_index.0] +=
@@ -559,7 +577,7 @@ pub fn resolve_complex_variants(
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
                                             locus_chr_pos: group_rule.locus_chr_pos.clone(),
                                             score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                            conflicts,
+                                            conflicts: conflicts.clone(),
                                             resolution_method,
                                             score_effect_allele: score_info.effect_allele.clone(),
                                             score_other_allele: score_info.other_allele.clone(),
@@ -732,11 +750,18 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             ResolutionMethod::ExactScoreAlleleMatch {..} => (bim_a1 == score_ea && bim_a2 == score_oa) || (bim_a1 == score_oa && bim_a2 == score_ea),
             ResolutionMethod::PrioritizeUnambiguousGenotype {..} => (bim_a1 == score_ea || bim_a1 == score_oa) && (bim_a2 == score_ea || bim_a2 == score_oa),
             ResolutionMethod::PreferMatchingAlleleStructure {..} => {
-                let s1_len = score_ea.len();
-                let s2_len = score_oa.len();
-                let b1_len = conflict.alleles.0.len();
-                let b2_len = conflict.alleles.1.len();
-                (b1_len == s1_len && b2_len == s2_len) || (b1_len == s2_len && b2_len == s1_len)
+                let score_a1_len = score_ea.len();
+                let score_a2_len = score_oa.len();
+
+                // Re-create the logic from the actual heuristic
+                let (person_allele_1, person_allele_2) = Heuristic::interpret_person_alleles(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
+                let person_a1_len = person_allele_1.len();
+                let person_a2_len = person_allele_2.len();
+
+                if person_a1_len == 0 { return false; }
+
+                (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
+                    || (person_a1_len == score_a2_len && person_a2_len == score_a1_len)
             }
             ResolutionMethod::PreferHeterozygous {..} => conflict.genotype_bits == 0b10,
             ResolutionMethod::ConsistentDosage {..} => true,
@@ -772,10 +797,12 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
         ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
             method_name = "'Prefer Matching Allele Structure' Heuristic";
-            let chosen = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele));
-            
-            if let Some(c) = chosen {
-                 write!(rationale, "The interpretation with alleles ({}, {}) was chosen because its allele lengths ({}, {}) structurally match the alleles from the score file.", c.alleles.0, c.alleles.1, c.alleles.0.len(), c.alleles.1.len()).unwrap();
+            // This now works because the 'is_chosen' logic from Fix #1 is correct.
+            if let Some(c) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+                // Re-interpret the genotype to get the person's actual alleles for the rationale.
+                let (pa1, pa2) = Heuristic::interpret_person_alleles(c.genotype_bits, &c.alleles.0, &c.alleles.1);
+                let person_geno_str = format!("{}/{}", pa1, pa2);
+                write!(rationale, "The interpretation from BIM Row {} (resulting in genotype '{}') was chosen because its allele lengths ({}, {}) structurally match the score file.", c.bim_row.0, person_geno_str, pa1.len(), pa2.len()).unwrap();
             }
         }
         ResolutionMethod::PreferHeterozygous { .. } => {
