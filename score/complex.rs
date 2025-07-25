@@ -178,7 +178,7 @@ impl Heuristic {
             .conflicting_interpretations
             .iter()
             .filter(|(packed_geno, (_, bim_a1, bim_a2))| {
-                // CHANGE: Interpret the person's actual alleles first.
+                // Interpret the person's actual alleles first.
                 let (person_allele_1, person_allele_2) = Self::interpret_person_alleles(*packed_geno, bim_a1, bim_a2);
 
                 // Get the lengths of the person's alleles.
