@@ -537,14 +537,12 @@ pub fn resolve_complex_variants(
                                         conflicting_interpretations: &matching_interpretations,
                                     };
 
-                                    // Collect conflict details once before branching.
-                                    let conflicts = matching_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                        bim_row: ctx.0,
-                                        alleles: (ctx.1.clone(), ctx.2.clone()),
-                                        genotype_bits: *bits,
-                                    }).collect();
-
                                     if let Some(resolution) = pipeline.resolve(&context) {
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        }).collect();
                                         person_scores_slice[score_info.score_column_index.0] +=
                                             resolution.chosen_dosage * score_info.weight as f64;
                                         let resolution_method = match resolution.method_used {
