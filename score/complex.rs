@@ -743,7 +743,15 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
     };
     
-    // ... (initial report writing) ...
+    // Add the individual, locus, and score information to the report
+    writeln!(
+        report,
+        "Ambiguity resolved for Individual '{}' at Locus {}:{}",
+        data.iid, data.locus_chr_pos.0, data.locus_chr_pos.1
+    )
+    .unwrap();
+    writeln!(report, "  While calculating score: '{}'", data.score_name).unwrap();
+    writeln!(report).unwrap();
 
     // Update the rationale generation
     let method_name: &str;
