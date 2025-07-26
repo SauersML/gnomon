@@ -198,7 +198,7 @@ pub fn train_model(
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
-    let final_fit = pirls::fit_model_for_fixed_rho_new(
+    let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         reml_state.x(),               // Use original X
         reml_state.y(),
@@ -415,7 +415,7 @@ pub mod internal {
 
             println!("  -> Solving inner P-IRLS loop for this evaluation...");
             
-            // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho_new)
+            // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
             let lambdas_for_logging = rho.mapv(f64::exp);
             log::debug!(
                 "Smoothing parameters for this evaluation: [{:.2e}, {:.2e}, ...]",
@@ -425,7 +425,7 @@ pub mod internal {
             
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
-            let pirls_result = pirls::fit_model_for_fixed_rho_new(
+            let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x.view(),
                 self.y,
@@ -2940,7 +2940,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 let final_lambda = final_rho.mapv(f64::exp);
                 
                 // Step 6: Call P-IRLS with the original matrices - it will do its own reparameterization
-                let final_fit_transformed = pirls::fit_model_for_fixed_rho_new(
+                let final_fit_transformed = pirls::fit_model_for_fixed_rho(
                     final_rho.view(),
                     reml_state.x(),
                     reml_state.y(),
@@ -3079,7 +3079,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // Here we need to create the original rs_list to pass to the new function
             let rs_original = compute_penalty_square_roots(&s_list)?;
             
-            let result = crate::calibrate::pirls::fit_model_for_fixed_rho_new(
+            let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 extreme_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
