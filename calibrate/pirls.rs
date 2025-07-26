@@ -32,7 +32,6 @@ pub struct PirlsResult {
     pub beta: Array1<f64>,
     pub penalized_hessian: Array2<f64>,
     pub deviance: f64,
-    #[allow(dead_code)]
     pub final_weights: Array1<f64>,
     pub status: PirlsStatus,
     pub iteration: usize,
@@ -644,13 +643,9 @@ pub fn stable_penalized_least_squares(
     
     log::debug!("Determined rank {} (out of {}) using R_cond algorithm", rank, p);
     
-    // Create list of dropped columns (unpivoted indices)
-    let mut computed_dropped_cols = Vec::new();
-    for i in rank..p {
-        if i < pivot.len() {
-            computed_dropped_cols.push(pivot[i]);
-        }
-    }
+    // Calculate number of dropped columns for logging
+    let dropped_columns_count = p - rank;
+    log::debug!("Dropped {} columns due to rank deficiency", dropped_columns_count);
 
     // Step E: Solve the system using the unified augmented QR solver
     // This also returns the stable, consistent penalized Hessian
@@ -858,6 +853,8 @@ fn build_sqrt_s_lambda(
 /// 5. Properly handles negative weights by correcting the RHS vector
 ///
 /// This approach works for both full-rank and rank-deficient cases.
+// This function legitimately needs many arguments for the complex QR solver implementation
+// and follows the pattern of the original C code in mgcv
 #[allow(clippy::too_many_arguments)]
 fn solve_with_augmented_qr(
     x: ArrayView2<f64>,
@@ -896,7 +893,7 @@ fn solve_with_augmented_qr(
     let nr = r_rows + e_trunc_t.nrows();
     let mut r_augmented = Array2::zeros((nr, rank));
     r_augmented.slice_mut(s![..r_rows, ..]).assign(&r1_trunc);
-    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc_t.t()); // Transpose E_trunc_t to stack
+    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc_t); // e_trunc_t is already transposed
 
     // 4. Final QR decomposition on the augmented matrix
     let (q_aug, r_aug) = r_augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -948,14 +945,8 @@ fn solve_with_augmented_qr(
         x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
     }
 
-    // Calculate the direct RHS vector (X_trunc' * W * z)
-    // Note: This first calculation is preserved for reference but we'll use the one below
-
-    // Create the pivoted and truncated design matrix.
-    let mut x_pivoted_trunc = Array2::zeros((x.nrows(), rank));
-    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-        x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
-    }
+    // The x_pivoted_trunc matrix was already created above at lines 945-949
+    // We'll reuse it for the stability check below
     
     // Get the final RHS slice for the primary, stable path.
     let final_rhs_slice = final_rhs.slice(s![..rank]);
@@ -1129,6 +1120,8 @@ mod tests {
     use super::*;
     use ndarray::{arr1, arr2};
     use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
+    use crate::calibrate::model::BasisConfig;
+    use std::collections::HashMap;
 
     /// This test explicitly verifies that the Hessian calculation is consistent between
     /// the stable_penalized_least_squares function and compute_final_penalized_hessian function
@@ -1284,7 +1277,10 @@ mod tests {
         );
     }
     
-
+    /// This test verifies that the new fit_model_for_fixed_rho_new function
+    /// performs reparameterization for each set of smoothing parameters.
+    #[test]
+    fn test_reparameterization_per_rho() {
         use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
         
         // Create a simple test case
@@ -1313,6 +1309,20 @@ mod tests {
             link_function: LinkFunction::Identity,
             max_iterations: 10,
             convergence_tolerance: 1e-8,
+            penalty_order: 2,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig {
+                num_knots: 3,
+                degree: 3,
+            },
+            pc_basis_configs: vec![],
+            pgs_range: (-1.0, 1.0),
+            pc_ranges: vec![],
+            pc_names: vec![],
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            num_pgs_interaction_bases: 0,
         };
         
         // Test with two very different rho values
@@ -1343,75 +1353,4 @@ mod tests {
         let diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
         assert!(diff > 1e-6, "Expected different results for different rho values");
     }
-        // SETUP: A simple, well-conditioned problem.
-        let x = arr2(&[[1.0, 2.0], [1.0, 3.0], [1.0, 5.0]]);
-        let y = arr1(&[4.1, 6.2, 9.8]);
-        let weights = arr1(&[1.0, 1.0, 1.0]); // Use identity weights to simplify test
-        let s1 = arr2(&[[4.0, 2.0], [2.0, 5.0]]);
-
-        // Compute penalty square roots
-        let s_list = vec![s1.clone()];
-        let rs_list = compute_penalty_square_roots(&s_list)
-            .expect("Failed to compute penalty square roots");
-        
-        // Create a minimal layout for the test
-        let _layout = ModelLayout {
-            intercept_col: 0,
-            pgs_main_cols: 0..0,
-            penalty_map: vec![],
-            total_coeffs: 2,
-            num_penalties: 1,
-            num_pgs_interaction_bases: 0,
-        };
-        
-        let _lambdas = vec![1.0];
-        
-        // Run our solver - now working directly with the original square roots
-        let result = stable_penalized_least_squares(
-            x.view(), 
-            y.view(), 
-            weights.view(), 
-            &rs_list[0], // Use the first rs matrix directly for the test
-            &rs_list, 
-            &_lambdas
-        ).expect("stable_penalized_least_squares failed");
-
-        // Verify the solution by checking if it minimizes the objective function
-        let fitted_values = x.dot(&result.beta);
-        let residuals = &y - &fitted_values;
-        let rss = residuals.dot(&residuals);
-        let penalty = result.beta.dot(&s1.dot(&result.beta));
-        let objective = rss + penalty;
-        
-        // The objective should be finite and reasonable
-        assert!(
-            objective.is_finite() && objective > 0.0,
-            "Objective function value is invalid: {}",
-            objective
-        );
-        
-        // Also verify that small perturbations to beta increase the objective
-        let delta = 1e-4;
-        let mut perturbed_better = false;
-        
-        // Try a few perturbations
-        for i in 0..result.beta.len() {
-            let mut beta_plus = result.beta.clone();
-            beta_plus[i] += delta;
-            
-            let fitted_plus = x.dot(&beta_plus);
-            let residuals_plus = &y - &fitted_plus;
-            let rss_plus = residuals_plus.dot(&residuals_plus);
-            let penalty_plus = beta_plus.dot(&s1.dot(&beta_plus));
-            let objective_plus = rss_plus + penalty_plus;
-            
-            // If any perturbation decreases the objective, our solution wasn't optimal
-            perturbed_better = perturbed_better || (objective_plus < objective);
-        }
-        
-        assert!(
-            !perturbed_better,
-            "Found a better solution through perturbation"
-        );
-    }
-    
+}
