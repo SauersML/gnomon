@@ -4,6 +4,7 @@ use ahash::AHashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -93,6 +94,69 @@ impl ComplexVariantResolver {
     }
 }
 
+// ========================================================================================
+//                            Complex Variant Resolution Types
+// ========================================================================================
+
+// A type alias for the per-thread collector.
+pub type PerThreadCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
+
+// A type alias for the final, merged collector.
+pub type FinalAggregatedCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
+
+/// An enum representing the complete, ordered set of resolution strategies.
+/// This approach uses static dispatch for zero-cost abstraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Heuristic {
+    /// Tries to find one BIM entry that perfectly matches both score file alleles.
+    ExactScoreAlleleMatch,
+    /// Tries to find one interpretation composed ONLY of score file alleles.
+    PrioritizeUnambiguousGenotype,
+    /// Prefers an interpretation where allele lengths match the score file.
+    PreferMatchingAlleleStructure,
+    /// Checks if all conflicting interpretations result in the same dosage.
+    ConsistentDosage,
+    /// As a last resort, prefers a single heterozygous call over homozygous ones.
+    PreferHeterozygous,
+}
+
+/// Describes the specific heuristic used to resolve a critical data ambiguity,
+/// holding the data needed for transparent reporting.
+#[derive(Debug, Clone)]
+pub enum ResolutionMethod {
+    /// All conflicting sources yielded the same effect allele dosage.
+    ConsistentDosage { dosage: f64 },
+    /// Exactly one heterozygous call was found alongside one or more homozygous
+    /// calls, and the heterozygous call was chosen.
+    PreferHeterozygous { chosen_dosage: f64 },
+    /// A single BIM entry's alleles perfectly matched the score file alleles.
+    ExactScoreAlleleMatch { chosen_dosage: f64 },
+    /// A single interpretation was composed of standard alleles from the score file.
+    PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
+    PreferMatchingAlleleStructure { chosen_dosage: f64 },
+}
+
+/// A private struct holding the raw data for one conflicting source of evidence.
+/// This is used exclusively for building the final fatal error report.
+#[derive(Debug, Clone)]
+pub struct ConflictSource {
+    pub bim_row: BimRowIndex,
+    pub alleles: (String, String),
+    pub genotype_bits: u8,
+}
+
+/// A private struct holding the data for a critical but non-fatal integrity warning.
+/// This is used when multiple data sources conflict but lead to a consistent outcome.
+#[derive(Debug, Clone)]
+pub struct CriticalIntegrityWarningInfo {
+    pub iid: String,
+    pub locus_chr_pos: (String, u32),
+    pub score_name: String,
+    pub conflicts: Vec<ConflictSource>,
+    pub resolution_method: ResolutionMethod,
+    pub score_effect_allele: String,
+    pub score_other_allele: String,
+}
 //========================================================================================
 //
 //                      The Zero-Cost Heuristic Pipeline
@@ -110,22 +174,6 @@ pub struct ResolutionContext<'a> {
 pub struct Resolution {
     pub chosen_dosage: f64,
     pub method_used: Heuristic,
-}
-
-/// An enum representing the complete, ordered set of resolution strategies.
-/// This approach uses static dispatch for zero-cost abstraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Heuristic {
-    /// Tries to find one BIM entry that perfectly matches both score file alleles.
-    ExactScoreAlleleMatch,
-    /// Tries to find one interpretation composed ONLY of score file alleles.
-    PrioritizeUnambiguousGenotype,
-    /// Prefers an interpretation where allele lengths match the score file.
-    PreferMatchingAlleleStructure,
-    /// Checks if all conflicting interpretations result in the same dosage.
-    ConsistentDosage,
-    /// As a last resort, prefers a single heterozygous call over homozygous ones.
-    PreferHeterozygous,
 }
 
 impl Heuristic {
@@ -379,14 +427,6 @@ impl ResolverPipeline {
     }
 }
 
-/// A private struct holding the raw data for one conflicting source of evidence.
-/// This is used exclusively for building the final fatal error report.
-struct ConflictSource {
-    bim_row: BimRowIndex,
-    alleles: (String, String),
-    genotype_bits: u8,
-}
-
 /// A private struct holding the complete, raw payload for a fatal ambiguity error.
 /// Collecting this data first and formatting it once at the end is a key optimization.
 struct FatalAmbiguityData {
@@ -394,33 +434,6 @@ struct FatalAmbiguityData {
     locus_chr_pos: (String, u32),
     score_name: String,
     conflicts: Vec<ConflictSource>,
-}
-
-/// Describes the specific heuristic used to resolve a critical data ambiguity,
-/// holding the data needed for transparent reporting.
-pub enum ResolutionMethod {
-    /// All conflicting sources yielded the same effect allele dosage.
-    ConsistentDosage { dosage: f64 },
-    /// Exactly one heterozygous call was found alongside one or more homozygous
-    /// calls, and the heterozygous call was chosen.
-    PreferHeterozygous { chosen_dosage: f64 },
-    /// A single BIM entry's alleles perfectly matched the score file alleles.
-    ExactScoreAlleleMatch { chosen_dosage: f64 },
-    /// A single interpretation was composed of standard alleles from the score file.
-    PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
-    PreferMatchingAlleleStructure { chosen_dosage: f64 },
-}
-
-/// A private struct holding the data for a critical but non-fatal integrity warning.
-/// This is used when multiple data sources conflict but lead to a consistent outcome.
-struct CriticalIntegrityWarningInfo {
-    iid: String,
-    locus_chr_pos: (String, u32),
-    score_name: String,
-    conflicts: Vec<ConflictSource>,
-    resolution_method: ResolutionMethod,
-    score_effect_allele: String,
-    score_other_allele: String,
 }
 
 // The "slow path" resolver for complex variants.
@@ -444,216 +457,214 @@ pub fn resolve_complex_variants(
 
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
-    let all_critical_warnings_to_print = Mutex::new(Vec::<CriticalIntegrityWarningInfo>::new());
 
-    for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
-        if fatal_error_occurred.load(Ordering::Relaxed) {
-            break;
-        }
+    let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
+    let progress_style = ProgressStyle::with_template(
+        "> Resolving complex variants [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+    )
+    .expect("Internal Error: Invalid progress bar template string.");
+    pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
+    let progress_counter = Arc::new(AtomicU64::new(0));
 
-        let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
-        let progress_style = ProgressStyle::with_template(&format!(
-            ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
-            rule_idx + 1,
-            num_rules
-        ))
-        .expect("Internal Error: Invalid progress bar template string.");
-        pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
-        let progress_counter = Arc::new(AtomicU64::new(0));
+    let pipeline = ResolverPipeline::new();
 
-        let pipeline = ResolverPipeline::new();
-
-        thread::scope(|s| {
-            s.spawn({
-                let pb_updater = pb.clone();
-                let counter_for_updater = Arc::clone(&progress_counter);
-                let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
-                let total_people = prep_result.num_people_to_score as u64;
-                move || {
-                    while counter_for_updater.load(Ordering::Relaxed) < total_people
-                        && !error_flag_for_updater.load(Ordering::Relaxed)
-                    {
-                        pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
-                        thread::sleep(Duration::from_millis(200));
-                    }
+    let final_warnings = thread::scope(|s| {
+        s.spawn({
+            let pb_updater = pb.clone();
+            let counter_for_updater = Arc::clone(&progress_counter);
+            let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
+            let total_people = prep_result.num_people_to_score as u64;
+            move || {
+                while counter_for_updater.load(Ordering::Relaxed) < total_people
+                    && !error_flag_for_updater.load(Ordering::Relaxed)
+                {
                     pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+                    thread::sleep(Duration::from_millis(200));
                 }
-            });
+                pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+            }
+        });
 
-            s.spawn(|| {
-                final_scores
-                    .par_chunks_mut(prep_result.score_names.len())
-                    .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
-                    .enumerate()
-                    .for_each(|(person_output_idx, (person_scores_slice, person_counts_slice))| {
-                        // Create a guard that will increment the counter when dropped
+        s.spawn(|| {
+            final_scores
+                .par_chunks_mut(prep_result.score_names.len())
+                .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
+                .enumerate()
+                .try_fold(
+                    || PerThreadCollector::new(),
+                    |mut local_collector, (person_output_idx, (person_scores_slice, person_counts_slice))| {
                         let guard = ScopeGuard::new(|| {
                             progress_counter.fetch_add(1, Ordering::Relaxed);
                         });
-                        // Use the guard to avoid unused variable warning
                         let _ = &guard;
 
                         if fatal_error_occurred.load(Ordering::Relaxed) {
-                            return;
+                            return Err(());
                         }
 
                         let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
-                        let valid_interpretations: Vec<_> = group_rule
-                            .possible_contexts
-                            .iter()
-                            .filter_map(|context| {
-                                let packed_geno = resolver.get_packed_genotype(
-                                    prep_result.bytes_per_variant,
-                                    context.0,
-                                    original_fam_idx,
-                                );
-                                (packed_geno != 0b01).then_some((packed_geno, context))
-                            })
-                            .collect();
+                        for group_rule in &prep_result.complex_rules {
+                            let valid_interpretations: Vec<_> = group_rule
+                                .possible_contexts
+                                .iter()
+                                .filter_map(|context| {
+                                    let packed_geno = resolver.get_packed_genotype(
+                                        prep_result.bytes_per_variant,
+                                        context.0,
+                                        original_fam_idx,
+                                    );
+                                    (packed_geno != 0b01).then_some((packed_geno, context))
+                                })
+                                .collect();
 
-                        match valid_interpretations.len() {
-                            0 => {
-                                // Ensure we only increment the missing count ONCE per unique score
-                                // column, even if a locus is used in multiple score file rows that
-                                // map to the same final score.
-                                let mut counted_cols = AHashSet::new();
-                                for score_info in &group_rule.score_applications {
-                                    counted_cols.insert(score_info.score_column_index);
-                                }
-                                for &score_col_idx in counted_cols.iter() {
-                                    person_counts_slice[score_col_idx.0] += 1;
-                                }
-                            }
-                            1 => {
-                                let (packed_geno, context) = valid_interpretations[0];
-                                let (_, bim_a1, bim_a2) = context;
-
-                                for score_info in &group_rule.score_applications {
-                                    // Add a guard to ensure the score's effect allele is actually
-                                    // present in the single genotype context we found. If not, this
-                                    // score rule is irrelevant, so we skip it. This prevents calls
-                                    // to calculate_dosage with bad data.
-                                    let effect_allele = &score_info.effect_allele;
-                                    if effect_allele != bim_a1 && effect_allele != bim_a2 {
-                                        continue;
+                            match valid_interpretations.len() {
+                                0 => {
+                                    let mut counted_cols = AHashSet::new();
+                                    for score_info in &group_rule.score_applications {
+                                        counted_cols.insert(score_info.score_column_index);
                                     }
-
-                                    let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, bim_a2, effect_allele);
-                                    person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
-                                }
-                            }
-                            _ => {
-                                for score_info in &group_rule.score_applications {
-                                    // Performance: Filter interpretations to only those relevant to the current score.
-                                    let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
-                                        score_info.effect_allele == context.1 || score_info.effect_allele == context.2
-                                    }).collect();
-                                    // If no interpretations match this score's alleles, skip to the next score.
-                                    if matching_interpretations.is_empty() {
-                                        continue;
+                                    for &score_col_idx in counted_cols.iter() {
+                                        person_counts_slice[score_col_idx.0] += 1;
                                     }
+                                }
+                                1 => {
+                                    let (packed_geno, context) = valid_interpretations[0];
+                                    let (_, bim_a1, bim_a2) = context;
 
-                                    let context = ResolutionContext {
-                                        score_info,
-                                        conflicting_interpretations: &matching_interpretations,
-                                    };
-
-                                    if let Some(resolution) = pipeline.resolve(&context) {
-                                        person_scores_slice[score_info.score_column_index.0] +=
-                                            resolution.chosen_dosage * score_info.weight as f64;
-                                        let resolution_method = match resolution.method_used {
-                                            Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
-                                            Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
-                                        };
-
-                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                            bim_row: ctx.0,
-                                            alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits,
-                                        }).collect();
-
-                                        all_critical_warnings_to_print.lock().unwrap().push(CriticalIntegrityWarningInfo {
-                                            iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                            conflicts,
-                                            resolution_method,
-                                            score_effect_allele: score_info.effect_allele.clone(),
-                                            score_other_allele: score_info.other_allele.clone(),
-                                        });
-
-                                    } else {
-                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                            bim_row: ctx.0,
-                                            alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits,
-                                        }).collect();
-
-                                        // The entire pipeline failed. This is a fatal error.
-                                        let data = FatalAmbiguityData {
-                                            iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                            conflicts,
-                                        };
-
-                                        if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                            *fatal_error_storage.lock().unwrap() = Some(data);
+                                    for score_info in &group_rule.score_applications {
+                                        let effect_allele = &score_info.effect_allele;
+                                        if effect_allele != bim_a1 && effect_allele != bim_a2 {
+                                            continue;
                                         }
-                                        // Use `return` to exit the entire closure for this person, preventing further work.
-                                        return;
+                                        let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, bim_a2, effect_allele);
+                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                                    }
+                                }
+                                _ => {
+                                    for score_info in &group_rule.score_applications {
+                                        let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
+                                            score_info.effect_allele == context.1 || score_info.effect_allele == context.2
+                                        }).collect();
+                                        if matching_interpretations.is_empty() {
+                                            continue;
+                                        }
+
+                                        let context = ResolutionContext {
+                                            score_info,
+                                            conflicting_interpretations: &matching_interpretations,
+                                        };
+
+                                        if let Some(resolution) = pipeline.resolve(&context) {
+                                            person_scores_slice[score_info.score_column_index.0] +=
+                                                resolution.chosen_dosage * score_info.weight as f64;
+
+                                            let (count, samples) = local_collector.entry(resolution.method_used).or_insert((0, Vec::new()));
+                                            *count += 1;
+                                            if samples.len() < 5 {
+                                                let resolution_method = match resolution.method_used {
+                                                    Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
+                                                    Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
+                                                };
+
+                                                let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                                    bim_row: ctx.0,
+                                                    alleles: (ctx.1.clone(), ctx.2.clone()),
+                                                    genotype_bits: *bits,
+                                                }).collect();
+
+                                                samples.push(CriticalIntegrityWarningInfo {
+                                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                                    conflicts,
+                                                    resolution_method,
+                                                    score_effect_allele: score_info.effect_allele.clone(),
+                                                    score_other_allele: score_info.other_allele.clone(),
+                                                });
+                                            }
+                                        } else {
+                                            let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                                bim_row: ctx.0,
+                                                alleles: (ctx.1.clone(), ctx.2.clone()),
+                                                genotype_bits: *bits,
+                                            }).collect();
+
+                                            let data = FatalAmbiguityData {
+                                                iid: prep_result.final_person_iids[person_output_idx].clone(),
+                                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                                                conflicts,
+                                            };
+
+                                            if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                                *fatal_error_storage.lock().unwrap() = Some(data);
+                                            }
+                                            return Err(());
+                                        }
                                     }
                                 }
                             }
                         }
-                    });
-            });
-        });
+                        Ok(local_collector)
+                    },
+                )
+                .map(|collector_opt| collector_opt.unwrap_or_default())
+                .try_reduce(
+                    || PerThreadCollector::new(),
+                    |mut main_collector, thread_collector| {
+                        for (heuristic, (count, samples)) in thread_collector {
+                            let (main_count, main_samples) = main_collector.entry(heuristic).or_insert((0, Vec::new()));
+                            *main_count += count;
+                            if main_samples.len() < 5 {
+                                main_samples.extend(samples.into_iter().take(5 - main_samples.len()));
+                            }
+                        }
+                        Ok(main_collector)
+                    },
+                )
+        })
+    }).unwrap();
 
-        pb.finish_with_message("Done.");
-    }
+    pb.finish_with_message("Done.");
 
-    let collected_critical_warnings =
-        std::mem::take(&mut *all_critical_warnings_to_print.lock().unwrap());
-    const MAX_WARNINGS_TO_PRINT: usize = 10;
-
-    if !collected_critical_warnings.is_empty() {
-        eprintln!(
-            "\n\n========================= CRITICAL DATA INTEGRITY ISSUE ========================="
-        );
-        eprintln!(
-            "Gnomon detected loci with conflicting genotype data that were resolved\nusing a heuristic. While computation continued, the underlying data is\nambiguous and should be investigated."
-        );
-        eprintln!(
-            "---------------------------------------------------------------------------------"
-        );
-
-        for (i, info) in collected_critical_warnings
-            .iter()
-            .enumerate()
-            .take(MAX_WARNINGS_TO_PRINT)
-        {
-            if i > 0 {
-                eprintln!(
-                    "---------------------------------------------------------------------------------"
-                );
-            }
-            eprintln!("{}", format_critical_integrity_warning(info));
-        }
-
-        if collected_critical_warnings.len() > MAX_WARNINGS_TO_PRINT {
+    if let Ok(Ok(all_warnings_for_reporting)) = final_warnings {
+        if !all_warnings_for_reporting.is_empty() {
             eprintln!(
-                "\n... and {} more similar critical warnings.",
-                collected_critical_warnings.len() - MAX_WARNINGS_TO_PRINT
+                "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
+            );
+            eprintln!(
+                "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
+            );
+
+            for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
+                eprintln!(
+                    "\n==================== WARNING CATEGORY: {:?} ====================",
+                    heuristic
+                );
+                eprintln!("Total Occurrences: {}", total_count);
+                eprintln!("Showing up to 5 samples:");
+
+                if samples.is_empty() {
+                    eprintln!("  (No samples collected)");
+                } else {
+                    for (i, info) in samples.iter().enumerate() {
+                        if i > 0 {
+                            eprintln!(
+                                "---------------------------------------------------------------------------------"
+                            );
+                        }
+                        eprintln!("{}", format_critical_integrity_warning(info));
+                    }
+                }
+            }
+            eprintln!(
+                "\n=================================================================================\n"
             );
         }
-        eprintln!(
-            "=================================================================================\n"
-        );
     }
 
     if fatal_error_occurred.load(Ordering::Relaxed) {
