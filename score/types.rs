@@ -200,6 +200,72 @@ impl PreparationResult {
 }
 
 // ========================================================================================
+//                            Complex Variant Resolution Types
+// ========================================================================================
+
+use std::collections::HashMap;
+
+// A type alias for the per-thread collector.
+pub type PerThreadCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
+
+// A type alias for the final, merged collector.
+pub type FinalAggregatedCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
+
+/// An enum representing the complete, ordered set of resolution strategies.
+/// This approach uses static dispatch for zero-cost abstraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Heuristic {
+    /// Tries to find one BIM entry that perfectly matches both score file alleles.
+    ExactScoreAlleleMatch,
+    /// Tries to find one interpretation composed ONLY of score file alleles.
+    PrioritizeUnambiguousGenotype,
+    /// Prefers an interpretation where allele lengths match the score file.
+    PreferMatchingAlleleStructure,
+    /// Checks if all conflicting interpretations result in the same dosage.
+    ConsistentDosage,
+    /// As a last resort, prefers a single heterozygous call over homozygous ones.
+    PreferHeterozygous,
+}
+
+/// Describes the specific heuristic used to resolve a critical data ambiguity,
+/// holding the data needed for transparent reporting.
+#[derive(Debug, Clone)]
+pub enum ResolutionMethod {
+    /// All conflicting sources yielded the same effect allele dosage.
+    ConsistentDosage { dosage: f64 },
+    /// Exactly one heterozygous call was found alongside one or more homozygous
+    /// calls, and the heterozygous call was chosen.
+    PreferHeterozygous { chosen_dosage: f64 },
+    /// A single BIM entry's alleles perfectly matched the score file alleles.
+    ExactScoreAlleleMatch { chosen_dosage: f64 },
+    /// A single interpretation was composed of standard alleles from the score file.
+    PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
+    PreferMatchingAlleleStructure { chosen_dosage: f64 },
+}
+
+/// A private struct holding the raw data for one conflicting source of evidence.
+/// This is used exclusively for building the final fatal error report.
+#[derive(Debug, Clone)]
+pub struct ConflictSource {
+    pub bim_row: BimRowIndex,
+    pub alleles: (String, String),
+    pub genotype_bits: u8,
+}
+
+/// A private struct holding the data for a critical but non-fatal integrity warning.
+/// This is used when multiple data sources conflict but lead to a consistent outcome.
+#[derive(Debug, Clone)]
+pub struct CriticalIntegrityWarningInfo {
+    pub iid: String,
+    pub locus_chr_pos: (String, u32),
+    pub score_name: String,
+    pub conflicts: Vec<ConflictSource>,
+    pub resolution_method: ResolutionMethod,
+    pub score_effect_allele: String,
+    pub score_other_allele: String,
+}
+
+// ========================================================================================
 //                            Primitive Type Definitions
 // ========================================================================================
 
