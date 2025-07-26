@@ -540,13 +540,6 @@ pub fn resolve_complex_variants(
                                 }
                             }
                             _ => {
-                                // MOVE the creation of `conflicts` outside the loop.
-                                let conflicts: Vec<_> = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                    bim_row: ctx.0,
-                                    alleles: (ctx.1.clone(), ctx.2.clone()),
-                                    genotype_bits: *bits,
-                                }).collect();
-
                                 for score_info in &group_rule.score_applications {
                                     // Performance: Filter interpretations to only those relevant to the current score.
                                     let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
@@ -573,17 +566,29 @@ pub fn resolve_complex_variants(
                                             Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
                                         };
 
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        }).collect();
+
                                         all_critical_warnings_to_print.lock().unwrap().push(CriticalIntegrityWarningInfo {
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
                                             locus_chr_pos: group_rule.locus_chr_pos.clone(),
                                             score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                            conflicts: conflicts.clone(),
+                                            conflicts,
                                             resolution_method,
                                             score_effect_allele: score_info.effect_allele.clone(),
                                             score_other_allele: score_info.other_allele.clone(),
                                         });
 
                                     } else {
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        }).collect();
+
                                         // The entire pipeline failed. This is a fatal error.
                                         let data = FatalAmbiguityData {
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
