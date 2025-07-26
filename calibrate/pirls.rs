@@ -715,7 +715,7 @@ mod tests {
     fn test_reparameterization_per_rho() {
         use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
         
-        // Create a simple test case with more samples
+        // Create a simple test case with more samples - using simple model known to converge
         let n_samples = 100;
         let x = Array2::from_shape_fn((n_samples, 2), |(i, j)| {
             if j == 0 { 1.0 } else { (i as f64) / (n_samples as f64) }
@@ -741,10 +741,10 @@ mod tests {
             num_pgs_interaction_bases: 0,
         };
         
-        // Create a simple config
+        // Create a simple config with values known to lead to convergence
         let config = ModelConfig {
-            link_function: LinkFunction::Identity,
-            max_iterations: 50, // Increased from 10 to give more time for convergence
+            link_function: LinkFunction::Identity, // Simple linear model for stability
+            max_iterations: 50,
             convergence_tolerance: 1e-8,
             penalty_order: 2,
             reml_convergence_tolerance: 1e-6,
@@ -762,78 +762,43 @@ mod tests {
             num_pgs_interaction_bases: 0,
         };
         
-        // Test with two very different rho values
-        let rho_vec1 = arr1(&[-5.0, 5.0]); // Lambda: [exp(-5), exp(5)]
-        let rho_vec2 = arr1(&[5.0, -5.0]); // Lambda: [exp(5), exp(-5)] - opposite!
+        // Test with two different rho values that are likely to converge
+        // Use a simpler pattern that ensures consistent convergence
+        let rho_vec1 = arr1(&[1.0, -1.0]); // Lambda: [exp(1), exp(-1)]
+        let rho_vec2 = arr1(&[-1.0, 1.0]); // Lambda: [exp(-1), exp(1)] - opposite!
         
-        // Call the function with both rho vectors
-        // Since our convergence criteria is now more robust, we need to handle potential non-convergence
-        let result1 = match super::fit_model_for_fixed_rho(
+        // Call the function with first rho vector
+        // Fail the test if the fit doesn't converge - this is expected behavior
+        let result1 = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
             x.view(),
             y.view(),
             &rs_original,
             &layout,
             &config
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                println!("Note: First call failed with error: {:?}", e);
-                println!("This test is verifying the reparameterization behavior, not convergence.");
-                // Create a minimal result for testing purposes
-                PirlsResult {
-                    beta: Array1::zeros(layout.total_coeffs),
-                    penalized_hessian: Array2::zeros((layout.total_coeffs, layout.total_coeffs)),
-                    deviance: 0.0,
-                    final_weights: Array1::zeros(x.nrows()),
-                    status: PirlsStatus::MaxIterationsReached,
-                    iteration: 0,
-                    max_abs_eta: 0.0,
-                    qs: Array2::eye(layout.total_coeffs), // Identity matrix as transformation
-                }
-            }
-        };
+        ).expect("First fit should converge for this stable test case");
         
-        let result2 = match super::fit_model_for_fixed_rho(
+        // Call the function with second rho vector
+        // Fail the test if the fit doesn't converge - this is expected behavior
+        let result2 = super::fit_model_for_fixed_rho(
             rho_vec2.view(),
             x.view(),
             y.view(),
             &rs_original,
             &layout,
             &config
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                println!("Note: Second call failed with error: {:?}", e);
-                println!("This test is verifying the reparameterization behavior, not convergence.");
-                // Create a different minimal result for testing purposes
-                // Using non-zero beta ensures our test still verifies the reparameterization behavior
-                let mut beta = Array1::zeros(layout.total_coeffs);
-                if !beta.is_empty() {
-                    beta[0] = 1.0; // Make result2 different from result1
-                }
-                PirlsResult {
-                    beta,
-                    penalized_hessian: Array2::zeros((layout.total_coeffs, layout.total_coeffs)),
-                    deviance: 0.0,
-                    final_weights: Array1::zeros(x.nrows()),
-                    status: PirlsStatus::MaxIterationsReached,
-                    iteration: 0,
-                    max_abs_eta: 0.0,
-                    qs: Array2::eye(layout.total_coeffs), // Identity matrix as transformation
-                }
-            }
-        };
+        ).expect("Second fit should converge for this stable test case");
+
+        // The key test: directly check that the transformation matrices are different
+        // This is the core behavior we want to verify - each set of smoothing parameters
+        // should produce a different transformation matrix
+        let qs_diff = (&result1.qs - &result2.qs).mapv(|x| x.abs()).sum();
+        assert!(qs_diff > 1e-6, "The transformation matrices 'qs' should be different for different rho values");
         
-        // Skip the detailed comparison if either call failed
-        // Just verify that the function works without crashing
-        if result1.status == PirlsStatus::MaxIterationsReached || result2.status == PirlsStatus::MaxIterationsReached {
-            println!("Test skipping detailed comparison due to non-convergence.");
-            return;
-        }
+        // As a secondary check, confirm the coefficient estimates are also different
+        let beta_diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
+        assert!(beta_diff > 1e-6, "Expected different coefficient estimates for different rho values");
         
-        // If both converged, verify results differ due to reparameterization
-        let diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
-        assert!(diff > 1e-6, "Expected different results for different rho values");
+        println!("✓ Test passed: Different smoothing parameters correctly produced different reparameterizations.");
     }
 }
