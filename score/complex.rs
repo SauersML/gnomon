@@ -329,7 +329,11 @@ impl Heuristic {
 
     /// A private helper to determine a person's actual alleles from their genotype bits.
     #[inline(always)]
-    fn interpret_person_alleles(packed_geno: u8, bim_a1: &str, bim_a2: &str) -> (&str, &str) {
+    fn interpret_person_alleles<'a>(
+        packed_geno: u8,
+        bim_a1: &'a str,
+        bim_a2: &'a str,
+    ) -> (&'a str, &'a str) {
         match packed_geno {
             0b00 => (bim_a1, bim_a1), // Homozygous for A1
             0b10 => (bim_a1, bim_a2), // Heterozygous (one A1, one A2)
