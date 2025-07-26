@@ -686,7 +686,7 @@ fn solve_truncated_system(
     lambdas: &[f64],
     q_bar: &Array2<f64>,
     r_bar: &Array2<f64>,
-    neg_indices: &[usize],
+    _neg_indices: &[usize], // Not used in rank-deficient case
 ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
     use ndarray::s;
     use ndarray_linalg::QR;
@@ -792,20 +792,26 @@ fn solve_truncated_system(
     }
     
     // Step 11: Compute the full penalized Hessian for consistency
-    // Unlike in the original function, we must reconstruct it from scratch
-    // since we never formed it explicitly during the solution process
-    let data_hessian_full = compute_corrected_data_hessian(p, neg_indices, q_bar, r_bar)?;
-    
-    // Build the full penalty matrix S_lambda
-    let mut s_lambda = Array2::zeros((p, p));
-    for (k, &lambda) in lambdas.iter().enumerate() {
-        if k < rs_transformed.len() {
-            let s_k = rs_transformed[k].dot(&rs_transformed[k].t());
-            s_lambda.scaled_add(lambda, &s_k);
+    // In the rank-deficient case, the Hessian must be computed from the final
+    // truncated system (`r_aug`) and then re-inflated to full size to be consistent
+    // with the truncated beta solution. `r_aug.t() * r_aug` is the correct
+    // penalized Hessian for the identified parameters.
+    let h_trunc = r_aug.slice(s![..rank, ..rank]).t().dot(&r_aug.slice(s![..rank, ..rank]));
+
+    // Re-inflate the truncated Hessian to full p x p size, inserting zeros
+    // for the dropped (unidentifiable) parameters.
+    let mut h_full = Array2::zeros((p, p));
+    for r_trunc in 0..rank {
+        for c_trunc in 0..rank {
+            let r_orig = pivot[r_trunc];
+            let c_orig = pivot[c_trunc];
+            // Symmetrically fill the matrix
+            h_full[[r_orig, c_orig]] = h_trunc[[r_trunc, c_trunc]];
+            if r_orig != c_orig {
+                h_full[[c_orig, r_orig]] = h_trunc[[r_trunc, c_trunc]];
+            }
         }
     }
-    
-    let h_full = data_hessian_full + s_lambda;
     
     Ok((beta_full, h_full))
 }

@@ -329,7 +329,11 @@ impl Heuristic {
 
     /// A private helper to determine a person's actual alleles from their genotype bits.
     #[inline(always)]
-    fn interpret_person_alleles(packed_geno: u8, bim_a1: &str, bim_a2: &str) -> (&str, &str) {
+    fn interpret_person_alleles<'a>(
+        packed_geno: u8,
+        bim_a1: &'a str,
+        bim_a2: &'a str,
+    ) -> (&'a str, &'a str) {
         match packed_geno {
             0b00 => (bim_a1, bim_a1), // Homozygous for A1
             0b10 => (bim_a1, bim_a2), // Heterozygous (one A1, one A2)
@@ -540,13 +544,6 @@ pub fn resolve_complex_variants(
                                 }
                             }
                             _ => {
-                                // MOVE the creation of `conflicts` outside the loop.
-                                let conflicts: Vec<_> = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                    bim_row: ctx.0,
-                                    alleles: (ctx.1.clone(), ctx.2.clone()),
-                                    genotype_bits: *bits,
-                                }).collect();
-
                                 for score_info in &group_rule.score_applications {
                                     // Performance: Filter interpretations to only those relevant to the current score.
                                     let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
@@ -573,17 +570,29 @@ pub fn resolve_complex_variants(
                                             Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
                                         };
 
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        }).collect();
+
                                         all_critical_warnings_to_print.lock().unwrap().push(CriticalIntegrityWarningInfo {
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
                                             locus_chr_pos: group_rule.locus_chr_pos.clone(),
                                             score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                            conflicts: conflicts.clone(),
+                                            conflicts,
                                             resolution_method,
                                             score_effect_allele: score_info.effect_allele.clone(),
                                             score_other_allele: score_info.other_allele.clone(),
                                         });
 
                                     } else {
+                                        let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        }).collect();
+
                                         // The entire pipeline failed. This is a fatal error.
                                         let data = FatalAmbiguityData {
                                             iid: prep_result.final_person_iids[person_output_idx].clone(),
@@ -845,3 +854,4 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     
     report.trim_end().to_string()
 }
+

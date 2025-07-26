@@ -1001,7 +1001,8 @@ pub mod internal {
                     let x_transformed = self.x().dot(qs);
                     let eta = x_transformed.dot(beta);
                     let residuals = &self.y() - &eta;
-                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&residuals);
+                    let deviance_grad_wrt_beta = if self.config.link_function == LinkFunction::Identity {
+                    Array1::zeros(beta.len()) } else { -2.0 * x_transformed.t().dot(&residuals) };
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
