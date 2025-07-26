@@ -85,6 +85,9 @@ pub fn fit_model_for_fixed_rho(
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
+    
+    // Save the most recent stable result to avoid redundant computation
+    let mut last_stable_result: Option<StablePLSResult> = None;
 
     // Validate dimensions
     assert_eq!(
@@ -131,6 +134,9 @@ pub fn fit_model_for_fixed_rho(
             rs_transformed,
             lambdas.as_slice().unwrap(),
         )?;
+        
+        // Save the most recent stable result to avoid redundant computation at the end
+        last_stable_result = Some(stable_result.clone());
 
         let mut beta_trial = stable_result.beta;
 
@@ -231,19 +237,27 @@ pub fn fit_model_for_fixed_rho(
                 "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
             );
 
-            // Return with instability status using the stable, consistent Hessian
-            let stable_result = stable_penalized_least_squares(
-                x.view(),
-                z.view(),
-                weights.view(),
-                eb,
-                rs_transformed,
-                lambdas.as_slice().unwrap(),
-            )?;
+            // Return with instability status using the saved stable result
+            let penalized_hessian = if let Some(ref result) = last_stable_result {
+                // Use the Hessian from the last stable solve
+                result.penalized_hessian.clone()
+            } else {
+                // This should never happen, but as a fallback, compute the Hessian
+                log::warn!("No stable result saved, computing Hessian as fallback");
+                let result = stable_penalized_least_squares(
+                    x.view(),
+                    z.view(),
+                    weights.view(),
+                    eb,
+                    rs_transformed,
+                    lambdas.as_slice().unwrap(),
+                )?;
+                result.penalized_hessian
+            };
             
             return Ok(PirlsResult {
                 beta,
-                penalized_hessian: stable_result.penalized_hessian,
+                penalized_hessian,
                 deviance: last_deviance,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
@@ -258,10 +272,15 @@ pub fn fit_model_for_fixed_rho(
         let deviance_change = (penalized_deviance_current - penalized_deviance_new).abs();
 
         // Calculate the gradient of the penalized deviance objective function
-        // gradient = 2 * ( X' * W * (X*beta - z) + S_lambda * beta )
-        // Simplified to: X'(mu - y) + S_lambda*beta for standard GLMs
-        let residuals = &mu - &y.view();
-        let penalized_deviance_gradient = x.t().dot(&residuals) + s_lambda.dot(&beta);
+        // The correct formula is: 2 * (X' * W * (eta - z) + S_lambda * beta)
+        let eta_minus_z = &eta - &z;
+        let w_times_diff = &weights * &eta_minus_z;
+        let deviance_gradient_part = x.t().dot(&w_times_diff);
+        
+        let penalty_gradient_part = s_lambda.dot(&beta);
+        
+        let penalized_deviance_gradient = 
+            &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
         let gradient_norm = penalized_deviance_gradient
             .iter()
             .map(|&x| x.abs())
@@ -294,6 +313,7 @@ pub fn fit_model_for_fixed_rho(
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
                 // For Gaussian, scale is the estimated residual variance
+                let residuals = &mu - &y.view(); // Recompute residuals for scale calculation
                 let df = x.nrows() as f64 - beta.len() as f64;
                 residuals.dot(&residuals) / df.max(1.0)
             }
@@ -313,20 +333,27 @@ pub fn fit_model_for_fixed_rho(
             log::info!("P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.", 
                       deviance_change, gradient_norm);
 
-            // Get the stable, consistent penalized Hessian from the solver
-            // This ensures we use the same stable computation throughout
-            let stable_result = stable_penalized_least_squares(
-                x.view(),
-                z.view(),
-                weights.view(),
-                eb,
-                rs_transformed,
-                lambdas.as_slice().unwrap(),
-            )?;
+            // Use the saved stable result to avoid redundant computation
+            let penalized_hessian = if let Some(ref result) = last_stable_result {
+                // Use the Hessian from the last stable solve
+                result.penalized_hessian.clone()
+            } else {
+                // This should never happen, but as a fallback, compute the Hessian
+                log::warn!("No stable result saved, computing Hessian as fallback");
+                let result = stable_penalized_least_squares(
+                    x.view(),
+                    z.view(),
+                    weights.view(),
+                    eb,
+                    rs_transformed,
+                    lambdas.as_slice().unwrap(),
+                )?;
+                result.penalized_hessian
+            };
 
             return Ok(PirlsResult {
                 beta,
-                penalized_hessian: stable_result.penalized_hessian,
+                penalized_hessian,
                 deviance: last_deviance,
                 final_weights: weights,
                 status: PirlsStatus::Converged,
@@ -342,21 +369,28 @@ pub fn fit_model_for_fixed_rho(
     // In mgcv's implementation, there is no additional check for whether we're at a valid minimum
     // It just reports failure to converge
     
-    // Get the stable, consistent penalized Hessian from the solver
-    // This ensures we use the same stable computation throughout
-    let stable_result = stable_penalized_least_squares(
-        x.view(),
-        z.view(),
-        weights.view(),
-        eb,
-        rs_transformed,
-        lambdas.as_slice().unwrap(),
-    )?;
+    // Use the saved stable result to avoid redundant computation
+    let penalized_hessian = if let Some(ref result) = last_stable_result {
+        // Use the Hessian from the last stable solve
+        result.penalized_hessian.clone()
+    } else {
+        // This should never happen, but as a fallback, compute the Hessian
+        log::warn!("No stable result saved, computing Hessian as fallback");
+        let result = stable_penalized_least_squares(
+            x.view(),
+            z.view(),
+            weights.view(),
+            eb,
+            rs_transformed,
+            lambdas.as_slice().unwrap(),
+        )?;
+        result.penalized_hessian
+    };
     
     // Simply return with MaxIterationsReached status
     Ok(PirlsResult {
         beta,
-        penalized_hessian: stable_result.penalized_hessian,
+        penalized_hessian,
         deviance: last_deviance,
         final_weights: weights,
         status: PirlsStatus::MaxIterationsReached,
