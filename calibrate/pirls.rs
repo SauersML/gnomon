@@ -21,12 +21,13 @@ pub enum PirlsStatus {
 ///
 /// # Fields
 ///
-/// * `beta`: The estimated coefficient vector.
+/// * `beta`: The estimated coefficient vector in the transformed basis.
 /// * `penalized_hessian`: The penalized Hessian matrix at convergence (X'WX + S_λ).
 /// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
 ///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
 /// * `final_weights`: The final IRLS weights at convergence.
+/// * `qs`: The transformation matrix used for stable reparameterization. The returned beta is in this transformed basis.
 #[derive(Clone)]
 pub struct PirlsResult {
     pub beta: Array1<f64>,
@@ -36,6 +37,7 @@ pub struct PirlsResult {
     pub status: PirlsStatus,
     pub iteration: usize,
     pub max_abs_eta: f64,
+    pub qs: Array2<f64>,
 }
 
 /// P-IRLS solver that uses pre-computed reparameterization results
@@ -110,21 +112,38 @@ fn fit_model_with_reparameterization(
     // Import the stable_reparameterization function if it's in a different module
     use crate::calibrate::construction::stable_reparameterization;
     
-    // Perform the reparameterization for the current rho/lambda values
+    // Perform the reparameterization ONCE for this evaluation
     let reparam_result = stable_reparameterization(
         rs_original, 
         &lambdas.to_vec(), // Convert to Vec since we need to pass it by reference
         layout
     )?;
     
+    // The design matrix MUST be transformed into the new basis
+    // This is critical: if beta is in the transformed basis, then X must also be transformed
+    let x_transformed = x.dot(&reparam_result.qs);
+    
     // Now use the freshly computed eb and rs_transformed for this specific set of smoothing parameters
     let eb = &reparam_result.eb;
     let rs_transformed = &reparam_result.rs_transformed;
     
-    log::info!("Reparameterization complete. Starting P-IRLS iterations...");
+    log::info!("Reparameterization complete. Design matrix transformed. Starting P-IRLS iterations...");
     
-    // Call the internal implementation with the freshly reparameterized penalties
-    fit_model_internal(rho_vec, x, y, eb, rs_transformed, layout, config)
+    // Call the internal implementation with the TRANSFORMED design matrix and reparameterized penalties
+    let mut internal_result = fit_model_internal(
+        rho_vec, 
+        x_transformed.view(), // Use transformed X
+        y, 
+        eb, 
+        rs_transformed, 
+        layout, 
+        config
+    )?;
+    
+    // Attach the transformation matrix to the result before returning
+    // This is essential so the caller knows which basis the beta coefficients are in
+    internal_result.qs = reparam_result.qs;
+    Ok(internal_result)
 }
 
 fn fit_model_internal(
@@ -350,6 +369,7 @@ fn fit_model_internal(
                 status: PirlsStatus::Unstable,
                 iteration: iter,
                 max_abs_eta,
+                qs: Array2::eye(layout.total_coeffs), // Will be set by wrapper
             });
         }
 
@@ -446,6 +466,7 @@ fn fit_model_internal(
                 status: PirlsStatus::Converged,
                 iteration: iter,
                 max_abs_eta,
+                qs: Array2::eye(layout.total_coeffs), // Will be set by wrapper
             });
         }
     }
@@ -483,6 +504,7 @@ fn fit_model_internal(
         status: PirlsStatus::MaxIterationsReached,
         iteration: last_iter,
         max_abs_eta,
+        qs: Array2::eye(layout.total_coeffs), // Will be set by wrapper
     })
 }
 
