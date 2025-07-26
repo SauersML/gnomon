@@ -85,7 +85,6 @@ pub fn fit_model_for_fixed_rho(
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
-    let mut broke_early = false;
 
     // Validate dimensions
     assert_eq!(
@@ -111,7 +110,7 @@ pub fn fit_model_for_fixed_rho(
         // This is the true objective function value at the start of the iteration
         let penalized_deviance_current = deviance_current + penalty_current;
 
-        // Check for non-finite values
+        // Check for non-finite values - this safety check is kept from modern version
         if !eta.iter().all(|x| x.is_finite())
             || !mu.iter().all(|x| x.is_finite())
             || !weights.iter().all(|x| x.is_finite())
@@ -123,7 +122,7 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        // Use stable solver for P-IRLS inner loop (robust iteration)
+        // Use stable solver for P-IRLS inner loop
         let stable_result = stable_penalized_least_squares(
             x.view(),
             z.view(),
@@ -133,115 +132,118 @@ pub fn fit_model_for_fixed_rho(
             lambdas.as_slice().unwrap(),
         )?;
 
-        let beta_proposal = stable_result.beta;
+        let mut beta_trial = stable_result.beta;
 
-        if !beta_proposal.iter().all(|x| x.is_finite()) {
-            log::error!("Non-finite beta values at iteration {iter}: {beta_proposal:?}");
+        if !beta_trial.iter().all(|x| x.is_finite()) {
+            log::error!("Non-finite beta values at iteration {iter}: {beta_trial:?}");
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
                 last_change: f64::NAN,
             });
         }
 
-        // Implement step halving with backtracking line search
-        let delta_beta = &beta_proposal - &beta_current;
-        let mut step_size = 1.0;
-        const MAX_HALVINGS: usize = 12;
+        // Calculate trial values
+        let mut eta_trial = x.dot(&beta_trial);
+        let (mut mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function);
+        let mut deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
 
-        let mut step_accepted = false;
-        let mut final_halving_attempts = 0; // Variable to store the number of attempts
+        // mgcv-style step halving (use while loop instead of for loop with counter)
+        let mut step_halving_count = 0;
+        
+        // Check for non-finite values or deviance increase
+        let mut valid_eta = eta_trial.iter().all(|v| v.is_finite());
+        let mut valid_mu = mu_trial.iter().all(|v| v.is_finite());
+        
+        // Calculate penalty and check if deviance has increased
+        let mut penalty_trial = beta_trial.dot(&s_lambda.dot(&beta_trial));
+        let mut penalized_deviance_trial = deviance_trial + penalty_trial;
+        let mut deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
 
-        for attempt in 0..=MAX_HALVINGS {
-            final_halving_attempts = attempt; // Keep track of attempts
-            let beta_trial = &beta_current + (step_size * &delta_beta);
-            let eta_trial = x.dot(&beta_trial);
-
-            if !eta_trial.iter().all(|v| v.is_finite()) {
-                step_size *= 0.5;
-                continue;
-            }
-
-            let (mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function);
-            let deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
-
-            if !deviance_trial.is_finite() {
-                log::error!(
-                    "Non-finite deviance at iteration {iter} with step size {step_size}: {deviance_trial}"
-                );
-                step_size *= 0.5;
-                continue;
-            }
-
-            // Calculate the penalty for the trial beta
-            let penalty_trial = beta_trial.dot(&s_lambda.dot(&beta_trial));
-            // This is the true objective function value for the trial step
-            let penalized_deviance_trial = deviance_trial + penalty_trial;
-
-            // SUCCESS CONDITION: The new point is strictly better in terms of penalized deviance.
-            if penalized_deviance_trial < penalized_deviance_current {
-                // Atomic state update
-                beta = beta_trial;
-                eta = eta_trial;
-                last_deviance = deviance_trial;
-                (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
-                // End atomic state update
-
-                step_accepted = true;
-                if attempt > 0 {
-                    log::debug!(
-                        "Step halving successful after {} attempts, final step size: {:.6}",
-                        attempt,
-                        step_size
-                    );
-                }
-                break; // Exit line search loop
-            }
-
-            // Step was not an improvement. Halve and retry.
-            if attempt < MAX_HALVINGS {
+        // Step halving when: invalid values or deviance increased
+        if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
+            log::debug!("Starting step halving due to invalid values or deviance increase");
+        }
+        
+        // mgcv-style while loop for step halving
+        while (!valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased) && step_halving_count < 30 {
+            // Half the step size
+            beta_trial = &beta_current + 0.5 * (&beta_trial - &beta_current);
+            eta_trial = x.dot(&beta_trial);
+            
+            // Re-evaluate
+            let update_result = update_glm_vectors(y, &eta_trial, config.link_function);
+            mu_trial = update_result.0;
+            deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
+            penalty_trial = beta_trial.dot(&s_lambda.dot(&beta_trial));
+            
+            // Check conditions again
+            valid_eta = eta_trial.iter().all(|v| v.is_finite());
+            valid_mu = mu_trial.iter().all(|v| v.is_finite());
+            penalized_deviance_trial = deviance_trial + penalty_trial;
+            deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
+            
+            step_halving_count += 1;
+            
+            if step_halving_count > 0 && step_halving_count % 5 == 0 {
                 log::debug!(
-                    "Step Halving Attempt {}: penalized deviance {:.6} -> {:.6}, halving step to {:.6e}",
-                    attempt + 1,
+                    "Step halving attempt {}: penalized deviance {:.6} -> {:.6}",
+                    step_halving_count, 
                     penalized_deviance_current,
-                    penalized_deviance_trial,
-                    step_size * 0.5
+                    penalized_deviance_trial
                 );
             }
-            step_size *= 0.5;
         }
 
-        if !step_accepted {
-            log::warn!(
-                "P-IRLS step-halving failed to reduce penalized deviance at iteration {}. The fit for this rho has stalled.",
-                iter
+        // If we couldn't find a valid step after max step halvings, fail
+        if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
+            log::warn!("P-IRLS failed to find valid step after {} halvings", step_halving_count);
+            // mgcv simply returns with failure in this case
+            return Err(EstimationError::PirlsDidNotConverge {
+                max_iterations: config.max_iterations,
+                last_change: if deviance_decreased { f64::NAN } else { f64::INFINITY },
+            });
+        }
+
+        // Log step halving info if any occurred
+        if step_halving_count > 0 {
+            log::debug!(
+                "Step halving successful after {} attempts",
+                step_halving_count
             );
-            log::info!("P-IRLS STALLED: Step halving failed. Terminating inner loop.");
-            last_iter = iter;
-            broke_early = true;
-            break; // Exit the main `for` loop and proceed to the final check.
         }
 
-        // Monitor the maximum absolute value of eta - the root cause of perfect separation
+        // Update all state variables atomically
+        beta = beta_trial;
+        eta = eta_trial;
+        last_deviance = deviance_trial;
+        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
+
+        // Monitor maximum eta value (to detect separation)
         max_abs_eta = eta
             .iter()
             .map(|v| v.abs())
             .fold(f64::NEG_INFINITY, f64::max);
 
-        // A very large eta value is a strong sign of separation.
-        // This threshold is chosen because exp(100) is astronomically large.
+        // Check for separation - this is a modern feature we'll keep
         const ETA_STABILITY_THRESHOLD: f64 = 100.0;
         if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function == LinkFunction::Logit {
             log::warn!(
                 "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
             );
 
-            // Don't fail here. Just return the current state with a status flag.
-            // Recompute the penalized Hessian with the final weights for consistency.
-            let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
-
+            // Return with instability status using the stable, consistent Hessian
+            let stable_result = stable_penalized_least_squares(
+                x.view(),
+                z.view(),
+                weights.view(),
+                eb,
+                rs_transformed,
+                lambdas.as_slice().unwrap(),
+            )?;
+            
             return Ok(PirlsResult {
                 beta,
-                penalized_hessian,
+                penalized_hessian: stable_result.penalized_hessian,
                 deviance: last_deviance,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
@@ -250,145 +252,117 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        // Calculate the current penalized deviance
+        // Calculate the penalized deviance change for convergence check
         let penalty_new = beta.dot(&s_lambda.dot(&beta));
         let penalized_deviance_new = last_deviance + penalty_new;
-
-        // Compute penalized deviance change safely
         let deviance_change = (penalized_deviance_current - penalized_deviance_new).abs();
-        let step_info = if final_halving_attempts > 0 {
-            format!(" | Step Halving: {} attempts", final_halving_attempts)
-        } else {
-            String::new()
-        };
 
-        // A more detailed, real-time log for each inner-loop iteration
+        // Calculate the gradient of the penalized deviance objective function
+        // gradient = 2 * ( X' * W * (X*beta - z) + S_lambda * beta )
+        // Simplified to: X'(mu - y) + S_lambda*beta for standard GLMs
+        let residuals = &mu - &y.view();
+        let penalized_deviance_gradient = x.t().dot(&residuals) + s_lambda.dot(&beta);
+        let gradient_norm = penalized_deviance_gradient
+            .iter()
+            .map(|&x| x.abs())
+            .fold(0.0, f64::max);
+
+        // Log iteration info
         log::debug!(
-            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
+            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e} | Gradient: {:>12.6e}{}",
             iter,
             penalized_deviance_new,
             deviance_change,
-            step_info
+            gradient_norm,
+            if step_halving_count > 0 { format!(" | Step Halving: {} attempts", step_halving_count) } else { String::new() }
         );
 
+        // Check for non-finite deviance change
         if !deviance_change.is_finite() {
             log::error!(
-                "Non-finite penalized deviance change at iteration {iter}: {deviance_change} (last: {penalized_deviance_current}, current: {penalized_deviance_new})"
+                "Non-finite penalized deviance change at iteration {iter}: {deviance_change}"
             );
-            // Non-finite deviance change is a critical error
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
-                last_change: if deviance_change.is_nan() {
-                    f64::NAN
-                } else {
-                    f64::INFINITY
-                },
+                last_change: if deviance_change.is_nan() { f64::NAN } else { f64::INFINITY },
             });
         }
 
-        // Robust convergence check
-        // - Skip if below min_iterations
-        // - Use combined relative/absolute: change < tol * (deviance + offset) to handle small deviances
-        // - Offset=0.1 is common (avoids div-by-zero; can tune if needed)
-        let reltol_offset = 0.1;
-        let relative_threshold =
-            config.convergence_tolerance * (penalized_deviance_new.abs() + reltol_offset);
-        let converged = iter >= min_iterations
-            && deviance_change < relative_threshold.max(config.convergence_tolerance);
+        // Set scale parameter based on link function
+        // For Logit (Binomial), scale=1. For Identity (Gaussian), use residual variance
+        let scale = match config.link_function {
+            LinkFunction::Logit => 1.0,
+            LinkFunction::Identity => {
+                // For Gaussian, scale is the estimated residual variance
+                let df = x.nrows() as f64 - beta.len() as f64;
+                residuals.dot(&residuals) / df.max(1.0)
+            }
+        };
+
+        // Comprehensive convergence check as in mgcv
+        // 1. The change in penalized deviance is small
+        let deviance_converged = deviance_change < config.convergence_tolerance;
+        
+        // 2. AND the gradient is close to zero (using scaled tolerance)
+        let gradient_tol = config.convergence_tolerance * (scale.abs() + penalized_deviance_new.abs());
+        let gradient_converged = gradient_norm < gradient_tol;
+        
+        let converged = iter >= min_iterations && deviance_converged && gradient_converged;
 
         if converged {
-            log::info!("P-IRLS Converged.");
+            log::info!("P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.", 
+                      deviance_change, gradient_norm);
 
-            // Recompute the penalized Hessian with the final weights for consistency
-            let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
+            // Get the stable, consistent penalized Hessian from the solver
+            // This ensures we use the same stable computation throughout
+            let stable_result = stable_penalized_least_squares(
+                x.view(),
+                z.view(),
+                weights.view(),
+                eb,
+                rs_transformed,
+                lambdas.as_slice().unwrap(),
+            )?;
 
             return Ok(PirlsResult {
                 beta,
-                penalized_hessian,
-                deviance: last_deviance, // Now guaranteed to be the final, converged value
+                penalized_hessian: stable_result.penalized_hessian,
+                deviance: last_deviance,
                 final_weights: weights,
                 status: PirlsStatus::Converged,
                 iteration: iter,
                 max_abs_eta,
             });
         }
-        // No need to update last_deviance here - it's already updated in the line search when a step is accepted
     }
 
+    // If we reach here, we've hit max iterations without converging
     log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
-
-    // This code is executed ONLY if the loop finishes without meeting the deviance convergence criteria.
-
-    if broke_early {
-        log::info!(
-            "P-IRLS STALLED: Step halving failed at iteration {}. Performing final check to see if stalled state is a valid minimum.",
-            last_iter
-        );
-    } else {
-        log::info!(
-            "P-IRLS STALLED: Hit max iterations ({}). Performing final check to see if stalled state is a valid minimum.",
-            config.max_iterations
-        );
-    }
-
-    // We are here because the loop timed out. The variables `beta`, `mu`, `weights`,
-    // and `s_lambda` hold the values from the last, stalled iteration.
-
-    // Check 1: Is the gradient of the penalized deviance close to zero?
-    // The gradient is g = XᵀW(z - η) - S_λβ = Xᵀ(y - μ) - S_λβ
-    let penalized_deviance_gradient = x.t().dot(&(&y.view() - &mu)) - s_lambda.dot(&beta);
-    let gradient_norm = penalized_deviance_gradient
-        .dot(&penalized_deviance_gradient)
-        .sqrt();
-    let is_gradient_zero = gradient_norm < 1e-4; // Use a reasonable tolerance for the gradient norm
-
-    // Compute the penalized Hessian for the final check
-    // We need to compute the Hessian using the final weights to ensure consistency
-    // with the returned beta and weights. This is more efficient than running the full
-    // stable_penalized_least_squares solver again.
-    log::debug!("Computing final Hessian for stalled state using current weights.");
-    let penalized_hessian = compute_final_penalized_hessian(x.view(), &weights, &s_lambda)?;
-
-    // Check 2: Is the penalized Hessian positive-definite?
-    use ndarray_linalg::{Cholesky, UPLO};
-    let is_positive_definite = penalized_hessian.cholesky(UPLO::Lower).is_ok();
-
-    // Final Decision: Is the stall "good enough"?
-    if is_gradient_zero && is_positive_definite {
-        log::info!(
-            "STALL ACCEPTED: A valid minimum was found (gradient_norm={:.2e}, Hessian is PD).",
-            gradient_norm
-        );
-        // The stall is acceptable. Return Ok() as if it had converged normally.
-        Ok(PirlsResult {
-            beta,
-            penalized_hessian,
-            deviance: last_deviance,
-            final_weights: weights,
-            status: PirlsStatus::StalledAtValidMinimum,
-            iteration: last_iter,
-            max_abs_eta,
-        })
-    } else {
-        // The stall is NOT at a valid minimum. Instead of failing, report the status.
-        log::warn!(
-            "STALL REJECTED: Not a valid minimum (gradient_norm={:.2e}, Hessian_PD={}). Reporting max iterations reached.",
-            gradient_norm,
-            is_positive_definite
-        );
-
-        // We don't need to calculate last deviance change anymore as we're just returning the status
-
-        Ok(PirlsResult {
-            beta,
-            penalized_hessian,
-            deviance: last_deviance,
-            final_weights: weights,
-            status: PirlsStatus::MaxIterationsReached,
-            iteration: last_iter,
-            max_abs_eta,
-        })
-    }
+    
+    // In mgcv's implementation, there is no additional check for whether we're at a valid minimum
+    // It just reports failure to converge
+    
+    // Get the stable, consistent penalized Hessian from the solver
+    // This ensures we use the same stable computation throughout
+    let stable_result = stable_penalized_least_squares(
+        x.view(),
+        z.view(),
+        weights.view(),
+        eb,
+        rs_transformed,
+        lambdas.as_slice().unwrap(),
+    )?;
+    
+    // Simply return with MaxIterationsReached status
+    Ok(PirlsResult {
+        beta,
+        penalized_hessian: stable_result.penalized_hessian,
+        deviance: last_deviance,
+        final_weights: weights,
+        status: PirlsStatus::MaxIterationsReached,
+        iteration: last_iter,
+        max_abs_eta,
+    })
 }
 
 // Pseudo-inverse functionality is handled directly in compute_gradient
@@ -531,20 +505,21 @@ pub fn stable_penalized_least_squares(
     // Step C: Perform pivoted QR decomposition on the rank-detection matrix
     let (_, r_combined, pivot) = pivoted_qr(&rank_matrix)?;
 
-    // Step D: Determine numerical rank from diagonal of R and create dropped_cols list
-    let r_diag = r_combined.diag();
-    let max_diag = r_diag.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
-    // Use a stricter tolerance for better numerical stability in rank-deficient cases
-    let threshold = 1e-10 * max_diag.max(1.0);
-    let mut rank = 0;
-    
-    for &diag_val in r_diag.iter() {
-        if diag_val.abs() > threshold {
-            rank += 1;
+    // Step D: Determine numerical rank using the R_cond algorithm from mgcv
+    let rank_tol = 1e-7; // mgcv's default
+    let mut rank = r_combined.ncols().min(r_combined.nrows());
+
+    while rank > 0 {
+        let r_sub = r_combined.slice(s![..rank, ..rank]);
+        let r_cond = estimate_r_condition(r_sub.view());
+        if !r_cond.is_finite() || rank_tol * r_cond > 1.0 {
+            rank -= 1;
         } else {
-            break;
+            break; // Rank is acceptable
         }
     }
+    
+    log::debug!("Determined rank {} (out of {}) using R_cond algorithm", rank, p);
     
     // Create list of dropped columns (unpivoted indices)
     let mut computed_dropped_cols = Vec::new();
@@ -555,6 +530,7 @@ pub fn stable_penalized_least_squares(
     }
 
     // Step E: Solve the system using the unified augmented QR solver
+    // This also returns the stable, consistent penalized Hessian
     let (beta_full, penalized_hessian_full) = solve_with_augmented_qr(
         x,
         y,
@@ -583,6 +559,56 @@ pub fn stable_penalized_least_squares(
 /// Helper function to compute Frobenius norm of a matrix
 fn frobenius_norm(matrix: &ArrayView2<f64>) -> f64 {
     matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
+}
+
+/// Port of the `R_cond` function from mgcv, which implements the CMSW
+/// algorithm to estimate the 1-norm condition number of an upper
+/// triangular matrix R. THIS IS A MANDATORY COMPONENT FOR ALIGNMENT.
+fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
+    use ndarray::s;
+    
+    let c = r_matrix.ncols();
+    if c == 0 { return 1.0; }
+    // We don't need r_rows, but include it for alignment with C code
+    let _r_rows = r_matrix.nrows();
+
+    let mut y = Array1::zeros(c);
+    let mut p = Array1::zeros(c);
+    let mut pp: Array1<f64> = Array1::zeros(c);
+    let mut pm: Array1<f64> = Array1::zeros(c);
+
+    for k in (0..c).rev() {
+        let r_kk = r_matrix[[k, k]];
+        if r_kk == 0.0 { return f64::INFINITY; }
+        let yp: f64 = (1.0 - p[k]) / r_kk;
+        let ym: f64 = (-1.0 - p[k]) / r_kk;
+
+        let mut pp_norm = 0.0;
+        let mut pm_norm = 0.0;
+        for i in 0..k {
+            let r_ik = r_matrix[[i, k]];
+            pp[i] = p[i] + r_ik * yp;
+            pm[i] = p[i] + r_ik * ym;
+            pp_norm += pp[i].abs();
+            pm_norm += pm[i].abs();
+        }
+
+        if yp.abs() + pp_norm >= ym.abs() + pm_norm {
+            y[k] = yp;
+            p.slice_mut(s![0..k]).assign(&pp.slice(s![0..k]));
+        } else {
+            y[k] = ym;
+            p.slice_mut(s![0..k]).assign(&pm.slice(s![0..k]));
+        }
+    }
+    
+    let y_inf_norm = y.iter().map(|v| v.abs()).fold(f64::NEG_INFINITY, f64::max);
+    
+    let r_inf_norm = (0..c).map(|i| {
+        (i..c).map(|j| r_matrix[[i, j]].abs()).sum::<f64>()
+    }).fold(f64::NEG_INFINITY, f64::max);
+
+    r_inf_norm * y_inf_norm
 }
 
 /// Perform pivoted QR decomposition using column-norm based pivoting
@@ -654,6 +680,11 @@ fn build_sqrt_s_lambda(
     lambdas: &[f64],
     p: usize,
 ) -> Result<Array2<f64>, EstimationError> {
+    // Early return for empty penalties to ensure consistent shape
+    if rs_transformed.is_empty() || lambdas.is_empty() {
+        return Ok(Array2::zeros((p, 0)));
+    }
+    
     let scaled_roots: Vec<_> = rs_transformed
         .iter()
         .zip(lambdas)
@@ -663,11 +694,34 @@ fn build_sqrt_s_lambda(
     if scaled_roots.is_empty() {
         return Ok(Array2::zeros((p, 0)));
     }
+    
+    // Ensure all matrices have the correct orientation (p rows)
+    let mut valid_roots = Vec::new();
+    for mat in &scaled_roots {
+        if mat.nrows() == p {
+            valid_roots.push(mat.view());
+        } else if mat.ncols() == p {
+            // Transpose if needed - this ensures correct dimensions
+            valid_roots.push(mat.t());
+        } else {
+            return Err(EstimationError::LayoutError(
+                format!("Penalty matrix has invalid dimensions: {}x{}, expected {} rows", 
+                        mat.nrows(), mat.ncols(), p).into()
+            ));
+        }
+    }
+
+    // Early return with zeros if no valid roots
+    if valid_roots.is_empty() {
+        return Ok(Array2::zeros((p, 0)));
+    }
 
     ndarray::concatenate(
         Axis(1),
-        &scaled_roots.iter().map(|m| m.view()).collect::<Vec<_>>(),
-    ).map_err(|_| EstimationError::LayoutError("Failed to concatenate penalty roots".into()))
+        &valid_roots,
+    ).map_err(|e| EstimationError::LayoutError(
+        format!("Failed to concatenate penalty roots: {:?}", e).into()
+    ))
 }
 
 /// Unified solver using augmented QR decomposition
@@ -695,7 +749,7 @@ fn solve_with_augmented_qr(
     neg_indices: &[usize],
 ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
     use ndarray::s;
-    use ndarray_linalg::{QR, SVD, Solve};
+    use ndarray_linalg::{QR, SVD};
 
     let p = x.ncols();
     let r_rows = r_bar.nrows().min(p);
@@ -765,10 +819,64 @@ fn solve_with_augmented_qr(
         final_rhs.slice_mut(s![..rank]).assign(&vt.t().dot(&temp_vec_corrected));
     }
 
-    // 7. Solve for truncated beta using back-substitution
+    // Create the pivoted and truncated design matrix for direct RHS calculation
+    let mut x_pivoted_trunc = Array2::zeros((x.nrows(), rank));
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
+    }
+
+    // Calculate the direct RHS vector (X_trunc' * W * z)
+    // Note: This first calculation is preserved for reference but we'll use the one below
+
+    // Create the pivoted and truncated design matrix.
+    let mut x_pivoted_trunc = Array2::zeros((x.nrows(), rank));
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
+    }
+    
+    // Get the final RHS slice for the primary, stable path.
     let final_rhs_slice = final_rhs.slice(s![..rank]);
-    let beta_trunc = r_aug_final.solve(&final_rhs_slice)
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    // PATH 1: The Stable RHS intermediate vector `v`, from solving R_aug' * v = final_rhs_slice.
+    // This is equivalent to R'Q'z in the C code's context.
+    use ndarray_linalg::{SolveTriangular, UPLO, Diag};
+    // THE FIX IS HERE: .to_owned() satisfies the trait bounds for solve_triangular.
+    let v_stable = r_aug_final.t().solve_triangular(UPLO::Lower, Diag::NonUnit, &final_rhs_slice.to_owned())
+        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+    
+    // PATH 2: The Direct RHS vector, from X_trunc' * W * z.
+    let wz = &y * &weights; // y is the working response z
+    let rhs_direct = x_pivoted_trunc.t().dot(&wz);
+    
+    // THE CORRECT STABILITY CHECK: Compare the two paths using the squared Euclidean norm.
+    let diff = &v_stable - &rhs_direct;
+    let norm_diff_sq: f64 = diff.iter().map(|&x| x * x).sum();
+    let norm_direct_sq: f64 = rhs_direct.iter().map(|&x| x * x).sum();
+    let rank_tol = 1e-7; // mgcv's tolerance
+    let use_wy_fallback = norm_diff_sq > rank_tol * norm_direct_sq;
+    
+    if use_wy_fallback {
+        log::warn!("Numerical stability issue detected (norm(R'Q'z - X'Wz)² > tol). Switching to fallback solver path.");
+    }
+    
+    // 7. Solve for truncated beta using the correctly triggered path.
+    let beta_trunc = if use_wy_fallback {
+        // --- FALLBACK PATH (`use_wy = 1` in C) ---
+        // Solves (X'WX+S) * beta = X'Wz, which is r_aug_final.t() * r_aug_final * beta = rhs_direct.
+        
+        // 1. Solve r_aug_final.t() * v = rhs_direct for v
+        let v_fallback = r_aug_final.t().solve_triangular(UPLO::Lower, Diag::NonUnit, &rhs_direct)
+            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
+    
+        // 2. Solve r_aug_final * beta = v for beta
+        r_aug_final.solve_triangular(UPLO::Upper, Diag::NonUnit, &v_fallback.to_owned())
+            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?  
+    } else {
+        // --- PRIMARY PATH (`use_wy = 0` in C) ---
+        // Solves r_aug_final * beta = final_rhs_slice
+        r_aug_final.solve_triangular(UPLO::Upper, Diag::NonUnit, &final_rhs_slice.to_owned())
+            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?  
+    };
 
     // 8. Re-inflate beta to full size
     let mut beta_full = Array1::zeros(p);
