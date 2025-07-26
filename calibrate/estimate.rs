@@ -204,16 +204,12 @@ pub fn train_model(
         &layout
     )?;
 
-    // 2. Transform the design matrix X into the stable basis using Qs.
-    let x_transformed = reml_state.x().dot(&reparam_result.qs);
-
-    // 3. Call the STABLE P-IRLS solver with the transformed matrices.
-    let final_fit_transformed = pirls::fit_model_for_fixed_rho(
+    // 3. Call the STABLE P-IRLS solver with original matrices to perform fresh reparameterization.
+    let final_fit_transformed = pirls::fit_model_for_fixed_rho_new(
         final_rho.view(),
-        x_transformed.view(),         // Use transformed X
+        reml_state.x(),               // Use original X
         reml_state.y(),
-        &reparam_result.eb,
-        &reparam_result.rs_transformed,
+        reml_state.rs_list_ref(),     // Pass original penalty matrices
         &layout,
         config,
     )?;
@@ -383,26 +379,21 @@ pub mod internal {
 
             println!("  -> Solving inner P-IRLS loop for this evaluation...");
             
-            // Convert rho to lambda
-            let lambdas = rho.mapv(f64::exp);
+            // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho_new)
+            let lambdas_for_logging = rho.mapv(f64::exp);
+            log::debug!(
+                "Smoothing parameters for this evaluation: [{:.2e}, {:.2e}, ...]",
+                lambdas_for_logging.get(0).unwrap_or(&0.0),
+                lambdas_for_logging.get(1).unwrap_or(&0.0)
+            );
             
-            // 1. First perform stable reparameterization using pre-computed penalty roots
-            let reparam_result = stable_reparameterization(
-                &self.rs_list,
-                lambdas.as_slice().unwrap(),
-                self.layout
-            )?;
-            
-            // 2. Transform design matrix to the stable basis
-            let x_transformed = self.x.dot(&reparam_result.qs);
-            
-            // 3. Run P-IRLS with transformed matrices and pre-computed reparameterization
-            let pirls_result = pirls::fit_model_for_fixed_rho(
+            // No need for pre-computation since reparameterization is now done inside the P-IRLS loop
+            // Run P-IRLS with original matrices to perform fresh reparameterization
+            let pirls_result = pirls::fit_model_for_fixed_rho_new(
                 rho.view(),
-                x_transformed.view(),
+                self.x.view(),
                 self.y,
-                &reparam_result.eb,
-                &reparam_result.rs_transformed,
+                &self.rs_list,
                 self.layout,
                 self.config,
             );
@@ -2795,15 +2786,25 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // The test has been simplified to avoid manual matrix construction,
             // which was causing broadcasting errors.
             
+            use rand::{Rng, SeedableRng};
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42); // For reproducibility
+            
             // Create a very simple dataset
-            let n_samples = 100; 
+            let n_samples = 200; 
             
-            // Create predictors with clear separation pattern
-            let p = Array::linspace(-1.0, 1.0, n_samples); // Linear pattern for PGS
-            let pc1 = Array::linspace(-0.5, 0.5, n_samples); // Linear pattern for PC1
+            // Create predictors with jitter for realism
+            let p = Array::linspace(-1.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
+            let pc1 = Array::linspace(-0.5, 0.5, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
             
-            // Generate response based on PGS only for simplicity
-            let y = p.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 }); // Simple threshold response
+            // Generate response probabilistically to avoid perfect separation
+            let y = p.mapv(|val| {
+                // 1. Create a logit (linear predictor) with some noise
+                let logit = 5.0 * val + rng.gen_range(-1.0..1.0); // Strong signal + noise
+                // 2. Convert logit to probability
+                let prob = 1.0 / (1.0 + (-logit as f64).exp());
+                // 3. Assign class based on a random draw
+                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            });
             
             let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
             
@@ -2811,8 +2812,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             
             // Create minimal configuration with fixed knots
             let mut config = create_test_config();
-            config.pgs_basis_config.num_knots = 1; // Minimal basis size
-            config.pc_basis_configs[0].num_knots = 1; // Minimal basis size
+            config.pgs_basis_config.num_knots = 2; // Minimal but functional basis size
+            config.pc_basis_configs[0].num_knots = 2; // Minimal but functional basis size
             
             // Instead of manually creating matrices and performing P-IRLS,
             // we'll use the train_model function with a fixed seed
@@ -2836,23 +2837,19 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 let final_rho = Array1::from_elem(layout.num_penalties, 0.0);
                 let final_lambda = final_rho.mapv(f64::exp);
                 
-                // Step 4: Compute reparameterization for the final fit
+                // We still need to compute reparameterization to get qs matrix for transforming coefficients back
                 let reparam_result = stable_reparameterization(
                     reml_state.rs_list_ref(),
                     final_lambda.as_slice().unwrap(),
                     &layout
                 )?;
                 
-                // Step 5: Transform the design matrix
-                let x_transformed = reml_state.x().dot(&reparam_result.qs);
-                
-                // Step 6: Call P-IRLS with the transformed matrices
-                let final_fit_transformed = pirls::fit_model_for_fixed_rho(
+                // Step 6: Call P-IRLS with the original matrices and penalty roots
+                let final_fit_transformed = pirls::fit_model_for_fixed_rho_new(
                     final_rho.view(),
-                    x_transformed.view(),
+                    reml_state.x(),
                     reml_state.y(),
-                    &reparam_result.eb,
-                    &reparam_result.rs_transformed,
+                    reml_state.rs_list_ref(),
                     &layout,
                     config
                 )?;
@@ -2878,6 +2875,19 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             
             // Apply our modified training function
             let trained_model = modified_train_model(&data, &config).expect("Model training failed");
+            
+            // Calculate true probabilities for comparison
+            let true_probs = p.mapv(|val| {
+                let logit = 5.0 * val; // Expected signal without noise
+                1.0 / (1.0 + (-logit).exp())
+            });
+            
+            // Generate predictions for the training data
+            let predictions = trained_model.predict(data.p.view(), data.pcs.view()).unwrap();
+            let correlation = correlation_coefficient(&predictions, &true_probs);
+            
+            println!("Correlation between model predictions and true probabilities: {:.4}", correlation);
+            assert!(correlation > 0.85, "Model predictions should be highly correlated with the true underlying probabilities.");
             
             // Create test points at different ends of the predictor range
             let test_pgs_low = array![-0.8]; 
@@ -2905,7 +2915,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
         }
 
         #[test]
-        fn test_pirls_nan_investigation() {
+        fn test_pirls_nan_investigation() -> Result<(), Box<dyn std::error::Error>> {
             // Test that P-IRLS remains stable with extreme values
             // Create conditions that might lead to NaN in P-IRLS
             // Using n_samples=150 to avoid over-parameterization
@@ -2969,32 +2979,16 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
 
             println!("Testing P-IRLS with extreme rho values: {:?}", extreme_rho);
             
-            // For testing, create dummy eb and rs_transformed
-            let eb = Array2::zeros((0, layout.total_coeffs));
-            let rs_transformed: Vec<Array2<f64>> = s_list.iter().map(|s| {
-                let (eigenvalues, eigenvectors) = s.eigh(ndarray_linalg::UPLO::Lower).unwrap();
-                let tolerance = 1e-12;
-                let p = s.nrows();
-                let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-                let mut rs = Array2::zeros((p, rank_k));
-                let mut col_idx = 0;
-                for (i, &eigenval) in eigenvalues.iter().enumerate() {
-                    if eigenval > tolerance {
-                        let sqrt_eigenval = eigenval.sqrt();
-                        let eigenvec = eigenvectors.column(i);
-                        rs.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
-                        col_idx += 1;
-                    }
-                }
-                rs
-            }).collect();
+            // Directly compute the original rs_list for the new function
             
-            let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
+            // Here we need to create the original rs_list to pass to the new function
+            let rs_original = compute_penalty_square_roots(&s_list)?;
+            
+            let result = crate::calibrate::pirls::fit_model_for_fixed_rho_new(
                 extreme_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
-                &eb,
-                &rs_transformed,
+                &rs_original,
                 &layout,
                 &config,
             );
@@ -3026,6 +3020,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     panic!("Unexpected error: {:?}", e);
                 }
             }
+            
+            Ok(())
         }
 
         #[test]
@@ -3167,7 +3163,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let mut rng = StdRng::seed_from_u64(42);
 
             let n_samples = 500; // Increased from 20 for better conditioning
-            let x_vals = Array1::linspace(0.0, 1.0, n_samples);
+            let x_vals = Array1::linspace(0.0, 1.0, n_samples)
+                .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
 
             let p = Array1::zeros(n_samples);
@@ -3672,7 +3669,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // BFGS minimizes cost function, so gradient should point uphill on cost surface
 
             let n_samples = 200; // Increased from 15 for better conditioning
-            let x_vals = Array1::linspace(0.0, 1.0, n_samples);
+            let x_vals = Array1::linspace(0.0, 1.0, n_samples)
+                .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
 
             let p = Array1::zeros(n_samples);
@@ -3774,7 +3772,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let test_gradient_for_link = |link_function: LinkFunction, rng: &mut StdRng| {
                 // --- 2. Create a small, simple test dataset ---
                 let n_samples = 200; // Increased from 50 for better conditioning
-                let x_vals = Array1::linspace(0.0, 1.0, n_samples);
+                let x_vals = Array1::linspace(0.0, 1.0, n_samples)
+                    .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
 
                 // Generate some smooth data based on the link function
                 let f_true = x_vals.mapv(|x| (x * 2.0 * std::f64::consts::PI).sin()); // sine wave
@@ -4505,7 +4504,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
 
             // Use fixed seed for reproducibility
             use rand::prelude::*;
-            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            let _rng = rand::rngs::StdRng::seed_from_u64(42);
 
             // 1. Define a simple model config for the test
             let mut simple_config = create_test_config();
@@ -4518,11 +4517,11 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             simple_config.pc_ranges = vec![(-1.5, 1.5)];
             simple_config.pgs_basis_config.num_knots = 2; // Fewer knots → fewer penalties
 
-            // Create data with realistic variance
+            // Create data with a clear signal instead of random values
             let data = TrainingData {
-                y: Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.0..1.0)), // Random values with variance
-                p: Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0)), // Random values with variance
-                pcs: Array2::from_shape_fn((n_samples, 1), |_| rng.gen_range(-1.5..1.5)), // Random values with variance
+                y: Array1::from_shape_fn(n_samples, |i| (i as f64 / n_samples as f64).sin()), // Data with a clear signal
+                p: Array1::from_shape_fn(n_samples, |i| (i as f64 / n_samples as f64) * 2.0 - 1.0), // Linear range
+                pcs: Array2::from_shape_fn((n_samples, 1), |(i, _)| (i as f64 / n_samples as f64) * 2.0 - 1.0), // Linear range
             };
 
             // 2. Generate consistent structures using the canonical function

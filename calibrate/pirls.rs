@@ -1276,9 +1276,14 @@ mod tests {
     fn test_reparameterization_per_rho() {
         use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
         
-        // Create a simple test case
-        let x = arr2(&[[1.0, 2.0], [1.0, 3.0], [1.0, 5.0]]);
-        let y = arr1(&[4.1, 6.2, 9.8]);
+        // Create a simple test case with more samples
+        let n_samples = 100;
+        let x = Array2::from_shape_fn((n_samples, 2), |(i, j)| {
+            if j == 0 { 1.0 } else { (i as f64) / (n_samples as f64) }
+        });
+        let y = Array1::from_shape_fn(n_samples, |i| {
+            4.1 + 2.0 * ((i as f64) / (n_samples as f64))
+        });
         
         // Create multiple penalty matrices with different scales
         let s1 = arr2(&[[1.0, 0.0], [0.0, 1.0]]);

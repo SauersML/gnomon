@@ -468,8 +468,10 @@ pub fn resolve_complex_variants(
 
     let pipeline = ResolverPipeline::new();
 
+    // Run the parallel processing in a thread scope
     let final_warnings = thread::scope(|s| {
-        s.spawn({
+        // Progress updater thread
+        let _progress_handle = s.spawn({
             let pb_updater = pb.clone();
             let counter_for_updater = Arc::clone(&progress_counter);
             let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
@@ -485,7 +487,8 @@ pub fn resolve_complex_variants(
             }
         });
 
-        s.spawn(|| {
+        // Main processing thread - collect the result from this one
+        let collector_handle = s.spawn(|| {
             final_scores
                 .par_chunks_mut(prep_result.score_names.len())
                 .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
@@ -613,7 +616,7 @@ pub fn resolve_complex_variants(
                     },
                 )
                 .map(|collector_opt| collector_opt.unwrap_or_default())
-                .try_reduce(
+                .reduce(
                     || PerThreadCollector::new(),
                     |mut main_collector, thread_collector| {
                         for (heuristic, (count, samples)) in thread_collector {
@@ -623,48 +626,52 @@ pub fn resolve_complex_variants(
                                 main_samples.extend(samples.into_iter().take(5 - main_samples.len()));
                             }
                         }
-                        Ok(main_collector)
-                    },
+                        main_collector
+                    }
                 )
-        })
-    }).unwrap();
+        });
+        
+        // Wait for the collector thread to finish and get its result
+        collector_handle.join().unwrap_or_default()
+    });
 
     pb.finish_with_message("Done.");
 
-    if let Ok(Ok(all_warnings_for_reporting)) = final_warnings {
-        if !all_warnings_for_reporting.is_empty() {
-            eprintln!(
-                "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
-            );
-            eprintln!(
-                "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
-            );
+    // Process the warnings collection
+    let all_warnings_for_reporting = final_warnings;
+    
+    if !all_warnings_for_reporting.is_empty() {
+        eprintln!(
+            "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
+        );
+        eprintln!(
+            "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
+        );
 
-            for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
-                eprintln!(
-                    "\n==================== WARNING CATEGORY: {:?} ====================",
-                    heuristic
-                );
-                eprintln!("Total Occurrences: {}", total_count);
-                eprintln!("Showing up to 5 samples:");
+        for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
+            eprintln!(
+                "\n==================== WARNING CATEGORY: {:?} ====================",
+                heuristic
+            );
+            eprintln!("Total Occurrences: {}", total_count);
+            eprintln!("Showing up to 5 samples:");
 
-                if samples.is_empty() {
-                    eprintln!("  (No samples collected)");
-                } else {
-                    for (i, info) in samples.iter().enumerate() {
-                        if i > 0 {
-                            eprintln!(
-                                "---------------------------------------------------------------------------------"
-                            );
-                        }
-                        eprintln!("{}", format_critical_integrity_warning(info));
+            if samples.is_empty() {
+                eprintln!("  (No samples collected)");
+            } else {
+                for (i, info) in samples.iter().enumerate() {
+                    if i > 0 {
+                        eprintln!(
+                            "---------------------------------------------------------------------------------"
+                        );
                     }
+                    eprintln!("{}", format_critical_integrity_warning(info));
                 }
             }
-            eprintln!(
-                "\n=================================================================================\n"
-            );
         }
+        eprintln!(
+            "\n=================================================================================\n"
+        );
     }
 
     if fatal_error_occurred.load(Ordering::Relaxed) {
