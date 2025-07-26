@@ -724,32 +724,30 @@ fn solve_truncated_system(
     };
     
     // Step 4: Build the truncated penalty square root matrix E_trunc.
-    // This matrix will have dimensions `e_cols x rank`.
-    let e_cols = e_full.ncols();
-    // It is constructed such that its columns correspond to the kept coefficients.
+    // The matrix e_full has dimensions p x sum(rank_k), with columns corresponding to penalty basis vectors
+    // We need to transpose it to get e_full_t with dimensions sum(rank_k) x p, where columns correspond to model coefficients
+    let e_full_t = e_full.t();
+    let e_rows = e_full_t.nrows();
     
-    // Use the dropped_cols parameter to identify which columns to exclude
-    // Alternatively, we can just use the first `rank` columns from the pivot
-    let mut e_trunc_rows = Vec::with_capacity(rank);
+    // Create a truncated e_full_t matrix by selecting the columns corresponding to kept coefficients
+    // This will have dimensions sum(rank_k) x rank
+    let mut e_trunc_t = Array2::zeros((e_rows, rank));
     
-    // This code uses the dropped_cols parameter to double-check our pivot selection
-    // If a column index is in dropped_cols, we should skip it
-    for &j_orig in pivot.iter().take(rank) {
+    // Select columns from e_full_t using the pivot vector
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
         // Verify this column isn't in dropped_cols (defensive programming)
         if !dropped_cols.contains(&j_orig) {
-            e_trunc_rows.push(e_full.row(j_orig));
+            e_trunc_t.column_mut(j_trunc).assign(&e_full_t.column(j_orig));
         } else {
             log::warn!("Column {} found in both pivot[:rank] and dropped_cols", j_orig);
         }
     }
-    let e_trunc = ndarray::stack(Axis(0), &e_trunc_rows)
-        .map_err(|_| EstimationError::LayoutError("Failed to stack truncated E rows".to_string()))?;
 
-    // Step 5: Form the augmented matrix by stacking R1_trunc and E_trunc.
-    let nr = r_rows + e_cols;
+    // Step 5: Form the augmented matrix by stacking R1_trunc and E_trunc_t.
+    let nr = r_rows + e_rows;
     let mut r_augmented = Array2::zeros((nr, rank));
     r_augmented.slice_mut(s![..r_rows, ..]).assign(&r1_trunc);
-    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc.t()); // Transpose E_trunc to align
+    r_augmented.slice_mut(s![r_rows.., ..]).assign(&e_trunc_t); // E_trunc_t is already in the right orientation
     
     // Step 6: Perform QR decomposition on the augmented matrix
     let (q_aug, r_aug) = r_augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
