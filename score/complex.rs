@@ -398,61 +398,54 @@ pub fn resolve_complex_variants(
 
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
     let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
-    let mut all_warnings_for_reporting: FinalAggregatedCollector = HashMap::new();
 
-    for (rule_idx, group_rule) in prep_result.complex_rules.iter().enumerate() {
-        if fatal_error_occurred.load(Ordering::Relaxed) {
-            break;
-        }
+    let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
+    let progress_style = ProgressStyle::with_template(
+        "> Resolving complex variants [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+    )
+    .expect("Internal Error: Invalid progress bar template string.");
+    pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
+    let progress_counter = Arc::new(AtomicU64::new(0));
 
-        let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
-        let progress_style = ProgressStyle::with_template(&format!(
-            ">  - Rule {:2}/{} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})",
-            rule_idx + 1,
-            num_rules
-        ))
-        .expect("Internal Error: Invalid progress bar template string.");
-        pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
-        let progress_counter = Arc::new(AtomicU64::new(0));
+    let pipeline = ResolverPipeline::new();
 
-        let pipeline = ResolverPipeline::new();
-
-        let rule_level_warnings = thread::scope(|s| {
-            s.spawn({
-                let pb_updater = pb.clone();
-                let counter_for_updater = Arc::clone(&progress_counter);
-                let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
-                let total_people = prep_result.num_people_to_score as u64;
-                move || {
-                    while counter_for_updater.load(Ordering::Relaxed) < total_people
-                        && !error_flag_for_updater.load(Ordering::Relaxed)
-                    {
-                        pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
-                        thread::sleep(Duration::from_millis(200));
-                    }
+    let final_warnings = thread::scope(|s| {
+        s.spawn({
+            let pb_updater = pb.clone();
+            let counter_for_updater = Arc::clone(&progress_counter);
+            let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
+            let total_people = prep_result.num_people_to_score as u64;
+            move || {
+                while counter_for_updater.load(Ordering::Relaxed) < total_people
+                    && !error_flag_for_updater.load(Ordering::Relaxed)
+                {
                     pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+                    thread::sleep(Duration::from_millis(200));
                 }
-            });
+                pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
+            }
+        });
 
-            s.spawn(|| {
-                final_scores
-                    .par_chunks_mut(prep_result.score_names.len())
-                    .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
-                    .enumerate()
-                    .try_fold(
-                        || PerThreadCollector::new(),
-                        |mut local_collector, (person_output_idx, (person_scores_slice, person_counts_slice))| {
-                            let guard = ScopeGuard::new(|| {
-                                progress_counter.fetch_add(1, Ordering::Relaxed);
-                            });
-                            let _ = &guard;
+        s.spawn(|| {
+            final_scores
+                .par_chunks_mut(prep_result.score_names.len())
+                .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
+                .enumerate()
+                .try_fold(
+                    || PerThreadCollector::new(),
+                    |mut local_collector, (person_output_idx, (person_scores_slice, person_counts_slice))| {
+                        let guard = ScopeGuard::new(|| {
+                            progress_counter.fetch_add(1, Ordering::Relaxed);
+                        });
+                        let _ = &guard;
 
-                            if fatal_error_occurred.load(Ordering::Relaxed) {
-                                return Err(());
-                            }
+                        if fatal_error_occurred.load(Ordering::Relaxed) {
+                            return Err(());
+                        }
 
-                            let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
+                        for group_rule in &prep_result.complex_rules {
                             let valid_interpretations: Vec<_> = group_rule
                                 .possible_contexts
                                 .iter()
@@ -556,72 +549,63 @@ pub fn resolve_complex_variants(
                                     }
                                 }
                             }
-                            Ok(local_collector)
-                        },
-                    )
-                    .map(|collector_opt| collector_opt.unwrap_or_default())
-                    .try_reduce(
-                        || PerThreadCollector::new(),
-                        |mut main_collector, thread_collector| {
-                            for (heuristic, (count, samples)) in thread_collector {
-                                let (main_count, main_samples) = main_collector.entry(heuristic).or_insert((0, Vec::new()));
-                                *main_count += count;
-                                if main_samples.len() < 5 {
-                                    main_samples.extend(samples.into_iter().take(5 - main_samples.len()));
-                                }
+                        }
+                        Ok(local_collector)
+                    },
+                )
+                .map(|collector_opt| collector_opt.unwrap_or_default())
+                .try_reduce(
+                    || PerThreadCollector::new(),
+                    |mut main_collector, thread_collector| {
+                        for (heuristic, (count, samples)) in thread_collector {
+                            let (main_count, main_samples) = main_collector.entry(heuristic).or_insert((0, Vec::new()));
+                            *main_count += count;
+                            if main_samples.len() < 5 {
+                                main_samples.extend(samples.into_iter().take(5 - main_samples.len()));
                             }
-                            Ok(main_collector)
-                        },
-                    )
-            })
-        });
+                        }
+                        Ok(main_collector)
+                    },
+                )
+        })
+    }).unwrap();
 
-        pb.finish_with_message("Done.");
+    pb.finish_with_message("Done.");
 
-        if let Ok(Ok(warnings)) = rule_level_warnings {
-            for (heuristic, (count, samples)) in warnings {
-                let (total_count, total_samples) =
-                    all_warnings_for_reporting.entry(heuristic).or_insert((0, Vec::new()));
-                *total_count += count;
-                if total_samples.len() < 5 {
-                    total_samples.extend(samples.into_iter().take(5 - total_samples.len()));
-                }
-            }
-        }
-    }
-
-    if !all_warnings_for_reporting.is_empty() {
-        eprintln!(
-            "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
-        );
-        eprintln!(
-            "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
-        );
-
-        for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
+    if let Ok(Ok(all_warnings_for_reporting)) = final_warnings {
+        if !all_warnings_for_reporting.is_empty() {
             eprintln!(
-                "\n==================== WARNING CATEGORY: {:?} ====================",
-                heuristic
+                "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
             );
-            eprintln!("Total Occurrences: {}", total_count);
-            eprintln!("Showing up to 5 samples:");
+            eprintln!(
+                "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
+            );
 
-            if samples.is_empty() {
-                eprintln!("  (No samples collected)");
-            } else {
-                for (i, info) in samples.iter().enumerate() {
-                    if i > 0 {
-                        eprintln!(
-                            "---------------------------------------------------------------------------------"
-                        );
+            for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
+                eprintln!(
+                    "\n==================== WARNING CATEGORY: {:?} ====================",
+                    heuristic
+                );
+                eprintln!("Total Occurrences: {}", total_count);
+                eprintln!("Showing up to 5 samples:");
+
+                if samples.is_empty() {
+                    eprintln!("  (No samples collected)");
+                } else {
+                    for (i, info) in samples.iter().enumerate() {
+                        if i > 0 {
+                            eprintln!(
+                                "---------------------------------------------------------------------------------"
+                            );
+                        }
+                        eprintln!("{}", format_critical_integrity_warning(info));
                     }
-                    eprintln!("{}", format_critical_integrity_warning(info));
                 }
             }
+            eprintln!(
+                "\n=================================================================================\n"
+            );
         }
-        eprintln!(
-            "\n=================================================================================\n"
-        );
     }
 
     if fatal_error_occurred.load(Ordering::Relaxed) {
