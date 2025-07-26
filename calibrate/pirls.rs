@@ -510,10 +510,13 @@ pub fn update_glm_vectors(
             // Prevent extreme values in working response z
             let residual = &y.view() - &mu;
             let z_adj = &residual / &weights;
-            // Use a more reasonable clamping range (1000 instead of 1e4) to prevent numerical instability
-            // while still allowing for reasonable convergence steps
-            let z_clamped = z_adj.mapv(|v| v.clamp(-1000.0, 1000.0));
-            let z = &eta_clamped + &z_clamped;
+            // REMOVED: Clamping of z_adj - this was causing algorithm instability
+            // The clamping was preventing the algorithm from taking the large steps it needs
+            // when dealing with quasi-perfect separation.
+            // let z_clamped = z_adj.mapv(|v| v.clamp(-1000.0, 1000.0));
+            // Using unclamped z_adj allows the algorithm to propose proper steps
+            // and rely on the robust step-halving to handle any issues.
+            let z = &eta_clamped + &z_adj;
 
             (mu, weights, z)
         }
