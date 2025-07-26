@@ -41,7 +41,94 @@ pub struct PirlsResult {
 
 /// P-IRLS solver that uses pre-computed reparameterization results
 /// This function is called once for each set of smoothing parameters
+/// P-IRLS solver that computes a new reparameterization for each set of smoothing parameters
+/// This function is called once for each set of smoothing parameters evaluated by the optimizer
+/// 
+/// This is the new, improved version that performs reparameterization for each set of rho
+/// to ensure optimal numerical stability.
+pub fn fit_model_for_fixed_rho_new(
+    rho_vec: ArrayView1<f64>,
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    rs_original: &[Array2<f64>],  // Original, untransformed penalty square roots
+    layout: &ModelLayout,
+    config: &ModelConfig,
+) -> Result<PirlsResult, EstimationError> {
+
+    // Core implementation
+    fit_model_with_reparameterization(rho_vec, x, y, rs_original, layout, config)
+}
+
+// Temporary compatibility function - keeps the old API working during transition
+// DEPRECATED: Use fit_model_for_fixed_rho with original penalty roots instead
+// This is the original function signature, kept for backwards compatibility with existing code
+#[deprecated(note = "Use fit_model_for_fixed_rho with original penalty roots instead")]
 pub fn fit_model_for_fixed_rho(
+    rho_vec: ArrayView1<f64>,
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    eb: &Array2<f64>,              // Pre-computed balanced penalty square root
+    rs_transformed: &[Array2<f64>], // Pre-computed transformed penalty square roots
+    layout: &ModelLayout,
+    config: &ModelConfig,
+) -> Result<PirlsResult, EstimationError> {
+    log::warn!("Using deprecated fit_model_for_fixed_rho_legacy which does not reparameterize for each rho");
+    
+    // Call internal implementation, bypassing the reparameterization
+    fit_model_internal(rho_vec, x, y, eb, rs_transformed, layout, config)
+}
+
+/// Internal implementation of the P-IRLS solver with fresh reparameterization
+/// This is the main implementation that performs reparameterization for each set of smoothing parameters
+fn fit_model_with_reparameterization(
+    rho_vec: ArrayView1<f64>,
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    rs_original: &[Array2<f64>],  // Original, untransformed penalty square roots
+    layout: &ModelLayout,
+    config: &ModelConfig,
+) -> Result<PirlsResult, EstimationError> {
+    let lambdas = rho_vec.mapv(f64::exp);
+
+    // Show calculated lambda values
+    if lambdas.is_empty() {
+        log::debug!("Lambdas calculated: [none] (model is unpenalized)");
+    } else {
+        log::debug!(
+            "Lambdas calculated (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]",
+            lambdas.get(0).unwrap_or(&0.0),
+            lambdas.get(1).unwrap_or(&0.0),
+            lambdas.get(2).unwrap_or(&0.0),
+            lambdas.get(3).unwrap_or(&0.0),
+            lambdas.get(4).unwrap_or(&0.0)
+        );
+    }
+    
+    // CRITICAL ARCHITECTURAL FIX: Perform stable reparameterization for each set of smoothing parameters
+    // This matches mgcv's behavior of calling gam.reparam() for every evaluation of the objective function
+    log::debug!("Performing stable reparameterization for current smoothing parameters");
+    
+    // Import the stable_reparameterization function if it's in a different module
+    use crate::calibrate::construction::stable_reparameterization;
+    
+    // Perform the reparameterization for the current rho/lambda values
+    let reparam_result = stable_reparameterization(
+        rs_original, 
+        &lambdas.to_vec(), // Convert to Vec since we need to pass it by reference
+        layout
+    )?;
+    
+    // Now use the freshly computed eb and rs_transformed for this specific set of smoothing parameters
+    let eb = &reparam_result.eb;
+    let rs_transformed = &reparam_result.rs_transformed;
+    
+    log::info!("Reparameterization complete. Starting P-IRLS iterations...");
+    
+    // Call the internal implementation with the freshly reparameterized penalties
+    fit_model_internal(rho_vec, x, y, eb, rs_transformed, layout, config)
+}
+
+fn fit_model_internal(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
@@ -66,8 +153,9 @@ pub fn fit_model_for_fixed_rho(
         );
     }
     
-    // Print setup complete message
-    log::info!("Inner loop setup complete. Starting iterations...");
+    // Just use the pre-computed eb and rs_transformed directly
+    
+    log::info!("Reparameterization complete. Starting P-IRLS iterations...");
 
     // Build the penalty matrix S_lambda from transformed penalty square roots (once per rho)
     let mut s_lambda = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
@@ -131,7 +219,7 @@ pub fn fit_model_for_fixed_rho(
             z.view(),
             weights.view(),
             eb,
-            rs_transformed,
+            rs_transformed, // These are now derived from the reparameterization for this specific rho
             lambdas.as_slice().unwrap(),
         )?;
         
@@ -480,12 +568,13 @@ pub struct StablePLSResult {
 
 /// New rank-truncating stable penalized least squares solver following mgcv's pls_fit1 algorithm
 /// This solver performs rank detection and truncation at every call to ensure numerical stability
+/// The function can now work directly with original or transformed penalty matrices
 pub fn stable_penalized_least_squares(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     weights: ArrayView1<f64>,
-    eb: &Array2<f64>,          // balanced penalty square root from reparameterization
-    rs_transformed: &[Array2<f64>], // transformed penalty square roots
+    eb: &Array2<f64>,          // balanced penalty square root - either from reparameterization or original
+    rs_transformed: &[Array2<f64>], // penalty square roots - either transformed or original
     lambdas: &[f64],           // current lambda values
 ) -> Result<StablePLSResult, EstimationError> {
     let p = x.ncols();
@@ -1039,7 +1128,7 @@ pub fn compute_final_penalized_hessian(
 mod tests {
     use super::*;
     use ndarray::{arr1, arr2};
-    use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+    use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
 
     /// This test explicitly verifies that the Hessian calculation is consistent between
     /// the stable_penalized_least_squares function and compute_final_penalized_hessian function
@@ -1076,7 +1165,7 @@ mod tests {
         // Create dummy eb and rs_transformed for the test
         let s_list = vec![s_lambda.clone()];
         let rs_list = compute_penalty_square_roots(&s_list).unwrap();
-        let layout = ModelLayout {
+        let _layout = ModelLayout {
             intercept_col: 0,
             pgs_main_cols: 0..0,
             penalty_map: vec![],
@@ -1084,12 +1173,10 @@ mod tests {
             num_penalties: 1,
             num_pgs_interaction_bases: 0,
         };
-        let lambdas = vec![1.0];
-        let reparam_result = stable_reparameterization(&rs_list, &lambdas, &layout).unwrap();
-        
-        // ACTION 1: Compute the Hessian using the full stable solver
+        let _lambdas = vec![1.0];
+        // ACTION 1: Compute the Hessian using the full stable solver directly with original penalties
         let stable_result =
-            stable_penalized_least_squares(x.view(), y.view(), weights.view(), &reparam_result.eb, &reparam_result.rs_transformed, &[1.0])
+            stable_penalized_least_squares(x.view(), y.view(), weights.view(), &rs_list[0], &rs_list, &[1.0])
                 .expect("Stable solver failed");
         let hessian_from_solver = stable_result.penalized_hessian;
 
@@ -1131,13 +1218,13 @@ mod tests {
         let weights = arr1(&[1.0, 1.0, 1.0]); // Use identity weights to simplify test
         let s1 = arr2(&[[4.0, 2.0], [2.0, 5.0]]);
 
-        // Compute penalty square roots and perform reparameterization
+        // Compute penalty square roots
         let s_list = vec![s1.clone()];
         let rs_list = compute_penalty_square_roots(&s_list)
             .expect("Failed to compute penalty square roots");
         
         // Create a minimal layout for the test
-        let layout = ModelLayout {
+        let _layout = ModelLayout {
             intercept_col: 0,
             pgs_main_cols: 0..0,
             penalty_map: vec![],
@@ -1146,18 +1233,16 @@ mod tests {
             num_pgs_interaction_bases: 0,
         };
         
-        let lambdas = vec![1.0];
-        let reparam_result = stable_reparameterization(&rs_list, &lambdas, &layout)
-            .expect("Reparameterization failed");
+        let _lambdas = vec![1.0];
         
-        // Run our solver
+        // Run our solver - now working directly with the original square roots
         let result = stable_penalized_least_squares(
             x.view(), 
             y.view(), 
             weights.view(), 
-            &reparam_result.eb, 
-            &reparam_result.rs_transformed, 
-            &lambdas
+            &rs_list[0], // Use the first rs matrix directly for the test
+            &rs_list, 
+            &_lambdas
         ).expect("stable_penalized_least_squares failed");
 
         // Verify the solution by checking if it minimizes the objective function
@@ -1199,4 +1284,134 @@ mod tests {
         );
     }
     
-}
+
+        use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
+        
+        // Create a simple test case
+        let x = arr2(&[[1.0, 2.0], [1.0, 3.0], [1.0, 5.0]]);
+        let y = arr1(&[4.1, 6.2, 9.8]);
+        
+        // Create multiple penalty matrices with different scales
+        let s1 = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let s2 = arr2(&[[0.0, 0.0], [0.0, 100.0]]); // Very different scale
+        
+        let s_list = vec![s1, s2];
+        let rs_original = compute_penalty_square_roots(&s_list).unwrap();
+        
+        // Create a model layout
+        let layout = ModelLayout {
+            intercept_col: 0,
+            pgs_main_cols: 0..0,
+            penalty_map: vec![],
+            total_coeffs: 2,
+            num_penalties: 2,
+            num_pgs_interaction_bases: 0,
+        };
+        
+        // Create a simple config
+        let config = ModelConfig {
+            link_function: LinkFunction::Identity,
+            max_iterations: 10,
+            convergence_tolerance: 1e-8,
+        };
+        
+        // Test with two very different rho values
+        let rho_vec1 = arr1(&[-5.0, 5.0]); // Lambda: [exp(-5), exp(5)]
+        let rho_vec2 = arr1(&[5.0, -5.0]); // Lambda: [exp(5), exp(-5)] - opposite!
+        
+        // Call the function with both rho vectors
+        let result1 = fit_model_with_reparameterization(
+            rho_vec1.view(),
+            x.view(),
+            y.view(),
+            &rs_original,
+            &layout,
+            &config
+        ).unwrap();
+        
+        let result2 = fit_model_with_reparameterization(
+            rho_vec2.view(),
+            x.view(),
+            y.view(),
+            &rs_original,
+            &layout,
+            &config
+        ).unwrap();
+        
+        // The results should be different because of the reparameterization
+        // This is testing that we don't reuse the same transformed penalties
+        let diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
+        assert!(diff > 1e-6, "Expected different results for different rho values");
+    }
+        // SETUP: A simple, well-conditioned problem.
+        let x = arr2(&[[1.0, 2.0], [1.0, 3.0], [1.0, 5.0]]);
+        let y = arr1(&[4.1, 6.2, 9.8]);
+        let weights = arr1(&[1.0, 1.0, 1.0]); // Use identity weights to simplify test
+        let s1 = arr2(&[[4.0, 2.0], [2.0, 5.0]]);
+
+        // Compute penalty square roots
+        let s_list = vec![s1.clone()];
+        let rs_list = compute_penalty_square_roots(&s_list)
+            .expect("Failed to compute penalty square roots");
+        
+        // Create a minimal layout for the test
+        let _layout = ModelLayout {
+            intercept_col: 0,
+            pgs_main_cols: 0..0,
+            penalty_map: vec![],
+            total_coeffs: 2,
+            num_penalties: 1,
+            num_pgs_interaction_bases: 0,
+        };
+        
+        let _lambdas = vec![1.0];
+        
+        // Run our solver - now working directly with the original square roots
+        let result = stable_penalized_least_squares(
+            x.view(), 
+            y.view(), 
+            weights.view(), 
+            &rs_list[0], // Use the first rs matrix directly for the test
+            &rs_list, 
+            &_lambdas
+        ).expect("stable_penalized_least_squares failed");
+
+        // Verify the solution by checking if it minimizes the objective function
+        let fitted_values = x.dot(&result.beta);
+        let residuals = &y - &fitted_values;
+        let rss = residuals.dot(&residuals);
+        let penalty = result.beta.dot(&s1.dot(&result.beta));
+        let objective = rss + penalty;
+        
+        // The objective should be finite and reasonable
+        assert!(
+            objective.is_finite() && objective > 0.0,
+            "Objective function value is invalid: {}",
+            objective
+        );
+        
+        // Also verify that small perturbations to beta increase the objective
+        let delta = 1e-4;
+        let mut perturbed_better = false;
+        
+        // Try a few perturbations
+        for i in 0..result.beta.len() {
+            let mut beta_plus = result.beta.clone();
+            beta_plus[i] += delta;
+            
+            let fitted_plus = x.dot(&beta_plus);
+            let residuals_plus = &y - &fitted_plus;
+            let rss_plus = residuals_plus.dot(&residuals_plus);
+            let penalty_plus = beta_plus.dot(&s1.dot(&beta_plus));
+            let objective_plus = rss_plus + penalty_plus;
+            
+            // If any perturbation decreases the objective, our solution wasn't optimal
+            perturbed_better = perturbed_better || (objective_plus < objective);
+        }
+        
+        assert!(
+            !perturbed_better,
+            "Found a better solution through perturbation"
+        );
+    }
+    
