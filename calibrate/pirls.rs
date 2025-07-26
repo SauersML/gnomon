@@ -899,7 +899,7 @@ fn solve_with_augmented_qr(
     let (q_aug, r_aug) = r_augmented.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
     let r_aug_final = r_aug.slice(s![..rank, ..]); // Ensure it's rank x rank
 
-    // 5. Form the Right-Hand-Side (RHS)
+    // 5. Form the initial, UNCORRECTED Right-Hand-Side (RHS)
     let sqrt_w_z = &weights.mapv(|w| w.abs().sqrt()) * &y;
     let rhs_transformed = q_bar.t().dot(&sqrt_w_z);
     
@@ -908,24 +908,63 @@ fn solve_with_augmented_qr(
     let n_rhs = rhs_transformed.len().min(r_rows);
     rhs_aug.slice_mut(s![..n_rhs]).assign(&rhs_transformed.slice(s![..n_rhs]));
     
-    // Apply Q' from the augmented QR
-    let mut final_rhs = q_aug.t().dot(&rhs_aug);
+    // Apply Q' from the augmented QR to get the initial uncorrected stable RHS
+    let final_rhs = q_aug.t().dot(&rhs_aug);
 
-    // 6. Correct RHS for negative weights (mgcv's approach)
-    if !neg_indices.is_empty() {
-        // 6a. Get the rows of Q1 (`q_bar`) for negative weights, truncated to the correct rank
+    // Create the pivoted and truncated design matrix for direct RHS calculation
+    let mut x_pivoted_trunc = Array2::zeros((x.nrows(), rank));
+    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
+        x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
+    }
+    
+    // 6. Perform the stability check to choose the intermediate RHS vector
+    use ndarray_linalg::{SolveTriangular, UPLO, Diag};
+    let intermediate_rhs = {
+        // Get the final RHS slice for the primary, stable path
+        let final_rhs_slice = final_rhs.slice(s![..rank]);
+        
+        // PATH 1: The Stable RHS intermediate vector - compute as R_aug' * final_rhs_slice
+        // This matches mgcv's C code approach correctly
+        let v_stable = r_aug_final.t().dot(&final_rhs_slice);
+        
+        // PATH 2: The Direct RHS vector, from X_trunc' * W * z
+        let wz = &y * &weights; // y is the working response z
+        let rhs_direct = x_pivoted_trunc.t().dot(&wz);
+        
+        // THE CORRECT STABILITY CHECK: Compare the two paths using the squared Euclidean norm
+        let diff = &v_stable - &rhs_direct;
+        let norm_diff_sq: f64 = diff.iter().map(|&x| x * x).sum();
+        let norm_direct_sq: f64 = rhs_direct.iter().map(|&x| x * x).sum();
+        let rank_tol = 1e-7; // mgcv's tolerance
+        let use_wy_fallback = norm_diff_sq > rank_tol * norm_direct_sq;
+        
+        if use_wy_fallback {
+            log::warn!("Numerical stability issue detected (norm(R_aug' * final_rhs - X'Wz)² > tol). Switching to fallback solver path.");
+            // Solve r_aug_final.t() * v = rhs_direct for v
+            // This creates the intermediate RHS for the fallback path
+            r_aug_final.t().solve_triangular(UPLO::Lower, Diag::NonUnit, &rhs_direct)
+                .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?
+        } else {
+            // Use the stable path's RHS directly
+            final_rhs_slice.to_owned()
+        }
+    };
+    
+    // 7. NOW, apply the negative weight correction to the chosen intermediate RHS
+    let corrected_rhs = if !neg_indices.is_empty() {
+        // Get the rows of Q1 (`q_bar`) for negative weights, truncated to the correct rank
         let q1_neg = q_bar.select(Axis(0), neg_indices);
         let mut q1_neg_trunc = Array2::zeros((neg_indices.len(), rank));
         for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
             q1_neg_trunc.column_mut(j_trunc).assign(&q1_neg.column(j_orig));
         }
 
-        // 6b. SVD of the truncated Q1_neg
+        // SVD of the truncated Q1_neg
         let (_, sigma, vt) = q1_neg_trunc.svd(true, true)
             .map_err(EstimationError::LinearSystemSolveFailed)?;
         let vt = vt.unwrap();
 
-        // 6c. Form the diagonal correction matrix (I - 2D²)^-1
+        // Form the diagonal correction matrix (I - 2D²)^-1
         let mut d_inv = Array1::zeros(rank);
         for i in 0..rank {
             let val = if i < sigma.len() { 1.0 - 2.0 * sigma[i].powi(2) } else { 1.0 };
@@ -933,64 +972,18 @@ fn solve_with_augmented_qr(
             d_inv[i] = if val.abs() > 1e-12 { 1.0 / val } else { 0.0 };
         }
 
-        // 6d. Apply the transformation T = V * D_inv * V' to final_rhs
-        let temp_vec = vt.dot(&final_rhs.slice(s![..rank]));
+        // Apply the transformation T = V * D_inv * V' to intermediate_rhs
+        let temp_vec = vt.dot(&intermediate_rhs);
         let temp_vec_corrected = &d_inv * &temp_vec;
-        final_rhs.slice_mut(s![..rank]).assign(&vt.t().dot(&temp_vec_corrected));
-    }
-
-    // Create the pivoted and truncated design matrix for direct RHS calculation
-    let mut x_pivoted_trunc = Array2::zeros((x.nrows(), rank));
-    for (j_trunc, &j_orig) in pivot.iter().take(rank).enumerate() {
-        x_pivoted_trunc.column_mut(j_trunc).assign(&x.column(j_orig));
-    }
-
-    // The x_pivoted_trunc matrix was already created above at lines 945-949
-    // We'll reuse it for the stability check below
-    
-    // Get the final RHS slice for the primary, stable path.
-    let final_rhs_slice = final_rhs.slice(s![..rank]);
-    
-    // PATH 1: The Stable RHS intermediate vector `v`, from solving R_aug' * v = final_rhs_slice.
-    // This is equivalent to R'Q'z in the C code's context.
-    use ndarray_linalg::{SolveTriangular, UPLO, Diag};
-    // THE FIX IS HERE: .to_owned() satisfies the trait bounds for solve_triangular.
-    let v_stable = r_aug_final.t().solve_triangular(UPLO::Lower, Diag::NonUnit, &final_rhs_slice.to_owned())
-        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-    
-    // PATH 2: The Direct RHS vector, from X_trunc' * W * z.
-    let wz = &y * &weights; // y is the working response z
-    let rhs_direct = x_pivoted_trunc.t().dot(&wz);
-    
-    // THE CORRECT STABILITY CHECK: Compare the two paths using the squared Euclidean norm.
-    let diff = &v_stable - &rhs_direct;
-    let norm_diff_sq: f64 = diff.iter().map(|&x| x * x).sum();
-    let norm_direct_sq: f64 = rhs_direct.iter().map(|&x| x * x).sum();
-    let rank_tol = 1e-7; // mgcv's tolerance
-    let use_wy_fallback = norm_diff_sq > rank_tol * norm_direct_sq;
-    
-    if use_wy_fallback {
-        log::warn!("Numerical stability issue detected (norm(R'Q'z - X'Wz)² > tol). Switching to fallback solver path.");
-    }
-    
-    // 7. Solve for truncated beta using the correctly triggered path.
-    let beta_trunc = if use_wy_fallback {
-        // --- FALLBACK PATH (`use_wy = 1` in C) ---
-        // Solves (X'WX+S) * beta = X'Wz, which is r_aug_final.t() * r_aug_final * beta = rhs_direct.
-        
-        // 1. Solve r_aug_final.t() * v = rhs_direct for v
-        let v_fallback = r_aug_final.t().solve_triangular(UPLO::Lower, Diag::NonUnit, &rhs_direct)
-            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-    
-        // 2. Solve r_aug_final * beta = v for beta
-        r_aug_final.solve_triangular(UPLO::Upper, Diag::NonUnit, &v_fallback.to_owned())
-            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?  
+        vt.t().dot(&temp_vec_corrected)
     } else {
-        // --- PRIMARY PATH (`use_wy = 0` in C) ---
-        // Solves r_aug_final * beta = final_rhs_slice
-        r_aug_final.solve_triangular(UPLO::Upper, Diag::NonUnit, &final_rhs_slice.to_owned())
-            .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?  
+        // No correction needed if no negative weights
+        intermediate_rhs
     };
+    
+    // 8. Final solve for truncated beta using the single, corrected RHS
+    let beta_trunc = r_aug_final.solve_triangular(UPLO::Upper, Diag::NonUnit, &corrected_rhs)
+        .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
 
     // 8. Re-inflate beta to full size
     let mut beta_full = Array1::zeros(p);
