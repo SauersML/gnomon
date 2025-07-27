@@ -177,7 +177,7 @@ pub fn fit_model_for_fixed_rho(
         }
 
         // Use simplified solver that works directly with the single penalty square root
-        let stable_result = solve_penalized_least_squares(
+        let stable_result = solve_penalized_least_squares_simple(
             x_transformed.view(),
             z.view(),
             weights.view(),
@@ -295,7 +295,7 @@ pub fn fit_model_for_fixed_rho(
             } else {
                 // This should never happen, but as a fallback, compute the Hessian
                 log::warn!("No stable result saved, computing Hessian as fallback");
-                let result = solve_penalized_least_squares(
+                let result = solve_penalized_least_squares_simple(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
@@ -391,7 +391,7 @@ pub fn fit_model_for_fixed_rho(
             } else {
                 // This should never happen, but as a fallback, compute the Hessian
                 log::warn!("No stable result saved, computing Hessian as fallback");
-                let result = solve_penalized_least_squares(
+                let result = solve_penalized_least_squares_simple(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
@@ -426,7 +426,7 @@ pub fn fit_model_for_fixed_rho(
     } else {
         // This should never happen, but as a fallback, compute the Hessian
         log::warn!("No stable result saved, computing Hessian as fallback");
-        let result = solve_penalized_least_squares(
+        let result = solve_penalized_least_squares_simple(
             x_transformed.view(),
             z.view(),
             weights.view(),
@@ -589,7 +589,7 @@ pub struct StablePLSResult {
 /// Simple penalized least squares solver using single penalty square root matrix
 /// This is the numerically stable approach that follows mgcv's architecture
 /// Uses the single square root matrix E from reparameterization
-pub fn solve_penalized_least_squares(
+pub fn solve_penalized_least_squares_simple(
     x: ArrayView2<f64>,
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
