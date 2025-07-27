@@ -712,13 +712,28 @@ pub fn solve_penalized_least_squares(
     }
     let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
     
-    // EDF and scale will be calculated in the main loop using the final Hessian.
+    // Calculate effective degrees of freedom (edf) using the penalized Hessian
+    let edf = calculate_edf(
+        &penalized_hessian,
+        x_transformed, // Use the transformed design matrix
+        weights,
+    )?;
+
+    // Calculate the scale parameter
+    let scale = calculate_scale(
+        &beta_transformed,
+        x_transformed, // Use the transformed design matrix
+        z,             // Use the un-weighted working response
+        weights,
+        edf,
+    );
+    
     Ok((
         StablePLSResult {
             beta: beta_transformed,
             penalized_hessian,
-            edf: 0.0,
-            scale: 0.0,
+            edf,
+            scale,
         },
         rank,
     ))
