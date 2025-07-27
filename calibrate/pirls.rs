@@ -448,11 +448,61 @@ pub fn fit_model_for_fixed_rho(
     })
 }
 
-// Previous deprecated function has been completely removed
 
-// Previous internal implementation has been completely removed and merged into fit_model_for_fixed_rho
+/// Port of the `R_cond` function from mgcv, which implements the CMSW
+/// algorithm to estimate the 1-norm condition number of an upper
+/// triangular matrix R. THIS IS A MANDATORY COMPONENT FOR ALIGNMENT.
+fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
+    use ndarray::s;
+    
+    let c = r_matrix.ncols();
+    if c == 0 { return 1.0; }
+    // We don't need r_rows, but include it for alignment with C code
+    let _r_rows = r_matrix.nrows();
 
-// Previous fit_model_internal has been completely removed
+    let mut y = Array1::zeros(c);
+    let mut p = Array1::zeros(c);
+    let mut pp: Array1<f64> = Array1::zeros(c);
+    let mut pm: Array1<f64> = Array1::zeros(c);
+
+    for k in (0..c).rev() {
+        let r_kk = r_matrix[[k, k]];
+        if r_kk == 0.0 { return f64::INFINITY; }
+        let yp: f64 = (1.0 - p[k]) / r_kk;
+        let ym: f64 = (-1.0 - p[k]) / r_kk;
+
+        let mut pp_norm = 0.0;
+        let mut pm_norm = 0.0;
+        for i in 0..k {
+            let r_ik = r_matrix[[i, k]];
+            pp[i] = p[i] + r_ik * yp;
+            pm[i] = p[i] + r_ik * ym;
+            pp_norm += pp[i].abs();
+            pm_norm += pm[i].abs();
+        }
+
+        if yp.abs() + pp_norm >= ym.abs() + pm_norm {
+            y[k] = yp;
+            p.slice_mut(s![0..k]).assign(&pp.slice(s![0..k]));
+        } else {
+            y[k] = ym;
+            p.slice_mut(s![0..k]).assign(&pm.slice(s![0..k]));
+        }
+    }
+    
+    let y_inf_norm = y.iter().map(|v| v.abs()).fold(f64::NEG_INFINITY, f64::max);
+    
+    let r_inf_norm = (0..c).map(|i| {
+        (i..c).map(|j| r_matrix[[i, j]].abs()).sum::<f64>()
+    }).fold(f64::NEG_INFINITY, f64::max);
+
+    r_inf_norm * y_inf_norm
+}
+
+
+
+
+
 
 // Pseudo-inverse functionality is handled directly in compute_gradient
 
@@ -598,6 +648,70 @@ pub fn solve_penalized_least_squares_simple(
 
 
 
+
+
+/// Perform pivoted QR decomposition using column-norm based pivoting
+fn pivoted_qr(matrix: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
+    use ndarray_linalg::QR;
+    
+    let m = matrix.nrows();
+    let n = matrix.ncols();
+    
+    // Initialize pivot vector and working matrix
+    let mut pivot: Vec<usize> = (0..n).collect();
+    let mut work_matrix = matrix.clone();
+    
+    // Compute initial column norms
+    let mut col_norms: Vec<f64> = (0..n)
+        .map(|j| work_matrix.column(j).dot(&work_matrix.column(j)).sqrt())
+        .collect();
+    
+    // Apply column pivoting based on norms
+    for k in 0..n.min(m) {
+        // Find column with maximum norm from k onwards
+        let (max_idx, _) = col_norms.iter()
+            .enumerate()
+            .skip(k)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+        
+        // Swap columns k and max_idx if needed
+        if max_idx != k {
+            // Swap in pivot vector
+            pivot.swap(k, max_idx);
+            
+            // Swap columns in matrix
+            let col_k = work_matrix.column(k).to_owned();
+            let col_max = work_matrix.column(max_idx).to_owned();
+            work_matrix.column_mut(k).assign(&col_max);
+            work_matrix.column_mut(max_idx).assign(&col_k);
+            
+            // Swap column norms
+            col_norms.swap(k, max_idx);
+        }
+        
+        // Update column norms for remaining columns
+        if k < m - 1 {
+            let _factor = if col_norms[k] > 0.0 {
+                work_matrix[[k, k]] / col_norms[k]
+            } else {
+                0.0
+            };
+            
+            for j in (k + 1)..n {
+                if col_norms[j] > 0.0 {
+                    let temp = work_matrix[[k, j]] / col_norms[j];
+                    col_norms[j] *= (1.0 - temp * temp).max(0.0).sqrt();
+                }
+            }
+        }
+    }
+    
+    // Perform QR decomposition on pivoted matrix
+    let (q, r) = work_matrix.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    
+    Ok((q, r, pivot))
+}
 
 
 

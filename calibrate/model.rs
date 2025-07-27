@@ -160,7 +160,12 @@ impl TrainedModel {
 
         // --- 4. Apply Inverse Link Function ---
         let predictions = match self.config.link_function {
-            LinkFunction::Logit => eta.mapv(|e| 1.0 / (1.0 + f64::exp(-e))), // Sigmoid
+            LinkFunction::Logit => {
+                // Clamp eta to prevent numerical overflow in exp(), just like in pirls.rs
+                let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+                // Apply the inverse link function (sigmoid) to the clamped eta
+                eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e))) // Sigmoid
+            },
             LinkFunction::Identity => eta,
         };
 
