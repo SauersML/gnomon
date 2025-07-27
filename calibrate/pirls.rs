@@ -167,6 +167,8 @@ pub fn fit_model_for_fixed_rho(
             z.view(),
             weights.view(),
             &e, // Single square root matrix from eigendecomposition in transformed space
+            y.view(), // Pass original response
+            config.link_function, // Pass link function for correct scale calculation
         )?;
 
         // Save the most recent stable result to avoid redundant computation at the end
@@ -324,6 +326,8 @@ pub fn fit_model_for_fixed_rho(
                     z.view(),
                     weights.view(),
                     &e,
+                    y.view(),
+                    config.link_function,
                 )?;
                 result.penalized_hessian
             };
@@ -451,6 +455,8 @@ pub fn fit_model_for_fixed_rho(
                     z.view(),
                     weights.view(),
                     &e,
+                    y.view(),
+                    config.link_function,
                 )?;
                 result.penalized_hessian
             };
@@ -499,7 +505,7 @@ pub fn fit_model_for_fixed_rho(
         // This should never happen, but as a fallback, compute the Hessian
         log::warn!("No stable result saved, computing Hessian as fallback");
         let (result, _rank) =
-            solve_penalized_least_squares(x_transformed.view(), z.view(), weights.view(), &e)?;
+            solve_penalized_least_squares(x_transformed.view(), z.view(), weights.view(), &e, y.view(), config.link_function)?;
         result.penalized_hessian
     };
 
@@ -673,6 +679,8 @@ pub fn solve_penalized_least_squares(
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     e: &Array2<f64>, // Single penalty square root matrix
+    y: ArrayView1<f64>, // Original response (not the working response z)
+    link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
     use ndarray::s;
     use ndarray_linalg::{Diag, SolveTriangular, UPLO};
@@ -683,21 +691,22 @@ pub fn solve_penalized_least_squares(
     let n = x_transformed.nrows();
     let p = x_transformed.ncols();
 
-    // Check for negative weights (will implement SVD correction in future)
-    let has_negative_weights = weights.iter().any(|&w| w < 0.0);
+    // --- Negative Weight Handling ---
+    // The reference mgcv implementation includes extensive logic for handling negative weights,
+    // which can arise during a full Newton-Raphson P-IRLS step with non-canonical link
+    // functions.
+    //
+    // Our current implementation for the Logit link uses Fisher Scoring, where weights
+    // w = mu(1-mu) are always non-negative. For the Identity link, weights are always 1.0.
+    // Therefore, negative weights are currently impossible.
+    //
+    // If full Newton-Raphson is implemented in the future, a full SVD-based correction, 
+    // as seen in the mgcv C function `pls_fit1`, would be required here for statistical correctness.
 
-    if has_negative_weights {
-        // TODO: Implement SVD-based approach for negative weights
-        // For now, fall back to simple absolute value approach
-        log::warn!(
-            "Negative weights detected - using simplified approach (full SVD correction not yet implemented)"
-        );
-    }
-
-    // Step 1: Form the weighted design matrix sqrt(|W|) * X_transformed
-    let sqrt_abs_w = weights.mapv(|w| w.abs().sqrt());
-    let wx = &x_transformed * &sqrt_abs_w.view().insert_axis(Axis(1));
-    let wz = &sqrt_abs_w * &z;
+    // Step 1: Form the weighted design matrix sqrt(W) * X_transformed
+    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
+    let wz = &sqrt_w * &z;
 
     // Step 2: Form the complete augmented system [sqrt(W)*X_transformed; e]
     // If there's no penalty (e.nrows() == 0), just use the weighted design matrix
@@ -775,9 +784,10 @@ pub fn solve_penalized_least_squares(
     let scale = calculate_scale(
         &beta_transformed,
         x_transformed, // Use the transformed design matrix
-        z,             // Use the un-weighted working response
+        y,             // Use the original response, not the working response z
         weights,
         edf,
+        link_function, // Pass the link function to determine appropriate scale calculation
     );
 
     Ok((
@@ -868,8 +878,8 @@ fn calculate_edf(
     use ndarray_linalg::Solve;
 
     let p = x.ncols();
-    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
-    let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1));
+    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
     let xtwx = wx.t().dot(&wx);
 
     let mut edf = 0.0;
@@ -882,23 +892,36 @@ fn calculate_edf(
     Ok(edf.max(1.0))
 }
 
-/// Calculate scale parameter
+/// Calculate scale parameter correctly for different link functions
+/// For Gaussian (Identity): Based on weighted residual sum of squares
+/// For Binomial (Logit): Fixed at 1.0 as in mgcv
 fn calculate_scale(
     beta: &Array1<f64>,
     x: ArrayView2<f64>,
-    y: ArrayView1<f64>,
+    y: ArrayView1<f64>,  // This is the original response, not the working response z
     weights: ArrayView1<f64>,
     edf: f64,
+    link_function: LinkFunction,
 ) -> f64 {
-    let fitted = x.dot(beta);
-    let residuals = &y - &fitted;
-    let weighted_rss: f64 = weights
-        .iter()
-        .zip(residuals.iter())
-        .map(|(&w, &r)| w * r * r)
-        .sum();
-    let n = x.nrows() as f64;
-    weighted_rss / (n - edf).max(1.0)
+    match link_function {
+        LinkFunction::Logit => {
+            // For binomial models (logistic regression), scale is fixed at 1.0
+            // This follows mgcv's convention in gam.fit3.R
+            1.0
+        }
+        LinkFunction::Identity => {
+            // For Gaussian models, scale is estimated from the residual sum of squares
+            let fitted = x.dot(beta);
+            let residuals = &y - &fitted;
+            let weighted_rss: f64 = weights
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            let n = x.nrows() as f64;
+            weighted_rss / (n - edf).max(1.0)
+        }
+    }
 }
 
 /// Compute penalized Hessian matrix X'WX + S_λ correctly handling negative weights
@@ -913,9 +936,9 @@ pub fn compute_final_penalized_hessian(
 
     let p = x.ncols();
 
-    // Step 1: Perform the QR decomposition of sqrt(|W|)X to get R_bar
-    let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
-    let wx = &x * &sqrt_w_abs.view().insert_axis(ndarray::Axis(1));
+    // Step 1: Perform the QR decomposition of sqrt(W)X to get R_bar
+    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
     let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
     let r_rows = r_bar.nrows().min(p);
     let r1_full = r_bar.slice(s![..r_rows, ..]);
@@ -998,7 +1021,8 @@ mod tests {
             e.shape()
         );
         // For the test, the design matrix is already in the correct basis
-        let result = solve_penalized_least_squares(x.view(), z.view(), weights.view(), &e);
+        // We're using identity link function for the test
+        let result = solve_penalized_least_squares(x.view(), z.view(), weights.view(), &e, z.view(), LinkFunction::Identity);
 
         // The solver should not fail despite the rank deficiency
         match &result {
