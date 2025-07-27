@@ -747,8 +747,18 @@ pub fn solve_penalized_least_squares(
     aug_rhs.slice_mut(s![..n]).assign(&wz);
     let q_t_rhs = q.t().dot(&aug_rhs);
 
-    let r_trunc = r.slice(s![..rank, ..rank]);
-    let rhs_trunc = q_t_rhs.slice(s![..rank]);
+    // CRITICAL FIX: We must carefully handle the dimensions of the R matrix from QR
+    // The shape of r is (min(m,n), n) where m=aug_rows and n=p
+    // We need to correctly slice it for the upper triangular part
+    let r_rows = r.nrows();
+    
+    // Ensure we don't try to access more rows than exist in r
+    let actual_rank = rank.min(r_rows);
+    
+    // Extract the upper triangular part of R up to the rank
+    // This correctly handles cases where r is not square
+    let r_trunc = r.slice(s![..actual_rank, ..actual_rank]);
+    let rhs_trunc = q_t_rhs.slice(s![..actual_rank]);
 
     let beta_trunc = r_trunc
         .solve_triangular(UPLO::Upper, Diag::NonUnit, &rhs_trunc.to_owned())
@@ -756,21 +766,30 @@ pub fn solve_penalized_least_squares(
 
     // Step 6: Restore solution to full size and un-pivot
     let mut beta_pivoted = Array1::zeros(p);
-    beta_pivoted.slice_mut(s![..rank]).assign(&beta_trunc);
+    beta_pivoted.slice_mut(s![..actual_rank]).assign(&beta_trunc);
 
     let mut beta_transformed = Array1::zeros(p); // Solution remains in the transformed basis
     for i in 0..p {
-        if i < rank {
+        if i < actual_rank {
             beta_transformed[pivot[i]] = beta_pivoted[i];
         }
     }
 
     // Step 7: Calculate the penalized Hessian IN THE TRANSFORMED BASIS
-    let hessian_pivoted = r.t().dot(&r);
+    // We must use the truncated R matrix to calculate the Hessian correctly
+    // This follows mgcv's approach of using the reduced-rank solution
+    let r_upper = r.slice(s![..actual_rank, ..p]);
+    let hessian_pivoted = r_upper.t().dot(&r_upper);
+    
+    // Create the permutation matrix for unpivoting
     let mut p_mat = Array2::zeros((p, p));
     for (i, &piv_col) in pivot.iter().enumerate() {
-        p_mat[[piv_col, i]] = 1.0;
+        if i < p { // Safety check
+            p_mat[[piv_col, i]] = 1.0;
+        }
     }
+    
+    // The final penalized Hessian is P * R'R * P'
     let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
 
     // Calculate effective degrees of freedom (edf) using the penalized Hessian
