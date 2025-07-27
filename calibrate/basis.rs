@@ -777,7 +777,6 @@ mod tests {
         println!("Total: {} + {} = {}", term1, term2, term1 + term2);
     }
 
-
     /// Validates the basis functions against Example 1 in Starkey's "Cox-deBoor" notes.
     ///
     /// This example is a linear spline (degree=1, order=2) with a uniform knot vector.

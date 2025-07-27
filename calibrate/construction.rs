@@ -449,31 +449,34 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 /// Computes penalty square roots from full penalty matrices using eigendecomposition
 /// Returns "skinny" matrices of dimension p x rank_k where rank_k is the rank of each penalty
-pub fn compute_penalty_square_roots(s_list: &[Array2<f64>]) -> Result<Vec<Array2<f64>>, EstimationError> {
+pub fn compute_penalty_square_roots(
+    s_list: &[Array2<f64>],
+) -> Result<Vec<Array2<f64>>, EstimationError> {
     let mut rs_list = Vec::with_capacity(s_list.len());
-    
+
     for s in s_list {
         let p = s.nrows();
-        
+
         // Use eigendecomposition for symmetric positive semi-definite matrices
-        let (eigenvalues, eigenvectors) = s.eigh(UPLO::Lower)
+        let (eigenvalues, eigenvectors) = s
+            .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        
+
         // Count positive eigenvalues to determine rank
         let tolerance = 1e-12;
         let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-        
+
         if rank_k == 0 {
             // Zero penalty matrix - return p x 0 matrix
             rs_list.push(Array2::zeros((p, 0)));
             continue;
         }
-        
+
         // Create skinny square root matrix: rS = V * diag(sqrt(λ))
         // Only include eigenvectors corresponding to positive eigenvalues
         let mut rs = Array2::zeros((p, rank_k));
         let mut col_idx = 0;
-        
+
         for (i, &eigenval) in eigenvalues.iter().enumerate() {
             if eigenval > tolerance {
                 let sqrt_eigenval = eigenval.sqrt();
@@ -483,10 +486,10 @@ pub fn compute_penalty_square_roots(s_list: &[Array2<f64>]) -> Result<Vec<Array2
                 col_idx += 1;
             }
         }
-        
+
         rs_list.push(rs);
     }
-    
+
     Ok(rs_list)
 }
 
@@ -539,13 +542,14 @@ pub fn construct_s_lambda(
 /// Now accepts penalty square roots (rS) instead of full penalty matrices
 /// Each rs_list[i] is a p x rank_i matrix where rank_i is the rank of penalty i
 pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>],  // penalty square roots (each is p x rank_i)
+    rs_list: &[Array2<f64>], // penalty square roots (each is p x rank_i)
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
     log::debug!(
         "Performing stable reparameterization for {} penalties with lambdas: {:?}",
-        lambdas.len(), lambdas
+        lambdas.len(),
+        lambdas
     );
     let p = layout.total_coeffs;
     let m = rs_list.len(); // Number of penalty square roots
@@ -567,7 +571,7 @@ pub fn stable_reparameterization(
 
     // Initialize global transformation matrix and working matrices
     let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
-    
+
     // Clone penalty square roots - we'll transform these in-place
     let mut rs_current = rs_list.to_vec();
 
@@ -581,8 +585,13 @@ pub fn stable_reparameterization(
         if gamma.is_empty() || q_current == 0 {
             break;
         }
-        
-        log::debug!("Iteration: k_offset={}, q_current={}, gamma={:?}", k_offset, q_current, gamma);
+
+        log::debug!(
+            "Iteration: k_offset={}, q_current={}, gamma={:?}",
+            k_offset,
+            q_current,
+            gamma
+        );
 
         // Step 1: Find Frobenius norms of penalties in current sub-problem
         // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
@@ -592,26 +601,30 @@ pub fn stable_reparameterization(
         for &i in &gamma {
             // Extract active rows from penalty square root (columns stay the same)
             let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
-            
+
             // Skip if penalty has no columns (zero penalty)
             if rs_current[i].ncols() == 0 {
                 frob_norms.push((i, 0.0));
                 continue;
             }
-            
+
             // Form the active sub-block of full penalty matrix S_i = rS_i * rS_i^T
             let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
-            
+
             // The Frobenius norm is the sqrt of sum of squares of matrix elements
             let frob_norm = s_active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
             // Scale by lambda to get the weighted norm (omega_i)
             let omega_i = frob_norm * lambdas[i];
-            
+
             // If omega_i is exactly 0.0, add a tiny perturbation to ensure differentiability
             // This is a critical fix for the tests with very different smoothing parameters
             // Adding a small epsilon ensures we don't get exactly the same result for very different lambdas
-            let omega_i = if omega_i == 0.0 { f64::EPSILON * lambdas[i] } else { omega_i };
-            
+            let omega_i = if omega_i == 0.0 {
+                f64::EPSILON * lambdas[i]
+            } else {
+                omega_i
+            };
+
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
         }
@@ -681,35 +694,41 @@ pub fn stable_reparameterization(
             if rs_current[i].ncols() == 0 {
                 continue;
             }
-            
+
             // Extract active rows
-            let c_matrix = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]).to_owned();
-            
+            let c_matrix = rs_current[i]
+                .slice(s![k_offset..k_offset + q_current, ..])
+                .to_owned();
+
             if alpha.contains(&i) {
                 // Dominant penalties: transform with U_r (first r eigenvectors)
                 let u_r = u_reordered.slice(s![.., ..r]);
                 let b_matrix = u_r.t().dot(&c_matrix); // r x rank_i
-                
+
                 // Copy transformed part back
-                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..])
+                rs_current[i]
+                    .slice_mut(s![k_offset..k_offset + r, ..])
                     .assign(&b_matrix);
-                
+
                 // Zero out the null space part
                 if k_offset + r < k_offset + q_current {
-                    rs_current[i].slice_mut(s![k_offset + r..k_offset + q_current, ..])
+                    rs_current[i]
+                        .slice_mut(s![k_offset + r..k_offset + q_current, ..])
                         .fill(0.0);
                 }
             } else if gamma_prime.contains(&i) {
                 // Sub-dominant penalties: transform with U_n (null space eigenvectors)
                 let u_n = u_reordered.slice(s![.., r..]);
                 let b_matrix = u_n.t().dot(&c_matrix); // (q_current - r) x rank_i
-                
+
                 // Zero out the range space part
-                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..])
+                rs_current[i]
+                    .slice_mut(s![k_offset..k_offset + r, ..])
                     .fill(0.0);
-                
+
                 // Copy transformed part to null space rows
-                rs_current[i].slice_mut(s![k_offset + r..k_offset + q_current, ..])
+                rs_current[i]
+                    .slice_mut(s![k_offset + r..k_offset + q_current, ..])
                     .assign(&b_matrix);
             }
         }
@@ -738,11 +757,11 @@ pub fn stable_reparameterization(
     let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
         .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    
+
     // Count non-zero eigenvalues to determine the rank
     let tolerance = 1e-12;
     let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-    
+
     // Construct Eb as the matrix square root, keeping only non-zero eigenvalues
     let mut eb = Array2::zeros((p, penalty_rank));
     let mut col_idx = 0;
@@ -755,7 +774,7 @@ pub fn stable_reparameterization(
             col_idx += 1;
         }
     }
-    
+
     // Eb should be transposed to be penalty_rank x p (matching mgcv's convention)
     let eb = eb.t().to_owned();
 
@@ -768,7 +787,7 @@ pub fn stable_reparameterization(
 
     // Step 5: Calculate derivatives using the correct transformed matrices
     let mut det1 = Array1::zeros(lambdas.len());
-    
+
     // Compute pseudo-inverse of transformed total penalty
     let mut s_plus = Array2::zeros((p, p));
     for (i, &eigenval) in s_eigenvalues.iter().enumerate() {

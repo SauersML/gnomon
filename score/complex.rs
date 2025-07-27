@@ -125,15 +125,25 @@ pub enum Heuristic {
 #[derive(Debug, Clone)]
 pub enum ResolutionMethod {
     /// All conflicting sources yielded the same effect allele dosage.
-    ConsistentDosage { dosage: f64 },
+    ConsistentDosage {
+        dosage: f64,
+    },
     /// Exactly one heterozygous call was found alongside one or more homozygous
     /// calls, and the heterozygous call was chosen.
-    PreferHeterozygous { chosen_dosage: f64 },
+    PreferHeterozygous {
+        chosen_dosage: f64,
+    },
     /// A single BIM entry's alleles perfectly matched the score file alleles.
-    ExactScoreAlleleMatch { chosen_dosage: f64 },
+    ExactScoreAlleleMatch {
+        chosen_dosage: f64,
+    },
     /// A single interpretation was composed of standard alleles from the score file.
-    PrioritizeUnambiguousGenotype { chosen_dosage: f64 },
-    PreferMatchingAlleleStructure { chosen_dosage: f64 },
+    PrioritizeUnambiguousGenotype {
+        chosen_dosage: f64,
+    },
+    PreferMatchingAlleleStructure {
+        chosen_dosage: f64,
+    },
 }
 
 /// A private struct holding the raw data for one conflicting source of evidence.
@@ -183,7 +193,9 @@ impl Heuristic {
         match self {
             Heuristic::ExactScoreAlleleMatch => self.resolve_exact_match(context),
             Heuristic::PrioritizeUnambiguousGenotype => self.resolve_unambiguous_genotype(context),
-            Heuristic::PreferMatchingAlleleStructure => self.resolve_prefer_matching_allele_structure(context),
+            Heuristic::PreferMatchingAlleleStructure => {
+                self.resolve_prefer_matching_allele_structure(context)
+            }
             Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
             Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
         }
@@ -218,7 +230,10 @@ impl Heuristic {
 
     /// Heuristic 3: Solves conflicts by preferring an interpretation where the resulting
     /// genotype's allele lengths match the allele lengths from the score file.
-    fn resolve_prefer_matching_allele_structure(&self, context: &ResolutionContext) -> Option<Resolution> {
+    fn resolve_prefer_matching_allele_structure(
+        &self,
+        context: &ResolutionContext,
+    ) -> Option<Resolution> {
         let score_a1_len = context.score_info.effect_allele.len();
         let score_a2_len = context.score_info.other_allele.len();
 
@@ -227,14 +242,17 @@ impl Heuristic {
             .iter()
             .filter(|(packed_geno, (_, bim_a1, bim_a2))| {
                 // Interpret the person's actual alleles first.
-                let (person_allele_1, person_allele_2) = Self::interpret_person_alleles(*packed_geno, bim_a1, bim_a2);
+                let (person_allele_1, person_allele_2) =
+                    Self::interpret_person_alleles(*packed_geno, bim_a1, bim_a2);
 
                 // Get the lengths of the person's alleles.
                 let person_a1_len = person_allele_1.len();
                 let person_a2_len = person_allele_2.len();
 
                 // If the genotype was invalid/missing, the lengths will be 0, so this will not match.
-                if person_a1_len == 0 { return false; }
+                if person_a1_len == 0 {
+                    return false;
+                }
 
                 // Check for a match in either direction to handle swapped alleles.
                 (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
@@ -386,7 +404,7 @@ impl Heuristic {
             0b00 => (bim_a1, bim_a1), // Homozygous for A1
             0b10 => (bim_a1, bim_a2), // Heterozygous (one A1, one A2)
             0b11 => (bim_a2, bim_a2), // Homozygous for A2
-            _ => ("", ""),           // Represents a missing or invalid genotype
+            _ => ("", ""),            // Represents a missing or invalid genotype
         }
     }
 }
@@ -630,7 +648,7 @@ pub fn resolve_complex_variants(
                     }
                 )
         });
-        
+
         // Wait for the collector thread to finish and get its result
         collector_handle.join().unwrap_or_default()
     });
@@ -639,7 +657,7 @@ pub fn resolve_complex_variants(
 
     // Process the warnings collection
     let all_warnings_for_reporting = final_warnings;
-    
+
     if !all_warnings_for_reporting.is_empty() {
         eprintln!(
             "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
@@ -770,31 +788,47 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     };
 
     // Update the `is_chosen` helper
-    let is_chosen = |method: &ResolutionMethod, conflict: &ConflictSource, score_ea: &str, score_oa: &str| -> bool {
+    let is_chosen = |method: &ResolutionMethod,
+                     conflict: &ConflictSource,
+                     score_ea: &str,
+                     score_oa: &str|
+     -> bool {
         let bim_a1 = &conflict.alleles.0;
         let bim_a2 = &conflict.alleles.1;
         match method {
-            ResolutionMethod::ExactScoreAlleleMatch {..} => (bim_a1 == score_ea && bim_a2 == score_oa) || (bim_a1 == score_oa && bim_a2 == score_ea),
-            ResolutionMethod::PrioritizeUnambiguousGenotype {..} => (bim_a1 == score_ea || bim_a1 == score_oa) && (bim_a2 == score_ea || bim_a2 == score_oa),
-            ResolutionMethod::PreferMatchingAlleleStructure {..} => {
+            ResolutionMethod::ExactScoreAlleleMatch { .. } => {
+                (bim_a1 == score_ea && bim_a2 == score_oa)
+                    || (bim_a1 == score_oa && bim_a2 == score_ea)
+            }
+            ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => {
+                (bim_a1 == score_ea || bim_a1 == score_oa)
+                    && (bim_a2 == score_ea || bim_a2 == score_oa)
+            }
+            ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
                 let score_a1_len = score_ea.len();
                 let score_a2_len = score_oa.len();
 
                 // Re-create the logic from the actual heuristic
-                let (person_allele_1, person_allele_2) = Heuristic::interpret_person_alleles(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
+                let (person_allele_1, person_allele_2) = Heuristic::interpret_person_alleles(
+                    conflict.genotype_bits,
+                    &conflict.alleles.0,
+                    &conflict.alleles.1,
+                );
                 let person_a1_len = person_allele_1.len();
                 let person_a2_len = person_allele_2.len();
 
-                if person_a1_len == 0 { return false; }
+                if person_a1_len == 0 {
+                    return false;
+                }
 
                 (person_a1_len == score_a1_len && person_a2_len == score_a2_len)
                     || (person_a1_len == score_a2_len && person_a2_len == score_a1_len)
             }
-            ResolutionMethod::PreferHeterozygous {..} => conflict.genotype_bits == 0b10,
-            ResolutionMethod::ConsistentDosage {..} => true,
+            ResolutionMethod::PreferHeterozygous { .. } => conflict.genotype_bits == 0b10,
+            ResolutionMethod::ConsistentDosage { .. } => true,
         }
     };
-    
+
     // Add the individual, locus, and score information to the report
     writeln!(
         report,
@@ -812,21 +846,46 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     match &data.resolution_method {
         ResolutionMethod::ExactScoreAlleleMatch { .. } => {
             method_name = "'Exact Score Allele Match' Heuristic";
-            if let Some(chosen) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+            if let Some(chosen) = data.conflicts.iter().find(|c| {
+                is_chosen(
+                    &data.resolution_method,
+                    c,
+                    &data.score_effect_allele,
+                    &data.score_other_allele,
+                )
+            }) {
                 write!(rationale, "The interpretation with alleles ({}, {}) was chosen because it perfectly matches the score file.", chosen.alleles.0, chosen.alleles.1).unwrap();
             }
         }
         ResolutionMethod::PrioritizeUnambiguousGenotype { .. } => {
             method_name = "'Prioritize Unambiguous Genotype' Heuristic";
-             if let Some(chosen) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+            if let Some(chosen) = data.conflicts.iter().find(|c| {
+                is_chosen(
+                    &data.resolution_method,
+                    c,
+                    &data.score_effect_allele,
+                    &data.score_other_allele,
+                )
+            }) {
                 write!(rationale, "The interpretation with alleles ({}, {}) was chosen because both alleles are present in the score file's required set.", chosen.alleles.0, chosen.alleles.1).unwrap();
             }
         }
         ResolutionMethod::PreferMatchingAlleleStructure { .. } => {
             method_name = "'Prefer Matching Allele Structure' Heuristic";
-            if let Some(c) = data.conflicts.iter().find(|c| is_chosen(&data.resolution_method, c, &data.score_effect_allele, &data.score_other_allele)) {
+            if let Some(c) = data.conflicts.iter().find(|c| {
+                is_chosen(
+                    &data.resolution_method,
+                    c,
+                    &data.score_effect_allele,
+                    &data.score_other_allele,
+                )
+            }) {
                 // Re-interpret the genotype to get the person's actual alleles for the rationale.
-                let (pa1, pa2) = Heuristic::interpret_person_alleles(c.genotype_bits, &c.alleles.0, &c.alleles.1);
+                let (pa1, pa2) = Heuristic::interpret_person_alleles(
+                    c.genotype_bits,
+                    &c.alleles.0,
+                    &c.alleles.1,
+                );
                 let person_geno_str = format!("{}/{}", pa1, pa2);
                 write!(rationale, "The interpretation from BIM Row {} (resulting in genotype '{}') was chosen because its allele lengths ({}, {}) structurally match the score file.", c.bim_row.0, person_geno_str, pa1.len(), pa2.len()).unwrap();
             }
@@ -835,7 +894,7 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             method_name = "'Prefer Heterozygous' Heuristic";
             let chosen = data.conflicts.iter().find(|c| c.genotype_bits == 0b10);
             let rejected = data.conflicts.iter().find(|c| c.genotype_bits != 0b10);
-             if let (Some(c), Some(r)) = (chosen, rejected) {
+            if let (Some(c), Some(r)) = (chosen, rejected) {
                 let chosen_geno = interpret_genotype(c.genotype_bits, &c.alleles.0, &c.alleles.1);
                 let rejected_geno = interpret_genotype(r.genotype_bits, &r.alleles.0, &r.alleles.1);
                 write!(rationale, "The heterozygous interpretation ({}) was chosen over a conflicting homozygous interpretation ({}).", chosen_geno, rejected_geno).unwrap();
@@ -848,28 +907,47 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
     };
 
     writeln!(report, "  Method: {}", method_name).unwrap();
-    writeln!(report, "  Score File requires: Effect={}, Other={}", data.score_effect_allele, data.score_other_allele).unwrap();
-    
+    writeln!(
+        report,
+        "  Score File requires: Effect={}, Other={}",
+        data.score_effect_allele, data.score_other_allele
+    )
+    .unwrap();
+
     writeln!(report, "\n  Conflicting Sources Considered:").unwrap();
 
     for conflict in &data.conflicts {
-        let prefix = if is_chosen(&data.resolution_method, conflict, &data.score_effect_allele, &data.score_other_allele) {
+        let prefix = if is_chosen(
+            &data.resolution_method,
+            conflict,
+            &data.score_effect_allele,
+            &data.score_other_allele,
+        ) {
             "-> Chosen:  "
         } else {
             "   Rejected:"
         };
-        let interpretation = interpret_genotype(conflict.genotype_bits, &conflict.alleles.0, &conflict.alleles.1);
+        let interpretation = interpret_genotype(
+            conflict.genotype_bits,
+            &conflict.alleles.0,
+            &conflict.alleles.1,
+        );
         writeln!(
-            report, "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
-            prefix, conflict.bim_row.0, conflict.alleles.0, conflict.alleles.1,
-            conflict.genotype_bits, interpretation
-        ).unwrap();
+            report,
+            "{} BIM Row {}: Alleles=({}, {}), Genotype={} ({})",
+            prefix,
+            conflict.bim_row.0,
+            conflict.alleles.0,
+            conflict.alleles.1,
+            conflict.genotype_bits,
+            interpretation
+        )
+        .unwrap();
     }
 
     if !rationale.is_empty() {
         writeln!(report, "\n  Rationale: {}", rationale).unwrap();
     }
-    
+
     report.trim_end().to_string()
 }
-

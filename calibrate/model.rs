@@ -169,7 +169,7 @@ impl TrainedModel {
                 // This matches the behavior in the training code (pirls.rs::update_glm_vectors)
                 probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
                 probs
-            },
+            }
             LinkFunction::Identity => eta,
         };
 

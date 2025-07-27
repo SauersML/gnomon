@@ -200,9 +200,9 @@ pub fn train_model(
     // and return the result along with the transformation matrix used.
     let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
-        reml_state.x(),               // Use original X
+        reml_state.x(), // Use original X
         reml_state.y(),
-        reml_state.rs_list_ref(),     // Pass original penalty matrices
+        reml_state.rs_list_ref(), // Pass original penalty matrices
         &layout,
         config,
     )?;
@@ -213,7 +213,8 @@ pub fn train_model(
     let final_beta_original = final_fit.qs.dot(&final_fit.beta);
 
     // Map the coefficients from the original basis.
-    let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+    let mapped_coefficients =
+        crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
@@ -227,23 +228,25 @@ pub fn train_model(
 }
 
 /// Helper function to compute log determinant and rank of penalty matrix
-fn compute_penalty_log_det_and_rank(s_lambda: &Array2<f64>) -> Result<(f64, usize), EstimationError> {
+fn compute_penalty_log_det_and_rank(
+    s_lambda: &Array2<f64>,
+) -> Result<(f64, usize), EstimationError> {
     use ndarray_linalg::{SVD, UPLO};
-    
+
     // Compute eigendecomposition for log determinant
     match s_lambda.eigh(UPLO::Lower) {
         Ok((eigenvalues, _)) => {
             let tolerance = 1e-12;
             let mut log_det = 0.0;
             let mut rank = 0;
-            
+
             for &eigenval in eigenvalues.iter() {
                 if eigenval > tolerance {
                     log_det += eigenval.ln();
                     rank += 1;
                 }
             }
-            
+
             Ok((log_det, rank))
         }
         Err(e) => {
@@ -253,17 +256,17 @@ fn compute_penalty_log_det_and_rank(s_lambda: &Array2<f64>) -> Result<(f64, usiz
                     let tolerance = 1e-12;
                     let mut log_det = 0.0;
                     let mut rank = 0;
-                    
+
                     for &sval in svals.iter() {
                         if sval > tolerance {
                             log_det += sval.ln();
                             rank += 1;
                         }
                     }
-                    
+
                     Ok((log_det, rank))
                 }
-                Err(_) => Err(EstimationError::LinearSystemSolveFailed(e))
+                Err(_) => Err(EstimationError::LinearSystemSolveFailed(e)),
             }
         }
     }
@@ -375,7 +378,7 @@ pub mod internal {
         ) -> Result<Self, EstimationError> {
             // Pre-compute penalty square roots once
             let rs_list = compute_penalty_square_roots(&s_list)?;
-            
+
             Ok(Self {
                 y,
                 x,
@@ -398,7 +401,6 @@ pub mod internal {
             self.y
         }
 
-        
         pub(super) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
             &self.rs_list
         }
@@ -414,7 +416,7 @@ pub mod internal {
             }
 
             println!("  -> Solving inner P-IRLS loop for this evaluation...");
-            
+
             // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
             let lambdas_for_logging = rho.mapv(f64::exp);
             log::debug!(
@@ -422,7 +424,7 @@ pub mod internal {
                 lambdas_for_logging.get(0).unwrap_or(&0.0),
                 lambdas_for_logging.get(1).unwrap_or(&0.0)
             );
-            
+
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
             let pirls_result = pirls::fit_model_for_fixed_rho(
@@ -514,9 +516,10 @@ pub mod internal {
             // Transform beta back to original basis for penalty calculations
             // The pirls_result.beta is in the transformed basis defined by pirls_result.qs
             let beta_original = pirls_result.qs.dot(&pirls_result.beta);
-            
+
             // Build the penalty matrix S_lambda in the original basis
-            let mut s_lambda_original = Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+            let mut s_lambda_original =
+                Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
             for k in 0..lambdas.len() {
                 // Reconstruct S_k from its square root: S_k = Rs_k * Rs_k^T
                 let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
@@ -616,7 +619,8 @@ pub mod internal {
                     };
 
                     // log |S_λ|_+ (pseudo-determinant) - compute from original penalty matrices
-                    let (log_det_s_plus, rank_s) = compute_penalty_log_det_and_rank(&s_lambda_original)?;
+                    let (log_det_s_plus, rank_s) =
+                        compute_penalty_log_det_and_rank(&s_lambda_original)?;
                     let mp = (p as usize - rank_s) as f64;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
@@ -635,9 +639,7 @@ pub mod internal {
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use beta in original basis for penalty calculation
                     let penalised_ll = -0.5 * pirls_result.deviance
-                        - 0.5
-                            * beta_original
-                                .dot(&s_lambda_original.dot(&beta_original));
+                        - 0.5 * beta_original.dot(&s_lambda_original.dot(&beta_original));
 
                     // Log-determinant of the penalty matrix - compute from original matrices
                     let (log_det_s, _) = compute_penalty_log_det_and_rank(&s_lambda_original)?;
@@ -688,8 +690,7 @@ pub mod internal {
                     println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
                     println!(
                         "  - Penalty Term (β'Sβ) : {:.6e}",
-                        beta_original
-                            .dot(&s_lambda_original.dot(&beta_original))
+                        beta_original.dot(&s_lambda_original.dot(&beta_original))
                     );
                     println!("  - Penalized LogLik    : {penalised_ll:.6e}");
                     println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
@@ -937,7 +938,7 @@ pub mod internal {
                 // Get the minimum eigenvalue to assess how problematic the original matrix was
                 if let Ok(eigenvals) = pirls_result.penalized_hessian.eigvals() {
                     let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
-                    
+
                     const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
                     if min_eig < SEVERE_INDEFINITENESS {
                         // The matrix was severely indefinite - signal a need to retreat
@@ -951,7 +952,7 @@ pub mod internal {
                     }
                 }
             }
-            
+
             // Use the stabilized Hessian for subsequent calculations
             let mut stable_pirls = pirls_result.clone();
             stable_pirls.penalized_hessian = hessian;
@@ -975,24 +976,26 @@ pub mod internal {
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
-                
+
             match self.config.link_function {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
                     // Calculate scale parameter
                     let rss = stable_pirls.deviance;
-                    
+
                     // FIX: Build penalty matrix in TRANSFORMED basis to match the Hessian
-                    let mut s_lambda_transformed = Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    let mut s_lambda_transformed =
+                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
                         // Get S_k in original basis
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
                         // Transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed = stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
+                        let s_k_transformed =
+                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
                         s_lambda_transformed.scaled_add(lambdas[k], &s_k_transformed);
                     }
-                    
+
                     // FIX: Compute penalty using beta in its native transformed basis
                     let penalty = beta.dot(&s_lambda_transformed.dot(beta));
                     let dp = rss + penalty; // Penalized deviance
@@ -1016,7 +1019,7 @@ pub mod internal {
                     //   We'll calculate s_k_beta for all cases, as it's needed for both paths
                     //   For Identity link, this is all we need due to envelope theorem
                     //   For other links, we'll use it to compute dβ/dρ_k
-                        
+
                     //   Use transformed penalty matrix for consistent gradient calculation
                     //   let s_k_beta = reparam_result.rs_transformed[k].dot(beta);
 
@@ -1025,8 +1028,12 @@ pub mod internal {
                     // FIX: Use transformed design matrix and beta (in transformed basis)
                     let eta = x_transformed.dot(beta);
                     let residuals = &self.y() - &eta;
-                    let deviance_grad_wrt_beta = if self.config.link_function == LinkFunction::Identity {
-                    Array1::zeros(beta.len()) } else { -2.0 * x_transformed.t().dot(&residuals) };
+                    let deviance_grad_wrt_beta =
+                        if self.config.link_function == LinkFunction::Identity {
+                            Array1::zeros(beta.len())
+                        } else {
+                            -2.0 * x_transformed.t().dot(&residuals)
+                        };
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
@@ -1034,7 +1041,8 @@ pub mod internal {
                         // First get S_k in original basis
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
                         // Transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed = stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
+                        let s_k_transformed =
+                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
                         // Multiply by beta (already in transformed basis)
                         let s_k_beta = s_k_transformed.dot(beta);
 
@@ -1043,10 +1051,8 @@ pub mod internal {
                         // R/C Counterpart: `oo$D1/(2*scale*gamma)`
                         // ---
 
-                        let dbeta_drho_k = -lambdas[k] * internal::robust_solve(
-                            &stable_pirls.penalized_hessian,
-                            &s_k_beta,
-                        )?;
+                        let dbeta_drho_k = -lambdas[k]
+                            * internal::robust_solve(&stable_pirls.penalized_hessian, &s_k_beta)?;
 
                         let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k);
                         let d_penalty_d_rho_k = lambdas[k] * beta.dot(&s_k_beta);
@@ -1096,13 +1102,16 @@ pub mod internal {
                                     }
                                     let s_pinv_mat = Array2::from_diag(&s_pinv);
                                     let s_pseudo_inv = vt.t().dot(&s_pinv_mat).dot(&u.t());
-                                    
+
                                     // Compute tr(S^+ * S_k) using already-transformed S_k
-                                    let trace_s_plus_s_k = s_pseudo_inv.dot(&s_k_transformed).diag().sum();
+                                    let trace_s_plus_s_k =
+                                        s_pseudo_inv.dot(&s_k_transformed).diag().sum();
                                     lambdas[k] * trace_s_plus_s_k / 2.0
                                 }
                                 Err(_) => {
-                                    log::warn!("SVD failed for penalty matrix gradient; using zero");
+                                    log::warn!(
+                                        "SVD failed for penalty matrix gradient; using zero"
+                                    );
                                     0.0
                                 }
                             }
@@ -1116,7 +1125,7 @@ pub mod internal {
                         // ---
                         cost_gradient[k] = penalized_deviance_grad_term  // Corresponds to `+ oo$D1/...`
                                          + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
-                                         - log_det_s_grad_term;          // Corresponds to `- rp$det1/2`
+                                         - log_det_s_grad_term; // Corresponds to `- rp$det1/2`
                     }
                 }
                 _ => {
@@ -1161,7 +1170,8 @@ pub mod internal {
                         // First, get S_k in the original basis
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
                         // Then, transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed = stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
+                        let s_k_transformed =
+                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
                         // Now multiply by beta (which is already in transformed basis)
                         let s_k_beta = s_k_transformed.dot(beta);
                         let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
@@ -1191,20 +1201,22 @@ pub mod internal {
                         // e. Assemble the gradient of the cost function (-V_LAML)
                         // ∇V_LAML = 0.5 * (λₖ * tr(S⁺Sₖ) - λₖ * tr(H⁻¹Sₖ) - weight_deriv_term)
                         // cost_grad = -∇V_LAML
-                        
+
                         // Compute tr(S^+ * S_k) for the log|S| gradient term
                         // FIX: Work in the transformed coordinate system
                         let log_det_s_grad_term = {
                             // Build S_lambda in the TRANSFORMED basis
-                            let mut s_lambda_transformed = Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                            let mut s_lambda_transformed =
+                                Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                             for j in 0..lambdas.len() {
                                 // Get S_j in original basis
                                 let s_j_original = self.rs_list[j].dot(&self.rs_list[j].t());
                                 // Transform it: S_j_transformed = Qsᵀ * S_j_original * Qs
-                                let s_j_transformed = stable_pirls.qs.t().dot(&s_j_original).dot(&stable_pirls.qs);
+                                let s_j_transformed =
+                                    stable_pirls.qs.t().dot(&s_j_original).dot(&stable_pirls.qs);
                                 s_lambda_transformed.scaled_add(lambdas[j], &s_j_transformed);
                             }
-                            
+
                             match s_lambda_transformed.svd(true, true) {
                                 Ok((u, s_vals, vt)) => {
                                     let u = u.unwrap();
@@ -1218,17 +1230,19 @@ pub mod internal {
                                     }
                                     let s_pinv_mat = Array2::from_diag(&s_pinv);
                                     let s_pseudo_inv = vt.t().dot(&s_pinv_mat).dot(&u.t());
-                                    
+
                                     // Compute tr(S^+ * S_k) using the already-transformed S_k
                                     s_pseudo_inv.dot(&s_k_transformed).diag().sum()
                                 }
                                 Err(_) => {
-                                    log::warn!("SVD failed for penalty matrix gradient; using zero");
+                                    log::warn!(
+                                        "SVD failed for penalty matrix gradient; using zero"
+                                    );
                                     0.0
                                 }
                             }
                         };
-                        
+
                         cost_gradient[k] = -0.5 * lambdas[k] * log_det_s_grad_term
                             + 0.5 * lambdas[k] * trace_h_inv_s_k
                             + 0.5 * weight_deriv_term;
@@ -1447,9 +1461,9 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use ndarray::s;
         use crate::calibrate::model::BasisConfig;
         use approx::assert_abs_diff_eq;
+        use ndarray::s;
         use ndarray::{Array, array};
         use rand;
         use rand::rngs::StdRng;
@@ -1837,40 +1851,43 @@ pub mod internal {
         }
 
         /// Helper function to calculate AUC to avoid code duplication
-fn calculate_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
-    let mut pairs: Vec<(f64, f64)> = predictions
-        .iter()
-        .zip(outcomes.iter())
-        .map(|(&p, &o)| (p, o))
-        .collect();
-    
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        fn calculate_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
+            let mut pairs: Vec<(f64, f64)> = predictions
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(&p, &o)| (p, o))
+                .collect();
 
-    let total_positives = outcomes.sum();
-    let total_negatives = outcomes.len() as f64 - total_positives;
+            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    if total_positives == 0.0 || total_negatives == 0.0 {
-        return 1.0; // Or handle as appropriate if all outcomes are the same class
-    }
+            let total_positives = outcomes.sum();
+            let total_negatives = outcomes.len() as f64 - total_positives;
 
-    let mut roc_area = 0.0;
-    let mut true_positives = total_positives;
-    let mut false_positives = total_negatives;
-    let mut last_fpr = 1.0;
+            if total_positives == 0.0 || total_negatives == 0.0 {
+                return 1.0; // Or handle as appropriate if all outcomes are the same class
+            }
 
-    for (_, outcome) in pairs.iter().rev() {
-        let fpr = false_positives / total_negatives;
-        let tpr = true_positives / total_positives;
-        roc_area += tpr * (last_fpr - fpr);
-        last_fpr = fpr;
+            let mut roc_area = 0.0;
+            let mut true_positives = total_positives;
+            let mut false_positives = total_negatives;
+            let mut last_fpr = 1.0;
 
-        if *outcome > 0.5 { true_positives -= 1.0; } 
-        else { false_positives -= 1.0; }
-    }
-    roc_area
-}
+            for (_, outcome) in pairs.iter().rev() {
+                let fpr = false_positives / total_negatives;
+                let tpr = true_positives / total_positives;
+                roc_area += tpr * (last_fpr - fpr);
+                last_fpr = fpr;
 
-fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
+                if *outcome > 0.5 {
+                    true_positives -= 1.0;
+                } else {
+                    false_positives -= 1.0;
+                }
+            }
+            roc_area
+        }
+
+        fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // Define a consistent epsilon for probability clamping throughout the test
             // This matches the P-IRLS MIN_WEIGHT value of 1e-6 in pirls.rs
             const PROB_EPS: f64 = 1e-6;
@@ -1914,7 +1931,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // Generate binary outcomes based on the true model
             // Use randomization with explicit seed for reproducibility while avoiding perfect separation
             // Reuse the existing RNG instance
-            
+
             // Create a vector to store the true probabilities (noise-free signal)
             let mut true_probabilities = Vec::with_capacity(n_total);
 
@@ -1928,7 +1945,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     // Clamp the true probability to prevent generating data that perfectly predicts 0 or 1,
                     // which helps stabilize the P-IRLS loop in the test
                     let prob = prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    
+
                     // Store the true probability for calculating the theoretical maximum correlation
                     true_probabilities.push(prob);
 
@@ -1940,53 +1957,60 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     }
                 })
                 .collect();
-                
+
             // Convert the true_probabilities Vec to an Array1 for easier calculations
             let true_probabilities = Array1::from(true_probabilities);
 
             // Calculate the theoretical maximum correlation based on signal-to-noise ratio
             // This follows the principle that the correlation between a binary outcome and its
             // underlying probability is bounded by the data's inherent noise
-            
+
             // Calculate variance of the true probabilities (signal)
             let signal_variance = {
                 let mean = true_probabilities.mean().unwrap_or(0.0);
-                true_probabilities.iter().map(|&p| (p - mean).powi(2)).sum::<f64>() / n_total as f64
+                true_probabilities
+                    .iter()
+                    .map(|&p| (p - mean).powi(2))
+                    .sum::<f64>()
+                    / n_total as f64
             };
-            
+
             // Calculate variance of the binary outcomes (total variance = signal + noise)
             let total_variance = {
                 let mean = y.mean().unwrap_or(0.0);
                 y.iter().map(|&y_i| (y_i - mean).powi(2)).sum::<f64>() / n_total as f64
             };
-            
+
             // Calculate maximum possible R-squared
             let max_r_squared = (signal_variance / total_variance).min(1.0).max(0.0);
             // Calculate maximum possible correlation
             let max_correlation = max_r_squared.sqrt();
-            
+
             // Define a safety margin (to account for approximation error in the model)
             let safety_margin = 0.90;
             // Calculate the dynamic correlation threshold
             let dynamic_correlation_threshold = safety_margin * max_correlation;
-            
+
             println!("Theoretical maximum correlation: {:.4}", max_correlation);
-            println!("Dynamic correlation threshold (with {:.0}% safety margin): {:.4}", 
-                safety_margin * 100.0, dynamic_correlation_threshold);
-            
+            println!(
+                "Dynamic correlation threshold (with {:.0}% safety margin): {:.4}",
+                safety_margin * 100.0,
+                dynamic_correlation_threshold
+            );
+
             // Split the data into training and test sets
             let train_data = TrainingData {
                 y: y.slice(s![..n_train]).to_owned(),
                 p: p.slice(s![..n_train]).to_owned(),
                 pcs: pcs.slice(s![..n_train, ..]).to_owned(),
             };
-            
+
             let test_data = TrainingData {
                 y: y.slice(s![n_train..]).to_owned(),
                 p: p.slice(s![n_train..]).to_owned(),
                 pcs: pcs.slice(s![n_train.., ..]).to_owned(),
             };
-            
+
             let train_true_probabilities = true_probabilities.slice(s![..n_train]).to_owned();
             let test_true_probabilities = true_probabilities.slice(s![n_train..]).to_owned();
 
@@ -2071,7 +2095,9 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             assert!(
                 correlation > dynamic_correlation_threshold,
                 "Correlation ({:.4}) did not meet the dynamic threshold ({:.4}). Theoretical max was {:.4}.",
-                correlation, dynamic_correlation_threshold, max_correlation
+                correlation,
+                dynamic_correlation_threshold,
+                max_correlation
             );
 
             // --- 4. Verify Smoothing Parameter Magnitudes ---
@@ -2129,34 +2155,42 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     pred_prob
                 );
             }
-            
+
             // --- 5a. Generate Predictions on Test Data for Metric Calculation ---
             // This is more meaningful than evaluating on training data as it measures generalization
             let predictions_on_test_data = trained_model
                 .predict(test_data.p.view(), test_data.pcs.view())
                 .expect("Prediction on test data failed");
-                
+
             // --- 5b. Calculate AUC for Discrimination ---
             // AUC measures how well the model's predicted probabilities can discriminate
             // between the actual binary outcomes (0s and 1s).
             let model_auc = calculate_auc(&predictions_on_test_data, &test_data.y);
-            
+
             println!("AUC on test data (model): {:.4}", model_auc);
-            
+
             // Calculate the oracle AUC using the true probabilities on test data
             let oracle_auc = calculate_auc(&test_true_probabilities, &test_data.y);
-            println!("AUC on test data (oracle/theoretical max): {:.4}", oracle_auc);
-            
+            println!(
+                "AUC on test data (oracle/theoretical max): {:.4}",
+                oracle_auc
+            );
+
             // Set a dynamic threshold: The model should achieve at least 95% of the oracle's performance
             let dynamic_auc_threshold = 0.95 * oracle_auc;
-            println!("Dynamic AUC threshold (95% of oracle): {:.4}", dynamic_auc_threshold);
-            
+            println!(
+                "Dynamic AUC threshold (95% of oracle): {:.4}",
+                dynamic_auc_threshold
+            );
+
             assert!(
                 model_auc > dynamic_auc_threshold,
                 "Model AUC on test data ({:.4}) did not meet the dynamic threshold ({:.4}). The theoretical maximum for this dataset was {:.4}.",
-                model_auc, dynamic_auc_threshold, oracle_auc
+                model_auc,
+                dynamic_auc_threshold,
+                oracle_auc
             );
-            
+
             // Calculate the rest of the metrics using our original implementation
             // (For backward compatibility during transition)
             let mut auc_pairs: Vec<(f64, f64)> = predictions_on_test_data
@@ -2172,7 +2206,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let total_negatives = test_data.y.len() as f64 - total_positives;
             let mut true_positives = total_positives;
             let mut false_positives = total_negatives;
-            
+
             let mut roc_area = 0.0;
             let mut last_fpr = 1.0;
 
@@ -2184,15 +2218,17 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 roc_area += tpr * (last_fpr - fpr);
                 last_fpr = fpr;
 
-                if *outcome > 0.5 { // Is a positive
+                if *outcome > 0.5 {
+                    // Is a positive
                     true_positives -= 1.0;
-                } else { // Is a negative
+                } else {
+                    // Is a negative
                     false_positives -= 1.0;
                 }
             }
-            
+
             println!("AUC (legacy calculation): {:.4}", roc_area);
-            
+
             // --- 5c. Calculate Brier Score for Calibration ---
             // The Brier score measures the accuracy of probabilistic predictions against binary outcomes.
 
@@ -2201,41 +2237,44 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 .mapv(|x| x.powi(2))
                 .mean()
                 .unwrap_or(f64::INFINITY);
-                
+
             // Brier Score for a perfect "Oracle" that knows the true probabilities,
             // judged against the same noisy binary outcomes. This is the irreducible error.
             let brier_oracle = (&test_true_probabilities - &test_data.y)
                 .mapv(|x| x.powi(2))
                 .mean()
                 .unwrap_or(f64::INFINITY);
-                
+
             println!("Brier Score (model): {:.6}", brier_model);
             println!("Brier Score (oracle): {:.6}", brier_oracle);
             println!("Ratio (model/oracle): {:.3}", brier_model / brier_oracle);
-            
+
             // The model's Brier score should be very close to the oracle's.
             // We allow it to be up to 20% worse to account for optimization imperfections.
             assert!(
                 brier_model < brier_oracle * 1.2,
                 "Model calibration ({:.6}) is significantly worse than the theoretical optimum ({:.6})",
-                brier_model, brier_oracle
+                brier_model,
+                brier_oracle
             );
-            
+
             // --- 6. Train an Oracle model on the noise-free probabilities ---
             // This model represents the theoretical best a model can do given the same structural constraints
-            println!("\n=== Training Oracle Model on noise-free data to determine maximum possible performance ===");
-            
+            println!(
+                "\n=== Training Oracle Model on noise-free data to determine maximum possible performance ==="
+            );
+
             // Create a dataset using true probabilities instead of binary outcomes
             let oracle_train_data = TrainingData {
                 y: train_true_probabilities.clone(), // Use true probabilities instead of binary y
                 p: train_data.p.clone(),
                 pcs: train_data.pcs.clone(),
             };
-            
+
             // Create a config with Identity link since we're predicting probabilities directly
             let mut oracle_config = config.clone();
             oracle_config.link_function = LinkFunction::Identity;
-            
+
             // Train the Oracle Model using the same structural constraints
             println!("Training Oracle Model on noise-free data...");
             match train_model(&oracle_train_data, &oracle_config) {
@@ -2244,57 +2283,74 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     let oracle_predictions = oracle_model
                         .predict(test_data.p.view(), test_data.pcs.view())
                         .expect("Oracle prediction on test data failed");
-                        
+
                     // Calculate metrics for the Oracle model
                     println!("Comparing regular model to Oracle model on test data:");
-                    
+
                     // Calculate RMSE between true probabilities and model predictions
                     let model_rmse = (&predictions_on_test_data - &test_true_probabilities)
                         .mapv(|x| x.powi(2))
                         .mean()
                         .map(|x| x.sqrt())
                         .unwrap_or(f64::INFINITY);
-                        
+
                     // Calculate RMSE between true probabilities and oracle predictions
                     let oracle_rmse = (&oracle_predictions - &test_true_probabilities)
                         .mapv(|x| x.powi(2))
                         .mean()
                         .map(|x| x.sqrt())
                         .unwrap_or(f64::INFINITY);
-                        
+
                     println!("RMSE (model vs true probs): {:.6}", model_rmse);
                     println!("RMSE (oracle vs true probs): {:.6}", oracle_rmse);
-                    
+
                     // The model's RMSE should be reasonably close to the oracle's
                     // We use a dynamic threshold based on the oracle's performance
                     let rmse_threshold = oracle_rmse * 1.5; // Allow 50% worse RMSE
-                    
+
                     assert!(
                         model_rmse < rmse_threshold,
                         "Model RMSE ({:.6}) is significantly worse than the Oracle's RMSE of {:.6}. The allowed threshold was {:.6}",
-                        model_rmse, oracle_rmse, rmse_threshold
+                        model_rmse,
+                        oracle_rmse,
+                        rmse_threshold
                     );
-                    
+
                     // Calculate correlation between model predictions and true probabilities
-                    let model_corr = correlation_coefficient(&predictions_on_test_data, &test_true_probabilities);
-                    
+                    let model_corr = correlation_coefficient(
+                        &predictions_on_test_data,
+                        &test_true_probabilities,
+                    );
+
                     // Calculate correlation between oracle predictions and true probabilities
-                    let oracle_corr = correlation_coefficient(&oracle_predictions, &test_true_probabilities);
-                    
-                    println!("Correlation with true probabilities (model): {:.6}", model_corr);
-                    println!("Correlation with true probabilities (oracle): {:.6}", oracle_corr);
-                    
+                    let oracle_corr =
+                        correlation_coefficient(&oracle_predictions, &test_true_probabilities);
+
+                    println!(
+                        "Correlation with true probabilities (model): {:.6}",
+                        model_corr
+                    );
+                    println!(
+                        "Correlation with true probabilities (oracle): {:.6}",
+                        oracle_corr
+                    );
+
                     // The model's correlation should be at least 90% of the oracle's
                     let corr_threshold = 0.90 * oracle_corr;
-                    
+
                     assert!(
                         model_corr > corr_threshold,
                         "Model correlation with true probabilities ({:.6}) is too low compared to the Oracle's correlation of {:.6}. The required threshold was {:.6}",
-                        model_corr, oracle_corr, corr_threshold
+                        model_corr,
+                        oracle_corr,
+                        corr_threshold
                     );
-                },
+                }
                 Err(e) => {
-                    println!("Note: Oracle model training failed: {:?}. Using fixed thresholds instead.", e);
+                    println!(
+                        "Note: Oracle model training failed: {:?}. Using fixed thresholds instead.",
+                        e
+                    );
                     // If Oracle model fails, fall back to simple fixed thresholds
                 }
             };
@@ -2368,70 +2424,84 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // Train an "Oracle Model" on the noise-free data to determine the theoretical best performance
             // This model is trained on the true probabilities directly, so it's only limited by the
             // approximation error inherent in the GAM's structure (knots, spline degree, etc.)
-            
+
             // Create a noise-free version of the training data using true_probabilities
             let oracle_data = TrainingData {
                 y: true_probabilities.clone(), // Use true probabilities instead of binary y
                 p: train_data.p.clone(),
                 pcs: train_data.pcs.clone(),
             };
-            
+
             // Create a new config with Identity link function since we're predicting probabilities directly
             let mut oracle_config = config.clone();
             oracle_config.link_function = LinkFunction::Identity;
-            
-            println!("Training Oracle Model on noise-free data to determine maximum possible correlation...");
-            
+
+            println!(
+                "Training Oracle Model on noise-free data to determine maximum possible correlation..."
+            );
+
             // Train the Oracle Model
             let oracle_result = train_model(&oracle_data, &oracle_config);
-            
+
             if let Ok(oracle_model) = oracle_result {
                 // Calculate the Oracle Model's PGS main effect shape
                 let mut oracle_pgs_logits = Vec::with_capacity(n_grid);
-                
+
                 for &pgs_val in pgs_test.iter() {
                     let test_pgs = Array1::from_elem(1, pgs_val);
                     // Get Oracle prediction (in probability space)
                     let oracle_prob = oracle_model
                         .predict(test_pgs.view(), pc_fixed.view())
                         .unwrap()[0];
-                    
+
                     // Convert to logit space for consistent comparison
                     let oracle_prob_clamped = oracle_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     let oracle_logit = (oracle_prob_clamped / (1.0 - oracle_prob_clamped)).ln();
                     oracle_pgs_logits.push(oracle_logit);
                 }
-                
+
                 // Calculate Oracle correlation with true PGS effect
                 let oracle_pgs_correlation = correlation_coefficient(
                     &Array1::from_vec(true_pgs_logits.clone()),
                     &Array1::from_vec(oracle_pgs_logits.clone()),
                 );
-                
+
                 // Add direct comparison between model and oracle shapes
                 let model_vs_oracle_corr = correlation_coefficient(
                     &Array1::from_vec(pgs_pred_logits.clone()),
                     &Array1::from_vec(oracle_pgs_logits.clone()),
                 );
-                
-                println!("Oracle Model PGS effect correlation: {:.4}", oracle_pgs_correlation);
-                println!("Actual Model PGS effect correlation: {:.4}", pgs_correlation);
-                println!("Model vs Oracle direct shape correlation: {:.4}", model_vs_oracle_corr);
-                
+
+                println!(
+                    "Oracle Model PGS effect correlation: {:.4}",
+                    oracle_pgs_correlation
+                );
+                println!(
+                    "Actual Model PGS effect correlation: {:.4}",
+                    pgs_correlation
+                );
+                println!(
+                    "Model vs Oracle direct shape correlation: {:.4}",
+                    model_vs_oracle_corr
+                );
+
                 // The noisy model should achieve a high percentage of the Oracle's performance.
                 let pgs_safety_margin = 0.90; // Require at least 90% of oracle performance
                 let pgs_dynamic_threshold = pgs_safety_margin * oracle_pgs_correlation;
-                
-                println!("Dynamic PGS correlation threshold ({:.0}% of Oracle): {:.4}", 
-                         pgs_safety_margin * 100.0, pgs_dynamic_threshold);
-                
+
+                println!(
+                    "Dynamic PGS correlation threshold ({:.0}% of Oracle): {:.4}",
+                    pgs_safety_margin * 100.0,
+                    pgs_dynamic_threshold
+                );
+
                 if pgs_correlation < pgs_dynamic_threshold {
                     return Err(format!(
                         "Learned PGS shape correlation ({:.4}) did not meet dynamic threshold ({:.4}) set by Oracle model ({:.4})",
                         pgs_correlation, pgs_dynamic_threshold, oracle_pgs_correlation
                     ));
                 }
-                
+
                 // Add strong assertion that model's shape should be very similar to the Oracle's shape
                 if model_vs_oracle_corr < 0.98 {
                     return Err(format!(
@@ -2441,7 +2511,9 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 }
             } else {
                 // If Oracle Model training fails, fall back to a reasonable fixed threshold.
-                println!("Warning: Oracle Model training failed, falling back to a fixed threshold for PGS shape.");
+                println!(
+                    "Warning: Oracle Model training failed, falling back to a fixed threshold for PGS shape."
+                );
                 if pgs_correlation <= 0.90 {
                     return Err(format!(
                         "Learned PGS main effect does not correlate well with the true effect: {:.4}",
@@ -2473,8 +2545,9 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
 
                     // Calculate interaction effect in logit space
                     // Interaction = Full - (PGS_main + PC_main - Intercept)
-                    let true_interaction_logit = full_logit - (pgs_main_logit + pc_main_logit - intercept_logit);
-                    
+                    let true_interaction_logit =
+                        full_logit - (pgs_main_logit + pc_main_logit - intercept_logit);
+
                     true_interaction_surface_logit.push(true_interaction_logit);
                 }
             }
@@ -2491,7 +2564,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 .unwrap()[0];
             let pred_intercept_prob_clamped = pred_intercept_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
             // Convert to logit scale
-            let pred_intercept_logit = (pred_intercept_prob_clamped / (1.0 - pred_intercept_prob_clamped)).ln();
+            let pred_intercept_logit =
+                (pred_intercept_prob_clamped / (1.0 - pred_intercept_prob_clamped)).ln();
 
             // For each point on the grid, calculate the learned interaction component
             for &pgs_val in pgs_int_grid.iter() {
@@ -2502,7 +2576,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     .unwrap()[0];
                 let pred_pgs_main_prob_clamped = pred_pgs_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 // Convert to logit scale
-                let pred_pgs_main_logit = (pred_pgs_main_prob_clamped / (1.0 - pred_pgs_main_prob_clamped)).ln();
+                let pred_pgs_main_logit =
+                    (pred_pgs_main_prob_clamped / (1.0 - pred_pgs_main_prob_clamped)).ln();
 
                 for &pc_val in pc_int_grid.iter() {
                     // Calculate PC main effect
@@ -2513,7 +2588,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     let pred_pc_main_prob_clamped =
                         pred_pc_main_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     // Convert to logit scale
-                    let pred_pc_main_logit = (pred_pc_main_prob_clamped / (1.0 - pred_pc_main_prob_clamped)).ln();
+                    let pred_pc_main_logit =
+                        (pred_pc_main_prob_clamped / (1.0 - pred_pc_main_prob_clamped)).ln();
 
                     // Calculate full effect
                     let pred_full_prob = trained_model
@@ -2521,19 +2597,22 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                         .unwrap()[0];
                     let pred_full_prob_clamped = pred_full_prob.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     // Convert to logit scale
-                    let pred_full_logit = (pred_full_prob_clamped / (1.0 - pred_full_prob_clamped)).ln();
+                    let pred_full_logit =
+                        (pred_full_prob_clamped / (1.0 - pred_full_prob_clamped)).ln();
 
                     // Calculate interaction in LOGIT SPACE
                     // Interaction = Full - (PGS_main + PC_main - Intercept)
-                    let model_interaction_logit = pred_full_logit - 
-                        (pred_pgs_main_logit + pred_pc_main_logit - pred_intercept_logit);
+                    let model_interaction_logit = pred_full_logit
+                        - (pred_pgs_main_logit + pred_pc_main_logit - pred_intercept_logit);
 
                     model_interaction_surface_logit.push(model_interaction_logit);
                 }
             }
 
             // Add finite checks before calculating metrics
-            let all_finite_true = true_interaction_surface_logit.iter().all(|&x| x.is_finite());
+            let all_finite_true = true_interaction_surface_logit
+                .iter()
+                .all(|&x| x.is_finite());
             let all_finite_pred = model_interaction_surface_logit
                 .iter()
                 .all(|&x| x.is_finite());
@@ -2672,8 +2751,6 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             numerator / (x_variance.sqrt() * y_variance.sqrt())
         }
 
-
-
         #[test]
         fn test_cost_function_correctly_penalizes_noise() {
             use rand::Rng;
@@ -2773,7 +2850,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
 
             // Create a reml_state that we'll use to evaluate costs
             let reml_state =
-                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config).unwrap();
+                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config)
+                    .unwrap();
 
             println!("Comparing costs when penalizing signal term (PC1) vs. noise term (PC2)");
 
@@ -2887,17 +2965,18 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // by using the train_model function with a simple dataset
             // The test has been simplified to avoid manual matrix construction,
             // which was causing broadcasting errors.
-            
+
             use rand::{Rng, SeedableRng};
             let mut rng = rand::rngs::StdRng::seed_from_u64(42); // For reproducibility
-            
+
             // Create a very simple dataset
-            let n_samples = 200; 
-            
+            let n_samples = 200;
+
             // Create predictors with jitter for realism
             let p = Array::linspace(-1.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
-            let pc1 = Array::linspace(-0.5, 0.5, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
-            
+            let pc1 =
+                Array::linspace(-0.5, 0.5, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
+
             // Generate response probabilistically to avoid perfect separation
             let y = p.mapv(|val| {
                 // 1. Create a logit (linear predictor) with some noise
@@ -2907,38 +2986,44 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // 3. Assign class based on a random draw
                 if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
             });
-            
+
             let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
-            
-            let data = TrainingData { y, p: p.clone(), pcs };
-            
+
+            let data = TrainingData {
+                y,
+                p: p.clone(),
+                pcs,
+            };
+
             // Create minimal configuration with fixed knots
             let mut config = create_test_config();
             config.pgs_basis_config.num_knots = 2; // Minimal but functional basis size
             config.pc_basis_configs[0].num_knots = 2; // Minimal but functional basis size
-            
+
             // Instead of manually creating matrices and performing P-IRLS,
             // we'll use the train_model function with a fixed seed
-            
+
             // Create a modified train_model function for testing that uses fixed parameters
-            let modified_train_model = |data: &TrainingData, config: &ModelConfig| -> Result<TrainedModel, EstimationError> {
+            let modified_train_model = |data: &TrainingData,
+                                        config: &ModelConfig|
+             -> Result<TrainedModel, EstimationError> {
                 // Step 1: Build the design and penalty matrices
-                let (x_matrix, s_list, layout, constraints, knot_vectors) = 
+                let (x_matrix, s_list, layout, constraints, knot_vectors) =
                     build_design_and_penalty_matrices(data, config)?;
-                
+
                 // Step 2: Create a RemlState for testing (without running BFGS)
                 let reml_state = internal::RemlState::new(
-                    data.y.view(), 
-                    x_matrix.view(), 
-                    s_list.clone(), 
-                    &layout, 
-                    config
+                    data.y.view(),
+                    x_matrix.view(),
+                    s_list.clone(),
+                    &layout,
+                    config,
                 )?;
-                
+
                 // Step 3: Use fixed rho values (lambda = 1.0) to skip optimization
                 let final_rho = Array1::from_elem(layout.num_penalties, 0.0);
                 let final_lambda = final_rho.mapv(f64::exp);
-                
+
                 // Step 6: Call P-IRLS with the original matrices - it will do its own reparameterization
                 let final_fit_transformed = pirls::fit_model_for_fixed_rho(
                     final_rho.view(),
@@ -2946,49 +3031,60 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     reml_state.y(),
                     reml_state.rs_list_ref(),
                     &layout,
-                    config
+                    config,
                 )?;
-                
+
                 // Step 7: Transform coefficients back to original basis using the qs from PIRLS
                 let final_beta_original = final_fit_transformed.qs.dot(&final_fit_transformed.beta);
-                
+
                 // Step 8: Map the coefficients
-                let mapped_coefficients = crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
-                
+                let mapped_coefficients =
+                    crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+
                 // Step 9: Create and return the trained model
                 let mut config_with_constraints = config.clone();
                 config_with_constraints.constraints = constraints;
                 config_with_constraints.knot_vectors = knot_vectors;
-                config_with_constraints.num_pgs_interaction_bases = layout.num_pgs_interaction_bases;
-                
+                config_with_constraints.num_pgs_interaction_bases =
+                    layout.num_pgs_interaction_bases;
+
                 Ok(TrainedModel {
                     config: config_with_constraints,
                     coefficients: mapped_coefficients,
                     lambdas: final_lambda.to_vec(),
                 })
             };
-            
+
             // Apply our modified training function
-            let trained_model = modified_train_model(&data, &config).expect("Model training failed");
-            
+            let trained_model =
+                modified_train_model(&data, &config).expect("Model training failed");
+
             // Calculate true probabilities for comparison
             let true_probs = p.mapv(|val| {
                 let logit = 5.0 * val; // Expected signal without noise
                 1.0 / (1.0 + (-logit).exp())
             });
-            
+
             // Generate predictions for the training data
-            let predictions = trained_model.predict(data.p.view(), data.pcs.view()).unwrap();
+            let predictions = trained_model
+                .predict(data.p.view(), data.pcs.view())
+                .unwrap();
             let correlation = correlation_coefficient(&predictions, &true_probs);
-            
-            println!("Correlation between model predictions and true probabilities: {:.4}", correlation);
-            assert!(correlation > 0.85, "Model predictions should be highly correlated with the true underlying probabilities.");
-            
+
+            println!(
+                "Correlation between model predictions and true probabilities: {:.4}",
+                correlation
+            );
+            assert!(
+                correlation > 0.85,
+                "Model predictions should be highly correlated with the true underlying probabilities."
+            );
+
             // Create test points at different ends of the predictor range
-            let test_pgs_low = array![-0.8]; 
+            let test_pgs_low = array![-0.8];
             let test_pgs_high = array![0.8];
             let test_pc_dummy = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
-            
+
             // Get model predictions
             let low_prob = trained_model
                 .predict(test_pgs_low.view(), test_pc_dummy.view())
@@ -2996,16 +3092,17 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let high_prob = trained_model
                 .predict(test_pgs_high.view(), test_pc_dummy.view())
                 .unwrap()[0];
-                
+
             eprintln!("Prediction for low input (pgs = -0.8): {}", low_prob);
             eprintln!("Prediction for high input (pgs = 0.8): {}", high_prob);
-            
+
             // For a threshold at 0.0, pgs=-0.8 should give low probability
             // and pgs=0.8 should give high probability
             assert!(
                 low_prob < high_prob,
                 "Model should predict higher probability for pgs=0.8 ({}) than pgs=-0.8 ({})",
-                high_prob, low_prob
+                high_prob,
+                low_prob
             );
         }
 
@@ -3073,12 +3170,12 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
 
             println!("Testing P-IRLS with extreme rho values: {:?}", extreme_rho);
-            
+
             // Directly compute the original rs_list for the new function
-            
+
             // Here we need to create the original rs_list to pass to the new function
             let rs_original = compute_penalty_square_roots(&s_list)?;
-            
+
             let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 extreme_rho.view(),
                 x_matrix.view(),
@@ -3115,7 +3212,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     panic!("Unexpected error: {:?}", e);
                 }
             }
-            
+
             Ok(())
         }
 
@@ -3189,7 +3286,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state =
-                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config).unwrap();
+                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config)
+                    .unwrap();
 
             // Try the initial rho = [0, 0] that causes the problem
             let initial_rho = Array1::zeros(layout.num_penalties);
@@ -3258,8 +3356,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let mut rng = StdRng::seed_from_u64(42);
 
             let n_samples = 500; // Increased from 20 for better conditioning
-            let x_vals = Array1::linspace(0.0, 1.0, n_samples)
-                .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
+            let x_vals =
+                Array1::linspace(0.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
 
             let p = Array1::zeros(n_samples);
@@ -3308,7 +3406,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 vec![penalty_matrix.clone()],
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             let test_rho = array![-1.0]; // λ ≈ 0.368
             let lambdas = test_rho.mapv(f64::exp);
@@ -3461,19 +3560,21 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             };
 
             // === VERIFY: Replace println! statements with a formal assertion ===
-            
+
             // Calculate error metric with protection against division by zero
             let error_metric = compute_error_metric(analytical_gradient, numerical_gradient);
             let tolerance = 1e-4; // A reasonable tolerance for this complex calculation
-            
+
             // Assert the assembled components match the numerical result
             assert!(
                 error_metric < tolerance,
                 "The analytical gradient assembled from isolated components does not match the numerical gradient.\n\
                  Analytical: {:.6e}, Numerical: {:.6e}, Relative Error: {:.4}",
-                analytical_gradient, numerical_gradient, error_metric
+                analytical_gradient,
+                numerical_gradient,
+                error_metric
             );
-            
+
             // Check symmetry of finite differences
             let h = adaptive_step_size(test_rho[0]);
             assert!(
@@ -3752,7 +3853,6 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             println!("✓ Proactive singularity detection test passed!");
         }
 
-
         #[test]
         fn test_gradient_sign_and_magnitude() {
             use rand::{SeedableRng, prelude::*, rngs::StdRng};
@@ -3764,8 +3864,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // BFGS minimizes cost function, so gradient should point uphill on cost surface
 
             let n_samples = 200; // Increased from 15 for better conditioning
-            let x_vals = Array1::linspace(0.0, 1.0, n_samples)
-                .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
+            let x_vals =
+                Array1::linspace(0.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
             let y = x_vals.mapv(|x| x + 0.1 * (rng.gen_range(-0.5..0.5))); // Linear + noise
 
             let p = Array1::zeros(n_samples);
@@ -3813,18 +3913,23 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 vec![penalty_matrix],
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             // ACTION: Test at multiple points to ensure the property holds generally
             for &rho_val in &[-1.0, 0.0, 1.0] {
                 let rho_start = array![rho_val];
-                
+
                 // Calculate cost and gradient at the starting point
-                let cost_start = safe_compute_cost(&reml_state, &rho_start)
-                    .expect(&format!("Cost calculation failed at start for rho={}", rho_val));
-                    
-                let grad_start = reml_state.compute_gradient(&rho_start)
-                    .expect(&format!("Gradient calculation failed at start for rho={}", rho_val));
+                let cost_start = safe_compute_cost(&reml_state, &rho_start).expect(&format!(
+                    "Cost calculation failed at start for rho={}",
+                    rho_val
+                ));
+
+                let grad_start = reml_state.compute_gradient(&rho_start).expect(&format!(
+                    "Gradient calculation failed at start for rho={}",
+                    rho_val
+                ));
 
                 // Skip if we are already at a minimum
                 if grad_start[0].abs() < 1e-6 {
@@ -3836,17 +3941,22 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 let rho_next = &rho_start - step_size * &grad_start;
 
                 // Calculate the cost at the new point
-                let cost_next = safe_compute_cost(&reml_state, &rho_next)
-                    .expect(&format!("Cost calculation failed after step for rho={}", rho_val));
+                let cost_next = safe_compute_cost(&reml_state, &rho_next).expect(&format!(
+                    "Cost calculation failed after step for rho={}",
+                    rho_val
+                ));
 
                 // VERIFY: Assert that the cost has decreased
                 assert!(
                     cost_next < cost_start,
                     "At rho={:.1}, taking a step in the negative gradient direction should decrease the cost.\n\
                      Start Cost: {:.8e}, Next Cost: {:.8e}, Gradient: {:.6e}",
-                    rho_val, cost_start, cost_next, grad_start[0]
+                    rho_val,
+                    cost_start,
+                    cost_next,
+                    grad_start[0]
                 );
-                
+
                 // Also check that the gradient magnitude is meaningful (not too small)
                 assert!(
                     grad_start[0].abs() > 1e-5,
@@ -3867,8 +3977,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let test_gradient_for_link = |link_function: LinkFunction, rng: &mut StdRng| {
                 // --- 2. Create a small, simple test dataset ---
                 let n_samples = 200; // Increased from 50 for better conditioning
-                let x_vals = Array1::linspace(0.0, 1.0, n_samples)
-                    .mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
+                let x_vals =
+                    Array1::linspace(0.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
 
                 // Generate some smooth data based on the link function
                 let f_true = x_vals.mapv(|x| (x * 2.0 * std::f64::consts::PI).sin()); // sine wave
@@ -3936,7 +4046,8 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                     vec![penalty_matrix],
                     &layout,
                     &config,
-                ).unwrap();
+                )
+                .unwrap();
 
                 // --- 7. Test point for gradient verification ---
                 // Test at rho = -1.0 (lambda ≈ 0.368) for a stable test
@@ -3966,14 +4077,17 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // --- 10. VERIFY: Assert that the gradients match within a reasonable tolerance ---
                 let tolerance = 1e-4; // Appropriate tolerance for numerical vs. analytical comparison
                 let error_metric = compute_error_metric(analytical_grad[0], numerical_grad);
-                
+
                 assert!(
                     error_metric < tolerance,
                     "Gradient mismatch for {:?}.\n\
                      Analytical: {:.8e}, Numerical: {:.8e}, Relative Error: {:.4}",
-                    link_function, analytical_grad[0], numerical_grad, error_metric
+                    link_function,
+                    analytical_grad[0],
+                    numerical_grad,
+                    error_metric
                 );
-                
+
                 // Check symmetry of finite differences to ensure the numerical approximation is valid
                 let h = adaptive_step_size(test_rho[0]);
                 assert!(
@@ -3985,19 +4099,21 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // Also verify that taking a step in the negative gradient direction decreases the cost
                 let cost_start = safe_compute_cost(&reml_state, &test_rho)
                     .expect("Cost calculation failed at start");
-                    
+
                 // Take a small step in the negative gradient direction
                 let step_size = 1e-7; // Small fixed step size for stability
                 let rho_next = &test_rho - step_size * &analytical_grad;
-                
+
                 let cost_next = safe_compute_cost(&reml_state, &rho_next)
                     .expect("Cost calculation failed after step");
-                
+
                 assert!(
                     cost_next < cost_start,
                     "For {:?}, taking a step in the negative gradient direction should decrease the cost.\n\
                      Start Cost: {:.8e}, Next Cost: {:.8e}",
-                    link_function, cost_start, cost_next
+                    link_function,
+                    cost_start,
+                    cost_next
                 );
 
                 // Verify the gradient is significant and not near zero
@@ -4344,29 +4460,34 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // 2. Define a SIMPLE config for a model with ONLY a PGS term.
                 let mut simple_config = create_test_config();
                 simple_config.link_function = link_function;
-                simple_config.pc_names = vec![];  // Remove PCs from the model definition
+                simple_config.pc_names = vec![]; // Remove PCs from the model definition
                 simple_config.pc_basis_configs = vec![];
                 simple_config.pc_ranges = vec![];
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
                 let (x_simple, s_list_simple, layout_simple, _, _) =
-                    build_design_and_penalty_matrices(&data, &simple_config)
-                        .unwrap_or_else(|e| panic!("Matrix build failed for {:?}: {:?}", link_function, e));
+                    build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+                        panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+                    });
 
                 if layout_simple.num_penalties == 0 {
-                    println!("Skipping gradient direction test for {:?}: model has no penalized terms.", link_function);
+                    println!(
+                        "Skipping gradient direction test for {:?}: model has no penalized terms.",
+                        link_function
+                    );
                     return;
                 }
 
                 // 4. Create the RemlState using these consistent objects.
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
-                    x_simple.view(),    // Use the simple design matrix
-                    s_list_simple,      // Use the simple penalty list
-                    &layout_simple,     // Use the simple layout
+                    x_simple.view(), // Use the simple design matrix
+                    s_list_simple,   // Use the simple penalty list
+                    &layout_simple,  // Use the simple layout
                     &simple_config,
-                ).unwrap();
+                )
+                .unwrap();
 
                 // 5. Start with a very low penalty (rho = -5 => lambda ≈ 6.7e-3)
                 let rho_start = Array1::from_elem(layout_simple.num_penalties, -5.0);
@@ -4379,29 +4500,35 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 // VERIFY: Assert that the gradient is negative, which means the cost decreases as rho increases
                 // This indicates the optimizer will correctly push towards more smoothing
                 let grad_pgs = grad[0];
-                
+
                 assert!(
                     grad_pgs < -0.1, // Check that it's not just negative, but meaningfully so
                     "For an overly flexible model, the gradient should be strongly negative, indicating a need for more smoothing.\n\
                      Got: {:.6e} for {:?} link function",
-                    grad_pgs, link_function
+                    grad_pgs,
+                    link_function
                 );
-                
+
                 // Also verify that taking a step in the direction of increasing rho (more smoothing)
                 // actually decreases the cost function value
                 let step_size = 0.1; // A small but meaningful step size
-                let rho_more_smoothing = &rho_start + Array1::from_elem(layout_simple.num_penalties, step_size);
-                
+                let rho_more_smoothing =
+                    &rho_start + Array1::from_elem(layout_simple.num_penalties, step_size);
+
                 let cost_start = safe_compute_cost(&reml_state, &rho_start)
                     .expect("Cost calculation failed at start point");
                 let cost_more_smoothing = safe_compute_cost(&reml_state, &rho_more_smoothing)
                     .expect("Cost calculation failed after step");
-                    
+
                 assert!(
                     cost_more_smoothing < cost_start,
                     "For an overly flexible model with {:?} link, increasing smoothing should decrease cost.\n\
                      Start (rho={:.1}): {:.6e}, After more smoothing (rho={:.1}): {:.6e}",
-                    link_function, rho_start[0], cost_start, rho_more_smoothing[0], cost_more_smoothing
+                    link_function,
+                    rho_start[0],
+                    cost_start,
+                    rho_more_smoothing[0],
+                    cost_more_smoothing
                 );
             };
 
@@ -4409,7 +4536,6 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             test_for_link(LinkFunction::Logit);
         }
 
-        
         #[test]
         fn test_gradient_descent_step_decreases_cost() {
             // For both LAML and REML, verify the most fundamental property of a gradient:
@@ -4449,27 +4575,27 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 let mut simple_config = create_test_config();
                 simple_config.link_function = link_function;
                 simple_config.pc_names = vec![]; // No PCs in this model
-                simple_config.pc_basis_configs = vec![]; 
+                simple_config.pc_basis_configs = vec![];
                 simple_config.pc_ranges = vec![];
-                
+
                 // Use a simple basis with fewer knots to reduce complexity
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _) = 
-                    build_design_and_penalty_matrices(&data, &simple_config)
-                    .unwrap_or_else(|e| {
+                let (x_simple, s_list_simple, layout_simple, _, _) =
+                    build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
 
                 // 3. Create RemlState with the consistent objects
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
-                    x_simple.view(), 
+                    x_simple.view(),
                     s_list_simple,
                     &layout_simple,
                     &simple_config,
-                ).unwrap();
+                )
+                .unwrap();
 
                 // Skip this test if there are no penalties
                 if layout_simple.num_penalties == 0 {
@@ -4616,24 +4742,25 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let data = TrainingData {
                 y: Array1::from_shape_fn(n_samples, |i| (i as f64 / n_samples as f64).sin()), // Data with a clear signal
                 p: Array1::from_shape_fn(n_samples, |i| (i as f64 / n_samples as f64) * 2.0 - 1.0), // Linear range
-                pcs: Array2::from_shape_fn((n_samples, 1), |(i, _)| (i as f64 / n_samples as f64) * 2.0 - 1.0), // Linear range
+                pcs: Array2::from_shape_fn((n_samples, 1), |(i, _)| {
+                    (i as f64 / n_samples as f64) * 2.0 - 1.0
+                }), // Linear range
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) = 
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
-                .unwrap_or_else(|e| {
-                    panic!("Matrix build failed: {:?}", e)
-                });
+                    .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
             // 3. Create RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
                 s_list_simple,
-                &layout_simple, 
+                &layout_simple,
                 &simple_config,
-            ).unwrap();
+            )
+            .unwrap();
 
             // Test at a specific, interpretable point
             let rho_test = Array1::from_elem(layout_simple.num_penalties, 0.0); // rho=0 means lambda=1
@@ -4681,7 +4808,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             };
 
             // --- 1. Calculate the cost at two very different smoothing levels ---
-            
+
             // A low smoothing level (high flexibility)
             let rho_low_smoothing = Array1::from_elem(layout_simple.num_penalties, -5.0); // lambda ~ 0.007
             let cost_low_smoothing = compute_cost_safe(&rho_low_smoothing);
@@ -4689,11 +4816,11 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             // A high smoothing level (low flexibility, approaching a linear fit)
             let rho_high_smoothing = Array1::from_elem(layout_simple.num_penalties, 5.0); // lambda ~ 148
             let cost_high_smoothing = compute_cost_safe(&rho_high_smoothing);
-            
+
             // --- 2. Calculate gradient at a mid point ---
             let rho_mid = Array1::from_elem(layout_simple.num_penalties, 0.0); // lambda = 1.0
             let grad_mid = compute_gradient_safe(&rho_mid);
-            
+
             // --- 3. VERIFY: Assert that the costs are different ---
             // This confirms that the smoothing parameter has a non-zero effect on the model's fit
             let difference = (cost_low_smoothing - cost_high_smoothing).abs();
@@ -4703,23 +4830,27 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                  Cost at low smoothing (rho=-5): {:.6}\n\
                  Cost at high smoothing (rho=5): {:.6}\n\
                  Difference: {:.6e}",
-                cost_low_smoothing, cost_high_smoothing, difference
+                cost_low_smoothing,
+                cost_high_smoothing,
+                difference
             );
-            
+
             // --- 4. VERIFY: Assert that taking a step in the negative gradient direction decreases cost ---
             // Test the fundamental descent property
             let step_size = 1e-5;
             let rho_step = &rho_mid - step_size * &grad_mid; // Standard gradient descent step
             let cost_mid = compute_cost_safe(&rho_mid);
             let cost_step = compute_cost_safe(&rho_step);
-            
+
             assert!(
                 cost_step < cost_mid,
                 "Taking a small step in the negative gradient direction should decrease the cost.\n\
                  Original cost: {:.10}\n\
                  Cost after gradient descent step: {:.10}\n\
                  Change in cost: {:.2e}",
-                cost_mid, cost_step, cost_step - cost_mid
+                cost_mid,
+                cost_step,
+                cost_step - cost_mid
             );
         }
 
@@ -4735,20 +4866,20 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let mut simple_config = create_test_config();
             simple_config.link_function = LinkFunction::Identity;
             simple_config.pc_names = vec![]; // No PCs in this model
-            simple_config.pc_basis_configs = vec![]; 
+            simple_config.pc_basis_configs = vec![];
             simple_config.pc_ranges = vec![];
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) = 
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
-                .unwrap_or_else(|e| {
-                    panic!("Matrix build failed: {:?}", e)
-                });
+                    .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
             // Guard clause: if there are no penalties, the test is meaningless
             if layout_simple.num_penalties == 0 {
-                println!("Skipping cost variation test: model has no penalties, so cost is expected to be constant.");
+                println!(
+                    "Skipping cost variation test: model has no penalties, so cost is expected to be constant."
+                );
                 return;
             }
 
@@ -4757,54 +4888,66 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 data.y.view(),
                 x_simple.view(),
                 s_list_simple,
-                &layout_simple, 
+                &layout_simple,
                 &simple_config,
-            ).unwrap();
+            )
+            .unwrap();
 
             // --- VERIFY: Test that the cost function responds appropriately to different smoothing levels ---
-            
+
             // Calculate cost at different smoothing levels
             let mut costs = Vec::new();
             for rho in [-2.0f64, -1.0, 0.0, 1.0, 2.0] {
                 let rho_array = Array1::from_elem(layout_simple.num_penalties, rho);
-                
+
                 match reml_state.compute_cost(&rho_array) {
                     Ok(cost) => costs.push((rho, cost)),
                     Err(e) => panic!("Cost calculation failed at rho={}: {:?}", rho, e),
                 }
             }
-            
+
             // Verify that costs differ significantly between different smoothing levels
-            let &(_, lowest_cost) = costs.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            let &(_, lowest_cost) = costs
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .expect("Should have at least one valid cost");
-            let &(_, highest_cost) = costs.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            let &(_, highest_cost) = costs
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .expect("Should have at least one valid cost");
-                
+
             assert!(
                 (highest_cost - lowest_cost).abs() > 1e-6,
                 "Cost function should vary meaningfully with different smoothing levels.\n\
                  Lowest cost: {:.6e}, Highest cost: {:.6e}, Difference: {:.6e}",
-                lowest_cost, highest_cost, (highest_cost - lowest_cost).abs()
+                lowest_cost,
+                highest_cost,
+                (highest_cost - lowest_cost).abs()
             );
-            
+
             // Verify that the cost function produces a reasonable curve (not chaotic)
             // Costs should be roughly monotonic or have at most one minimum/maximum
             // This checks that adjacent smoothing levels have similar costs
             for i in 1..costs.len() {
-                let (rho1, cost1) = costs[i-1];
+                let (rho1, cost1) = costs[i - 1];
                 let (rho2, cost2) = costs[i];
-                
+
                 // Check that the cost doesn't jump wildly between adjacent smoothing levels
                 let delta_rho = (rho2 - rho1).abs();
                 let delta_cost = (cost2 - cost1).abs();
-                
+
                 assert!(
                     delta_cost < 100.0 * delta_rho, // Allow reasonable change but not extreme jumps
                     "Cost function should change smoothly with smoothing parameter.\n\
                      At rho={:.1}, cost={:.6e}\n\
                      At rho={:.1}, cost={:.6e}\n\
                      Cost jumped by {:.6e} for a rho change of only {:.1}",
-                    rho1, cost1, rho2, cost2, delta_cost, delta_rho
+                    rho1,
+                    cost1,
+                    rho2,
+                    cost2,
+                    delta_cost,
+                    delta_rho
                 );
             }
         }
@@ -4821,25 +4964,24 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let mut simple_config = create_test_config();
             simple_config.link_function = LinkFunction::Identity;
             simple_config.pc_names = vec![]; // No PCs in this model
-            simple_config.pc_basis_configs = vec![]; 
+            simple_config.pc_basis_configs = vec![];
             simple_config.pc_ranges = vec![];
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) = 
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
-                .unwrap_or_else(|e| {
-                    panic!("Matrix build failed: {:?}", e)
-                });
+                    .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
             // 3. Create RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
                 s_list_simple,
-                &layout_simple, 
+                &layout_simple,
                 &simple_config,
-            ).unwrap();
+            )
+            .unwrap();
 
             if layout_simple.num_penalties == 0 {
                 println!("Skipping gradient vs cost relationship test: model has no penalties.");
@@ -4850,7 +4992,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
             let test_points = [-1.0, 0.0, 1.0];
             let mut all_tests_passed = true;
             let tolerance = 1e-4;
-            
+
             for &rho_val in &test_points {
                 let rho = Array1::from_elem(layout_simple.num_penalties, rho_val);
 
@@ -4865,12 +5007,12 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
                 let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
                 let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
-                
+
                 // Calculate error between analytical and numerical gradients
                 let error_metric = compute_error_metric(analytical_grad, numerical_grad);
                 let test_passed = error_metric < tolerance;
                 all_tests_passed = all_tests_passed && test_passed;
-                
+
                 println!("Test at rho={:.1}:", rho_val);
                 println!("  Cost: {:.6e}", cost_0);
                 println!("  Analytical gradient: {:.6e}", analytical_grad);
@@ -4878,7 +5020,7 @@ fn test_train_model_approximates_smooth_function_impl() -> Result<(), String> {
                 println!("  Error: {:.6e}", error_metric);
                 println!("  Test passed: {}", test_passed);
             }
-            
+
             // Final assertion to ensure test actually fails if any comparison failed
             assert!(
                 all_tests_passed,
@@ -5052,57 +5194,63 @@ fn test_indefinite_hessian_detection_and_retreat() {
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
     if let Ok((x_matrix, s_list, layout, _, _)) = matrices_result {
-        let reml_state_result = RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
-        
+        let reml_state_result =
+            RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
+
         if let Ok(reml_state) = reml_state_result {
             // Test 1: Reasonable parameters should work
             let reasonable_rho = Array1::zeros(layout.num_penalties);
             let reasonable_cost = reml_state.compute_cost(&reasonable_rho);
             let reasonable_grad = reml_state.compute_gradient(&reasonable_rho);
 
-        match (&reasonable_cost, &reasonable_grad) {
-            (Ok(cost), Ok(grad)) if cost.is_finite() => {
-                println!(
-                    "✓ Reasonable parameters work: cost={:.6e}, grad_norm={:.6e}",
-                    cost,
-                    grad.dot(grad).sqrt()
-                );
+            match (&reasonable_cost, &reasonable_grad) {
+                (Ok(cost), Ok(grad)) if cost.is_finite() => {
+                    println!(
+                        "✓ Reasonable parameters work: cost={:.6e}, grad_norm={:.6e}",
+                        cost,
+                        grad.dot(grad).sqrt()
+                    );
 
-                // Test 2: Extreme parameters that might cause indefiniteness
-                let extreme_rho = Array1::from_elem(layout.num_penalties, 50.0); // Very large
-                let extreme_cost = reml_state.compute_cost(&extreme_rho);
-                let extreme_grad = reml_state.compute_gradient(&extreme_rho);
+                    // Test 2: Extreme parameters that might cause indefiniteness
+                    let extreme_rho = Array1::from_elem(layout.num_penalties, 50.0); // Very large
+                    let extreme_cost = reml_state.compute_cost(&extreme_rho);
+                    let extreme_grad = reml_state.compute_gradient(&extreme_rho);
 
-                match extreme_cost {
-                    Ok(cost) if cost == f64::INFINITY => {
-                        println!(
-                            "✓ Indefinite Hessian correctly detected - infinite cost returned"
-                        );
+                    match extreme_cost {
+                        Ok(cost) if cost == f64::INFINITY => {
+                            println!(
+                                "✓ Indefinite Hessian correctly detected - infinite cost returned"
+                            );
 
-                        // Verify retreat gradient is non-zero
-                        if let Ok(grad) = extreme_grad {
-                            let grad_norm = grad.dot(&grad).sqrt();
-                            assert!(grad_norm > 0.0, "Retreat gradient should be non-zero");
-                            println!("✓ Retreat gradient returned with norm: {:.6e}", grad_norm);
+                            // Verify retreat gradient is non-zero
+                            if let Ok(grad) = extreme_grad {
+                                let grad_norm = grad.dot(&grad).sqrt();
+                                assert!(grad_norm > 0.0, "Retreat gradient should be non-zero");
+                                println!(
+                                    "✓ Retreat gradient returned with norm: {:.6e}",
+                                    grad_norm
+                                );
+                            }
+                        }
+                        Ok(cost) if cost.is_finite() => {
+                            println!("✓ Extreme parameters handled (finite cost: {:.6e})", cost);
+                        }
+                        Ok(_) => {
+                            println!("✓ Cost computation handled extreme case");
+                        }
+                        Err(_) => {
+                            println!("✓ Extreme parameters properly rejected with error");
                         }
                     }
-                    Ok(cost) if cost.is_finite() => {
-                        println!("✓ Extreme parameters handled (finite cost: {:.6e})", cost);
-                    }
-                    Ok(_) => {
-                        println!("✓ Cost computation handled extreme case");
-                    }
-                    Err(_) => {
-                        println!("✓ Extreme parameters properly rejected with error");
-                    }
+                }
+                _ => {
+                    println!("✓ Test completed - small dataset may not support full computation");
                 }
             }
-            _ => {
-                println!("✓ Test completed - small dataset may not support full computation");
-            }
-        }
         } else {
-            println!("✓ RemlState construction failed for small dataset (expected for minimal test)");
+            println!(
+                "✓ RemlState construction failed for small dataset (expected for minimal test)"
+            );
         }
     } else {
         println!("✓ Matrix construction failed for small dataset (expected for minimal test)");

@@ -47,7 +47,7 @@ pub struct PirlsResult {
 ///
 /// 1. Perform stable reparameterization ONCE at the beginning (mgcv's gam.reparam)
 /// 2. Transform the design matrix into this stable basis
-/// 3. Extract a single penalty square root from the transformed penalty 
+/// 3. Extract a single penalty square root from the transformed penalty
 /// 4. Run the P-IRLS loop entirely in the transformed basis
 /// 5. Transform the coefficients back to the original basis only when returning
 ///
@@ -57,14 +57,17 @@ pub fn fit_model_for_fixed_rho(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
-    rs_original: &[Array2<f64>],  // Original, untransformed penalty square roots
+    rs_original: &[Array2<f64>], // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
     // Step 1: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
     let lambdas = rho_vec.mapv(f64::exp);
 
-    log::info!("Starting P-IRLS fitting with {} smoothing parameters", lambdas.len());
+    log::info!(
+        "Starting P-IRLS fitting with {} smoothing parameters",
+        lambdas.len()
+    );
     if !lambdas.is_empty() {
         log::debug!(
             "Lambdas (first 5): [{:.2e}, {:.2e}, {:.2e}, {:.2e}, {:.2e}, ...]",
@@ -75,31 +78,28 @@ pub fn fit_model_for_fixed_rho(
             lambdas.get(4).unwrap_or(&0.0)
         );
     }
-    
+
     // Step 2: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
-    
+
     use crate::calibrate::construction::stable_reparameterization;
-    let reparam_result = stable_reparameterization(
-        rs_original, 
-        &lambdas.to_vec(),
-        layout
-    )?;
-    
+    let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+
     // Step 3: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
-    
+
     // Step 4: Get the transformed penalty matrices
     let s_transformed = &reparam_result.s_transformed;
-    
+
     // Step 5: Extract the single penalty square root from the transformed penalty
     use ndarray_linalg::{Eigh, UPLO};
-    let (eigenvalues, eigenvectors) = s_transformed.eigh(UPLO::Lower)
+    let (eigenvalues, eigenvectors) = s_transformed
+        .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    
+
     let tolerance = 1e-12;
     let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-    
+
     let mut e = Array2::zeros((rank_s, layout.total_coeffs));
     let mut col_idx = 0;
     for (i, &eigenval) in eigenvalues.iter().enumerate() {
@@ -109,7 +109,7 @@ pub fn fit_model_for_fixed_rho(
             col_idx += 1;
         }
     }
-    
+
     // Step 6: Initialize P-IRLS state variables in the TRANSFORMED basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = x_transformed.dot(&beta_transformed);
@@ -117,7 +117,7 @@ pub fn fit_model_for_fixed_rho(
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
-    
+
     // Save the most recent stable result to avoid redundant computation
     let mut last_stable_result: Option<(StablePLSResult, usize)> = None;
 
@@ -133,19 +133,19 @@ pub fn fit_model_for_fixed_rho(
         LinkFunction::Logit => 3, // Ensure at least some refinement for non-Gaussian
         LinkFunction::Identity => 1, // Gaussian may converge faster
     };
-    
+
     log::info!("Reparameterization complete. Starting P-IRLS loop in transformed basis...");
 
     for iter in 1..=config.max_iterations {
         last_iter = iter; // Update on every iteration
-        
+
         // --- Store the state from the START of the iteration ---
         let beta_current = beta_transformed.clone();
         let deviance_current = last_deviance;
 
         // Calculate the penalty for the current beta using the transformed total penalty matrix
         let penalty_current = beta_current.dot(&s_transformed.dot(&beta_current));
-        
+
         // This is the true objective function value at the start of the iteration
         let penalized_deviance_current = deviance_current + penalty_current;
 
@@ -168,13 +168,13 @@ pub fn fit_model_for_fixed_rho(
             weights.view(),
             &e, // Single square root matrix from eigendecomposition in transformed space
         )?;
-        
+
         // Save the most recent stable result to avoid redundant computation at the end
         last_stable_result = Some(stable_result.clone());
-        
+
         // The solver now returns beta in the transformed basis which is what we need for the P-IRLS loop
         log::debug!(
-            "P-IRLS Iteration #{}: Getting solver result in transformed basis", 
+            "P-IRLS Iteration #{}: Getting solver result in transformed basis",
             iter
         );
         let mut beta_trial = stable_result.0.beta.clone();
@@ -194,24 +194,30 @@ pub fn fit_model_for_fixed_rho(
 
         // mgcv-style step halving (use while loop instead of for loop with counter)
         let mut step_halving_count = 0;
-        
+
         // Check for non-finite values or deviance increase
         let mut valid_eta = eta_trial.iter().all(|v| v.is_finite());
         let mut valid_mu = mu_trial.iter().all(|v| v.is_finite());
-        
+
         // Calculate penalty using the transformed total penalty matrix
         let mut penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
         let mut penalized_deviance_trial = deviance_trial + penalty_trial;
         let mut deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
-        
+
         // Enhanced debugging for the failing test
         log::debug!(
-            "P-IRLS Iteration #{}: Starting values check | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}", 
-            iter, valid_eta, valid_mu, deviance_trial.is_finite(), deviance_decreased
+            "P-IRLS Iteration #{}: Starting values check | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}",
+            iter,
+            valid_eta,
+            valid_mu,
+            deviance_trial.is_finite(),
+            deviance_decreased
         );
         log::debug!(
-            "P-IRLS Iteration #{}: Deviance check | current: {:.8e}, trial: {:.8e}, change: {:.8e}", 
-            iter, penalized_deviance_current, penalized_deviance_trial,
+            "P-IRLS Iteration #{}: Deviance check | current: {:.8e}, trial: {:.8e}, change: {:.8e}",
+            iter,
+            penalized_deviance_current,
+            penalized_deviance_trial,
             penalized_deviance_current - penalized_deviance_trial
         );
 
@@ -219,48 +225,63 @@ pub fn fit_model_for_fixed_rho(
         if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
             log::debug!("Starting step halving due to invalid values or deviance increase");
         }
-        
+
         // mgcv-style while loop for step halving
-        while (!valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased) && step_halving_count < 30 {
+        while (!valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased)
+            && step_halving_count < 30
+        {
             // Half the step size
             beta_trial = &beta_current + 0.5 * (&beta_trial - &beta_current);
             eta_trial = x_transformed.dot(&beta_trial);
-            
+
             // Re-evaluate
             let update_result = update_glm_vectors(y, &eta_trial, config.link_function);
             mu_trial = update_result.0;
             deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
-            
+
             // Update the penalty using the transformed total penalty matrix
             penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
-            
+
             // Check conditions again
             valid_eta = eta_trial.iter().all(|v| v.is_finite());
             valid_mu = mu_trial.iter().all(|v| v.is_finite());
             penalized_deviance_trial = deviance_trial + penalty_trial;
             deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
-            
+
             step_halving_count += 1;
-            
+
             // Enhanced debugging for all step-halving attempts
             log::debug!(
-                "Step halving #{} | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}", 
-                step_halving_count, valid_eta, valid_mu, deviance_trial.is_finite(), deviance_decreased
+                "Step halving #{} | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}",
+                step_halving_count,
+                valid_eta,
+                valid_mu,
+                deviance_trial.is_finite(),
+                deviance_decreased
             );
             log::debug!(
-                "Step halving #{} | current: {:.8e}, trial: {:.8e}, change: {:.8e}", 
-                step_halving_count, penalized_deviance_current, penalized_deviance_trial,
+                "Step halving #{} | current: {:.8e}, trial: {:.8e}, change: {:.8e}",
+                step_halving_count,
+                penalized_deviance_current,
+                penalized_deviance_trial,
                 penalized_deviance_current - penalized_deviance_trial
             );
         }
 
         // If we couldn't find a valid step after max step halvings, fail
         if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
-            log::warn!("P-IRLS failed to find valid step after {} halvings", step_halving_count);
+            log::warn!(
+                "P-IRLS failed to find valid step after {} halvings",
+                step_halving_count
+            );
             // mgcv simply returns with failure in this case
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
-                last_change: if deviance_decreased { f64::NAN } else { f64::INFINITY },
+                last_change: if deviance_decreased {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                },
             });
         }
 
@@ -306,16 +327,19 @@ pub fn fit_model_for_fixed_rho(
                 )?;
                 result.penalized_hessian
             };
-            
+
             // At the end of the P-IRLS loop we always need to transform back to original basis
             // This is exactly how mgcv works - all computation in the transformed space,
             // transform back only at the very end
             log::debug!("Unstable convergence: transforming coefficients back to original basis");
             let beta_original = reparam_result.qs.dot(&beta_transformed);
-            let penalized_hessian = reparam_result.qs.dot(&penalized_hessian_transformed).dot(&reparam_result.qs.t());
-            
+            let penalized_hessian = reparam_result
+                .qs
+                .dot(&penalized_hessian_transformed)
+                .dot(&reparam_result.qs.t());
+
             return Ok(PirlsResult {
-                beta: beta_original, 
+                beta: beta_original,
                 penalized_hessian,
                 deviance: last_deviance,
                 final_weights: weights,
@@ -337,15 +361,15 @@ pub fn fit_model_for_fixed_rho(
         let eta_minus_z = &eta - &z;
         let w_times_diff = &weights * &eta_minus_z;
         let deviance_gradient_part = x_transformed.t().dot(&w_times_diff);
-        
+
         // Use s_transformed for the penalty gradient term
         let penalty_gradient_part = s_transformed.dot(&beta_transformed);
-        
+
         // Form the gradient of the penalized deviance objective function
-        let penalized_deviance_gradient = 
+        let penalized_deviance_gradient =
             &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
-        
-        // Calculate the infinity norm (maximum absolute element) 
+
+        // Calculate the infinity norm (maximum absolute element)
         let gradient_norm = penalized_deviance_gradient
             .iter()
             .map(|&x| x.abs())
@@ -358,7 +382,11 @@ pub fn fit_model_for_fixed_rho(
             penalized_deviance_new,
             deviance_change,
             gradient_norm,
-            if step_halving_count > 0 { format!(" | Step Halving: {} attempts", step_halving_count) } else { String::new() }
+            if step_halving_count > 0 {
+                format!(" | Step Halving: {} attempts", step_halving_count)
+            } else {
+                String::new()
+            }
         );
 
         // Check for non-finite deviance change
@@ -368,7 +396,11 @@ pub fn fit_model_for_fixed_rho(
             );
             return Err(EstimationError::PirlsDidNotConverge {
                 max_iterations: config.max_iterations,
-                last_change: if deviance_change.is_nan() { f64::NAN } else { f64::INFINITY },
+                last_change: if deviance_change.is_nan() {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                },
             });
         }
 
@@ -385,23 +417,27 @@ pub fn fit_model_for_fixed_rho(
 
         // Comprehensive convergence check as in mgcv
         // 1. The gradient has already been calculated above, no need to recompute
-            
+
         // 2. The change in penalized deviance is small
         let deviance_converged = deviance_change < config.convergence_tolerance;
-        
+
         // 3. AND the gradient is close to zero (using scaled tolerance)
         // This is the mgcv approach, which scales the gradient tolerance based on both:
         // - The scale parameter (which depends on the link function)
         // - The magnitude of the current objective function value
-        let gradient_tol = config.convergence_tolerance * (scale.abs() + penalized_deviance_new.abs());
+        let gradient_tol =
+            config.convergence_tolerance * (scale.abs() + penalized_deviance_new.abs());
         let gradient_converged = gradient_norm < gradient_tol;
-        
+
         // Both criteria must be met for convergence AND we must have completed minimum iterations
         let converged = iter >= min_iterations && deviance_converged && gradient_converged;
 
         if converged {
-            log::info!("P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.", 
-                      deviance_change, gradient_norm);
+            log::info!(
+                "P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.",
+                deviance_change,
+                gradient_norm
+            );
 
             // Use the saved stable result to avoid redundant computation
             let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
@@ -423,12 +459,19 @@ pub fn fit_model_for_fixed_rho(
             // This follows mgcv exactly: work in the transformed basis during iteration,
             // transform back only at the very end
             let beta_original = reparam_result.qs.dot(&beta_transformed);
-            
+
             // Transform the Hessian back to the original basis: H_orig = Qs * H_transformed * Qs^T
-            let penalized_hessian = reparam_result.qs.dot(&penalized_hessian_transformed).dot(&reparam_result.qs.t());
-            
-            log::info!("P-IRLS converged after {} iterations with deviance {:.6e}", iter, last_deviance);
-            
+            let penalized_hessian = reparam_result
+                .qs
+                .dot(&penalized_hessian_transformed)
+                .dot(&reparam_result.qs.t());
+
+            log::info!(
+                "P-IRLS converged after {} iterations with deviance {:.6e}",
+                iter,
+                last_deviance
+            );
+
             return Ok(PirlsResult {
                 beta: beta_original,
                 penalized_hessian,
@@ -444,10 +487,10 @@ pub fn fit_model_for_fixed_rho(
 
     // If we reach here, we've hit max iterations without converging
     log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
-    
+
     // In mgcv's implementation, there is no additional check for whether we're at a valid minimum
     // It just reports failure to converge
-    
+
     // Use the saved stable result to avoid redundant computation
     let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
         // Use the Hessian from the last stable solve
@@ -455,23 +498,25 @@ pub fn fit_model_for_fixed_rho(
     } else {
         // This should never happen, but as a fallback, compute the Hessian
         log::warn!("No stable result saved, computing Hessian as fallback");
-        let (result, _rank) = solve_penalized_least_squares(
-            x_transformed.view(),
-            z.view(),
-            weights.view(),
-            &e,
-        )?;
+        let (result, _rank) =
+            solve_penalized_least_squares(x_transformed.view(), z.view(), weights.view(), &e)?;
         result.penalized_hessian
     };
-    
+
     // At the end, transform coefficients and Hessian back to original basis
     // This follows mgcv exactly: work in transformed basis during iteration,
     // transform back only at the end
     let beta_original = reparam_result.qs.dot(&beta_transformed);
-    let penalized_hessian = reparam_result.qs.dot(&penalized_hessian_transformed).dot(&reparam_result.qs.t());
-    
-    log::warn!("P-IRLS reached max iterations ({}) without convergence", last_iter);
-    
+    let penalized_hessian = reparam_result
+        .qs
+        .dot(&penalized_hessian_transformed)
+        .dot(&reparam_result.qs.t());
+
+    log::warn!(
+        "P-IRLS reached max iterations ({}) without convergence",
+        last_iter
+    );
+
     // Return with MaxIterationsReached status
     Ok(PirlsResult {
         beta: beta_original,
@@ -485,15 +530,16 @@ pub fn fit_model_for_fixed_rho(
     })
 }
 
-
 /// Port of the `R_cond` function from mgcv, which implements the CMSW
 /// algorithm to estimate the 1-norm condition number of an upper
 /// triangular matrix R. THIS IS A MANDATORY COMPONENT FOR ALIGNMENT.
 fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     use ndarray::s;
-    
+
     let c = r_matrix.ncols();
-    if c == 0 { return 1.0; }
+    if c == 0 {
+        return 1.0;
+    }
     // We don't need r_rows, but include it for alignment with C code
     let _r_rows = r_matrix.nrows();
 
@@ -504,7 +550,9 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 
     for k in (0..c).rev() {
         let r_kk = r_matrix[[k, k]];
-        if r_kk == 0.0 { return f64::INFINITY; }
+        if r_kk == 0.0 {
+            return f64::INFINITY;
+        }
         let yp: f64 = (1.0 - p[k]) / r_kk;
         let ym: f64 = (-1.0 - p[k]) / r_kk;
 
@@ -526,12 +574,12 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
             p.slice_mut(s![0..k]).assign(&pm.slice(s![0..k]));
         }
     }
-    
+
     let y_inf_norm = y.iter().map(|v| v.abs()).fold(f64::NEG_INFINITY, f64::max);
-    
-    let r_inf_norm = (0..c).map(|i| {
-        (i..c).map(|j| r_matrix[[i, j]].abs()).sum::<f64>()
-    }).fold(f64::NEG_INFINITY, f64::max);
+
+    let r_inf_norm = (0..c)
+        .map(|i| (i..c).map(|j| r_matrix[[i, j]].abs()).sum::<f64>())
+        .fold(f64::NEG_INFINITY, f64::max);
 
     r_inf_norm * y_inf_norm
 }
@@ -621,34 +669,36 @@ pub struct StablePLSResult {
 /// Robust penalized least squares solver following mgcv's pls_fit1 architecture
 /// This function implements the logic for a SINGLE P-IRLS step in the TRANSFORMED basis
 pub fn solve_penalized_least_squares(
-    x_transformed: ArrayView2<f64>,  // The TRANSFORMED design matrix
+    x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
-    e: &Array2<f64>,  // Single penalty square root matrix
+    e: &Array2<f64>, // Single penalty square root matrix
 ) -> Result<(StablePLSResult, usize), EstimationError> {
     use ndarray::s;
-    use ndarray_linalg::{SolveTriangular, UPLO, Diag};
-    
+    use ndarray_linalg::{Diag, SolveTriangular, UPLO};
+
     // Define rank tolerance, matching mgcv's default
     const RANK_TOL: f64 = 1e-7;
-    
+
     let n = x_transformed.nrows();
     let p = x_transformed.ncols();
-    
+
     // Check for negative weights (will implement SVD correction in future)
     let has_negative_weights = weights.iter().any(|&w| w < 0.0);
-    
+
     if has_negative_weights {
         // TODO: Implement SVD-based approach for negative weights
         // For now, fall back to simple absolute value approach
-        log::warn!("Negative weights detected - using simplified approach (full SVD correction not yet implemented)");
+        log::warn!(
+            "Negative weights detected - using simplified approach (full SVD correction not yet implemented)"
+        );
     }
-    
+
     // Step 1: Form the weighted design matrix sqrt(|W|) * X_transformed
     let sqrt_abs_w = weights.mapv(|w| w.abs().sqrt());
     let wx = &x_transformed * &sqrt_abs_w.view().insert_axis(Axis(1));
     let wz = &sqrt_abs_w * &z;
-    
+
     // Step 2: Form the complete augmented system [sqrt(W)*X_transformed; e]
     // If there's no penalty (e.nrows() == 0), just use the weighted design matrix
     let (aug_matrix, aug_rows) = if e.nrows() > 0 {
@@ -661,10 +711,10 @@ pub fn solve_penalized_least_squares(
         // No penalty, just use weighted design matrix
         (wx.clone(), n)
     };
-    
+
     // Step 3: Perform a SINGLE pivoted QR on the entire augmented system
     let (q, r, pivot) = pivoted_qr(&aug_matrix)?;
-    
+
     // Step 4: Determine rank from this R matrix using the condition number
     let mut rank = p.min(aug_rows);
     while rank > 0 {
@@ -676,34 +726,36 @@ pub fn solve_penalized_least_squares(
             break;
         }
     }
-    if rank == 0 { 
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }); 
+    if rank == 0 {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     log::debug!("Solver determined rank {}/{}", rank, p);
-    
+
     // Step 5: Solve the truncated system
     let mut aug_rhs = Array1::zeros(aug_rows);
     aug_rhs.slice_mut(s![..n]).assign(&wz);
     let q_t_rhs = q.t().dot(&aug_rhs);
-    
+
     let r_trunc = r.slice(s![..rank, ..rank]);
     let rhs_trunc = q_t_rhs.slice(s![..rank]);
-    
+
     let beta_trunc = r_trunc
         .solve_triangular(UPLO::Upper, Diag::NonUnit, &rhs_trunc.to_owned())
         .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
-    
+
     // Step 6: Restore solution to full size and un-pivot
     let mut beta_pivoted = Array1::zeros(p);
     beta_pivoted.slice_mut(s![..rank]).assign(&beta_trunc);
-    
+
     let mut beta_transformed = Array1::zeros(p); // Solution remains in the transformed basis
     for i in 0..p {
         if i < rank {
             beta_transformed[pivot[i]] = beta_pivoted[i];
         }
     }
-    
+
     // Step 7: Calculate the penalized Hessian IN THE TRANSFORMED BASIS
     let hessian_pivoted = r.t().dot(&r);
     let mut p_mat = Array2::zeros((p, p));
@@ -711,7 +763,7 @@ pub fn solve_penalized_least_squares(
         p_mat[[piv_col, i]] = 1.0;
     }
     let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
-    
+
     // Calculate effective degrees of freedom (edf) using the penalized Hessian
     let edf = calculate_edf(
         &penalized_hessian,
@@ -727,7 +779,7 @@ pub fn solve_penalized_least_squares(
         weights,
         edf,
     );
-    
+
     Ok((
         StablePLSResult {
             beta: beta_transformed,
@@ -739,47 +791,49 @@ pub fn solve_penalized_least_squares(
     ))
 }
 
-
 /// Perform pivoted QR decomposition using column-norm based pivoting
-fn pivoted_qr(matrix: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
+fn pivoted_qr(
+    matrix: &Array2<f64>,
+) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
     use ndarray_linalg::QR;
-    
+
     let m = matrix.nrows();
     let n = matrix.ncols();
-    
+
     // Initialize pivot vector and working matrix
     let mut pivot: Vec<usize> = (0..n).collect();
     let mut work_matrix = matrix.clone();
-    
+
     // Compute initial column norms
     let mut col_norms: Vec<f64> = (0..n)
         .map(|j| work_matrix.column(j).dot(&work_matrix.column(j)).sqrt())
         .collect();
-    
+
     // Apply column pivoting based on norms
     for k in 0..n.min(m) {
         // Find column with maximum norm from k onwards
-        let (max_idx, _) = col_norms.iter()
+        let (max_idx, _) = col_norms
+            .iter()
             .enumerate()
             .skip(k)
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
-        
+
         // Swap columns k and max_idx if needed
         if max_idx != k {
             // Swap in pivot vector
             pivot.swap(k, max_idx);
-            
+
             // Swap columns in matrix
             let col_k = work_matrix.column(k).to_owned();
             let col_max = work_matrix.column(max_idx).to_owned();
             work_matrix.column_mut(k).assign(&col_max);
             work_matrix.column_mut(max_idx).assign(&col_k);
-            
+
             // Swap column norms
             col_norms.swap(k, max_idx);
         }
-        
+
         // Update column norms for remaining columns
         if k < m - 1 {
             let _factor = if col_norms[k] > 0.0 {
@@ -787,7 +841,7 @@ fn pivoted_qr(matrix: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>, Vec<usi
             } else {
                 0.0
             };
-            
+
             for j in (k + 1)..n {
                 if col_norms[j] > 0.0 {
                     let temp = work_matrix[[k, j]] / col_norms[j];
@@ -796,13 +850,14 @@ fn pivoted_qr(matrix: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>, Vec<usi
             }
         }
     }
-    
+
     // Perform QR decomposition on pivoted matrix
-    let (q, r) = work_matrix.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    
+    let (q, r) = work_matrix
+        .qr()
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+
     Ok((q, r, pivot))
 }
-
 
 /// Calculate effective degrees of freedom
 fn calculate_edf(
@@ -811,19 +866,19 @@ fn calculate_edf(
     weights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
     use ndarray_linalg::Solve;
-    
+
     let p = x.ncols();
     let sqrt_w_abs = weights.mapv(|w| w.abs().sqrt());
     let wx = &x * &sqrt_w_abs.view().insert_axis(Axis(1));
     let xtwx = wx.t().dot(&wx);
-    
+
     let mut edf = 0.0;
     for j in 0..p {
         if let Ok(h_inv_col) = penalized_hessian.solve(&xtwx.column(j).to_owned()) {
             edf += h_inv_col[j];
         }
     }
-    
+
     Ok(edf.max(1.0))
 }
 
@@ -854,7 +909,7 @@ pub fn compute_final_penalized_hessian(
     s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
 ) -> Result<Array2<f64>, EstimationError> {
     use ndarray::s;
-    use ndarray_linalg::{QR, UPLO, Eigh};
+    use ndarray_linalg::{Eigh, QR, UPLO};
 
     let p = x.ncols();
 
@@ -867,12 +922,13 @@ pub fn compute_final_penalized_hessian(
 
     // Step 2: Get the square root of the penalty matrix, E
     // We need to use eigendecomposition as S_lambda is not necessarily from a single root
-    let (eigenvalues, eigenvectors) = s_lambda.eigh(UPLO::Lower)
+    let (eigenvalues, eigenvectors) = s_lambda
+        .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    
+
     let tolerance = 1e-12;
     let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-    
+
     let mut e = Array2::zeros((p, rank_s));
     let mut col_idx = 0;
     for (i, &eigenval) in eigenvalues.iter().enumerate() {
@@ -889,11 +945,15 @@ pub fn compute_final_penalized_hessian(
     let e_t = e.t();
     let nr = r_rows + e_t.nrows();
     let mut augmented_matrix = Array2::zeros((nr, p));
-    augmented_matrix.slice_mut(s![..r_rows, ..]).assign(&r1_full);
+    augmented_matrix
+        .slice_mut(s![..r_rows, ..])
+        .assign(&r1_full);
     augmented_matrix.slice_mut(s![r_rows.., ..]).assign(&e_t);
 
     // Step 4: Perform QR decomposition on the augmented matrix
-    let (_, r_aug) = augmented_matrix.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    let (_, r_aug) = augmented_matrix
+        .qr()
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
 
     // Step 5: The penalized Hessian is R_aug' * R_aug
     let h_final = r_aug.t().dot(&r_aug);
@@ -904,8 +964,8 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{arr1, arr2};
     use crate::calibrate::model::BasisConfig;
+    use ndarray::{arr1, arr2};
     use std::collections::HashMap;
 
     /// Test the robust rank-revealing solver with a rank-deficient matrix
@@ -915,26 +975,31 @@ mod tests {
         // This matrix has 5 rows and 3 columns, but only rank 2
         // The third column is a linear combination of the first two: col3 = col1 + col2
         let x = arr2(&[
-            [1.0, 0.0, 1.0],  // Note that col3 = col1 + col2
+            [1.0, 0.0, 1.0], // Note that col3 = col1 + col2
             [1.0, 1.0, 2.0],
             [1.0, 2.0, 3.0],
             [1.0, 3.0, 4.0],
             [1.0, 4.0, 5.0],
         ]);
-        
+
         let z = arr1(&[0.1, 0.2, 0.3, 0.4, 0.5]);
         let weights = arr1(&[1.0, 1.0, 1.0, 1.0, 1.0]);
-        
+
         // Use NO penalty to ensure rank detection works without the help of penalization
         // This tests the solver's ability to detect rank deficiency purely from the data
-        let e = Array2::zeros((0, 3));  // No penalty
-        
+        let e = Array2::zeros((0, 3)); // No penalty
+
         // Run our solver
-        println!("Running solver with x shape: {:?}, z shape: {:?}, weights shape: {:?}, e shape: {:?}", 
-                 x.shape(), z.shape(), weights.shape(), e.shape());
+        println!(
+            "Running solver with x shape: {:?}, z shape: {:?}, weights shape: {:?}, e shape: {:?}",
+            x.shape(),
+            z.shape(),
+            weights.shape(),
+            e.shape()
+        );
         // For the test, the design matrix is already in the correct basis
         let result = solve_penalized_least_squares(x.view(), z.view(), weights.view(), &e);
-        
+
         // The solver should not fail despite the rank deficiency
         match &result {
             Ok((_, detected_rank)) => {
@@ -944,61 +1009,71 @@ mod tests {
                 panic!("Solver failed with error: {:?}", e);
             }
         }
-        
+
         let (solution, detected_rank) = result.unwrap();
-        
+
         // CRITICAL TEST: solver should have detected that the matrix is rank 2
         // This is the core test of the rank detection algorithm
         // CRITICAL TEST: solver should have detected that the matrix is rank 2
         // This is the core test of the rank detection algorithm
-        assert_eq!(detected_rank, 2, "Solver should have detected the rank as 2");
+        assert_eq!(
+            detected_rank, 2,
+            "Solver should have detected the rank as 2"
+        );
         println!("Detected rank: {}", detected_rank);
-        
+
         // Check that we get reasonable values
-        assert!(solution.beta.iter().all(|&x| x.is_finite()), 
-                "All coefficient values should be finite");
-        
+        assert!(
+            solution.beta.iter().all(|&x| x.is_finite()),
+            "All coefficient values should be finite"
+        );
+
         // Verify that the fitted values are still close to the target
         // Even with reduced rank, we should get good predictions
         let fitted = x.dot(&solution.beta);
-        let residual_sum_sq: f64 = weights.iter()
-                                    .zip(z.iter())
-                                    .zip(fitted.iter())
-                                    .map(|((w, &z), &f)| w * (z - f).powi(2))
-                                    .sum();
-        
+        let residual_sum_sq: f64 = weights
+            .iter()
+            .zip(z.iter())
+            .zip(fitted.iter())
+            .map(|((w, &z), &f)| w * (z - f).powi(2))
+            .sum();
+
         // Even with rank deficiency, we should still get a good fit
-        assert!(residual_sum_sq < 0.1, 
-                "Residual sum of squares should be reasonably small");
-        
+        assert!(
+            residual_sum_sq < 0.1,
+            "Residual sum of squares should be reasonably small"
+        );
+
         // CRITICAL TEST: At least one coefficient should be exactly zero due to rank truncation
         // The solver should have identified a redundant dimension and truncated it
-        let near_zero_count = solution.beta.iter()
-            .filter(|&&x| x.abs() < 1e-9)
-            .count();
-        
-        assert_eq!(near_zero_count, 1, 
-                   "Exactly one coefficient should be truncated to zero by rank detection");
-        
+        let near_zero_count = solution.beta.iter().filter(|&&x| x.abs() < 1e-9).count();
+
+        assert_eq!(
+            near_zero_count, 1,
+            "Exactly one coefficient should be truncated to zero by rank detection"
+        );
+
         // Print some debug info for transparency
         println!("Detected rank: {}", detected_rank);
         println!("Solution coefficients: {:?}", solution.beta);
         println!("Residual sum of squares: {}", residual_sum_sq);
     }
-    
-    /// This test directly verifies that different smoothing parameters 
+
+    /// This test directly verifies that different smoothing parameters
     /// produce different transformation matrices during reparameterization
     #[test]
     fn test_reparameterization_matrix_depends_on_rho() {
-        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
-        
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+        };
+
         // Create penalty matrices with different scales
         let s1 = arr2(&[[0.1, 0.0], [0.0, 0.1]]);
         let s2 = arr2(&[[0.0, 0.0], [0.0, 1.0]]);
-        
+
         let s_list = vec![s1, s2];
         let rs_original = compute_penalty_square_roots(&s_list).unwrap();
-        
+
         // Create a model layout
         let layout = ModelLayout {
             intercept_col: 0,
@@ -1008,55 +1083,56 @@ mod tests {
             num_penalties: 2,
             num_pgs_interaction_bases: 0,
         };
-        
+
         // Test with two different rho values
         let lambdas1 = vec![0.01, 100.0]; // Very different weights
         let lambdas2 = vec![100.0, 0.01]; // Reverse the weights
-        
+
         // Call stable_reparameterization directly to test the core functionality
-        let reparam1 = stable_reparameterization(
-            &rs_original,
-            &lambdas1,
-            &layout
-        ).unwrap();
-        
-        let reparam2 = stable_reparameterization(
-            &rs_original,
-            &lambdas2,
-            &layout
-        ).unwrap();
-        
+        let reparam1 = stable_reparameterization(&rs_original, &lambdas1, &layout).unwrap();
+
+        let reparam2 = stable_reparameterization(&rs_original, &lambdas2, &layout).unwrap();
+
         // The key test: directly check that the transformation matrices are different
         let qs_diff = (&reparam1.qs - &reparam2.qs).mapv(|x| x.abs()).sum();
-        assert!(qs_diff > 1e-6, "The transformation matrices 'qs' should be different for different lambda values");
-        
-        println!("✓ Test passed: Different smoothing parameters correctly produced different reparameterizations.");
+        assert!(
+            qs_diff > 1e-6,
+            "The transformation matrices 'qs' should be different for different lambda values"
+        );
+
+        println!(
+            "✓ Test passed: Different smoothing parameters correctly produced different reparameterizations."
+        );
     }
-    
+
     /// This integration test verifies that the fit_model_for_fixed_rho function
     /// performs reparameterization for each set of smoothing parameters and
     /// correctly converges with the P-IRLS algorithm.
     #[test]
     fn test_reparameterization_per_rho() {
-        use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
-        
+        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+
         // Create a simple test case with more samples - using simple model known to converge
         let n_samples = 100;
         let x = Array2::from_shape_fn((n_samples, 2), |(i, j)| {
-            if j == 0 { 1.0 } else { (i as f64) / (n_samples as f64) }
+            if j == 0 {
+                1.0
+            } else {
+                (i as f64) / (n_samples as f64)
+            }
         });
         let y = Array1::from_shape_fn(n_samples, |i| {
             // Perfect linear relationship for guaranteed convergence
             2.0 + 3.0 * ((i as f64) / (n_samples as f64))
         });
-        
+
         // Create multiple penalty matrices with different scales - using smaller values for stability
         let s1 = arr2(&[[0.01, 0.0], [0.0, 0.01]]); // Very small penalties
         let s2 = arr2(&[[0.0, 0.0], [0.0, 100.0]]); // Much larger penalty
-        
+
         let s_list = vec![s1, s2];
         let rs_original = compute_penalty_square_roots(&s_list).unwrap();
-        
+
         // Create a model layout
         let layout = ModelLayout {
             intercept_col: 0,
@@ -1066,12 +1142,12 @@ mod tests {
             num_penalties: 2,
             num_pgs_interaction_bases: 0,
         };
-        
+
         // Create a simple config with values known to lead to convergence
         let config = ModelConfig {
             link_function: LinkFunction::Identity, // Simple linear model for stability
-            max_iterations: 100, // Increased for stability
-            convergence_tolerance: 1e-6, // Less strict for test stability
+            max_iterations: 100,                   // Increased for stability
+            convergence_tolerance: 1e-6,           // Less strict for test stability
             penalty_order: 2,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
@@ -1087,14 +1163,18 @@ mod tests {
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
         };
-        
+
         // Test with moderately different rho values to avoid extreme numerical issues
         // while still guaranteeing different reparameterizations
         log::info!("Running test_reparameterization_per_rho with detailed diagnostics");
         let rho_vec1 = arr1(&[2.0, -2.0]); // Lambda: [exp(2.0) ≈ 7.4, exp(-2.0) ≈ 0.14]
         let rho_vec2 = arr1(&[-2.0, 2.0]); // Lambda: [exp(-2.0) ≈ 0.14, exp(2.0) ≈ 7.4]
-        log::info!("Testing P-IRLS with rho values: {:?} (lambdas: {:?})", rho_vec1, rho_vec1.mapv(f64::exp));
-        
+        log::info!(
+            "Testing P-IRLS with rho values: {:?} (lambdas: {:?})",
+            rho_vec1,
+            rho_vec1.mapv(f64::exp)
+        );
+
         // Call the function with first rho vector
         let result1 = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
@@ -1102,9 +1182,10 @@ mod tests {
             y.view(),
             &rs_original,
             &layout,
-            &config
-        ).expect("First fit should converge for this stable test case");
-        
+            &config,
+        )
+        .expect("First fit should converge for this stable test case");
+
         // Call the function with second rho vector
         let result2 = super::fit_model_for_fixed_rho(
             rho_vec2.view(),
@@ -1112,23 +1193,40 @@ mod tests {
             y.view(),
             &rs_original,
             &layout,
-            &config
-        ).expect("Second fit should converge for this stable test case");
+            &config,
+        )
+        .expect("Second fit should converge for this stable test case");
 
         // The key test: directly check that the transformation matrices are different
         // This is the core behavior we want to verify - each set of smoothing parameters
         // should produce a different transformation matrix
         let qs_diff = (&result1.qs - &result2.qs).mapv(|x| x.abs()).sum();
-        assert!(qs_diff > 1e-6, "The transformation matrices 'qs' should be different for different rho values");
-        
+        assert!(
+            qs_diff > 1e-6,
+            "The transformation matrices 'qs' should be different for different rho values"
+        );
+
         // As a secondary check, confirm the coefficient estimates are also different
         let beta_diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
-        assert!(beta_diff > 1e-6, "Expected different coefficient estimates for different rho values");
-        
+        assert!(
+            beta_diff > 1e-6,
+            "Expected different coefficient estimates for different rho values"
+        );
+
         // Check convergence status
-        assert_eq!(result1.status, PirlsStatus::Converged, "First fit should have converged");
-        assert_eq!(result2.status, PirlsStatus::Converged, "Second fit should have converged");
-        
-        println!("✓ Test passed: P-IRLS converged with different smoothing parameters, producing different reparameterizations.");
+        assert_eq!(
+            result1.status,
+            PirlsStatus::Converged,
+            "First fit should have converged"
+        );
+        assert_eq!(
+            result2.status,
+            PirlsStatus::Converged,
+            "Second fit should have converged"
+        );
+
+        println!(
+            "✓ Test passed: P-IRLS converged with different smoothing parameters, producing different reparameterizations."
+        );
     }
 }
