@@ -164,7 +164,11 @@ impl TrainedModel {
                 // Clamp eta to prevent numerical overflow in exp(), just like in pirls.rs
                 let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
                 // Apply the inverse link function (sigmoid) to the clamped eta
-                eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e))) // Sigmoid
+                let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e))); // Sigmoid
+                // BUGFIX: Clamp probabilities away from 0 and 1 to prevent numerical instability
+                // This matches the behavior in the training code (pirls.rs::update_glm_vectors)
+                probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+                probs
             },
             LinkFunction::Identity => eta,
         };
