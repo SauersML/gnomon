@@ -586,9 +586,10 @@ pub struct StablePLSResult {
     pub scale: f64,
 }
 
-/// Simple penalized least squares solver using single penalty square root matrix
-/// This is the numerically stable approach that follows mgcv's architecture
-/// Uses the single square root matrix E from reparameterization
+/// Robust penalized least squares solver using single penalty square root matrix
+/// This is the numerically stable approach that follows mgcv's pls_fit1 architecture
+/// Uses the single square root matrix E from reparameterization and performs
+/// rank detection and truncation to handle ill-conditioned weighted design matrices
 pub fn solve_penalized_least_squares_simple(
     x: ArrayView2<f64>,
     z: ArrayView1<f64>,
@@ -596,7 +597,10 @@ pub fn solve_penalized_least_squares_simple(
     e: &Array2<f64>,  // Single penalty square root matrix (rank_penalty x p)
 ) -> Result<StablePLSResult, EstimationError> {
     use ndarray::s;
-    use ndarray_linalg::{QR, SolveTriangular, UPLO, Diag};
+    use ndarray_linalg::{SolveTriangular, UPLO, Diag};
+    
+    // Define rank tolerance, matching mgcv's default
+    const RANK_TOL: f64 = 1e-7;
     
     let n = x.nrows();
     let p = x.ncols();
@@ -623,15 +627,51 @@ pub fn solve_penalized_least_squares_simple(
     augmented_rhs.slice_mut(s![..n]).assign(&wz);
     // The penalty part is already zero
     
-    // Perform QR decomposition on the augmented matrix
-    let (q, r) = augmented_matrix.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    // CRITICAL CHANGE: Use pivoted QR decomposition for rank detection
+    let (q, r, pivot) = pivoted_qr(&augmented_matrix)?;
     
-    // Solve R * beta = Q' * augmented_rhs
+    // Determine numerical rank using the R matrix condition number
+    // Start with full rank and reduce until we have a well-conditioned submatrix
+    let mut rank = p.min(augmented_rows);
+    while rank > 0 {
+        let r_sub = r.slice(s![..rank, ..rank]);
+        let condition = estimate_r_condition(r_sub.view());
+        
+        // Check if the condition number is acceptable
+        if !condition.is_finite() || RANK_TOL * condition > 1.0 {
+            rank -= 1;
+        } else {
+            break; // Rank is acceptable
+        }
+    }
+    
+    if rank == 0 {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    
+    log::debug!("Determined numerical rank {} (out of {}) using condition number criterion", rank, p);
+    
+    // Solve the truncated system using the well-conditioned part
     let q_t_rhs = q.t().dot(&augmented_rhs);
-    let beta = r.solve_triangular(UPLO::Upper, Diag::NonUnit, &q_t_rhs.slice(s![..p]).to_owned())
+    let r_trunc = r.slice(s![..rank, ..rank]);
+    let rhs_trunc = q_t_rhs.slice(s![..rank]);
+    
+    let beta_trunc = r_trunc.solve_triangular(UPLO::Upper, Diag::NonUnit, &rhs_trunc.to_owned())
         .map_err(|e| EstimationError::LinearSystemSolveFailed(e))?;
     
-    // The penalized Hessian is R' * R
+    // Re-inflate the solution: create full-sized beta and un-pivot
+    let mut beta_pivoted = Array1::zeros(p);
+    beta_pivoted.slice_mut(s![..rank]).assign(&beta_trunc);
+    
+    // Un-pivot the solution to get it in the original coefficient order
+    let mut beta = Array1::zeros(p);
+    for (i, &piv) in pivot.iter().enumerate() {
+        if i < rank {
+            beta[piv] = beta_pivoted[i];
+        }
+    }
+    
+    // The penalized Hessian is R' * R (use the full R for consistency with mgcv)
     let penalized_hessian = r.t().dot(&r);
     
     // Calculate EDF and scale
