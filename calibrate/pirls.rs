@@ -973,8 +973,9 @@ pub fn solve_penalized_least_squares(
         });
     }
     log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
-    // Use the pivot from the scaled matrix for determining dropped columns
-    let pivot_for_dropping = pivot_scaled;
+    // Use the pivot from the initial QR decomposition for determining dropped columns
+    // This is critical to maintain consistency with mgcv's pls_fit1
+    let pivot_for_dropping = _initial_pivot;
     
     // Record which columns are unidentifiable based on pivot order
     // In a rank-deficient system, columns beyond rank are linearly dependent
