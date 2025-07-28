@@ -665,6 +665,8 @@ pub fn stable_reparameterization(
             break;
         }
         
+        log::debug!("Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
+        
         // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
 
         // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
@@ -718,32 +720,11 @@ pub fn stable_reparameterization(
                     r, eigenvalues.len(), largest_eigenval, rank_tolerance);
 
         // Step 4: Check termination criterion
-        // This MUST match mgcv's get_stableS() function exactly
+        // Continue the similarity-transform loop until the γ set is empty
+        // Do NOT exit early on iter==1 even if full rank - this was causing identity Qs matrices
         if r == q_current {
-            // If r equals q_current (full rank)...
-            if iteration == 1 {
-                // First iteration and full rank case.
-                // From the mgcv C code: when iter==1 and Q==r, we still need to 
-                // update the transformation matrix with the eigenvectors before terminating.
-                // This is crucial for the partitioning to work correctly.
-                
-                log::debug!("First iteration, full rank (r={} == q_current={}). Applying transform and terminating.", r, q_current);
-                
-                // Apply the transformation from the dominant penalties
-                // For ascending order, we want the last r indices (largest eigenvalues)
-                let selected_indices = &sorted_indices[q - r..];
-                let u_reordered = u.select(Axis(1), selected_indices);
-                
-                // Update the transformation matrix
-                // For the first iteration, we replace the entire qf matrix
-                qf = u_reordered.clone();
-                
-                break;
-            } else {
-                // Otherwise, the sub-problem is full rank, so we're done
-                log::debug!("Sub-problem is full rank at iteration {}. Stopping.", iteration);
-                break;
-            }
+            log::debug!("Sub-problem is full rank at iteration {} (r={} == q_current={}). Continuing loop.", iteration, r, q_current);
+            // Continue to apply transformation and process remaining penalties
         }
         
         log::debug!("Partial rank detected: r={} < q_current={}. Continuing with transformation.", r, q_current);

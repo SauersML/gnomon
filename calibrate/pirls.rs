@@ -915,7 +915,11 @@ pub fn solve_penalized_least_squares(
     let wz = &sqrt_w * &z;
     
     // Perform initial pivoted QR on the weighted design matrix only
-    let (_q1, r1, _initial_pivot) = pivoted_qr(&wx)?;
+    let (_q1, r1_full, _initial_pivot) = pivoted_qr(&wx)?;
+    
+    // CRITICAL FIX: mgcv keeps only the leading p rows of R1
+    // This prevents the scaled augmented matrix from becoming nearly singular
+    let r1 = r1_full.slice(s![..p, ..]).to_owned();
     
     // Stage 2: Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1);
@@ -924,7 +928,7 @@ pub fn solve_penalized_least_squares(
     log::debug!("Frobenius norms: R_norm={}, E_norm={}", r_norm, e_norm);
     
     // Stage 3: Create the scaled augmented matrix for rank determination
-    let r_rows = r1.nrows();
+    let r_rows = p;  // Use p instead of r1.nrows()
     let e_rows = e.nrows();
     let scaled_rows = r_rows + e_rows;
     let mut scaled_matrix = Array2::zeros((scaled_rows, p));
