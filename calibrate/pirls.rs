@@ -1154,44 +1154,55 @@ pub fn solve_penalized_least_squares(
     
     // The Hessian calculation is now done in the section above where we have r_square
     
-    // Create the permutation matrix for unpivoting using pivot_for_dropping
-    // CRITICAL: Must use the same pivot that was used for coefficient placement
+    // Create the permutation matrix for unpivoting
+    // CRITICAL: Must use the SAME pivot system as used for coefficient mapping
+    // Following mgcv's approach, we use pivot_final for both coefficient mapping
+    // and Hessian unpivoting to maintain consistency
     let mut p_mat = Array2::zeros((p, p));
     let mut used_rows = vec![false; p];
     
-    // First, create the mapping for the retained columns
+    // Create an expanded/augmented pivot that combines pivot_final and drop_indices
+    // This gives a full permutation vector for the entire coefficient space
+    let mut full_permutation = Vec::with_capacity(p);
+    
+    // First, create a mapping from original column indices to their positions in the reduced system
+    let mut reduced_col_mapping = std::collections::HashMap::new();
+    let mut idx = 0;
+    for orig_idx in 0..p {
+        if !drop_indices.contains(&orig_idx) {
+            reduced_col_mapping.insert(orig_idx, idx);
+            idx += 1;
+        }
+    }
+    
+    // Step 1: Add the columns in pivot_final's ordering
     for i in 0..rank {
-        let original_col = pivot_for_dropping[i];
-        // Only set if this row hasn't been used yet (prevents duplicates)
-        if !used_rows[original_col] {
-            p_mat[[original_col, i]] = 1.0;
-            used_rows[original_col] = true;
-        }
-    }
-    
-    // For dropped columns, place them in identity positions
-    let mut dropped_pos = rank;
-    for &dropped_col in &drop_indices {
-        // Only set if this row hasn't been used yet (prevents duplicates)
-        if !used_rows[dropped_col] {
-            p_mat[[dropped_col, dropped_pos]] = 1.0;
-            used_rows[dropped_col] = true;
-        }
-        dropped_pos += 1;
-    }
-    
-    // Ensure all rows have exactly one 1.0 (proper permutation matrix)
-    for i in 0..p {
-        if !used_rows[i] {
-            // Find the first unused column
-            for j in 0..p {
-                if p_mat.column(j).sum() == 0.0 {
-                    p_mat[[i, j]] = 1.0;
-                    break;
-                }
+        // Get the original column index from reduced position pivot_final[i]
+        let reduced_pos = pivot_final[i];
+        // Find which original column this corresponds to
+        for (&orig_col, &reduced_idx) in &reduced_col_mapping {
+            if reduced_idx == reduced_pos {
+                full_permutation.push(orig_col);
+                break;
             }
         }
     }
+    
+    // Step 2: Add the dropped columns
+    for &dropped_col in &drop_indices {
+        full_permutation.push(dropped_col);
+    }
+    
+    // Now build the permutation matrix using this full permutation
+    for i in 0..p {
+        let permuted_col = full_permutation[i];
+        p_mat[[permuted_col, i]] = 1.0;
+    }
+    
+    // Verify that the permutation matrix is valid (exactly one 1.0 in each row and column)
+    // This should always be true if the algorithm is correct
+    debug_assert_eq!(p_mat.sum_axis(ndarray::Axis(0)), Array1::ones(p));
+    debug_assert_eq!(p_mat.sum_axis(ndarray::Axis(1)), Array1::ones(p));
     
     // Create a well-conditioned Hessian:
     // 1. For identifiable parameters (within rank): use the R'R result
@@ -1313,10 +1324,27 @@ fn pivoted_qr_faer(
         }
     }
 
-    // Reconstruct Q from the Householder reflectors
-    // For now, we'll use a simplified approach that works for our use case
-    // The lower triangular part contains the Householder vectors
-    let q = Array2::eye(m);
+    // Properly reconstruct Q from the Householder reflectors
+    // This is critical for numerical stability - cannot use identity placeholder
+    
+    // Compute Q explicitly from the QR factorization
+    let mut q_faer = Mat::zeros(m, m.min(n));
+    
+    // Use faer's built-in function to compute Q from the QR factorization
+    faer::linalg::qr::compute_q(
+        q_faer.as_mut(),
+        faer_matrix.as_ref(),
+        q_coeff.as_ref(),
+        Par::Seq,
+    );
+    
+    // Convert to ndarray format
+    let mut q = Array2::zeros((m, m.min(n)));
+    for i in 0..m {
+        for j in 0..m.min(n) {
+            q[[i, j]] = q_faer[(i, j)];
+        }
+    }
     
     // Convert back to ndarray format and return pivot as Vec<usize>
     let pivot: Vec<usize> = perm.arrays().0.to_vec();
