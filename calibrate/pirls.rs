@@ -1120,18 +1120,35 @@ pub fn solve_penalized_least_squares(
     println!("DEBUG: pivot_for_dropping: {:?}", pivot_for_dropping);
     println!("DEBUG: rank: {}", rank);
     
-    // Map the final pivot indices to original matrix indices
-    // pivot_for_dropping[0..rank] gives us the original columns that were kept
-    // pivot_final tells us the order of these kept columns after the final QR
+    // Fix: Use the proper two-step approach from mgcv to map coefficients
+    
+    // STEP 1: Un-pivot the rank-sized solution within the reduced stable system
+    // This mirrors the mgcv C code: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
+    // where y is a temporary vector of size rank and z is beta_dropped
+    let mut beta_unpivoted = Array1::zeros(rank);
     for i in 0..rank {
-        // pivot_final[i] tells us which column of the dropped matrix corresponds to position i
-        // pivot_for_dropping[pivot_final[i]] tells us the original column index
-        let dropped_col_idx = pivot_final[i];
-        let full_index = pivot_for_dropping[dropped_col_idx];
-        beta_transformed[full_index] = beta_dropped[i];
-        println!("DEBUG: beta_dropped[{}] = {} -> beta_transformed[{}] (via dropped col {})", 
-                 i, beta_dropped[i], full_index, dropped_col_idx);
+        // pivot_final[i] tells us which column in the reduced matrix should receive the i-th solution value
+        beta_unpivoted[pivot_final[i]] = beta_dropped[i];
+        println!("DEBUG: beta_dropped[{}] = {} -> beta_unpivoted[{}]", 
+                 i, beta_dropped[i], pivot_final[i]);
     }
+    println!("DEBUG: beta_unpivoted (after un-pivoting): {:?}", beta_unpivoted);
+
+    // STEP 2: Inflate the rank-sized vector to the full p-sized vector by inserting zeros
+    // This mirrors the mgcv C code: "undrop_rows(y,*q,1,drop,n_drop);"
+    // Zero the destination vector first (already done during initialization of beta_transformed)
+    // Then copy the values from beta_unpivoted into the positions that weren't dropped
+    let mut src_idx = 0;
+    for dst_idx in 0..p {
+        if !drop_indices.contains(&dst_idx) {
+            // This original column wasn't dropped, copy the next available coefficient here
+            beta_transformed[dst_idx] = beta_unpivoted[src_idx];
+            src_idx += 1;
+        }
+        // If the column was dropped, its value in beta_transformed remains 0.0
+    }
+    
+    println!("DEBUG: final beta_transformed (after inflation): {:?}", beta_transformed);
     // The (p - rank) coefficients corresponding to the dropped columns will remain zero
     
     // Step 6B: The undrop_rows step is actually not needed here because we're
