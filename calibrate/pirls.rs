@@ -1201,8 +1201,9 @@ pub fn solve_penalized_least_squares(
     
     // Verify that the permutation matrix is valid (exactly one 1.0 in each row and column)
     // This should always be true if the algorithm is correct
-    debug_assert_eq!(p_mat.sum_axis(ndarray::Axis(0)), Array1::ones(p));
-    debug_assert_eq!(p_mat.sum_axis(ndarray::Axis(1)), Array1::ones(p));
+    let ones = Array1::<f64>::ones(p);
+    debug_assert!(p_mat.sum_axis(ndarray::Axis(0)).abs_diff_eq(&ones, 1e-10));
+    debug_assert!(p_mat.sum_axis(ndarray::Axis(1)).abs_diff_eq(&ones, 1e-10));
     
     // Create a well-conditioned Hessian:
     // 1. For identifiable parameters (within rank): use the R'R result
@@ -1327,21 +1328,27 @@ fn pivoted_qr_faer(
     // Properly reconstruct Q from the Householder reflectors
     // This is critical for numerical stability - cannot use identity placeholder
     
-    // Compute Q explicitly from the QR factorization
-    let mut q_faer = Mat::zeros(m, m.min(n));
+    // Create full Q matrix using householder reflectors
+    // First create identity matrix
+    let mut q_faer = Mat::zeros(m, m);
+    for i in 0..m {
+        q_faer[(i, i)] = 1.0;
+    }
     
-    // Use faer's built-in function to compute Q from the QR factorization
-    faer::linalg::qr::compute_q(
+    // Apply Householder reflectors to the identity matrix
+    // This effectively computes Q from the QR factorization
+    faer::linalg::qr::col_pivoting::factor::apply_q(
         q_faer.as_mut(),
         faer_matrix.as_ref(),
         q_coeff.as_ref(),
+        false, // don't transpose
         Par::Seq,
     );
     
-    // Convert to ndarray format
-    let mut q = Array2::zeros((m, m.min(n)));
+    // Convert to ndarray format - full m×m Q matrix
+    let mut q = Array2::zeros((m, m));
     for i in 0..m {
-        for j in 0..m.min(n) {
+        for j in 0..m {
             q[[i, j]] = q_faer[(i, j)];
         }
     }
