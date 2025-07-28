@@ -1549,13 +1549,17 @@ mod tests {
         println!("Target z: {:?}", z);
         println!("Residual sum of squares: {}", residual_sum_sq);
 
-        // Relax the assertion to account for valid least-squares solutions
-        // This is a rank-deficient system with infinite valid solutions
-        // The solver finds a mathematically correct solution, but not necessarily
-        // the one with the smallest residual sum of squares
+        // For this rank-deficient problem, the true least-squares solution is not unique.
+        // One standard solution is beta = [0.1, 0.1, 0.0]. Another is [0.0, 0.0, 0.1].
+        // The solver should find a solution that achieves the minimum possible RSS.
+        // For this specific problem, a perfect fit with RSS = 0 is possible.
+        
+        // Assert that the residual sum of squares is extremely close to the true minimum (0.0).
+        // This is a much stronger and more correct assertion than simply being "small".
         assert!(
-            residual_sum_sq < 0.5,
-            "Residual sum of squares should be reasonably small. Got: {}", residual_sum_sq
+            residual_sum_sq < 1e-9,
+            "The residual sum of squares should be effectively zero for a correct least-squares solution. Got: {}",
+            residual_sum_sq
         );
 
         // CRITICAL TEST: At least one coefficient should be exactly zero due to rank truncation
