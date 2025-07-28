@@ -723,12 +723,13 @@ pub fn stable_reparameterization(
 
         // Step 5: Update global transformation matrix Qf
         // For ascending order, we want the last r indices (largest eigenvalues)
-        let selected_indices = &sorted_indices[q - r..];
-        let u_reordered = u.select(Axis(1), selected_indices);
-
-        // Update the appropriate block of Qf
+        // let selected_indices = &sorted_indices[q - r..];
+        
+        // CRITICAL FIX: Use the FULL eigenvector matrix for transformation, not truncated
+        // The transformation must be done with the full q_current x q_current matrix
+        // to maintain proper dimensions throughout the algorithm
         let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
-        let qf_new = qf_block.dot(&u_reordered);
+        let qf_new = qf_block.dot(&u); // Use full eigenvector matrix u
         qf.slice_mut(s![.., k_offset..k_offset + q_current])
             .assign(&qf_new);
 
@@ -745,36 +746,46 @@ pub fn stable_reparameterization(
                 .slice(s![k_offset..k_offset + q_current, ..])
                 .to_owned();
 
-            if alpha.contains(&i) {
-                // Dominant penalties: transform with U_r (first r eigenvectors)
-                let u_r = u_reordered.slice(s![.., ..r]);
-                let b_matrix = u_r.t().dot(&c_matrix); // r x rank_i
+            // Transform using FULL eigenvector matrix, then partition
+            let b_matrix = u.t().dot(&c_matrix); // q_current x rank_i
 
-                // Copy transformed part back
-                rs_current[i]
-                    .slice_mut(s![k_offset..k_offset + r, ..])
-                    .assign(&b_matrix);
+            if alpha.contains(&i) {
+                // Dominant penalties: keep only the rows corresponding to largest r eigenvalues
+                // For ascending order, these are the last r rows
+                let start_idx = q - r;
+                for (idx, &sorted_idx) in sorted_indices.iter().enumerate() {
+                    if idx >= start_idx {
+                        // This eigenvector is in the dominant set
+                        let row_offset = idx - start_idx;
+                        rs_current[i]
+                            .slice_mut(s![k_offset + row_offset, ..])
+                            .assign(&b_matrix.row(sorted_idx));
+                    }
+                }
 
                 // Zero out the null space part
-                if k_offset + r < k_offset + q_current {
+                if r < q_current {
                     rs_current[i]
                         .slice_mut(s![k_offset + r..k_offset + q_current, ..])
                         .fill(0.0);
                 }
             } else if gamma_prime.contains(&i) {
-                // Sub-dominant penalties: transform with U_n (null space eigenvectors)
-                let u_n = u_reordered.slice(s![.., r..]);
-                let b_matrix = u_n.t().dot(&c_matrix); // (q_current - r) x rank_i
-
+                // Sub-dominant penalties: keep only the rows corresponding to smallest (q-r) eigenvalues
                 // Zero out the range space part
                 rs_current[i]
                     .slice_mut(s![k_offset..k_offset + r, ..])
                     .fill(0.0);
 
-                // Copy transformed part to null space rows
-                rs_current[i]
-                    .slice_mut(s![k_offset + r..k_offset + q_current, ..])
-                    .assign(&b_matrix);
+                // Copy rows corresponding to smallest eigenvalues
+                for (idx, &sorted_idx) in sorted_indices.iter().enumerate() {
+                    if idx < q - r {
+                        // This eigenvector is in the null space
+                        let row_offset = r + idx;
+                        rs_current[i]
+                            .slice_mut(s![k_offset + row_offset, ..])
+                            .assign(&b_matrix.row(sorted_idx));
+                    }
+                }
             }
         }
 
