@@ -1327,30 +1327,22 @@ fn pivoted_qr_faer(
     // Properly reconstruct Q from the Householder reflectors
     // This is critical for numerical stability - cannot use identity placeholder
     
-    // Create full Q matrix using householder reflectors
-    // First create identity matrix
-    // Use faer's qr::reconstruct module to properly reconstruct Q
-    use faer::linalg::qr::col_pivoting::reconstruct::reconstruct_q;
+    // Use faer's higher-level QR solver which provides a compute_Q method
+    use faer::linalg::solvers::Qr;
     
-    // Create a matrix to hold Q
-    let mut q_faer = Mat::zeros(m, m.min(n));
+    // Create matrix A as a copy of the input matrix
+    let mut a_faer = Mat::zeros(m, n);
+    for i in 0..m {
+        for j in 0..n {
+            a_faer[(i, j)] = matrix[[i, j]];
+        }
+    }
     
-    // Reconstruct Q from the reflectors stored in faer_matrix and q_coeff
-    reconstruct_q(
-        q_faer.as_mut(),
-        faer_matrix.as_ref(),
-        q_coeff.as_ref(),
-        Par::Seq,
-        faer::dyn_stack::GlobalPodBuffer::new(
-            faer::linalg::qr::col_pivoting::reconstruct::reconstruct_q_req::<f64>(
-                m,
-                m.min(n),
-                n,
-                blocksize,
-                Par::Seq,
-            )
-        ),
-    );
+    // Compute the QR decomposition using faer's Qr solver
+    let qr = Qr::new(a_faer.as_ref());
+    
+    // Extract Q
+    let q_faer = qr.compute_Q();
     
     // Convert to ndarray format - Q matrix with proper dimensions
     let mut q = Array2::zeros((m, m.min(n)));
