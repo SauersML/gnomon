@@ -546,11 +546,8 @@ pub fn stable_reparameterization(
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
-    log::debug!(
-        "Performing stable reparameterization for {} penalties with lambdas: {:?}",
-        lambdas.len(),
-        lambdas
-    );
+    // println!("DEBUG: lambdas: {:?}", lambdas);
+    // println!("DEBUG: rs_list: {:?}", rs_list);
     let p = layout.total_coeffs;
     let m = rs_list.len(); // Number of penalty square roots
 
@@ -566,7 +563,8 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = f64::EPSILON.powf(1.0 / 3.0); // d_tol - group similar sized penalties
+    let eps = 0.01; // d_tol - group similar sized penalties (use a more reasonable threshold)
+    // println!("DEBUG: eps = {}", eps);
     let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 
     // Initialize global transformation matrix and working matrices
@@ -591,7 +589,8 @@ pub fn stable_reparameterization(
         }
 
         log::debug!(
-            "Iteration: k_offset={}, q_current={}, gamma={:?}",
+            "Iteration {}: k_offset={}, q_current={}, gamma={:?}",
+            iteration,
             k_offset,
             q_current,
             gamma
@@ -631,6 +630,7 @@ pub fn stable_reparameterization(
 
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
+            // println!("DEBUG: Penalty {} has omega_i = {}", i, omega_i);
         }
 
         if max_omega < 1e-15 {
@@ -638,60 +638,78 @@ pub fn stable_reparameterization(
         }
 
         // Step 2: Partition into dominant α and subdominant γ' sets
-        // CRITICAL FIX: We need to ensure this logic exactly matches mgcv's get_stableS
+        // CRITICAL FIX: This is the most critical part of the algorithm
+        // We must ensure this logic exactly matches mgcv's get_stableS function
         let threshold = eps * max_omega;
+        // println!("DEBUG: max_omega = {}, threshold = {}", max_omega, threshold);
         
-        // Initialize alpha and gamma_prime
-        let mut alpha = vec![false; m]; // Term is in alpha set
-        let mut gamma_prime = vec![false; m]; // Term is in gamma_prime set
-        // We'll just count at the end rather than tracking
+        // Initialize alpha and gamma_prime sets as empty
+        let mut alpha = Vec::new();
+        let mut gamma_prime = Vec::new();
         
         // For each term in gamma, decide whether it goes in alpha or gamma_prime
+        // based on its weighted Frobenius norm (omega)
         for &i in &gamma {
             // Find the omega value for this index
             if let Some(&(_, omega)) = frob_norms.iter().find(|&&(idx, _)| idx == i) {
                 if omega >= threshold {
-                    // Deal with it now - put in alpha
-                    alpha[i] = true;
-                    gamma_prime[i] = false;
+                    // This penalty has significant influence - put in alpha (dominant)
+                    alpha.push(i);
                 } else {
-                    // Put it off - put in gamma_prime
-                    alpha[i] = false;
-                    gamma_prime[i] = true;
+                    // This penalty has minor influence - put in gamma_prime (subdominant)
+                    gamma_prime.push(i);
                 }
             }
         }
         
-        // Convert alpha and gamma_prime to index lists
-        let alpha: Vec<usize> = (0..m).filter(|&i| alpha[i]).collect();
-        let gamma_prime: Vec<usize> = (0..m).filter(|&i| gamma_prime[i]).collect();
+        // Now alpha contains indices of penalties with ω_i ≥ threshold
+        // gamma_prime contains indices of penalties with ω_i < threshold
+        
+        // Alpha and gamma_prime are already index lists
+        // No need for conversion - they contain the actual indices from gamma
         
         if alpha.is_empty() {
             log::debug!("No terms in alpha set. Terminating.");
             break;
         }
         
-        log::debug!("Partitioned: alpha set has {} terms, gamma_prime set has {} terms", 
-                    alpha.len(), gamma_prime.len());
+        // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
 
-        // Step 3: Form weighted sum of dominant penalties and eigendecompose
+        // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
+        // This is the key difference from a naive approach - we only use alpha penalties
         let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
             let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
             let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
-            sb.scaled_add(lambdas[i], &s_active_block);
+            
+            // Critical: Add a small perturbation to the diagonal to ensure positive definiteness
+            // and avoid numerical instability with extremely small eigenvalues
+            // This is similar to the approach used in mgcv's gam.fit3.R
+            let mut s_perturbed = s_active_block.clone();
+            for j in 0..q_current {
+                s_perturbed[[j, j]] += 1e-10;
+            }
+            
+            sb.scaled_add(lambdas[i], &s_perturbed);
         }
+        
+        // println!("DEBUG: Final sb matrix: {:?}", sb);
 
         // Eigendecomposition to get rank and eigenvectors
         let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb
             .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
+        
+        // println!("DEBUG: Eigenvalues: {:?}", eigenvalues);
+        // println!("DEBUG: Eigenvectors: {:?}", u);
 
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
         
         // Sort eigenvalues in descending order for correct rank determination
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
+        
+        // println!("DEBUG: sorted_indices: {:?}", sorted_indices);
         
         // Calculate rank_tolerance based on largest eigenvalue
         // This exactly matches the logic in mgcv
@@ -708,13 +726,24 @@ pub fn stable_reparameterization(
                     r, eigenvalues.len(), max_eigenval, rank_tolerance);
 
         // Step 4: Check termination criterion
-        // CRITICAL FIX: This must match mgcv's get_stableS() function exactly
+        // This MUST match mgcv's get_stableS() function exactly
         if r == q_current {
             // If r equals q_current (full rank)...
             if iteration == 1 {
-                // ...and this is the first iteration, then the original problem was
-                // full rank. No transform needed. qf remains the identity matrix.
-                log::debug!("First iteration, full rank. No transformation needed.");
+                // First iteration and full rank case.
+                // From the mgcv C code: when iter==1 and Q==r, we still need to 
+                // update the transformation matrix with the eigenvectors before terminating.
+                // This is crucial for the partitioning to work correctly.
+                
+                log::debug!("First iteration, full rank (r={} == q_current={}). Applying transform and terminating.", r, q_current);
+                
+                // Apply the transformation from the dominant penalties
+                let u_reordered = u.select(Axis(1), &sorted_indices);
+                
+                // Update the transformation matrix
+                // For the first iteration, we replace the entire qf matrix
+                qf = u_reordered.clone();
+                
                 break;
             } else {
                 // Otherwise, the sub-problem is full rank, so we're done
