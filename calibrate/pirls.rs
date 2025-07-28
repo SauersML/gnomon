@@ -666,14 +666,14 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 /// * `src`: Source matrix with all columns (r × c)
 /// * `drop_indices`: Column indices to drop (MUST be in ascending order)
 /// * `dst`: Destination matrix with dropped columns removed (r × (c - n_drop))
-fn drop_cols(src: &ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>) {
+fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>) {
     let r = src.nrows();
     let c = src.ncols();
     let n_drop = drop_indices.len();
     
     if n_drop == 0 {
         // If no columns to drop, just copy src to dst
-        dst.assign(src);
+        dst.assign(&src);
         return;
     }
     
@@ -999,12 +999,12 @@ pub fn solve_penalized_least_squares(
     
     // Step 6A: Drop columns from the original R1 matrix (data part)
     let mut r1_dropped = Array2::zeros((r_rows, p - n_drop));
-    drop_cols(&r1.view(), &drop_indices, &mut r1_dropped);
+    drop_cols(r1.view(), &drop_indices, &mut r1_dropped);
     
     // Step 6B: Drop columns from the original e matrix (penalty part)
     let mut e_dropped = Array2::zeros((e_rows, p - n_drop));
     if e_rows > 0 {
-        drop_cols(&e.view(), &drop_indices, &mut e_dropped);
+        drop_cols(e.view(), &drop_indices, &mut e_dropped);
     }
     
     // Step 6C: Handle the case where there's no penalty (e_rows = 0)
@@ -1147,24 +1147,39 @@ pub fn solve_penalized_least_squares(
     // Create the permutation matrix for unpivoting using pivot_for_dropping
     // CRITICAL: Must use the same pivot that was used for coefficient placement
     let mut p_mat = Array2::zeros((p, p));
+    let mut used_rows = vec![false; p];
     
     // First, create the mapping for the retained columns
     for i in 0..rank {
         let original_col = pivot_for_dropping[i];
-        p_mat[[original_col, i]] = 1.0;
+        // Only set if this row hasn't been used yet (prevents duplicates)
+        if !used_rows[original_col] {
+            p_mat[[original_col, i]] = 1.0;
+            used_rows[original_col] = true;
+        }
     }
     
-    // For dropped columns, place them in identity positions with small ridge
+    // For dropped columns, place them in identity positions
     let mut dropped_pos = rank;
     for &dropped_col in &drop_indices {
-        p_mat[[dropped_col, dropped_pos]] = 1.0;
+        // Only set if this row hasn't been used yet (prevents duplicates)
+        if !used_rows[dropped_col] {
+            p_mat[[dropped_col, dropped_pos]] = 1.0;
+            used_rows[dropped_col] = true;
+        }
         dropped_pos += 1;
     }
     
-    // Ensure all diagonal elements have at least a small ridge for numerical stability
+    // Ensure all rows have exactly one 1.0 (proper permutation matrix)
     for i in 0..p {
-        if p_mat[[i, i]] == 0.0 {
-            p_mat[[i, i]] = 1e-8;
+        if !used_rows[i] {
+            // Find the first unused column
+            for j in 0..p {
+                if p_mat.column(j).sum() == 0.0 {
+                    p_mat[[i, j]] = 1.0;
+                    break;
+                }
+            }
         }
     }
     
@@ -1280,12 +1295,6 @@ fn pivoted_qr(
 
         // Update column norms for remaining columns
         if k < m - 1 {
-            let _factor = if col_norms[k] > 0.0 {
-                work_matrix[[k, k]] / col_norms[k]
-            } else {
-                0.0
-            };
-
             for j in (k + 1)..n {
                 if col_norms[j] > 0.0 {
                     let temp = work_matrix[[k, j]] / col_norms[j];
@@ -1382,8 +1391,8 @@ fn calculate_scale(
                 .zip(residuals.iter())
                 .map(|(&w, &r)| w * r * r)
                 .sum();
-            let n = x.nrows() as f64;
-            weighted_rss / (n - edf).max(1.0)
+            let effective_n = weights.sum();
+            weighted_rss / (effective_n - edf).max(1.0)
         }
     }
 }

@@ -702,18 +702,18 @@ pub fn stable_reparameterization(
         sorted_indices.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
         
         let q = eigenvalues.len();
-        let smallest_eigenval = eigenvalues[sorted_indices[0]]; // First element is smallest when sorted ascending
-        let rank_tolerance = smallest_eigenval * r_tol;
+        let largest_eigenval = eigenvalues[sorted_indices[q - 1]]; // Last element is largest when sorted ascending
+        let rank_tolerance = largest_eigenval * r_tol;
         
         // mgcv logic: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
-        // But ev[Q-1] should be the smallest eigenvalue, not largest
+        // where ev[Q-1] is the largest eigenvalue (eigenvalues are in ascending order)
         let mut r = 1;
         while r < q && eigenvalues[sorted_indices[q - r - 1]] > rank_tolerance {
             r += 1;
         }
             
-        log::debug!("Rank determination: found rank {} from {} eigenvalues (smallest eigenval: {}, tol: {})",
-                    r, eigenvalues.len(), smallest_eigenval, rank_tolerance);
+        log::debug!("Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
+                    r, eigenvalues.len(), largest_eigenval, rank_tolerance);
 
         // Step 4: Check termination criterion
         // This is the critical fix: when r == q_current on the first iteration,
