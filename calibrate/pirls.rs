@@ -969,9 +969,6 @@ pub fn solve_penalized_least_squares(
     // Use the pivot from the scaled matrix for determining dropped columns
     let pivot_for_dropping = pivot_scaled;
     
-    println!("Debug: pivot_for_dropping: {:?}", pivot_for_dropping);
-    println!("Debug: rank: {}, p: {}", rank, p);
-    
     // Record which columns are unidentifiable based on pivot order
     // In a rank-deficient system, columns beyond rank are linearly dependent
     // CRITICAL: These must be in ascending order for undrop_rows to work correctly
@@ -979,7 +976,10 @@ pub fn solve_penalized_least_squares(
     let mut drop_indices: Vec<usize> = Vec::with_capacity(n_drop);
     for i in rank..p {
         drop_indices.push(pivot_for_dropping[i]);
-        println!("Debug: Dropping column {} (pivot position {})", pivot_for_dropping[i], i);
+    }
+    
+    if n_drop > 0 {
+        log::debug!("Dropping {} columns due to rank deficiency: {:?}", n_drop, drop_indices);
     }
     drop_indices.sort(); // Ensure they're in ascending order
     
@@ -990,9 +990,6 @@ pub fn solve_penalized_least_squares(
     // Step 6A: Drop columns from the original R1 matrix (data part)
     let mut r1_dropped = Array2::zeros((r_rows, p - n_drop));
     drop_cols(&r1.view(), &drop_indices, &mut r1_dropped);
-    
-    println!("Debug: r1 original: {:?}", r1);
-    println!("Debug: r1_dropped: {:?}", r1_dropped);
     
     // Step 6B: Drop columns from the original e matrix (penalty part)
     let mut e_dropped = Array2::zeros((e_rows, p - n_drop));
@@ -1028,12 +1025,8 @@ pub fn solve_penalized_least_squares(
     // Apply Q1^T to wz to get the transformed RHS
     let q1_t_wz = _q1.t().dot(&wz);
     
-    println!("Debug: q1_t_wz: {:?}", q1_t_wz);
-    
     // Apply the second QR transformation to get the final RHS
     let q_data_t_rhs = q_data.t().dot(&q1_t_wz.slice(s![..r_rows]));
-    
-    println!("Debug: q_data_t_rhs: {:?}", q_data_t_rhs);
     
     // Step 6F: Solve the truncated system using back-substitution
     // Use only the data part R matrix for back-substitution
@@ -1042,9 +1035,6 @@ pub fn solve_penalized_least_squares(
     
     // Back-substitution implementation for upper triangular system
     let mut beta_dropped = Array1::zeros(rank);
-    println!("Debug: Back-substitution:");
-    println!("Debug: r_square: {:?}", r_square);
-    println!("Debug: rhs_square: {:?}", rhs_square);
     
     for i in (0..rank).rev() {
         // Initialize with right-hand side value
@@ -1064,7 +1054,6 @@ pub fn solve_penalized_least_squares(
         }
         
         beta_dropped[i] = sum / r_square[[i, i]];
-        println!("Debug: beta_dropped[{}] = {} / {} = {}", i, sum, r_square[[i, i]], beta_dropped[i]);
     }
     
     // This is our solved beta for the reduced, well-conditioned system
@@ -1102,17 +1091,11 @@ pub fn solve_penalized_least_squares(
     
     // Use pivot_final to place the solved coefficients into their correct positions
     // in the full p-dimensional vector
-    println!("Debug: pivot_final: {:?}", pivot_final);
-    println!("Debug: non_dropped_indices: {:?}", non_dropped_indices);
-    println!("Debug: beta_dropped: {:?}", beta_dropped);
-    println!("Debug: drop_indices: {:?}", drop_indices);
-    
     for i in 0..rank {
         // The i-th element of the solution beta_dropped corresponds to the
         // pivot_final[i]-th column of the reduced system, which maps to 
         // non_dropped_indices[pivot_final[i]] in the full system
         let full_index = non_dropped_indices[pivot_final[i]];
-        println!("Debug: Placing beta_dropped[{}] = {} at full_index {}", i, beta_dropped[i], full_index);
         beta_transformed[full_index] = beta_dropped[i];
     }
     // The (p - rank) coefficients corresponding to the dropped columns will remain zero
@@ -1121,8 +1104,9 @@ pub fn solve_penalized_least_squares(
     // directly placing values in their original positions. The dropped columns
     // are already at zero in beta_transformed.
     
-    log::debug!("Dropped {} columns due to rank deficiency: {:?}", drop_indices.len(), drop_indices);
-    log::debug!("Solution has {} non-zero coefficients", rank);
+    if n_drop > 0 {
+        log::debug!("Solver: rank {}/{}, dropped {} columns", rank, p, n_drop);
+    }
 
     // Step 7: Handle the Hessian for the rank-deficient case
     // Instead of directly constructing a potentially singular Hessian,
@@ -1137,13 +1121,21 @@ pub fn solve_penalized_least_squares(
     
     // The Hessian calculation is now done in the section above where we have r_square
     
-    // Create the permutation matrix for unpivoting using pivot_for_dropping
-    // This maintains consistency with the column dropping logic
+    // Create the permutation matrix for unpivoting using pivot_final
+    // CRITICAL: Must use the same pivot that was used for coefficient placement
     let mut p_mat = Array2::zeros((p, p));
-    for (i, &piv_col) in pivot_for_dropping.iter().enumerate() {
-        if i < p { // Safety check
-            p_mat[[piv_col, i]] = 1.0;
-        }
+    
+    // First, create the mapping for the retained columns
+    for i in 0..rank {
+        let original_col = non_dropped_indices[pivot_final[i]];
+        p_mat[[original_col, i]] = 1.0;
+    }
+    
+    // For dropped columns, place them in identity positions
+    let mut dropped_pos = rank;
+    for &dropped_col in &drop_indices {
+        p_mat[[dropped_col, dropped_pos]] = 1.0;
+        dropped_pos += 1;
     }
     
     // Create a well-conditioned Hessian:
