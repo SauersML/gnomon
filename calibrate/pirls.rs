@@ -903,6 +903,9 @@ pub fn solve_penalized_least_squares(
     //
     // If full Newton-Raphson is implemented in the future, a full SVD-based correction, 
     // as seen in the mgcv C function `pls_fit1`, would be required here for statistical correctness.
+    
+    // Assert all weights are non-negative (required for current implementation)
+    assert!(weights.iter().all(|&w| w >= 0.0), "All weights must be non-negative");
 
     // EXACTLY following mgcv's pls_fit1 multi-stage scaled approach:
     //
@@ -988,6 +991,9 @@ pub fn solve_penalized_least_squares(
     let mut r1_dropped = Array2::zeros((r_rows, p - n_drop));
     drop_cols(&r1.view(), &drop_indices, &mut r1_dropped);
     
+    println!("Debug: r1 original: {:?}", r1);
+    println!("Debug: r1_dropped: {:?}", r1_dropped);
+    
     // Step 6B: Drop columns from the original e matrix (penalty part)
     let mut e_dropped = Array2::zeros((e_rows, p - n_drop));
     if e_rows > 0 {
@@ -1014,34 +1020,25 @@ pub fn solve_penalized_least_squares(
         }
     }
     
-    // Step 6D: Perform final QR decomposition on the truncated unscaled matrix
-    let (q_final, r_final, pivot_final) = pivoted_qr(&final_aug_matrix)?;
+    // Step 6D: Perform QR decomposition on the truncated data matrix only
+    // CRITICAL FIX: Use only the data part R1_dropped for back-substitution
+    let (q_data, r_data, pivot_final) = pivoted_qr(&r1_dropped)?;
     
     // Step 6E: Prepare the RHS for solving
-    // The RHS should be transformed through the QR process
-    // We need to apply Q1^T to wz to get the transformed RHS
+    // Apply Q1^T to wz to get the transformed RHS
     let q1_t_wz = _q1.t().dot(&wz);
     
     println!("Debug: q1_t_wz: {:?}", q1_t_wz);
     
-    // Create final_rhs with the correct size
-    let mut final_rhs = Array1::zeros(final_aug_rows);
-    // Only assign the first r_rows elements (corresponding to the data part)
-    final_rhs.slice_mut(s![..r_rows]).assign(&q1_t_wz.slice(s![..r_rows]));
-    // The remaining elements (penalty part) stay zero
+    // Apply the second QR transformation to get the final RHS
+    let q_data_t_rhs = q_data.t().dot(&q1_t_wz.slice(s![..r_rows]));
     
-    println!("Debug: final_rhs: {:?}", final_rhs);
-    
-    let q_t_final_rhs = q_final.t().dot(&final_rhs);
-    
-    println!("Debug: q_t_final_rhs: {:?}", q_t_final_rhs);
+    println!("Debug: q_data_t_rhs: {:?}", q_data_t_rhs);
     
     // Step 6F: Solve the truncated system using back-substitution
-    // CRITICAL: We must use only the R from the data part, not the augmented matrix
-    // The r_final comes from QR of [R₁_dropped; E_dropped], but for back-substitution
-    // we need only the top part corresponding to the data
-    let r_square = r_final.slice(s![..rank, ..rank]);
-    let rhs_square = q_t_final_rhs.slice(s![..rank]);
+    // Use only the data part R matrix for back-substitution
+    let r_square = r_data.slice(s![..rank, ..rank]);
+    let rhs_square = q_data_t_rhs.slice(s![..rank]);
     
     // Back-substitution implementation for upper triangular system
     let mut beta_dropped = Array1::zeros(rank);
@@ -1159,7 +1156,7 @@ pub fn solve_penalized_least_squares(
     // 3. Correctly handles the pivoting that was done during the rank determination
     
     // First create a well-conditioned rank x rank Hessian using R'R from the final system
-    let r_square = r_final.slice(s![..rank, ..rank]);  // Get the square part of the final R matrix
+    let r_square = r_data.slice(s![..rank, ..rank]);  // Get the square part of the final R matrix
     let r_square_scaled = r_square.mapv(|x| x * 1.0);  // Create a clean copy
     let hessian_rank_part = r_square_scaled.t().dot(&r_square_scaled);
     
@@ -1171,14 +1168,8 @@ pub fn solve_penalized_least_squares(
         }
     }
     
-    // Add a small ridge term to the diagonal to ensure positive definiteness
-    // This makes the matrix invertible while preserving the identifiable subspace structure
-    let ridge_value = 1e-8;  // Small enough to not affect results, large enough for stability
-    for i in 0..p {
-        // Add a larger ridge for unidentifiable parameters to clearly separate them
-        let ridge = if i < rank { ridge_value } else { 1e-3 };
-        hessian_pivoted[[i, i]] += ridge;
-    }
+    // No artificial ridge - mgcv keeps the Hessian singular in factorized form
+    // Downstream calculations must handle the singular directions correctly
     
     // Unpivot the Hessian to get the final result
     // This is P * H_pivoted * P^T where P is the permutation matrix

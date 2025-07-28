@@ -563,7 +563,7 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = 0.01; // d_tol - group similar sized penalties (use a more reasonable threshold)
+    let eps = f64::EPSILON.powf(2.0/3.0); // d_tol - matches mgcv's default
     // println!("DEBUG: eps = {}", eps);
     let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 
@@ -619,15 +619,7 @@ pub fn stable_reparameterization(
             // Scale by lambda to get the weighted norm (omega_i)
             let omega_i = frob_norm * lambdas[i];
 
-            // If omega_i is exactly 0.0, add a tiny perturbation to ensure differentiability
-            // This is a critical fix for the tests with very different smoothing parameters
-            // Adding a small epsilon ensures we don't get exactly the same result for very different lambdas
-            let omega_i = if omega_i == 0.0 {
-                f64::EPSILON * lambdas[i]
-            } else {
-                omega_i
-            };
-
+            // No artificial perturbation - mgcv handles zero penalties exactly
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
             // println!("DEBUG: Penalty {} has omega_i = {}", i, omega_i);
@@ -705,25 +697,25 @@ pub fn stable_reparameterization(
 
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
         
-        // Sort eigenvalues in descending order for correct rank determination
+        // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
+        // mgcv uses ascending eigenvalues: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
+        
+        // Sort eigenvalues and get indices in ascending order (mgcv convention)
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
-        sorted_indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
+        sorted_indices.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
         
-        // println!("DEBUG: sorted_indices: {:?}", sorted_indices);
+        let q = eigenvalues.len();
+        let largest_eigenval = eigenvalues[sorted_indices[q - 1]]; // Last element is largest when sorted ascending
+        let rank_tolerance = largest_eigenval * r_tol;
         
-        // Calculate rank_tolerance based on largest eigenvalue
-        // This exactly matches the logic in mgcv
-        let max_eigenval = eigenvalues[sorted_indices[0]].max(1.0); // Ensure non-zero
-        let rank_tolerance = max_eigenval * r_tol;
-        
-        // Determine rank by counting eigenvalues above tolerance
-        let r = sorted_indices
-            .iter()
-            .take_while(|&&i| eigenvalues[i] > rank_tolerance)
-            .count();
+        // mgcv logic: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
+        let mut r = 1;
+        while r < q && eigenvalues[sorted_indices[q - r - 1]] > rank_tolerance {
+            r += 1;
+        }
             
-        log::debug!("Rank determination: found rank {} from {} eigenvalues (max eigenval: {}, tol: {})",
-                    r, eigenvalues.len(), max_eigenval, rank_tolerance);
+        log::debug!("Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
+                    r, eigenvalues.len(), largest_eigenval, rank_tolerance);
 
         // Step 4: Check termination criterion
         // This MUST match mgcv's get_stableS() function exactly
@@ -738,7 +730,9 @@ pub fn stable_reparameterization(
                 log::debug!("First iteration, full rank (r={} == q_current={}). Applying transform and terminating.", r, q_current);
                 
                 // Apply the transformation from the dominant penalties
-                let u_reordered = u.select(Axis(1), &sorted_indices);
+                // For ascending order, we want the last r indices (largest eigenvalues)
+                let selected_indices = &sorted_indices[q - r..];
+                let u_reordered = u.select(Axis(1), selected_indices);
                 
                 // Update the transformation matrix
                 // For the first iteration, we replace the entire qf matrix
@@ -755,7 +749,9 @@ pub fn stable_reparameterization(
         log::debug!("Partial rank detected: r={} < q_current={}. Continuing with transformation.", r, q_current);
 
         // Step 5: Update global transformation matrix Qf
-        let u_reordered = u.select(Axis(1), &sorted_indices);
+        // For ascending order, we want the last r indices (largest eigenvalues)
+        let selected_indices = &sorted_indices[q - r..];
+        let u_reordered = u.select(Axis(1), selected_indices);
 
         // Update the appropriate block of Qf
         let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
