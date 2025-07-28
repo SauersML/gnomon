@@ -889,7 +889,7 @@ pub fn solve_penalized_least_squares(
     // Define rank tolerance, matching mgcv's default
     const RANK_TOL: f64 = 1e-7;
 
-    let _n = x_transformed.nrows();
+    let n = x_transformed.nrows();
     let p = x_transformed.ncols();
 
     // --- Negative Weight Handling ---
@@ -907,28 +907,39 @@ pub fn solve_penalized_least_squares(
     // Note: Current implementation uses Fisher scoring where weights are always non-negative
     // Full Newton-Raphson would require handling negative weights via SVD correction
 
-    // EXACTLY following mgcv's pls_fit1 multi-stage scaled approach:
-    //
-    // Stage 1: Initial QR of the data part (sqrt(W)X) alone
-    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    // EXACTLY following mgcv's pls_fit1 multi-stage approach:
+    
+    //-----------------------------------------------------------------------
+    // STAGE 1: Initial QR decomposition of weighted design matrix
+    //-----------------------------------------------------------------------
+    
+    // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
+    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative
     let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
     let wz = &sqrt_w * &z;
     
-    // Perform initial pivoted QR on the weighted design matrix only
-    let (_q1, r1_full, _initial_pivot) = pivoted_qr_faer(&wx)?;
+    // Perform initial pivoted QR on the weighted design matrix
+    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
     
-    // CRITICAL FIX: mgcv keeps only the leading p rows of R1
-    // Handle n < p case safely to prevent panics
+    // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p);
     let r1 = r1_full.slice(s![..r_rows, ..]).to_owned();
     
-    // Stage 2: Calculate Frobenius norms for scaling
+    // Transform RHS using Q1' (first transformation of the RHS)
+    let q1_t_wz = q1.t().dot(&wz);
+    
+    //-----------------------------------------------------------------------
+    // STAGE 2: Rank determination using scaled augmented system
+    //-----------------------------------------------------------------------
+    
+    // Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1);
     let e_norm = if e.nrows() > 0 { frobenius_norm(e) } else { 1.0 };
     
     log::debug!("Frobenius norms: R_norm={}, E_norm={}", r_norm, e_norm);
     
-    // Stage 3: Create the scaled augmented matrix for rank determination
+    // Create the scaled augmented matrix for numerical stability
+    // [R1/Rnorm; E/Enorm]
     let e_rows = e.nrows();
     let scaled_rows = r_rows + e_rows;
     let mut scaled_matrix = Array2::zeros((scaled_rows, p));
@@ -949,10 +960,10 @@ pub fn solve_penalized_least_squares(
         }
     }
     
-    // Stage 4: Perform QR decomposition on the scaled matrix for rank determination
-    let (_, r_scaled, pivot_scaled) = pivoted_qr_faer(&scaled_matrix)?;
+    // Perform pivoted QR on the scaled matrix for rank determination
+    let (_, r_scaled, rank_pivot) = pivoted_qr_faer(&scaled_matrix)?;
     
-    // Stage 5: Determine rank using condition number on the scaled matrix
+    // Determine rank using condition number on the scaled matrix
     let mut rank = p.min(scaled_rows);
     while rank > 0 {
         let r_sub = r_scaled.slice(s![..rank, ..rank]);
@@ -967,97 +978,90 @@ pub fn solve_penalized_least_squares(
             break;
         }
     }
+    
+    // Check if the problem is fully rank deficient
     if rank == 0 {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
     }
-    log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
-    // Use the pivot from the initial QR decomposition for determining dropped columns
-    // This is critical to maintain consistency with mgcv's pls_fit1
-    let pivot_for_dropping = _initial_pivot;
     
-    // Record which columns are unidentifiable based on pivot order
-    // In a rank-deficient system, columns beyond rank are linearly dependent
-    // CRITICAL: These must be in ascending order for undrop_rows to work correctly
+    log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
+    
+    //-----------------------------------------------------------------------
+    // STAGE 3: Create rank-reduced system using the rank pivot
+    //-----------------------------------------------------------------------
+    
+    // Use rank_pivot to identify columns to drop (from rank determination)
+    // These are the unidentifiable columns based on the scaled system
     let n_drop = p - rank;
     let mut drop_indices: Vec<usize> = Vec::with_capacity(n_drop);
     for i in rank..p {
-        drop_indices.push(pivot_for_dropping[i]);
+        drop_indices.push(rank_pivot[i]);
     }
     
+    // Sort drop_indices in ascending order (required for drop_cols/undrop_rows)
     if n_drop > 0 {
+        drop_indices.sort();
         log::debug!("Dropping {} columns due to rank deficiency: {:?}", n_drop, drop_indices);
     }
-    drop_indices.sort(); // Ensure they're in ascending order
     
-    // Stage 6: Now discard the scaled matrices and work with the original unscaled matrices
-    // Following mgcv exactly: go back to original R1 and e, drop the identified columns,
-    // then form the final augmented matrix for solving
-    
-    // Step 6A: Drop columns from the original R1 matrix (data part)
-    let mut r1_dropped = Array2::zeros((r_rows, p - n_drop));
+    // Create rank-reduced versions of r1 and e by dropping unidentifiable columns
+    let mut r1_dropped = Array2::zeros((r_rows, rank));
     drop_cols(r1.view(), &drop_indices, &mut r1_dropped);
     
-    // Step 6B: Drop columns from the original e matrix (penalty part)
-    let mut e_dropped = Array2::zeros((e_rows, p - n_drop));
+    let mut e_dropped = Array2::zeros((e_rows, rank));
     if e_rows > 0 {
         drop_cols(e.view(), &drop_indices, &mut e_dropped);
     }
     
-    // Step 6C: Handle the case where there's no penalty (e_rows = 0)
-    let (q_final, r_final, pivot_final) = if e_rows == 0 {
-        // No penalty case - perform PIVOTED QR on the rank-reduced data matrix  
-        // This matches mgcv's final pivoted QR step
-        pivoted_qr_faer(&r1_dropped)?
-    } else {
-        // Penalty case - form the final augmented matrix [R1_dropped; e_dropped]
-        let final_aug_rows = r_rows + e_rows;
-        let mut final_aug_matrix = Array2::zeros((final_aug_rows, p - n_drop));
-        
-        // Fill in the data part (R1_dropped)
-        for i in 0..r_rows {
-            for j in 0..(p - n_drop) {
-                final_aug_matrix[[i, j]] = r1_dropped[[i, j]];
-            }
+    //-----------------------------------------------------------------------
+    // STAGE 4: Final QR decomposition on the unscaled, reduced system
+    //-----------------------------------------------------------------------
+    
+    // Form the final augmented matrix: [R1_dropped; E_dropped]
+    let final_aug_rows = r_rows + e_rows;
+    let mut final_aug_matrix = Array2::zeros((final_aug_rows, rank));
+    
+    // Fill in the data part (R1_dropped)
+    for i in 0..r_rows {
+        for j in 0..rank {
+            final_aug_matrix[[i, j]] = r1_dropped[[i, j]];
         }
-        
-        // Fill in the penalty part (e_dropped)
+    }
+    
+    // Fill in the penalty part (E_dropped)
+    if e_rows > 0 {
         for i in 0..e_rows {
-            for j in 0..(p - n_drop) {
+            for j in 0..rank {
                 final_aug_matrix[[r_rows + i, j]] = e_dropped[[i, j]];
             }
         }
-        
-        // Step 6D: Perform PIVOTED QR on the final augmented matrix [R1_dropped; E_dropped]
-        // CRITICAL FIX: This must be a pivoted QR, not unpivoted, to match mgcv
-        pivoted_qr_faer(&final_aug_matrix)?
-    };
+    }
     
-    // Step 6E: Prepare the RHS for solving
-    // Apply Q1^T to wz to get the transformed RHS
-    let q1_t_wz = _q1.t().dot(&wz);
+    // Perform final pivoted QR on the unscaled, reduced system
+    let (q_final, r_final, pivot_final) = pivoted_qr_faer(&final_aug_matrix)?;
     
-    // Apply the final QR transformation to get the proper RHS
-    let rhs_final = if e_rows == 0 {
-        // No penalty case - use the data part directly
-        q_final.t().dot(&q1_t_wz.slice(s![..r_rows]))
-    } else {
-        // Penalty case - pad with zeros for the penalty part
-        let final_aug_rows = r_rows + e_rows;
-        let mut rhs_full = Array1::<f64>::zeros(final_aug_rows);
-        rhs_full
-            .slice_mut(s![..r_rows])
-            .assign(&q1_t_wz.slice(s![..r_rows]));
-        q_final.t().dot(&rhs_full)
-    };
+    //-----------------------------------------------------------------------
+    // STAGE 5: Apply second transformation to the RHS and solve system
+    //-----------------------------------------------------------------------
     
-    // Step 6F: Solve the truncated system using back-substitution
-    // Use the upper-triangular part of the final QR matrix
+    // Prepare the full RHS for the final system
+    let mut rhs_full = Array1::<f64>::zeros(final_aug_rows);
+    
+    // Use q1_t_wz for the data part (already transformed by Q1')
+    rhs_full.slice_mut(s![..r_rows]).assign(&q1_t_wz.slice(s![..r_rows]));
+    
+    // The penalty part is zeros (already initialized)
+    
+    // Apply second transformation to the RHS using Q_final'
+    let rhs_final = q_final.t().dot(&rhs_full);
+    
+    // Extract the square upper-triangular part of R and corresponding RHS
     let r_square = r_final.slice(s![..rank, ..rank]);
     let rhs_square = rhs_final.slice(s![..rank]);
     
-    // Back-substitution implementation for upper triangular system
+    // Back-substitution to solve the triangular system
     let mut beta_dropped = Array1::zeros(rank);
     
     for i in (0..rank).rev() {
@@ -1080,146 +1084,42 @@ pub fn solve_penalized_least_squares(
         beta_dropped[i] = sum / r_square[[i, i]];
     }
     
-    // This is our solved beta for the reduced, well-conditioned system
-    // It correctly accounts for the dropped columns (set to zero)
-
-    // Step 6: EXACTLY following mgcv's pls_fit1 algorithm:
-    // The C code does these steps in order:
-    // 1. Back-substitute to solve the truncated system
-    // 2. Un-pivot the result ("for (i=0;i<rank;i++) y[pivot1[i]] = z[i];")
-    // 3. Re-inflate by inserting zeros for dropped columns ("undrop_rows")
+    //-----------------------------------------------------------------------
+    // STAGE 6: Reconstruct the full coefficient vector using mgcv's approach
+    //-----------------------------------------------------------------------
     
-    // Create a full-size solution vector initialized to zeros
-    let mut beta_transformed = Array1::zeros(p);
-    
-    // Step 7: Un-pivot the solved coefficients directly into the full vector
-    // This is the exact C code: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
-    // where z is our beta_dropped and pivot1 is the inverse pivot mapping
-    
-    // CRITICAL: We need to map from the solved coefficients back to the original parameter space
-    // The pivot_final tells us the order of columns in the final truncated system
-    // But we need to map back to the original full parameter space
-    
-    // CRITICAL FIX: Un-pivoting using pivot_for_dropping (pivot_scaled) consistently
-    // CRITICAL FIX: Use pivot_final from the final QR decomposition, not pivot_for_dropping
-    // Following mgcv's pls_fit1 exactly: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
-    // where pivot1 is the pivot from the FINAL QR decomposition, not the scaled one
-    
-    // First, we need to map through the dropping transformation
-    // pivot_final refers to column indices in the dropped matrix (size rank)
-    // We need to map these back to the original full matrix indices
-    // Fix: Use the proper two-step approach from mgcv to map coefficients
-    
-    // STEP 1: Un-pivot the rank-sized solution within the reduced stable system
-    // This mirrors the mgcv C code: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
-    // where y is a temporary vector of size rank and z is beta_dropped
+    // STEP 1: Un-pivot the rank-sized solution using pivot_final
+    // This is exactly how mgcv does it: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
     let mut beta_unpivoted = Array1::zeros(rank);
     for i in 0..rank {
-        // pivot_final[i] tells us which column in the reduced matrix should receive the i-th solution value
         beta_unpivoted[pivot_final[i]] = beta_dropped[i];
     }
     
-    // STEP 2: Inflate the rank-sized vector to the full p-sized vector by inserting zeros
-    // This mirrors the mgcv C code: "undrop_rows(y,*q,1,drop,n_drop);"
-    // Zero the destination vector first (already done during initialization of beta_transformed)
-    // Then copy the values from beta_unpivoted into the positions that weren't dropped
+    // STEP 2: Inflate to full size by inserting zeros for dropped columns
+    // This matches mgcv's undrop_rows function
+    let mut beta_transformed = Array1::zeros(p);
+    
+    // Map the unpivoted coefficients back to the full parameter space
+    // For each position in the full vector, check if it was dropped
+    // If not dropped, copy the next value from beta_unpivoted
     let mut src_idx = 0;
     for dst_idx in 0..p {
         if !drop_indices.contains(&dst_idx) {
-            // This original column wasn't dropped, copy the next available coefficient here
             beta_transformed[dst_idx] = beta_unpivoted[src_idx];
             src_idx += 1;
         }
-        // If the column was dropped, its value in beta_transformed remains 0.0
-    }
-    // The (p - rank) coefficients corresponding to the dropped columns will remain zero
-    
-    // Step 6B: The undrop_rows step is actually not needed here because we're
-    // directly placing values in their original positions. The dropped columns
-    // are already at zero in beta_transformed.
-    
-    if n_drop > 0 {
-        log::debug!("Solver: rank {}/{}, dropped {} columns", rank, p, n_drop);
-    }
-
-    // Step 7: Handle the Hessian for the rank-deficient case
-    // Instead of directly constructing a potentially singular Hessian,
-    // we'll create a well-conditioned, positive definite Hessian by adding a small
-    // ridge term to the unidentifiable dimensions.
-    //
-    // This follows the approach in mgcv where the Hessian is kept in factorized form
-    // and never explicitly constructed as a singular matrix.
-    
-    // We'll use the r_square from the dropped system for the Hessian
-    // This was already computed above as r_dropped.slice(s![..rank, ..rank])
-    
-    // The Hessian calculation is now done in the section above where we have r_square
-    
-    // Create the permutation matrix for unpivoting
-    // CRITICAL: Must use the SAME pivot system as used for coefficient mapping
-    // Following mgcv's approach, we use pivot_final for both coefficient mapping
-    // and Hessian unpivoting to maintain consistency
-    let mut p_mat = Array2::zeros((p, p));
-    
-    // Create an expanded/augmented pivot that combines pivot_final and drop_indices
-    // This gives a full permutation vector for the entire coefficient space
-    let mut full_permutation = Vec::with_capacity(p);
-    
-    // First, create a mapping from original column indices to their positions in the reduced system
-    let mut reduced_col_mapping = std::collections::HashMap::new();
-    let mut idx = 0;
-    for orig_idx in 0..p {
-        if !drop_indices.contains(&orig_idx) {
-            reduced_col_mapping.insert(orig_idx, idx);
-            idx += 1;
-        }
+        // If dropped, leave as zero (already initialized)
     }
     
-    // Step 1: Add the columns in pivot_final's ordering
-    for i in 0..rank {
-        // Get the original column index from reduced position pivot_final[i]
-        let reduced_pos = pivot_final[i];
-        // Find which original column this corresponds to
-        for (&orig_col, &reduced_idx) in &reduced_col_mapping {
-            if reduced_idx == reduced_pos {
-                full_permutation.push(orig_col);
-                break;
-            }
-        }
-    }
+    //-----------------------------------------------------------------------
+    // STAGE 7: Construct the penalized Hessian
+    //-----------------------------------------------------------------------
     
-    // Step 2: Add the dropped columns
-    for &dropped_col in &drop_indices {
-        full_permutation.push(dropped_col);
-    }
-    
-    // Now build the permutation matrix using this full permutation
-    for i in 0..p {
-        let permuted_col = full_permutation[i];
-        p_mat[[permuted_col, i]] = 1.0;
-    }
-    
-    // Verify that the permutation matrix is valid (exactly one 1.0 in each row and column)
-    // This should always be true if the algorithm is correct
-    let ones = Array1::<f64>::ones(p);
-    debug_assert!(p_mat.sum_axis(ndarray::Axis(0)).abs_diff_eq(&ones, 1e-10));
-    debug_assert!(p_mat.sum_axis(ndarray::Axis(1)).abs_diff_eq(&ones, 1e-10));
-    
-    // Create a well-conditioned Hessian:
-    // 1. For identifiable parameters (within rank): use the R'R result
-    // 2. For unidentifiable parameters: add a small ridge term (diagonal regularization)
-    
-    // Following mgcv's approach, we need to construct a penalized Hessian that is:
-    // 1. Positive definite (for numerical stability in downstream calculations)
-    // 2. Preserves the correct parameter subspaces (identifiable vs unidentifiable)
-    // 3. Correctly handles the pivoting that was done during the rank determination
-    
-    // First create a well-conditioned rank x rank Hessian using R'R from the final system
-    let r_square_for_hessian = r_final.slice(s![..rank, ..rank]);  // Get the square part of the final R matrix
-    let r_square_scaled = r_square_for_hessian.mapv(|x| x * 1.0);  // Create a clean copy
+    // Create R'R for the identifiable part
+    let r_square_scaled = r_square.mapv(|x| x);  // Create a clean copy
     let hessian_rank_part = r_square_scaled.t().dot(&r_square_scaled);
     
-    // Create a pivoted Hessian with the rank-aware part in the right place
+    // Create pivoted Hessian with zeros for unidentifiable directions
     let mut hessian_pivoted = Array2::zeros((p, p));
     for i in 0..rank {
         for j in 0..rank {
@@ -1227,35 +1127,68 @@ pub fn solve_penalized_least_squares(
         }
     }
     
-    // No artificial ridge - mgcv keeps the Hessian singular in factorized form
-    // Downstream calculations must handle the singular directions correctly
+    // Create a permutation matrix to un-pivot the Hessian
+    // This requires a combined mapping that accounts for both dropping and pivoting
     
-    // Unpivot the Hessian to get the final result
-    // This is P * H_pivoted * P^T where P is the permutation matrix
+    // Step 1: Map columns in the reduced system to their original indices
+    let mut orig_col_indices = Vec::with_capacity(p);
+    
+    // First add the columns that weren't dropped (in order they appear in reduced system)
+    let mut col_idx = 0;
+    for orig_idx in 0..p {
+        if !drop_indices.contains(&orig_idx) {
+            // This column wasn't dropped, record its original index
+            orig_col_indices.push(orig_idx);
+            col_idx += 1;
+        }
+    }
+    
+    // Then apply the final pivot to get the true column ordering
+    let mut permutation = Vec::with_capacity(p);
+    
+    // First add the pivoted columns in the correct order
+    for i in 0..rank {
+        permutation.push(orig_col_indices[pivot_final[i]]);
+    }
+    
+    // Then add the dropped columns
+    for &idx in &drop_indices {
+        permutation.push(idx);
+    }
+    
+    // Build the permutation matrix
+    let mut p_mat = Array2::zeros((p, p));
+    for i in 0..p {
+        p_mat[[permutation[i], i]] = 1.0;
+    }
+    
+    // Un-pivot the Hessian: P * H_pivoted * P^T
     let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
-
-    // Calculate effective degrees of freedom (edf) using the pivoted Hessian
-    // We need to use the same basis for both the Hessian and the design matrix
-    // Since we're in the solver working in the transformed space, use the pivoted Hessian
-    // and the corresponding subset of the transformed design matrix
+    
+    //-----------------------------------------------------------------------
+    // STAGE 8: Calculate EDF and scale parameter
+    //-----------------------------------------------------------------------
+    
+    // Calculate effective degrees of freedom
     let edf = calculate_edf_with_rank_reduction(
         &hessian_pivoted,
         x_transformed,
         weights,
-        &pivot_for_dropping,
+        &rank_pivot,
         rank,
     )?;
-
-    // Calculate the scale parameter
+    
+    // Calculate scale parameter
     let scale = calculate_scale(
         &beta_transformed,
-        x_transformed, // Use the transformed design matrix
-        y,             // Use the original response, not the working response z
+        x_transformed,
+        y,
         weights,
         edf,
-        link_function, // Pass the link function to determine appropriate scale calculation
+        link_function,
     );
-
+    
+    // Return the result
     Ok((
         StablePLSResult {
             beta: beta_transformed,
