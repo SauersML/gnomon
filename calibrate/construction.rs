@@ -676,15 +676,9 @@ pub fn stable_reparameterization(
             let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
             let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
             
-            // Critical: Add a small perturbation to the diagonal to ensure positive definiteness
-            // and avoid numerical instability with extremely small eigenvalues
-            // This is similar to the approach used in mgcv's gam.fit3.R
-            let mut s_perturbed = s_active_block.clone();
-            for j in 0..q_current {
-                s_perturbed[[j, j]] += 1e-10;
-            }
-            
-            sb.scaled_add(lambdas[i], &s_perturbed);
+            // Use the penalty matrix directly without artificial perturbation
+            // mgcv handles zero penalties exactly in the null-space
+            sb.scaled_add(lambdas[i], &s_active_block);
         }
         
         // println!("DEBUG: Final sb matrix: {:?}", sb);
@@ -700,34 +694,32 @@ pub fn stable_reparameterization(
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
         
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
-        // mgcv uses ascending eigenvalues: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
+        // mgcv uses: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
+        // This means compare to the SMALLEST eigenvalue, not the largest
         
         // Sort eigenvalues and get indices in ascending order (mgcv convention)
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
         
         let q = eigenvalues.len();
-        let largest_eigenval = eigenvalues[sorted_indices[q - 1]]; // Last element is largest when sorted ascending
-        let rank_tolerance = largest_eigenval * r_tol;
+        let smallest_eigenval = eigenvalues[sorted_indices[0]]; // First element is smallest when sorted ascending
+        let rank_tolerance = smallest_eigenval * r_tol;
         
         // mgcv logic: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
+        // But ev[Q-1] should be the smallest eigenvalue, not largest
         let mut r = 1;
         while r < q && eigenvalues[sorted_indices[q - r - 1]] > rank_tolerance {
             r += 1;
         }
             
-        log::debug!("Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
-                    r, eigenvalues.len(), largest_eigenval, rank_tolerance);
+        log::debug!("Rank determination: found rank {} from {} eigenvalues (smallest eigenval: {}, tol: {})",
+                    r, eigenvalues.len(), smallest_eigenval, rank_tolerance);
 
         // Step 4: Check termination criterion
-        // Continue the similarity-transform loop until the γ set is empty
-        // Do NOT exit early on iter==1 even if full rank - this was causing identity Qs matrices
-        if r == q_current {
-            log::debug!("Sub-problem is full rank at iteration {} (r={} == q_current={}). Continuing loop.", iteration, r, q_current);
-            // Continue to apply transformation and process remaining penalties
-        }
-        
-        log::debug!("Partial rank detected: r={} < q_current={}. Continuing with transformation.", r, q_current);
+        // This is the critical fix: when r == q_current on the first iteration,
+        // mgcv still performs the transformation and constructs the final outputs
+        // The key is to properly update the transformation matrices first
+        log::debug!("Rank detection: r={}, q_current={}, iteration={}", r, q_current, iteration);
 
         // Step 5: Update global transformation matrix Qf
         // For ascending order, we want the last r indices (largest eigenvalues)
