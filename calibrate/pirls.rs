@@ -973,9 +973,6 @@ pub fn solve_penalized_least_squares(
         });
     }
     log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
-    println!("DEBUG: Pivot from scaled QR: {:?}", pivot_scaled);
-    // This will be printed after drop_indices is created
-    
     // Use the pivot from the scaled matrix for determining dropped columns
     let pivot_for_dropping = pivot_scaled;
     
@@ -992,7 +989,6 @@ pub fn solve_penalized_least_squares(
         log::debug!("Dropping {} columns due to rank deficiency: {:?}", n_drop, drop_indices);
     }
     drop_indices.sort(); // Ensure they're in ascending order
-    println!("DEBUG: Drop indices: {:?}", drop_indices);
     
     // Stage 6: Now discard the scaled matrices and work with the original unscaled matrices
     // Following mgcv exactly: go back to original R1 and e, drop the identified columns,
@@ -1063,9 +1059,6 @@ pub fn solve_penalized_least_squares(
     // Back-substitution implementation for upper triangular system
     let mut beta_dropped = Array1::zeros(rank);
     
-    println!("DEBUG: RHS for back-substitution: {:?}", rhs_square);
-    println!("DEBUG: R matrix for back-substitution: {:?}", r_square);
-    
     for i in (0..rank).rev() {
         // Initialize with right-hand side value
         let mut sum = rhs_square[i];
@@ -1084,7 +1077,6 @@ pub fn solve_penalized_least_squares(
         }
         
         beta_dropped[i] = sum / r_square[[i, i]];
-        println!("DEBUG: beta_dropped[{}] = {} / {} = {}", i, sum, r_square[[i, i]], beta_dropped[i]);
     }
     
     // This is our solved beta for the reduced, well-conditioned system
@@ -1115,11 +1107,6 @@ pub fn solve_penalized_least_squares(
     // First, we need to map through the dropping transformation
     // pivot_final refers to column indices in the dropped matrix (size rank)
     // We need to map these back to the original full matrix indices
-    println!("DEBUG: beta_dropped: {:?}", beta_dropped);
-    println!("DEBUG: pivot_final: {:?}", pivot_final);
-    println!("DEBUG: pivot_for_dropping: {:?}", pivot_for_dropping);
-    println!("DEBUG: rank: {}", rank);
-    
     // Fix: Use the proper two-step approach from mgcv to map coefficients
     
     // STEP 1: Un-pivot the rank-sized solution within the reduced stable system
@@ -1129,11 +1116,8 @@ pub fn solve_penalized_least_squares(
     for i in 0..rank {
         // pivot_final[i] tells us which column in the reduced matrix should receive the i-th solution value
         beta_unpivoted[pivot_final[i]] = beta_dropped[i];
-        println!("DEBUG: beta_dropped[{}] = {} -> beta_unpivoted[{}]", 
-                 i, beta_dropped[i], pivot_final[i]);
     }
-    println!("DEBUG: beta_unpivoted (after un-pivoting): {:?}", beta_unpivoted);
-
+    
     // STEP 2: Inflate the rank-sized vector to the full p-sized vector by inserting zeros
     // This mirrors the mgcv C code: "undrop_rows(y,*q,1,drop,n_drop);"
     // Zero the destination vector first (already done during initialization of beta_transformed)
@@ -1147,8 +1131,6 @@ pub fn solve_penalized_least_squares(
         }
         // If the column was dropped, its value in beta_transformed remains 0.0
     }
-    
-    println!("DEBUG: final beta_transformed (after inflation): {:?}", beta_transformed);
     // The (p - rank) coefficients corresponding to the dropped columns will remain zero
     
     // Step 6B: The undrop_rows step is actually not needed here because we're
