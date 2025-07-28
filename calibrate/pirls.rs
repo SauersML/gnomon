@@ -1159,7 +1159,6 @@ pub fn solve_penalized_least_squares(
     // Following mgcv's approach, we use pivot_final for both coefficient mapping
     // and Hessian unpivoting to maintain consistency
     let mut p_mat = Array2::zeros((p, p));
-    let mut used_rows = vec![false; p];
     
     // Create an expanded/augmented pivot that combines pivot_final and drop_indices
     // This gives a full permutation vector for the entire coefficient space
@@ -1330,25 +1329,33 @@ fn pivoted_qr_faer(
     
     // Create full Q matrix using householder reflectors
     // First create identity matrix
-    let mut q_faer = Mat::zeros(m, m);
-    for i in 0..m {
-        q_faer[(i, i)] = 1.0;
-    }
+    // Use faer's qr::reconstruct module to properly reconstruct Q
+    use faer::linalg::qr::col_pivoting::reconstruct::reconstruct_q;
     
-    // Apply Householder reflectors to the identity matrix
-    // This effectively computes Q from the QR factorization
-    faer::linalg::qr::col_pivoting::factor::apply_q(
+    // Create a matrix to hold Q
+    let mut q_faer = Mat::zeros(m, m.min(n));
+    
+    // Reconstruct Q from the reflectors stored in faer_matrix and q_coeff
+    reconstruct_q(
         q_faer.as_mut(),
         faer_matrix.as_ref(),
         q_coeff.as_ref(),
-        false, // don't transpose
         Par::Seq,
+        faer::dyn_stack::GlobalPodBuffer::new(
+            faer::linalg::qr::col_pivoting::reconstruct::reconstruct_q_req::<f64>(
+                m,
+                m.min(n),
+                n,
+                blocksize,
+                Par::Seq,
+            )
+        ),
     );
     
-    // Convert to ndarray format - full m×m Q matrix
-    let mut q = Array2::zeros((m, m));
+    // Convert to ndarray format - Q matrix with proper dimensions
+    let mut q = Array2::zeros((m, m.min(n)));
     for i in 0..m {
-        for j in 0..m {
+        for j in 0..m.min(n) {
             q[[i, j]] = q_faer[(i, j)];
         }
     }
