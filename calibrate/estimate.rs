@@ -25,8 +25,6 @@
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
-#[cfg(test)]
-use crate::calibrate::construction::PenalizedBlock;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
     compute_penalty_square_roots,
@@ -3537,90 +3535,72 @@ pub mod internal {
 
             // --- 1. Function to test gradient for a specific link function ---
             let test_gradient_for_link = |link_function: LinkFunction, rng: &mut StdRng| {
-                // --- 2. Create a small, simple test dataset ---
-                let n_samples = 200; // Increased from 50 for better conditioning
+                // --- 2. Create a small, well-posed test dataset for a single predictor model ---
+                let n_samples = 200;
+                // Jitter is added to the predictor to improve numerical stability.
                 let x_vals =
-                    Array1::linspace(0.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.01..0.01)); // Add jitter
+                    Array1::linspace(0.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.01..0.01));
 
-                // Generate some smooth data based on the link function
+                // Generate a smooth response `y` from a true function `f_true`.
                 let f_true = x_vals.mapv(|x| (x * 2.0 * std::f64::consts::PI).sin()); // sine wave
 
                 let y = match link_function {
                     LinkFunction::Identity => {
-                        // For Gaussian/Identity, add some noise
                         &f_true + &Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 0.1)
                     }
                     LinkFunction::Logit => {
-                        // For Logit, use our helper function to generate non-separable data
-                        // f_true contains values that we can use as logits
+                        // Use a helper that generates non-separable binary data to avoid instability.
                         generate_y_from_logit(&f_true, rng)
                     }
                 };
-
-                // Dummy values for TrainingData struct requirements
-                let p = Array1::zeros(n_samples);
-                let pcs = Array2::zeros((n_samples, 0));
-                let data = TrainingData { y, p, pcs };
-
-                // --- 3. Setup a simple model with a single smooth term ---
-                // Instead of going through the complex `build_design_and_penalty_matrices` logic,
-                // we'll manually create a simple B-spline design matrix and penalty matrix
-                let degree = 3;
-                let n_knots = 8; // For degree 3, need at least 2*(3+1) = 8 knots
-                let knots = Array1::linspace(0.0, 1.0, n_knots);
-                let (x_matrix, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
-                    x_vals.view(),
-                    knots.view(),
-                    degree,
-                )
-                .expect("Failed to create B-spline design matrix");
-
-                // Create a second-order difference penalty matrix
-                let penalty_matrix =
-                    crate::calibrate::basis::create_difference_penalty_matrix(x_matrix.ncols(), 2)
-                        .expect("Failed to create penalty matrix");
-
-                // --- 4. Setup a dummy ModelLayout ---
-                // This layout correctly describes a model with NO separate intercept term.
-                // The single penalized term spans all columns of the provided basis matrix.
-                let layout = ModelLayout {
-                    intercept_col: 0, // Keep for coefficient mapping, but no columns are assigned to it.
-                    pgs_main_cols: 0..0, // No unpenalized main effects.
-                    penalty_map: vec![PenalizedBlock {
-                        term_name: "f(x)".to_string(),
-                        // The penalty applies to all columns since there is no separate intercept.
-                        col_range: 0..x_matrix.ncols(),
-                        penalty_idx: 0,
-                    }],
-                    total_coeffs: x_matrix.ncols(),
-                    num_penalties: 1,
-                    num_pgs_interaction_bases: 0, // No interactions in this test
+                
+                // --- 3. Setup TrainingData with PC to create a penalized term ---
+                // Since the canonical builder doesn't penalize the main PGS term,
+                // we use the PC mechanism to create a penalized smooth term for testing.
+                let dummy_pc = Array2::from_shape_vec((n_samples, 1), x_vals.to_vec()).unwrap();
+                let data = TrainingData { 
+                    y, 
+                    p: Array1::zeros(n_samples), // Use zero for PGS since we're testing PC penalty
+                    pcs: dummy_pc 
                 };
 
-                // --- 5. Create a config with the specified link function ---
+                // Configure for a single penalized PC term
                 let mut config = create_test_config();
                 config.link_function = link_function;
+                config.pc_names = vec!["test_smooth".to_string()];
+                config.pc_basis_configs = vec![crate::calibrate::model::BasisConfig {
+                    num_knots: 8,
+                    degree: 3,
+                }];
+                config.pc_ranges = vec![(0.0, 1.0)];
+                
+                // --- 4. THE FIX: Use the canonical builder to create a well-posed model ---
+                let (x_matrix, s_list, layout, _, _) =
+                    build_design_and_penalty_matrices(&data, &config)
+                        .expect("Failed to build model structure with canonical builder");
 
-                // --- 6. Initialize REML state ---
+                // --- 5. Initialize REML state with the correctly built components ---
+                // RemlState::new handles the square root conversion internally
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
                     x_matrix.view(),
-                    vec![penalty_matrix],
+                    s_list,
                     &layout,
                     &config,
                 )
                 .unwrap();
 
-                // --- 7. Test point for gradient verification ---
-                // Test at rho = -1.0 (lambda ≈ 0.368) for a stable test
-                let test_rho = array![-1.0];
+                // --- 6. Test point for gradient verification ---
+                // Create rho vector with correct length for all penalties
+                let test_rho = Array1::from_elem(layout.num_penalties, -1.0);
 
-                // --- 8. Calculate the analytical gradient ---
+                // --- 7. Calculate the analytical gradient ---
                 let analytical_grad = reml_state
                     .compute_gradient(&test_rho)
                     .expect("Analytical gradient calculation failed");
 
-                // --- 9. Compute numerical gradient via robust central differences ---
+                // --- 8. Compute numerical gradient via robust central differences ---
+                // Test the first penalty parameter for simplicity
                 let numerical_grad = match compute_numerical_gradient_robust(
                     &reml_state,
                     &test_rho,
@@ -3636,8 +3616,8 @@ pub mod internal {
                     }
                 };
 
-                // --- 10. VERIFY: Assert that the gradients match within a reasonable tolerance ---
-                let tolerance = 1e-4; // Appropriate tolerance for numerical vs. analytical comparison
+                // --- 9. VERIFY: Assert that the gradients match within a reasonable tolerance ---
+                let tolerance = 1e-4; // Appropriate tolerance for numerical vs. analytical comparison  
                 let error_metric = compute_error_metric(analytical_grad[0], numerical_grad);
 
                 assert!(
@@ -3678,7 +3658,7 @@ pub mod internal {
                     cost_next
                 );
 
-                // Verify the gradient is significant and not near zero
+                // Verify the first gradient component is significant and not near zero
                 assert!(
                     analytical_grad[0].abs() > 1e-6,
                     "For {:?}, gradient magnitude should be significant but was too small: {:.8e}",
@@ -3687,7 +3667,7 @@ pub mod internal {
                 );
             };
 
-            // --- 11. Test both link functions ---
+            // --- 10. Test both link functions ---
             test_gradient_for_link(LinkFunction::Identity, &mut rng);
             test_gradient_for_link(LinkFunction::Logit, &mut rng);
         }
