@@ -1320,36 +1320,6 @@ fn calculate_edf(
     Ok(if edf > 1.0 { edf } else { 1.0 })
 }
 
-/// Calculate effective degrees of freedom with rank reduction
-fn calculate_edf_with_rank_reduction(
-    hessian_pivoted: &Array2<f64>,
-    x_transformed: ArrayView2<f64>,
-    weights: ArrayView1<f64>,
-    pivot: &[usize],
-    rank: usize,
-) -> Result<f64, EstimationError> {
-    use ndarray_linalg::Solve;
-    
-    // Extract the columns of the transformed design matrix corresponding to the retained parameters
-    let mut x_reduced = Array2::zeros((x_transformed.nrows(), rank));
-    for j in 0..rank {
-        let col_idx = pivot[j];
-        x_reduced.column_mut(j).assign(&x_transformed.column(col_idx));
-    }
-    
-    let sqrt_w = weights.mapv(|w| w.sqrt());
-    let wx = &x_reduced * &sqrt_w.view().insert_axis(Axis(1));
-    let xtwx = wx.t().dot(&wx);
-
-    let mut edf: f64 = 0.0;
-    for j in 0..rank {
-        if let Ok(h_inv_col) = hessian_pivoted.solve(&xtwx.column(j).to_owned()) {
-            edf += h_inv_col[j];
-        }
-    }
-
-    Ok(if edf > 1.0 { edf } else { 1.0 })
-}
 
 /// Calculate scale parameter correctly for different link functions
 /// For Gaussian (Identity): Based on weighted residual sum of squares
@@ -1662,9 +1632,11 @@ mod tests {
             2.0 + 3.0 * ((i as f64) / (n_samples as f64))
         });
 
-        // Create multiple penalty matrices with different scales - using smaller values for stability
-        let s1 = arr2(&[[0.01, 0.0], [0.0, 0.01]]); // Very small penalties
-        let s2 = arr2(&[[0.0, 0.0], [0.0, 100.0]]); // Much larger penalty
+        // Create penalty matrices with DIFFERENT eigenvector structures (matching working test)
+        // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²  
+        let s1 = arr2(&[[1.0, -1.0], [-1.0, 1.0]]);
+        // s2 is a ridge penalty on the first coefficient only: β₁²
+        let s2 = arr2(&[[1.0, 0.0], [0.0, 0.0]]);
 
         let s_list = vec![s1, s2];
         let rs_original = compute_penalty_square_roots(&s_list).unwrap();
@@ -1700,11 +1672,10 @@ mod tests {
             num_pgs_interaction_bases: 0,
         };
 
-        // Test with moderately different rho values to avoid extreme numerical issues
-        // while still guaranteeing different reparameterizations
+        // Test with lambda values that match the working test pattern  
         log::info!("Running test_reparameterization_per_rho with detailed diagnostics");
-        let rho_vec1 = arr1(&[2.0, -2.0]); // Lambda: [exp(2.0) ≈ 7.4, exp(-2.0) ≈ 0.14]
-        let rho_vec2 = arr1(&[-2.0, 2.0]); // Lambda: [exp(-2.0) ≈ 0.14, exp(2.0) ≈ 7.4]
+        let rho_vec1 = arr1(&[f64::ln(100.0), f64::ln(0.01)]); // Lambda: [100.0, 0.01] - s1 dominates
+        let rho_vec2 = arr1(&[f64::ln(0.01), f64::ln(100.0)]); // Lambda: [0.01, 100.0] - s2 dominates
         log::info!(
             "Testing P-IRLS with rho values: {:?} (lambdas: {:?})",
             rho_vec1,
