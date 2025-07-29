@@ -642,6 +642,36 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     kappa
 }
 
+/// Un-pivots the columns of a matrix according to a pivot vector.
+///
+/// This is a direct translation of the "unpivot x" logic for columns
+/// from mgcv's `pivoter` C function. It reverses the permutation applied
+/// by a pivoted QR decomposition.
+///
+/// # Parameters
+/// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the R factor).
+/// * `pivot`: The permutation vector from the QR decomposition. `pivot[j]` is the
+///   original index of the j-th column in the pivoted matrix.
+fn unpivot_columns(
+    pivoted_matrix: ArrayView2<f64>,
+    pivot: &[usize],
+) -> Array2<f64> {
+    let r = pivoted_matrix.nrows();
+    let c = pivoted_matrix.ncols();
+    let mut unpivoted_matrix = Array2::zeros((r, c));
+
+    // The C code logic `dum[*pi]= *px;` translates to:
+    // The i-th column of the pivoted matrix belongs at the `pivot[i]`-th
+    // position in the un-pivoted matrix.
+    for i in 0..c {
+        let original_col_index = pivot[i];
+        let pivoted_col = pivoted_matrix.column(i);
+        unpivoted_matrix.column_mut(original_col_index).assign(&pivoted_col);
+    }
+
+    unpivoted_matrix
+}
+
 /// Drop columns from a matrix based on column indices in `drop`.
 /// This is a direct translation of `drop_cols` from mgcv's C code:
 /// 
@@ -889,7 +919,7 @@ pub fn solve_penalized_least_squares(
     // Define rank tolerance, matching mgcv's default
     const RANK_TOL: f64 = 1e-7;
 
-    let n = x_transformed.nrows();
+    // let n = x_transformed.nrows();
     let p = x_transformed.ncols();
 
     // --- Negative Weight Handling ---
@@ -923,7 +953,15 @@ pub fn solve_penalized_least_squares(
     
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p);
-    let r1 = r1_full.slice(s![..r_rows, ..]).to_owned();
+    let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
+    
+    // CRITICAL FIX: Un-pivot the columns of R1 to restore their original order.
+    // This is the missing step from mgcv's `pivoter` function. We must un-pivot
+    // the columns of the R factor to restore their original order before proceeding.
+    // The columns of R1 are currently scrambled according to `initial_pivot`.
+    // We need to unscramble them so they align with the penalty matrix E.
+    let r1 = unpivot_columns(r1_pivoted, &initial_pivot);
+    log::debug!("Un-pivoted R1 matrix after first QR to restore original column order");
     
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(&wz);
@@ -1134,12 +1172,12 @@ pub fn solve_penalized_least_squares(
     let mut orig_col_indices = Vec::with_capacity(p);
     
     // First add the columns that weren't dropped (in order they appear in reduced system)
-    let mut col_idx = 0;
+    // let mut col_idx = 0;
     for orig_idx in 0..p {
         if !drop_indices.contains(&orig_idx) {
             // This column wasn't dropped, record its original index
             orig_col_indices.push(orig_idx);
-            col_idx += 1;
+            // col_idx += 1;
         }
     }
     
@@ -1571,6 +1609,32 @@ mod tests {
         println!(
             "✓ Test passed: Different smoothing parameters correctly produced different reparameterizations."
         );
+    }
+
+    /// Test that the unpivot_columns function correctly reverses a column pivot
+    #[test]
+    fn test_unpivot_columns_basic() {
+        // Create a simple test matrix
+        let original = arr2(&[
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ]);
+        
+        // Simulate a pivot where columns are reordered as: [0, 2, 1] -> [2, 0, 1]
+        let pivot = vec![2, 0, 1]; // This means: col 0 goes to pos 2, col 1 goes to pos 0, col 2 goes to pos 1
+        
+        // Create a manually pivoted matrix to simulate what QR would produce
+        let pivoted = arr2(&[
+            [3.0, 1.0, 2.0], // Column order: original[2], original[0], original[1]
+            [6.0, 4.0, 5.0],
+        ]);
+        
+        // Un-pivot using our function
+        let unpivoted = unpivot_columns(pivoted.view(), &pivot);
+        
+        // Check that we get back the original column order
+        assert_eq!(unpivoted, original);
+        println!("✓ unpivot_columns correctly reversed the column pivot");
     }
 
     /// This integration test verifies that the fit_model_for_fixed_rho function
