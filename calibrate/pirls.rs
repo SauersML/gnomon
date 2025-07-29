@@ -1589,6 +1589,18 @@ mod tests {
         );
     }
 
+    /// Helper to set up the inputs required for `fit_model_for_fixed_rho`.
+    /// This encapsulates the boilerplate of setting up test inputs.
+    fn setup_pirls_test_inputs(
+        data: &TrainingData,
+        config: &ModelConfig,
+    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
+        let (x_matrix, s_list, layout, _, _) =
+            build_design_and_penalty_matrices(data, config)?;
+        let rs_original = compute_penalty_square_roots(&s_list)?;
+        Ok((x_matrix, rs_original, layout))
+    }
+
     /// Test that the unpivot_columns function correctly reverses a column pivot
     #[test]
     fn test_unpivot_columns_basic() {
@@ -1788,9 +1800,7 @@ mod tests {
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
-        let (x_matrix, s_list, layout, _, _) =
-            build_design_and_penalty_matrices(&data, &config)?;
-        let rs_original = compute_penalty_square_roots(&s_list)?;
+        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
         
         // This is the exact parameter value that caused `inf` in other tests.
         let rho_vec = arr1(&[0.0]);
@@ -1844,6 +1854,101 @@ mod tests {
         println!("Individual spline coefficients: {:?}", &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]);
 
         println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data.");
+
+        Ok(())
+    }
+
+    /// Test that P-IRLS is stable and correctly learns from realistic data with a clear signal.
+    /// This verifies the algorithm not only converges, but finds meaningful patterns when they exist.
+    #[test]
+    fn test_pirls_learns_realistic_signal() -> Result<(), Box<dyn std::error::Error>> {
+        // === Create realistic dataset WITH a clear signal ===
+        let n_samples = 1000;
+        let mut rng = StdRng::seed_from_u64(42); // Different seed for variety
+
+        // Predictor: uniform distribution 
+        let p = Array1::linspace(-2.0, 2.0, n_samples);
+
+        // Outcome: Generate from a clear logistic relationship
+        // True function: log_odds = -0.5 + 1.5 * p (strong linear signal)
+        let y_values: Vec<f64> = p.iter().map(|&p_val| {
+            let log_odds: f64 = -0.5 + 1.5 * p_val;
+            let prob = 1.0 / (1.0 + (-log_odds).exp());
+            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        }).collect();
+        let y = Array1::from_vec(y_values);
+
+        let data = TrainingData {
+            y,
+            p,
+            pcs: Array2::zeros((n_samples, 0)),
+        };
+
+        // === Use same stable model configuration ===
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-7,
+            max_iterations: 150,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 },
+            pc_basis_configs: vec![],
+            pgs_range: (-2.0, 2.0),
+            pc_ranges: vec![],
+            pc_names: vec![],
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            num_pgs_interaction_bases: 0,
+        };
+
+        // === Set up inputs using helper ===
+        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let rho_vec = arr1(&[0.0]); // Same parameter value
+
+        // === Execute P-IRLS ===
+        let pirls_result = fit_model_for_fixed_rho(
+            rho_vec.view(),
+            x_matrix.view(),
+            data.y.view(),
+            &rs_original,
+            &layout,
+            &config,
+        )
+        .expect("P-IRLS should converge on realistic data with clear signal");
+
+        // === Assert stability (same as random data test) ===
+        assert!(
+            pirls_result.deviance.is_finite(),
+            "Deviance must be finite, got: {}", pirls_result.deviance
+        );
+        assert!(
+            pirls_result.beta.iter().all(|&b| b.is_finite()),
+            "All beta coefficients must be finite"
+        );
+        assert!(
+            pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            "Penalized Hessian must be finite"
+        );
+
+        // === Assert signal detection (different from random data test) ===
+        // Transform back to interpretable basis
+        let beta_original = pirls_result.qs.dot(&pirls_result.beta);
+        let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
+        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
+        
+        // For data with a strong signal, coefficients should be substantial
+        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        assert!(
+            pgs_coeffs_norm > 0.5, // Should be much larger than random noise
+            "Model should detect the clear signal, got coefficient norm: {}", pgs_coeffs_norm
+        );
+
+        // Log diagnostics
+        println!("Signal data - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
+        println!("Signal data - Sample coefficients: {:?}", 
+                &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]);
+        println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal");
 
         Ok(())
     }
