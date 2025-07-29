@@ -175,6 +175,9 @@ pub fn fit_model_for_fixed_rho(
         // Save the most recent stable result to avoid redundant computation at the end
         last_stable_result = Some(stable_result.clone());
 
+        // Capture the EDF from the solver for correct scale calculation
+        let edf_from_solver = stable_result.0.edf;
+
         // The solver now returns beta in the transformed basis which is what we need for the P-IRLS loop
         log::debug!(
             "P-IRLS Iteration #{}: Getting solver result in transformed basis",
@@ -205,7 +208,7 @@ pub fn fit_model_for_fixed_rho(
         // Calculate penalty using the transformed total penalty matrix
         let mut penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
         let mut penalized_deviance_trial = deviance_trial + penalty_trial;
-        let mut deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
+        let mut deviance_decreased = penalized_deviance_trial <= penalized_deviance_current;
 
         // Enhanced debugging for the failing test
         log::debug!(
@@ -249,7 +252,7 @@ pub fn fit_model_for_fixed_rho(
             valid_eta = eta_trial.iter().all(|v| v.is_finite());
             valid_mu = mu_trial.iter().all(|v| v.is_finite());
             penalized_deviance_trial = deviance_trial + penalty_trial;
-            deviance_decreased = penalized_deviance_trial < penalized_deviance_current;
+            deviance_decreased = penalized_deviance_trial <= penalized_deviance_current;
 
             step_halving_count += 1;
 
@@ -415,8 +418,10 @@ pub fn fit_model_for_fixed_rho(
             LinkFunction::Identity => {
                 // For Gaussian, scale is the estimated residual variance
                 let residuals = &mu - &y.view(); // Recompute residuals for scale calculation
-                let df = x_transformed.nrows() as f64 - beta_transformed.len() as f64;
-                residuals.dot(&residuals) / df.max(1.0)
+                // Use the EDF from the solver, not a naive n-p calculation.
+                // For penalized models, the correct degrees of freedom is n - edf.
+                let df = (x_transformed.nrows() as f64 - edf_from_solver).max(1.0);
+                residuals.dot(&residuals) / df
             }
         };
 
@@ -1207,13 +1212,12 @@ pub fn solve_penalized_least_squares(
     // STAGE 8: Calculate EDF and scale parameter
     //-----------------------------------------------------------------------
     
-    // Calculate effective degrees of freedom
-    let edf = calculate_edf_with_rank_reduction(
-        &hessian_pivoted,
+    // Calculate effective degrees of freedom using the final, unpivoted Hessian
+    // This avoids pivot mismatches by using the correctly aligned final matrices
+    let edf = calculate_edf(
+        &penalized_hessian,
         x_transformed,
         weights,
-        &rank_pivot,
-        rank,
     )?;
     
     // Calculate scale parameter
@@ -1293,8 +1297,8 @@ fn pivoted_qr_faer(
     Ok((q, r, pivot))
 }
 
-/// Calculate effective degrees of freedom
-#[allow(dead_code)]
+/// Calculate effective degrees of freedom using the final unpivoted Hessian
+/// This avoids pivot mismatches by using the correctly aligned final matrices
 fn calculate_edf(
     penalized_hessian: &Array2<f64>,
     x: ArrayView2<f64>,
