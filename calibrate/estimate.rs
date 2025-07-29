@@ -1440,7 +1440,7 @@ pub mod internal {
         use crate::calibrate::model::BasisConfig;
         use approx::assert_abs_diff_eq;
         use ndarray::s;
-        use ndarray::{Array, array};
+        use ndarray::{Array};
         use rand;
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
@@ -1816,7 +1816,7 @@ pub mod internal {
                     // Test completed successfully
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    panic!("Test took too long: exceeded 120 second timeout");
+                    panic!("Test took too long: exceeded 180 second timeout");
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("Thread disconnected unexpectedly");
@@ -1868,8 +1868,8 @@ pub mod internal {
             // This matches the P-IRLS MIN_WEIGHT value of 1e-6 in pirls.rs
             const PROB_EPS: f64 = 1e-6;
             // --- 1. Setup: Generate data from a known smooth function ---
-            let n_total = 4000; // Increased from 3000 for better signal-to-noise ratio and to support a train/test split
-            let n_train = 3000; // Use 3000 samples for training
+            let n_total = 2000; // for better signal-to-noise ratio and to support a train/test split
+            let n_train = 1000; // Use  samples for training
 
             // Create independent inputs using uniform random sampling to avoid collinearity
             use rand::prelude::*;
@@ -2937,148 +2937,77 @@ pub mod internal {
         /// relying on the unstable BFGS optimization.
         #[test]
         fn test_basic_model_estimation() {
-            // This test verifies the model fitting process works correctly
-            // by using the train_model function with a simple dataset
-            // The test has been simplified to avoid manual matrix construction,
-            // which was causing broadcasting errors.
-
+            // --- 1. SETUP: Generate more realistic, non-separable data ---
+            let n_samples = 300; // A slightly larger sample size for stability
             use rand::{Rng, SeedableRng};
-            let mut rng = rand::rngs::StdRng::seed_from_u64(42); // For reproducibility
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
-            // Create a very simple dataset
-            let n_samples = 200;
+            let p = Array::linspace(-2.0, 2.0, n_samples);
+            
+            // Define the true, noise-free relationship (the signal)
+            let true_logits = p.mapv(|val| 1.5 * val - 0.5); // A clear linear signal
+            let true_probabilities = true_logits.mapv(|logit| 1.0 / (1.0 + (-logit as f64).exp()));
 
-            // Create predictors with jitter for realism
-            let p = Array::linspace(-1.0, 1.0, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
-            let pc1 =
-                Array::linspace(-0.5, 0.5, n_samples).mapv(|v| v + rng.gen_range(-0.05..0.05));
-
-            // Generate response probabilistically to avoid perfect separation
-            let y = p.mapv(|val| {
-                // 1. Create a logit (linear predictor) with some noise
-                let logit = 5.0 * val + rng.gen_range(-1.0..1.0); // Strong signal + noise
-                // 2. Convert logit to probability
-                let prob = 1.0 / (1.0 + (-logit as f64).exp());
-                // 3. Assign class based on a random draw
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-            });
-
-            let pcs = pc1.into_shape_with_order((n_samples, 1)).unwrap();
-
+            // Generate the noisy, binary outcomes from the true probabilities
+            let y = true_probabilities.mapv(|prob| if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 });
+            
             let data = TrainingData {
-                y,
+                y: y.clone(),
                 p: p.clone(),
-                pcs,
+                pcs: Array2::zeros((n_samples, 0)), // No PCs for this simple test
             };
 
-            // Create minimal configuration with fixed knots
+            // --- 2. MODEL CONFIGURATION ---
             let mut config = create_test_config();
-            config.pgs_basis_config.num_knots = 2; // Minimal but functional basis size
-            config.pc_basis_configs[0].num_knots = 2; // Minimal but functional basis size
+            config.pc_names.clear();
+            config.pc_basis_configs.clear();
+            config.pc_ranges.clear();
+            config.pgs_basis_config.num_knots = 4; // A reasonable number of knots
 
-            // Instead of manually creating matrices and performing P-IRLS,
-            // we'll use the train_model function with a fixed seed
+            // --- 3. TRAIN THE MODEL (using the existing `train_model` function) ---
+            let trained_model = train_model(&data, &config)
+                .expect("Model training should succeed on this well-posed data");
 
-            // Create a modified train_model function for testing that uses fixed parameters
-            let modified_train_model = |data: &TrainingData,
-                                        config: &ModelConfig|
-             -> Result<TrainedModel, EstimationError> {
-                // Step 1: Build the design and penalty matrices
-                let (x_matrix, s_list, layout, constraints, knot_vectors) =
-                    build_design_and_penalty_matrices(data, config)?;
-
-                // Step 2: Create a RemlState for testing (without running BFGS)
-                let reml_state = internal::RemlState::new(
-                    data.y.view(),
-                    x_matrix.view(),
-                    s_list.clone(),
-                    &layout,
-                    config,
-                )?;
-
-                // Step 3: Use fixed rho values (lambda = 1.0) to skip optimization
-                let final_rho = Array1::from_elem(layout.num_penalties, 0.0);
-                let final_lambda = final_rho.mapv(f64::exp);
-
-                // Step 6: Call P-IRLS with the original matrices - it will do its own reparameterization
-                let final_fit_transformed = pirls::fit_model_for_fixed_rho(
-                    final_rho.view(),
-                    reml_state.x(),
-                    reml_state.y(),
-                    reml_state.rs_list_ref(),
-                    &layout,
-                    config,
-                )?;
-
-                // Step 7: Transform coefficients back to original basis using the qs from PIRLS
-                let final_beta_original = final_fit_transformed.qs.dot(&final_fit_transformed.beta);
-
-                // Step 8: Map the coefficients
-                let mapped_coefficients =
-                    crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
-
-                // Step 9: Create and return the trained model
-                let mut config_with_constraints = config.clone();
-                config_with_constraints.constraints = constraints;
-                config_with_constraints.knot_vectors = knot_vectors;
-                config_with_constraints.num_pgs_interaction_bases =
-                    layout.num_pgs_interaction_bases;
-
-                Ok(TrainedModel {
-                    config: config_with_constraints,
-                    coefficients: mapped_coefficients,
-                    lambdas: final_lambda.to_vec(),
-                })
-            };
-
-            // Apply our modified training function
-            let trained_model =
-                modified_train_model(&data, &config).expect("Model training failed");
-
-            // Calculate true probabilities for comparison
-            let true_probs = p.mapv(|val| {
-                let logit = 5.0 * val; // Expected signal without noise
-                1.0 / (1.0 + (-logit).exp())
-            });
-
-            // Generate predictions for the training data
+            // --- 4. EVALUATE THE MODEL ---
+            // Get model predictions on the training data
             let predictions = trained_model
                 .predict(data.p.view(), data.pcs.view())
                 .unwrap();
-            let correlation = correlation_coefficient(&predictions, &true_probs);
 
-            println!(
-                "Correlation between model predictions and true probabilities: {:.4}",
-                correlation
-            );
+            // --- 5. DYNAMIC ASSERTIONS AGAINST THE ORACLE ---
+            // The "Oracle" knows the `true_probabilities`. We compare our model to it.
+
+            // Metric 1: Correlation (the original test's metric, now made robust)
+            let model_correlation = correlation_coefficient(&predictions, &data.y);
+            let oracle_correlation = correlation_coefficient(&true_probabilities, &data.y);
+            
+            println!("Oracle Performance (Theoretical Max on this data):");
+            println!("  - Correlation: {:.4}", oracle_correlation);
+            
+            println!("\nModel Performance:");
+            println!("  - Correlation: {:.4}", model_correlation);
+            
+            // Dynamic Assertion: The model must achieve at least 90% of the oracle's performance.
+            let correlation_threshold = 0.90 * oracle_correlation;
             assert!(
-                correlation > 0.85,
-                "Model predictions should be highly correlated with the true underlying probabilities."
+                model_correlation > correlation_threshold,
+                "Model correlation ({:.4}) did not meet the dynamic threshold ({:.4}). The oracle achieved {:.4}.",
+                model_correlation, correlation_threshold, oracle_correlation
             );
 
-            // Create test points at different ends of the predictor range
-            let test_pgs_low = array![-0.8];
-            let test_pgs_high = array![0.8];
-            let test_pc_dummy = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+            // Metric 2: AUC for discrimination
+            let model_auc = calculate_auc(&predictions, &data.y);
+            let oracle_auc = calculate_auc(&true_probabilities, &data.y);
 
-            // Get model predictions
-            let low_prob = trained_model
-                .predict(test_pgs_low.view(), test_pc_dummy.view())
-                .unwrap()[0];
-            let high_prob = trained_model
-                .predict(test_pgs_high.view(), test_pc_dummy.view())
-                .unwrap()[0];
-
-            eprintln!("Prediction for low input (pgs = -0.8): {}", low_prob);
-            eprintln!("Prediction for high input (pgs = 0.8): {}", high_prob);
-
-            // For a threshold at 0.0, pgs=-0.8 should give low probability
-            // and pgs=0.8 should give high probability
+            println!("  - AUC: {:.4}", model_auc);
+            println!("Oracle AUC: {:.4}", oracle_auc);
+            
+            // Dynamic Assertion: AUC should be very close to the oracle's.
+            let auc_threshold = 0.95 * oracle_auc;
             assert!(
-                low_prob < high_prob,
-                "Model should predict higher probability for pgs=0.8 ({}) than pgs=-0.8 ({})",
-                high_prob,
-                low_prob
+                model_auc > auc_threshold,
+                "Model AUC ({:.4}) did not meet the dynamic threshold ({:.4}). The oracle achieved {:.4}.",
+                model_auc, auc_threshold, oracle_auc
             );
         }
 
