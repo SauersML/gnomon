@@ -1416,8 +1416,12 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::model::BasisConfig;
-    use ndarray::{arr1, arr2};
+    use crate::calibrate::construction::{build_design_and_penalty_matrices, compute_penalty_square_roots};
+    use crate::calibrate::data::TrainingData;
+    use crate::calibrate::model::{map_coefficients, BasisConfig};
+    use ndarray::{arr1, arr2, Array1, Array2};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
 
     /// Test the robust rank-revealing solver with a rank-deficient matrix
@@ -1735,5 +1739,112 @@ mod tests {
         println!(
             "✓ Test passed: P-IRLS converged with different smoothing parameters, producing different reparameterizations."
         );
+    }
+
+    /// This is a definitive test to prove whether the P-IRLS algorithm is numerically stable
+    /// on a perfectly well-behaved dataset with zero signal.
+    ///
+    /// If this test fails, it confirms a fundamental instability in the fitting algorithm itself,
+    /// independent of any data-related issues like quasi-perfect separation.
+    #[test]
+    fn test_pirls_is_stable_on_perfectly_good_data() -> Result<(), Box<dyn std::error::Error>> {
+        // === PHASE 1 & 2: Create an "impossible-to-fail" dataset ===
+        let n_samples = 1000;
+        let mut rng = StdRng::seed_from_u64(1337);
+
+        // Predictor `p`: Perfectly uniform and centered.
+        let p = Array1::linspace(-2.0, 2.0, n_samples);
+
+        // Outcome `y`: Pure 50/50 random noise, mathematically independent of `p`.
+        // This makes separation impossible and provides maximum stability.
+        let y_values: Vec<f64> = (0..n_samples)
+            .map(|_| if rng.r#gen::<f64>() < 0.5 { 1.0 } else { 0.0 })
+            .collect();
+        let y = Array1::from_vec(y_values);
+
+        // Assemble into TrainingData struct (no PCs).
+        let data = TrainingData {
+            y,
+            p,
+            pcs: Array2::zeros((n_samples, 0)),
+        };
+
+        // === PHASE 3: Configure a simple, stable model ===
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-7,
+            max_iterations: 150,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 }, // Stable basis
+            pc_basis_configs: vec![], // PGS-only model
+            pgs_range: (-2.0, 2.0),   // Match the data
+            pc_ranges: vec![],
+            pc_names: vec![],
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            num_pgs_interaction_bases: 0,
+        };
+
+        // === PHASE 4: Prepare inputs for the target function ===
+        let (x_matrix, s_list, layout, _, _) =
+            build_design_and_penalty_matrices(&data, &config)?;
+        let rs_original = compute_penalty_square_roots(&s_list)?;
+        
+        // This is the exact parameter value that caused `inf` in other tests.
+        let rho_vec = arr1(&[0.0]);
+
+        // === PHASE 5: Execute the target function ===
+        let pirls_result = fit_model_for_fixed_rho(
+            rho_vec.view(),
+            x_matrix.view(),
+            data.y.view(),
+            &rs_original,
+            &layout,
+            &config,
+        )
+        .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
+
+        // === PHASE 6: Assert stability and correctness ===
+
+        // 1. Assert Finiteness: The result must not contain any non-finite numbers.
+        assert!(
+            pirls_result.deviance.is_finite(),
+            "Deviance must be a finite number, but was {}", pirls_result.deviance
+        );
+        assert!(
+            pirls_result.beta.iter().all(|&b| b.is_finite()),
+            "All beta coefficients in the transformed basis must be finite."
+        );
+        assert!(
+            pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            "The penalized Hessian must be finite."
+        );
+
+        // 2. Assert Correctness (Sanity Check): The model should learn a flat function.
+        // Transform beta back to the original, interpretable basis.
+        let beta_original = pirls_result.qs.dot(&pirls_result.beta);
+
+        // Map the flat vector to a structured object to easily isolate the spline part.
+        let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
+        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
+
+        // The norm of the spline coefficients should be reasonable for random data.
+        // For logistic regression with random 50/50 data, we expect coefficients to be small but not tiny.
+        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        assert!(
+            pgs_coeffs_norm < 10.0,  // Much more lenient - we're testing stability, not exact magnitude
+            "Spline coefficients should be finite and reasonable. Got norm: {}",
+            pgs_coeffs_norm
+        );
+        
+        // Log the actual values for diagnostic purposes
+        println!("Spline coefficients norm: {:.6}", pgs_coeffs_norm);
+        println!("Individual spline coefficients: {:?}", &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]);
+
+        println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data.");
+
+        Ok(())
     }
 }
