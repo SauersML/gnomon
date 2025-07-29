@@ -1424,6 +1424,103 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
 
+    // === Helper types for test refactoring ===
+    #[derive(Debug, Clone)]
+    enum SignalType {
+        NoSignal,       // Pure noise, expect coefficients near zero
+        LinearSignal,   // A clear linear trend the model should find
+    }
+
+    struct TestScenarioResult {
+        pirls_result: PirlsResult,
+        x_matrix: Array2<f64>,
+        layout: ModelLayout,
+        true_linear_predictor: Array1<f64>,
+    }
+
+    /// Calculates the Pearson correlation coefficient between two vectors.
+    fn calculate_correlation(v1: ArrayView1<f64>, v2: ArrayView1<f64>) -> f64 {
+        let mean1 = v1.mean().unwrap();
+        let mean2 = v2.mean().unwrap();
+
+        let centered1 = v1.mapv(|x| x - mean1);
+        let centered2 = v2.mapv(|x| x - mean2);
+
+        let numerator = centered1.dot(&centered2);
+        let denom = (centered1.dot(&centered1) * centered2.dot(&centered2)).sqrt();
+
+        if denom == 0.0 { 0.0 } else { numerator / denom }
+    }
+
+    /// A generic test runner for P-IRLS scenarios.
+    fn run_pirls_test_scenario(
+        link_function: LinkFunction,
+        signal_type: SignalType,
+    ) -> Result<TestScenarioResult, Box<dyn std::error::Error>> {
+        // --- 1. Data Generation ---
+        let n_samples = 1000;
+        let mut rng = StdRng::seed_from_u64(42);
+        let p = Array1::linspace(-2.0, 2.0, n_samples);
+
+        let (y, true_linear_predictor) = match link_function {
+            LinkFunction::Logit => {
+                let true_log_odds = match signal_type {
+                    SignalType::NoSignal => Array1::zeros(n_samples), // log_odds = 0 -> prob = 0.5
+                    SignalType::LinearSignal => &p * 1.5 - 0.5,
+                };
+                let y_values: Vec<f64> = true_log_odds.iter().map(|&log_odds| {
+                    let prob = 1.0 / (1.0 + (-log_odds as f64).exp());
+                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                }).collect();
+                (Array1::from_vec(y_values), true_log_odds)
+            },
+            LinkFunction::Identity => {
+                let true_mean = match signal_type {
+                    SignalType::NoSignal => Array1::zeros(n_samples), // Mean = 0
+                    SignalType::LinearSignal => &p * 1.5 + 0.5, // Different intercept for variety
+                };
+                let noise: Array1<f64> = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() - 0.5); // N(0, 1/12)
+                let y = &true_mean + &noise;
+                (y, true_mean)
+            }
+        };
+
+        let data = TrainingData { y, p, pcs: Array2::zeros((n_samples, 0)) };
+
+        // --- 2. Model Configuration ---
+        let config = ModelConfig {
+            link_function,
+            penalty_order: 2,
+            convergence_tolerance: 1e-7,
+            max_iterations: 150,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 },
+            pc_basis_configs: vec![],
+            pgs_range: (-2.0, 2.0),
+            pc_ranges: vec![], 
+            pc_names: vec![], 
+            constraints: HashMap::new(),
+            knot_vectors: HashMap::new(), 
+            num_pgs_interaction_bases: 0,
+        };
+
+        // --- 3. Run the Fit ---
+        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let rho_vec = arr1(&[0.0]);
+
+        let pirls_result = fit_model_for_fixed_rho(
+            rho_vec.view(), x_matrix.view(), data.y.view(),
+            &rs_original, &layout, &config,
+        )?;
+
+        // --- 4. Return all necessary components for assertion ---
+        Ok(TestScenarioResult {
+            pirls_result, x_matrix, layout,
+            true_linear_predictor,
+        })
+    }
+
     /// Test the robust rank-revealing solver with a rank-deficient matrix
     #[test]
     fn test_robust_solver_with_rank_deficient_matrix() {
@@ -1944,11 +2041,125 @@ mod tests {
             "Model should detect the clear signal, got coefficient norm: {}", pgs_coeffs_norm
         );
 
+        // === More principled test: Compare fitted vs true function ===
+        let predicted_log_odds = x_matrix.dot(&beta_original);
+        let true_log_odds = data.p.mapv(|p_val| -0.5 + 1.5 * p_val);
+
+        // Calculate correlation coefficient (scale-invariant measure)
+        let pred_mean = predicted_log_odds.mean().unwrap();
+        let true_mean = true_log_odds.mean().unwrap();
+        
+        let numerator = (&predicted_log_odds - pred_mean).dot(&(&true_log_odds - true_mean));
+        let pred_var = (&predicted_log_odds - pred_mean).mapv(|v| v.powi(2)).sum();
+        let true_var = (&true_log_odds - true_mean).mapv(|v| v.powi(2)).sum();
+        let correlation = numerator / (pred_var * true_var).sqrt();
+        
+        println!("Correlation between fitted and true function: {:.6}", correlation);
+        assert!(
+            correlation > 0.9, // Strong positive correlation expected
+            "The fitted function should strongly correlate with the true function. Correlation: {:.6}", correlation
+        );
+
         // Log diagnostics
         println!("Signal data - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
         println!("Signal data - Sample coefficients: {:?}", 
                 &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]);
         println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal");
+
+        Ok(())
+    }
+
+    /// Test that P-IRLS is stable and correct on ideal data with Identity link (Gaussian).
+    /// This verifies the algorithm converges and behaves correctly on easy data.
+    #[test]
+    fn test_pirls_is_stable_on_perfectly_good_data_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let result = run_pirls_test_scenario(LinkFunction::Identity, SignalType::NoSignal)?;
+
+        // === Assert stability ===
+        assert!(
+            result.pirls_result.deviance.is_finite(),
+            "Deviance must be finite, got: {}", result.pirls_result.deviance
+        );
+        assert!(
+            result.pirls_result.beta.iter().all(|&b| b.is_finite()),
+            "All beta coefficients must be finite"
+        );
+        assert!(
+            result.pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            "Penalized Hessian must be finite"
+        );
+
+        // === Assert that coefficients are small (no signal case) ===
+        let beta_original = result.pirls_result.qs.dot(&result.pirls_result.beta);
+        let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
+        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
+        
+        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        assert!(
+            pgs_coeffs_norm < 0.5, // Should be small for no-signal data
+            "With no signal, spline coeffs should be near zero. Norm: {}", pgs_coeffs_norm
+        );
+
+        // Log the actual values for diagnostic purposes
+        println!("Identity No Signal - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
+        println!("Identity No Signal - Individual spline coefficients: {:?}", &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]);
+
+        println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data with Identity link.");
+
+        Ok(())
+    }
+
+    /// Test that P-IRLS is stable and correctly learns from realistic data with a clear signal using Identity link.
+    /// This verifies the algorithm not only converges, but finds meaningful patterns when they exist.
+    #[test]
+    fn test_pirls_learns_realistic_signal_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let result = run_pirls_test_scenario(LinkFunction::Identity, SignalType::LinearSignal)?;
+
+        // === Assert stability (same as random data test) ===
+        assert!(
+            result.pirls_result.deviance.is_finite(),
+            "Deviance must be finite, got: {}", result.pirls_result.deviance
+        );
+        assert!(
+            result.pirls_result.beta.iter().all(|&b| b.is_finite()),
+            "All beta coefficients must be finite"
+        );
+        assert!(
+            result.pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            "Penalized Hessian must be finite"
+        );
+
+        // === Assert signal detection ===
+        // Transform back to interpretable basis
+        let beta_original = result.pirls_result.qs.dot(&result.pirls_result.beta);
+        let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
+        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
+        
+        // For data with a strong signal, coefficients should be substantial
+        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        assert!(
+            pgs_coeffs_norm > 0.5, // Should be much larger than random noise
+            "Model should detect the clear signal, got coefficient norm: {}", pgs_coeffs_norm
+        );
+
+        // === More principled test: Compare fitted vs true function ===
+        let predicted_linear_predictor = result.x_matrix.dot(&beta_original);
+        let correlation = calculate_correlation(
+            predicted_linear_predictor.view(),
+            result.true_linear_predictor.view(),
+        );
+        
+        println!("Correlation between fitted and true function: {:.6}", correlation);
+        assert!(
+            correlation > 0.9, // Strong positive correlation expected
+            "The fitted function should strongly correlate with the true function. Correlation: {:.6}", correlation
+        );
+
+        // Log diagnostics
+        println!("Identity Signal data - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
+        println!("Identity Signal data - Sample coefficients: {:?}", 
+                &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]);
+        println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal with Identity link");
 
         Ok(())
     }
