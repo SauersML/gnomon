@@ -511,9 +511,8 @@ pub mod internal {
             }
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
-            // Transform beta back to original basis for penalty calculations
-            // The pirls_result.beta is in the transformed basis defined by pirls_result.qs
-            let beta_original = pirls_result.qs.dot(&pirls_result.beta);
+            // The pirls_result.beta is already in the original basis (transformed back by pirls.rs)
+            let beta_original = &pirls_result.beta;
 
             // Build the penalty matrix S_lambda in the original basis
             let mut s_lambda_original =
@@ -964,13 +963,9 @@ pub mod internal {
             // the formula directly computes the cost gradient.
             let mut cost_gradient = Array1::zeros(lambdas.len());
 
-            let beta = &stable_pirls.beta; // This is beta in the transformed basis
+            let beta = &stable_pirls.beta; // This is beta in the ORIGINAL basis (already transformed back by pirls.rs)
             let n = self.y.len() as f64;
             let p_coeffs = beta.len() as f64;
-
-            // CRITICAL FIX: Transform the design matrix to the same basis as beta
-            // This ensures all calculations are done consistently in the transformed coordinate system
-            let x_transformed = self.x.dot(&stable_pirls.qs);
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
@@ -982,28 +977,25 @@ pub mod internal {
                     // Calculate scale parameter
                     let rss = stable_pirls.deviance;
 
-                    // FIX: Build penalty matrix in TRANSFORMED basis to match the Hessian
-                    let mut s_lambda_transformed =
+                    // Build penalty matrix S_lambda in the original basis (same as beta and Hessian)
+                    let mut s_lambda_original =
                         Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
                         // Get S_k in original basis
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
-                        // Transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed =
-                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
-                        s_lambda_transformed.scaled_add(lambdas[k], &s_k_transformed);
+                        s_lambda_original.scaled_add(lambdas[k], &s_k_original);
                     }
 
-                    // FIX: Compute penalty using beta in its native transformed basis
-                    let penalty = beta.dot(&s_lambda_transformed.dot(beta));
+                    // Compute penalty using beta in original basis
+                    let penalty = beta.dot(&s_lambda_original.dot(beta));
                     let dp = rss + penalty; // Penalized deviance
 
-                    // EDF calculation - FIX: Use transformed penalty matrix
+                    // EDF calculation using original basis matrices
                     let mut trace_h_inv_s_lambda = 0.0;
-                    for j in 0..s_lambda_transformed.ncols() {
-                        let s_col = s_lambda_transformed.column(j);
+                    for j in 0..s_lambda_original.ncols() {
+                        let s_col = s_lambda_original.column(j);
                         if let Ok(h_inv_col) = internal::robust_solve(
-                            &stable_pirls.penalized_hessian, // Use stabilized Hessian (already in transformed basis)
+                            &stable_pirls.penalized_hessian, // Use stabilized Hessian (in original basis)
                             &s_col.to_owned(),
                         ) {
                             trace_h_inv_s_lambda += h_inv_col[j];
@@ -1023,26 +1015,22 @@ pub mod internal {
 
                     // Pre-computation for the gradient of the unpenalized deviance (RSS)
                     // This is ∂D/∂β = -2 * Xᵀ(y - Xβ), which is needed for the chain rule.
-                    // FIX: Use transformed design matrix and beta (in transformed basis)
-                    let eta = x_transformed.dot(beta);
+                    // Use original design matrix with beta (both in original basis)
+                    let eta = self.x.dot(beta);
                     let residuals = &self.y() - &eta;
                     let deviance_grad_wrt_beta =
                         if self.config.link_function == LinkFunction::Identity {
                             Array1::zeros(beta.len())
                         } else {
-                            -2.0 * x_transformed.t().dot(&residuals)
+                            -2.0 * self.x.t().dot(&residuals)
                         };
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
-                        // FIX: Use transformed penalty matrix for consistent gradient calculation
-                        // First get S_k in original basis
+                        // Get S_k in original basis (same as beta)
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
-                        // Transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed =
-                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
-                        // Multiply by beta (already in transformed basis)
-                        let s_k_beta = s_k_transformed.dot(beta);
+                        // Multiply by beta (both in original basis)
+                        let s_k_beta = s_k_original.dot(beta);
 
                         // ---
                         // Component 1: Derivative of the Penalized Deviance
@@ -1062,11 +1050,10 @@ pub mod internal {
                         // Component 2: Derivative of the Penalized Hessian Determinant
                         // R/C Counterpart: `oo$trA1/2`
                         // ---
-                        // Calculate tr(H⁻¹ * S_k) using TRANSFORMED penalty matrix
-                        // We already computed s_k_transformed above, so reuse it
+                        // Calculate tr(H⁻¹ * S_k) using original basis penalty matrix
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_transformed.ncols() {
-                            let s_col = s_k_transformed.column(j);
+                        for j in 0..s_k_original.ncols() {
+                            let s_col = s_k_original.column(j);
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
@@ -1086,8 +1073,8 @@ pub mod internal {
                         // This is more complex without reparameterization, so we compute it directly
                         // ---
                         let log_det_s_grad_term = {
-                            // FIX: Compute pseudo-inverse of s_lambda in TRANSFORMED basis
-                            match s_lambda_transformed.svd(true, true) {
+                            // Compute pseudo-inverse of s_lambda in original basis
+                            match s_lambda_original.svd(true, true) {
                                 Ok((u, s_vals, vt)) => {
                                     let u = u.unwrap();
                                     let vt = vt.unwrap();
@@ -1101,9 +1088,9 @@ pub mod internal {
                                     let s_pinv_mat = Array2::from_diag(&s_pinv);
                                     let s_pseudo_inv = vt.t().dot(&s_pinv_mat).dot(&u.t());
 
-                                    // Compute tr(S^+ * S_k) using already-transformed S_k
+                                    // Compute tr(S^+ * S_k) using original basis S_k
                                     let trace_s_plus_s_k =
-                                        s_pseudo_inv.dot(&s_k_transformed).diag().sum();
+                                        s_pseudo_inv.dot(&s_k_original).diag().sum();
                                     lambdas[k] * trace_s_plus_s_k / 2.0
                                 }
                                 Err(_) => {
@@ -1134,8 +1121,8 @@ pub mod internal {
                     let solver = RobustSolver::new(&stable_pirls.penalized_hessian)?; // Use stabilized Hessian
 
                     // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
-                    // FIX: Use TRANSFORMED design matrix to match the transformed Hessian
-                    let rows: Vec<_> = x_transformed.axis_iter(Axis(0)).collect();
+                    // Use original design matrix (same basis as Hessian)
+                    let rows: Vec<_> = self.x.axis_iter(Axis(0)).collect();
                     let hat_diag_par: Vec<f64> = rows
                         .into_par_iter()
                         .map(|row| -> Result<f64, EstimationError> {
@@ -1148,8 +1135,8 @@ pub mod internal {
                     let hat_diag = Array1::from_vec(hat_diag_par);
 
                     // 2. Compute dW/dη, which depends on the link function.
-                    // FIX: Use TRANSFORMED design matrix and beta (already in transformed basis)
-                    let eta = x_transformed.dot(beta); // Consistent coordinate system
+                    // Use original design matrix and beta (both in original basis)
+                    let eta = self.x.dot(beta);
                     let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
                         self.y,
                         &eta,
@@ -1164,19 +1151,15 @@ pub mod internal {
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
-                        // FIX: Transform S_k to match the transformed basis
-                        // First, get S_k in the original basis
+                        // Get S_k in the original basis (same as beta and Hessian)
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
-                        // Then, transform it: S_k_transformed = Qsᵀ * S_k_original * Qs
-                        let s_k_transformed =
-                            stable_pirls.qs.t().dot(&s_k_original).dot(&stable_pirls.qs);
-                        // Now multiply by beta (which is already in transformed basis)
-                        let s_k_beta = s_k_transformed.dot(beta);
+                        // Multiply by beta (both in original basis)
+                        let s_k_beta = s_k_original.dot(beta);
                         let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
-                        // FIX: Use TRANSFORMED design matrix
-                        let eta1_k = x_transformed.dot(&dbeta_drho_k);
+                        // Use original design matrix
+                        let eta1_k = self.x.dot(&dbeta_drho_k);
 
                         // c. Calculate the weight derivative term: tr(H⁻¹ Xᵀ (∂W/∂ρₖ) X)
                         //    = sum(diag(X H⁻¹ Xᵀ) * diag(∂W/∂ρₖ))
@@ -1184,11 +1167,10 @@ pub mod internal {
                         let dwdrho_k_diag = &dw_deta * &eta1_k;
                         let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag);
 
-                        // d. Calculate tr(H⁻¹ * S_k) using TRANSFORMED penalty matrix
-                        // We already computed s_k_transformed above, so reuse it
+                        // d. Calculate tr(H⁻¹ * S_k) using original basis penalty matrix
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_transformed.ncols() {
-                            let s_col = s_k_transformed.column(j);
+                        for j in 0..s_k_original.ncols() {
+                            let s_col = s_k_original.column(j);
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
@@ -1201,21 +1183,17 @@ pub mod internal {
                         // cost_grad = -∇V_LAML
 
                         // Compute tr(S^+ * S_k) for the log|S| gradient term
-                        // FIX: Work in the transformed coordinate system
                         let log_det_s_grad_term = {
-                            // Build S_lambda in the TRANSFORMED basis
-                            let mut s_lambda_transformed =
+                            // Build S_lambda in the original basis
+                            let mut s_lambda_original =
                                 Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                             for j in 0..lambdas.len() {
                                 // Get S_j in original basis
                                 let s_j_original = self.rs_list[j].dot(&self.rs_list[j].t());
-                                // Transform it: S_j_transformed = Qsᵀ * S_j_original * Qs
-                                let s_j_transformed =
-                                    stable_pirls.qs.t().dot(&s_j_original).dot(&stable_pirls.qs);
-                                s_lambda_transformed.scaled_add(lambdas[j], &s_j_transformed);
+                                s_lambda_original.scaled_add(lambdas[j], &s_j_original);
                             }
 
-                            match s_lambda_transformed.svd(true, true) {
+                            match s_lambda_original.svd(true, true) {
                                 Ok((u, s_vals, vt)) => {
                                     let u = u.unwrap();
                                     let vt = vt.unwrap();
@@ -1229,8 +1207,8 @@ pub mod internal {
                                     let s_pinv_mat = Array2::from_diag(&s_pinv);
                                     let s_pseudo_inv = vt.t().dot(&s_pinv_mat).dot(&u.t());
 
-                                    // Compute tr(S^+ * S_k) using the already-transformed S_k
-                                    s_pseudo_inv.dot(&s_k_transformed).diag().sum()
+                                    // Compute tr(S^+ * S_k) using original basis S_k
+                                    s_pseudo_inv.dot(&s_k_original).diag().sum()
                                 }
                                 Err(_) => {
                                     log::warn!(
@@ -3565,6 +3543,14 @@ pub mod internal {
                 };
 
                 // Configure for a single penalized PC term
+                // NOTE: This actually creates a more complex model than y ~ 1 + f(x_vals):
+                // The model is: y ~ 1 + f(PGS=0) + f(PC=x_vals) + f(PGS_B1, PC=x_vals) + ... + f(PGS_B6, PC=x_vals)
+                // This happens because:
+                // 1. The PGS config creates an unpenalized "ghost" term f(PGS=0) 
+                // 2. The PC config creates the main penalized term f(PC=x_vals)
+                // 3. Interactions are created between each PGS basis function and the PC term
+                // The gradient test still works correctly since it validates analytical vs numerical
+                // gradients on this well-posed (though complex) model architecture.
                 let mut config = create_test_config();
                 config.link_function = link_function;
                 config.pc_names = vec!["test_smooth".to_string()];
