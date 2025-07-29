@@ -558,7 +558,7 @@ pub mod internal {
                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
                     // Use beta in original basis for penalty calculation
-                    let penalty = beta_original.dot(&s_lambda_original.dot(&beta_original));
+                    let penalty = beta_original.dot(&s_lambda_original.dot(beta_original));
                     let dp = rss + penalty; // Correct penalized deviance
 
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
@@ -636,7 +636,7 @@ pub mod internal {
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use beta in original basis for penalty calculation
                     let penalised_ll = -0.5 * pirls_result.deviance
-                        - 0.5 * beta_original.dot(&s_lambda_original.dot(&beta_original));
+                        - 0.5 * beta_original.dot(&s_lambda_original.dot(beta_original));
 
                     // Log-determinant of the penalty matrix - compute from original matrices
                     let (log_det_s, _) = compute_penalty_log_det_and_rank(&s_lambda_original)?;
@@ -687,7 +687,7 @@ pub mod internal {
                     println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
                     println!(
                         "  - Penalty Term (β'Sβ) : {:.6e}",
-                        beta_original.dot(&s_lambda_original.dot(&beta_original))
+                        beta_original.dot(&s_lambda_original.dot(beta_original))
                     );
                     println!("  - Penalized LogLik    : {penalised_ll:.6e}");
                     println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
