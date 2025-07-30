@@ -183,8 +183,13 @@ pub fn fit_model_for_fixed_rho(
         // The penalized least squares solver computes coefficient updates using a rank-revealing
         // QR decomposition with careful handling of potential rank deficiencies in the weighted
         // design matrix. It applies 5-stage numerical stability techniques following Wood (2011).
-        println!("[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares with penalty weight λ={:.4e}", 
-                 iter, last_deviance, lambdas[0]);
+        let penalty_info = if !lambdas.is_empty() {
+            format!("with penalty weight λ={:.4e}", lambdas[0])
+        } else {
+            "(no penalties)".to_string()
+        };
+        println!("[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares {}", 
+                 iter, last_deviance, penalty_info);
         
         // The logger outputs detailed matrix dimensions and timings for each sub-stage
         // of the solver, which helps identify potential numerical issues.
