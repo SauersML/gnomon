@@ -180,11 +180,13 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        // Entering the core solver for this iteration - this solver computes the optimal coefficients
-        // for the current linearized problem and handles all rank deficiency issues
+        // The penalized least squares solver computes coefficient updates using a rank-revealing
+        // QR decomposition with careful handling of potential rank deficiencies in the weighted
+        // design matrix. It applies 5-stage numerical stability techniques following Wood (2011).
         println!("[P-IRLS Loop Iter #{}] ==> Entering solver solve_penalized_least_squares...", iter);
         
-        // This log statement serves as a test of the logging system configuration
+        // The logger outputs detailed matrix dimensions and timings for each sub-stage
+        // of the solver, which helps identify potential numerical issues.
         log::debug!("[P-IRLS Loop Iter #{}] Logger configuration check: debug-level logs enabled", iter);
         
         // Use our robust solver that handles rank deficiency correctly
@@ -953,8 +955,12 @@ pub fn solve_penalized_least_squares(
     y: ArrayView1<f64>, // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
-    // This entry point confirmation indicates the solver function has been successfully reached
-    // and is beginning execution with the provided transformed data matrices
+    // The penalized least squares solver implements a 5-stage algorithm:
+    // 1. Pre-scaling to improve numerical conditioning
+    // 2. Initial QR decomposition of the weighted design matrix
+    // 3. Rank detection and removal of numerically unidentifiable coefficients
+    // 4. Second QR decomposition on the reduced system
+    // 5. Back-substitution and reconstruction of coefficients
     println!("[PLS Solver] ==> Top of solve_penalized_least_squares reached.");
     
     let function_timer = Instant::now();
@@ -1302,8 +1308,11 @@ pub fn solve_penalized_least_squares(
     log::debug!("[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]", stage5_timer.elapsed());
     log::debug!("[PLS Solver] Exiting. Total time: [{:.2?}]", function_timer.elapsed());
     
-    // This exit confirmation indicates the solver has completed all computations successfully
-    // and is about to return the computed coefficients and statistics
+    // At this point, the solver has completed:
+    // - Computing coefficient estimates (beta) for the current iteration
+    // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
+    // - Calculating effective degrees of freedom (model complexity measure)
+    // - Estimating the scale parameter (variance component for Gaussian models)
     println!("[PLS Solver] <== Bottom of solve_penalized_least_squares reached, about to return Ok.");
     
     // Return the result
