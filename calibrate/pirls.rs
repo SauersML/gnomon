@@ -1875,14 +1875,14 @@ mod tests {
         // The key test: directly check that the transformation matrices are different
         // This is the core behavior we want to verify - each set of smoothing parameters
         // should produce a different transformation matrix
-        let qs_diff = (&result1.qs - &result2.qs).mapv(|x| x.abs()).sum();
+        let qs_diff = (&result1.reparam_result.qs - &result2.reparam_result.qs).mapv(|x| x.abs()).sum();
         assert!(
             qs_diff > 1e-6,
             "The transformation matrices 'qs' should be different for different rho values"
         );
 
         // As a secondary check, confirm the coefficient estimates are also different
-        let beta_diff = (&result1.beta - &result2.beta).mapv(|x| x.abs()).sum();
+        let beta_diff = (&result1.beta_transformed - &result2.beta_transformed).mapv(|x| x.abs()).sum();
         assert!(
             beta_diff > 1e-6,
             "Expected different coefficient estimates for different rho values"
@@ -1976,17 +1976,17 @@ mod tests {
             "Deviance must be a finite number, but was {}", pirls_result.deviance
         );
         assert!(
-            pirls_result.beta.iter().all(|&b| b.is_finite()),
+            pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients in the transformed basis must be finite."
         );
         assert!(
-            pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
             "The penalized Hessian must be finite."
         );
 
         // 2. Assert Correctness (Sanity Check): The model should learn a flat function.
         // Transform beta back to the original, interpretable basis.
-        let beta_original = pirls_result.qs.dot(&pirls_result.beta);
+        let beta_original = pirls_result.reparam_result.qs.dot(&pirls_result.beta_transformed);
 
         // Map the flat vector to a structured object to easily isolate the spline part.
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
@@ -2075,17 +2075,17 @@ mod tests {
             "Deviance must be finite, got: {}", pirls_result.deviance
         );
         assert!(
-            pirls_result.beta.iter().all(|&b| b.is_finite()),
+            pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert signal detection (different from random data test) ===
         // Transform back to interpretable basis
-        let beta_original = pirls_result.qs.dot(&pirls_result.beta);
+        let beta_original = pirls_result.reparam_result.qs.dot(&pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
         
@@ -2136,16 +2136,16 @@ mod tests {
             "Deviance must be finite, got: {}", result.pirls_result.deviance
         );
         assert!(
-            result.pirls_result.beta.iter().all(|&b| b.is_finite()),
+            result.pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            result.pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            result.pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert that coefficients are small (no signal case) ===
-        let beta_original = result.pirls_result.qs.dot(&result.pirls_result.beta);
+        let beta_original = result.pirls_result.reparam_result.qs.dot(&result.pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
         
@@ -2176,17 +2176,17 @@ mod tests {
             "Deviance must be finite, got: {}", result.pirls_result.deviance
         );
         assert!(
-            result.pirls_result.beta.iter().all(|&b| b.is_finite()),
+            result.pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            result.pirls_result.penalized_hessian.iter().all(|&h| h.is_finite()),
+            result.pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert signal detection ===
         // Transform back to interpretable basis
-        let beta_original = result.pirls_result.qs.dot(&result.pirls_result.beta);
+        let beta_original = result.pirls_result.reparam_result.qs.dot(&result.pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
         
