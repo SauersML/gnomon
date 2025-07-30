@@ -1,4 +1,4 @@
-use crate::calibrate::construction::ModelLayout;
+use crate::calibrate::construction::{ModelLayout, ReparamResult};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
@@ -33,16 +33,27 @@ pub enum PirlsStatus {
 /// * `det1_s`: The stable derivative of log|S|+ w.r.t. rho.
 #[derive(Clone)]
 pub struct PirlsResult {
-    pub beta: Array1<f64>,
-    pub penalized_hessian: Array2<f64>,
+    // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
+    pub beta_transformed: Array1<f64>,
+    pub penalized_hessian_transformed: Array2<f64>,
+    
+    // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
+    
+    // NEW: The penalty term, calculated stably within P-IRLS
+    // This is beta_transformed' * S_transformed * beta_transformed
+    pub stable_penalty_term: f64,
+    
+    // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
+    
+    // Keep all other fields as they are
     pub status: PirlsStatus,
     pub iteration: usize,
     pub max_abs_eta: f64,
-    pub qs: Array2<f64>,
-    pub log_det_s: f64,
-    pub det1_s: Array1<f64>,
+    
+    // Pass through the entire reparameterization result for use in the gradient
+    pub reparam_result: ReparamResult,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -387,27 +398,20 @@ pub fn fit_model_for_fixed_rho(
                 result.penalized_hessian
             };
 
-            // At the end of the P-IRLS loop we always need to transform back to original basis
-            // This is exactly how mgcv works - all computation in the transformed space,
-            // transform back only at the very end
-            log::debug!("Unstable convergence: transforming coefficients back to original basis");
-            let beta_original = reparam_result.qs.dot(&beta_transformed);
-            let penalized_hessian = reparam_result
-                .qs
-                .dot(&penalized_hessian_transformed)
-                .dot(&reparam_result.qs.t());
+            // Calculate the stable penalty term using the transformed quantities
+            let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
+            // Populate the new PirlsResult struct with stable, transformed quantities
             return Ok(PirlsResult {
-                beta: beta_original,
-                penalized_hessian,
+                beta_transformed: beta_transformed.clone(),
+                penalized_hessian_transformed,
                 deviance: last_deviance,
+                stable_penalty_term,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
                 iteration: iter,
                 max_abs_eta,
-                qs: reparam_result.qs.clone(),
-                log_det_s: reparam_result.log_det,
-                det1_s: reparam_result.det1.clone(),
+                reparam_result: reparam_result.clone(),
             });
         }
 
@@ -480,20 +484,20 @@ pub fn fit_model_for_fixed_rho(
                     result.penalized_hessian
                 };
 
-                let beta_original = reparam_result.qs.dot(&beta_transformed);
-                let penalized_hessian = reparam_result.qs.dot(&penalized_hessian_transformed).dot(&reparam_result.qs.t());
-                
+                // Calculate the stable penalty term using the transformed quantities
+                let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+
+                // Populate the new PirlsResult struct with stable, transformed quantities
                 return Ok(PirlsResult {
-                    beta: beta_original,
-                    penalized_hessian,
+                    beta_transformed: beta_transformed.clone(),
+                    penalized_hessian_transformed,
                     deviance: last_deviance,
+                    stable_penalty_term,
                     final_weights: weights,
                     status: PirlsStatus::Converged,
                     iteration: iter,
                     max_abs_eta,
-                    qs: reparam_result.qs.clone(),
-                    log_det_s: reparam_result.log_det,
-                    det1_s: reparam_result.det1.clone(),
+                    reparam_result: reparam_result.clone(),
                 });
             }
         }
@@ -518,14 +522,8 @@ pub fn fit_model_for_fixed_rho(
         result.penalized_hessian
     };
 
-    // At the end, transform coefficients and Hessian back to original basis
-    // This follows mgcv exactly: work in transformed basis during iteration,
-    // transform back only at the end
-    let beta_original = reparam_result.qs.dot(&beta_transformed);
-    let penalized_hessian = reparam_result
-        .qs
-        .dot(&penalized_hessian_transformed)
-        .dot(&reparam_result.qs.t());
+    // Calculate the stable penalty term using the transformed quantities
+    let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
     log::warn!(
         "P-IRLS reached max iterations ({}) without convergence",
@@ -534,16 +532,15 @@ pub fn fit_model_for_fixed_rho(
 
     // Return with MaxIterationsReached status
     Ok(PirlsResult {
-        beta: beta_original,
-        penalized_hessian,
+        beta_transformed,
+        penalized_hessian_transformed,
         deviance: last_deviance,
+        stable_penalty_term,
         final_weights: weights,
         status: PirlsStatus::MaxIterationsReached,
         iteration: last_iter,
         max_abs_eta,
-        qs: reparam_result.qs.clone(),
-        log_det_s: reparam_result.log_det,
-        det1_s: reparam_result.det1.clone(),
+        reparam_result,
     })
 }
 

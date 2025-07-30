@@ -326,10 +326,10 @@ mod internal {
             } else {
                 // Search for the span in the relevant part of the knot vector.
                 // Can be optimized with binary search, but linear is fine and robust.
-                // BUGFIX: Changed >= to > to correctly handle the half-open interval [knots[span], knots[span+1])
-                // This ensures data points that fall exactly on a knot boundary are handled correctly.
+                // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
+                // The `>=` is crucial for correctly handling the half-open interval definition when x falls exactly on a knot.
                 let mut span = degree;
-                while span < num_basis && x_clamped > knots[span + 1] {
+                while span < num_basis && x_clamped >= knots[span + 1] {
                     span += 1;
                 }
                 span

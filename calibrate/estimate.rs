@@ -218,13 +218,13 @@ pub fn train_model(
         config,
     )?;
 
-    // The coefficients in final_fit.beta are already in the original basis.
-    // The pirls::fit_model_for_fixed_rho function handles the stable reparameterization 
-    // internally and transforms the coefficients back to the original basis before returning them.
+    // NEW STEP: Transform the final, optimal coefficients from the stable basis
+    // back to the original, interpretable basis.
+    let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
 
-    // Map the coefficients from the original basis.
+    // Now, map the coefficients from the original basis for user output.
     let mapped_coefficients =
-        crate::calibrate::model::map_coefficients(&final_fit.beta, &layout)?;
+        crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
@@ -493,13 +493,13 @@ pub mod internal {
             // Check indefiniteness BEFORE proceeding with cost calculation
             // Use Cholesky decomposition as it's fastest and fails if and only if matrix is not positive-definite
             if pirls_result
-                .penalized_hessian
+                .penalized_hessian_transformed
                 .cholesky(UPLO::Lower)
                 .is_err()
             {
                 // Cholesky failed, check eigenvalues to confirm indefiniteness
                 let eigenvals = pirls_result
-                    .penalized_hessian
+                    .penalized_hessian_transformed
                     .eigvals()
                     .map_err(EstimationError::EigendecompositionFailed)?;
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
@@ -523,17 +523,8 @@ pub mod internal {
             }
             lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
 
-            // The pirls_result.beta is already in the original basis (transformed back by pirls.rs)
-            let beta_original = &pirls_result.beta;
-
-            // Build the penalty matrix S_lambda in the original basis
-            let mut s_lambda_original =
-                Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
-            for k in 0..lambdas.len() {
-                // Reconstruct S_k from its square root: S_k = Rs_k * Rs_k^T
-                let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
-                s_lambda_original.scaled_add(lambdas[k], &s_k);
-            }
+            // Use stable penalty calculation - no need to reconstruct matrices
+            // The penalty term is already calculated stably in the P-IRLS loop
 
             match self.config.link_function {
                 LinkFunction::Identity => {
@@ -544,7 +535,7 @@ pub mod internal {
 
                     // Check condition number with improved thresholds per Wood (2011)
                     const MAX_CONDITION_NUMBER: f64 = 1e12; // More generous threshold
-                    match calculate_condition_number(&pirls_result.penalized_hessian) {
+                    match calculate_condition_number(&pirls_result.penalized_hessian_transformed) {
                         Ok(condition_number) => {
                             if condition_number > MAX_CONDITION_NUMBER {
                                 log::warn!(
@@ -565,28 +556,43 @@ pub mod internal {
                     }
 
                     let n = self.y.len() as f64;
-                    let p = pirls_result.beta.len() as f64;
+                    let p = pirls_result.beta_transformed.len() as f64;
 
                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
-                    // Use beta in original basis for penalty calculation
-                    let penalty = beta_original.dot(&s_lambda_original.dot(beta_original));
+                    // Use stable penalty term calculated in P-IRLS
+                    let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Correct penalized deviance
 
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
+                    // Need to build S_lambda for EDF calculation (not for penalty - that's stable)
+                    let mut s_lambda_original =
+                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    for k in 0..lambdas.len() {
+                        let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
+                        s_lambda_original.scaled_add(lambdas[k], &s_k);
+                    }
+                    
                     let mut trace_h_inv_s_lambda = 0.0;
-                    let s_lambda = &s_lambda_original;
-                    for j in 0..s_lambda.ncols() {
-                        let s_col = s_lambda.column(j);
+
+                    // NEW: Get the transformation matrix and transformed Hessian
+                    let qs = &pirls_result.reparam_result.qs;
+                    let hessian_transformed = &pirls_result.penalized_hessian_transformed;
+                    
+                    // NEW: Transform the Hessian back to the original basis for this calculation
+                    let hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
+                    
+                    for j in 0..s_lambda_original.ncols() {
+                        let s_col = s_lambda_original.column(j);
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
 
                         // Ensure matrix is positive definite before solving
-                        let mut hessian_work = pirls_result.penalized_hessian.clone();
+                        let mut hessian_work = hessian_original.clone(); // Use original basis Hessian
                         ensure_positive_definite(&mut hessian_work);
 
-                        match hessian_work.solve(&s_col.to_owned()) {
+                        match hessian_work.solve(&s_col.to_owned()) { // CORRECT: Both matrices are now in the original basis
                             Ok(h_inv_s_col) => {
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
                             }
@@ -607,14 +613,14 @@ pub mod internal {
                     }
 
                     // log |H| = log |X'X + S_λ|
-                    let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result.penalized_hessian_transformed.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             log::warn!(
                                 "Cholesky failed for penalized Hessian, using eigenvalue method"
                             );
                             let eigenvals = pirls_result
-                                .penalized_hessian
+                                .penalized_hessian_transformed
                                 .eigvals()
                                 .map_err(EstimationError::LinearSystemSolveFailed)?;
 
@@ -628,7 +634,7 @@ pub mod internal {
                     };
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
-                    let log_det_s_plus = pirls_result.log_det_s;
+                    let log_det_s_plus = pirls_result.reparam_result.log_det;
                     // rank calculation is implicitly handled by the stable reparameterization
                     let mp = (self.layout.total_coeffs - self.layout.num_penalties) as f64;
 
@@ -646,15 +652,14 @@ pub mod internal {
                     // For non-Gaussian GLMs, use the LAML approximation
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
-                    // Use beta in original basis for penalty calculation
-                    let penalised_ll = -0.5 * pirls_result.deviance
-                        - 0.5 * beta_original.dot(&s_lambda_original.dot(beta_original));
+                    // Use stable penalty term calculated in P-IRLS
+                    let penalised_ll = -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
                     // Log-determinant of the penalty matrix - use stable value from P-IRLS
-                    let log_det_s = pirls_result.log_det_s;
+                    let log_det_s = pirls_result.reparam_result.log_det;
 
                     // Log-determinant of the penalized Hessian.
-                    let log_det_h = match pirls_result.penalized_hessian.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result.penalized_hessian_transformed.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
@@ -663,7 +668,7 @@ pub mod internal {
                             );
 
                             let eigenvals = pirls_result
-                                .penalized_hessian
+                                .penalized_hessian_transformed
                                 .eigvals()
                                 .map_err(EstimationError::LinearSystemSolveFailed)?;
 
@@ -685,9 +690,14 @@ pub mod internal {
 
                     // Compute null space dimension using original penalty matrices
                     // Sum all the penalty matrices weighted by lambda
-                    let s_total: Array2<f64> = s_lambda_original.clone();
+                    let mut s_lambda_original =
+                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    for k in 0..lambdas.len() {
+                        let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
+                        s_lambda_original.scaled_add(lambdas[k], &s_k);
+                    }
 
-                    let rank = match s_total.svd(false, false) {
+                    let rank = match s_lambda_original.svd(false, false) {
                         Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
                         Err(_) => self.layout.total_coeffs, // fallback to full rank
                     };
@@ -699,14 +709,14 @@ pub mod internal {
                     println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
                     println!(
                         "  - Penalty Term (β'Sβ) : {:.6e}",
-                        beta_original.dot(&s_lambda_original.dot(beta_original))
+                        pirls_result.stable_penalty_term
                     );
                     println!("  - Penalized LogLik    : {penalised_ll:.6e}");
                     println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
                     println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
 
                     // Check if we used eigenvalues for the Hessian determinant
-                    let eigenvals = pirls_result.penalized_hessian.eigvals().ok();
+                    let eigenvals = pirls_result.penalized_hessian_transformed.eigvals().ok();
 
                     if let Some(eigs) = eigenvals {
                         let min_eig = eigs.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
@@ -927,9 +937,19 @@ pub mod internal {
             p: &Array1<f64>,
             pirls_result: &PirlsResult,
         ) -> Result<Array1<f64>, EstimationError> {
+            // --- Extract stable transformed quantities ---
+            let beta_transformed = &pirls_result.beta_transformed;
+            let hessian_transformed = &pirls_result.penalized_hessian_transformed;
+            let reparam_result = &pirls_result.reparam_result;
+            let qs = &reparam_result.qs;
+
+            // Transform the design matrix and get transformed penalty square roots
+            let x_transformed = self.x.dot(qs);
+            let rs_transformed = &reparam_result.rs_transformed;
+            
             // --- Proactive Hessian Stabilization ---
             // Create a mutable copy of the Hessian to work with.
-            let mut hessian = pirls_result.penalized_hessian.clone();
+            let mut hessian = hessian_transformed.clone();
 
             // Proactively check and stabilize the Hessian using the existing helper function.
             // This function returns true if any adjustments were made.
@@ -945,7 +965,7 @@ pub mod internal {
             // Let's check if we should return a retreat gradient instead
             if was_adjusted {
                 // Get the minimum eigenvalue to assess how problematic the original matrix was
-                if let Ok(eigenvals) = pirls_result.penalized_hessian.eigvals() {
+                if let Ok(eigenvals) = hessian_transformed.eigvals() {
                     let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
 
                     const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
@@ -962,10 +982,6 @@ pub mod internal {
                 }
             }
 
-            // Use the stabilized Hessian for subsequent calculations
-            let mut stable_pirls = pirls_result.clone();
-            stable_pirls.penalized_hessian = hessian;
-
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
 
@@ -975,9 +991,8 @@ pub mod internal {
             // the formula directly computes the cost gradient.
             let mut cost_gradient = Array1::zeros(lambdas.len());
 
-            let beta = &stable_pirls.beta; // This is beta in the ORIGINAL basis (already transformed back by pirls.rs)
             let n = self.y.len() as f64;
-            let p_coeffs = beta.len() as f64;
+            let p_coeffs = beta_transformed.len() as f64;
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
@@ -987,27 +1002,25 @@ pub mod internal {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
                     // Calculate scale parameter
-                    let rss = stable_pirls.deviance;
+                    let rss = pirls_result.deviance;
 
-                    // Build penalty matrix S_lambda in the original basis (same as beta and Hessian)
+                    // Use stable penalty term calculated in P-IRLS
+                    let penalty = pirls_result.stable_penalty_term;
+                    let dp = rss + penalty; // Penalized deviance
+
+                    // EDF calculation - need to rebuild penalty matrix for this calculation
                     let mut s_lambda_original =
                         Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
-                        // Get S_k in original basis
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
                         s_lambda_original.scaled_add(lambdas[k], &s_k_original);
                     }
-
-                    // Compute penalty using beta in original basis
-                    let penalty = beta.dot(&s_lambda_original.dot(beta));
-                    let dp = rss + penalty; // Penalized deviance
-
-                    // EDF calculation using original basis matrices
+                    
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
                         if let Ok(h_inv_col) = internal::robust_solve(
-                            &stable_pirls.penalized_hessian, // Use stabilized Hessian (in original basis)
+                            &hessian, // Use stabilized transformed Hessian
                             &s_col.to_owned(),
                         ) {
                             trace_h_inv_s_lambda += h_inv_col[j];
@@ -1027,8 +1040,8 @@ pub mod internal {
 
                     // Pre-computation for the gradient of the unpenalized deviance (RSS)
                     // This is ∂D/∂β = -2 * Xᵀ(y - Xβ), which is needed for the chain rule.
-                    // Use original design matrix with beta (both in original basis)
-                    let eta = self.x.dot(beta);
+                    // Use transformed design matrix with transformed beta
+                    let eta = x_transformed.dot(beta_transformed);
                     let residuals = &self.y() - &eta;
                     
                     // For the Gaussian/REML case, the gradient calculation is a direct application of the
@@ -1052,28 +1065,27 @@ pub mod internal {
                     // direct contribution from the penalty term, as prescribed by the theorem.
                     let deviance_grad_wrt_beta =
                         if self.config.link_function == LinkFunction::Identity {
-                            Array1::zeros(beta.len())
+                            Array1::zeros(beta_transformed.len())
                         } else {
-                            -2.0 * self.x.t().dot(&residuals)
+                            -2.0 * x_transformed.t().dot(&residuals)
                         };
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
-                        // Get S_k in original basis (same as beta)
-                        let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
-                        // Multiply by beta (both in original basis)
-                        let s_k_beta = s_k_original.dot(beta);
+                        // Use transformed penalty matrix (consistent with other calculations)
+                        let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
+                        let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
 
                         // ---
                         // Component 1: Derivative of the Penalized Deviance
                         // R/C Counterpart: `oo$D1/(2*scale*gamma)`
                         // ---
 
-                        let dbeta_drho_k = -lambdas[k]
-                            * internal::robust_solve(&stable_pirls.penalized_hessian, &s_k_beta)?;
+                        let dbeta_drho_k_transformed = -lambdas[k]
+                            * internal::robust_solve(&hessian, &s_k_beta_transformed)?;
 
-                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k);
-                        let d_penalty_d_rho_k = lambdas[k] * beta.dot(&s_k_beta);
+                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
+                        let d_penalty_d_rho_k = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
 
                         let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k; // Corresponds to oo$D1
                         let penalized_deviance_grad_term = d1 / (2.0 * scale);
@@ -1082,15 +1094,15 @@ pub mod internal {
                         // Component 2: Derivative of the Penalized Hessian Determinant
                         // R/C Counterpart: `oo$trA1/2`
                         // ---
-                        // Calculate tr(H⁻¹ * S_k) using original basis penalty matrix
+                        // Calculate tr(H⁻¹ * S_k) using transformed penalty matrix
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_original.ncols() {
-                            let s_col = s_k_original.column(j);
+                        for j in 0..s_k_transformed.ncols() {
+                            let s_col = s_k_transformed.column(j);
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
                             if let Ok(h_inv_col) = internal::robust_solve(
-                                &stable_pirls.penalized_hessian,
+                                &hessian,
                                 &s_col.to_owned(),
                             ) {
                                 trace_h_inv_s_k += h_inv_col[j];
@@ -1101,9 +1113,9 @@ pub mod internal {
 
                         // ---
                         // Component 3: Derivative of the Penalty Pseudo-Determinant
-                        // Use the stable derivative from P-IRLS (det1_s contains d/drho log|S|)
+                        // Use the stable derivative from P-IRLS reparameterization
                         // ---
-                        let log_det_s_grad_term = 0.5 * pirls_result.det1_s[k];
+                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
 
                         // ---
                         // Final Gradient Assembly for the MINIMIZER
@@ -1121,11 +1133,11 @@ pub mod internal {
                     log::debug!("Pre-computing for gradient calculation (LAML)...");
 
                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
-                    let solver = RobustSolver::new(&stable_pirls.penalized_hessian)?; // Use stabilized Hessian
+                    let solver = RobustSolver::new(&hessian)?; // Use stabilized transformed Hessian
 
                     // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
-                    // Use original design matrix (same basis as Hessian)
-                    let rows: Vec<_> = self.x.axis_iter(Axis(0)).collect();
+                    // Use transformed design matrix (same basis as Hessian)
+                    let rows: Vec<_> = x_transformed.axis_iter(Axis(0)).collect();
                     let hat_diag_par: Vec<f64> = rows
                         .into_par_iter()
                         .map(|row| -> Result<f64, EstimationError> {
@@ -1138,8 +1150,8 @@ pub mod internal {
                     let hat_diag = Array1::from_vec(hat_diag_par);
 
                     // 2. Compute dW/dη, which depends on the link function.
-                    // Use original design matrix and beta (both in original basis)
-                    let eta = self.x.dot(beta);
+                    // Use transformed design matrix and beta (both in transformed basis)
+                    let eta = x_transformed.dot(beta_transformed);
                     let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
                         self.y,
                         &eta,
@@ -1154,15 +1166,14 @@ pub mod internal {
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
-                        // Get S_k in the original basis (same as beta and Hessian)
-                        let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
-                        // Multiply by beta (both in original basis)
-                        let s_k_beta = s_k_original.dot(beta);
-                        let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
+                        // Use transformed penalty matrix (consistent with other calculations)
+                        let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
+                        let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
+                        let dbeta_drho_k_transformed = -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
-                        // Use original design matrix
-                        let eta1_k = self.x.dot(&dbeta_drho_k);
+                        // Use transformed design matrix
+                        let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
 
                         // c. Calculate the weight derivative term: tr(H⁻¹ Xᵀ (∂W/∂ρₖ) X)
                         //    = sum(diag(X H⁻¹ Xᵀ) * diag(∂W/∂ρₖ))
@@ -1170,10 +1181,10 @@ pub mod internal {
                         let dwdrho_k_diag = &dw_deta * &eta1_k;
                         let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag);
 
-                        // d. Calculate tr(H⁻¹ * S_k) using original basis penalty matrix
+                        // d. Calculate tr(H⁻¹ * S_k) using transformed penalty matrix
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_original.ncols() {
-                            let s_col = s_k_original.column(j);
+                        for j in 0..s_k_transformed.ncols() {
+                            let s_col = s_k_transformed.column(j);
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
@@ -1185,12 +1196,12 @@ pub mod internal {
                         // ∇V_LAML = 0.5 * (λₖ * tr(S⁺Sₖ) - λₖ * tr(H⁻¹Sₖ) - weight_deriv_term)
                         // cost_grad = -∇V_LAML
 
-                        // Use the stable gradient from P-IRLS
-                        // det1_s[k] contains d/drho log|S| for the k-th smoothing parameter
+                        // Use the stable gradient from P-IRLS reparameterization
+                        // reparam_result.det1[k] contains d/drho log|S| for the k-th smoothing parameter
                         // The LAML gradient formula needs -0.5 * d/drho log|S|
                         cost_gradient[k] = 0.5 * lambdas[k] * trace_h_inv_s_k
                             + 0.5 * weight_deriv_term
-                            - 0.5 * pirls_result.det1_s[k];
+                            - 0.5 * pirls_result.reparam_result.det1[k];
                     }
                     log::debug!("LAML gradient computation finished.");
                 }
