@@ -1016,11 +1016,14 @@ pub mod internal {
                         s_lambda_original.scaled_add(lambdas[k], &s_k_original);
                     }
                     
+                    // Transform Hessian back to original basis for this calculation
+                    let hessian_original = qs.dot(&hessian).dot(&qs.t());
+                    
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
                         if let Ok(h_inv_col) = internal::robust_solve(
-                            &hessian, // Use stabilized transformed Hessian
+                            &hessian_original, // Use original basis Hessian
                             &s_col.to_owned(),
                         ) {
                             trace_h_inv_s_lambda += h_inv_col[j];
