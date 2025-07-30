@@ -1030,6 +1030,26 @@ pub mod internal {
                     // Use original design matrix with beta (both in original basis)
                     let eta = self.x.dot(beta);
                     let residuals = &self.y() - &eta;
+                    
+                    // For the Gaussian/REML case, the gradient calculation is a direct application of the
+                    // Envelope Theorem. The inner P-IRLS loop minimizes the penalized deviance 
+                    // `D_p(β, ρ) = ||y - Xβ||² + β'S(ρ)β` by choosing optimal coefficients `β*` for a
+                    // fixed set of log-smoothing parameters `ρ`.
+                    //
+                    // The Envelope Theorem (see Wainwright, 2004; Nachbar, 2023) states that the
+                    // derivative of the optimized objective function with respect to a parameter (`ρ`) equals
+                    // the partial derivative of the objective function with respect to that parameter, holding
+                    // the choice variables (`β`) fixed at their optimal values. All indirect effects, which
+                    // arise from how `β*` changes with `ρ`, sum to zero.
+                    //
+                    // In our case, the unpenalized deviance `||y - Xβ||²` does not directly depend on `ρ`. The only
+                    // direct dependence is within the penalty term `S(ρ)`. Therefore, the gradient of the
+                    // penalized deviance component of the REML score is simply the partial derivative of the
+                    // penalty term: `∂(β'S(ρ)β)/∂ρ`.
+                    //
+                    // This code correctly implements this result. By setting `deviance_grad_wrt_beta` to zero,
+                    // the `d1` calculation for the penalized deviance derivative correctly isolates only the
+                    // direct contribution from the penalty term, as prescribed by the theorem.
                     let deviance_grad_wrt_beta =
                         if self.config.link_function == LinkFunction::Identity {
                             Array1::zeros(beta.len())
