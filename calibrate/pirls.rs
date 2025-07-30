@@ -98,8 +98,14 @@ pub fn fit_model_for_fixed_rho(
              reparam_result.s_transformed.sum(),
              reparam_result.log_det);
 
+    println!("[Matrix Multiply] ==> Performing x.dot(qs) | x.shape: {:?}, qs.shape: {:?}",
+            x.shape(), reparam_result.qs.shape());
+
     // Step 3: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
+    
+    println!("[Matrix Multiply] <== x.dot(qs) complete. x_transformed_sum: {:.4e}",
+            x_transformed.sum());
 
     // Step 4: Get the transformed penalty matrices
     let s_transformed = &reparam_result.s_transformed;
@@ -174,6 +180,10 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
+        println!("[P-IRLS Loop Iter #{}] ==> Entering solver solve_penalized_least_squares...", iter);
+        
+        log::debug!("[P-IRLS Loop Iter #{}] DEBUG CHECK: This should print if debug logs are enabled.", iter);
+        
         // Use our robust solver that handles rank deficiency correctly
         let stable_result = solve_penalized_least_squares(
             x_transformed.view(), // Pass transformed x
@@ -940,6 +950,8 @@ pub fn solve_penalized_least_squares(
     y: ArrayView1<f64>, // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
+    println!("[PLS Solver] ==> Top of solve_penalized_least_squares reached.");
+    
     let function_timer = Instant::now();
     log::debug!(
         "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), e=({}x{})",
@@ -1284,6 +1296,8 @@ pub fn solve_penalized_least_squares(
     
     log::debug!("[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]", stage5_timer.elapsed());
     log::debug!("[PLS Solver] Exiting. Total time: [{:.2?}]", function_timer.elapsed());
+    
+    println!("[PLS Solver] <== Bottom of solve_penalized_least_squares reached, about to return Ok.");
     
     // Return the result
     Ok((
