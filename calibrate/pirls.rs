@@ -183,7 +183,8 @@ pub fn fit_model_for_fixed_rho(
         // The penalized least squares solver computes coefficient updates using a rank-revealing
         // QR decomposition with careful handling of potential rank deficiencies in the weighted
         // design matrix. It applies 5-stage numerical stability techniques following Wood (2011).
-        println!("[P-IRLS Loop Iter #{}] ==> Entering solver solve_penalized_least_squares...", iter);
+        println!("[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares with penalty weight λ={:.4e}", 
+                 iter, last_deviance, lambdas[0]);
         
         // The logger outputs detailed matrix dimensions and timings for each sub-stage
         // of the solver, which helps identify potential numerical issues.
@@ -961,7 +962,8 @@ pub fn solve_penalized_least_squares(
     // 3. Rank detection and removal of numerically unidentifiable coefficients
     // 4. Second QR decomposition on the reduced system
     // 5. Back-substitution and reconstruction of coefficients
-    println!("[PLS Solver] ==> Top of solve_penalized_least_squares reached.");
+    println!("[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} penalty matrix", 
+             x_transformed.nrows(), x_transformed.ncols(), e.nrows(), e.ncols());
     
     let function_timer = Instant::now();
     log::debug!(
@@ -1313,7 +1315,8 @@ pub fn solve_penalized_least_squares(
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
-    println!("[PLS Solver] <== Bottom of solve_penalized_least_squares reached, about to return Ok.");
+    println!("[PLS Solver] Completed with edf={:.2f}, scale={:.4e}, rank={}/{}", 
+             stable_result.edf, stable_result.scale, rank, x_transformed.ncols());
     
     // Return the result
     Ok((
