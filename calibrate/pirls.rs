@@ -238,6 +238,18 @@ pub fn fit_model_for_fixed_rho(
         let mut penalized_deviance_trial = deviance_trial + penalty_trial;
         let mut deviance_decreased = penalized_deviance_trial <= penalized_deviance_current;
 
+        if iter > 45 {
+            eprintln!("\n[DEBUG STEP-HALVING | Iter #{}", iter);
+            eprintln!("  - Penalized Deviance (Current): {:.16e}", penalized_deviance_current);
+            eprintln!("  - Penalized Deviance (Trial):   {:.16e}", penalized_deviance_trial);
+            let diff = penalized_deviance_trial - penalized_deviance_current;
+            eprintln!("  - Difference (Trial - Current): {:.16e}", diff);
+            eprintln!("  - Deviance Decreased Flag: {}", deviance_decreased);
+            if !deviance_decreased && diff > 0.0 {
+                eprintln!("  - >>> TRIGGERING STEP-HALVING due to a positive difference of {:.16e}", diff);
+            }
+        }
+
         // Enhanced debugging for the failing test
         log::debug!(
             "P-IRLS Iteration #{}: Starting values check | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}",
@@ -329,6 +341,11 @@ pub fn fit_model_for_fixed_rho(
 
         // Update all state variables atomically
         beta_transformed = beta_trial;
+        
+        // Print beta norm to track coefficient growth
+        let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
+        println!("[P-IRLS State] Beta Norm: {:.6e}", beta_norm);
+        
         eta = eta_trial;
         last_deviance = deviance_trial;
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
@@ -389,60 +406,10 @@ pub fn fit_model_for_fixed_rho(
             });
         }
 
-        // Calculate the penalized deviance change for convergence check
-        // Use the transformed total penalty matrix for the penalty calculation
+        // Calculate the penalized deviance using the transformed penalty matrix
         let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
         let penalized_deviance_new = last_deviance + penalty_new;
-        let deviance_change = (penalized_deviance_current - penalized_deviance_new).abs();
-
-        // Calculate the gradient of the penalized deviance objective function
-        // The correct formula is: 2 * (X' * W * (eta - z) + S_λ * beta)
-        let eta_minus_z = &eta - &z;
-        let w_times_diff = &weights * &eta_minus_z;
-        let deviance_gradient_part = x_transformed.t().dot(&w_times_diff);
-
-        // Use s_transformed for the penalty gradient term
-        let penalty_gradient_part = s_transformed.dot(&beta_transformed);
-
-        // Form the gradient of the penalized deviance objective function
-        let penalized_deviance_gradient =
-            &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
-
-        // Calculate the infinity norm (maximum absolute element)
-        let gradient_norm = penalized_deviance_gradient
-            .iter()
-            .map(|&x| x.abs())
-            .fold(0.0, f64::max);
-
-        // Log iteration info
-        log::debug!(
-            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e} | Gradient: {:>12.6e}{}",
-            iter,
-            penalized_deviance_new,
-            deviance_change,
-            gradient_norm,
-            if step_halving_count > 0 {
-                format!(" | Step Halving: {} attempts", step_halving_count)
-            } else {
-                String::new()
-            }
-        );
-
-        // Check for non-finite deviance change
-        if !deviance_change.is_finite() {
-            log::error!(
-                "Non-finite penalized deviance change at iteration {iter}: {deviance_change}"
-            );
-            return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: config.max_iterations,
-                last_change: if deviance_change.is_nan() {
-                    f64::NAN
-                } else {
-                    f64::INFINITY
-                },
-            });
-        }
-
+        
         // Set scale parameter based on link function
         let scale = match config.link_function {
             LinkFunction::Logit => 1.0,
@@ -455,77 +422,74 @@ pub fn fit_model_for_fixed_rho(
                 residuals.dot(&residuals) / df
             }
         };
-
-        // Comprehensive convergence check as in mgcv
-        // 1. The gradient has already been calculated above, no need to recompute
-
-        // 2. The change in penalized deviance is small
-        let deviance_converged = deviance_change < config.convergence_tolerance;
-
-        // 3. AND the gradient is close to zero (using scaled tolerance)
-        // This is the mgcv approach: grad_tol = ε½ * max(scale, PDev)
-        // where ε½ is sqrt(machine epsilon) and PDev is penalized deviance
-        let gradient_tol = f64::EPSILON.sqrt() * f64::max(scale.abs(), penalized_deviance_new.abs());
-        let gradient_converged = gradient_norm < gradient_tol;
-
-        // Both criteria must be met for convergence AND we must have completed minimum iterations
-        let converged = iter >= min_iterations && deviance_converged && gradient_converged;
-
-        if converged {
-            log::info!(
-                "P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.",
-                deviance_change,
-                gradient_norm
-            );
-
-            // Use the saved stable result to avoid redundant computation
-            let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
-                // Use the Hessian from the last stable solve
-                result.penalized_hessian.clone()
+        
+        // This scaling factor is the key to mgcv's numerical stability.
+        // It prevents the tolerance from collapsing when the deviance is small.
+        let convergence_scale = scale.abs() + penalized_deviance_new.abs();
+        let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
+        
+        // Log iteration info
+        log::debug!(
+            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
+            iter,
+            penalized_deviance_new,
+            deviance_change_scaled,
+            if step_halving_count > 0 {
+                format!(" | Step Halving: {} attempts", step_halving_count)
             } else {
-                // This should never happen, but as a fallback, compute the Hessian
-                log::warn!("No stable result saved, computing Hessian as fallback");
-                let (result, rank) = solve_penalized_least_squares(
-                    x_transformed.view(),
-                    z.view(),
-                    weights.view(),
-                    &e,
-                    y.view(),
-                    config.link_function,
-                )?;
-                log::trace!("Fallback solve rank: {}", rank);
-                result.penalized_hessian
-            };
+                String::new()
+            }
+        );
+        
+        // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
+        if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
+            
+            // If deviance has converged, we must ALSO check that the gradient is small.
+            let deviance_gradient_part = x_transformed.t().dot(&(&weights * (&eta - &z)));
+            let penalty_gradient_part = s_transformed.dot(&beta_transformed);
+            let penalized_deviance_gradient = &deviance_gradient_part + &penalty_gradient_part;
+            let gradient_norm = penalized_deviance_gradient.iter().map(|&x| x.abs()).fold(0.0, f64::max);
 
-            // At convergence, transform the coefficients and Hessian back to the original basis
-            // This follows mgcv exactly: work in the transformed basis during iteration,
-            // transform back only at the very end
-            let beta_original = reparam_result.qs.dot(&beta_transformed);
+            // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
+            // and uses the user's epsilon, not machine epsilon.
+            let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
 
-            // Transform the Hessian back to the original basis: H_orig = Qs * H_transformed * Qs^T
-            let penalized_hessian = reparam_result
-                .qs
-                .dot(&penalized_hessian_transformed)
-                .dot(&reparam_result.qs.t());
+            println!("[P-IRLS Check] Deviance Change: {:.6e} | Gradient Norm: {:.6e} | Tolerance: {:.6e}",
+                     deviance_change_scaled, gradient_norm, gradient_tol);
 
-            log::info!(
-                "P-IRLS converged after {} iterations with deviance {:.6e}",
-                iter,
-                last_deviance
-            );
+            if gradient_norm < gradient_tol && iter >= min_iterations {
+                // SUCCESS: Both deviance and gradient have converged.
+                log::info!(
+                    "P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.",
+                    deviance_change_scaled,
+                    gradient_norm
+                );
+                
+                let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
+                    result.penalized_hessian.clone()
+                } else {
+                    let (result, _) = solve_penalized_least_squares(
+                        x_transformed.view(), z.view(), weights.view(), &e, y.view(), config.link_function
+                    )?;
+                    result.penalized_hessian
+                };
 
-            return Ok(PirlsResult {
-                beta: beta_original,
-                penalized_hessian,
-                deviance: last_deviance,
-                final_weights: weights,
-                status: PirlsStatus::Converged,
-                iteration: iter,
-                max_abs_eta,
-                qs: reparam_result.qs.clone(),
-                log_det_s: reparam_result.log_det,
-                det1_s: reparam_result.det1.clone(),
-            });
+                let beta_original = reparam_result.qs.dot(&beta_transformed);
+                let penalized_hessian = reparam_result.qs.dot(&penalized_hessian_transformed).dot(&reparam_result.qs.t());
+                
+                return Ok(PirlsResult {
+                    beta: beta_original,
+                    penalized_hessian,
+                    deviance: last_deviance,
+                    final_weights: weights,
+                    status: PirlsStatus::Converged,
+                    iteration: iter,
+                    max_abs_eta,
+                    qs: reparam_result.qs.clone(),
+                    log_det_s: reparam_result.log_det,
+                    det1_s: reparam_result.det1.clone(),
+                });
+            }
         }
     }
 
@@ -1315,8 +1279,8 @@ pub fn solve_penalized_least_squares(
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
-    println!("[PLS Solver] Completed with edf={:.2f}, scale={:.4e}, rank={}/{}", 
-             stable_result.edf, stable_result.scale, rank, x_transformed.ncols());
+    println!("[PLS Solver] Completed with edf={:.2}, scale={:.4e}, rank={}/{}", 
+             edf, scale, rank, x_transformed.ncols());
     
     // Return the result
     Ok((
