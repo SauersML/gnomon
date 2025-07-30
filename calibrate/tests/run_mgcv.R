@@ -14,16 +14,17 @@ data <- read.csv(input_csv_file)
 
 
 # --- 3. Define and Fit the GAM ---
-# - variable_one: unpenalized (fx=TRUE), cubic (default), 8 knots (k=4)
-# - variable_two: penalized, cubic (default), 8 knots (k=4)
-# - interaction: penalized, cubic (default), 8 knots for each marginal (k=c(4,4))
+# - variable_one: unpenalized (fx=TRUE), cubic (default), 8 INTERNAL knots (k=6)
+# - variable_two: penalized, cubic (default), 8 INTERNAL knots (k=6)
+# - interaction: penalized, cubic (default), 8 INTERNAL knots for each marginal (k=c(6,6))
 #
-# Note on knots: For bs="ps" with degree=3, number of knots = k + 4.
-# Therefore, to get 8 knots, k must be 4.
+# Note on knots: For bs="ps" with degree=3, number of internal knots = k - degree + 1.
+# Therefore, to get 8 internal knots, k must be 6.
+# This results in 10 total unique knot locations (2 boundary + 8 internal).
 
-gam_formula <- outcome ~ s(variable_one, bs = "ps", k = 4, fx = TRUE) +
-                           s(variable_two, bs = "ps", k = 4) +
-                           ti(variable_one, variable_two, bs = c("ps", "ps"), k = c(4, 4))
+gam_formula <- outcome ~ s(variable_one, bs = "ps", k = 6, fx = TRUE) +
+                           s(variable_two, bs = "ps", k = 6) +
+                           ti(variable_one, variable_two, bs = c("ps", "ps"), k = c(6, 6))
 
 cat("Fitting the GAM... This may take a moment.\n")
 # Fit the model using REML for smoothness selection
