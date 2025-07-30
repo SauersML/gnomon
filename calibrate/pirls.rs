@@ -447,7 +447,8 @@ pub fn fit_model_for_fixed_rho(
             // If deviance has converged, we must ALSO check that the gradient is small.
             let deviance_gradient_part = x_transformed.t().dot(&(&weights * (&eta - &z)));
             let penalty_gradient_part = s_transformed.dot(&beta_transformed);
-            let penalized_deviance_gradient = &deviance_gradient_part + &penalty_gradient_part;
+            // CORRECTED: Reinstate the factor of 2 to match mgcv and the math
+            let penalized_deviance_gradient = &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
             let gradient_norm = penalized_deviance_gradient.iter().map(|&x| x.abs()).fold(0.0, f64::max);
 
             // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
