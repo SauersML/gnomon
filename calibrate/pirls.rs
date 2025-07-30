@@ -3,6 +3,7 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use std::time::Instant;
 
 /// The status of the P-IRLS convergence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub enum PirlsStatus {
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
 /// * `final_weights`: The final IRLS weights at convergence.
 /// * `qs`: The transformation matrix that was used internally for stable reparameterization.
+/// * `log_det_s`: The stable log|S|+ from reparameterization.
+/// * `det1_s`: The stable derivative of log|S|+ w.r.t. rho.
 #[derive(Clone)]
 pub struct PirlsResult {
     pub beta: Array1<f64>,
@@ -38,6 +41,8 @@ pub struct PirlsResult {
     pub iteration: usize,
     pub max_abs_eta: f64,
     pub qs: Array2<f64>,
+    pub log_det_s: f64,
+    pub det1_s: Array1<f64>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -84,7 +89,9 @@ pub fn fit_model_for_fixed_rho(
     log::info!("Computing stable reparameterization for numerical stability");
 
     use crate::calibrate::construction::stable_reparameterization;
+    println!("[Reparam] ==> Entering stable_reparameterization...");
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+    println!("[Reparam] <== Exited stable_reparameterization successfully.");
 
     // Step 3: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
@@ -325,7 +332,7 @@ pub fn fit_model_for_fixed_rho(
             } else {
                 // This should never happen, but as a fallback, compute the Hessian
                 log::warn!("No stable result saved, computing Hessian as fallback");
-                let (result, _rank) = solve_penalized_least_squares(
+                let (result, rank) = solve_penalized_least_squares(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
@@ -333,6 +340,7 @@ pub fn fit_model_for_fixed_rho(
                     y.view(),
                     config.link_function,
                 )?;
+                log::trace!("Fallback solve rank: {}", rank);
                 result.penalized_hessian
             };
 
@@ -355,6 +363,8 @@ pub fn fit_model_for_fixed_rho(
                 iteration: iter,
                 max_abs_eta,
                 qs: reparam_result.qs.clone(),
+                log_det_s: reparam_result.log_det,
+                det1_s: reparam_result.det1.clone(),
             });
         }
 
@@ -454,7 +464,7 @@ pub fn fit_model_for_fixed_rho(
             } else {
                 // This should never happen, but as a fallback, compute the Hessian
                 log::warn!("No stable result saved, computing Hessian as fallback");
-                let (result, _rank) = solve_penalized_least_squares(
+                let (result, rank) = solve_penalized_least_squares(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
@@ -462,6 +472,7 @@ pub fn fit_model_for_fixed_rho(
                     y.view(),
                     config.link_function,
                 )?;
+                log::trace!("Fallback solve rank: {}", rank);
                 result.penalized_hessian
             };
 
@@ -491,6 +502,8 @@ pub fn fit_model_for_fixed_rho(
                 iteration: iter,
                 max_abs_eta,
                 qs: reparam_result.qs.clone(),
+                log_det_s: reparam_result.log_det,
+                det1_s: reparam_result.det1.clone(),
             });
         }
     }
@@ -508,8 +521,9 @@ pub fn fit_model_for_fixed_rho(
     } else {
         // This should never happen, but as a fallback, compute the Hessian
         log::warn!("No stable result saved, computing Hessian as fallback");
-        let (result, _rank) =
+        let (result, rank) =
             solve_penalized_least_squares(x_transformed.view(), z.view(), weights.view(), &e, y.view(), config.link_function)?;
+        log::trace!("Final solve rank: {}", rank);
         result.penalized_hessian
     };
 
@@ -537,6 +551,8 @@ pub fn fit_model_for_fixed_rho(
         iteration: last_iter,
         max_abs_eta,
         qs: reparam_result.qs.clone(),
+        log_det_s: reparam_result.log_det,
+        det1_s: reparam_result.det1.clone(),
     })
 }
 
@@ -583,8 +599,8 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
         return 1.0;
     }
     // r_rows is used for proper stride calculation when accessing R elements
-    // Not using r_rows in this function currently
-    let _r_rows = r_matrix.nrows();
+    let r_rows = r_matrix.nrows();
+    log::trace!("R matrix rows: {}", r_rows);
 
     let mut y: Array1<f64> = Array1::zeros(c);
     let mut p: Array1<f64> = Array1::zeros(c);
@@ -919,6 +935,15 @@ pub fn solve_penalized_least_squares(
     y: ArrayView1<f64>, // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
+    let function_timer = Instant::now();
+    log::debug!(
+        "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), e=({}x{})",
+        x_transformed.nrows(),
+        x_transformed.ncols(),
+        e.nrows(),
+        e.ncols()
+    );
+
     use ndarray::s;
 
     // Define rank tolerance, matching mgcv's default
@@ -948,6 +973,9 @@ pub fn solve_penalized_least_squares(
     // STAGE 1: Initial QR decomposition of weighted design matrix
     //-----------------------------------------------------------------------
     
+    let stage1_timer = Instant::now();
+    log::debug!("[PLS Solver] Stage 1/5: Starting initial QR on weighted design matrix...");
+    
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
     let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative
     let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
@@ -971,9 +999,14 @@ pub fn solve_penalized_least_squares(
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(&wz);
     
+    log::debug!("[PLS Solver] Stage 1/5: Initial QR complete. [{:.2?}]", stage1_timer.elapsed());
+    
     //-----------------------------------------------------------------------
     // STAGE 2: Rank determination using scaled augmented system
     //-----------------------------------------------------------------------
+    
+    let stage2_timer = Instant::now();
+    log::debug!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
     
     // Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1);
@@ -1030,10 +1063,14 @@ pub fn solve_penalized_least_squares(
     }
     
     log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
+    log::debug!("[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]", rank, p, stage2_timer.elapsed());
     
     //-----------------------------------------------------------------------
     // STAGE 3: Create rank-reduced system using the rank pivot
     //-----------------------------------------------------------------------
+    
+    let stage3_timer = Instant::now();
+    log::debug!("[PLS Solver] Stage 3/5: Reducing system to rank {}...", rank);
     
     // Use rank_pivot to identify columns to drop (from rank determination)
     // These are the unidentifiable columns based on the scaled system
@@ -1058,9 +1095,14 @@ pub fn solve_penalized_least_squares(
         drop_cols(e.view(), &drop_indices, &mut e_dropped);
     }
     
+    log::debug!("[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]", stage3_timer.elapsed());
+    
     //-----------------------------------------------------------------------
     // STAGE 4: Final QR decomposition on the unscaled, reduced system
     //-----------------------------------------------------------------------
+    
+    let stage4_timer = Instant::now();
+    log::debug!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
     
     // Form the final augmented matrix: [R1_dropped; E_dropped]
     let final_aug_rows = r_rows + e_rows;
@@ -1085,9 +1127,14 @@ pub fn solve_penalized_least_squares(
     // Perform final pivoted QR on the unscaled, reduced system
     let (q_final, r_final, pivot_final) = pivoted_qr_faer(&final_aug_matrix)?;
     
+    log::debug!("[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]", stage4_timer.elapsed());
+    
     //-----------------------------------------------------------------------
     // STAGE 5: Apply second transformation to the RHS and solve system
     //-----------------------------------------------------------------------
+    
+    let stage5_timer = Instant::now();
+    log::debug!("[PLS Solver] Stage 5/5: Solving system and reconstructing results...");
     
     // Prepare the full RHS for the final system
     let mut rhs_full = Array1::<f64>::zeros(final_aug_rows);
@@ -1229,6 +1276,9 @@ pub fn solve_penalized_least_squares(
         edf,
         link_function,
     );
+    
+    log::debug!("[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]", stage5_timer.elapsed());
+    log::debug!("[PLS Solver] Exiting. Total time: [{:.2?}]", function_timer.elapsed());
     
     // Return the result
     Ok((

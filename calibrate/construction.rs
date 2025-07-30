@@ -584,9 +584,17 @@ pub fn stable_reparameterization(
         // Increment iteration counter
         iteration += 1;
         
+        println!("[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
+                 iteration, gamma.len(), q_current);
+                 
         if gamma.is_empty() || q_current == 0 {
             break;
         }
+
+        log::debug!(
+            "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
+            iteration, gamma.len(), q_current
+        );
 
         log::debug!(
             "Iteration {}: k_offset={}, q_current={}, gamma={:?}",
@@ -797,7 +805,17 @@ pub fn stable_reparameterization(
         
         log::debug!("Updated for next iteration: k_offset={}, q_current={}, gamma.len()={}",
                   k_offset, q_current, gamma.len());
+        
+        log::debug!(
+            "[Reparam Iteration #{}] Finished. Determined rank: {}. Next problem size: {}",
+            iteration, r, q_current
+        );
     }
+
+    log::debug!(
+        "[Reparam] Loop finished after {} iterations. Proceeding to generate final outputs.",
+        iteration
+    );
 
     // AFTER LOOP: Generate final outputs from the transformed penalty roots
 
