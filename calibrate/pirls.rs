@@ -93,6 +93,12 @@ pub fn fit_model_for_fixed_rho(
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
 
+    // ADD THIS PRINT STATEMENT:
+    println!("[Reparam Result Check] qs_sum: {:.4e}, s_transformed_sum: {:.4e}, log_det_s: {:.4e}",
+             reparam_result.qs.sum(),
+             reparam_result.s_transformed.sum(),
+             reparam_result.log_det);
+
     // Step 3: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
 
