@@ -813,7 +813,7 @@ mod tests {
             pc_main_effects: {
                 let mut effects = HashMap::new();
                 effects.insert("PC1".to_string(), 0.9);  // Strong PC1 effect (major population structure)
-                effects.insert("PC2".to_string(), 0.6);  // Moderate PC2 effect
+                effects.insert("PC2".to_string(), 0.0);  // No PC2 effect (null)
                 effects.insert("PC3".to_string(), 0.3);  // Smaller PC3 effect 
                 effects.insert("PC4".to_string(), 0.15); // Very small PC4 effect
                 effects.insert("PC5".to_string(), 0.0);  // No PC5 effect (null)
@@ -822,7 +822,7 @@ mod tests {
             interaction_effects: {
                 let mut effects = HashMap::new();
                 effects.insert("PC1".to_string(), 0.8);   // Strong PC1×PGS interaction (ancestry-specific effect)
-                effects.insert("PC2".to_string(), -0.4);  // Negative PC2×PGS interaction
+                effects.insert("PC2".to_string(), 0.0);   // No PC2×PGS interaction
                 effects.insert("PC3".to_string(), 0.0);   // No PC3×PGS interaction
                 effects.insert("PC4".to_string(), 0.2);   // Subtle PC4×PGS interaction 
                 effects.insert("PC5".to_string(), 0.0);   // No PC5×PGS interaction

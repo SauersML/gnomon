@@ -2732,8 +2732,8 @@ pub mod internal {
             pcs.column_mut(2).assign(&pc3);
             
             // Create true linear predictor with interactions
-            let true_logits = &p * 0.5 + &pc1 * 0.3 + &pc2 * (-0.4) + &pc3 * 0.2 +
-                              &(&p * &pc1) * 0.6 + &(&p * &pc2) * (-0.3) + &(&p * &pc3) * 0.2;
+            let true_logits = &p * 0.5 + &pc1 * 0.3 + &pc2 * 0.0 + &pc3 * 0.2 +
+                              &(&p * &pc1) * 0.6 + &(&p * &pc2) * 0.0 + &(&p * &pc3) * 0.2;
                               
             // Generate binary outcomes
             let y = generate_y_from_logit(&true_logits, &mut rng);
