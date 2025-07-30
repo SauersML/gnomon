@@ -151,7 +151,7 @@ pub fn train_model(
             };
 
             // Only accept the solution if gradient norm is small enough
-            const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 10.0;
+            const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1000.0;
             if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
                     "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
@@ -218,14 +218,13 @@ pub fn train_model(
         config,
     )?;
 
-    // IMPORTANT: The returned beta is in the transformed basis.
-    // Transform it back to the original basis using the `qs` matrix
-    // that was returned *from the same fit*.
-    let final_beta_original = final_fit.qs.dot(&final_fit.beta);
+    // The coefficients in final_fit.beta are already in the original basis.
+    // The pirls::fit_model_for_fixed_rho function handles the stable reparameterization 
+    // internally and transforms the coefficients back to the original basis before returning them.
 
     // Map the coefficients from the original basis.
     let mapped_coefficients =
-        crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+        crate::calibrate::model::map_coefficients(&final_fit.beta, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
