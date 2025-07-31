@@ -367,12 +367,16 @@ pub fn build_design_and_penalty_matrices(
                     if m == 0 || m > pgs_main_basis_unc.ncols() {
                         continue; // Skip out-of-bounds
                     }
-                    let pgs_weight_col = pgs_main_basis_unc.column(m - 1);
+                    let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
+                    
+                    // Center the PGS basis column to ensure orthogonality
+                    let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
+                    let pgs_weight_col = &pgs_weight_col_uncentered - mean;
 
                     // Use the CONSTRAINED PC basis matrix
                     let pc_constrained_basis = &pc_constrained_bases[pc_idx];
 
-                    // Form the interaction tensor product with pure pre-centering
+                    // Form the interaction tensor product with centered bases
                     let interaction_term =
                         pc_constrained_basis * &pgs_weight_col.view().insert_axis(Axis(1));
 
