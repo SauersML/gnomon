@@ -25,6 +25,10 @@ def print_array_summary(name, arr):
         print(f"    -> First 2x5 slice:\n{arr[:2, :5]}")
 
 def evaluate_bspline_basis(x, knots, degree):
+    """
+    A Python implementation of the Cox-de Boor algorithm that mirrors the Rust code's
+    logic, including state persistence for intermediate calculations and boundary handling.
+    """
     num_knots = len(knots)
     num_bases = num_knots - degree - 1
     
@@ -41,21 +45,18 @@ def evaluate_bspline_basis(x, knots, degree):
         b = np.zeros(degree + 1)
         b[0] = 1.0
         
-        # Initialize `left` and `right` ONCE, outside the loop, with their full size.
         left = np.zeros(degree + 1)
         right = np.zeros(degree + 1)
         
         for d in range(1, degree + 1):
-            # These now correctly access and overwrite parts of the persistent arrays
             left[d] = val - knots[mu + 1 - d]
             right[d] = knots[mu + d] - val
 
             saved = 0.0
             for r in range(d):
-                # This calculation now correctly uses values from previous `d` loops
                 den = right[r + 1] + left[d - r]
                 temp = 0.0
-                if abs(den) > 1e-12:  # Use abs() for safety
+                if abs(den) > 1e-12:
                     temp = b[r] / den
                 
                 b[r] = saved + right[r + 1] * temp
@@ -63,9 +64,7 @@ def evaluate_bspline_basis(x, knots, degree):
             b[d] = saved
         
         start_index = mu - degree
-        # Ensure we don't write out of bounds if start_index is negative
         if start_index < 0:
-             # This can happen at the left boundary. We only use the valid part of `b`.
              b_valid = b[-start_index:]
              basis_matrix[i, 0 : len(b_valid)] = b_valid
         else:
@@ -75,8 +74,7 @@ def evaluate_bspline_basis(x, knots, degree):
 
 def get_mgcv_basis_data():
     """
-    Runs a robust R script to extract the final, constrained basis functions
-    and coefficients for the main smooth term of 'variable_one'.
+    Runs an R script to extract the mgcv model's basis matrix and coefficients.
     """
     print("\n" + "="*80)
     print("--- STAGE 1: Extracting CONSTRAINED basis from R/mgcv model ---")
@@ -120,8 +118,7 @@ def get_mgcv_basis_data():
         
         return {"x_axis": x_axis, "basis_matrix": basis_matrix, "coeffs": coeffs}
     except subprocess.CalledProcessError as e:
-        print(f"\n--- FATAL ERROR: R script execution failed. ---")
-        print(f"R stdout:\n{e.stdout}\n R stderr:\n{e.stderr}")
+        print(f"\n--- FATAL ERROR: R script execution failed. ---\n{e.stderr}")
         sys.exit(1)
     finally:
         for f in [x_axis_file, basis_file, coeffs_file]:
@@ -129,8 +126,7 @@ def get_mgcv_basis_data():
 
 def get_gnomon_basis_data():
     """
-    Correctly reconstructs the gnomon constrained basis using BSpline.design_matrix
-    and applying constraints ONLY to the non-constant raw basis functions.
+    Reconstructs the gnomon constrained basis from the model.toml file.
     """
     print("\n" + "="*80)
     print("--- STAGE 2: Reconstructing CONSTRAINED basis from Rust/gnomon model ---")
@@ -157,130 +153,100 @@ def get_gnomon_basis_data():
     print(f"  [PRINT] gnomon: Loaded 'pgs_main' constraint matrix.")
     print_array_summary("z_transform", z_transform)
 
-    # Reconstruct the FULL RAW basis using the robust BSpline.design_matrix function.
-    # This is the canonical and correct way to generate the basis matrix in SciPy.
     x_range = toml_data['config']['pgs_range']
     x_axis = np.linspace(x_range[0], x_range[1], N_POINTS_PLOT)
     raw_basis_matrix = evaluate_bspline_basis(x_axis, knots, degree)
-    print(f"  [PRINT] gnomon: Reconstructed FULL raw basis matrix using BSpline.design_matrix.")
+    print(f"  [PRINT] gnomon: Reconstructed FULL raw basis matrix.")
     print_array_summary("raw_basis_matrix", raw_basis_matrix)
 
     raw_main_basis_functions = raw_basis_matrix[:, 1:]
     print(f"  [INFO] gnomon: Sliced raw basis to get the non-constant bases for constraining.")
     print_array_summary("raw_main_basis_functions", raw_main_basis_functions)
     
-    # 6. Verify dimensions before applying the constraint
     if raw_main_basis_functions.shape[1] != z_transform.shape[0]:
-        print(f"\n--- FATAL ERROR: Dimension mismatch for constraint matrix multiplication! ---")
-        print(f"Non-constant raw basis has {raw_main_basis_functions.shape[1]} columns.")
-        print(f"Constraint matrix 'z_transform' expects {z_transform.shape[0]} rows.")
+        print(f"\n--- FATAL ERROR: Dimension mismatch for constraint! ---")
+        print(f"Raw main basis columns: {raw_main_basis_functions.shape[1]}, Z-transform rows: {z_transform.shape[0]}")
         sys.exit(1)
 
-    # 7. Apply transformation to get the FINAL CONSTRAINED basis: B_constrained = B_raw_non_constant @ Z
     constrained_basis_matrix = raw_main_basis_functions @ z_transform
     print(f"  [PRINT] gnomon: Created FINAL constrained basis matrix.")
     print_array_summary("constrained_basis_matrix", constrained_basis_matrix)
     
-    # 8. Final dimension verification
     if constrained_basis_matrix.shape[1] != len(coeffs):
         print(f"\n--- FATAL ERROR: Final dimension mismatch! ---")
-        print(f"Final constrained basis has {constrained_basis_matrix.shape[1]} columns.")
-        print(f"Model file provides {len(coeffs)} coefficients for this term.")
+        print(f"Final basis columns: {constrained_basis_matrix.shape[1]}, Coefficients length: {len(coeffs)}")
         sys.exit(1)
         
     print("  [INFO] All dimension checks passed successfully.")
     return {"x_axis": x_axis, "basis_matrix": constrained_basis_matrix, "coeffs": coeffs}
 
-def normalize_basis_and_coeffs(data):
-    """
-    Normalizes a basis matrix and its corresponding coefficients.
-    
-    This re-scales the components so that each basis function has a unit L2-norm,
-    forcing the full scale of the effect into the coefficients. This makes them
-    more comparable to other systems like gnomon.
-    
-    The final curve (basis @ coeffs) remains mathematically identical.
-    """
-    basis = data['basis_matrix']
-    coeffs = data['coeffs']
-    
-    # Calculate the L2-norm (Euclidean length) of each column of the basis matrix
-    norms = np.linalg.norm(basis, axis=0)
-    
-    # Avoid division by zero for any all-zero columns
-    norms[norms < 1e-9] = 1.0
-    
-    # Normalize the basis matrix by dividing each column by its norm
-    normalized_basis = basis / norms
-    
-    # Rescale the coefficients by multiplying each by the corresponding norm
-    # This perfectly cancels the basis normalization, preserving the final curve
-    rescaled_coeffs = coeffs * norms
-    
-    data['basis_matrix'] = normalized_basis
-    data['coeffs'] = rescaled_coeffs
-    
-    print("\n  --- MGCV DATA NORMALIZED ---")
-    print("  [PRINT] MGCV Normalized Basis Matrix:")
-    print_array_summary("mgcv basis_matrix", normalized_basis)
-    print("  [PRINT] MGCV Rescaled Coefficients:")
-    print_array_summary("mgcv coeffs", rescaled_coeffs)
-    
-    return data
-
 def create_comparison_plot(mgcv_data, gnomon_data):
     """
-    Creates ONE single 3x2 plot comparing all components of the main smooth term.
+    Creates a 3x2 plot comparing all components of the main smooth term.
+    The mgcv components are centered for visual comparability.
     """
     print("\n" + "="*80)
     print("--- STAGE 3: Generating the SINGLE 3x2 Comparison Plot ---")
     print("="*80)
 
-    # --- Pre-calculate all components for plotting ---
-    mgcv_basis = mgcv_data['basis_matrix']
+    # --- gnomon calculations (straightforward) ---
     gnomon_basis = gnomon_data['basis_matrix']
-    mgcv_coeffs = mgcv_data['coeffs']
-    mgcv_coeffs_centered = mgcv_coeffs - np.mean(mgcv_coeffs)
-    mgcv_weighted = mgcv_basis * mgcv_coeffs_centered
-    gnomon_weighted = gnomon_basis * gnomon_data['coeffs']
-    mgcv_final_curve = mgcv_weighted.sum(axis=1)
+    gnomon_coeffs = gnomon_data['coeffs']
+    gnomon_weighted = gnomon_basis * gnomon_coeffs
     gnomon_final_curve = gnomon_weighted.sum(axis=1)
+
+    # --- mgcv calculations (requires centering for visualization) ---
+    mgcv_basis = mgcv_data['basis_matrix']
+    mgcv_coeffs = mgcv_data['coeffs']
     
-    print(f"  [PRINT] mgcv: Calculated weighted basis and final curve.")
-    print_array_summary("mgcv_weighted", mgcv_weighted)
-    print_array_summary("mgcv_final_curve", mgcv_final_curve)
-    print(f"  [PRINT] gnomon: Calculated weighted basis and final curve.")
+    # 1. Calculate the original, uncentered weighted basis and final curve
+    mgcv_weighted_uncentered = mgcv_basis * mgcv_coeffs
+    mgcv_final_curve_uncentered = mgcv_weighted_uncentered.sum(axis=1)
+    
+    # 2. Calculate the mean of the final curve. This is the offset we need to remove.
+    mean_offset = np.mean(mgcv_final_curve_uncentered)
+    
+    # 3. Create the final, centered curve for plotting. This represents the true shape of the smooth.
+    mgcv_final_curve_centered = mgcv_final_curve_uncentered - mean_offset
+
+    # 4. Create a centered version of the weighted basis functions FOR PLOTTING ONLY.
+    # We subtract the average contribution of each weighted basis function.
+    mgcv_weighted_centered = mgcv_weighted_uncentered - np.mean(mgcv_weighted_uncentered, axis=0)
+
+    # --- Print Diagnostics ---
+    print(f"  [PRINT] mgcv: Calculated components.")
+    print_array_summary("mgcv_weighted_centered", mgcv_weighted_centered)
+    print_array_summary("mgcv_final_curve_centered", mgcv_final_curve_centered)
+    print(f"  [PRINT] gnomon: Calculated components.")
     print_array_summary("gnomon_weighted", gnomon_weighted)
     print_array_summary("gnomon_final_curve", gnomon_final_curve)
 
+    # --- Plotting ---
     fig, axes = plt.subplots(3, 2, figsize=(15, 18), sharex=True, constrained_layout=True)
-    fig.suptitle("Internal Component Comparison: s(variable_one) vs s(pgs)", fontsize=20)
+    fig.suptitle("Internal Component Comparison: mgcv vs gnomon", fontsize=20)
 
-    # --- Column Titles ---
-    axes[0, 0].set_title("mgcv Model", fontsize=16)
-    axes[0, 1].set_title("gnomon Model", fontsize=16)
+    axes[0, 0].set_title("mgcv Model (Computational Basis)", fontsize=16)
+    axes[0, 1].set_title("gnomon Model (Interpretable Basis)", fontsize=16)
 
-    # --- Row 1: Constrained Basis Functions ---
+    # Row 1: Constrained Basis Functions
     axes[0, 0].plot(mgcv_data['x_axis'], mgcv_basis, alpha=0.7)
-    axes[0, 0].set_ylabel("Constrained Basis Value", fontsize=12)
+    axes[0, 0].set_ylabel("Basis Value", fontsize=12)
     axes[0, 1].plot(gnomon_data['x_axis'], gnomon_basis, alpha=0.7)
 
-    # --- Row 2: Weighted Basis Functions ---
-    axes[1, 0].plot(mgcv_data['x_axis'], mgcv_weighted, alpha=0.7)
+    # Row 2: Weighted Basis Functions (using the centered mgcv version)
+    axes[1, 0].plot(mgcv_data['x_axis'], mgcv_weighted_centered, alpha=0.7)
     axes[1, 0].axhline(0, color='black', linestyle='--', linewidth=1)
-    axes[1, 0].set_ylabel("Weighted Basis Value", fontsize=12)
+    axes[1, 0].set_ylabel("Centered Weighted Basis Value", fontsize=12)
     axes[1, 1].plot(gnomon_data['x_axis'], gnomon_weighted, alpha=0.7)
     axes[1, 1].axhline(0, color='black', linestyle='--', linewidth=1)
 
-    # --- Row 3: Final Smooth Curve and Overlay ---
-    axes[2, 0].plot(mgcv_data['x_axis'], mgcv_final_curve, color='crimson', linewidth=3)
-    axes[2, 0].set_xlabel("variable_one", fontsize=12)
-    axes[2, 0].set_ylabel("Final Smooth Contribution", fontsize=12)
-    axes[2, 0].set_title("Sum of Weighted Bases", fontsize=14)
+    # Row 3: Final Smooth Curve and Overlay (using the centered mgcv version)
+    axes[2, 0].plot(mgcv_data['x_axis'], mgcv_final_curve_centered, color='crimson', linewidth=3)
+    axes[2, 0].set_xlabel(mgcv_data.get('var_name', 'variable_one'), fontsize=12)
+    axes[2, 0].set_ylabel("Centered Smooth Contribution", fontsize=12)
     axes[2, 0].grid(True, linestyle=':', alpha=0.7)
     
-    # The final verification plot: BOTH curves overlaid
-    axes[2, 1].plot(mgcv_data['x_axis'], mgcv_final_curve, label='mgcv', color='blue', linewidth=6, alpha=0.6)
+    axes[2, 1].plot(mgcv_data['x_axis'], mgcv_final_curve_centered, label='mgcv (Centered)', color='blue', linewidth=6, alpha=0.6)
     axes[2, 1].plot(gnomon_data['x_axis'], gnomon_final_curve, label='gnomon', color='red', linewidth=2.5, linestyle='--')
     axes[2, 1].set_xlabel("pgs", fontsize=12)
     axes[2, 1].legend(title="Model")
@@ -296,7 +262,6 @@ def main():
             print(f"--- FATAL ERROR: Required file not found: '{f}' ---"); sys.exit(1)
 
     mgcv_data = get_mgcv_basis_data()
-    mgcv_data = normalize_basis_and_coeffs(mgcv_data)
     gnomon_data = get_gnomon_basis_data()
     create_comparison_plot(mgcv_data, gnomon_data)
     
