@@ -191,6 +191,43 @@ def get_gnomon_basis_data():
     print("  [INFO] All dimension checks passed successfully.")
     return {"x_axis": x_axis, "basis_matrix": constrained_basis_matrix, "coeffs": coeffs}
 
+def normalize_basis_and_coeffs(data):
+    """
+    Normalizes a basis matrix and its corresponding coefficients.
+    
+    This re-scales the components so that each basis function has a unit L2-norm,
+    forcing the full scale of the effect into the coefficients. This makes them
+    more comparable to other systems like gnomon.
+    
+    The final curve (basis @ coeffs) remains mathematically identical.
+    """
+    basis = data['basis_matrix']
+    coeffs = data['coeffs']
+    
+    # Calculate the L2-norm (Euclidean length) of each column of the basis matrix
+    norms = np.linalg.norm(basis, axis=0)
+    
+    # Avoid division by zero for any all-zero columns
+    norms[norms < 1e-9] = 1.0
+    
+    # Normalize the basis matrix by dividing each column by its norm
+    normalized_basis = basis / norms
+    
+    # Rescale the coefficients by multiplying each by the corresponding norm
+    # This perfectly cancels the basis normalization, preserving the final curve
+    rescaled_coeffs = coeffs * norms
+    
+    data['basis_matrix'] = normalized_basis
+    data['coeffs'] = rescaled_coeffs
+    
+    print("\n  --- MGCV DATA NORMALIZED ---")
+    print("  [PRINT] MGCV Normalized Basis Matrix:")
+    print_array_summary("mgcv basis_matrix", normalized_basis)
+    print("  [PRINT] MGCV Rescaled Coefficients:")
+    print_array_summary("mgcv coeffs", rescaled_coeffs)
+    
+    return data
+
 def create_comparison_plot(mgcv_data, gnomon_data):
     """
     Creates ONE single 3x2 plot comparing all components of the main smooth term.
@@ -257,6 +294,7 @@ def main():
             print(f"--- FATAL ERROR: Required file not found: '{f}' ---"); sys.exit(1)
 
     mgcv_data = get_mgcv_basis_data()
+    mgcv_data = normalize_basis_and_coeffs(mgcv_data)
     gnomon_data = get_gnomon_basis_data()
     create_comparison_plot(mgcv_data, gnomon_data)
     
