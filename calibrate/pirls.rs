@@ -36,22 +36,22 @@ pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
     pub beta_transformed: Array1<f64>,
     pub penalized_hessian_transformed: Array2<f64>,
-    
+
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
-    
+
     // NEW: The penalty term, calculated stably within P-IRLS
     // This is beta_transformed' * S_transformed * beta_transformed
     pub stable_penalty_term: f64,
-    
+
     // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
-    
+
     // Keep all other fields as they are
     pub status: PirlsStatus,
     pub iteration: usize,
     pub max_abs_eta: f64,
-    
+
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
 }
@@ -86,14 +86,13 @@ pub fn fit_model_for_fixed_rho(
         lambdas.len()
     );
     println!(
-        "P-IRLS input dimensions: x: {:?}, y: {}, rs_original: {}", 
-        x.shape(), y.len(), rs_original.len()
+        "P-IRLS input dimensions: x: {:?}, y: {}, rs_original: {}",
+        x.shape(),
+        y.len(),
+        rs_original.len()
     );
     if !lambdas.is_empty() {
-        println!(
-            "Lambdas: {:?}",
-            lambdas
-        );
+        println!("Lambdas: {:?}", lambdas);
     }
 
     // Step 2: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
@@ -104,19 +103,26 @@ pub fn fit_model_for_fixed_rho(
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
 
-    println!("[Reparam Result Check] qs_sum: {:.4e}, s_transformed_sum: {:.4e}, log_det_s: {:.4e}",
-             reparam_result.qs.sum(),
-             reparam_result.s_transformed.sum(),
-             reparam_result.log_det);
+    println!(
+        "[Reparam Result Check] qs_sum: {:.4e}, s_transformed_sum: {:.4e}, log_det_s: {:.4e}",
+        reparam_result.qs.sum(),
+        reparam_result.s_transformed.sum(),
+        reparam_result.log_det
+    );
 
-    println!("[Matrix Multiply] ==> Performing x.dot(qs) | x.shape: {:?}, qs.shape: {:?}",
-            x.shape(), reparam_result.qs.shape());
+    println!(
+        "[Matrix Multiply] ==> Performing x.dot(qs) | x.shape: {:?}, qs.shape: {:?}",
+        x.shape(),
+        reparam_result.qs.shape()
+    );
 
     // Step 3: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
-    
-    println!("[Matrix Multiply] <== x.dot(qs) complete. x_transformed_sum: {:.4e}",
-            x_transformed.sum());
+
+    println!(
+        "[Matrix Multiply] <== x.dot(qs) complete. x_transformed_sum: {:.4e}",
+        x_transformed.sum()
+    );
 
     // Step 4: Get the transformed penalty matrices
     let s_transformed = &reparam_result.s_transformed;
@@ -199,19 +205,24 @@ pub fn fit_model_for_fixed_rho(
         } else {
             "(no penalties)".to_string()
         };
-        println!("[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares {}", 
-                 iter, last_deviance, penalty_info);
-        
+        println!(
+            "[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares {}",
+            iter, last_deviance, penalty_info
+        );
+
         // The logger outputs detailed matrix dimensions and timings for each sub-stage
         // of the solver, which helps identify potential numerical issues.
-        log::debug!("[P-IRLS Loop Iter #{}] Logger configuration check: debug-level logs enabled", iter);
-        
+        log::debug!(
+            "[P-IRLS Loop Iter #{}] Logger configuration check: debug-level logs enabled",
+            iter
+        );
+
         // Use our robust solver that handles rank deficiency correctly
         let stable_result = solve_penalized_least_squares(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
-            &e, // Single square root matrix from eigendecomposition in transformed space
+            &e,       // Single square root matrix from eigendecomposition in transformed space
             y.view(), // Pass original response
             config.link_function, // Pass link function for correct scale calculation
         )?;
@@ -256,13 +267,22 @@ pub fn fit_model_for_fixed_rho(
 
         if iter > 45 {
             eprintln!("\n[DEBUG STEP-HALVING | Iter #{}", iter);
-            eprintln!("  - Penalized Deviance (Current): {:.16e}", penalized_deviance_current);
-            eprintln!("  - Penalized Deviance (Trial):   {:.16e}", penalized_deviance_trial);
+            eprintln!(
+                "  - Penalized Deviance (Current): {:.16e}",
+                penalized_deviance_current
+            );
+            eprintln!(
+                "  - Penalized Deviance (Trial):   {:.16e}",
+                penalized_deviance_trial
+            );
             let diff = penalized_deviance_trial - penalized_deviance_current;
             eprintln!("  - Difference (Trial - Current): {:.16e}", diff);
             eprintln!("  - Deviance Decreased Flag: {}", deviance_decreased);
             if !deviance_decreased && diff > 0.0 {
-                eprintln!("  - >>> TRIGGERING STEP-HALVING due to a positive difference of {:.16e}", diff);
+                eprintln!(
+                    "  - >>> TRIGGERING STEP-HALVING due to a positive difference of {:.16e}",
+                    diff
+                );
             }
         }
 
@@ -357,11 +377,11 @@ pub fn fit_model_for_fixed_rho(
 
         // Update all state variables atomically
         beta_transformed = beta_trial;
-        
+
         // Print beta norm to track coefficient growth
         let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
         println!("[P-IRLS State] Beta Norm: {:.6e}", beta_norm);
-        
+
         eta = eta_trial;
         last_deviance = deviance_trial;
         (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
@@ -418,7 +438,7 @@ pub fn fit_model_for_fixed_rho(
         // Calculate the penalized deviance using the transformed penalty matrix
         let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
         let penalized_deviance_new = last_deviance + penalty_new;
-        
+
         // Set scale parameter based on link function
         let scale = match config.link_function {
             LinkFunction::Logit => 1.0,
@@ -431,12 +451,12 @@ pub fn fit_model_for_fixed_rho(
                 residuals.dot(&residuals) / df
             }
         };
-        
+
         // This scaling factor is the key to mgcv's numerical stability.
         // It prevents the tolerance from collapsing when the deviance is small.
         let convergence_scale = scale.abs() + penalized_deviance_new.abs();
         let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
-        
+
         // Log iteration info
         log::debug!(
             "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
@@ -449,23 +469,28 @@ pub fn fit_model_for_fixed_rho(
                 String::new()
             }
         );
-        
+
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
-            
             // If deviance has converged, we must ALSO check that the gradient is small.
             let deviance_gradient_part = x_transformed.t().dot(&(&weights * (&eta - &z)));
             let penalty_gradient_part = s_transformed.dot(&beta_transformed);
             // CORRECTED: Reinstate the factor of 2 to match mgcv and the math
-            let penalized_deviance_gradient = &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
-            let gradient_norm = penalized_deviance_gradient.iter().map(|&x| x.abs()).fold(0.0, f64::max);
+            let penalized_deviance_gradient =
+                &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
+            let gradient_norm = penalized_deviance_gradient
+                .iter()
+                .map(|&x| x.abs())
+                .fold(0.0, f64::max);
 
             // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
             // and uses the user's epsilon, not machine epsilon.
             let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
 
-            println!("[P-IRLS Check] Deviance Change: {:.6e} | Gradient Norm: {:.6e} | Tolerance: {:.6e}",
-                     deviance_change_scaled, gradient_norm, gradient_tol);
+            println!(
+                "[P-IRLS Check] Deviance Change: {:.6e} | Gradient Norm: {:.6e} | Tolerance: {:.6e}",
+                deviance_change_scaled, gradient_norm, gradient_tol
+            );
 
             if gradient_norm < gradient_tol && iter >= min_iterations {
                 // SUCCESS: Both deviance and gradient have converged.
@@ -474,18 +499,25 @@ pub fn fit_model_for_fixed_rho(
                     deviance_change_scaled,
                     gradient_norm
                 );
-                
-                let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
-                    result.penalized_hessian.clone()
-                } else {
-                    let (result, _) = solve_penalized_least_squares(
-                        x_transformed.view(), z.view(), weights.view(), &e, y.view(), config.link_function
-                    )?;
-                    result.penalized_hessian
-                };
+
+                let penalized_hessian_transformed =
+                    if let Some((ref result, _)) = last_stable_result {
+                        result.penalized_hessian.clone()
+                    } else {
+                        let (result, _) = solve_penalized_least_squares(
+                            x_transformed.view(),
+                            z.view(),
+                            weights.view(),
+                            &e,
+                            y.view(),
+                            config.link_function,
+                        )?;
+                        result.penalized_hessian
+                    };
 
                 // Calculate the stable penalty term using the transformed quantities
-                let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+                let stable_penalty_term =
+                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
                 // Populate the new PirlsResult struct with stable, transformed quantities
                 return Ok(PirlsResult {
@@ -516,8 +548,14 @@ pub fn fit_model_for_fixed_rho(
     } else {
         // This should never happen, but as a fallback, compute the Hessian
         log::warn!("No stable result saved, computing Hessian as fallback");
-        let (result, rank) =
-            solve_penalized_least_squares(x_transformed.view(), z.view(), weights.view(), &e, y.view(), config.link_function)?;
+        let (result, rank) = solve_penalized_least_squares(
+            x_transformed.view(),
+            z.view(),
+            weights.view(),
+            &e,
+            y.view(),
+            config.link_function,
+        )?;
         log::trace!("Final solve rank: {}", rank);
         result.penalized_hessian
     };
@@ -547,7 +585,7 @@ pub fn fit_model_for_fixed_rho(
 /// Port of the `R_cond` function from mgcv, which implements the CMSW
 /// algorithm to estimate the 1-norm condition number of an upper
 /// triangular matrix R.
-/// 
+///
 /// This is a direct translation of the C code from mgcv:
 /// ```c
 /// void R_cond(double *R, int *r, int *c, double *work, double *Rcondition) {
@@ -571,7 +609,7 @@ pub fn fit_model_for_fixed_rho(
 ///     kappa=fabs(y[k]);
 ///     if (kappa>y_inf) y_inf=kappa;
 ///   }
-///   for (i=0;i<*c;i++) { 
+///   for (i=0;i<*c;i++) {
 ///     for (kappa=0.0,j=i;j<*c;j++) kappa += fabs(R[i + *r * j]);  
 ///     if (kappa>R_inf) R_inf = kappa;
 ///   }
@@ -626,19 +664,20 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
                 p[i] = pm[i];
             }
         }
-        
+
         let kappa = y[k].abs();
         if kappa > y_inf {
             y_inf = kappa;
         }
     }
 
-    // Calculate R_inf, which is the max row sum of absolute values  
+    // Calculate R_inf, which is the max row sum of absolute values
     // For an upper triangular matrix, we only sum the upper triangle elements (j >= i)
     let mut r_inf = 0.0;
     for i in 0..c {
         let mut kappa = 0.0;
-        for j in i..c {  // Only sum upper triangle elements (j >= i)
+        for j in i..c {
+            // Only sum upper triangle elements (j >= i)
             kappa += r_matrix[[i, j]].abs();
         }
         if kappa > r_inf {
@@ -661,10 +700,7 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 /// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the R factor).
 /// * `pivot`: The permutation vector from the QR decomposition. `pivot[j]` is the
 ///   original index of the j-th column in the pivoted matrix.
-fn unpivot_columns(
-    pivoted_matrix: ArrayView2<f64>,
-    pivot: &[usize],
-) -> Array2<f64> {
+fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     let r = pivoted_matrix.nrows();
     let c = pivoted_matrix.ncols();
     let mut unpivoted_matrix = Array2::zeros((r, c));
@@ -675,7 +711,9 @@ fn unpivot_columns(
     for i in 0..c {
         let original_col_index = pivot[i];
         let pivoted_col = pivoted_matrix.column(i);
-        unpivoted_matrix.column_mut(original_col_index).assign(&pivoted_col);
+        unpivoted_matrix
+            .column_mut(original_col_index)
+            .assign(&pivoted_col);
     }
 
     unpivoted_matrix
@@ -683,7 +721,7 @@ fn unpivot_columns(
 
 /// Drop columns from a matrix based on column indices in `drop`.
 /// This is a direct translation of `drop_cols` from mgcv's C code:
-/// 
+///
 /// ```c
 /// void drop_cols(double *X, int r, int c, int *drop, int n_drop) {
 ///   int k,j,j0,j1;  
@@ -708,23 +746,33 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
     let r = src.nrows();
     let c = src.ncols();
     let n_drop = drop_indices.len();
-    
+
     if n_drop == 0 {
         // If no columns to drop, just copy src to dst
         dst.assign(&src);
         return;
     }
-    
+
     // Validate dimensions
-    assert_eq!(r, dst.nrows(), "Source and destination must have same number of rows");
-    assert_eq!(c - n_drop, dst.ncols(), "Destination must have c - n_drop columns");
-    
+    assert_eq!(
+        r,
+        dst.nrows(),
+        "Source and destination must have same number of rows"
+    );
+    assert_eq!(
+        c - n_drop,
+        dst.ncols(),
+        "Destination must have c - n_drop columns"
+    );
+
     // Ensure drop_indices is in ascending order
     for i in 1..n_drop {
-        assert!(drop_indices[i] > drop_indices[i-1],
-               "drop_indices must be in ascending order");
+        assert!(
+            drop_indices[i] > drop_indices[i - 1],
+            "drop_indices must be in ascending order"
+        );
     }
-    
+
     // Copy columns from source to destination, skipping the ones in drop_indices
     let mut dst_col = 0;
     for src_col in 0..c {
@@ -738,7 +786,7 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
-/// 
+///
 /// ```c
 /// void undrop_rows(double *X, int r, int c, int *drop, int n_drop) {
 ///   double *Xs;
@@ -757,7 +805,7 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
 ///   }
 /// }
 /// ```
-/// 
+///
 /// Parameters:
 /// * `src`: Source vector without the dropped rows (length = total - n_drop)
 /// * `dropped_rows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
@@ -765,7 +813,7 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
 #[allow(dead_code)]
 fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
     let n_drop = dropped_rows.len();
-    
+
     if n_drop == 0 {
         // If no rows to drop, just copy src to dst
         if src.len() == dst.len() {
@@ -773,20 +821,25 @@ fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>)
         }
         return;
     }
-    
+
     // Validate that the dimensions are compatible
-    assert_eq!(src.len() + n_drop, dst.len(),
-               "Source length + dropped rows must equal destination length");
-    
+    assert_eq!(
+        src.len() + n_drop,
+        dst.len(),
+        "Source length + dropped rows must equal destination length"
+    );
+
     // Ensure dropped_rows is in ascending order
     for i in 1..n_drop {
-        assert!(dropped_rows[i] > dropped_rows[i-1],
-               "dropped_rows must be in ascending order");
+        assert!(
+            dropped_rows[i] > dropped_rows[i - 1],
+            "dropped_rows must be in ascending order"
+        );
     }
-    
+
     // Zero the destination vector first
     dst.fill(0.0);
-    
+
     // Reinsert values from source, skipping the dropped indices
     let mut src_idx = 0;
     for dst_idx in 0..dst.len() {
@@ -804,7 +857,7 @@ fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>)
 #[allow(dead_code)]
 fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
     let n_drop = drop_indices.len();
-    
+
     if n_drop == 0 {
         // If no rows to drop, just copy src to dst
         if src.len() == dst.len() {
@@ -812,17 +865,22 @@ fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
         }
         return;
     }
-    
+
     // Validate that the dimensions are compatible
-    assert_eq!(src.len(), dst.len() + n_drop,
-               "Source length must equal destination length + dropped rows");
-    
+    assert_eq!(
+        src.len(),
+        dst.len() + n_drop,
+        "Source length must equal destination length + dropped rows"
+    );
+
     // Ensure drop_indices is in ascending order
     for i in 1..n_drop {
-        assert!(drop_indices[i] > drop_indices[i-1],
-               "drop_indices must be in ascending order");
+        assert!(
+            drop_indices[i] > drop_indices[i - 1],
+            "drop_indices must be in ascending order"
+        );
     }
-    
+
     // Copy values from source, skipping the dropped indices
     let mut dst_idx = 0;
     for src_idx in 0..src.len() {
@@ -919,8 +977,8 @@ pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
-    e: &Array2<f64>, // Single penalty square root matrix
-    y: ArrayView1<f64>, // Original response (not the working response z)
+    e: &Array2<f64>,             // Single penalty square root matrix
+    y: ArrayView1<f64>,          // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
     // The penalized least squares solver implements a 5-stage algorithm:
@@ -929,9 +987,14 @@ pub fn solve_penalized_least_squares(
     // 3. Rank detection and removal of numerically unidentifiable coefficients
     // 4. Second QR decomposition on the reduced system
     // 5. Back-substitution and reconstruction of coefficients
-    println!("[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} penalty matrix", 
-             x_transformed.nrows(), x_transformed.ncols(), e.nrows(), e.ncols());
-    
+    println!(
+        "[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} penalty matrix",
+        x_transformed.nrows(),
+        x_transformed.ncols(),
+        e.nrows(),
+        e.ncols()
+    );
+
     let function_timer = Instant::now();
     log::debug!(
         "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), e=({}x{})",
@@ -958,33 +1021,33 @@ pub fn solve_penalized_least_squares(
     // w = mu(1-mu) are always non-negative. For the Identity link, weights are always 1.0.
     // Therefore, negative weights are currently impossible.
     //
-    // If full Newton-Raphson is implemented in the future, a full SVD-based correction, 
+    // If full Newton-Raphson is implemented in the future, a full SVD-based correction,
     // as seen in the mgcv C function `pls_fit1`, would be required here for statistical correctness.
-    
+
     // Note: Current implementation uses Fisher scoring where weights are always non-negative
     // Full Newton-Raphson would require handling negative weights via SVD correction
 
     // EXACTLY following mgcv's pls_fit1 multi-stage approach:
-    
+
     //-----------------------------------------------------------------------
     // STAGE 1: Initial QR decomposition of weighted design matrix
     //-----------------------------------------------------------------------
-    
+
     let stage1_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 1/5: Starting initial QR on weighted design matrix...");
-    
+
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
     let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative
     let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
     let wz = &sqrt_w * &z;
-    
+
     // Perform initial pivoted QR on the weighted design matrix
     let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
-    
+
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p);
     let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
-    
+
     // CRITICAL FIX: Un-pivot the columns of R1 to restore their original order.
     // This is the missing step from mgcv's `pivoter` function. We must un-pivot
     // the columns of the R factor to restore their original order before proceeding.
@@ -992,38 +1055,45 @@ pub fn solve_penalized_least_squares(
     // We need to unscramble them so they align with the penalty matrix E.
     let r1 = unpivot_columns(r1_pivoted, &initial_pivot);
     log::debug!("Un-pivoted R1 matrix after first QR to restore original column order");
-    
+
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(&wz);
-    
-    log::debug!("[PLS Solver] Stage 1/5: Initial QR complete. [{:.2?}]", stage1_timer.elapsed());
-    
+
+    log::debug!(
+        "[PLS Solver] Stage 1/5: Initial QR complete. [{:.2?}]",
+        stage1_timer.elapsed()
+    );
+
     //-----------------------------------------------------------------------
     // STAGE 2: Rank determination using scaled augmented system
     //-----------------------------------------------------------------------
-    
+
     let stage2_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
-    
+
     // Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1);
-    let e_norm = if e.nrows() > 0 { frobenius_norm(e) } else { 1.0 };
-    
+    let e_norm = if e.nrows() > 0 {
+        frobenius_norm(e)
+    } else {
+        1.0
+    };
+
     log::debug!("Frobenius norms: R_norm={}, E_norm={}", r_norm, e_norm);
-    
+
     // Create the scaled augmented matrix for numerical stability
     // [R1/Rnorm; E/Enorm]
     let e_rows = e.nrows();
     let scaled_rows = r_rows + e_rows;
     let mut scaled_matrix = Array2::zeros((scaled_rows, p));
-    
+
     // Fill in the scaled data part (R1/Rnorm)
     for i in 0..r_rows {
         for j in 0..p {
             scaled_matrix[[i, j]] = r1[[i, j]] / r_norm;
         }
     }
-    
+
     // Fill in the scaled penalty part (e/Enorm)
     if e_rows > 0 {
         for i in 0..e_rows {
@@ -1032,10 +1102,10 @@ pub fn solve_penalized_least_squares(
             }
         }
     }
-    
+
     // Perform pivoted QR on the scaled matrix for rank determination
     let (_, r_scaled, rank_pivot) = pivoted_qr_faer(&scaled_matrix)?;
-    
+
     // Determine rank using condition number on the scaled matrix
     let mut rank = p.min(scaled_rows);
     while rank > 0 {
@@ -1051,24 +1121,32 @@ pub fn solve_penalized_least_squares(
             break;
         }
     }
-    
+
     // Check if the problem is fully rank deficient
     if rank == 0 {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
     }
-    
+
     log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
-    log::debug!("[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]", rank, p, stage2_timer.elapsed());
-    
+    log::debug!(
+        "[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]",
+        rank,
+        p,
+        stage2_timer.elapsed()
+    );
+
     //-----------------------------------------------------------------------
     // STAGE 3: Create rank-reduced system using the rank pivot
     //-----------------------------------------------------------------------
-    
+
     let stage3_timer = Instant::now();
-    log::debug!("[PLS Solver] Stage 3/5: Reducing system to rank {}...", rank);
-    
+    log::debug!(
+        "[PLS Solver] Stage 3/5: Reducing system to rank {}...",
+        rank
+    );
+
     // Use rank_pivot to identify columns to drop (from rank determination)
     // These are the unidentifiable columns based on the scaled system
     let n_drop = p - rank;
@@ -1076,42 +1154,49 @@ pub fn solve_penalized_least_squares(
     for i in rank..p {
         drop_indices.push(rank_pivot[i]);
     }
-    
+
     // Sort drop_indices in ascending order (required for drop_cols/undrop_rows)
     if n_drop > 0 {
         drop_indices.sort();
-        log::debug!("Dropping {} columns due to rank deficiency: {:?}", n_drop, drop_indices);
+        log::debug!(
+            "Dropping {} columns due to rank deficiency: {:?}",
+            n_drop,
+            drop_indices
+        );
     }
-    
+
     // Create rank-reduced versions of r1 and e by dropping unidentifiable columns
     let mut r1_dropped = Array2::zeros((r_rows, rank));
     drop_cols(r1.view(), &drop_indices, &mut r1_dropped);
-    
+
     let mut e_dropped = Array2::zeros((e_rows, rank));
     if e_rows > 0 {
         drop_cols(e.view(), &drop_indices, &mut e_dropped);
     }
-    
-    log::debug!("[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]", stage3_timer.elapsed());
-    
+
+    log::debug!(
+        "[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]",
+        stage3_timer.elapsed()
+    );
+
     //-----------------------------------------------------------------------
     // STAGE 4: Final QR decomposition on the unscaled, reduced system
     //-----------------------------------------------------------------------
-    
+
     let stage4_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
-    
+
     // Form the final augmented matrix: [R1_dropped; E_dropped]
     let final_aug_rows = r_rows + e_rows;
     let mut final_aug_matrix = Array2::zeros((final_aug_rows, rank));
-    
+
     // Fill in the data part (R1_dropped)
     for i in 0..r_rows {
         for j in 0..rank {
             final_aug_matrix[[i, j]] = r1_dropped[[i, j]];
         }
     }
-    
+
     // Fill in the penalty part (E_dropped)
     if e_rows > 0 {
         for i in 0..e_rows {
@@ -1120,46 +1205,51 @@ pub fn solve_penalized_least_squares(
             }
         }
     }
-    
+
     // Perform final pivoted QR on the unscaled, reduced system
     let (q_final, r_final, pivot_final) = pivoted_qr_faer(&final_aug_matrix)?;
-    
-    log::debug!("[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]", stage4_timer.elapsed());
-    
+
+    log::debug!(
+        "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
+        stage4_timer.elapsed()
+    );
+
     //-----------------------------------------------------------------------
     // STAGE 5: Apply second transformation to the RHS and solve system
     //-----------------------------------------------------------------------
-    
+
     let stage5_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 5/5: Solving system and reconstructing results...");
-    
+
     // Prepare the full RHS for the final system
     let mut rhs_full = Array1::<f64>::zeros(final_aug_rows);
-    
+
     // Use q1_t_wz for the data part (already transformed by Q1')
-    rhs_full.slice_mut(s![..r_rows]).assign(&q1_t_wz.slice(s![..r_rows]));
-    
+    rhs_full
+        .slice_mut(s![..r_rows])
+        .assign(&q1_t_wz.slice(s![..r_rows]));
+
     // The penalty part is zeros (already initialized)
-    
+
     // Apply second transformation to the RHS using Q_final'
     let rhs_final = q_final.t().dot(&rhs_full);
-    
+
     // Extract the square upper-triangular part of R and corresponding RHS
     let r_square = r_final.slice(s![..rank, ..rank]);
     let rhs_square = rhs_final.slice(s![..rank]);
-    
+
     // Back-substitution to solve the triangular system
     let mut beta_dropped = Array1::zeros(rank);
-    
+
     for i in (0..rank).rev() {
         // Initialize with right-hand side value
         let mut sum = rhs_square[i];
-        
+
         // Subtract known values from higher indices
-        for j in (i+1)..rank {
+        for j in (i + 1)..rank {
             sum -= r_square[[i, j]] * beta_dropped[j];
         }
-        
+
         // Divide by diagonal element to solve for this variable
         if r_square[[i, i]].abs() < 1e-10 {
             // Handle effectively zero diagonal (should not happen with proper rank detection)
@@ -1167,25 +1257,25 @@ pub fn solve_penalized_least_squares(
                 condition_number: f64::INFINITY,
             });
         }
-        
+
         beta_dropped[i] = sum / r_square[[i, i]];
     }
-    
+
     //-----------------------------------------------------------------------
     // STAGE 6: Reconstruct the full coefficient vector using mgcv's approach
     //-----------------------------------------------------------------------
-    
+
     // STEP 1: Un-pivot the rank-sized solution using pivot_final
     // This is exactly how mgcv does it: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
     let mut beta_unpivoted = Array1::zeros(rank);
     for i in 0..rank {
         beta_unpivoted[pivot_final[i]] = beta_dropped[i];
     }
-    
+
     // STEP 2: Inflate to full size by inserting zeros for dropped columns
     // This matches mgcv's undrop_rows function
     let mut beta_transformed = Array1::zeros(p);
-    
+
     // Map the unpivoted coefficients back to the full parameter space
     // For each position in the full vector, check if it was dropped
     // If not dropped, copy the next value from beta_unpivoted
@@ -1197,15 +1287,15 @@ pub fn solve_penalized_least_squares(
         }
         // If dropped, leave as zero (already initialized)
     }
-    
+
     //-----------------------------------------------------------------------
     // STAGE 7: Construct the penalized Hessian
     //-----------------------------------------------------------------------
-    
+
     // Create R'R for the identifiable part
-    let r_square_scaled = r_square.mapv(|x| x);  // Create a clean copy
+    let r_square_scaled = r_square.mapv(|x| x); // Create a clean copy
     let hessian_rank_part = r_square_scaled.t().dot(&r_square_scaled);
-    
+
     // Create pivoted Hessian with zeros for unidentifiable directions
     let mut hessian_pivoted = Array2::zeros((p, p));
     for i in 0..rank {
@@ -1213,13 +1303,13 @@ pub fn solve_penalized_least_squares(
             hessian_pivoted[[i, j]] = hessian_rank_part[[i, j]];
         }
     }
-    
+
     // Create a permutation matrix to un-pivot the Hessian
     // This requires a combined mapping that accounts for both dropping and pivoting
-    
+
     // Step 1: Map columns in the reduced system to their original indices
     let mut orig_col_indices = Vec::with_capacity(p);
-    
+
     // First add the columns that weren't dropped (in order they appear in reduced system)
     // let mut col_idx = 0;
     for orig_idx in 0..p {
@@ -1229,41 +1319,37 @@ pub fn solve_penalized_least_squares(
             // col_idx += 1;
         }
     }
-    
+
     // Then apply the final pivot to get the true column ordering
     let mut permutation = Vec::with_capacity(p);
-    
+
     // First add the pivoted columns in the correct order
     for i in 0..rank {
         permutation.push(orig_col_indices[pivot_final[i]]);
     }
-    
+
     // Then add the dropped columns
     for &idx in &drop_indices {
         permutation.push(idx);
     }
-    
+
     // Build the permutation matrix
     let mut p_mat = Array2::zeros((p, p));
     for i in 0..p {
         p_mat[[permutation[i], i]] = 1.0;
     }
-    
+
     // Un-pivot the Hessian: P * H_pivoted * P^T
     let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
-    
+
     //-----------------------------------------------------------------------
     // STAGE 8: Calculate EDF and scale parameter
     //-----------------------------------------------------------------------
-    
+
     // Calculate effective degrees of freedom using the final, unpivoted Hessian
     // This avoids pivot mismatches by using the correctly aligned final matrices
-    let edf = calculate_edf(
-        &penalized_hessian,
-        x_transformed,
-        weights,
-    )?;
-    
+    let edf = calculate_edf(&penalized_hessian, x_transformed, weights)?;
+
     // Calculate scale parameter
     let scale = calculate_scale(
         &beta_transformed,
@@ -1273,18 +1359,29 @@ pub fn solve_penalized_least_squares(
         edf,
         link_function,
     );
-    
-    log::debug!("[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]", stage5_timer.elapsed());
-    log::debug!("[PLS Solver] Exiting. Total time: [{:.2?}]", function_timer.elapsed());
-    
+
+    log::debug!(
+        "[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]",
+        stage5_timer.elapsed()
+    );
+    log::debug!(
+        "[PLS Solver] Exiting. Total time: [{:.2?}]",
+        function_timer.elapsed()
+    );
+
     // At this point, the solver has completed:
     // - Computing coefficient estimates (beta) for the current iteration
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
-    println!("[PLS Solver] Completed with edf={:.2}, scale={:.4e}, rank={}/{}", 
-             edf, scale, rank, x_transformed.ncols());
-    
+    println!(
+        "[PLS Solver] Completed with edf={:.2}, scale={:.4e}, rank={}/{}",
+        edf,
+        scale,
+        rank,
+        x_transformed.ncols()
+    );
+
     // Return the result
     Ok((
         StablePLSResult {
@@ -1303,13 +1400,13 @@ fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
 }
 
 /// Perform pivoted QR decomposition using faer's robust implementation
-/// This uses faer's high-level ColPivQr solver which guarantees mathematical 
+/// This uses faer's high-level ColPivQr solver which guarantees mathematical
 /// consistency between the Q, R, and P factors of the decomposition A*P = Q*R
 fn pivoted_qr_faer(
     matrix: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
-    use faer::linalg::solvers::ColPivQr;
     use faer::Mat;
+    use faer::linalg::solvers::ColPivQr;
 
     let m = matrix.nrows();
     let n = matrix.ncols();
@@ -1344,7 +1441,7 @@ fn pivoted_qr_faer(
             r[[i, j]] = r_faer[(i, j)];
         }
     }
-    
+
     // Step 5: Extract the consistent column permutation (pivot)
     let perm = qr.P();
     let pivot: Vec<usize> = perm.arrays().0.to_vec();
@@ -1375,14 +1472,13 @@ fn calculate_edf(
     Ok(if edf > 1.0 { edf } else { 1.0 })
 }
 
-
 /// Calculate scale parameter correctly for different link functions
 /// For Gaussian (Identity): Based on weighted residual sum of squares
 /// For Binomial (Logit): Fixed at 1.0 as in mgcv
 fn calculate_scale(
     beta: &Array1<f64>,
     x: ArrayView2<f64>,
-    y: ArrayView1<f64>,  // This is the original response, not the working response z
+    y: ArrayView1<f64>, // This is the original response, not the working response z
     weights: ArrayView1<f64>,
     edf: f64,
     link_function: LinkFunction,
@@ -1471,10 +1567,12 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::construction::{build_design_and_penalty_matrices, compute_penalty_square_roots};
+    use crate::calibrate::construction::{
+        build_design_and_penalty_matrices, compute_penalty_square_roots,
+    };
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{map_coefficients, BasisConfig};
-    use ndarray::{arr1, arr2, Array1, Array2};
+    use crate::calibrate::model::{BasisConfig, map_coefficients};
+    use ndarray::{Array1, Array2, arr1, arr2};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
@@ -1482,8 +1580,8 @@ mod tests {
     // === Helper types for test refactoring ===
     #[derive(Debug, Clone)]
     enum SignalType {
-        NoSignal,       // Pure noise, expect coefficients near zero
-        LinearSignal,   // A clear linear trend the model should find
+        NoSignal,     // Pure noise, expect coefficients near zero
+        LinearSignal, // A clear linear trend the model should find
     }
 
     struct TestScenarioResult {
@@ -1523,24 +1621,32 @@ mod tests {
                     SignalType::NoSignal => Array1::zeros(n_samples), // log_odds = 0 -> prob = 0.5
                     SignalType::LinearSignal => &p * 1.5 - 0.5,
                 };
-                let y_values: Vec<f64> = true_log_odds.iter().map(|&log_odds| {
-                    let prob = 1.0 / (1.0 + (-log_odds as f64).exp());
-                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-                }).collect();
+                let y_values: Vec<f64> = true_log_odds
+                    .iter()
+                    .map(|&log_odds| {
+                        let prob = 1.0 / (1.0 + (-log_odds as f64).exp());
+                        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                    })
+                    .collect();
                 (Array1::from_vec(y_values), true_log_odds)
-            },
+            }
             LinkFunction::Identity => {
                 let true_mean = match signal_type {
                     SignalType::NoSignal => Array1::zeros(n_samples), // Mean = 0
                     SignalType::LinearSignal => &p * 1.5 + 0.5, // Different intercept for variety
                 };
-                let noise: Array1<f64> = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() - 0.5); // N(0, 1/12)
+                let noise: Array1<f64> =
+                    Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() - 0.5); // N(0, 1/12)
                 let y = &true_mean + &noise;
                 (y, true_mean)
             }
         };
 
-        let data = TrainingData { y, p, pcs: Array2::zeros((n_samples, 0)) };
+        let data = TrainingData {
+            y,
+            p,
+            pcs: Array2::zeros((n_samples, 0)),
+        };
 
         // --- 2. Model Configuration ---
         let config = ModelConfig {
@@ -1550,13 +1656,16 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 },
+            pgs_basis_config: BasisConfig {
+                num_knots: 5,
+                degree: 3,
+            },
             pc_basis_configs: vec![],
             pgs_range: (-2.0, 2.0),
-            pc_ranges: vec![], 
-            pc_names: vec![], 
+            pc_ranges: vec![],
+            pc_names: vec![],
             constraints: HashMap::new(),
-            knot_vectors: HashMap::new(), 
+            knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
         };
 
@@ -1565,13 +1674,19 @@ mod tests {
         let rho_vec = arr1(&[0.0]);
 
         let pirls_result = fit_model_for_fixed_rho(
-            rho_vec.view(), x_matrix.view(), data.y.view(),
-            &rs_original, &layout, &config,
+            rho_vec.view(),
+            x_matrix.view(),
+            data.y.view(),
+            &rs_original,
+            &layout,
+            &config,
         )?;
 
         // --- 4. Return all necessary components for assertion ---
         Ok(TestScenarioResult {
-            pirls_result, x_matrix, layout,
+            pirls_result,
+            x_matrix,
+            layout,
             true_linear_predictor,
         })
     }
@@ -1607,7 +1722,14 @@ mod tests {
         );
         // For the test, the design matrix is already in the correct basis
         // We're using identity link function for the test
-        let result = solve_penalized_least_squares(x.view(), z.view(), weights.view(), &e, z.view(), LinkFunction::Identity);
+        let result = solve_penalized_least_squares(
+            x.view(),
+            z.view(),
+            weights.view(),
+            &e,
+            z.view(),
+            LinkFunction::Identity,
+        );
 
         // The solver should not fail despite the rank deficiency
         match &result {
@@ -1655,7 +1777,7 @@ mod tests {
         // One standard solution is beta = [0.1, 0.1, 0.0]. Another is [0.0, 0.0, 0.1].
         // The solver should find a solution that achieves the minimum possible RSS.
         // For this specific problem, a perfect fit with RSS = 0 is possible.
-        
+
         // Assert that the residual sum of squares is extremely close to the true minimum (0.0).
         // This is a much stronger and more correct assertion than simply being "small".
         assert!(
@@ -1747,8 +1869,7 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _, _) =
-            build_design_and_penalty_matrices(data, config)?;
+        let (x_matrix, s_list, layout, _, _) = build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
     }
@@ -1757,23 +1878,20 @@ mod tests {
     #[test]
     fn test_unpivot_columns_basic() {
         // Create a simple test matrix
-        let original = arr2(&[
-            [1.0, 2.0, 3.0],
-            [4.0, 5.0, 6.0],
-        ]);
-        
+        let original = arr2(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+
         // Simulate a pivot where columns are reordered as: [0, 2, 1] -> [2, 0, 1]
         let pivot = vec![2, 0, 1]; // This means: col 0 goes to pos 2, col 1 goes to pos 0, col 2 goes to pos 1
-        
+
         // Create a manually pivoted matrix to simulate what QR would produce
         let pivoted = arr2(&[
             [3.0, 1.0, 2.0], // Column order: original[2], original[0], original[1]
             [6.0, 4.0, 5.0],
         ]);
-        
+
         // Un-pivot using our function
         let unpivoted = unpivot_columns(pivoted.view(), &pivot);
-        
+
         // Check that we get back the original column order
         assert_eq!(unpivoted, original);
         println!("✓ unpivot_columns correctly reversed the column pivot");
@@ -1801,7 +1919,7 @@ mod tests {
         });
 
         // Create penalty matrices with DIFFERENT eigenvector structures (matching working test)
-        // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²  
+        // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²
         let s1 = arr2(&[[1.0, -1.0], [-1.0, 1.0]]);
         // s2 is a ridge penalty on the first coefficient only: β₁²
         let s2 = arr2(&[[1.0, 0.0], [0.0, 0.0]]);
@@ -1840,7 +1958,7 @@ mod tests {
             num_pgs_interaction_bases: 0,
         };
 
-        // Test with lambda values that match the working test pattern  
+        // Test with lambda values that match the working test pattern
         log::info!("Running test_reparameterization_per_rho with detailed diagnostics");
         let rho_vec1 = arr1(&[f64::ln(100.0), f64::ln(0.01)]); // Lambda: [100.0, 0.01] - s1 dominates
         let rho_vec2 = arr1(&[f64::ln(0.01), f64::ln(100.0)]); // Lambda: [0.01, 100.0] - s2 dominates
@@ -1875,14 +1993,18 @@ mod tests {
         // The key test: directly check that the transformation matrices are different
         // This is the core behavior we want to verify - each set of smoothing parameters
         // should produce a different transformation matrix
-        let qs_diff = (&result1.reparam_result.qs - &result2.reparam_result.qs).mapv(|x| x.abs()).sum();
+        let qs_diff = (&result1.reparam_result.qs - &result2.reparam_result.qs)
+            .mapv(|x| x.abs())
+            .sum();
         assert!(
             qs_diff > 1e-6,
             "The transformation matrices 'qs' should be different for different rho values"
         );
 
         // As a secondary check, confirm the coefficient estimates are also different
-        let beta_diff = (&result1.beta_transformed - &result2.beta_transformed).mapv(|x| x.abs()).sum();
+        let beta_diff = (&result1.beta_transformed - &result2.beta_transformed)
+            .mapv(|x| x.abs())
+            .sum();
         assert!(
             beta_diff > 1e-6,
             "Expected different coefficient estimates for different rho values"
@@ -1941,7 +2063,10 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 }, // Stable basis
+            pgs_basis_config: BasisConfig {
+                num_knots: 5,
+                degree: 3,
+            }, // Stable basis
             pc_basis_configs: vec![], // PGS-only model
             pgs_range: (-2.0, 2.0),   // Match the data
             pc_ranges: vec![],
@@ -1953,7 +2078,7 @@ mod tests {
 
         // === PHASE 4: Prepare inputs for the target function ===
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        
+
         // This is the exact parameter value that caused `inf` in other tests.
         let rho_vec = arr1(&[0.0]);
 
@@ -1973,20 +2098,27 @@ mod tests {
         // 1. Assert Finiteness: The result must not contain any non-finite numbers.
         assert!(
             pirls_result.deviance.is_finite(),
-            "Deviance must be a finite number, but was {}", pirls_result.deviance
+            "Deviance must be a finite number, but was {}",
+            pirls_result.deviance
         );
         assert!(
             pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients in the transformed basis must be finite."
         );
         assert!(
-            pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
+            pirls_result
+                .penalized_hessian_transformed
+                .iter()
+                .all(|&h| h.is_finite()),
             "The penalized Hessian must be finite."
         );
 
         // 2. Assert Correctness (Sanity Check): The model should learn a flat function.
         // Transform beta back to the original, interpretable basis.
-        let beta_original = pirls_result.reparam_result.qs.dot(&pirls_result.beta_transformed);
+        let beta_original = pirls_result
+            .reparam_result
+            .qs
+            .dot(&pirls_result.beta_transformed);
 
         // Map the flat vector to a structured object to easily isolate the spline part.
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
@@ -1994,16 +2126,23 @@ mod tests {
 
         // The norm of the spline coefficients should be reasonable for random data.
         // For logistic regression with random 50/50 data, we expect coefficients to be small but not tiny.
-        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        let pgs_coeffs_norm = pgs_spline_coeffs
+            .iter()
+            .map(|&c| c.powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!(
-            pgs_coeffs_norm < 10.0,  // Much more lenient - we're testing stability, not exact magnitude
+            pgs_coeffs_norm < 10.0, // Much more lenient - we're testing stability, not exact magnitude
             "Spline coefficients should be finite and reasonable. Got norm: {}",
             pgs_coeffs_norm
         );
-        
+
         // Log the actual values for diagnostic purposes
         println!("Spline coefficients norm: {:.6}", pgs_coeffs_norm);
-        println!("Individual spline coefficients: {:?}", &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]);
+        println!(
+            "Individual spline coefficients: {:?}",
+            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]
+        );
 
         println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data.");
 
@@ -2018,16 +2157,19 @@ mod tests {
         let n_samples = 1000;
         let mut rng = StdRng::seed_from_u64(42); // Different seed for variety
 
-        // Predictor: uniform distribution 
+        // Predictor: uniform distribution
         let p = Array1::linspace(-2.0, 2.0, n_samples);
 
         // Outcome: Generate from a clear logistic relationship
         // True function: log_odds = -0.5 + 1.5 * p (strong linear signal)
-        let y_values: Vec<f64> = p.iter().map(|&p_val| {
-            let log_odds: f64 = -0.5 + 1.5 * p_val;
-            let prob = 1.0 / (1.0 + (-log_odds).exp());
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-        }).collect();
+        let y_values: Vec<f64> = p
+            .iter()
+            .map(|&p_val| {
+                let log_odds: f64 = -0.5 + 1.5 * p_val;
+                let prob = 1.0 / (1.0 + (-log_odds).exp());
+                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            })
+            .collect();
         let y = Array1::from_vec(y_values);
 
         let data = TrainingData {
@@ -2044,7 +2186,10 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 5, degree: 3 },
+            pgs_basis_config: BasisConfig {
+                num_knots: 5,
+                degree: 3,
+            },
             pc_basis_configs: vec![],
             pgs_range: (-2.0, 2.0),
             pc_ranges: vec![],
@@ -2072,28 +2217,40 @@ mod tests {
         // === Assert stability (same as random data test) ===
         assert!(
             pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}", pirls_result.deviance
+            "Deviance must be finite, got: {}",
+            pirls_result.deviance
         );
         assert!(
             pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
+            pirls_result
+                .penalized_hessian_transformed
+                .iter()
+                .all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert signal detection (different from random data test) ===
         // Transform back to interpretable basis
-        let beta_original = pirls_result.reparam_result.qs.dot(&pirls_result.beta_transformed);
+        let beta_original = pirls_result
+            .reparam_result
+            .qs
+            .dot(&pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-        
+
         // For data with a strong signal, coefficients should be substantial
-        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        let pgs_coeffs_norm = pgs_spline_coeffs
+            .iter()
+            .map(|&c| c.powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!(
             pgs_coeffs_norm > 0.5, // Should be much larger than random noise
-            "Model should detect the clear signal, got coefficient norm: {}", pgs_coeffs_norm
+            "Model should detect the clear signal, got coefficient norm: {}",
+            pgs_coeffs_norm
         );
 
         // === More principled test: Compare fitted vs true function ===
@@ -2103,22 +2260,31 @@ mod tests {
         // Calculate correlation coefficient (scale-invariant measure)
         let pred_mean = predicted_log_odds.mean().unwrap();
         let true_mean = true_log_odds.mean().unwrap();
-        
+
         let numerator = (&predicted_log_odds - pred_mean).dot(&(&true_log_odds - true_mean));
         let pred_var = (&predicted_log_odds - pred_mean).mapv(|v| v.powi(2)).sum();
         let true_var = (&true_log_odds - true_mean).mapv(|v| v.powi(2)).sum();
         let correlation = numerator / (pred_var * true_var).sqrt();
-        
-        println!("Correlation between fitted and true function: {:.6}", correlation);
+
+        println!(
+            "Correlation between fitted and true function: {:.6}",
+            correlation
+        );
         assert!(
             correlation > 0.9, // Strong positive correlation expected
-            "The fitted function should strongly correlate with the true function. Correlation: {:.6}", correlation
+            "The fitted function should strongly correlate with the true function. Correlation: {:.6}",
+            correlation
         );
 
         // Log diagnostics
-        println!("Signal data - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
-        println!("Signal data - Sample coefficients: {:?}", 
-                &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]);
+        println!(
+            "Signal data - Spline coefficients norm: {:.6}",
+            pgs_coeffs_norm
+        );
+        println!(
+            "Signal data - Sample coefficients: {:?}",
+            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]
+        );
         println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal");
 
         Ok(())
@@ -2127,39 +2293,66 @@ mod tests {
     /// Test that P-IRLS is stable and correct on ideal data with Identity link (Gaussian).
     /// This verifies the algorithm converges and behaves correctly on easy data.
     #[test]
-    fn test_pirls_is_stable_on_perfectly_good_data_identity() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_pirls_is_stable_on_perfectly_good_data_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let result = run_pirls_test_scenario(LinkFunction::Identity, SignalType::NoSignal)?;
 
         // === Assert stability ===
         assert!(
             result.pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}", result.pirls_result.deviance
+            "Deviance must be finite, got: {}",
+            result.pirls_result.deviance
         );
         assert!(
-            result.pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
+            result
+                .pirls_result
+                .beta_transformed
+                .iter()
+                .all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            result.pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
+            result
+                .pirls_result
+                .penalized_hessian_transformed
+                .iter()
+                .all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert that coefficients are small (no signal case) ===
-        let beta_original = result.pirls_result.reparam_result.qs.dot(&result.pirls_result.beta_transformed);
+        let beta_original = result
+            .pirls_result
+            .reparam_result
+            .qs
+            .dot(&result.pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-        
-        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+
+        let pgs_coeffs_norm = pgs_spline_coeffs
+            .iter()
+            .map(|&c| c.powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!(
             pgs_coeffs_norm < 0.5, // Should be small for no-signal data
-            "With no signal, spline coeffs should be near zero. Norm: {}", pgs_coeffs_norm
+            "With no signal, spline coeffs should be near zero. Norm: {}",
+            pgs_coeffs_norm
         );
 
         // Log the actual values for diagnostic purposes
-        println!("Identity No Signal - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
-        println!("Identity No Signal - Individual spline coefficients: {:?}", &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]);
+        println!(
+            "Identity No Signal - Spline coefficients norm: {:.6}",
+            pgs_coeffs_norm
+        );
+        println!(
+            "Identity No Signal - Individual spline coefficients: {:?}",
+            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]
+        );
 
-        println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data with Identity link.");
+        println!(
+            "✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data with Identity link."
+        );
 
         Ok(())
     }
@@ -2173,28 +2366,46 @@ mod tests {
         // === Assert stability (same as random data test) ===
         assert!(
             result.pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}", result.pirls_result.deviance
+            "Deviance must be finite, got: {}",
+            result.pirls_result.deviance
         );
         assert!(
-            result.pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
+            result
+                .pirls_result
+                .beta_transformed
+                .iter()
+                .all(|&b| b.is_finite()),
             "All beta coefficients must be finite"
         );
         assert!(
-            result.pirls_result.penalized_hessian_transformed.iter().all(|&h| h.is_finite()),
+            result
+                .pirls_result
+                .penalized_hessian_transformed
+                .iter()
+                .all(|&h| h.is_finite()),
             "Penalized Hessian must be finite"
         );
 
         // === Assert signal detection ===
         // Transform back to interpretable basis
-        let beta_original = result.pirls_result.reparam_result.qs.dot(&result.pirls_result.beta_transformed);
+        let beta_original = result
+            .pirls_result
+            .reparam_result
+            .qs
+            .dot(&result.pirls_result.beta_transformed);
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-        
+
         // For data with a strong signal, coefficients should be substantial
-        let pgs_coeffs_norm = pgs_spline_coeffs.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
+        let pgs_coeffs_norm = pgs_spline_coeffs
+            .iter()
+            .map(|&c| c.powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!(
             pgs_coeffs_norm > 0.5, // Should be much larger than random noise
-            "Model should detect the clear signal, got coefficient norm: {}", pgs_coeffs_norm
+            "Model should detect the clear signal, got coefficient norm: {}",
+            pgs_coeffs_norm
         );
 
         // === More principled test: Compare fitted vs true function ===
@@ -2203,18 +2414,29 @@ mod tests {
             predicted_linear_predictor.view(),
             result.true_linear_predictor.view(),
         );
-        
-        println!("Correlation between fitted and true function: {:.6}", correlation);
+
+        println!(
+            "Correlation between fitted and true function: {:.6}",
+            correlation
+        );
         assert!(
             correlation > 0.9, // Strong positive correlation expected
-            "The fitted function should strongly correlate with the true function. Correlation: {:.6}", correlation
+            "The fitted function should strongly correlate with the true function. Correlation: {:.6}",
+            correlation
         );
 
         // Log diagnostics
-        println!("Identity Signal data - Spline coefficients norm: {:.6}", pgs_coeffs_norm);
-        println!("Identity Signal data - Sample coefficients: {:?}", 
-                &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]);
-        println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal with Identity link");
+        println!(
+            "Identity Signal data - Spline coefficients norm: {:.6}",
+            pgs_coeffs_norm
+        );
+        println!(
+            "Identity Signal data - Sample coefficients: {:?}",
+            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]
+        );
+        println!(
+            "✓ Test passed: P-IRLS stable and correctly learns realistic signal with Identity link"
+        );
 
         Ok(())
     }

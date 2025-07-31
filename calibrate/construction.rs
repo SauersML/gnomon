@@ -563,7 +563,7 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = f64::EPSILON.powf(2.0/3.0); // d_tol - matches mgcv's default
+    let eps = f64::EPSILON.powf(2.0 / 3.0); // d_tol - matches mgcv's default
     // println!("DEBUG: eps = {}", eps);
     let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 
@@ -583,17 +583,23 @@ pub fn stable_reparameterization(
     loop {
         // Increment iteration counter
         iteration += 1;
-        
-        println!("[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
-                 iteration, gamma.len(), q_current);
-                 
+
+        println!(
+            "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
+            iteration,
+            gamma.len(),
+            q_current
+        );
+
         if gamma.is_empty() || q_current == 0 {
             break;
         }
 
         log::debug!(
             "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
-            iteration, gamma.len(), q_current
+            iteration,
+            gamma.len(),
+            q_current
         );
 
         log::debug!(
@@ -642,11 +648,11 @@ pub fn stable_reparameterization(
         // We must ensure this logic exactly matches mgcv's get_stableS function
         let threshold = eps * max_omega;
         // println!("DEBUG: max_omega = {}, threshold = {}", max_omega, threshold);
-        
+
         // Initialize alpha and gamma_prime sets as empty
         let mut alpha = Vec::new();
         let mut gamma_prime = Vec::new();
-        
+
         // For each term in gamma, decide whether it goes in alpha or gamma_prime
         // based on its weighted Frobenius norm (omega)
         for &i in &gamma {
@@ -661,20 +667,24 @@ pub fn stable_reparameterization(
                 }
             }
         }
-        
+
         // Now alpha contains indices of penalties with ω_i ≥ threshold
         // gamma_prime contains indices of penalties with ω_i < threshold
-        
+
         // Alpha and gamma_prime are already index lists
         // No need for conversion - they contain the actual indices from gamma
-        
+
         if alpha.is_empty() {
             log::debug!("No terms in alpha set. Terminating.");
             break;
         }
-        
-        log::debug!("Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
-        
+
+        log::debug!(
+            "Partitioned: alpha set = {:?}, gamma_prime set = {:?}",
+            alpha,
+            gamma_prime
+        );
+
         // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
 
         // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
@@ -683,56 +693,66 @@ pub fn stable_reparameterization(
         for &i in &alpha {
             let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
             let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
-            
+
             // Use the penalty matrix directly without artificial perturbation
             // mgcv handles zero penalties exactly in the null-space
             sb.scaled_add(lambdas[i], &s_active_block);
         }
-        
+
         // println!("DEBUG: Final sb matrix: {:?}", sb);
 
         // Eigendecomposition to get rank and eigenvectors
         let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb
             .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        
+
         // println!("DEBUG: Eigenvalues: {:?}", eigenvalues);
         // println!("DEBUG: Eigenvectors: {:?}", u);
 
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
-        
+
         // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
         // mgcv uses: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
         // This means compare to the SMALLEST eigenvalue, not the largest
-        
+
         // Sort eigenvalues and get indices in ascending order (mgcv convention)
         let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
         sorted_indices.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
-        
+
         let q = eigenvalues.len();
         let largest_eigenval = eigenvalues[sorted_indices[q - 1]]; // Last element is largest when sorted ascending
         let rank_tolerance = largest_eigenval * r_tol;
-        
+
         // mgcv logic: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
         // where ev[Q-1] is the largest eigenvalue (eigenvalues are in ascending order)
         let mut r = 1;
         while r < q && eigenvalues[sorted_indices[q - r - 1]] > rank_tolerance {
             r += 1;
         }
-            
-        log::debug!("Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
-                    r, eigenvalues.len(), largest_eigenval, rank_tolerance);
+
+        log::debug!(
+            "Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
+            r,
+            eigenvalues.len(),
+            largest_eigenval,
+            rank_tolerance
+        );
 
         // Step 4: Check termination criterion
         // This is the critical fix: when r == q_current on the first iteration,
         // mgcv still performs the transformation and constructs the final outputs
         // The key is to properly update the transformation matrices first
-        log::debug!("Rank detection: r={}, q_current={}, iteration={}", r, q_current, iteration);
+        log::debug!(
+            "Rank detection: r={}, q_current={}, iteration={}",
+            r,
+            q_current,
+            iteration
+        );
 
         // Step 5: Update global transformation matrix Qf
         // For ascending order, we want the last r indices (largest eigenvalues)
         // let selected_indices = &sorted_indices[q - r..];
-        
+
         // CRITICAL FIX: Use the FULL eigenvector matrix for transformation, not truncated
         // The transformation must be done with the full q_current x q_current matrix
         // to maintain proper dimensions throughout the algorithm
@@ -799,16 +819,22 @@ pub fn stable_reparameterization(
 
         // Update for next iteration
         // CRITICAL FIX: Update iteration variables for next loop according to mgcv
-        k_offset += r;        // Increase offset by the rank we processed
-        q_current -= r;       // Reduce problem size by the rank we processed
-        gamma = gamma_prime;  // Continue with the subdominant penalties
-        
-        log::debug!("Updated for next iteration: k_offset={}, q_current={}, gamma.len()={}",
-                  k_offset, q_current, gamma.len());
-        
+        k_offset += r; // Increase offset by the rank we processed
+        q_current -= r; // Reduce problem size by the rank we processed
+        gamma = gamma_prime; // Continue with the subdominant penalties
+
+        log::debug!(
+            "Updated for next iteration: k_offset={}, q_current={}, gamma.len()={}",
+            k_offset,
+            q_current,
+            gamma.len()
+        );
+
         log::debug!(
             "[Reparam Iteration #{}] Finished. Determined rank: {}. Next problem size: {}",
-            iteration, r, q_current
+            iteration,
+            r,
+            q_current
         );
     }
 

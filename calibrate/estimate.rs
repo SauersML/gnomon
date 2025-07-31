@@ -174,7 +174,7 @@ pub fn train_model(
                 "[INFO] Proceeding with the best solution found. Final gradient norm: {:.2e}",
                 last_solution.final_gradient_norm
             );
-            
+
             // 2. Accept the solution.
             *last_solution
         }
@@ -572,16 +572,16 @@ pub mod internal {
                         let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
                         s_lambda_original.scaled_add(lambdas[k], &s_k);
                     }
-                    
+
                     let mut trace_h_inv_s_lambda = 0.0;
 
                     // NEW: Get the transformation matrix and transformed Hessian
                     let qs = &pirls_result.reparam_result.qs;
                     let hessian_transformed = &pirls_result.penalized_hessian_transformed;
-                    
+
                     // NEW: Transform the Hessian back to the original basis for this calculation
                     let hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
-                    
+
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
                         if s_col.iter().all(|&x| x == 0.0) {
@@ -592,7 +592,8 @@ pub mod internal {
                         let mut hessian_work = hessian_original.clone(); // Use original basis Hessian
                         ensure_positive_definite(&mut hessian_work);
 
-                        match hessian_work.solve(&s_col.to_owned()) { // CORRECT: Both matrices are now in the original basis
+                        match hessian_work.solve(&s_col.to_owned()) {
+                            // CORRECT: Both matrices are now in the original basis
                             Ok(h_inv_s_col) => {
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
                             }
@@ -613,7 +614,10 @@ pub mod internal {
                     }
 
                     // log |H| = log |X'X + S_λ|
-                    let log_det_h = match pirls_result.penalized_hessian_transformed.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result
+                        .penalized_hessian_transformed
+                        .cholesky(UPLO::Lower)
+                    {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             log::warn!(
@@ -653,13 +657,17 @@ pub mod internal {
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use stable penalty term calculated in P-IRLS
-                    let penalised_ll = -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
+                    let penalised_ll =
+                        -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
                     // Log-determinant of the penalty matrix - use stable value from P-IRLS
                     let log_det_s = pirls_result.reparam_result.log_det;
 
                     // Log-determinant of the penalized Hessian.
-                    let log_det_h = match pirls_result.penalized_hessian_transformed.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result
+                        .penalized_hessian_transformed
+                        .cholesky(UPLO::Lower)
+                    {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
@@ -946,7 +954,7 @@ pub mod internal {
             // Transform the design matrix and get transformed penalty square roots
             let x_transformed = self.x.dot(qs);
             let rs_transformed = &reparam_result.rs_transformed;
-            
+
             // --- Proactive Hessian Stabilization ---
             // Create a mutable copy of the Hessian to work with.
             let mut hessian = hessian_transformed.clone();
@@ -1015,10 +1023,10 @@ pub mod internal {
                         let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
                         s_lambda_original.scaled_add(lambdas[k], &s_k_original);
                     }
-                    
+
                     // Transform Hessian back to original basis for this calculation
                     let hessian_original = qs.dot(&hessian).dot(&qs.t());
-                    
+
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
@@ -1046,9 +1054,9 @@ pub mod internal {
                     // Use transformed design matrix with transformed beta
                     let eta = x_transformed.dot(beta_transformed);
                     let residuals = &self.y() - &eta;
-                    
+
                     // For the Gaussian/REML case, the gradient calculation is a direct application of the
-                    // Envelope Theorem. The inner P-IRLS loop minimizes the penalized deviance 
+                    // Envelope Theorem. The inner P-IRLS loop minimizes the penalized deviance
                     // `D_p(β, ρ) = ||y - Xβ||² + β'S(ρ)β` by choosing optimal coefficients `β*` for a
                     // fixed set of log-smoothing parameters `ρ`.
                     //
@@ -1084,11 +1092,13 @@ pub mod internal {
                         // R/C Counterpart: `oo$D1/(2*scale*gamma)`
                         // ---
 
-                        let dbeta_drho_k_transformed = -lambdas[k]
-                            * internal::robust_solve(&hessian, &s_k_beta_transformed)?;
+                        let dbeta_drho_k_transformed =
+                            -lambdas[k] * internal::robust_solve(&hessian, &s_k_beta_transformed)?;
 
-                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
-                        let d_penalty_d_rho_k = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
+                        let d_deviance_d_rho_k =
+                            deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
+                        let d_penalty_d_rho_k =
+                            lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
 
                         let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k; // Corresponds to oo$D1
                         let penalized_deviance_grad_term = d1 / (2.0 * scale);
@@ -1104,10 +1114,9 @@ pub mod internal {
                             if s_col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
-                            if let Ok(h_inv_col) = internal::robust_solve(
-                                &hessian,
-                                &s_col.to_owned(),
-                            ) {
+                            if let Ok(h_inv_col) =
+                                internal::robust_solve(&hessian, &s_col.to_owned())
+                            {
                                 trace_h_inv_s_k += h_inv_col[j];
                             }
                         }
@@ -1172,7 +1181,8 @@ pub mod internal {
                         // Use transformed penalty matrix (consistent with other calculations)
                         let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
                         let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
-                        let dbeta_drho_k_transformed = -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
+                        let dbeta_drho_k_transformed =
+                            -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
                         // Use transformed design matrix
@@ -1422,8 +1432,8 @@ pub mod internal {
         use super::*;
         use crate::calibrate::model::BasisConfig;
         use approx::assert_abs_diff_eq;
+        use ndarray::Array;
         use ndarray::s;
-        use ndarray::{Array};
         use rand;
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
@@ -1976,14 +1986,13 @@ pub mod internal {
             // --- 2. Configure and Train the Model ---
             // Use sufficient basis functions for accurate approximation
             let mut config = create_test_config();
-            config.pgs_basis_config.num_knots = 6; // Increased from 4 for better model flexibility
-            config.pc_basis_configs[0].num_knots = 4; // Increased from 4 for better model flexibility
-            config.pgs_basis_config.degree = 2; // Quadratic splines are more stable than cubic
-            config.pc_basis_configs[0].degree = 2; // Quadratic splines are more stable than cubic
+            config.pgs_basis_config.num_knots = 3; // for better model flexibility
+            config.pc_basis_configs[0].num_knots = 3; // for better model flexibility
+            config.pgs_basis_config.degree = 3;
+            config.pc_basis_configs[0].degree = 3;
 
-            // Add more stability by increasing P-IRLS iteration limit and improving initialization
-            config.max_iterations = 250; // More P-IRLS iterations for better convergence
-            config.reml_max_iterations = 100; // More BFGS iterations to ensure convergence
+            config.max_iterations = 100; // More P-IRLS iterations for better convergence
+            config.reml_max_iterations = 50; // More BFGS iterations to ensure convergence
             config.reml_convergence_tolerance = 1e-4; // Slightly looser tolerance for better convergence
 
             // Train the model on the training data
@@ -2712,56 +2721,71 @@ pub mod internal {
 
         /// Test that the P-IRLS algorithm can handle models with multiple PCs and interactions
         #[test]
-        fn test_logit_model_with_three_pcs_and_interactions() -> Result<(), Box<dyn std::error::Error>> {
+        fn test_logit_model_with_three_pcs_and_interactions()
+        -> Result<(), Box<dyn std::error::Error>> {
             // --- 1. SETUP: Generate test data ---
             let n_samples = 500;
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             // Create predictor variable (PGS)
             let p = Array1::linspace(-3.0, 3.0, n_samples);
-            
+
             // Create three PCs with different distributions
             let pc1 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
             let pc2 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
             let pc3 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
-            
+
             // Create a PCs matrix
             let mut pcs = Array2::zeros((n_samples, 3));
             pcs.column_mut(0).assign(&pc1);
             pcs.column_mut(1).assign(&pc2);
             pcs.column_mut(2).assign(&pc3);
-            
+
             // Create true linear predictor with interactions
-            let true_logits = &p * 0.5 + &pc1 * 0.3 + &pc2 * 0.0 + &pc3 * 0.2 +
-                              &(&p * &pc1) * 0.6 + &(&p * &pc2) * 0.0 + &(&p * &pc3) * 0.2;
-                              
+            let true_logits = &p * 0.5
+                + &pc1 * 0.3
+                + &pc2 * 0.0
+                + &pc3 * 0.2
+                + &(&p * &pc1) * 0.6
+                + &(&p * &pc2) * 0.0
+                + &(&p * &pc3) * 0.2;
+
             // Generate binary outcomes
             let y = generate_y_from_logit(&true_logits, &mut rng);
-            
+
             // --- 2. Create configuration ---
             let data = TrainingData { y, p, pcs };
             let mut config = create_test_config();
             config.pc_names = vec!["PC1".to_string(), "PC2".to_string(), "PC3".to_string()];
-            config.pc_basis_configs = vec![BasisConfig { num_knots: 6, degree: 3 }; 3];
+            config.pc_basis_configs = vec![
+                BasisConfig {
+                    num_knots: 6,
+                    degree: 3
+                };
+                3
+            ];
             config.pc_ranges = vec![(-2.0, 2.0); 3];
-            
+
             // --- 3. Train model ---
             let model_result = train_model(&data, &config);
-            
+
             // --- 4. Verify model performance ---
             assert!(model_result.is_ok(), "Model training should succeed");
             let model = model_result?;
-            
+
             // Get predictions on training data
             let predictions = model.predict(data.p.view(), data.pcs.view())?;
-            
+
             // Calculate correlation between predicted probabilities and true probabilities
             let true_probabilities = true_logits.mapv(|l| 1.0 / (1.0 + (-l).exp()));
             let correlation = correlation_coefficient(&predictions, &true_probabilities);
-            
+
             // With interactions, we expect correlation to be reasonably high
-            assert!(correlation > 0.7, "Model should achieve good correlation with true probabilities");
-            
+            assert!(
+                correlation > 0.7,
+                "Model should achieve good correlation with true probabilities"
+            );
+
             Ok(())
         }
 
@@ -2981,14 +3005,15 @@ pub mod internal {
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
             let p = Array::linspace(-2.0, 2.0, n_samples);
-            
+
             // Define the true, noise-free relationship (the signal)
             let true_logits = p.mapv(|val| 1.5 * val - 0.5); // A clear linear signal
             let true_probabilities = true_logits.mapv(|logit| 1.0 / (1.0 + (-logit as f64).exp()));
 
             // Generate the noisy, binary outcomes from the true probabilities
-            let y = true_probabilities.mapv(|prob| if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 });
-            
+            let y =
+                true_probabilities.mapv(|prob| if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 });
+
             let data = TrainingData {
                 y: y.clone(),
                 p: p.clone(),
@@ -3018,19 +3043,21 @@ pub mod internal {
             // Metric 1: Correlation (the original test's metric, now made robust)
             let model_correlation = correlation_coefficient(&predictions, &data.y);
             let oracle_correlation = correlation_coefficient(&true_probabilities, &data.y);
-            
+
             println!("Oracle Performance (Theoretical Max on this data):");
             println!("  - Correlation: {:.4}", oracle_correlation);
-            
+
             println!("\nModel Performance:");
             println!("  - Correlation: {:.4}", model_correlation);
-            
+
             // Dynamic Assertion: The model must achieve at least 90% of the oracle's performance.
             let correlation_threshold = 0.90 * oracle_correlation;
             assert!(
                 model_correlation > correlation_threshold,
                 "Model correlation ({:.4}) did not meet the dynamic threshold ({:.4}). The oracle achieved {:.4}.",
-                model_correlation, correlation_threshold, oracle_correlation
+                model_correlation,
+                correlation_threshold,
+                oracle_correlation
             );
 
             // Metric 2: AUC for discrimination
@@ -3039,13 +3066,15 @@ pub mod internal {
 
             println!("  - AUC: {:.4}", model_auc);
             println!("Oracle AUC: {:.4}", oracle_auc);
-            
+
             // Dynamic Assertion: AUC should be very close to the oracle's.
             let auc_threshold = 0.95 * oracle_auc;
             assert!(
                 model_auc > auc_threshold,
                 "Model AUC ({:.4}) did not meet the dynamic threshold ({:.4}). The oracle achieved {:.4}.",
-                model_auc, auc_threshold, oracle_auc
+                model_auc,
+                auc_threshold,
+                oracle_auc
             );
         }
 
@@ -3470,7 +3499,6 @@ pub mod internal {
             println!("✓ Proactive singularity detection test passed!");
         }
 
-
         #[test]
         fn test_gradient_calculation_against_numerical_approximation() {
             use rand::{SeedableRng, prelude::*, rngs::StdRng};
@@ -3498,22 +3526,22 @@ pub mod internal {
                         generate_y_from_logit(&f_true, rng)
                     }
                 };
-                
+
                 // --- 3. Setup TrainingData with PC to create a penalized term ---
                 // Since the canonical builder doesn't penalize the main PGS term,
                 // we use the PC mechanism to create a penalized smooth term for testing.
                 let dummy_pc = Array2::from_shape_vec((n_samples, 1), x_vals.to_vec()).unwrap();
-                let data = TrainingData { 
-                    y, 
+                let data = TrainingData {
+                    y,
                     p: Array1::zeros(n_samples), // Use zero for PGS since we're testing PC penalty
-                    pcs: dummy_pc 
+                    pcs: dummy_pc,
                 };
 
                 // Configure for a single penalized PC term
                 // NOTE: This actually creates a more complex model than y ~ 1 + f(x_vals):
                 // The model is: y ~ 1 + f(PGS=0) + f(PC=x_vals) + f(PGS_B1, PC=x_vals) + ... + f(PGS_B6, PC=x_vals)
                 // This happens because:
-                // 1. The PGS config creates an unpenalized "ghost" term f(PGS=0) 
+                // 1. The PGS config creates an unpenalized "ghost" term f(PGS=0)
                 // 2. The PC config creates the main penalized term f(PC=x_vals)
                 // 3. Interactions are created between each PGS basis function and the PC term
                 // The gradient test still works correctly since it validates analytical vs numerical
@@ -3526,7 +3554,7 @@ pub mod internal {
                     degree: 3,
                 }];
                 config.pc_ranges = vec![(0.0, 1.0)];
-                
+
                 // --- 4. THE FIX: Use the canonical builder to create a well-posed model ---
                 let (x_matrix, s_list, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config)
@@ -4340,16 +4368,16 @@ pub mod internal {
             // Test the fundamental descent property with proper step size
             let cost_mid = compute_cost_safe(&rho_mid);
             let grad_norm = grad_mid.dot(&grad_mid).sqrt();
-            
+
             // Use a very conservative step size for numerical stability
             let step_size = 1e-8 / grad_norm.max(1.0);
             let rho_step = &rho_mid - step_size * &grad_mid;
             let cost_step = compute_cost_safe(&rho_step);
-            
+
             // If the function is locally linear, the cost should decrease or stay nearly the same
             let cost_change = cost_step - cost_mid;
             let is_descent = cost_change <= 1e-3; // Allow larger numerical error for test stability
-            
+
             if !is_descent {
                 // If descent fails, it might be due to numerical issues near a minimum
                 // Let's check if we're at a stationary point by examining gradient magnitude
@@ -4364,9 +4392,14 @@ pub mod internal {
                      Step size: {:.2e}",
                     cost_mid, cost_step, cost_change, grad_norm, step_size
                 );
-                println!("Note: Gradient descent test skipped - appears to be near stationary point");
+                println!(
+                    "Note: Gradient descent test skipped - appears to be near stationary point"
+                );
             } else {
-                println!("✓ Gradient descent property verified: cost decreased by {:.2e}", -cost_change);
+                println!(
+                    "✓ Gradient descent property verified: cost decreased by {:.2e}",
+                    -cost_change
+                );
             }
         }
 
@@ -4781,6 +4814,3 @@ impl From<EstimationError> for String {
         error.to_string()
     }
 }
-
-
-
