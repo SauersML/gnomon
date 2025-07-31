@@ -60,8 +60,7 @@ pub struct ModelConfig {
     /// Use an Option because not all terms might be constrained.
     #[serde(default)] // For backward compatibility with old models that don't have this field
     pub constraints: HashMap<String, Constraint>,
-    /// Knot vectors used during training, saved for exact reproduction during prediction
-    #[serde(default)] // For backward compatibility with old models that don't have this field
+    /// Knot vectors used during training, required for exact reproduction during prediction
     pub knot_vectors: HashMap<String, Array1<f64>>,
     /// Number of PGS interaction bases (empirical from actual basis generation)
     /// Used to ensure consistency between construction and coefficient flattening
@@ -204,23 +203,15 @@ mod internal {
         config: &ModelConfig,
     ) -> Result<Array2<f64>, ModelError> {
         // 1. Generate basis for PGS using saved knot vector if available
-        let (pgs_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get("pgs") {
-            // Use saved knot vector for exact reproduction
-            basis::create_bspline_basis_with_knots(
-                p_new,
-                saved_knots.view(),
-                config.pgs_basis_config.degree,
-            )?
-        } else {
-            // Fallback to original method for backward compatibility
-            create_bspline_basis(
-                p_new,
-                None,
-                config.pgs_range,
-                config.pgs_basis_config.num_knots,
-                config.pgs_basis_config.degree,
-            )?
-        };
+        // Only use saved knot vectors - remove fallback to ensure consistency
+        let saved_knots = config.knot_vectors.get("pgs")
+            .ok_or_else(|| ModelError::InternalStackingError)?;
+        
+        let (pgs_basis_unc, _) = basis::create_bspline_basis_with_knots(
+            p_new,
+            saved_knots.view(),
+            config.pgs_basis_config.degree,
+        )?;
 
         // Apply the SAVED PGS constraint
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -248,23 +239,15 @@ mod internal {
         for i in 0..config.pc_names.len() {
             let pc_col = pcs_new.column(i);
             let pc_name = &config.pc_names[i];
-            let (pc_basis_unc, _) = if let Some(saved_knots) = config.knot_vectors.get(pc_name) {
-                // Use saved knot vector for exact reproduction
-                basis::create_bspline_basis_with_knots(
-                    pc_col,
-                    saved_knots.view(),
-                    config.pc_basis_configs[i].degree,
-                )?
-            } else {
-                // Fallback to original method for backward compatibility
-                create_bspline_basis(
-                    pc_col,
-                    None,
-                    config.pc_ranges[i],
-                    config.pc_basis_configs[i].num_knots,
-                    config.pc_basis_configs[i].degree,
-                )?
-            };
+            // Only use saved knot vectors - remove fallback to ensure consistency
+            let saved_knots = config.knot_vectors.get(pc_name)
+                .ok_or_else(|| ModelError::InternalStackingError)?;
+            
+            let (pc_basis_unc, _) = basis::create_bspline_basis_with_knots(
+                pc_col,
+                saved_knots.view(),
+                config.pc_basis_configs[i].degree,
+            )?;
 
             // Apply the SAVED PC constraint
             let pc_name = &config.pc_names[i];
@@ -313,7 +296,11 @@ mod internal {
             if m == 0 || m > pgs_main_basis_unc.ncols() {
                 continue; // Skip out-of-bounds
             }
-            let pgs_weight_col = pgs_main_basis_unc.column(m - 1);
+            let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
+            
+            // Center the PGS basis column to ensure orthogonality
+            let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
+            let pgs_weight_col = &pgs_weight_col_uncentered - mean;
 
             // Iterate through PC names in the canonical order
             for pc_name in &config.pc_names {
@@ -321,8 +308,8 @@ mod internal {
                 let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
                 let pc_basis_con = &pc_constrained_bases[pc_idx];
 
-                // Pure interaction approach: use constrained PC basis with constrained PGS
-                // Both bases are constrained (sum-to-zero) to avoid linear dependencies
+                // Pure interaction approach: use constrained PC basis with centered PGS
+                // Both bases are now properly centered to avoid linear dependencies
                 let interaction_term = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
 
                 for col in interaction_term.axis_iter(Axis(1)) {
