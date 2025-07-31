@@ -239,7 +239,9 @@ def create_comparison_plot(mgcv_data, gnomon_data):
     # --- Pre-calculate all components for plotting ---
     mgcv_basis = mgcv_data['basis_matrix']
     gnomon_basis = gnomon_data['basis_matrix']
-    mgcv_weighted = mgcv_basis * mgcv_data['coeffs']
+    mgcv_coeffs = mgcv_data['coeffs']
+    mgcv_coeffs_centered = mgcv_coeffs - np.mean(mgcv_coeffs)
+    mgcv_weighted = mgcv_basis * mgcv_coeffs_centered
     gnomon_weighted = gnomon_basis * gnomon_data['coeffs']
     mgcv_final_curve = mgcv_weighted.sum(axis=1)
     gnomon_final_curve = gnomon_weighted.sum(axis=1)
