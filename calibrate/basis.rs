@@ -493,7 +493,11 @@ mod tests {
 
     #[test]
     fn test_single_point_evaluation_degree_one() {
-        // Test a single point where the value can be calculated by hand for a simple case.
+        // This test validates the raw output of the UNCONSTRAINED basis evaluator
+        // (internal::evaluate_splines_at_point), not a final model prediction which
+        // would require applying constraints. The test only verifies that the raw
+        // basis functions are correctly evaluated, before any constraints are applied.
+        // 
         // Degree 1 (linear) splines with knots t = [0,0,1,2,2].
         // This gives 3 basis functions (n = k-d-1 = 5-1-1 = 3), B_{0,1}, B_{1,1}, B_{2,1}.
         let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
@@ -828,6 +832,70 @@ mod tests {
         // and both have value 0.5 (from linear interpolation)
         assert_abs_diff_eq!(basis_at_2_5[2], 0.5, epsilon = 1e-9);
         assert_abs_diff_eq!(basis_at_2_5[3], 0.5, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_prediction_with_constrained_basis() {
+        // This test verifies the complete process:
+        // 1. Create an unconstrained basis.
+        // 2. Apply a sum-to-zero constraint.
+        // 3. Make a prediction using the constrained basis and coefficients.
+
+        let data = Array::linspace(0.0, 1.0, 11);
+        let degree = 3;
+        let num_internal_knots = 5;
+
+        // --- Step 1: Create the full, unconstrained basis matrix ---
+        let (basis_unc, _) =
+            create_bspline_basis(data.view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
+        
+        // The first column is the intercept, the rest are for the main effect
+        let main_basis_unc = basis_unc.slice(s![.., 1..]);
+
+        // --- Step 2: Apply the sum-to-zero constraint ---
+        let (main_basis_con, z_transform) =
+            apply_sum_to_zero_constraint(main_basis_unc).unwrap();
+
+        // --- Step 3: Make a prediction ---
+        // Define some coefficients for the constrained basis
+        let intercept_coeff = 0.5;
+        let num_con_coeffs = main_basis_con.ncols();
+        let main_coeffs = Array1::from_shape_fn(num_con_coeffs, |i| (i as f64 + 1.0) * 0.1);
+        
+        // The final prediction is intercept + B_constrained * β
+        let expected_prediction = intercept_coeff + main_basis_con.dot(&main_coeffs);
+        
+        // --- Now, simulate this process for a single point ---
+        let test_point_x = 0.65;
+        
+        // a. Get the raw basis functions at the test point
+        let (raw_basis_at_point, _) =
+            create_bspline_basis(array![test_point_x].view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
+        
+        // b. Isolate the main effect part
+        let main_basis_unc_at_point = raw_basis_at_point.slice(s![0, 1..]);
+        
+        // c. Apply the *same* Z transformation matrix derived from the full dataset
+        let main_basis_con_at_point = Array1::from_vec(main_basis_unc_at_point.to_vec()).dot(&z_transform);
+        
+        // d. Calculate the final prediction for that single point
+        let final_prediction_at_point = intercept_coeff + main_basis_con_at_point.dot(&main_coeffs);
+        
+        // Find the corresponding point in our full expected_prediction vector
+        // We need to find which index in `data` is closest to `test_point_x`
+        let closest_idx = data
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - test_point_x).abs().partial_cmp(&(*b - test_point_x).abs()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+
+        // The prediction at the test point should be very close to the pre-calculated value
+        assert_abs_diff_eq!(
+            final_prediction_at_point,
+            expected_prediction[closest_idx],
+            epsilon = 1e-9
+        );
     }
 
     #[test]

@@ -369,17 +369,30 @@ mod tests {
     use super::*;
     // TrainingData is not used in tests
     use ndarray::{Array1, Array2, array};
+    use approx::assert_abs_diff_eq;
 
     /// Test a trivially simple case with degree 1 B-spline (piecewise linear interpolation).
     /// This test uses a simple ground truth we can calculate by hand to verify the prediction.
     #[test]
     fn test_trained_model_predict() {
-        // Create a model with degree 1 B-spline and a single internal knot (0.5)
-        // Knot vector: [0, 0, 0.5, 1, 1]
+        // --- Setup a simple, known model configuration ---
         let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
-        let z_transform = Array2::<f64>::eye(2); // Identity matrix for no constraint
+        let degree = 1;
+        // For a degree=1 spline with this knot vector, there are 3 unconstrained basis functions.
+        // The main effect (excluding the intercept) has 2 basis functions.
+        // The sum-to-zero constraint will transform these 2 functions into 1 constrained function.
+        // However, the test below will derive this transformation programmatically.
+        
+        // Create a dummy unconstrained basis to derive the constraint matrix Z
+        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+            array![0.25, 0.75].view(), // two arbitrary points
+            knot_vector.view(),
+            degree,
+        ).unwrap();
+        let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
+        let (_, z_transform) = basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view()).unwrap();
 
-        // Simple model with intercept=0, main effect coeffs [2.0, 4.0]
+
         let model = TrainedModel {
             config: ModelConfig {
                 link_function: LinkFunction::Identity,
@@ -389,10 +402,10 @@ mod tests {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 pgs_basis_config: BasisConfig {
-                    num_knots: 1,
-                    degree: 1,
-                }, // Degree 1 with 1 internal knot
-                pc_basis_configs: vec![], // No PC effects in this simple test
+                    num_knots: 1, // Number of internal knots
+                    degree,
+                },
+                pc_basis_configs: vec![],
                 pgs_range: (0.0, 1.0),
                 pc_ranges: vec![],
                 pc_names: vec![],
@@ -408,15 +421,16 @@ mod tests {
                 },
                 knot_vectors: {
                     let mut knots = HashMap::new();
-                    knots.insert("pgs".to_string(), knot_vector);
+                    knots.insert("pgs".to_string(), knot_vector.clone());
                     knots
                 },
-                num_pgs_interaction_bases: 0, // No interactions in this test
+                num_pgs_interaction_bases: 0,
             },
             coefficients: MappedCoefficients {
-                intercept: 0.0,
+                intercept: 0.5, // Added an intercept for a more complete test
                 main_effects: MainEffects {
-                    pgs: vec![2.0, 4.0], // Two coefficients for degree 1 B-spline
+                    // There is only 1 coefficient after constraint for this simple case
+                    pgs: vec![2.0], 
                     pcs: HashMap::new(),
                 },
                 interaction_effects: HashMap::new(),
@@ -424,44 +438,37 @@ mod tests {
             lambdas: vec![],
         };
 
-        // Test point x = 0.25, which is halfway between knots at 0 and 0.5
-        let test_point = array![0.25];
-        let empty_pcs = Array2::<f64>::zeros((1, 0)); // No PCs
+        // --- Define Test Points ---
+        let test_points = array![0.25, 0.75];
+        let empty_pcs = Array2::<f64>::zeros((2, 0));
 
-        // Calculate expected result by hand:
-        // For x = 0.25, the basis functions will have values B_0,1 = 0.5, B_1,1 = 0.5, B_2,1 = 0.0
-        // But the model ignores B_0,1 (first basis column) and only uses B_1,1 and B_2,1
-        // Linear predictor: eta = (0.5 * 2.0) + (0.0 * 4.0) = 1.0
-        let expected_value = 1.0;
+        // --- Calculate the expected result CORRECTLY ---
+        // The manual calculation was flawed. Here's the correct way to derive the ground truth:
+        // 1. Generate the raw, unconstrained basis at the test points.
+        let (full_basis_unc, _) = basis::create_bspline_basis_with_knots(
+            test_points.view(),
+            knot_vector.view(),
+            degree,
+        ).unwrap();
+        
+        // 2. Isolate the main effect part of the basis (all columns except the intercept).
+        let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
+        
+        // 3. Apply the same sum-to-zero constraint transformation.
+        let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
 
-        // Get the model prediction
-        let prediction = model.predict(test_point.view(), empty_pcs.view()).unwrap();
+        // 4. Get the coefficients for the constrained basis.
+        let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
+        
+        // 5. Calculate the final expected linear predictor: intercept + constrained_basis * coeffs
+        let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
 
-        // Verify the result matches our ground truth
-        assert_eq!(prediction.len(), 1);
-        assert!(
-            (prediction[0] - expected_value).abs() < 1e-10,
-            "Prediction {} does not match expected value {}",
-            prediction[0],
-            expected_value
-        );
+        // Get the model's prediction using the actual `predict` method
+        let predictions = model.predict(test_points.view(), empty_pcs.view()).unwrap();
 
-        // Also test at x = 0.75, which is halfway between knots at 0.5 and 1.0
-        // For x = 0.75, the basis functions will have values B_0,1 = 0.0, B_1,1 = 0.5, B_2,1 = 0.5
-        // But the model ignores B_0,1 (first basis column) and only uses B_1,1 and B_2,1
-        // Linear predictor: eta = (0.5 * 2.0) + (0.5 * 4.0) = 3.0
-        let test_point_2 = array![0.75];
-        let expected_value_2 = 3.0;
-
-        let prediction_2 = model
-            .predict(test_point_2.view(), empty_pcs.view())
-            .unwrap();
-        assert!(
-            (prediction_2[0] - expected_value_2).abs() < 1e-10,
-            "Prediction {} does not match expected value {}",
-            prediction_2[0],
-            expected_value_2
-        );
+        // Verify the results match our correctly calculated ground truth
+        assert_eq!(predictions.len(), 2);
+        assert_abs_diff_eq!(predictions, expected_values, epsilon = 1e-10);
     }
 
     /// Tests that the prediction fails appropriately with invalid input dimensions.
