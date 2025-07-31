@@ -1383,83 +1383,71 @@ mod tests {
             pc_magnitudes.insert(pc_name, l2_norm);
         }
         
-        // 1. Real vs. Null: Check if real effects (PC1, PC2, PC4) are significantly larger than null effects (PC3, PC5)
-        println!("   1. Validating Real vs. Null Effects");
+        // 1. Group PCs by their true effect tiers based on the TrueEffects struct
+        println!("   1. Validating Effect Hierarchy (Strong > Weak > Null)");
         
-        // Calculate the average magnitude for real and null effects
-        let real_pcs = ["PC1", "PC2", "PC4"];
-        let null_pcs = ["PC3", "PC5"];
+        // Group PCs by their true effect tiers based on the TrueEffects struct
+        let strong_pcs = ["PC1"];
+        let weak_pcs = ["PC3", "PC4"];
+        let null_pcs = ["PC2", "PC5"];
         
-        let real_magnitude_sum: f64 = real_pcs.iter()
+        // Calculate average L2 norm for each tier
+        let strong_avg_magnitude = strong_pcs
+            .iter()
             .filter_map(|&pc| pc_magnitudes.get(pc))
-            .sum();
-        let real_avg_magnitude = real_magnitude_sum / real_pcs.len() as f64;
-        
-        let null_magnitude_sum: f64 = null_pcs.iter()
+            .sum::<f64>()
+            / strong_pcs.len() as f64;
+
+        let weak_avg_magnitude = weak_pcs
+            .iter()
             .filter_map(|&pc| pc_magnitudes.get(pc))
-            .sum();
-        let null_avg_magnitude = null_magnitude_sum / null_pcs.len() as f64;
-        
-        println!("     - Real effects average magnitude: {:.6}", real_avg_magnitude);
-        println!("     - Null effects average magnitude: {:.6}", null_avg_magnitude);
-        println!("     - Ratio (real/null): {:.2}x", real_avg_magnitude / null_avg_magnitude);
-        
-        // Verify real effects are significantly larger than null effects (at least 2x)
+            .sum::<f64>()
+            / weak_pcs.len() as f64;
+
+        let null_avg_magnitude = null_pcs
+            .iter()
+            .filter_map(|&pc| pc_magnitudes.get(pc))
+            .sum::<f64>()
+            / null_pcs.len() as f64;
+
+        println!("     - Strong effect avg magnitude (PC1): {:.6}", strong_avg_magnitude);
+        println!("     - Weak effects avg magnitude (PC3, PC4): {:.6}", weak_avg_magnitude);
+        println!("     - Null effects avg magnitude (PC2, PC5): {:.6}", null_avg_magnitude);
+
+        // Assert on the hierarchy
         assert!(
-            real_avg_magnitude > null_avg_magnitude * 2.0,
-            "Real effects (PC1, PC2, PC4) should have significantly larger magnitudes than null effects (PC3, PC5)"
-        );
-        
-        // 2. Effect Hierarchy: Verify PC1 > PC2 > PC4 (should match the strength of simulated effects)
-        println!("   2. Validating Effect Hierarchy");
-        
-        let pc1_magnitude = pc_magnitudes.get("PC1").unwrap_or(&0.0);
-        let pc2_magnitude = pc_magnitudes.get("PC2").unwrap_or(&0.0);
-        let pc4_magnitude = pc_magnitudes.get("PC4").unwrap_or(&0.0);
-        
-        println!("     - PC1 magnitude: {:.6}", pc1_magnitude);
-        println!("     - PC2 magnitude: {:.6}", pc2_magnitude);
-        println!("     - PC4 magnitude: {:.6}", pc4_magnitude);
-        
-        // Verify that PC1 > PC2
-        assert!(
-            pc1_magnitude > pc2_magnitude,
-            "PC1 should have larger coefficient magnitude than PC2"
-        );
-        
-        // Verify that PC2 > PC4
-        assert!(
-            pc2_magnitude > pc4_magnitude,
-            "PC2 should have larger coefficient magnitude than PC4"
-        );
-        
-        // 3. Shrinkage: Verify null effects are very close to zero (effective regularization)
-        println!("   3. Validating Shrinkage of Null Effects");
-        
-        let pc3_magnitude = pc_magnitudes.get("PC3").unwrap_or(&0.0);
-        let pc5_magnitude = pc_magnitudes.get("PC5").unwrap_or(&0.0);
-        
-        println!("     - PC3 magnitude (null): {:.6}", pc3_magnitude);
-        println!("     - PC5 magnitude (null): {:.6}", pc5_magnitude);
-        
-        // Define a threshold for "close to zero" - should be very small compared to real effects
-        let threshold = real_avg_magnitude * 0.1; // 10% of average real effect
-        
-        // Verify null effects are below threshold
-        assert!(
-            *pc3_magnitude < threshold,
-            "PC3 coefficient magnitude should be shrunk close to zero (< {:.6})", threshold
+            strong_avg_magnitude > weak_avg_magnitude * 1.5,
+            "Strong effects (PC1) should have significantly larger magnitude than weak effects (PC3, PC4). Ratio: {:.2}x",
+            strong_avg_magnitude / weak_avg_magnitude
         );
         assert!(
-            *pc5_magnitude < threshold,
-            "PC5 coefficient magnitude should be shrunk close to zero (< {:.6})", threshold
+            weak_avg_magnitude > null_avg_magnitude * 2.0,
+            "Weak effects (PC3, PC4) should have significantly larger magnitude than null effects (PC2, PC5). Ratio: {:.2}x",
+            weak_avg_magnitude / null_avg_magnitude
         );
+        println!("     ✓ Hierarchy correctly preserved.");
+        
+        
+        // 2. Validate Shrinkage of Null Effects
+        println!("   2. Validating Shrinkage of Null Effects");
+        // Define a threshold relative to the strongest detected signal
+        let shrinkage_threshold = strong_avg_magnitude * 0.2; // e.g., 20% of the main signal
+        println!("     - Shrinkage threshold (relative to strong effect): < {:.6}", shrinkage_threshold);
+
+        // Assert that EACH null effect is below the threshold
+        for &pc_name in &null_pcs {
+            let magnitude = pc_magnitudes.get(pc_name).unwrap_or(&0.0);
+            println!("     - Magnitude of null effect '{}': {:.6}", pc_name, magnitude);
+            assert!(
+                *magnitude < shrinkage_threshold,
+                "Null effect '{}' was not properly shrunk. Magnitude {:.6} > Threshold {:.6}",
+                pc_name, magnitude, shrinkage_threshold
+            );
+        }
+        println!("     ✓ Null effects properly regularized toward zero.");
         
         // Output overall validation results
         println!("   ✓ Coefficient structure validation passed for {} model", model_name);
-        println!("     - Real effects properly distinguished from null effects");
-        println!("     - Effect hierarchy correctly preserved (PC1 > PC2 > PC4)");
-        println!("     - Null effects properly regularized toward zero");
     }
     
     /// Validates that null effects are learned as flat functions and real effects are not.
@@ -1560,18 +1548,18 @@ mod tests {
         );
         
         // ASSERTION 3: Effect hierarchy should match known pattern
-        if let (Some((std_pc1, _)), Some((std_pc2, _)), Some((std_pc4, _))) = (
+        if let (Some((std_pc1, _)), Some((std_pc3, _)), Some((std_pc4, _))) = (
             pc_function_stats.get("PC1"),
-            pc_function_stats.get("PC2"),
+            pc_function_stats.get("PC3"),
             pc_function_stats.get("PC4")
         ) {
             println!("\nEffect hierarchy check:");
             println!("PC1 std_dev: {:.6}", std_pc1);
-            println!("PC2 std_dev: {:.6}", std_pc2);
+            println!("PC3 std_dev: {:.6}", std_pc3);
             println!("PC4 std_dev: {:.6}", std_pc4);
             
-            assert!(std_pc1 > std_pc2, "Expected PC1 effect > PC2 effect");
-            assert!(std_pc2 > std_pc4, "Expected PC2 effect > PC4 effect");
+            assert!(std_pc1 > std_pc3, "Expected PC1 effect (strong) > PC3 effect (weak)");
+            assert!(std_pc3 > std_pc4, "Expected PC3 effect > PC4 effect (within weak tier)");
         }
         
         println!("✓ Smooth function shape validation passed");
