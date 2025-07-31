@@ -15,9 +15,9 @@ data <- read.csv(input_csv_file)
 
 # --- 3. Define and Fit the GAM ---
 
-gam_formula <- outcome ~ s(variable_one, bs = "ps", k = 10, fx = TRUE, m = c(4, 2)) +
-                                     s(variable_two, bs = "ps", k = 10, m = c(4, 2)) +
-                                     ti(variable_one, variable_two, bs = c("ps", "ps"), k = c(10, 10), m = c(4, 2))
+gam_formula <- outcome ~ s(variable_one, bs = "ps", k = 11, fx = TRUE, m = c(4, 2)) +
+                                     s(variable_two, bs = "ps", k = 12, m = c(4, 2)) +
+                                     ti(variable_one, variable_two, bs = c("ps", "ps"), k = c(12, 12), m = c(4, 2))
 
 cat("Fitting the GAM... This may take a moment.\n")
 # Fit the model using REML for smoothness selection
