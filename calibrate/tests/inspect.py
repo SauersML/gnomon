@@ -26,56 +26,51 @@ def print_array_summary(name, arr):
         print(f"    -> First 2x5 slice:\n{arr[:2, :5]}")
 
 def evaluate_bspline_basis(x, knots, degree):
-    """
-    A Python implementation of the Cox-de Boor algorithm that mirrors the Rust code's
-    logic, especially the boundary condition handling.
-    """
     num_knots = len(knots)
     num_bases = num_knots - degree - 1
     
-    # Create the output matrix
     basis_matrix = np.zeros((len(x), num_bases))
-
-    # Clamp x to the valid domain defined by the knots
     x_clamped = np.clip(x, knots[degree], knots[num_bases])
 
     for i, val in enumerate(x_clamped):
-        # Find the knot span `mu` such that knots[mu] <= x < knots[mu+1]
-        # This is the most important part for boundary handling
         if val >= knots[num_bases]:
             mu = num_bases - 1
         else:
             mu = np.searchsorted(knots, val, side='right') - 1
-            mu = max(degree, mu) # Ensure mu is at least degree
+            mu = max(degree, mu)
 
-        # `b` will store the non-zero basis function values
         b = np.zeros(degree + 1)
         b[0] = 1.0
         
+        # Initialize `left` and `right` ONCE, outside the loop, with their full size.
+        left = np.zeros(degree + 1)
+        right = np.zeros(degree + 1)
+        
         for d in range(1, degree + 1):
-            # Temporary arrays for the recurrence relation
-            left = np.zeros(d + 1)
-            right = np.zeros(d + 1)
-            
-            for r in range(d):
-                left[r+1] = val - knots[mu - d + 1 + r]
-                right[r+1] = knots[mu + 1 + r] - val
+            # These now correctly access and overwrite parts of the persistent arrays
+            left[d] = val - knots[mu + 1 - d]
+            right[d] = knots[mu + d] - val
 
             saved = 0.0
             for r in range(d):
-                # This is the core of Cox-de Boor
-                den = right[r+1] + left[d-r]
+                # This calculation now correctly uses values from previous `d` loops
+                den = right[r + 1] + left[d - r]
                 temp = 0.0
-                if den > 1e-12:
+                if abs(den) > 1e-12:  # Use abs() for safety
                     temp = b[r] / den
                 
-                b[r] = saved + right[r+1] * temp
-                saved = left[d-r] * temp
+                b[r] = saved + right[r + 1] * temp
+                saved = left[d - r] * temp
             b[d] = saved
         
-        # Place the calculated non-zero values into the correct columns of the basis matrix
         start_index = mu - degree
-        basis_matrix[i, start_index : start_index + degree + 1] = b
+        # Ensure we don't write out of bounds if start_index is negative
+        if start_index < 0:
+             # This can happen at the left boundary. We only use the valid part of `b`.
+             b_valid = b[-start_index:]
+             basis_matrix[i, 0 : len(b_valid)] = b_valid
+        else:
+             basis_matrix[i, start_index : start_index + degree + 1] = b
 
     return basis_matrix
 
