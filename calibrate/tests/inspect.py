@@ -25,6 +25,59 @@ def print_array_summary(name, arr):
         print(f"    -> Stds of first 5 columns: {col_stds[:5]}")
         print(f"    -> First 2x5 slice:\n{arr[:2, :5]}")
 
+def evaluate_bspline_basis(x, knots, degree):
+    """
+    A Python implementation of the Cox-de Boor algorithm that mirrors the Rust code's
+    logic, especially the boundary condition handling.
+    """
+    num_knots = len(knots)
+    num_bases = num_knots - degree - 1
+    
+    # Create the output matrix
+    basis_matrix = np.zeros((len(x), num_bases))
+
+    # Clamp x to the valid domain defined by the knots
+    x_clamped = np.clip(x, knots[degree], knots[num_bases])
+
+    for i, val in enumerate(x_clamped):
+        # Find the knot span `mu` such that knots[mu] <= x < knots[mu+1]
+        # This is the most important part for boundary handling
+        if val >= knots[num_bases]:
+            mu = num_bases - 1
+        else:
+            mu = np.searchsorted(knots, val, side='right') - 1
+            mu = max(degree, mu) # Ensure mu is at least degree
+
+        # `b` will store the non-zero basis function values
+        b = np.zeros(degree + 1)
+        b[0] = 1.0
+        
+        for d in range(1, degree + 1):
+            # Temporary arrays for the recurrence relation
+            left = np.zeros(d + 1)
+            right = np.zeros(d + 1)
+            
+            for r in range(d):
+                left[r+1] = val - knots[mu - d + 1 + r]
+                right[r+1] = knots[mu + 1 + r] - val
+
+            saved = 0.0
+            for r in range(d):
+                # This is the core of Cox-de Boor
+                den = right[r+1] + left[d-r]
+                temp = 0.0
+                if den > 1e-12:
+                    temp = b[r] / den
+                
+                b[r] = saved + right[r+1] * temp
+                saved = left[d-r] * temp
+            b[d] = saved
+        
+        # Place the calculated non-zero values into the correct columns of the basis matrix
+        start_index = mu - degree
+        basis_matrix[i, start_index : start_index + degree + 1] = b
+
+    return basis_matrix
 
 def get_mgcv_basis_data():
     """
@@ -92,7 +145,6 @@ def get_gnomon_basis_data():
     with open(RUST_MODEL_CONFIG_PATH, "rb") as f:
         toml_data = tomli.load(f)
 
-    # 1. Extract B-spline recipe and coefficients for the 'pgs' MAIN EFFECT
     knots = np.array(toml_data['config']['knot_vectors']['pgs']['data'])
     degree = toml_data['config']['pgs_basis_config']['degree']
     coeffs = np.array(toml_data['coefficients']['main_effects']['pgs'])
@@ -102,27 +154,23 @@ def get_gnomon_basis_data():
     print(f"  [PRINT] gnomon: Loaded {len(coeffs)} coefficients for `pgs` main effect.")
     print_array_summary("Coefficients", coeffs)
     
-    # 2. Derive number of raw basis functions from the knot vector (num_knots = num_basis + degree + 1)
     num_raw_bases = len(knots) - degree - 1
     print(f"  [INFO] gnomon: Derived k={num_raw_bases} total raw B-spline bases from knot vector.")
 
-    # 3. Extract the reparameterization matrix ('z_transform')
     constraint_info = toml_data['config']['constraints']['pgs_main']['z_transform']
     z_dims, z_data = constraint_info['dim'], constraint_info['data']
     z_transform = np.array(z_data).reshape(z_dims)
     print(f"  [PRINT] gnomon: Loaded 'pgs_main' constraint matrix.")
     print_array_summary("z_transform", z_transform)
 
-    # 4. *** THE DEFINITIVE FIX ***
     # Reconstruct the FULL RAW basis using the robust BSpline.design_matrix function.
     # This is the canonical and correct way to generate the basis matrix in SciPy.
     x_range = toml_data['config']['pgs_range']
     x_axis = np.linspace(x_range[0], x_range[1], N_POINTS_PLOT)
-    raw_basis_matrix = BSpline.design_matrix(x_axis, knots, degree, extrapolate=False).toarray()
+    raw_basis_matrix = evaluate_bspline_basis(x_axis, knots, degree)
     print(f"  [PRINT] gnomon: Reconstructed FULL raw basis matrix using BSpline.design_matrix.")
     print_array_summary("raw_basis_matrix", raw_basis_matrix)
 
-    # 5. Correctly slice the raw basis to isolate the non-constant functions
     raw_main_basis_functions = raw_basis_matrix[:, 1:]
     print(f"  [INFO] gnomon: Sliced raw basis to get the non-constant bases for constraining.")
     print_array_summary("raw_main_basis_functions", raw_main_basis_functions)
