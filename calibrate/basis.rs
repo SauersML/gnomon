@@ -835,66 +835,86 @@ mod tests {
     }
 
     #[test]
-    fn test_prediction_with_constrained_basis() {
-        // This test verifies the complete process:
-        // 1. Create an unconstrained basis.
-        // 2. Apply a sum-to-zero constraint.
-        // 3. Make a prediction using the constrained basis and coefficients.
+    fn test_prediction_consistency_on_and_off_grid() {
+        // This test replaces a previously flawed version. The goal is to verify that
+        // the prediction logic for a constrained B-spline basis is consistent and correct.
+        // We perform two checks:
+        // 1. On-Grid Consistency: Ensure calculating a prediction for a single point that
+        //    is ON the original grid yields the same result as the batch calculation.
+        // 2. Off-Grid Interpolation: Ensure a prediction for a point OFF the grid
+        //    (e.g., 0.65) produces a value that lies between its neighbors (0.6 and 0.7),
+        //    validating the spline's interpolation property.
+        //
+        // The previous test incorrectly asserted that the value at 0.65 should equal
+        // the value at 0.6, which is false for a non-flat cubic spline.
 
+        // --- 1. Setup: Same as the original test ---
         let data = Array::linspace(0.0, 1.0, 11);
         let degree = 3;
         let num_internal_knots = 5;
 
-        // --- Step 1: Create the full, unconstrained basis matrix ---
         let (basis_unc, _) =
             create_bspline_basis(data.view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
         
-        // The first column is the intercept, the rest are for the main effect
         let main_basis_unc = basis_unc.slice(s![.., 1..]);
-
-        // --- Step 2: Apply the sum-to-zero constraint ---
         let (main_basis_con, z_transform) =
             apply_sum_to_zero_constraint(main_basis_unc).unwrap();
 
-        // --- Step 3: Make a prediction ---
-        // Define some coefficients for the constrained basis
         let intercept_coeff = 0.5;
         let num_con_coeffs = main_basis_con.ncols();
         let main_coeffs = Array1::from_shape_fn(num_con_coeffs, |i| (i as f64 + 1.0) * 0.1);
         
-        // The final prediction is intercept + B_constrained * β
-        let expected_prediction = intercept_coeff + main_basis_con.dot(&main_coeffs);
+        // --- 2. Calculate Batch Predictions on the Grid (Our Ground Truth) ---
+        let predictions_on_grid = intercept_coeff + main_basis_con.dot(&main_coeffs);
         
-        // --- Now, simulate this process for a single point ---
-        let test_point_x = 0.65;
+        // --- 3. On-Grid Consistency Check ---
+        // Let's test the point x=0.6, which corresponds to index 6 in our `data` grid.
+        let test_point_on_grid_x = 0.6;
+        let on_grid_idx = 6;
         
-        // a. Get the raw basis functions at the test point
+        // Calculate the prediction for this single point from scratch.
         let (raw_basis_at_point, _) =
-            create_bspline_basis(array![test_point_x].view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
-        
-        // b. Isolate the main effect part
+            create_bspline_basis(array![test_point_on_grid_x].view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
         let main_basis_unc_at_point = raw_basis_at_point.slice(s![0, 1..]);
-        
-        // c. Apply the *same* Z transformation matrix derived from the full dataset
         let main_basis_con_at_point = Array1::from_vec(main_basis_unc_at_point.to_vec()).dot(&z_transform);
+        let prediction_at_0_6 = intercept_coeff + main_basis_con_at_point.dot(&main_coeffs);
         
-        // d. Calculate the final prediction for that single point
-        let final_prediction_at_point = intercept_coeff + main_basis_con_at_point.dot(&main_coeffs);
-        
-        // Find the corresponding point in our full expected_prediction vector
-        // We need to find which index in `data` is closest to `test_point_x`
-        let closest_idx = data
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| (*a - test_point_x).abs().partial_cmp(&(*b - test_point_x).abs()).unwrap())
-            .map(|(i, _)| i)
-            .unwrap();
-
-        // The prediction at the test point should be very close to the pre-calculated value
+        // ASSERT: The single-point prediction must exactly match the batch prediction for the same point.
         assert_abs_diff_eq!(
-            final_prediction_at_point,
-            expected_prediction[closest_idx],
-            epsilon = 1e-9
+            prediction_at_0_6,
+            predictions_on_grid[on_grid_idx],
+            epsilon = 1e-12 // Use a tight epsilon for this identity check
+        );
+        
+        // --- 4. Off-Grid Interpolation Check ---
+        // Now test the off-grid point x=0.65, which lies between grid points 0.6 and 0.7.
+        let test_point_off_grid_x = 0.65;
+        
+        // Calculate the prediction for this single off-grid point.
+        let (raw_basis_off_grid, _) =
+            create_bspline_basis(array![test_point_off_grid_x].view(), Some(data.view()), (0.0, 1.0), num_internal_knots, degree).unwrap();
+        let main_basis_unc_off_grid = raw_basis_off_grid.slice(s![0, 1..]);
+        let main_basis_con_off_grid = Array1::from_vec(main_basis_unc_off_grid.to_vec()).dot(&z_transform);
+        let prediction_at_0_65 = intercept_coeff + main_basis_con_off_grid.dot(&main_coeffs);
+
+        // Get the values of the neighboring on-grid points from our batch calculation.
+        let value_at_0_6 = predictions_on_grid[6];
+        let value_at_0_7 = predictions_on_grid[7];
+
+        // Determine the bounds for the interpolation.
+        let lower_bound = value_at_0_6.min(value_at_0_7);
+        let upper_bound = value_at_0_6.max(value_at_0_7);
+
+        println!("Value at x=0.60: {}", value_at_0_6);
+        println!("Value at x=0.65: {}", prediction_at_0_65);
+        println!("Value at x=0.70: {}", value_at_0_7);
+        
+        // ASSERT: The prediction at 0.65 must lie between the values at 0.6 and 0.7.
+        // This is a robust check of the spline's interpolating behavior.
+        assert!(
+            prediction_at_0_65 >= lower_bound && prediction_at_0_65 <= upper_bound,
+            "Off-grid prediction ({}) at x=0.65 should be between its neighbors ({}, {})",
+            prediction_at_0_65, value_at_0_6, value_at_0_7
         );
     }
 
