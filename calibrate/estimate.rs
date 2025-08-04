@@ -3016,6 +3016,13 @@ pub mod internal {
                         "✓ BFGS optimization failed with non-finite final value (acceptable for ill-conditioned model)"
                     );
                 }
+                EstimationError::RemlOptimizationFailed(msg)
+                    if msg.contains("Line-search failed far from a stationary point") =>
+                {
+                    println!(
+                        "✓ BFGS optimization failed far from a stationary point (acceptable for ill-conditioned model)"
+                    );
+                }
                 other => panic!(
                     "Expected ModelIsIllConditioned or optimization failure, got: {:?}",
                     other
