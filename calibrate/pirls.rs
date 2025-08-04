@@ -95,10 +95,23 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Step 2: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
-    log::info!("Computing stable reparameterization for numerical stability");
+    // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
+    // This is computed ONCE from the unweighted penalty structure and never changes
+    log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
+    
+    // Reconstruct full penalty matrices from square roots for balanced penalty creation
+    let mut s_list_full = Vec::with_capacity(rs_original.len());
+    for rs in rs_original {
+        let s_full = rs.dot(&rs.t());
+        s_list_full.push(s_full);
+    }
+    
+    use crate::calibrate::construction::{stable_reparameterization, create_balanced_penalty_root};
+    let eb = create_balanced_penalty_root(&s_list_full)?;
+    println!("[Balanced Penalty] Created lambda-independent eb with shape: {:?}", eb.shape());
 
-    use crate::calibrate::construction::stable_reparameterization;
+    // Step 3: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
+    log::info!("Computing stable reparameterization for numerical stability");
     println!("[Reparam] ==> Entering stable_reparameterization...");
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
@@ -124,29 +137,13 @@ pub fn fit_model_for_fixed_rho(
         x_transformed.sum()
     );
 
-    // Step 4: Get the transformed penalty matrices
+    // Step 4: Extract penalty matrices using the TRULY lambda-independent eb
+    // CRITICAL FIX: eb is computed from unweighted penalties and never changes with lambda
     let s_transformed = &reparam_result.s_transformed;
+    // eb is already computed above as lambda-INDEPENDENT
+    let e_transformed = &reparam_result.e_transformed; // Lambda-DEPENDENT for penalty application
 
-    // Step 5: Extract the single penalty square root from the transformed penalty
-    use ndarray_linalg::{Eigh, UPLO};
-    let (eigenvalues, eigenvectors) = s_transformed
-        .eigh(UPLO::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-
-    let tolerance = 1e-12;
-    let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    let mut e = Array2::zeros((rank_s, layout.total_coeffs));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let scaled_eigvec = eigenvectors.column(i).mapv(|v| v * eigenval.sqrt());
-            e.row_mut(col_idx).assign(&scaled_eigvec);
-            col_idx += 1;
-        }
-    }
-
-    // Step 6: Initialize P-IRLS state variables in the TRANSFORMED basis
+    // Step 5: Initialize P-IRLS state variables in the TRANSFORMED basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
@@ -218,12 +215,14 @@ pub fn fit_model_for_fixed_rho(
         );
 
         // Use our robust solver that handles rank deficiency correctly
+        // CRITICAL FIX: Pass BOTH penalty matrices for proper separation of concerns
         let stable_result = solve_penalized_least_squares(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
-            &e,       // Single square root matrix from eigendecomposition in transformed space
-            y.view(), // Pass original response
+            &eb,              // Lambda-INDEPENDENT balanced penalty root for rank detection
+            e_transformed,    // Lambda-DEPENDENT penalty root for penalty application
+            y.view(),         // Pass original response
             config.link_function, // Pass link function for correct scale calculation
         )?;
 
@@ -410,7 +409,8 @@ pub fn fit_model_for_fixed_rho(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
-                    &e,
+                    &eb,
+                    e_transformed,
                     y.view(),
                     config.link_function,
                 )?;
@@ -508,7 +508,8 @@ pub fn fit_model_for_fixed_rho(
                             x_transformed.view(),
                             z.view(),
                             weights.view(),
-                            &e,
+                            &eb,
+                            e_transformed,
                             y.view(),
                             config.link_function,
                         )?;
@@ -552,7 +553,8 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(),
             z.view(),
             weights.view(),
-            &e,
+            &eb,
+            e_transformed,
             y.view(),
             config.link_function,
         )?;
@@ -973,11 +975,16 @@ pub struct StablePLSResult {
 
 /// Robust penalized least squares solver following mgcv's pls_fit1 architecture
 /// This function implements the logic for a SINGLE P-IRLS step in the TRANSFORMED basis
+/// 
+/// The solver now accepts TWO penalty matrices to separate rank detection from penalty application:
+/// - `eb`: Lambda-INDEPENDENT balanced penalty root used ONLY for numerical rank detection
+/// - `e_transformed`: Lambda-DEPENDENT penalty root used ONLY for applying the actual penalty
 pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
-    e: &Array2<f64>,             // Single penalty square root matrix
+    eb: &Array2<f64>,            // Balanced penalty root for rank detection (lambda-independent)
+    e_transformed: &Array2<f64>, // Lambda-dependent penalty root for penalty application
     y: ArrayView1<f64>,          // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
@@ -988,20 +995,24 @@ pub fn solve_penalized_least_squares(
     // 4. Second QR decomposition on the reduced system
     // 5. Back-substitution and reconstruction of coefficients
     println!(
-        "[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} penalty matrix",
+        "[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} eb (rank detect) + {}×{} e_transformed (penalty apply)",
         x_transformed.nrows(),
         x_transformed.ncols(),
-        e.nrows(),
-        e.ncols()
+        eb.nrows(),
+        eb.ncols(),
+        e_transformed.nrows(),
+        e_transformed.ncols()
     );
 
     let function_timer = Instant::now();
     log::debug!(
-        "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), e=({}x{})",
+        "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), eb=({}x{}), e_transformed=({}x{})",
         x_transformed.nrows(),
         x_transformed.ncols(),
-        e.nrows(),
-        e.ncols()
+        eb.nrows(),
+        eb.ncols(),
+        e_transformed.nrows(),
+        e_transformed.ncols()
     );
 
     use ndarray::s;
@@ -1073,18 +1084,18 @@ pub fn solve_penalized_least_squares(
 
     // Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1);
-    let e_norm = if e.nrows() > 0 {
-        frobenius_norm(e)
+    let eb_norm = if eb.nrows() > 0 {
+        frobenius_norm(eb)
     } else {
         1.0
     };
 
-    log::debug!("Frobenius norms: R_norm={}, E_norm={}", r_norm, e_norm);
+    log::debug!("Frobenius norms: R_norm={}, Eb_norm={}", r_norm, eb_norm);
 
-    // Create the scaled augmented matrix for numerical stability
-    // [R1/Rnorm; E/Enorm]
-    let e_rows = e.nrows();
-    let scaled_rows = r_rows + e_rows;
+    // Create the scaled augmented matrix for numerical stability using eb for rank detection
+    // [R1/Rnorm; Eb/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
+    let eb_rows = eb.nrows();
+    let scaled_rows = r_rows + eb_rows;
     let mut scaled_matrix = Array2::zeros((scaled_rows, p));
 
     // Fill in the scaled data part (R1/Rnorm)
@@ -1094,11 +1105,11 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    // Fill in the scaled penalty part (e/Enorm)
-    if e_rows > 0 {
-        for i in 0..e_rows {
+    // Fill in the scaled penalty part (eb/Eb_norm) - this is for rank detection only
+    if eb_rows > 0 {
+        for i in 0..eb_rows {
             for j in 0..p {
-                scaled_matrix[[r_rows + i, j]] = e[[i, j]] / e_norm;
+                scaled_matrix[[r_rows + i, j]] = eb[[i, j]] / eb_norm;
             }
         }
     }
@@ -1165,13 +1176,15 @@ pub fn solve_penalized_least_squares(
         );
     }
 
-    // Create rank-reduced versions of r1 and e by dropping unidentifiable columns
+    // Create rank-reduced versions of r1 and e_transformed by dropping unidentifiable columns
+    // NOTE: We use e_transformed here, NOT eb, because this is for the final solve
     let mut r1_dropped = Array2::zeros((r_rows, rank));
     drop_cols(r1.view(), &drop_indices, &mut r1_dropped);
 
-    let mut e_dropped = Array2::zeros((e_rows, rank));
-    if e_rows > 0 {
-        drop_cols(e.view(), &drop_indices, &mut e_dropped);
+    let e_transformed_rows = e_transformed.nrows();
+    let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
+    if e_transformed_rows > 0 {
+        drop_cols(e_transformed.view(), &drop_indices, &mut e_transformed_dropped);
     }
 
     log::debug!(
@@ -1186,8 +1199,9 @@ pub fn solve_penalized_least_squares(
     let stage4_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
 
-    // Form the final augmented matrix: [R1_dropped; E_dropped]
-    let final_aug_rows = r_rows + e_rows;
+    // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
+    // This uses the lambda-DEPENDENT penalty for actual penalty application
+    let final_aug_rows = r_rows + e_transformed_rows;
     let mut final_aug_matrix = Array2::zeros((final_aug_rows, rank));
 
     // Fill in the data part (R1_dropped)
@@ -1197,11 +1211,11 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    // Fill in the penalty part (E_dropped)
-    if e_rows > 0 {
-        for i in 0..e_rows {
+    // Fill in the penalty part (E_transformed_dropped) - this applies the actual penalty
+    if e_transformed_rows > 0 {
+        for i in 0..e_transformed_rows {
             for j in 0..rank {
-                final_aug_matrix[[r_rows + i, j]] = e_dropped[[i, j]];
+                final_aug_matrix[[r_rows + i, j]] = e_transformed_dropped[[i, j]];
             }
         }
     }
@@ -1726,7 +1740,8 @@ mod tests {
             x.view(),
             z.view(),
             weights.view(),
-            &e,
+            &e,  // For test: use same matrix for both rank detection and penalty
+            &e,  // For test: use same matrix for both rank detection and penalty
             z.view(),
             LinkFunction::Identity,
         );

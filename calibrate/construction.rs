@@ -463,11 +463,63 @@ pub struct ReparamResult {
     pub qs: Array2<f64>,
     /// Transformed penalty square roots rS (each is p x rank_k)
     pub rs_transformed: Vec<Array2<f64>>,
-    /// Balanced penalty square root for rank detection (rank x p matrix)
-    pub eb: Array2<f64>,
+    /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
+    /// This is used for applying the actual penalty in the least squares solve
+    pub e_transformed: Array2<f64>,
 }
 
 use indicatif::{ProgressBar, ProgressStyle};
+
+/// Creates a lambda-independent balanced penalty root for stable rank detection
+/// This follows mgcv's approach: scale each penalty to unit Frobenius norm, sum them,
+/// and take the matrix square root. This balanced penalty is used ONLY for rank detection.
+pub fn create_balanced_penalty_root(
+    s_list: &[Array2<f64>],
+) -> Result<Array2<f64>, EstimationError> {
+    if s_list.is_empty() {
+        // No penalties case - return empty matrix
+        return Ok(Array2::zeros((0, s_list.get(0).map_or(0, |s| s.nrows()))));
+    }
+    
+    let p = s_list[0].nrows();
+    let mut s_balanced = Array2::zeros((p, p));
+    
+    // Scale each penalty to have unit Frobenius norm and sum them
+    for s_k in s_list {
+        let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        if frob_norm > 1e-12 {
+            // Scale to unit Frobenius norm and add to balanced sum
+            s_balanced.scaled_add(1.0 / frob_norm, s_k);
+        }
+    }
+    
+    // Take the matrix square root of the balanced penalty
+    let (eigenvalues, eigenvectors) = s_balanced
+        .eigh(ndarray_linalg::UPLO::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    
+    let tolerance = 1e-12;
+    let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+    
+    if penalty_rank == 0 {
+        return Ok(Array2::zeros((0, p)));
+    }
+    
+    // Construct the balanced penalty square root
+    let mut eb = Array2::zeros((p, penalty_rank));
+    let mut col_idx = 0;
+    for (i, &eigenval) in eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let sqrt_eigenval = eigenval.sqrt();
+            let eigenvec = eigenvectors.column(i);
+            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+            col_idx += 1;
+        }
+    }
+    
+    // Return as rank x p matrix (matching mgcv's convention)
+    Ok(eb.t().to_owned())
+}
 
 /// Computes penalty square roots from full penalty matrices using eigendecomposition
 /// Returns "skinny" matrices of dimension p x rank_k where rank_k is the rank of each penalty
@@ -563,6 +615,9 @@ pub fn construct_s_lambda(
 /// This follows the complete recursive similarity transformation procedure
 /// Now accepts penalty square roots (rS) instead of full penalty matrices
 /// Each rs_list[i] is a p x rank_i matrix where rank_i is the rank of penalty i
+/// 
+/// The eb parameter is the pre-computed lambda-INDEPENDENT balanced penalty root
+/// for rank detection, computed once at a higher level to ensure stability.
 pub fn stable_reparameterization(
     rs_list: &[Array2<f64>], // penalty square roots (each is p x rank_i)
     lambdas: &[f64],
@@ -580,7 +635,7 @@ pub fn stable_reparameterization(
             det1: Array1::zeros(0),
             qs: Array2::eye(p),
             rs_transformed: vec![],
-            eb: Array2::zeros((0, p)), // rank x p matrix
+            e_transformed: Array2::zeros((0, p)), // rank x p matrix
         });
     }
 
@@ -878,7 +933,7 @@ pub fn stable_reparameterization(
         s_transformed.scaled_add(lambdas[i], &s_k_transformed);
     }
 
-    // Step 3: Compute the balanced penalty square root (Eb) from s_transformed
+    // Step 3: Compute the lambda-DEPENDENT penalty square root from s_transformed
     // Use eigendecomposition: if S = V*D*V^T, then sqrt(S) = V*sqrt(D)*V^T
     let (s_eigenvalues, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
         .eigh(UPLO::Lower)
@@ -888,21 +943,22 @@ pub fn stable_reparameterization(
     let tolerance = 1e-12;
     let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
-    // Construct Eb as the matrix square root, keeping only non-zero eigenvalues
-    let mut eb = Array2::zeros((p, penalty_rank));
+    // Construct the lambda-DEPENDENT penalty square root matrix
+    let mut e_matrix = Array2::zeros((p, penalty_rank));
     let mut col_idx = 0;
     for (i, &eigenval) in s_eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
             let eigenvec = s_eigenvectors.column(i);
-            // Each column of Eb is sqrt(eigenvalue) * eigenvector
-            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+            // Each column of the matrix is sqrt(eigenvalue) * eigenvector
+            e_matrix.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
             col_idx += 1;
         }
     }
 
-    // Eb should be transposed to be penalty_rank x p (matching mgcv's convention)
-    let eb = eb.t().to_owned();
+    // e_transformed: Lambda-DEPENDENT penalty root for actual penalty application
+    // This represents the true penalty strength and changes with lambda values
+    let e_transformed = e_matrix.t().to_owned();
 
     // Step 4: Calculate log-determinant from the eigenvalues we already computed
     let log_det: f64 = s_eigenvalues
@@ -941,7 +997,7 @@ pub fn stable_reparameterization(
         det1,
         qs: qf,
         rs_transformed: final_rs_transformed,
-        eb,
+        e_transformed,
     })
 }
 
