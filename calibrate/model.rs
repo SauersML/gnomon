@@ -1,4 +1,4 @@
-use crate::calibrate::basis::{self, create_bspline_basis};
+use crate::calibrate::basis::{self};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
@@ -164,7 +164,7 @@ impl TrainedModel {
                 let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
                 // Apply the inverse link function (sigmoid) to the clamped eta
                 let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e))); // Sigmoid
-                // BUGFIX: Clamp probabilities away from 0 and 1 to prevent numerical instability
+                // Clamp probabilities away from 0 and 1 to prevent numerical instability
                 // This matches the behavior in the training code (pirls.rs::update_glm_vectors)
                 probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
                 probs
@@ -204,9 +204,11 @@ mod internal {
     ) -> Result<Array2<f64>, ModelError> {
         // 1. Generate basis for PGS using saved knot vector if available
         // Only use saved knot vectors - remove fallback to ensure consistency
-        let saved_knots = config.knot_vectors.get("pgs")
+        let saved_knots = config
+            .knot_vectors
+            .get("pgs")
             .ok_or_else(|| ModelError::InternalStackingError)?;
-        
+
         let (pgs_basis_unc, _) = basis::create_bspline_basis_with_knots(
             p_new,
             saved_knots.view(),
@@ -240,9 +242,11 @@ mod internal {
             let pc_col = pcs_new.column(i);
             let pc_name = &config.pc_names[i];
             // Only use saved knot vectors - remove fallback to ensure consistency
-            let saved_knots = config.knot_vectors.get(pc_name)
+            let saved_knots = config
+                .knot_vectors
+                .get(pc_name)
                 .ok_or_else(|| ModelError::InternalStackingError)?;
-            
+
             let (pc_basis_unc, _) = basis::create_bspline_basis_with_knots(
                 pc_col,
                 saved_knots.view(),
@@ -297,7 +301,7 @@ mod internal {
                 continue; // Skip out-of-bounds
             }
             let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
-            
+
             // Center the PGS basis column to ensure orthogonality
             let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
             let pgs_weight_col = &pgs_weight_col_uncentered - mean;
@@ -368,8 +372,8 @@ mod internal {
 mod tests {
     use super::*;
     // TrainingData is not used in tests
-    use ndarray::{Array1, Array2, array};
     use approx::assert_abs_diff_eq;
+    use ndarray::{Array1, Array2, array};
 
     /// Test a trivially simple case with degree 1 B-spline (piecewise linear interpolation).
     /// This test uses a simple ground truth we can calculate by hand to verify the prediction.
@@ -382,16 +386,17 @@ mod tests {
         // The main effect (excluding the intercept) has 2 basis functions.
         // The sum-to-zero constraint will transform these 2 functions into 1 constrained function.
         // However, the test below will derive this transformation programmatically.
-        
+
         // Create a dummy unconstrained basis to derive the constraint matrix Z
         let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
             array![0.25, 0.75].view(), // two arbitrary points
             knot_vector.view(),
             degree,
-        ).unwrap();
+        )
+        .unwrap();
         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
-        let (_, z_transform) = basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view()).unwrap();
-
+        let (_, z_transform) =
+            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view()).unwrap();
 
         let model = TrainedModel {
             config: ModelConfig {
@@ -430,7 +435,7 @@ mod tests {
                 intercept: 0.5, // Added an intercept for a more complete test
                 main_effects: MainEffects {
                     // There is only 1 coefficient after constraint for this simple case
-                    pgs: vec![2.0], 
+                    pgs: vec![2.0],
                     pcs: HashMap::new(),
                 },
                 interaction_effects: HashMap::new(),
@@ -445,21 +450,19 @@ mod tests {
         // --- Calculate the expected result CORRECTLY ---
         // The manual calculation was flawed. Here's the correct way to derive the ground truth:
         // 1. Generate the raw, unconstrained basis at the test points.
-        let (full_basis_unc, _) = basis::create_bspline_basis_with_knots(
-            test_points.view(),
-            knot_vector.view(),
-            degree,
-        ).unwrap();
-        
+        let (full_basis_unc, _) =
+            basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
+                .unwrap();
+
         // 2. Isolate the main effect part of the basis (all columns except the intercept).
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
-        
+
         // 3. Apply the same sum-to-zero constraint transformation.
         let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
 
         // 4. Get the coefficients for the constrained basis.
         let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
-        
+
         // 5. Calculate the final expected linear predictor: intercept + constrained_basis * coeffs
         let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
 

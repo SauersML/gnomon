@@ -235,7 +235,7 @@ pub fn train_model(
         config,
     )?;
 
-    // NEW STEP: Transform the final, optimal coefficients from the stable basis
+    // Transform the final, optimal coefficients from the stable basis
     // back to the original, interpretable basis.
     let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
 
@@ -592,11 +592,11 @@ pub mod internal {
 
                     let mut trace_h_inv_s_lambda = 0.0;
 
-                    // NEW: Get the transformation matrix and transformed Hessian
+                    // Get the transformation matrix and transformed Hessian
                     let qs = &pirls_result.reparam_result.qs;
                     let hessian_transformed = &pirls_result.penalized_hessian_transformed;
 
-                    // NEW: Transform the Hessian back to the original basis for this calculation
+                    // Transform the Hessian back to the original basis for this calculation
                     let hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
 
                     for j in 0..s_lambda_original.ncols() {
@@ -3037,7 +3037,7 @@ pub mod internal {
                 pcs: Array2::zeros((n_samples, 0)), // No PCs for this simple test
             };
 
-            // --- 2. MODEL CONFIGURATION ---
+            // --- 2. Model Configuration ---
             let mut config = create_test_config();
             config.pc_names.clear();
             config.pc_basis_configs.clear();
@@ -3048,13 +3048,13 @@ pub mod internal {
             let trained_model = train_model(&data, &config)
                 .expect("Model training should succeed on this well-posed data");
 
-            // --- 4. EVALUATE THE MODEL ---
+            // --- 4. Evaluate the Model ---
             // Get model predictions on the training data
             let predictions = trained_model
                 .predict(data.p.view(), data.pcs.view())
                 .unwrap();
 
-            // --- 5. DYNAMIC ASSERTIONS AGAINST THE ORACLE ---
+            // --- 5. Dynamic Assertions against the Oracle ---
             // The "Oracle" knows the `true_probabilities`. We compare our model to it.
 
             // Metric 1: Correlation (the original test's metric, now made robust)
@@ -3572,7 +3572,7 @@ pub mod internal {
                 }];
                 config.pc_ranges = vec![(0.0, 1.0)];
 
-                // --- 4. THE FIX: Use the canonical builder to create a well-posed model ---
+                // --- 4. Use the canonical builder to create a well-posed model ---
                 let (x_matrix, s_list, layout, _, _) =
                     build_design_and_penalty_matrices(&data, &config)
                         .expect("Failed to build model structure with canonical builder");

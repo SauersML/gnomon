@@ -368,7 +368,7 @@ pub fn build_design_and_penalty_matrices(
                         continue; // Skip out-of-bounds
                     }
                     let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
-                    
+
                     // Center the PGS basis column to ensure orthogonality
                     let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
                     let pgs_weight_col = &pgs_weight_col_uncentered - mean;
@@ -666,7 +666,7 @@ pub fn stable_reparameterization(
         }
 
         // Step 2: Partition into dominant α and subdominant γ' sets
-        // CRITICAL FIX: This is the most critical part of the algorithm
+        // This is the most critical part of the algorithm
         // We must ensure this logic exactly matches mgcv's get_stableS function
         let threshold = eps * max_omega;
         // println!("DEBUG: max_omega = {}, threshold = {}", max_omega, threshold);
@@ -731,9 +731,9 @@ pub fn stable_reparameterization(
         // println!("DEBUG: Eigenvalues: {:?}", eigenvalues);
         // println!("DEBUG: Eigenvectors: {:?}", u);
 
-        // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
+        // This rank determination logic must match mgcv's get_stableS exactly
 
-        // CRITICAL FIX: This rank determination logic must match mgcv's get_stableS exactly
+        // This rank determination logic must match mgcv's get_stableS exactly
         // mgcv uses: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
         // This means compare to the SMALLEST eigenvalue, not the largest
 
@@ -775,7 +775,7 @@ pub fn stable_reparameterization(
         // For ascending order, we want the last r indices (largest eigenvalues)
         // let selected_indices = &sorted_indices[q - r..];
 
-        // CRITICAL FIX: Use the FULL eigenvector matrix for transformation, not truncated
+        // Use the FULL eigenvector matrix for transformation, not truncated
         // The transformation must be done with the full q_current x q_current matrix
         // to maintain proper dimensions throughout the algorithm
         let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
@@ -840,7 +840,7 @@ pub fn stable_reparameterization(
         }
 
         // Update for next iteration
-        // CRITICAL FIX: Update iteration variables for next loop according to mgcv
+        // Update iteration variables for next loop according to mgcv
         k_offset += r; // Increase offset by the rank we processed
         q_current -= r; // Reduce problem size by the rank we processed
         gamma = gamma_prime; // Continue with the subdominant penalties

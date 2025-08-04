@@ -40,7 +40,7 @@ pub struct PirlsResult {
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
 
-    // NEW: The penalty term, calculated stably within P-IRLS
+    // The penalty term, calculated stably within P-IRLS
     // This is beta_transformed' * S_transformed * beta_transformed
     pub stable_penalty_term: f64,
 
@@ -475,7 +475,7 @@ pub fn fit_model_for_fixed_rho(
             // If deviance has converged, we must ALSO check that the gradient is small.
             let deviance_gradient_part = x_transformed.t().dot(&(&weights * (&eta - &z)));
             let penalty_gradient_part = s_transformed.dot(&beta_transformed);
-            // CORRECTED: Reinstate the factor of 2 to match mgcv and the math
+            // Reinstate the factor of 2 to match mgcv and the math
             let penalized_deviance_gradient =
                 &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
             let gradient_norm = penalized_deviance_gradient
@@ -796,10 +796,10 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
 ///   X += r*c - 1;              /* end of final X */
 ///   for (j=c-1;j>=0;j--) { /* back through columns */
 ///     for (i=r-1;i>drop[n_drop-1];i--,X--,Xs--) *X = *Xs;
-///     *X = 0.0;X--;
+///     *x = 0.0; x--;
 ///     for (k=n_drop-1;k>0;k--) {
 ///       for (i=drop[k]-1;i>drop[k-1];i--,X--,Xs--) *X = *Xs;
-///       *X = 0.0;X--;
+///       *x = 0.0; x--;
 ///     }
 ///     for (i=drop[0]-1;i>=0;i--,X--,Xs--) *X = *Xs;
 ///   }
@@ -1048,7 +1048,7 @@ pub fn solve_penalized_least_squares(
     let r_rows = r1_full.nrows().min(p);
     let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
 
-    // CRITICAL FIX: Un-pivot the columns of R1 to restore their original order.
+    // Un-pivot the columns of R1 to restore their original order.
     // This is the missing step from mgcv's `pivoter` function. We must un-pivot
     // the columns of the R factor to restore their original order before proceeding.
     // The columns of R1 are currently scrambled according to `initial_pivot`.
