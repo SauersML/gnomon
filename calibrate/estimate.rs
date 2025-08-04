@@ -1651,6 +1651,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0, // Will be set during training
+                pgs_basis_means: vec![],
             }
         }
 
@@ -2429,6 +2430,7 @@ pub mod internal {
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 num_pgs_interaction_bases: 0, // Important: no interactions for stability
+                pgs_basis_means: vec![],
             };
 
             // --- 3. Build Model Structure ---
@@ -4052,6 +4054,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         num_pgs_interaction_bases: 0,
+        pgs_basis_means: vec![],
     };
 
     // 3. Train the model and expect an error
@@ -4121,6 +4124,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         num_pgs_interaction_bases: 0,
+        pgs_basis_means: vec![],
     };
 
     // Try to build the matrices - if this fails, the test is still valid

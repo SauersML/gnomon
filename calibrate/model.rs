@@ -437,6 +437,7 @@ mod tests {
                     knots
                 },
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -506,6 +507,7 @@ mod tests {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 1, // 1 PGS interaction base for this test
+                pgs_basis_means: vec![],
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -601,6 +603,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 2, // 2 PGS interaction bases for this test
+            pgs_basis_means: vec![],
         };
 
         // Use the internal flatten_coefficients function
@@ -679,6 +682,7 @@ mod tests {
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             num_pgs_interaction_bases: 3, // 3 PGS interaction bases for this test
+            pgs_basis_means: vec![],
         };
 
         // Create a dummy dataset for generating the correct model structure

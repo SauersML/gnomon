@@ -1681,6 +1681,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
+            pgs_basis_means: vec![],
         };
 
         // --- 3. Run the Fit ---
@@ -1971,6 +1972,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
+            pgs_basis_means: vec![],
         };
 
         // Test with lambda values that match the working test pattern
@@ -2089,6 +2091,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
+            pgs_basis_means: vec![],
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
@@ -2212,6 +2215,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0,
+            pgs_basis_means: vec![],
         };
 
         // === Set up inputs using helper ===
