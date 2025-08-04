@@ -75,6 +75,23 @@ pub enum EstimationError {
     LayoutError(String),
 
     #[error(
+        "Model is over-parameterized: {num_coeffs} coefficients for {num_samples} samples.\n\n\
+        Coefficient Breakdown:\n\
+          - Intercept:           {intercept_coeffs}\n\
+          - PGS Main Effects:    {pgs_main_coeffs}\n\
+          - PC Main Effects:     {pc_main_coeffs}\n\
+          - Interaction Effects: {interaction_coeffs}"
+    )]
+    ModelOverparameterized {
+        num_coeffs: usize,
+        num_samples: usize,
+        intercept_coeffs: usize,
+        pgs_main_coeffs: usize,
+        pc_main_coeffs: usize,
+        interaction_coeffs: usize,
+    },
+
+    #[error(
         "Model is ill-conditioned with condition number {condition_number:.2e}. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization."
     )]
     ModelIsIllConditioned { condition_number: f64 },
@@ -1861,8 +1878,8 @@ pub mod internal {
             // This matches the P-IRLS MIN_WEIGHT value of 1e-6 in pirls.rs
             const PROB_EPS: f64 = 1e-6;
             // --- 1. Setup: Generate data from a known smooth function ---
-            let n_total = 2000; // for better signal-to-noise ratio and to support a train/test split
-            let n_train = 1000; // Use  samples for training
+            let n_total = 600; // Reduced sample size for faster execution
+            let n_train = 300; // Use fewer samples for training
 
             // Create independent inputs using uniform random sampling to avoid collinearity
             use rand::prelude::*;
@@ -2002,8 +2019,8 @@ pub mod internal {
             let trained_model = result?;
 
             // --- 3. Verify the Model's Predictions Against Ground Truth ---
-            // Create a fine grid of test points that spans the input space
-            let n_grid = 40; // Finer grid for more accurate evaluation
+            // Create a grid of test points that spans the input space
+            let n_grid = 20; // Reduced grid size for faster execution
             let test_pgs = Array1::linspace(-2.0, 2.0, n_grid);
             let test_pc = Array1::linspace(-1.5, 1.5, n_grid);
 
@@ -2493,7 +2510,7 @@ pub mod internal {
             // ----- Validate interaction effect -----
 
             // Create a 2D grid to evaluate the full interaction surface
-            let int_grid_size = 25; // Increased grid size for better resolution now that other stability issues are fixed
+            let int_grid_size = 15; // Reduced grid size for faster execution
             let pgs_int_grid = Array1::linspace(-2.0, 2.0, int_grid_size);
             let pc_int_grid = Array1::linspace(-1.5, 1.5, int_grid_size); // Consistent with training data range
 

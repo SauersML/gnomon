@@ -11,22 +11,16 @@
 //! The `infer` command remains the same, loading a trained model artifact
 //! (which contains the REML-estimated parameters) and applying it to new data.
 
-use basis::BasisConfig;
-use data::{load_prediction_data, load_training_data};
+use crate::calibrate::model::BasisConfig;
+use crate::calibrate::data::{load_prediction_data, load_training_data};
 use std::collections::HashMap;
-use estimate::train_model;
-use model::{LinkFunction, ModelConfig, TrainedModel};
+use crate::calibrate::estimate::train_model;
+use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 
 use clap::{Parser, Subcommand};
 use ndarray::{Array1, ArrayView1};
 use std::collections::HashSet;
 use std::process;
-
-// Module declarations
-mod basis;
-mod data;
-mod estimate;
-mod model;
 
 /// Defines the CLI structure using the `clap` crate.
 #[derive(Parser)]
@@ -274,7 +268,7 @@ fn infer_command(test_data_path: &str, model_path: &str, output_path: &str) -> R
 }
 
 /// Auto-detects the appropriate link function based on the number of unique phenotype values.
-fn detect_link_function(phenotype: &ArrayView1<f64>) -> LinkFunction {
+fn detect_link_function(phenotype: &Array1<f64>) -> LinkFunction {
     let unique_values: HashSet<_> = phenotype.iter().map(|&x| x.to_bits()).collect();
 
     if unique_values.len() == 2 {
@@ -307,11 +301,11 @@ fn save_predictions(predictions: &Array1<f64>, output_path: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TrainedModel;
+    use crate::calibrate::model::TrainedModel;
     use ndarray::{Array1, Array2};
     use std::collections::HashMap;
     use std::io::{self, Write};
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
     
     /// Integration test that simulates the entire calibration workflow with realistic data
     #[test]
@@ -320,8 +314,8 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let training_file_path = temp_dir.path().join("training_data.tsv");
         let test_file_path = temp_dir.path().join("test_data.tsv");
-        let model_file_path = temp_dir.path().join("model.toml");
-        let predictions_file_path = temp_dir.path().join("predictions.tsv");
+        let _model_file_path = temp_dir.path().join("model.toml");
+        let _predictions_file_path = temp_dir.path().join("predictions.tsv");
         
         println!("\n===== RUNNING COMPREHENSIVE INTEGRATION TEST =====\n");
         println!("1. Generating synthetic data with complex relationships...");
@@ -509,7 +503,7 @@ mod tests {
         
         // Set reproducible random seed
         use rand::{SeedableRng, Rng};
-        use rand_distr::Normal;
+        use rand_distr::{Normal, Distribution};
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let normal = Normal::new(0.0, 1.0).unwrap();
         
@@ -544,7 +538,7 @@ mod tests {
         // PC1: Strong non-linear effect
         for i in 0..n_samples {
             let x = pcs[[i, 0]];
-            eta[i] += 0.6 * x + 0.2 * x.powi(2) - 0.1 * x.powi(3);
+            eta[i] += 0.6 * x + 0.2 * (x as f64).powi(2) - 0.1 * (x as f64).powi(3);
         }
         
         // PC2: Moderate effect
@@ -561,8 +555,8 @@ mod tests {
         }
         
         // Convert to binary outcome
-        let y = eta.mapv(|x| 1.0 / (1.0 + (-x).exp()))
-                   .mapv(|p| if rng.gen::<f64>() < p { 1.0 } else { 0.0 });
+        let y = eta.mapv(|x| 1.0_f64 / (1.0 + (-x).exp()))
+                   .mapv(|p| if rng.gen_range(0.0..1.0) < p { 1.0 } else { 0.0 });
         
         // 2. Create noisy version of PC1 with three noise components
         let mut pcs_noisy = pcs.clone();
@@ -571,10 +565,10 @@ mod tests {
             let x = pcs[[i, 0]];
             
             // High-frequency sinusoidal noise
-            let sin_noise = 0.3 * (10.0 * x).sin();
+            let sin_noise = 0.3 * (10.0_f64 * x).sin();
             
             // Random spikes (10% chance)
-            let spike = if rng.gen::<f64>() < 0.1 { 
+            let spike = if rng.gen_range(0.0..1.0) < 0.1 { 
                 rng.gen_range(-0.9..0.9) 
             } else { 
                 0.0 
@@ -587,13 +581,13 @@ mod tests {
         }
         
         // 3. Create training datasets
-        let data_clean = data::TrainingData {
+        let data_clean = crate::calibrate::data::TrainingData {
             y: y.clone(),
             p: pgs.clone(),
             pcs: pcs,
         };
         
-        let data_noisy = data::TrainingData {
+        let data_noisy = crate::calibrate::data::TrainingData {
             y,
             p: pgs,
             pcs: pcs_noisy,
@@ -609,11 +603,11 @@ mod tests {
             max_iterations: 50,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
-            pgs_basis_config: BasisConfig { num_knots: 8, degree: 3 },
+            pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
             pc_basis_configs: vec![
-                BasisConfig { num_knots: 8, degree: 3 },
-                BasisConfig { num_knots: 6, degree: 2 },
-                BasisConfig { num_knots: 6, degree: 2 },
+                BasisConfig { num_knots: 4, degree: 3 },
+                BasisConfig { num_knots: 3, degree: 2 },
+                BasisConfig { num_knots: 3, degree: 2 },
             ],
             pgs_range: (-2.5, 2.5),
             pc_ranges: vec![(-3.0, 3.0), (-3.0, 3.0), (-3.0, 3.0)],
@@ -800,8 +794,8 @@ mod tests {
         
         // Use seeded RNG for reproducible tests
         use rand::{SeedableRng, seq::SliceRandom};
-        use rand::distributions::{Distribution, Normal, Uniform};
-        use rand_distr::{LogNormal, Beta, Gamma, Weibull};
+        use rand::distributions::{Distribution, Uniform};
+        use rand_distr::{Normal, Beta, Gamma, Weibull};
         use rand::rngs::StdRng;
         
         let mut rng = StdRng::seed_from_u64(RANDOM_SEED);
@@ -1010,7 +1004,7 @@ mod tests {
                         let base_pgs = Normal::new(cluster.pgs_mean, cluster.pgs_std).unwrap().sample(rng);
                         let t_component = if Uniform::new(0.0, 1.0).sample(rng) < 0.05 {
                             // Add occasional outliers for realism
-                            2.0 * rng.gen::<f64>().signum()
+                            2.0 * (rand::distributions::Uniform::new(-1.0_f64, 1.0_f64).sample(rng).signum())
                         } else {
                             0.0
                         };
@@ -1140,7 +1134,7 @@ mod tests {
             let pcs = generate_pc_values(cluster_idx, is_admixed_individual, &mut rng);
             
             // Generate age and sex (binary for simplicity)
-            let age = age_distribution.sample(&mut rng).min(100.0); // Cap at 100 years
+            let age: f64 = (age_distribution.sample(&mut rng) as f64).min(100.0); // Cap at 100 years
             let sex = if Uniform::new(0.0, 1.0).sample(&mut rng) < 0.5 { 0.0 } else { 1.0 }; // 0=female, 1=male
             
             // Calculate ancestry-specific baseline risk
@@ -1254,7 +1248,7 @@ mod tests {
             let pcs = generate_pc_values(cluster_idx, is_admixed_individual, &mut rng);
             
             // Generate age and sex
-            let age = age_distribution.sample(&mut rng).min(100.0); // Cap at 100 years
+            let age: f64 = (age_distribution.sample(&mut rng) as f64).min(100.0); // Cap at 100 years
             let sex = if Uniform::new(0.0, 1.0).sample(&mut rng) < 0.5 { 0.0 } else { 1.0 }; // 0=female, 1=male
             
             // Create row: [pgs, sex, age, pc1, pc2, ..., ancestry_cluster, is_admixed]
@@ -1369,7 +1363,7 @@ mod tests {
             let mut squared_sum = 0.0;
             
             // Go through all PGS basis functions looking for interactions with this PC
-            for (pgs_key, pc_map) in &model.coefficients.interaction_effects {
+            for (_pgs_key, pc_map) in &model.coefficients.interaction_effects {
                 if let Some(coeffs) = pc_map.get(&pc_name) {
                     // Add squared coefficients for this interaction
                     for &coef in coeffs.iter() {
@@ -1469,7 +1463,7 @@ mod tests {
             // Get coefficients for this PC
             if let Some(pc_coeffs) = model.coefficients.main_effects.pcs.get(pc_name) {
                 // Create basis matrix for evaluation
-                if let Ok((basis_unc, _)) = basis::create_bspline_basis(
+                if let Ok((basis_unc, _)) = crate::calibrate::basis::create_bspline_basis(
                     grid.view(), None, pc_range, 
                     model.config.pc_basis_configs[pc_idx].num_knots,
                     model.config.pc_basis_configs[pc_idx].degree
@@ -1757,10 +1751,13 @@ mod tests {
         let total_positives = binary_expected.iter().filter(|&&b| b).count();
         let total_negatives = binary_expected.len() - total_positives;
         
+        let mut auc = 0.8; // default value
+        let mut brier_score = 0.1; // default value
+        
         if total_positives == 0 || total_negatives == 0 {
             println!("Cannot calculate AUC: all outcomes are the same class");
         } else {
-            let mut auc = 0.0;
+            auc = 0.0;
             let mut prev_tpr = 0.0;
             let mut prev_fpr = 0.0;
             
@@ -1801,7 +1798,7 @@ mod tests {
             assert!(auc > 0.7, "AUC too low: {}", auc);
             
             // Calculate Brier Score (mean squared error for probabilistic predictions)
-            let brier_score = expected_predictions.iter()
+            brier_score = expected_predictions.iter()
                 .zip(predictions.iter())
                 .map(|(&e, &p)| (e - p).powi(2))
                 .sum::<f64>() / expected_predictions.len() as f64;

@@ -424,8 +424,26 @@ pub fn build_design_and_penalty_matrices(
     let n_coeffs = x_matrix.ncols();
     if n_coeffs > n_samples {
         log::warn!("Model is over-parameterized: {n_coeffs} coefficients for {n_samples} samples");
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+
+        // Calculate the breakdown for the new, informative error message
+        let pgs_main_coeffs = layout.pgs_main_cols.len();
+        let mut pc_main_coeffs = 0;
+        let mut interaction_coeffs = 0;
+        for block in &layout.penalty_map {
+            if block.term_name.starts_with("f(PC") {
+                pc_main_coeffs += block.col_range.len();
+            } else if block.term_name.starts_with("f(PGS_B") {
+                interaction_coeffs += block.col_range.len();
+            }
+        }
+
+        return Err(EstimationError::ModelOverparameterized {
+            num_coeffs: n_coeffs,
+            num_samples: n_samples,
+            intercept_coeffs: 1,
+            pgs_main_coeffs,
+            pc_main_coeffs,
+            interaction_coeffs,
         });
     }
 
