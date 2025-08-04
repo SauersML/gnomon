@@ -2174,41 +2174,82 @@ pub mod internal {
             println!("  PC main effect correlation:  {:.4}", pc_correlation);
         }
 
-        /// Helper function to calculate AUC to avoid code duplication
+        /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
+        ///
+        /// This implementation is robust to several common issues:
+        /// 1. **Tie Handling**: Processes all data points with the same prediction score as a single
+        ///    group, creating a single point on the ROC curve. This is the correct way to
+        ///    handle ties and avoids creating artificial diagonal segments.
+        /// 2. **Edge Cases**: If all outcomes belong to a single class (all positives or all
+        ///    negatives), AUC is mathematically undefined. This function follows the common
+        ///    convention of returning 0.5 in such cases, representing the performance of a
+        ///    random classifier.
+        /// 3. **Numerical Stability**: Uses `sort_unstable_by` for safe and efficient sorting of floating-point scores.
+        ///
+        /// # Arguments
+        /// * `predictions`: A 1D array of predicted scores or probabilities. Higher scores should
+        ///   indicate a higher likelihood of the positive class.
+        /// * `outcomes`: A 1D array of true binary outcomes (0.0 for negative, 1.0 for positive).
+        ///
+        /// # Returns
+        /// The AUC score as an `f64`, ranging from 0.0 to 1.0.
         fn calculate_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
-            let mut pairs: Vec<(f64, f64)> = predictions
-                .iter()
-                .zip(outcomes.iter())
-                .map(|(&p, &o)| (p, o))
-                .collect();
+            assert_eq!(predictions.len(), outcomes.len(), "Predictions and outcomes must have the same length.");
 
-            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-            let total_positives = outcomes.sum();
+            let total_positives = outcomes.iter().filter(|&&o| o > 0.5).count() as f64;
             let total_negatives = outcomes.len() as f64 - total_positives;
 
+            // Edge Case: If there's only one class, AUC is undefined. Return 0.5 by convention.
             if total_positives == 0.0 || total_negatives == 0.0 {
-                return 1.0; // Or handle as appropriate if all outcomes are the same class
+                return 0.5;
             }
 
-            let mut roc_area = 0.0;
-            let mut true_positives = total_positives;
-            let mut false_positives = total_negatives;
-            let mut last_fpr = 1.0;
+            // Combine predictions and outcomes, then sort by prediction score in descending order.
+            let mut pairs: Vec<_> = predictions.iter().zip(outcomes.iter()).collect();
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            for (_, outcome) in pairs.iter().rev() {
-                let fpr = false_positives / total_negatives;
-                let tpr = true_positives / total_positives;
-                roc_area += tpr * (last_fpr - fpr);
-                last_fpr = fpr;
+            let mut auc: f64 = 0.0;
+            let mut tp: f64 = 0.0;
+            let mut fp: f64 = 0.0;
 
-                if *outcome > 0.5 {
-                    true_positives -= 1.0;
-                } else {
-                    false_positives -= 1.0;
+            // Initialize the last point at the origin (0,0) of the ROC curve.
+            let mut last_tpr: f64 = 0.0;
+            let mut last_fpr: f64 = 0.0;
+
+            let mut i = 0;
+            while i < pairs.len() {
+                // Handle ties: Process all data points with the same prediction score together.
+                let current_score = pairs[i].0;
+                let mut tp_in_tie_group = 0.0;
+                let mut fp_in_tie_group = 0.0;
+
+                while i < pairs.len() && *pairs[i].0 == *current_score {
+                    if *pairs[i].1 > 0.5 { // It's a positive outcome
+                        tp_in_tie_group += 1.0;
+                    } else { // It's a negative outcome
+                        fp_in_tie_group += 1.0;
+                    }
+                    i += 1;
                 }
+
+                // Update total TP and FP counts AFTER processing the entire tie group.
+                tp += tp_in_tie_group;
+                fp += fp_in_tie_group;
+
+                let tpr = tp / total_positives;
+                let fpr = fp / total_negatives;
+
+                // Add the area of the trapezoid formed by the previous point and the current point.
+                // The height of the trapezoid is the average of the two TPRs.
+                // The width of the trapezoid is the change in FPR.
+                auc += (fpr - last_fpr) * (tpr + last_tpr) / 2.0;
+
+                // Update the last point for the next iteration.
+                last_tpr = tpr;
+                last_fpr = fpr;
             }
-            roc_area
+
+            auc
         }
 
         /// Calculates the correlation coefficient between two arrays

@@ -1962,67 +1962,65 @@ mod tests {
         // Convert expected continuous probabilities to binary outcomes using 0.5 threshold for simplicity
         let binary_expected: Vec<bool> = expected_predictions.iter().map(|&p| p > 0.5).collect();
 
-        // Sort predicted probabilities with their expected binary outcome
-        let mut pred_with_outcome: Vec<(f64, bool)> = predictions
-            .iter()
-            .zip(binary_expected.iter())
-            .map(|(&pred, &outcome)| (pred, outcome))
-            .collect();
-
-        pred_with_outcome.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-        // Calculate AUC using the trapezoidal rule
-        let mut true_positives = 0;
-        let mut false_positives = 0;
+        // Calculate AUC directly from predictions and binary outcomes
+        
+        // Calculate AUC using the robust implementation
+        let mut auc = 0.5; // default value (random chance if undefined)
+        let mut brier_score = 0.1; // default value
+        
+        // Edge case handling: If all outcomes belong to a single class, AUC is undefined
         let total_positives = binary_expected.iter().filter(|&&b| b).count();
         let total_negatives = binary_expected.len() - total_positives;
-
-        let mut auc = 0.8; // default value
-        let mut brier_score = 0.1; // default value
-
+        
         if total_positives == 0 || total_negatives == 0 {
-            println!("Cannot calculate AUC: all outcomes are the same class");
+            println!("Cannot calculate AUC: all outcomes are the same class (returning 0.5)");
+            // auc remains at 0.5 (random chance) for undefined case
         } else {
+            // Combine predictions and outcomes, then sort by prediction score in descending order
+            let mut pairs: Vec<_> = predictions.iter().zip(binary_expected.iter()).collect();
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
+            
+            let mut tp: f64 = 0.0;
+            let mut fp: f64 = 0.0;
+            let mut last_tpr: f64 = 0.0;
+            let mut last_fpr: f64 = 0.0;
+            
+            // Calculate AUC using the trapezoidal rule with proper tie handling
             auc = 0.0;
-            let mut prev_tpr = 0.0;
-            let mut prev_fpr = 0.0;
-
-            // Add sentinel point for (0,0)
-            let mut roc_points = vec![(0.0, 0.0)];
-
-            for (_, outcome) in pred_with_outcome.iter().rev() {
-                if *outcome {
-                    true_positives += 1;
-                } else {
-                    false_positives += 1;
+            let mut i = 0;
+            while i < pairs.len() {
+                // Handle ties: Process all data points with the same prediction score together
+                let current_score = pairs[i].0;
+                let mut tp_in_tie_group = 0.0;
+                let mut fp_in_tie_group = 0.0;
+                
+                while i < pairs.len() && *pairs[i].0 == *current_score {
+                    if *pairs[i].1 { // It's a positive outcome
+                        tp_in_tie_group += 1.0;
+                    } else { // It's a negative outcome
+                        fp_in_tie_group += 1.0;
+                    }
+                    i += 1;
                 }
-
-                let tpr = true_positives as f64 / total_positives as f64;
-                let fpr = false_positives as f64 / total_negatives as f64;
-
-                auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0;
-
-                prev_tpr = tpr;
-                prev_fpr = fpr;
-
-                // Save ROC points for further analysis
-                roc_points.push((fpr, tpr));
+                
+                // Update total TP and FP counts AFTER processing the entire tie group
+                tp += tp_in_tie_group;
+                fp += fp_in_tie_group;
+                
+                let tpr = tp / total_positives as f64;
+                let fpr = fp / total_negatives as f64;
+                
+                // Add the area of the trapezoid formed by the previous point and current point
+                auc += (fpr - last_fpr) * (tpr + last_tpr) / 2.0;
+                
+                // Update the last point for the next iteration
+                last_tpr = tpr;
+                last_fpr = fpr;
             }
-
-            // Add sentinel point for (1,1)
-            roc_points.push((1.0, 1.0));
-
-            // Calculate AUC using the trapezoidal rule on the ROC points
-            auc = 0.0;
-            for i in 1..roc_points.len() {
-                let (x1, y1) = roc_points[i - 1];
-                let (x2, y2) = roc_points[i];
-                auc += (x2 - x1) * (y1 + y2) / 2.0;
-            }
-
+            
             println!("✓ Area Under ROC Curve (AUC): {:.3}", auc);
             assert!(auc > 0.7, "AUC too low: {}", auc);
-
+            
             // Calculate Brier Score (mean squared error for probabilistic predictions)
             brier_score = expected_predictions
                 .iter()
@@ -2030,7 +2028,7 @@ mod tests {
                 .map(|(&e, &p)| (e - p).powi(2))
                 .sum::<f64>()
                 / expected_predictions.len() as f64;
-
+                
             println!("✓ Brier Score: {:.3} (lower is better)", brier_score);
             assert!(brier_score < 0.25, "Brier Score too high: {}", brier_score);
         }
