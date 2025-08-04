@@ -489,7 +489,8 @@ pub fn resolve_complex_variants(
     // Run the parallel processing in a thread scope
     let final_warnings = thread::scope(|s| {
         // Progress updater thread
-        let _progress_handle = s.spawn({
+        // Spawn progress updater thread
+        let progress_handle = s.spawn({
             let pb_updater = pb.clone();
             let counter_for_updater = Arc::clone(&progress_counter);
             let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
@@ -507,6 +508,9 @@ pub fn resolve_complex_variants(
 
         // Main processing thread - collect the result from this one
         let collector_handle = s.spawn(|| {
+            // Ensure the progress_handle is "used" to avoid unused variable warning
+            // This is a direct dependency that ensures the progress thread stays alive
+            std::mem::drop(progress_handle);
             final_scores
                 .par_chunks_mut(prep_result.score_names.len())
                 .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))

@@ -138,7 +138,7 @@ pub fn fit_model_for_fixed_rho(
     );
 
     // Step 4: Extract penalty matrices using the TRULY lambda-independent eb
-    // CRITICAL FIX: eb is computed from unweighted penalties and never changes with lambda
+    // Note: eb is computed from unweighted penalties and never changes with lambda
     let s_transformed = &reparam_result.s_transformed;
     // eb is already computed above as lambda-INDEPENDENT
     let e_transformed = &reparam_result.e_transformed; // Lambda-DEPENDENT for penalty application
@@ -215,7 +215,7 @@ pub fn fit_model_for_fixed_rho(
         );
 
         // Use our robust solver that handles rank deficiency correctly
-        // CRITICAL FIX: Pass BOTH penalty matrices for proper separation of concerns
+        // Note: Pass both penalty matrices for proper separation of concerns
         let stable_result = solve_penalized_least_squares(
             x_transformed.view(), // Pass transformed x
             z.view(),
