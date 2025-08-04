@@ -231,6 +231,7 @@ fn train_command(
         constraints: HashMap::new(),  // Will be filled during training
         knot_vectors: HashMap::new(), // Will be filled during training
         num_pgs_interaction_bases: 0, // Will be set during training
+        pgs_basis_means: vec![], // Will be filled during training
     };
 
     // --- Train the model using REML ---
@@ -683,6 +684,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0, // Will be set during training
+            pgs_basis_means: vec![], // Will be set during training
         };
 
         // 5. Train models

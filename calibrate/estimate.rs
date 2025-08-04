@@ -68,6 +68,9 @@ pub enum EstimationError {
     )]
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
+    #[error("FATAL: Hessian matrix has all negative eigenvalues. This indicates a critical numerical instability.")]
+    HessianNotPositiveDefinite { min_eigenvalue: f64 },
+
     #[error("REML/BFGS optimization failed to converge: {0}")]
     RemlOptimizationFailed(String),
 
@@ -111,7 +114,7 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    let (x_matrix, s_list, layout, constraints, knot_vectors) =
+    let (x_matrix, s_list, layout, constraints, knot_vectors, pgs_basis_means) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
     eprintln!(
@@ -246,6 +249,7 @@ pub fn train_model(
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.num_pgs_interaction_bases = layout.num_pgs_interaction_bases;
+    config_with_constraints.pgs_basis_means = pgs_basis_means;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -519,8 +523,17 @@ pub mod internal {
                     .penalized_hessian_transformed
                     .eigvals()
                     .map_err(EstimationError::EigendecompositionFailed)?;
+                
+                // Check specifically for ALL negative eigenvalues
+                let all_negative = eigenvals.iter().all(|&x| x.re < 0.0);
+                
+                if all_negative {
+                    log::warn!("Critical instability detected: ALL eigenvalues are negative.");
+                    return Ok(f64::INFINITY); // Barrier: infinite cost
+                }
+                
+                // Original behavior for indefiniteness
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
-
                 if min_eig <= 0.0 {
                     log::warn!(
                         "Indefinite Hessian detected (min eigenvalue: {min_eig}); returning infinite cost to retreat."
@@ -607,7 +620,7 @@ pub mod internal {
 
                         // Ensure matrix is positive definite before solving
                         let mut hessian_work = hessian_original.clone(); // Use original basis Hessian
-                        ensure_positive_definite(&mut hessian_work);
+                        ensure_positive_definite(&mut hessian_work)?;
 
                         match hessian_work.solve(&s_col.to_owned()) {
                             // CORRECT: Both matrices are now in the original basis
@@ -977,33 +990,24 @@ pub mod internal {
             let mut hessian = hessian_transformed.clone();
 
             // Proactively check and stabilize the Hessian using the existing helper function.
-            // This function returns true if any adjustments were made.
-            let was_adjusted = ensure_positive_definite(&mut hessian);
-            if was_adjusted {
-                log::warn!(
-                    "Hessian was stabilized before gradient calculation to ensure positive-definiteness."
-                );
-            }
+            ensure_positive_definite(&mut hessian)?;
             // All subsequent code will now use the GUARANTEED STABLE `hessian` matrix.
 
-            // If the Hessian needed extreme adjustments, this suggests a problematic region
-            // Let's check if we should return a retreat gradient instead
-            if was_adjusted {
-                // Get the minimum eigenvalue to assess how problematic the original matrix was
-                if let Ok(eigenvals) = hessian_transformed.eigvals() {
-                    let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
-
-                    const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
-                    if min_eig < SEVERE_INDEFINITENESS {
-                        // The matrix was severely indefinite - signal a need to retreat
-                        log::warn!(
-                            "Severely indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
-                            min_eig
-                        );
-                        // Generate an informed retreat direction based on current parameters
-                        let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
-                        return Ok(retreat_grad);
-                    }
+            // Check for severe indefiniteness in the original Hessian (before stabilization)
+            // This suggests a problematic region we should retreat from
+            if let Ok(eigenvals) = hessian_transformed.eigvals() {
+                // Original behavior for severe indefiniteness
+                let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
+                if min_eig < SEVERE_INDEFINITENESS {
+                    // The matrix was severely indefinite - signal a need to retreat
+                    log::warn!(
+                        "Severely indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
+                        min_eig
+                    );
+                    // Generate an informed retreat direction based on current parameters
+                    let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                    return Ok(retreat_grad);
                 }
             }
 
@@ -1247,12 +1251,21 @@ pub mod internal {
     }
 
     /// Ensures a matrix is positive definite by adjusting negative eigenvalues
-    fn ensure_positive_definite(hess: &mut Array2<f64>) -> bool {
-        if let Ok((mut evals, evecs)) = hess.eigh(UPLO::Lower) {
+    fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
+        if let Ok((evals, evecs)) = hess.eigh(UPLO::Lower) {
+            // Check if ALL eigenvalues are negative - CRITICAL numerical issue
+            if evals.iter().all(|&x| x < 0.0) {
+                let min_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                // CRITICAL ERROR - CRASH THE PROGRAM
+                return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
+            }
+            
+            // Original behavior for other cases
             let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
             let mut adjusted = false;
+            let mut evals_mut = evals.clone();
 
-            for eval in evals.iter_mut() {
+            for eval in evals_mut.iter_mut() {
                 if *eval < thresh {
                     *eval = thresh;
                     adjusted = true;
@@ -1260,16 +1273,16 @@ pub mod internal {
             }
 
             if adjusted {
-                *hess = evecs.dot(&Array2::from_diag(&evals)).dot(&evecs.t());
+                *hess = evecs.dot(&Array2::from_diag(&evals_mut)).dot(&evecs.t());
             }
 
-            adjusted
+            Ok(())
         } else {
             // Fallback: add small ridge to diagonal
             for i in 0..hess.nrows() {
                 hess[[i, i]] += 1e-6;
             }
-            true
+            Ok(())
         }
     }
 
@@ -1610,6 +1623,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
             (data, config)
@@ -2017,6 +2031,7 @@ pub mod internal {
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
             
             // Train the model
@@ -2417,7 +2432,7 @@ pub mod internal {
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // --- 4. Find the penalty indices corresponding to the main effects of PC1 and PC2 ---
@@ -2689,10 +2704,11 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -2808,10 +2824,11 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state =
@@ -3015,6 +3032,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
             println!(
@@ -3108,9 +3126,10 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
-            let (x, s_list, layout, _, _) =
+            let (x, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             // Explicitly drop unused variables
             // Unused variables removed
@@ -3284,10 +3303,11 @@ pub mod internal {
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
                 num_pgs_interaction_bases: 0,
+                pgs_basis_means: vec![],
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _) =
+            let (x_matrix, s_list, layout, constraints, _, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3410,7 +3430,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3526,7 +3546,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3698,7 +3718,7 @@ pub mod internal {
             let data = TrainingData { y, p, pcs };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -3841,7 +3861,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -3939,7 +3959,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4105,7 +4125,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _)) = matrices_result {
         let reml_state_result =
             RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
 

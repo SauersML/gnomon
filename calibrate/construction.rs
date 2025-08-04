@@ -106,7 +106,7 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, and knot vectors.
+/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, and PGS basis means.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
@@ -117,6 +117,7 @@ pub fn build_design_and_penalty_matrices(
         ModelLayout,
         HashMap<String, Constraint>,
         HashMap<String, Array1<f64>>,
+        Vec<f64>,
     ),
     EstimationError,
 > {
@@ -176,9 +177,10 @@ pub fn build_design_and_penalty_matrices(
 
         // Save PC knot vector
         knot_vectors.insert(pc_name.clone(), pc_knots);
-        // Apply sum-to-zero constraint to PC basis
+        // Apply sum-to-zero constraint to PC main effects (excluding intercept)
+        let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
         let (constrained_basis, z_transform) =
-            basis::apply_sum_to_zero_constraint(pc_basis_unc.view())?;
+            basis::apply_sum_to_zero_constraint(pc_main_basis_unc)?;
         pc_constrained_bases.push(constrained_basis);
 
         // Save the PC constraint transformation
@@ -192,7 +194,7 @@ pub fn build_design_and_penalty_matrices(
 
         // Transform the penalty matrix: S_constrained = Z^T * S_unconstrained * Z
         let s_unconstrained =
-            create_difference_penalty_matrix(pc_basis_unc.ncols(), config.penalty_order)?;
+            create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
         let s_constrained = z_transform.t().dot(&s_unconstrained.dot(&z_transform));
 
         // Embed into full-sized p × p matrix (will be determined after layout is created)
@@ -355,6 +357,17 @@ pub fn build_design_and_penalty_matrices(
     // Use the unconstrained PGS basis count for consistency.
     let total_pgs_bases = num_pgs_interaction_weights;
 
+    // Calculate and store PGS basis column means for use during prediction
+    let mut pgs_basis_means = Vec::with_capacity(total_pgs_bases);
+    for m in 1..=total_pgs_bases {
+        if m == 0 || m > pgs_main_basis_unc.ncols() {
+            continue; // Skip out-of-bounds
+        }
+        let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
+        let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
+        pgs_basis_means.push(mean);
+    }
+
     for m in 1..=total_pgs_bases {
         for pc_name in &config.pc_names {
             for block in &layout.penalty_map {
@@ -369,8 +382,8 @@ pub fn build_design_and_penalty_matrices(
                     }
                     let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
 
-                    // Center the PGS basis column to ensure orthogonality
-                    let mean = pgs_weight_col_uncentered.mean().unwrap_or(0.0);
+                    // Use the SAVED mean from training data
+                    let mean = pgs_basis_means[m - 1];
                     let pgs_weight_col = &pgs_weight_col_uncentered - mean;
 
                     // Use the CONSTRAINED PC basis matrix
@@ -447,7 +460,7 @@ pub fn build_design_and_penalty_matrices(
         });
     }
 
-    Ok((x_matrix, s_list_full, layout, constraints, knot_vectors))
+    Ok((x_matrix, s_list_full, layout, constraints, knot_vectors, pgs_basis_means))
 }
 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
