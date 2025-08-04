@@ -256,6 +256,9 @@ mod internal {
                 config.pc_basis_configs[i].degree,
             )?;
 
+            // Slice the basis to remove the intercept term, just like in the training code
+            let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
+
             // Apply the SAVED PC constraint
             let pc_name = &config.pc_names[i];
             let pc_z = &config
@@ -265,11 +268,11 @@ mod internal {
                 .z_transform;
 
             // Check that dimensions match before matrix multiplication
-            if pc_basis_unc.ncols() != pc_z.nrows() {
+            if pc_main_basis_unc.ncols() != pc_z.nrows() {
                 return Err(ModelError::InternalStackingError);
             }
 
-            pc_constrained_bases.push(pc_basis_unc.dot(pc_z)); // Now constrained
+            pc_constrained_bases.push(pc_main_basis_unc.dot(pc_z)); // Now constrained
         }
 
         // 3. Assemble the design matrix following the canonical order
