@@ -7,13 +7,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
 # --- 1. Import the data generation function from the existing script ---
-try:
-    from mgcv import generate_data
-except ImportError:
-    print("--- ERROR: Could not import 'generate_data' from 'mgcv.py'. ---")
-    print("Ensure 'mgcv.py' is in the same directory as this script.")
-    sys.exit(1)
-
+from mgcv import generate_data
 # --- 2. Define Paths and Parameters ---
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,27 +65,20 @@ def generate_and_run_scatter_comparison():
 def generate_and_plot_surfaces():
     """Generates grid data, runs inference, and plots all four surfaces."""
     print("\n" + "#"*70); print("### STEP 2: LEARNED SURFACE COMPARISON PLOT ###"); print("#"*70)
-    
-    # A. Create grid and calculate True & Empirical surfaces
+
+    # A. Create grid and get data for benchmark surfaces
     print("\n--- 2A. Generating Grid and Calculating Benchmark Surfaces ---")
     v1_range = np.linspace(0, 2 * np.pi, GRID_POINTS)
     v2_range = np.linspace(-1.5, 1.5, GRID_POINTS)
     v1_grid, v2_grid = np.meshgrid(v1_range, v2_range)
-    
-    # Surface 1: The "True" optimal surface (no noise)
+
+    # Surface 1: The "True" optimal surface (noise-free ground truth)
     true_logit = np.sin(v1_grid) + v2_grid
     true_surface_prob = 1 / (1 + np.exp(-true_logit))
 
-    # Surface 2: The "Empirical" surface from noisy samples.
-    # This shows the best possible result one could expect from averaging a finite, noisy sample.
-    # We use vectorization for efficiency.
-    noise_array = np.random.normal(0, NOISE_STD_DEV, (GRID_POINTS, GRID_POINTS, N_INFERENCE_SAMPLES))
-    # Expand grid dimensions to broadcast across the noise samples
-    logit_samples = np.sin(v1_grid[:, :, np.newaxis]) + v2_grid[:, :, np.newaxis] + noise_array
-    prob_samples = 1 / (1 + np.exp(-logit_samples))
-    # Simulate Bernoulli trials and average to get the empirical probability
-    outcomes = (np.random.uniform(size=prob_samples.shape) < prob_samples).astype(int)
-    empirical_surface_prob = np.mean(outcomes, axis=2)
+    # Data for Surface 2: Load the actual CSV data used for metrics. This will
+    # be plotted directly using a hexbin plot.
+    empirical_df = pd.read_csv(INFERENCE_DATA_CSV)
 
     # B. Get predictions from the models for the grid
     grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
@@ -99,19 +86,19 @@ def generate_and_plot_surfaces():
     grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
     r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
     rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
-    
+
     run_r_inference(grid_csv_path, r_preds_path)
     run_rust_inference(grid_csv_path, grid_tsv_path, rust_preds_path)
-    
+
     r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
     rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
 
     # C. Create the 2x2 plot
     print("\n--- 2B. Generating 2x2 Surface Plot ---")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True, sharex=True, sharey=True)
     fig.suptitle("Comparison of Learned Surfaces: P(outcome=1)", fontsize=20)
     levels = np.linspace(0, 1, 21)
-    
+
     # Top-left: R/mgcv Model
     axes[0, 0].contourf(v1_grid, v2_grid, r_preds, levels=levels, cmap='viridis')
     axes[0, 0].set_title("R / mgcv Model", fontsize=14)
@@ -126,11 +113,21 @@ def generate_and_plot_surfaces():
     axes[1, 0].set_title("True Optimal Surface (Noise-Free)", fontsize=14)
     axes[1, 0].set_xlabel("variable_one"); axes[1, 0].set_ylabel("variable_two")
 
-    # Bottom-right: Empirical Surface from Noisy Samples
-    cf = axes[1, 1].contourf(v1_grid, v2_grid, empirical_surface_prob, levels=levels, cmap='viridis')
-    axes[1, 1].set_title(f"Empirical Surface (from {N_INFERENCE_SAMPLES} noisy samples)", fontsize=14)
+    # Bottom-right: Empirical Surface using a Hexagonal Binning plot from the CSV data
+    # The 'C' argument takes the 'outcome' values. 'reduce_C_function=np.mean' calculates
+    # the average outcome (i.e., empirical probability) for all points in each hexagon.
+    cf = axes[1, 1].hexbin(
+        x=empirical_df['variable_one'],
+        y=empirical_df['variable_two'],
+        C=empirical_df['outcome'],
+        gridsize=40,  # Number of hexagons across the x-axis. A key tuning parameter.
+        cmap='viridis',
+        reduce_C_function=np.mean,
+        vmin=0, vmax=1  # Ensure color scale is consistent with other plots
+    )
+    axes[1, 1].set_title(f"Empirical Surface (Hexbin on {N_INFERENCE_SAMPLES} CSV points)", fontsize=14)
     axes[1, 1].set_xlabel("variable_one")
-    
+
     fig.colorbar(cf, ax=axes, orientation='vertical', shrink=0.8, label='Predicted Probability')
     plt.show()
 
