@@ -5,31 +5,29 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, brier_score_loss
+import argparse
 
-# --- 1. Import the data generation function from the existing script ---
-from mgcv import generate_data
-# --- 2. Define Paths and Parameters ---
+# --- 1. Define Paths and Parameters ---
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 
+# --- Model and Data Paths ---
 GNOMON_EXECUTABLE = WORKSPACE_ROOT / "target" / "release" / "gnomon"
 R_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.rds'
 RUST_MODEL_CONFIG_PATH = PROJECT_ROOT / 'model.toml'
+TRAINING_DATA_CSV = SCRIPT_DIR / 'synthetic_classification_data.csv' # KEY CHANGE
 
-# Permanent files for scatter plot comparison
-INFERENCE_DATA_CSV = SCRIPT_DIR / 'new_inference_data.csv'
-RUST_FORMATTED_INFERENCE_DATA_TSV = SCRIPT_DIR / 'rust_formatted_inference_data.tsv'
+# --- Temporary File Paths for Inference ---
 R_PREDICTIONS_CSV = SCRIPT_DIR / 'r_model_predictions.csv'
 RUST_PREDICTIONS_CSV = SCRIPT_DIR / 'rust_model_predictions.csv'
+RUST_FORMATTED_TRAINING_DATA_TSV = SCRIPT_DIR / 'rust_formatted_training_data.tsv'
 
-N_INFERENCE_SAMPLES = 1000
-NOISE_STD_DEV = 0.5
-# Increased resolution for smoother surface plots
-GRID_POINTS = 100
+# --- Plotting Parameters ---
+GRID_POINTS = 500
 
-# --- 3. Re-usable Metric Functions ---
+# --- 2. Re-usable Metric Functions (Unchanged) ---
 
 def tjurs_r2(y_true, y_prob):
     y_true = pd.Series(y_true).reset_index(drop=True)
@@ -50,92 +48,7 @@ def nagelkerkes_r2(y_true, y_prob):
     max_r2_cs = 1 - np.exp((2/n) * ll_null)
     return r2_cs / max_r2_cs if max_r2_cs > 0 else 0.0
 
-# --- 4. Main Execution Blocks ---
-
-def generate_and_run_scatter_comparison():
-    """Generates random data, runs inference, prints metrics, and plots scatter."""
-    print("\n" + "#"*70); print("### STEP 1: SCATTER PLOT AND METRIC COMPARISON ON RANDOM DATA ###"); print("#"*70)
-    print("\n--- 1A. Generating New Data for Inference ---")
-    generate_data(N_INFERENCE_SAMPLES, NOISE_STD_DEV).to_csv(INFERENCE_DATA_CSV, index=False)
-    print(f"Successfully generated {N_INFERENCE_SAMPLES} samples.")
-    run_r_inference(INFERENCE_DATA_CSV, R_PREDICTIONS_CSV)
-    run_rust_inference(INFERENCE_DATA_CSV, RUST_FORMATTED_INFERENCE_DATA_TSV, RUST_PREDICTIONS_CSV)
-    compare_and_plot_scatter()
-
-def generate_and_plot_surfaces():
-    """Generates grid data, runs inference, and plots all four surfaces."""
-    print("\n" + "#"*70); print("### STEP 2: LEARNED SURFACE COMPARISON PLOT ###"); print("#"*70)
-
-    # A. Create grid and get data for benchmark surfaces
-    print("\n--- 2A. Generating Grid and Calculating Benchmark Surfaces ---")
-    v1_range = np.linspace(0, 2 * np.pi, GRID_POINTS)
-    v2_range = np.linspace(-1.5, 1.5, GRID_POINTS)
-    v1_grid, v2_grid = np.meshgrid(v1_range, v2_range)
-
-    # Surface 1: The "True" optimal surface (noise-free ground truth)
-    true_logit = np.sin(v1_grid) + v2_grid
-    true_surface_prob = 1 / (1 + np.exp(-true_logit))
-
-    # Data for Surface 2: Load the actual CSV data used for metrics. This will
-    # be plotted directly using a hexbin plot.
-    empirical_df = pd.read_csv(INFERENCE_DATA_CSV)
-
-    # B. Get predictions from the models for the grid
-    grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
-    grid_csv_path = SCRIPT_DIR / 'temp_grid_data.csv'; grid_df.to_csv(grid_csv_path, index=False)
-    grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
-    r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
-    rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
-
-    run_r_inference(grid_csv_path, r_preds_path)
-    run_rust_inference(grid_csv_path, grid_tsv_path, rust_preds_path)
-
-    r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-    rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-
-    # C. Create the 2x2 plot
-    print("\n--- 2B. Generating 2x2 Surface Plot ---")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True, sharex=True, sharey=True)
-    fig.suptitle("Comparison of Learned Surfaces: P(outcome=1)", fontsize=20)
-    levels = np.linspace(0, 1, 21)
-
-    # Top-left: R/mgcv Model
-    axes[0, 0].contourf(v1_grid, v2_grid, r_preds, levels=levels, cmap='viridis')
-    axes[0, 0].set_title("R / mgcv Model", fontsize=14)
-    axes[0, 0].set_ylabel("variable_two")
-
-    # Top-right: Rust/gnomon Model
-    axes[0, 1].contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap='viridis')
-    axes[0, 1].set_title("Rust / gnomon Model", fontsize=14)
-
-    # Bottom-left: True Optimal Surface
-    axes[1, 0].contourf(v1_grid, v2_grid, true_surface_prob, levels=levels, cmap='viridis')
-    axes[1, 0].set_title("True Optimal Surface (Noise-Free)", fontsize=14)
-    axes[1, 0].set_xlabel("variable_one"); axes[1, 0].set_ylabel("variable_two")
-
-    # Bottom-right: Empirical Surface using a Hexagonal Binning plot from the CSV data
-    # The 'C' argument takes the 'outcome' values. 'reduce_C_function=np.mean' calculates
-    # the average outcome (i.e., empirical probability) for all points in each hexagon.
-    cf = axes[1, 1].hexbin(
-        x=empirical_df['variable_one'],
-        y=empirical_df['variable_two'],
-        C=empirical_df['outcome'],
-        gridsize=40,  # Number of hexagons across the x-axis. A key tuning parameter.
-        cmap='viridis',
-        reduce_C_function=np.mean,
-        vmin=0, vmax=1  # Ensure color scale is consistent with other plots
-    )
-    axes[1, 1].set_title(f"Empirical Surface (Hexbin on {N_INFERENCE_SAMPLES} CSV points)", fontsize=14)
-    axes[1, 1].set_xlabel("variable_one")
-
-    fig.colorbar(cf, ax=axes, orientation='vertical', shrink=0.8, label='Predicted Probability')
-    plt.show()
-
-    # D. Cleanup
-    grid_csv_path.unlink(); grid_tsv_path.unlink(); r_preds_path.unlink(); rust_preds_path.unlink()
-
-
-# --- 5. Helper Functions ---
+# --- 3. Analysis and Plotting Functions ---
 
 def run_r_inference(input_csv, output_csv):
     """Generic function to get predictions from the R/mgcv model."""
@@ -162,8 +75,9 @@ def run_rust_inference(input_csv, temp_tsv, output_csv):
         print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}"); sys.exit(1)
 
 def print_performance_report(df):
+    """Calculates and prints all performance metrics."""
     y_true, models = df['outcome'], {"R / mgcv": df['r_prediction'], "Rust / gnomon": df['rust_prediction']}
-    print("\n" + "="*60); print("      Model Performance Comparison"); print("="*60)
+    print("\n" + "="*60); print("      Model Performance on Training Data"); print("="*60)
     print("\n[Discrimination: AUC]"); print("Higher is better.")
     for n, p in models.items(): print(f"  - {n:<20}: {roc_auc_score(y_true, p):.4f}")
     print("\n[Accuracy: Brier Score]"); print("Lower is better.")
@@ -174,21 +88,106 @@ def print_performance_report(df):
     for n, p in models.items(): print(f"  - {n:<20}: {tjurs_r2(y_true, p):.4f}")
     print("\n" + "="*60)
 
-def compare_and_plot_scatter():
-    df = pd.concat([pd.read_csv(INFERENCE_DATA_CSV)[['outcome']], pd.read_csv(R_PREDICTIONS_CSV), pd.read_csv(RUST_PREDICTIONS_CSV)], axis=1)
-    print_performance_report(df)
+def plot_prediction_scatter(df):
+    """Plots the scatter plot comparing R and Rust predictions."""
     mae = np.mean(np.abs(df['r_prediction'] - df['rust_prediction']))
     print(f"\n[Inter-Model Agreement: MAE]\n  - MAE: {mae:.6f}")
     fig, ax = plt.subplots(figsize=(8, 8)); ax.scatter(df['r_prediction'], df['rust_prediction'], alpha=0.5, s=20)
     ax.plot([0, 1], [0, 1], 'r--', label='Perfect Agreement'); ax.set(xlabel="R / mgcv Predictions", ylabel="Rust / gnomon Predictions", title=f"Prediction Comparison (MAE = {mae:.6f})")
     ax.grid(True, linestyle='--'); ax.set_aspect('equal', 'box'); ax.legend(); plt.tight_layout(); plt.show()
 
+def plot_all_surfaces(empirical_df, linear_mode):
+    """Generates the 2x2 plot of model, true, and empirical surfaces."""
+    print("\n" + "#"*70); print("### PLOTTING LEARNED SURFACE COMPARISON ###"); print("#"*70)
+
+    # A. Create grid for querying models. This MUST be mode-aware.
+    if linear_mode:
+        print("\n--- Generating plot grid for LINEAR mode (-3 to 3) ---")
+        v1_range = np.linspace(-3, 3, GRID_POINTS)
+    else:
+        print("\n--- Generating plot grid for NON-LINEAR mode (0 to 2*pi) ---")
+        v1_range = np.linspace(0, 2 * np.pi, GRID_POINTS)
+    v2_range = np.linspace(-1.5, 1.5, GRID_POINTS)
+    v1_grid, v2_grid = np.meshgrid(v1_range, v2_range)
+
+    # B. Calculate the "True Optimal Surface" - THIS IS A FIXED BENCHMARK AS REQUESTED.
+    # It always uses the sine wave formula regardless of the mode.
+    print("--- Calculating the fixed 'True Optimal Surface' (sine wave benchmark) ---")
+    true_logit = np.sin(v1_grid) + v2_grid
+    true_surface_prob = 1 / (1 + np.exp(-true_logit))
+
+    # C. Get predictions from the models over the generated grid
+    grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
+    grid_csv_path = SCRIPT_DIR / 'temp_grid_data.csv'; grid_df.to_csv(grid_csv_path, index=False)
+    grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
+    r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
+    rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
+
+    run_r_inference(grid_csv_path, r_preds_path)
+    run_rust_inference(grid_csv_path, grid_tsv_path, rust_preds_path)
+
+    r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
+    rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
+
+    # D. Create the 2x2 plot
+    print("\n--- Generating 2x2 Surface Plot ---")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True, sharex=True, sharey=True)
+    fig.suptitle("Comparison of Learned Surfaces: P(outcome=1)", fontsize=20)
+    levels = np.linspace(0, 1, 21)
+
+    axes[0, 0].contourf(v1_grid, v2_grid, r_preds, levels=levels, cmap='viridis'); axes[0, 0].set_title("R / mgcv Model", fontsize=14); axes[0, 0].set_ylabel("variable_two")
+    axes[0, 1].contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap='viridis'); axes[0, 1].set_title("Rust / gnomon Model", fontsize=14)
+    axes[1, 0].contourf(v1_grid, v2_grid, true_surface_prob, levels=levels, cmap='viridis'); axes[1, 0].set_title("True Optimal Surface (Fixed Benchmark)", fontsize=14); axes[1, 0].set_xlabel("variable_one"); axes[1, 0].set_ylabel("variable_two")
+
+    # The empirical surface plot now correctly uses the original training data
+    cf = axes[1, 1].hexbin(x=empirical_df['variable_one'], y=empirical_df['variable_two'], C=empirical_df['outcome'], gridsize=40, cmap='viridis', reduce_C_function=np.mean, vmin=0, vmax=1)
+    axes[1, 1].set_title(f"Empirical Surface (Hexbin on Training Data)", fontsize=14); axes[1, 1].set_xlabel("variable_one")
+
+    fig.colorbar(cf, ax=axes, orientation='vertical', shrink=0.8, label='Predicted Probability')
+    plt.show()
+
+    # E. Cleanup temporary files
+    grid_csv_path.unlink(); grid_tsv_path.unlink(); r_preds_path.unlink(); rust_preds_path.unlink();
+
+# --- 4. Main Execution Block ---
+
 def main():
-    if not R_MODEL_PATH.is_file() or not RUST_MODEL_CONFIG_PATH.is_file():
-        print("ERROR: Required model files not found."); sys.exit(1)
-    generate_and_run_scatter_comparison()
-    generate_and_plot_surfaces()
-    print("\n--- Script finished successfully. ---")
+    parser = argparse.ArgumentParser(description="Analyze and compare trained R and Rust models.", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('--linear', action='store_true', help="Specify if models were trained in linear mode.\nThis ensures plots are generated over the correct range.")
+    args = parser.parse_args()
+
+    # --- 1. Check for required files ---
+    required_files = [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TRAINING_DATA_CSV]
+    for f in required_files:
+        if not f.is_file():
+            print(f"FATAL ERROR: Required file not found: {f}")
+            print("Please run the training script (e.g., 'python mgcv.py --linear') first.")
+            sys.exit(1)
+
+    # --- 2. Load the original training data ---
+    print(f"--- Loading training data from '{TRAINING_DATA_CSV.name}' ---")
+    training_df = pd.read_csv(TRAINING_DATA_CSV)
+
+    # --- 3. Run inference on the training data to get predictions ---
+    run_r_inference(TRAINING_DATA_CSV, R_PREDICTIONS_CSV)
+    run_rust_inference(TRAINING_DATA_CSV, RUST_FORMATTED_TRAINING_DATA_TSV, RUST_PREDICTIONS_CSV)
+
+    # --- 4. Combine data and predictions ---
+    r_preds_df = pd.read_csv(R_PREDICTIONS_CSV)
+    rust_preds_df = pd.read_csv(RUST_PREDICTIONS_CSV)
+    combined_df = pd.concat([training_df, r_preds_df, rust_preds_df], axis=1)
+
+    # --- 5. Report metrics and plot scatter ---
+    print_performance_report(combined_df)
+    plot_prediction_scatter(combined_df)
+
+    # --- 6. Plot all surfaces ---
+    # The linear_mode flag is passed to ensure the correct plot ranges are used.
+    plot_all_surfaces(training_df, linear_mode=args.linear)
+
+    # --- 7. Final cleanup ---
+    R_PREDICTIONS_CSV.unlink(); RUST_PREDICTIONS_CSV.unlink(); RUST_FORMATTED_TRAINING_DATA_TSV.unlink()
+    print("\n--- Analysis script finished successfully. ---")
 
 if __name__ == "__main__":
     main()
