@@ -98,17 +98,20 @@ pub fn fit_model_for_fixed_rho(
     // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
     log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
-    
+
     // Reconstruct full penalty matrices from square roots for balanced penalty creation
     let mut s_list_full = Vec::with_capacity(rs_original.len());
     for rs in rs_original {
         let s_full = rs.dot(&rs.t());
         s_list_full.push(s_full);
     }
-    
-    use crate::calibrate::construction::{stable_reparameterization, create_balanced_penalty_root};
+
+    use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
     let eb = create_balanced_penalty_root(&s_list_full)?;
-    println!("[Balanced Penalty] Created lambda-independent eb with shape: {:?}", eb.shape());
+    println!(
+        "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
+        eb.shape()
+    );
 
     // Step 3: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
@@ -220,9 +223,9 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
-            &eb,              // Lambda-INDEPENDENT balanced penalty root for rank detection
-            e_transformed,    // Lambda-DEPENDENT penalty root for penalty application
-            y.view(),         // Pass original response
+            &eb,                  // Lambda-INDEPENDENT balanced penalty root for rank detection
+            e_transformed,        // Lambda-DEPENDENT penalty root for penalty application
+            y.view(),             // Pass original response
             config.link_function, // Pass link function for correct scale calculation
         )?;
 
@@ -975,7 +978,7 @@ pub struct StablePLSResult {
 
 /// Robust penalized least squares solver following mgcv's pls_fit1 architecture
 /// This function implements the logic for a SINGLE P-IRLS step in the TRANSFORMED basis
-/// 
+///
 /// The solver now accepts TWO penalty matrices to separate rank detection from penalty application:
 /// - `eb`: Lambda-INDEPENDENT balanced penalty root used ONLY for numerical rank detection
 /// - `e_transformed`: Lambda-DEPENDENT penalty root used ONLY for applying the actual penalty
@@ -983,9 +986,9 @@ pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
-    eb: &Array2<f64>,            // Balanced penalty root for rank detection (lambda-independent)
+    eb: &Array2<f64>, // Balanced penalty root for rank detection (lambda-independent)
     e_transformed: &Array2<f64>, // Lambda-dependent penalty root for penalty application
-    y: ArrayView1<f64>,          // Original response (not the working response z)
+    y: ArrayView1<f64>, // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
     // The penalized least squares solver implements a 5-stage algorithm:
@@ -1184,7 +1187,11 @@ pub fn solve_penalized_least_squares(
     let e_transformed_rows = e_transformed.nrows();
     let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
     if e_transformed_rows > 0 {
-        drop_cols(e_transformed.view(), &drop_indices, &mut e_transformed_dropped);
+        drop_cols(
+            e_transformed.view(),
+            &drop_indices,
+            &mut e_transformed_dropped,
+        );
     }
 
     log::debug!(
@@ -1741,8 +1748,8 @@ mod tests {
             x.view(),
             z.view(),
             weights.view(),
-            &e,  // For test: use same matrix for both rank detection and penalty
-            &e,  // For test: use same matrix for both rank detection and penalty
+            &e, // For test: use same matrix for both rank detection and penalty
+            &e, // For test: use same matrix for both rank detection and penalty
             z.view(),
             LinkFunction::Identity,
         );

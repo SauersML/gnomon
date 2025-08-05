@@ -231,7 +231,7 @@ fn train_command(
         constraints: HashMap::new(),  // Will be filled during training
         knot_vectors: HashMap::new(), // Will be filled during training
         num_pgs_interaction_bases: 0, // Will be set during training
-        pgs_basis_means: vec![], // Will be filled during training
+        pgs_basis_means: vec![],      // Will be filled during training
     };
 
     // --- Train the model using REML ---
@@ -684,7 +684,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0, // Will be set during training
-            pgs_basis_means: vec![], // Will be set during training
+            pgs_basis_means: vec![],      // Will be set during training
         };
 
         // 5. Train models
@@ -1965,28 +1965,29 @@ mod tests {
         let binary_expected: Vec<bool> = expected_predictions.iter().map(|&p| p > 0.5).collect();
 
         // Calculate AUC directly from predictions and binary outcomes
-        
+
         // Calculate AUC using the robust implementation
         let mut auc = 0.5; // default value (random chance if undefined)
         let mut brier_score = 0.1; // default value
-        
+
         // Edge case handling: If all outcomes belong to a single class, AUC is undefined
         let total_positives = binary_expected.iter().filter(|&&b| b).count();
         let total_negatives = binary_expected.len() - total_positives;
-        
+
         if total_positives == 0 || total_negatives == 0 {
             println!("Cannot calculate AUC: all outcomes are the same class (returning 0.5)");
             // auc remains at 0.5 (random chance) for undefined case
         } else {
             // Combine predictions and outcomes, then sort by prediction score in descending order
             let mut pairs: Vec<_> = predictions.iter().zip(binary_expected.iter()).collect();
-            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
-            
+            pairs
+                .sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
+
             let mut tp: f64 = 0.0;
             let mut fp: f64 = 0.0;
             let mut last_tpr: f64 = 0.0;
             let mut last_fpr: f64 = 0.0;
-            
+
             // Calculate AUC using the trapezoidal rule with proper tie handling
             auc = 0.0;
             let mut i = 0;
@@ -1995,34 +1996,36 @@ mod tests {
                 let current_score = pairs[i].0;
                 let mut tp_in_tie_group = 0.0;
                 let mut fp_in_tie_group = 0.0;
-                
+
                 while i < pairs.len() && *pairs[i].0 == *current_score {
-                    if *pairs[i].1 { // It's a positive outcome
+                    if *pairs[i].1 {
+                        // It's a positive outcome
                         tp_in_tie_group += 1.0;
-                    } else { // It's a negative outcome
+                    } else {
+                        // It's a negative outcome
                         fp_in_tie_group += 1.0;
                     }
                     i += 1;
                 }
-                
+
                 // Update total TP and FP counts AFTER processing the entire tie group
                 tp += tp_in_tie_group;
                 fp += fp_in_tie_group;
-                
+
                 let tpr = tp / total_positives as f64;
                 let fpr = fp / total_negatives as f64;
-                
+
                 // Add the area of the trapezoid formed by the previous point and current point
                 auc += (fpr - last_fpr) * (tpr + last_tpr) / 2.0;
-                
+
                 // Update the last point for the next iteration
                 last_tpr = tpr;
                 last_fpr = fpr;
             }
-            
+
             println!("✓ Area Under ROC Curve (AUC): {:.3}", auc);
             assert!(auc > 0.7, "AUC too low: {}", auc);
-            
+
             // Calculate Brier Score (mean squared error for probabilistic predictions)
             brier_score = expected_predictions
                 .iter()
@@ -2030,7 +2033,7 @@ mod tests {
                 .map(|(&e, &p)| (e - p).powi(2))
                 .sum::<f64>()
                 / expected_predictions.len() as f64;
-                
+
             println!("✓ Brier Score: {:.3} (lower is better)", brier_score);
             assert!(brier_score < 0.25, "Brier Score too high: {}", brier_score);
         }

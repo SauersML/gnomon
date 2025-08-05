@@ -68,7 +68,9 @@ pub enum EstimationError {
     )]
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
-    #[error("FATAL: Hessian matrix has all negative eigenvalues. This indicates a critical numerical instability.")]
+    #[error(
+        "FATAL: Hessian matrix has all negative eigenvalues. This indicates a critical numerical instability."
+    )]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
 
     #[error("REML/BFGS optimization failed to converge: {0}")]
@@ -523,15 +525,15 @@ pub mod internal {
                     .penalized_hessian_transformed
                     .eigvals()
                     .map_err(EstimationError::EigendecompositionFailed)?;
-                
+
                 // Check specifically for ALL negative eigenvalues
                 let all_negative = eigenvals.iter().all(|&x| x.re < 0.0);
-                
+
                 if all_negative {
                     log::warn!("Critical instability detected: ALL eigenvalues are negative.");
                     return Ok(f64::INFINITY); // Barrier: infinite cost
                 }
-                
+
                 // Original behavior for indefiniteness
                 let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
                 if min_eig <= 0.0 {
@@ -1259,7 +1261,7 @@ pub mod internal {
                 // CRITICAL ERROR - CRASH THE PROGRAM
                 return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
             }
-            
+
             // Original behavior for other cases
             let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
             let mut adjusted = false;
@@ -1816,19 +1818,22 @@ pub mod internal {
             // Generate data from a known function
             let n_samples = 100;
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
             let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
-            let pcs = pc1_values.clone().into_shape_with_order((n_samples, 1)).unwrap();
-            
+            let pcs = pc1_values
+                .clone()
+                .into_shape_with_order((n_samples, 1))
+                .unwrap();
+
             // Define a known function that the model should learn
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let term1 = (pgs_val * 0.5).sin() * 0.4; 
-                let term2 = 0.4 * pc_val.powi(2); 
+                let term1 = (pgs_val * 0.5).sin() * 0.4;
+                let term2 = 0.4 * pc_val.powi(2);
                 let term3 = 0.15 * (pgs_val * pc_val).tanh();
-                0.3 + term1 + term2 + term3 
+                0.3 + term1 + term2 + term3
             };
-            
+
             // Generate binary outcomes based on the true model
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
@@ -1837,29 +1842,32 @@ pub mod internal {
                     let logit = true_function(pgs_val, pc_val);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
                     let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
-                    
-                    if rng.gen_range(0.0..1.0) < prob_clamped { 1.0 } else { 0.0 }
+
+                    if rng.gen_range(0.0..1.0) < prob_clamped {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 })
                 .collect();
-            
+
             let data = TrainingData { y, p, pcs };
-            
+
             // Train the model
             let mut config = create_test_config();
             config.pgs_basis_config.num_knots = 3;
             config.pc_basis_configs[0].num_knots = 3;
-            
-            let trained_model = train_model(&data, &config)
-                .expect("Model training should succeed");
-            
+
+            let trained_model = train_model(&data, &config).expect("Model training should succeed");
+
             // Create a grid of test points to evaluate overall fit
             let n_grid = 15;
             let test_pgs = Array1::linspace(-2.0, 2.0, n_grid);
             let test_pc = Array1::linspace(-1.5, 1.5, n_grid);
-            
+
             let mut true_probs = Vec::with_capacity(n_grid * n_grid);
             let mut pred_probs = Vec::with_capacity(n_grid * n_grid);
-            
+
             // For every combination of PGS and PC values in our test grid
             for &pgs_val in test_pgs.iter() {
                 for &pc_val in test_pc.iter() {
@@ -1867,7 +1875,7 @@ pub mod internal {
                     let true_logit = true_function(pgs_val, pc_val);
                     let true_prob = 1.0 / (1.0 + f64::exp(-true_logit));
                     true_probs.push(true_prob);
-                    
+
                     // Get the model's prediction
                     let pred_pgs = Array1::from_elem(1, pgs_val);
                     let pred_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
@@ -1877,12 +1885,12 @@ pub mod internal {
                     pred_probs.push(pred_prob);
                 }
             }
-            
+
             // Calculate correlation between true and predicted values
             let true_prob_array = Array1::from_vec(true_probs);
             let pred_prob_array = Array1::from_vec(pred_probs);
             let correlation = correlation_coefficient(&true_prob_array, &pred_prob_array);
-            
+
             // Assert high correlation (this is the main test)
             assert!(
                 correlation > 0.95,
@@ -1899,19 +1907,22 @@ pub mod internal {
             let n_total = 500;
             let n_train = 300;
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             let p = Array1::from_shape_fn(n_total, |_| rng.gen_range(-2.0..2.0));
             let pc1_values = Array1::from_shape_fn(n_total, |_| rng.gen_range(-1.5..1.5));
-            let pcs = pc1_values.clone().into_shape_with_order((n_total, 1)).unwrap();
-            
+            let pcs = pc1_values
+                .clone()
+                .into_shape_with_order((n_total, 1))
+                .unwrap();
+
             // Define the same known function
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let term1 = (pgs_val * 0.5).sin() * 0.4; 
-                let term2 = 0.4 * pc_val.powi(2); 
+                let term1 = (pgs_val * 0.5).sin() * 0.4;
+                let term2 = 0.4 * pc_val.powi(2);
                 let term3 = 0.15 * (pgs_val * pc_val).tanh();
-                0.3 + term1 + term2 + term3 
+                0.3 + term1 + term2 + term3
             };
-            
+
             // Generate binary outcomes and true probabilities
             let mut true_probabilities = Vec::with_capacity(n_total);
             let y: Array1<f64> = (0..n_total)
@@ -1921,52 +1932,56 @@ pub mod internal {
                     let logit = true_function(pgs_val, pc_val);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
                     let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
-                    
+
                     true_probabilities.push(prob_clamped);
-                    
-                    if rng.gen_range(0.0..1.0) < prob_clamped { 1.0 } else { 0.0 }
+
+                    if rng.gen_range(0.0..1.0) < prob_clamped {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 })
                 .collect();
-            
+
             // Split into training and test sets
             let train_data = TrainingData {
                 y: y.slice(ndarray::s![..n_train]).to_owned(),
                 p: p.slice(ndarray::s![..n_train]).to_owned(),
                 pcs: pcs.slice(ndarray::s![..n_train, ..]).to_owned(),
             };
-            
+
             let test_data = TrainingData {
                 y: y.slice(ndarray::s![n_train..]).to_owned(),
                 p: p.slice(ndarray::s![n_train..]).to_owned(),
                 pcs: pcs.slice(ndarray::s![n_train.., ..]).to_owned(),
             };
-            
+
             let test_true_probabilities = Array1::from(true_probabilities[n_train..].to_vec());
-            
+
             // Train model only on training data
             let mut config = create_test_config();
             config.pgs_basis_config.num_knots = 3;
             config.pc_basis_configs[0].num_knots = 3;
-            
-            let trained_model = train_model(&train_data, &config)
-                .expect("Model training should succeed");
-            
+
+            let trained_model =
+                train_model(&train_data, &config).expect("Model training should succeed");
+
             // Make predictions on test data
             let test_predictions = trained_model
                 .predict(test_data.p.view(), test_data.pcs.view())
                 .expect("Prediction on test data failed");
-            
+
             // Calculate AUC for model and oracle on test data
             let model_auc = calculate_auc(&test_predictions, &test_data.y);
             let oracle_auc = calculate_auc(&test_true_probabilities, &test_data.y);
-            
+
             // Assert that oracle performs better than random (> 0.5) - this fixes the bug!
             assert!(
                 oracle_auc > 0.5,
                 "Oracle AUC should be > 0.5, indicating the signal is positively correlated with outcomes. Got: {:.4}",
                 oracle_auc
             );
-            
+
             // Model should achieve at least 90% of oracle performance
             let threshold = 0.90 * oracle_auc;
             assert!(
@@ -1979,27 +1994,27 @@ pub mod internal {
         }
 
         /// **Test 3: The Automatic Smoothing Test (Most Informative!)**
-        /// Verifies the core "magic" of GAMs: that the REML/LAML optimization automatically 
+        /// Verifies the core "magic" of GAMs: that the REML/LAML optimization automatically
         /// identifies and penalizes irrelevant "noise" predictors.
         #[test]
         fn test_smoothing_correctly_penalizes_irrelevant_predictor() {
             let n_samples = 100;
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             // Generate predictors
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
-            
+
             // PC1 is the signal - has a true effect
             let pc1_signal = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
-            
+
             // PC2 is pure noise - has NO effect on the outcome
             let pc2_noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
-            
+
             // Create PCs matrix
             let mut pcs = Array2::zeros((n_samples, 2));
             pcs.column_mut(0).assign(&pc1_signal);
             pcs.column_mut(1).assign(&pc2_noise);
-            
+
             // Generate outcomes that depend ONLY on PC1 (not PC2)
             let y = Array1::from_shape_fn(n_samples, |i| {
                 let pc1_effect = 0.5 * pcs[[i, 0]]; // PC1 has effect
@@ -2007,12 +2022,16 @@ pub mod internal {
                 let logit = 0.2 + pc1_effect;
                 let prob: f64 = 1.0 / (1.0 + f64::exp(-logit));
                 let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
-                
-                if rng.gen_range(0.0..1.0) < prob_clamped { 1.0 } else { 0.0 }
+
+                if rng.gen_range(0.0..1.0) < prob_clamped {
+                    1.0
+                } else {
+                    0.0
+                }
             });
-            
+
             let data = TrainingData { y, p, pcs };
-            
+
             // Configure model to include both PC terms
             let config = ModelConfig {
                 link_function: LinkFunction::Logit,
@@ -2021,10 +2040,19 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
-                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
                 pc_basis_configs: vec![
-                    BasisConfig { num_knots: 3, degree: 3 }, // PC1 (signal)
-                    BasisConfig { num_knots: 3, degree: 3 }, // PC2 (noise)
+                    BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    }, // PC1 (signal)
+                    BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    }, // PC2 (noise)
                 ],
                 pgs_range: (-3.0, 3.0),
                 pc_ranges: vec![(-2.0, 2.0), (-2.0, 2.0)],
@@ -2034,11 +2062,10 @@ pub mod internal {
                 num_pgs_interaction_bases: 0,
                 pgs_basis_means: vec![],
             };
-            
+
             // Train the model
-            let trained_model = train_model(&data, &config)
-                .expect("Model training should succeed");
-            
+            let trained_model = train_model(&data, &config).expect("Model training should succeed");
+
             // Find lambda indices for PC1 and PC2 main effects
             // The lambdas are stored in the order the penalty terms were created
             // We need at least 2 lambdas for the two PC terms
@@ -2046,16 +2073,16 @@ pub mod internal {
                 trained_model.lambdas.len() >= 2,
                 "Model should have at least 2 smoothing parameters (for PC1 and PC2)"
             );
-            
+
             // The first penalty should be for PC1, second for PC2
             // (This depends on the internal ordering - we'll make this robust)
             let pc1_lambda = trained_model.lambdas[0];
             let pc2_lambda = trained_model.lambdas[1];
-            
-            // Key assertion: The noise term (PC2) should be much more heavily penalized 
+
+            // Key assertion: The noise term (PC2) should be much more heavily penalized
             // than the signal term (PC1)
             let penalty_ratio = pc2_lambda / pc1_lambda;
-            
+
             assert!(
                 penalty_ratio > 10.0,
                 "Noise predictor (PC2) should be penalized much more heavily than signal predictor (PC1). \
@@ -2064,7 +2091,7 @@ pub mod internal {
                 pc2_lambda,
                 penalty_ratio
             );
-            
+
             println!("✓ Automatic smoothing test passed!");
             println!("  PC1 (signal) lambda: {:.6e}", pc1_lambda);
             println!("  PC2 (noise) lambda:  {:.6e}", pc2_lambda);
@@ -2078,18 +2105,21 @@ pub mod internal {
         fn test_model_recovers_individual_smooth_shapes() {
             let n_samples = 100;
             let mut rng = StdRng::seed_from_u64(42);
-            
+
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
             let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
-            let pcs = pc1_values.clone().into_shape_with_order((n_samples, 1)).unwrap();
-            
+            let pcs = pc1_values
+                .clone()
+                .into_shape_with_order((n_samples, 1))
+                .unwrap();
+
             // Define a SIMPLE, ADDITIVE function (no interactions)
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = (pgs_val * 0.8).sin() * 0.5;     // sin effect for PGS
-                let pc_effect = 0.4 * pc_val.powi(2);             // quadratic effect for PC
-                0.2 + pgs_effect + pc_effect                      // additive combination
+                let pgs_effect = (pgs_val * 0.8).sin() * 0.5; // sin effect for PGS
+                let pc_effect = 0.4 * pc_val.powi(2); // quadratic effect for PC
+                0.2 + pgs_effect + pc_effect // additive combination
             };
-            
+
             // Generate outcomes
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
@@ -2098,93 +2128,96 @@ pub mod internal {
                     let logit = true_function(pgs_val, pc_val);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
                     let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
-                    
-                    if rng.gen_range(0.0..1.0) < prob_clamped { 1.0 } else { 0.0 }
+
+                    if rng.gen_range(0.0..1.0) < prob_clamped {
+                        1.0
+                    } else {
+                        0.0
+                    }
                 })
                 .collect();
-            
+
             let data = TrainingData { y, p, pcs };
-            
+
             // Train model
             let mut config = create_test_config();
             config.pgs_basis_config.num_knots = 4; // More knots for better shape recovery
             config.pc_basis_configs[0].num_knots = 4;
-            
-            let trained_model = train_model(&data, &config)
-                .expect("Model training should succeed");
-            
+
+            let trained_model = train_model(&data, &config).expect("Model training should succeed");
+
             // Test PGS main effect shape (with PC fixed at 0)
             let n_test = 20;
             let test_pgs_values = Array1::linspace(-2.0, 2.0, n_test);
             let pc_zero = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
-            
+
             let mut true_pgs_effects = Vec::with_capacity(n_test);
             let mut predicted_pgs_effects = Vec::with_capacity(n_test);
-            
+
             for &pgs_val in test_pgs_values.iter() {
                 // True PGS effect at PC=0
                 let true_logit = true_function(pgs_val, 0.0);
                 true_pgs_effects.push(true_logit);
-                
+
                 // Model prediction at PC=0
                 let test_pgs = Array1::from_elem(1, pgs_val);
                 let pred_prob = trained_model
                     .predict(test_pgs.view(), pc_zero.view())
                     .unwrap()[0];
-                
+
                 // Convert back to logit scale for comparison
                 let pred_prob_clamped = pred_prob.clamp(1e-6, 1.0 - 1e-6);
                 let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
                 predicted_pgs_effects.push(pred_logit);
             }
-            
+
             // Calculate correlation for PGS main effect
             let true_pgs_array = Array1::from_vec(true_pgs_effects);
             let pred_pgs_array = Array1::from_vec(predicted_pgs_effects);
             let pgs_correlation = correlation_coefficient(&true_pgs_array, &pred_pgs_array);
-            
-            // Test PC main effect shape (with PGS fixed at 0)  
+
+            // Test PC main effect shape (with PGS fixed at 0)
             let test_pc_values = Array1::linspace(-1.5, 1.5, n_test);
             let pgs_zero = Array1::from_elem(1, 0.0);
-            
+
             let mut true_pc_effects = Vec::with_capacity(n_test);
             let mut predicted_pc_effects = Vec::with_capacity(n_test);
-            
+
             for &pc_val in test_pc_values.iter() {
                 // True PC effect at PGS=0
                 let true_logit = true_function(0.0, pc_val);
                 true_pc_effects.push(true_logit);
-                
+
                 // Model prediction at PGS=0
                 let test_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
                 let pred_prob = trained_model
                     .predict(pgs_zero.view(), test_pc.view())
                     .unwrap()[0];
-                
+
                 // Convert back to logit scale
                 let pred_prob_clamped = pred_prob.clamp(1e-6, 1.0 - 1e-6);
                 let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
                 predicted_pc_effects.push(pred_logit);
             }
-            
+
             // Calculate correlation for PC main effect
             let true_pc_array = Array1::from_vec(true_pc_effects);
             let pred_pc_array = Array1::from_vec(predicted_pc_effects);
             let pc_correlation = correlation_coefficient(&true_pc_array, &pred_pc_array);
-            
+
             // Assert high correlation for both components
             assert!(
                 pgs_correlation > 0.85,
                 "PGS main effect should be well recovered. Correlation: {:.4}",
                 pgs_correlation
             );
-            
+
             assert!(
                 pc_correlation > 0.90,
                 "PC main effect should be well recovered. Correlation: {:.4}",
                 pc_correlation
             );
-            
+
             println!("✓ Individual shape recovery test passed!");
             println!("  PGS main effect correlation: {:.4}", pgs_correlation);
             println!("  PC main effect correlation:  {:.4}", pc_correlation);
@@ -2210,7 +2243,11 @@ pub mod internal {
         /// # Returns
         /// The AUC score as an `f64`, ranging from 0.0 to 1.0.
         fn calculate_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
-            assert_eq!(predictions.len(), outcomes.len(), "Predictions and outcomes must have the same length.");
+            assert_eq!(
+                predictions.len(),
+                outcomes.len(),
+                "Predictions and outcomes must have the same length."
+            );
 
             let total_positives = outcomes.iter().filter(|&&o| o > 0.5).count() as f64;
             let total_negatives = outcomes.len() as f64 - total_positives;
@@ -2222,7 +2259,8 @@ pub mod internal {
 
             // Combine predictions and outcomes, then sort by prediction score in descending order.
             let mut pairs: Vec<_> = predictions.iter().zip(outcomes.iter()).collect();
-            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
+            pairs
+                .sort_unstable_by(|a, b| b.0.partial_cmp(a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut auc: f64 = 0.0;
             let mut tp: f64 = 0.0;
@@ -2240,9 +2278,11 @@ pub mod internal {
                 let mut fp_in_tie_group = 0.0;
 
                 while i < pairs.len() && *pairs[i].0 == *current_score {
-                    if *pairs[i].1 > 0.5 { // It's a positive outcome
+                    if *pairs[i].1 > 0.5 {
+                        // It's a positive outcome
                         tp_in_tie_group += 1.0;
-                    } else { // It's a negative outcome
+                    } else {
+                        // It's a negative outcome
                         fp_in_tie_group += 1.0;
                     }
                     i += 1;
@@ -2988,7 +3028,9 @@ pub mod internal {
                     );
                 }
                 EstimationError::ModelOverparameterized { .. } => {
-                    println!("✓ Got ModelOverparameterized error (acceptable): model has too many coefficients relative to sample size");
+                    println!(
+                        "✓ Got ModelOverparameterized error (acceptable): model has too many coefficients relative to sample size"
+                    );
                 }
                 other => panic!(
                     "Expected ModelIsIllConditioned, RemlOptimizationFailed, or ModelOverparameterized, got: {:?}",
@@ -3092,7 +3134,6 @@ pub mod internal {
 
             println!("✓ Proactive singularity detection test passed!");
         }
-
 
         #[test]
         fn test_layout_and_matrix_construction() {
@@ -4019,7 +4060,6 @@ pub mod internal {
                 "The analytical gradient should match the numerical approximation at all test points."
             );
         }
-
     }
 }
 

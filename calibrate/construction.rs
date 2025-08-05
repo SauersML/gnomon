@@ -460,7 +460,14 @@ pub fn build_design_and_penalty_matrices(
         });
     }
 
-    Ok((x_matrix, s_list_full, layout, constraints, knot_vectors, pgs_basis_means))
+    Ok((
+        x_matrix,
+        s_list_full,
+        layout,
+        constraints,
+        knot_vectors,
+        pgs_basis_means,
+    ))
 }
 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
@@ -493,10 +500,10 @@ pub fn create_balanced_penalty_root(
         // No penalties case - return empty matrix
         return Ok(Array2::zeros((0, s_list.get(0).map_or(0, |s| s.nrows()))));
     }
-    
+
     let p = s_list[0].nrows();
     let mut s_balanced = Array2::zeros((p, p));
-    
+
     // Scale each penalty to have unit Frobenius norm and sum them
     for s_k in s_list {
         let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
@@ -505,19 +512,19 @@ pub fn create_balanced_penalty_root(
             s_balanced.scaled_add(1.0 / frob_norm, s_k);
         }
     }
-    
+
     // Take the matrix square root of the balanced penalty
     let (eigenvalues, eigenvectors) = s_balanced
         .eigh(ndarray_linalg::UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    
+
     let tolerance = 1e-12;
     let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-    
+
     if penalty_rank == 0 {
         return Ok(Array2::zeros((0, p)));
     }
-    
+
     // Construct the balanced penalty square root
     let mut eb = Array2::zeros((p, penalty_rank));
     let mut col_idx = 0;
@@ -529,7 +536,7 @@ pub fn create_balanced_penalty_root(
             col_idx += 1;
         }
     }
-    
+
     // Return as rank x p matrix (matching mgcv's convention)
     Ok(eb.t().to_owned())
 }
@@ -628,7 +635,7 @@ pub fn construct_s_lambda(
 /// This follows the complete recursive similarity transformation procedure
 /// Now accepts penalty square roots (rS) instead of full penalty matrices
 /// Each rs_list[i] is a p x rank_i matrix where rank_i is the rank of penalty i
-/// 
+///
 /// The eb parameter is the pre-computed lambda-INDEPENDENT balanced penalty root
 /// for rank detection, computed once at a higher level to ensure stability.
 pub fn stable_reparameterization(
@@ -964,7 +971,9 @@ pub fn stable_reparameterization(
             let sqrt_eigenval = eigenval.sqrt();
             let eigenvec = s_eigenvectors.column(i);
             // Each column of the matrix is sqrt(eigenvalue) * eigenvector
-            e_matrix.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
+            e_matrix
+                .column_mut(col_idx)
+                .assign(&(&eigenvec * sqrt_eigenval));
             col_idx += 1;
         }
     }
