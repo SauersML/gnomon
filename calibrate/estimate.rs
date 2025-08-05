@@ -116,7 +116,7 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    let (x_matrix, s_list, layout, constraints, knot_vectors, pgs_basis_means) =
+    let (x_matrix, s_list, layout, constraints, knot_vectors) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
     eprintln!(
@@ -251,7 +251,6 @@ pub fn train_model(
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.num_pgs_interaction_bases = layout.num_pgs_interaction_bases;
-    config_with_constraints.pgs_basis_means = pgs_basis_means;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -1625,7 +1624,6 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             (data, config)
@@ -1653,7 +1651,6 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0, // Will be set during training
-                pgs_basis_means: vec![],
             }
         }
 
@@ -2060,7 +2057,6 @@ pub mod internal {
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             // Train the model
@@ -2470,25 +2466,26 @@ pub mod internal {
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 num_pgs_interaction_bases: 0, // Important: no interactions for stability
-                pgs_basis_means: vec![],
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, s_list, layout, _, _, _) =
+            let (x_matrix, s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // --- 4. Find the penalty indices corresponding to the main effects of PC1 and PC2 ---
             let pc1_penalty_idx = layout
                 .penalty_map
                 .iter()
-                .position(|b| b.term_name == "f(PC1)")
-                .expect("PC1 penalty not found");
+                .find(|b| b.term_name == "f(PC1)")
+                .expect("PC1 penalty not found")
+                .penalty_indices[0]; // Main effects have single penalty
 
             let pc2_penalty_idx = layout
                 .penalty_map
                 .iter()
-                .position(|b| b.term_name == "f(PC2)")
-                .expect("PC2 penalty not found");
+                .find(|b| b.term_name == "f(PC2)")
+                .expect("PC2 penalty not found")
+                .penalty_indices[0]; // Main effects have single penalty
 
             // --- 5. Instead of using the gradient, we'll directly compare costs at different penalty levels ---
             // This is a more robust approach that avoids potential issues with P-IRLS convergence
@@ -2746,11 +2743,10 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _) =
+            let (x_matrix, s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -2866,11 +2862,10 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _) =
+            let (x_matrix, s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state =
@@ -3076,7 +3071,6 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             println!(
@@ -3169,10 +3163,9 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
-            let (x, s_list, layout, _, _, _) =
+            let (x, s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             // Explicitly drop unused variables
             // Unused variables removed
@@ -3269,7 +3262,7 @@ pub mod internal {
                 let block = layout
                     .penalty_map
                     .iter()
-                    .find(|b| b.penalty_idx == i)
+                    .find(|b| b.penalty_indices.contains(&i))
                     .expect(&format!(
                         "Could not find layout block for penalty index {}",
                         i
@@ -3346,11 +3339,10 @@ pub mod internal {
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _) =
+            let (x_matrix, s_list, layout, constraints, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3411,7 +3403,7 @@ pub mod internal {
             // Verify that penalty matrices for interactions have the correct structure
             for block in &layout.penalty_map {
                 if block.term_name.starts_with("f(PGS_B") {
-                    let penalty_matrix = &s_list[block.penalty_idx];
+                    let penalty_matrix = &s_list[block.penalty_indices[0]];
 
                     // The embedded penalty matrix should be full-sized (p × p)
                     assert_eq!(
@@ -3473,7 +3465,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3589,7 +3581,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3761,7 +3753,7 @@ pub mod internal {
             let data = TrainingData { y, p, pcs };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -3904,7 +3896,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4002,7 +3994,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4094,7 +4086,6 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         num_pgs_interaction_bases: 0,
-        pgs_basis_means: vec![],
     };
 
     // 3. Train the model and expect an error
@@ -4164,12 +4155,11 @@ fn test_indefinite_hessian_detection_and_retreat() {
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         num_pgs_interaction_bases: 0,
-        pgs_basis_means: vec![],
     };
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _)) = matrices_result {
         let reml_state_result =
             RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
 

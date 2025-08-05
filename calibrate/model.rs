@@ -65,9 +65,6 @@ pub struct ModelConfig {
     /// Number of PGS interaction bases (empirical from actual basis generation)
     /// Used to ensure consistency between construction and coefficient flattening
     pub num_pgs_interaction_bases: usize,
-    /// PGS basis column means from training data (for centering during prediction)
-    /// Each element corresponds to one unconstrained PGS basis column (excluding intercept)
-    pub pgs_basis_means: Vec<f64>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -76,11 +73,10 @@ pub struct ModelConfig {
 pub struct MappedCoefficients {
     pub intercept: f64,
     pub main_effects: MainEffects,
-    /// Nested map for interaction terms.
-    /// - Outer key: PGS basis function name (e.g., "PGS_B1").
-    /// - Inner key: PC name (e.g., "PC1").
-    /// - Value: The vector of coefficients for that interaction's spline.
-    pub interaction_effects: HashMap<String, HashMap<String, Vec<f64>>>,
+    /// Flat map for tensor product interaction terms.
+    /// - Key: Interaction term name (e.g., "f(PGS,PC1)").
+    /// - Value: The vector of coefficients for the entire tensor product surface.
+    pub interaction_effects: HashMap<String, Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +194,30 @@ impl TrainedModel {
 mod internal {
     use super::*;
 
+    /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
+    /// This creates the design matrix columns for tensor product interactions.
+    /// Each row of the result is the outer product of the corresponding rows from A and B.
+    fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+        let n_samples = a.nrows();
+        assert_eq!(n_samples, b.nrows(), "Matrices must have same number of rows");
+        
+        let a_cols = a.ncols();
+        let b_cols = b.ncols();
+        let mut result = Array2::zeros((n_samples, a_cols * b_cols));
+        
+        for row in 0..n_samples {
+            let mut col_idx = 0;
+            for i in 0..a_cols {
+                for j in 0..b_cols {
+                    result[[row, col_idx]] = a[[row, i]] * b[[row, j]];
+                    col_idx += 1;
+                }
+            }
+        }
+        
+        result
+    }
+
     /// Constructs the design matrix `X` for new data following a strict canonical order.
     /// This order is the implicit contract that allows the flattened coefficients to work correctly.
     pub(super) fn construct_design_matrix(
@@ -294,41 +314,17 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Interaction effects
-        // Use the saved empirical count from config for consistency
-        // This ensures construct_design_matrix and flatten_coefficients use the same count
-        let total_pgs_bases = config.num_pgs_interaction_bases;
-
-        // Use 1-indexed loop for interaction effects to match the canonical ordering in estimate.rs
-        for m in 1..=total_pgs_bases {
-            // Use unconstrained PGS basis for interaction weights
-            // Note: pgs_main_basis_unc excludes intercept column, so m=1 maps to index 0
-            if m == 0 || m > pgs_main_basis_unc.ncols() {
-                continue; // Skip out-of-bounds
-            }
-            let pgs_weight_col_uncentered = pgs_main_basis_unc.column(m - 1);
-
-            // Use the SAVED mean from training data - CRITICAL FIX for prediction consistency
-            let mean = if m <= config.pgs_basis_means.len() {
-                config.pgs_basis_means[m - 1]
-            } else {
-                return Err(ModelError::InternalStackingError);
-            };
-            let pgs_weight_col = &pgs_weight_col_uncentered - mean;
-
-            // Iterate through PC names in the canonical order
-            for pc_name in &config.pc_names {
-                // Find the PC index from the name
-                let pc_idx = config.pc_names.iter().position(|n| n == pc_name).unwrap();
-                let pc_basis_con = &pc_constrained_bases[pc_idx];
-
-                // Pure interaction approach: use constrained PC basis with centered PGS
-                // Both bases are now properly centered to avoid linear dependencies
-                let interaction_term = pc_basis_con * &pgs_weight_col.view().insert_axis(Axis(1));
-
-                for col in interaction_term.axis_iter(Axis(1)) {
-                    owned_cols.push(col.to_owned());
-                }
+        // 4. Tensor product interaction effects
+        // Create unified interaction surfaces using row-wise tensor products
+        for (pc_idx, _pc_name) in config.pc_names.iter().enumerate() {
+            let pc_basis_con = &pc_constrained_bases[pc_idx];
+            
+            // Create tensor product interaction using the same logic as training
+            let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_basis_con);
+            
+            // Add all columns from this tensor product to the design matrix
+            for col in tensor_interaction.axis_iter(Axis(1)) {
+                owned_cols.push(col.to_owned());
             }
         }
 
@@ -360,17 +356,11 @@ mod internal {
         // 3. Main PGS effects (for basis functions m > 0).
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
-        // 4. Interaction effects (ordered by PGS basis index `m`, then by `pc_names`).
-        // CRITICAL: Use the empirical value saved during training to ensure consistency.
-        let total_pgs_bases = config.num_pgs_interaction_bases;
-        for m in 1..=total_pgs_bases {
-            let pgs_key = format!("PGS_B{m}");
-            if let Some(pc_map) = coeffs.interaction_effects.get(&pgs_key) {
-                for pc_name in &config.pc_names {
-                    if let Some(c) = pc_map.get(pc_name) {
-                        flattened.extend_from_slice(c);
-                    }
-                }
+        // 4. Tensor product interaction effects (ordered by PC)
+        for pc_name in &config.pc_names {
+            let tensor_key = format!("f(PGS,{})", pc_name);
+            if let Some(tensor_coeffs) = coeffs.interaction_effects.get(&tensor_key) {
+                flattened.extend_from_slice(tensor_coeffs);
             }
         }
 
@@ -440,7 +430,6 @@ mod tests {
                     knots
                 },
                 num_pgs_interaction_bases: 0,
-                pgs_basis_means: vec![],
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -510,7 +499,6 @@ mod tests {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 num_pgs_interaction_bases: 1, // 1 PGS interaction base for this test
-                pgs_basis_means: vec![],
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -562,18 +550,11 @@ mod tests {
             interaction_effects: {
                 let mut interactions = HashMap::new();
 
-                // PGS_B1 interactions
-                let mut pgs_b1 = HashMap::new();
-                pgs_b1.insert("PC1".to_string(), vec![8.0, 9.0]);
-                pgs_b1.insert("PC2".to_string(), vec![10.0, 11.0]);
+                // Unified tensor product interactions - flattened coefficient vectors
+                // For tensor products, coefficients are flattened in the order: pgs_basis × pc_basis
+                interactions.insert("f(PGS,PC1)".to_string(), vec![8.0, 9.0, 12.0, 13.0]);
+                interactions.insert("f(PGS,PC2)".to_string(), vec![10.0, 11.0, 14.0, 15.0]);
 
-                // PGS_B2 interactions
-                let mut pgs_b2 = HashMap::new();
-                pgs_b2.insert("PC1".to_string(), vec![12.0, 13.0]);
-                pgs_b2.insert("PC2".to_string(), vec![14.0, 15.0]);
-
-                interactions.insert("PGS_B1".to_string(), pgs_b1);
-                interactions.insert("PGS_B2".to_string(), pgs_b2);
                 interactions
             },
         };
@@ -605,8 +586,7 @@ mod tests {
             pc_names: vec!["PC1".to_string(), "PC2".to_string()], // Order matters for flattening
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            num_pgs_interaction_bases: 2, // 2 PGS interaction bases for this test
-            pgs_basis_means: vec![],
+            num_pgs_interaction_bases: 2 // 2 PGS interaction bases for this test
         };
 
         // Use the internal flatten_coefficients function
@@ -625,10 +605,8 @@ mod tests {
             4.0, 5.0, // PC1 main effects
             6.0, 7.0, // PC2 main effects
             2.0, 3.0, // PGS main effects
-            8.0, 9.0, // PGS_B1 * PC1 interaction
-            10.0, 11.0, // PGS_B1 * PC2 interaction
-            12.0, 13.0, // PGS_B2 * PC1 interaction
-            14.0, 15.0, // PGS_B2 * PC2 interaction
+            8.0, 9.0, 12.0, 13.0, // f(PGS,PC1) tensor product interaction
+            10.0, 11.0, 14.0, 15.0, // f(PGS,PC2) tensor product interaction
         ];
 
         // Convert to vectors for easier comparison
@@ -684,8 +662,7 @@ mod tests {
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
-            num_pgs_interaction_bases: 3, // 3 PGS interaction bases for this test
-            pgs_basis_means: vec![],
+            num_pgs_interaction_bases: 3 // 3 PGS interaction bases for this test
         };
 
         // Create a dummy dataset for generating the correct model structure
@@ -702,7 +679,7 @@ mod tests {
         };
 
         // Generate the correct constraints and structure using the actual model-building code
-        let (_, _, layout, constraints, knot_vectors, _) =
+        let (_, _, layout, constraints, knot_vectors) =
             crate::calibrate::construction::build_design_and_penalty_matrices(
                 &dummy_data,
                 &model_config,
@@ -725,8 +702,7 @@ mod tests {
                 pc_names: vec!["PC1".to_string()],
                 constraints: constraints.clone(), // Clone to avoid ownership issues
                 knot_vectors, // Use the knot vectors generated by the model-building code
-                num_pgs_interaction_bases: 3, // 3 PGS interaction bases for this test
-                pgs_basis_means: vec![0.0, 0.1, 0.2], // Example means for testing
+                num_pgs_interaction_bases: 3 // 3 PGS interaction bases for this test
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -767,13 +743,9 @@ mod tests {
                     let mut interactions = HashMap::new();
                     // Build interaction terms for each PGS basis function
                     for i in 1..=num_pgs_basis_funcs {
-                        let mut pgs_bx = HashMap::new();
-                        // Create coefficients for each PC dimension
-                        pgs_bx.insert(
-                            "PC1".to_string(),
-                            (1..=pc1_dim).map(|j| (i * 10 + j) as f64).collect(),
-                        );
-                        interactions.insert(format!("PGS_B{}", i), pgs_bx);
+                        // Create flattened vector for interaction term
+                        let interaction_coeffs: Vec<f64> = (1..=pc1_dim).map(|j| (i * 10 + j) as f64).collect();
+                        interactions.insert(format!("f(PGS,PC1)_B{}", i), interaction_coeffs);
                     }
                     interactions
                 },
@@ -857,44 +829,26 @@ mod tests {
             original_model.coefficients.interaction_effects.len()
         );
 
-        // Check PGS_B1 interactions
-        if let (Some(pgs_b1_loaded), Some(pgs_b1_orig)) = (
-            loaded_model.coefficients.interaction_effects.get("PGS_B1"),
-            original_model
-                .coefficients
-                .interaction_effects
-                .get("PGS_B1"),
+        // Check for interaction effect f(PGS,PC1)_B1
+        let key_b1 = "f(PGS,PC1)_B1";
+        if let (Some(b1_loaded), Some(b1_orig)) = (
+            loaded_model.coefficients.interaction_effects.get(key_b1),
+            original_model.coefficients.interaction_effects.get(key_b1),
         ) {
-            assert_eq!(pgs_b1_loaded.len(), pgs_b1_orig.len());
-            if let (Some(pc1_loaded), Some(pc1_orig)) =
-                (pgs_b1_loaded.get("PC1"), pgs_b1_orig.get("PC1"))
-            {
-                assert_eq!(pc1_loaded, pc1_orig);
-            } else {
-                panic!("Missing PC1 in PGS_B1 interaction effects");
-            }
+            assert_eq!(b1_loaded, b1_orig, "Mismatch in {}", key_b1);
         } else {
-            panic!("Missing PGS_B1 interaction effects");
+            panic!("Missing {} interaction effect", key_b1);
         }
 
-        // Check PGS_B2 interactions
-        if let (Some(pgs_b2_loaded), Some(pgs_b2_orig)) = (
-            loaded_model.coefficients.interaction_effects.get("PGS_B2"),
-            original_model
-                .coefficients
-                .interaction_effects
-                .get("PGS_B2"),
+        // Check for interaction effect f(PGS,PC1)_B2
+        let key_b2 = "f(PGS,PC1)_B2";
+        if let (Some(b2_loaded), Some(b2_orig)) = (
+            loaded_model.coefficients.interaction_effects.get(key_b2),
+            original_model.coefficients.interaction_effects.get(key_b2),
         ) {
-            assert_eq!(pgs_b2_loaded.len(), pgs_b2_orig.len());
-            if let (Some(pc1_loaded), Some(pc1_orig)) =
-                (pgs_b2_loaded.get("PC1"), pgs_b2_orig.get("PC1"))
-            {
-                assert_eq!(pc1_loaded, pc1_orig);
-            } else {
-                panic!("Missing PC1 in PGS_B2 interaction effects");
-            }
+            assert_eq!(b2_loaded, b2_orig, "Mismatch in {}", key_b2);
         } else {
-            panic!("Missing PGS_B2 interaction effects");
+            panic!("Missing {} interaction effect", key_b2);
         }
 
         // 5. Check lambdas
@@ -950,17 +904,9 @@ pub fn map_coefficients(
                 let pc_name = name.replace("f(", "").replace(")", "");
                 pcs.insert(pc_name, coeffs);
             }
-            name if name.starts_with("f(PGS_B") => {
-                let parts: Vec<_> = name.split([',', ')']).collect();
-                if parts.len() < 2 {
-                    continue;
-                }
-                let pgs_key = parts[0].replace("f(", "").to_string();
-                let pc_name = parts[1].trim().to_string();
-                interaction_effects
-                    .entry(pgs_key)
-                    .or_insert_with(HashMap::new)
-                    .insert(pc_name, coeffs);
+            name if name.starts_with("f(PGS,") => {
+                // Tensor product interaction: f(PGS,PC1) -> direct storage
+                interaction_effects.insert(name.to_string(), coeffs);
             }
             _ => {
                 return Err(EstimationError::LayoutError(format!(

@@ -231,7 +231,6 @@ fn train_command(
         constraints: HashMap::new(),  // Will be filled during training
         knot_vectors: HashMap::new(), // Will be filled during training
         num_pgs_interaction_bases: 0, // Will be set during training
-        pgs_basis_means: vec![],      // Will be filled during training
     };
 
     // --- Train the model using REML ---
@@ -684,7 +683,6 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             num_pgs_interaction_bases: 0, // Will be set during training
-            pgs_basis_means: vec![],      // Will be set during training
         };
 
         // 5. Train models
@@ -1525,13 +1523,13 @@ mod tests {
 
         for pc_idx in 0..true_effects.pc_main_effects.len() {
             let pc_name = format!("PC{}", pc_idx + 1);
-            let mut squared_sum = 0.0;
+            let mut squared_sum: f64 = 0.0;
 
-            // Go through all PGS basis functions looking for interactions with this PC
-            for (_, pc_map) in &model.coefficients.interaction_effects {
-                if let Some(coeffs) = pc_map.get(&pc_name) {
+            // Go through all interaction effects looking for those involving this PC
+            for (interaction_name, coeffs) in &model.coefficients.interaction_effects {
+                if interaction_name.contains(&pc_name as &str) {
                     // Add squared coefficients for this interaction
-                    for &coef in coeffs.iter() {
+                    for &coef in coeffs {
                         squared_sum += coef * coef;
                     }
                 }
