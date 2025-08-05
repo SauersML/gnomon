@@ -3,43 +3,36 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 
-# --- 1. Parameters (Global Constants) ---
-# These are safe to define globally as they are just configuration values.
+
 N_SAMPLES = 2000
 NOISE_STD_DEV = 0.5
 OUTPUT_FILENAME = 'synthetic_classification_data.csv'
 N_BINS = 20
 
-# --- 2. Function Definitions ---
-# These functions are the script's "tools." They are defined but not run here.
 
-def generate_data(n_samples, noise_std, linear_mode=False):
-    """
-    Generates synthetic data for a binary classification problem.
-    The script supports two modes controlled by the `linear_mode` flag.
+def generate_data(n_samples, noise_std, linear_mode=False, noise_mode=False):
+    # Generate common components first
+    noise = np.random.normal(0, noise_std, n_samples)
 
-    --- Non-Linear Mode (default) ---
-    The probability of the outcome is a non-linear function of both variables.
-    - logit = sin(var1) + var2 + noise
-
-    --- Linear Mode (--linear flag) ---
-    The probability of the outcome is a linear function of only variable_one.
-    - logit = var1 + noise
-    - var2 is generated but is pure noise with no relation to the outcome.
-    """
-    if linear_mode:
+    if noise_mode:
+        print(f"--- Running in PURE NOISE mode ---")
+        print(f"Generating {n_samples} samples with ZERO signal...")
+        # Use standard ranges for variables, but they won't affect the outcome
+        var1 = np.random.uniform(-3, 3, n_samples)
+        var2 = np.random.uniform(-1.5, 1.5, n_samples)
+        # The logit is ONLY noise, severing any link to the variables.
+        logit = noise
+    elif linear_mode:
         print(f"--- Running in LINEAR mode ---")
         print(f"Generating {n_samples} samples...")
         var1 = np.random.uniform(-3, 3, n_samples)
         var2 = np.random.uniform(-1.5, 1.5, n_samples)
-        noise = np.random.normal(0, noise_std, n_samples)
         logit = var1 + noise  # var2 is intentionally omitted
-    else:
+    else: # Default non-linear mode
         print(f"--- Running in NON-LINEAR mode (default) ---")
         print(f"Generating {n_samples} samples...")
         var1 = np.random.uniform(0, 2 * np.pi, n_samples)
         var2 = np.random.uniform(-1.5, 1.5, n_samples)
-        noise = np.random.normal(0, noise_std, n_samples)
         logit = np.sin(var1) + var2 + noise
 
     prob_of_one = 1 / (1 + np.exp(-logit))
@@ -53,7 +46,7 @@ def generate_data(n_samples, noise_std, linear_mode=False):
     })
     return df
 
-def create_binned_plots(df, linear_mode=False):
+def create_binned_plots(df, linear_mode=False, noise_mode=False):
     """
     Creates plots showing the binned probability of outcome=1 against each
     independent variable, adapted for the generation mode.
@@ -61,26 +54,37 @@ def create_binned_plots(df, linear_mode=False):
     print("\nGenerating plots...")
     fig, axes = plt.subplots(1, 2, figsize=(15, 6), constrained_layout=True)
 
+    # Determine the main title based on the mode
+    if noise_mode:
+        fig.suptitle('Binned Probability (Pure Noise Mode)', fontsize=16)
+    elif linear_mode:
+        fig.suptitle('Binned Probability (Linear Logit Mode)', fontsize=16)
+    else:
+        fig.suptitle('Binned Probability (Non-Linear Mode)', fontsize=16)
+
+
     # --- Subplot 1: variable 1 vs. P(1) ---
     df['v1_bin'] = pd.cut(df['variable_one'], bins=N_BINS)
     binned_prob_v1 = df.groupby('v1_bin', observed=True)['outcome'].mean()
     bin_centers_v1 = [b.mid for b in binned_prob_v1.index]
     axes[0].plot(bin_centers_v1, binned_prob_v1.values, 'o-', label='Binned Empirical P(1)')
 
-    if linear_mode:
-        fig.suptitle('Binned Probability (Linear Logit Mode)', fontsize=16)
+    if noise_mode:
+        axes[0].axhline(0.5, color='r', linestyle='--', label='Theoretical P(1) = 0.5\n(No relationship)')
+        axes[0].set_title('variable 1 vs. P(1) (Pure Noise)')
+        axes[0].set_xlabel('variable 1')
+    elif linear_mode:
         x_theory = np.linspace(df['variable_one'].min(), df['variable_one'].max(), 200)
         y_theory = 1 / (1 + np.exp(-x_theory))
         axes[0].plot(x_theory, y_theory, 'r--', label='Theoretical P(1) = sigmoid(var1)')
-        axes[0].set_xlabel('variable 1')
         axes[0].set_title('variable 1 vs. P(1)')
-    else:
-        fig.suptitle('Binned Probability (Non-Linear Mode)', fontsize=16)
+        axes[0].set_xlabel('variable 1')
+    else: # Non-linear mode
         x_theory = np.linspace(0, 2 * np.pi, 200)
         y_theory = 1 / (1 + np.exp(-np.sin(x_theory)))
         axes[0].plot(x_theory, y_theory, 'r--', label='Theoretical P(1) = sigmoid(sin(var1))')
-        axes[0].set_xlabel('variable 1 (angle in radians)')
         axes[0].set_title('variable 1 vs. P(1)')
+        axes[0].set_xlabel('variable 1 (angle in radians)')
 
     axes[0].set_ylabel('Proportion of "1"s in Bin')
     axes[0].grid(True, linestyle='--', alpha=0.6)
@@ -93,10 +97,11 @@ def create_binned_plots(df, linear_mode=False):
     bin_centers_v2 = [b.mid for b in binned_prob_v2.index]
     axes[1].plot(bin_centers_v2, binned_prob_v2.values, 'o-', label='Binned Empirical P(1)')
 
-    if linear_mode:
+    # In both linear and pure noise modes, var2 has no relationship to the outcome.
+    if linear_mode or noise_mode:
         axes[1].axhline(0.5, color='r', linestyle='--', label='Theoretical P(1) = 0.5\n(No relationship)')
         axes[1].set_title('variable 2 vs. P(1) (Pure Noise)')
-    else:
+    else: # Non-linear mode
         x_theory = np.linspace(df['variable_two'].min(), df['variable_two'].max(), 200)
         y_theory = 1 / (1 + np.exp(-x_theory))
         axes[1].plot(x_theory, y_theory, 'r--', label='Theoretical P(1) = sigmoid(var2)')
@@ -110,8 +115,6 @@ def create_binned_plots(df, linear_mode=False):
 
     plt.show()
 
-# --- 3. Main Execution Block ---
-# This is where the script's actions are orchestrated.
 
 def main():
     """
@@ -121,19 +124,33 @@ def main():
         description="Generate synthetic data for binary classification.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument(
+    # Group for mutually exclusive modes. Default is non-linear.
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         '--linear',
         action='store_true',
         help="""Run in 100%% linear mode:
   - 'variable_one' is linearly related to the log-odds of the outcome.
-  - 'variable_two' is pure noise with no relationship to the outcome.
-  - The sine wave is removed."""
+  - 'variable_two' is pure noise with no relationship to the outcome."""
+    )
+    mode_group.add_argument(
+        '--noise',
+        action='store_true',
+        help="""Run in 100%% pure noise mode:
+  - 'variable_one' has NO relationship to the outcome.
+  - 'variable_two' has NO relationship to the outcome.
+  - Both variables are pure noise (zero signal)."""
     )
     args = parser.parse_args()
 
     # --- Run the logic ---
-    # The 'linear_mode' flag is now correctly passed to the functions.
-    final_data = generate_data(N_SAMPLES, NOISE_STD_DEV, linear_mode=args.linear)
+    # The mode flags are now correctly passed to the functions.
+    final_data = generate_data(
+        N_SAMPLES,
+        NOISE_STD_DEV,
+        linear_mode=args.linear,
+        noise_mode=args.noise
+    )
 
     final_data.to_csv(OUTPUT_FILENAME, index=False)
 
@@ -143,11 +160,12 @@ def main():
     print("\nOutcome Distribution (should be ~50/50):")
     print(final_data['outcome'].value_counts(normalize=True))
 
-    create_binned_plots(final_data, linear_mode=args.linear)
+    create_binned_plots(
+        final_data.copy(), # Pass a copy to avoid SettingWithCopyWarning
+        linear_mode=args.linear,
+        noise_mode=args.noise
+    )
 
-# --- 4. Script Entry Point ---
-# This special block ensures that the main() function is called only when
-# the script is executed directly (e.g., `python your_script.py`).
-# It prevents the code from running if it's imported as a module elsewhere.
+
 if __name__ == "__main__":
     main()
