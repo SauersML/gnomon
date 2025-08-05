@@ -688,7 +688,7 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = f64::EPSILON.powf(2.0 / 3.0); // d_tol - matches mgcv's default
+    let eps = 1e-4; // A much more robust tolerance for partitioning
     // println!("DEBUG: eps = {}", eps);
     let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 

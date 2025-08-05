@@ -741,12 +741,17 @@ mod tests {
                     let num_pgs_basis_funcs = 6 + 3; // From pgs_basis_config
 
                     let mut interactions = HashMap::new();
-                    // Build interaction terms for each PGS basis function
-                    for i in 1..=num_pgs_basis_funcs {
-                        // Create flattened vector for interaction term
-                        let interaction_coeffs: Vec<f64> = (1..=pc1_dim).map(|j| (i * 10 + j) as f64).collect();
-                        interactions.insert(format!("f(PGS,PC1)_B{}", i), interaction_coeffs);
-                    }
+
+                    // Calculate the total number of interaction coefficients for the unified term
+                    let total_interaction_coeffs = num_pgs_basis_funcs * pc1_dim;
+
+                    // Create a single flattened vector of coefficients
+                    let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)
+                        .map(|i| i as f64 * 10.0) // Example values
+                        .collect();
+
+                    // Insert under the single, correct key
+                    interactions.insert("f(PGS,PC1)".to_string(), interaction_coeffs);
                     interactions
                 },
             },
@@ -829,26 +834,15 @@ mod tests {
             original_model.coefficients.interaction_effects.len()
         );
 
-        // Check for interaction effect f(PGS,PC1)_B1
-        let key_b1 = "f(PGS,PC1)_B1";
-        if let (Some(b1_loaded), Some(b1_orig)) = (
-            loaded_model.coefficients.interaction_effects.get(key_b1),
-            original_model.coefficients.interaction_effects.get(key_b1),
+        // Check for interaction effect f(PGS,PC1)
+        let key_interaction = "f(PGS,PC1)";
+        if let (Some(interaction_loaded), Some(interaction_orig)) = (
+            loaded_model.coefficients.interaction_effects.get(key_interaction),
+            original_model.coefficients.interaction_effects.get(key_interaction),
         ) {
-            assert_eq!(b1_loaded, b1_orig, "Mismatch in {}", key_b1);
+            assert_eq!(interaction_loaded, interaction_orig, "Mismatch in {}", key_interaction);
         } else {
-            panic!("Missing {} interaction effect", key_b1);
-        }
-
-        // Check for interaction effect f(PGS,PC1)_B2
-        let key_b2 = "f(PGS,PC1)_B2";
-        if let (Some(b2_loaded), Some(b2_orig)) = (
-            loaded_model.coefficients.interaction_effects.get(key_b2),
-            original_model.coefficients.interaction_effects.get(key_b2),
-        ) {
-            assert_eq!(b2_loaded, b2_orig, "Mismatch in {}", key_b2);
-        } else {
-            panic!("Missing {} interaction effect", key_b2);
+            panic!("Missing {} interaction effect", key_interaction);
         }
 
         // 5. Check lambdas

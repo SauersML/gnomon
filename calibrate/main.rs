@@ -872,7 +872,6 @@ mod tests {
         sex_effect: f64,
         age_effect: f64,
         age_pgs_interaction: f64,
-        random_seed: u64,
         threshold_effects: bool,
         ancestry_specific_effects: HashMap<String, f64>,
     }
@@ -929,7 +928,6 @@ mod tests {
             sex_effect: 0.5,           // Males have higher risk
             age_effect: 0.02,          // Risk increases with age
             age_pgs_interaction: 0.01, // PGS effect stronger in older individuals
-            random_seed: RANDOM_SEED,  // Store the seed for reproducibility
             threshold_effects: true,   // Enable threshold effects
             ancestry_specific_effects: {
                 let mut effects = HashMap::new();
@@ -944,7 +942,6 @@ mod tests {
         // Define 3 ancestry clusters with different PGS distributions and disease risks
         #[derive(Debug, Clone)]
         struct AncestryCluster {
-            name: String,
             pc1_mean: f64,
             pc1_std: f64,
             pc2_mean: f64,
@@ -954,7 +951,6 @@ mod tests {
             pgs_mean: f64,
             pgs_std: f64,
             proportion: f64,
-            baseline_risk_modifier: f64,
             // Parameters for generating admixed individuals
             admixture_proportion: f64, // What proportion are admixed
             admixture_target: usize,   // Which population to admix with
@@ -964,7 +960,6 @@ mod tests {
         let ancestry_clusters = vec![
             // Population 1 (reference population - European ancestry)
             AncestryCluster {
-                name: "European".to_string(),
                 pc1_mean: -0.8,
                 pc1_std: 0.3,
                 pc2_mean: 0.0,
@@ -974,14 +969,12 @@ mod tests {
                 pgs_mean: 0.0,
                 pgs_std: 0.8,
                 proportion: 0.5,
-                baseline_risk_modifier: 0.0, // Reference
                 admixture_proportion: 0.1,   // 10% admixed
                 admixture_target: 1,         // With population 2
                 admixture_degree: 0.3,       // 30% admixture
             },
             // Population 2 (African ancestry)
             AncestryCluster {
-                name: "African".to_string(),
                 pc1_mean: 0.85,
                 pc1_std: 0.35,
                 pc2_mean: 0.7,
@@ -991,14 +984,12 @@ mod tests {
                 pgs_mean: 0.2, // Higher mean PGS
                 pgs_std: 0.9,
                 proportion: 0.3,
-                baseline_risk_modifier: 0.3, // Higher baseline risk
                 admixture_proportion: 0.15,  // 15% admixed
                 admixture_target: 0,         // With population 1
                 admixture_degree: 0.25,      // 25% admixture
             },
             // Population 3 (East Asian ancestry)
             AncestryCluster {
-                name: "EastAsian".to_string(),
                 pc1_mean: 0.3,
                 pc1_std: 0.25,
                 pc2_mean: -0.9,
@@ -1008,7 +999,6 @@ mod tests {
                 pgs_mean: -0.3, // Lower mean PGS
                 pgs_std: 0.7,
                 proportion: 0.2,
-                baseline_risk_modifier: -0.2, // Lower baseline risk
                 admixture_proportion: 0.05,   // 5% admixed
                 admixture_target: 0,          // With population 1
                 admixture_degree: 0.2,        // 20% admixture
@@ -1494,13 +1484,9 @@ mod tests {
     struct ValidationMetrics {
         correlation: f64,
         r_squared: f64,
-        mae: f64,
         auc: f64,
         brier_score: f64,
         calibration_error: f64,
-        monotonicity_score: f64,
-        pc1_interaction_detected: bool,
-        pc2_interaction_detected: bool,
     }
 
     /// Validates that the model's internal coefficient structure reflects the ground truth.
@@ -2320,25 +2306,9 @@ mod tests {
         ValidationMetrics {
             correlation,
             r_squared,
-            mae,
             auc,
             brier_score,
             calibration_error: mean_calibration_error,
-            monotonicity_score: 9.0 - monotonic_violations as f64,
-            pc1_interaction_detected: test_pc_interaction(
-                1,
-                "PC1",
-                *true_effects.interaction_effects.get("PC1").unwrap_or(&0.0),
-                data,
-                predictions,
-            ),
-            pc2_interaction_detected: test_pc_interaction(
-                2,
-                "PC2",
-                *true_effects.interaction_effects.get("PC2").unwrap_or(&0.0),
-                data,
-                predictions,
-            ),
         }
     }
 }
