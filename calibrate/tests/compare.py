@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, brier_score_loss
-import argparse
 
 # --- 1. Define Paths and Parameters ---
 
@@ -17,7 +16,7 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 GNOMON_EXECUTABLE = WORKSPACE_ROOT / "target" / "release" / "gnomon"
 R_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.rds'
 RUST_MODEL_CONFIG_PATH = PROJECT_ROOT / 'model.toml'
-TRAINING_DATA_CSV = SCRIPT_DIR / 'synthetic_classification_data.csv' # KEY CHANGE
+TRAINING_DATA_CSV = SCRIPT_DIR / 'synthetic_classification_data.csv'
 
 # --- Temporary File Paths for Inference ---
 R_PREDICTIONS_CSV = SCRIPT_DIR / 'r_model_predictions.csv'
@@ -26,6 +25,7 @@ RUST_FORMATTED_TRAINING_DATA_TSV = SCRIPT_DIR / 'rust_formatted_training_data.ts
 
 # --- Plotting Parameters ---
 GRID_POINTS = 500
+PLOT_RANGE_EXPANSION_FACTOR = 1.2 # Expand plot boundaries by 20%
 
 # --- 2. Re-usable Metric Functions (Unchanged) ---
 
@@ -96,27 +96,39 @@ def plot_prediction_scatter(df):
     ax.plot([0, 1], [0, 1], 'r--', label='Perfect Agreement'); ax.set(xlabel="R / mgcv Predictions", ylabel="Rust / gnomon Predictions", title=f"Prediction Comparison (MAE = {mae:.6f})")
     ax.grid(True, linestyle='--'); ax.set_aspect('equal', 'box'); ax.legend(); plt.tight_layout(); plt.show()
 
-def plot_all_surfaces(empirical_df, linear_mode):
-    """Generates the 2x2 plot of model, true, and empirical surfaces."""
+def plot_all_surfaces(empirical_df):
+    """Generates the 2x2 plot of model, true, and empirical surfaces using a dynamic range from the data."""
     print("\n" + "#"*70); print("### PLOTTING LEARNED SURFACE COMPARISON ###"); print("#"*70)
 
-    # A. Create grid for querying models. This MUST be mode-aware.
-    if linear_mode:
-        print("\n--- Generating plot grid for LINEAR mode (-3 to 3) ---")
-        v1_range = np.linspace(-3, 3, GRID_POINTS)
-    else:
-        print("\n--- Generating plot grid for NON-LINEAR mode (0 to 2*pi) ---")
-        v1_range = np.linspace(0, 2 * np.pi, GRID_POINTS)
-    v2_range = np.linspace(-1.5, 1.5, GRID_POINTS)
+    # A. Dynamically calculate plot boundaries based on empirical data range
+    # This makes the plot robust to different datasets.
+    print(f"\n--- Dynamically calculating plot ranges from '{TRAINING_DATA_CSV.name}' ---")
+
+    def get_expanded_range(data_series, factor):
+        """Calculates an expanded range around the data's min and max."""
+        min_val, max_val = data_series.min(), data_series.max()
+        center = (min_val + max_val) / 2
+        half_width = (max_val - min_val) / 2
+        expanded_half_width = half_width * factor
+        return center - expanded_half_width, center + expanded_half_width
+
+    v1_min, v1_max = get_expanded_range(empirical_df['variable_one'], PLOT_RANGE_EXPANSION_FACTOR)
+    v2_min, v2_max = get_expanded_range(empirical_df['variable_two'], PLOT_RANGE_EXPANSION_FACTOR)
+    
+    print(f"  - variable_one plot range: [{v1_min:.2f}, {v1_max:.2f}]")
+    print(f"  - variable_two plot range: [{v2_min:.2f}, {v2_max:.2f}]")
+
+    # B. Create the grid for querying models using the new dynamic ranges
+    v1_range = np.linspace(v1_min, v1_max, GRID_POINTS)
+    v2_range = np.linspace(v2_min, v2_max, GRID_POINTS)
     v1_grid, v2_grid = np.meshgrid(v1_range, v2_range)
 
-    # B. Calculate the "True Optimal Surface" - THIS IS A FIXED BENCHMARK AS REQUESTED.
-    # It always uses the sine wave formula regardless of the mode.
-    print("--- Calculating the fixed 'True Optimal Surface' (sine wave benchmark) ---")
+    # C. Calculate the "True Optimal Surface" over the new dynamic grid
+    print("--- Calculating the fixed 'True Optimal Surface' (sine wave benchmark) on the dynamic grid ---")
     true_logit = np.sin(v1_grid) + v2_grid
     true_surface_prob = 1 / (1 + np.exp(-true_logit))
 
-    # C. Get predictions from the models over the generated grid
+    # D. Get predictions from the models over the generated grid
     grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
     grid_csv_path = SCRIPT_DIR / 'temp_grid_data.csv'; grid_df.to_csv(grid_csv_path, index=False)
     grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
@@ -129,7 +141,7 @@ def plot_all_surfaces(empirical_df, linear_mode):
     r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
     rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
 
-    # D. Create the 2x2 plot
+    # E. Create the 2x2 plot
     print("\n--- Generating 2x2 Surface Plot ---")
     fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True, sharex=True, sharey=True)
     fig.suptitle("Comparison of Learned Surfaces: P(outcome=1)", fontsize=20)
@@ -139,29 +151,24 @@ def plot_all_surfaces(empirical_df, linear_mode):
     axes[0, 1].contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap='viridis'); axes[0, 1].set_title("Rust / gnomon Model", fontsize=14)
     axes[1, 0].contourf(v1_grid, v2_grid, true_surface_prob, levels=levels, cmap='viridis'); axes[1, 0].set_title("True Optimal Surface (Fixed Benchmark)", fontsize=14); axes[1, 0].set_xlabel("variable_one"); axes[1, 0].set_ylabel("variable_two")
 
-    # The empirical surface plot now correctly uses the original training data
     cf = axes[1, 1].hexbin(x=empirical_df['variable_one'], y=empirical_df['variable_two'], C=empirical_df['outcome'], gridsize=40, cmap='viridis', reduce_C_function=np.mean, vmin=0, vmax=1)
     axes[1, 1].set_title(f"Empirical Surface (Hexbin on Training Data)", fontsize=14); axes[1, 1].set_xlabel("variable_one")
 
     fig.colorbar(cf, ax=axes, orientation='vertical', shrink=0.8, label='Predicted Probability')
     plt.show()
 
-    # E. Cleanup temporary files
+    # F. Cleanup temporary files
     grid_csv_path.unlink(); grid_tsv_path.unlink(); r_preds_path.unlink(); rust_preds_path.unlink();
 
 # --- 4. Main Execution Block ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze and compare trained R and Rust models.", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--linear', action='store_true', help="Specify if models were trained in linear mode.\nThis ensures plots are generated over the correct range.")
-    args = parser.parse_args()
-
     # --- 1. Check for required files ---
     required_files = [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TRAINING_DATA_CSV]
     for f in required_files:
         if not f.is_file():
             print(f"FATAL ERROR: Required file not found: {f}")
-            print("Please run the training script (e.g., 'python mgcv.py --linear') first.")
+            print("Please run the training script first.")
             sys.exit(1)
 
     # --- 2. Load the original training data ---
@@ -182,8 +189,7 @@ def main():
     plot_prediction_scatter(combined_df)
 
     # --- 6. Plot all surfaces ---
-    # The linear_mode flag is passed to ensure the correct plot ranges are used.
-    plot_all_surfaces(training_df, linear_mode=args.linear)
+    plot_all_surfaces(training_df)
 
     # --- 7. Final cleanup ---
     R_PREDICTIONS_CSV.unlink(); RUST_PREDICTIONS_CSV.unlink(); RUST_FORMATTED_TRAINING_DATA_TSV.unlink()
