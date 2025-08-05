@@ -490,6 +490,69 @@ mod tests {
             );
         }
     }
+    
+    #[test]
+    fn test_bspline_basis_sums_to_one_with_quantile_knots() {
+        // Create data with a non-uniform distribution to test quantile knots
+        // This creates a bimodal distribution with more points at the extremes
+        let mut data = Array::zeros(100);
+        for i in 0..100 {
+            let x = if i < 50 {
+                // Points clustered around 2.0
+                2.0 + (i as f64) / 25.0  // Range: 2.0 to 4.0
+            } else {
+                // Points clustered around 8.0
+                6.0 + (i as f64 - 50.0) / 25.0  // Range: 6.0 to 8.0
+            };
+            data[i] = x;
+        }
+        
+        // Use the quantile strategy by providing the data for quantiles
+        let (basis, knots) = create_bspline_basis(data.view(), Some(data.view()), (0.0, 10.0), 10, 3).unwrap();
+
+        // Verify knot placement - we should have more knots in the dense regions
+        // Output knot positions for inspection
+        println!("Quantile knots: {:?}", knots);
+        
+        // Check that knots follow the data distribution
+        // Count knots in each half of the range
+        let knots_in_first_half = knots.iter().filter(|&&k| k > 0.0 && k < 5.0).count();
+        let knots_in_second_half = knots.iter().filter(|&&k| k >= 5.0 && k < 10.0).count();
+        
+        // We expect a roughly balanced number of knots between the two clusters
+        println!("Knots in first half (0-5): {}", knots_in_first_half);
+        println!("Knots in second half (5-10): {}", knots_in_second_half);
+        
+        // Verify that the basis still sums to 1.0 for each data point
+        let sums = basis.sum_axis(Axis(1));
+
+        // Every row should sum to 1.0 (with floating point tolerance)
+        for &sum in sums.iter() {
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "Quantile basis did not sum to 1, got {}",
+                sum
+            );
+        }
+        
+        // Now verify for points outside the original data distribution
+        // Create a different set of evaluation points that are spread uniformly
+        let eval_points = Array::linspace(0.1, 9.9, 100);
+        
+        // Create basis using the previously generated knots
+        let (eval_basis, _) = create_bspline_basis_with_knots(eval_points.view(), knots.view(), 3).unwrap();
+        
+        // Verify sums for the evaluation points
+        let eval_sums = eval_basis.sum_axis(Axis(1));
+        
+        for &sum in eval_sums.iter() {
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "Basis at evaluation points did not sum to 1, got {}",
+                sum
+            );
+        }
+    }
 
     #[test]
     fn test_single_point_evaluation_degree_one() {
