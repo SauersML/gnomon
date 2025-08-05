@@ -3176,21 +3176,20 @@ pub mod internal {
             let pc_n_basis =
                 config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5
 
-            // After sum-to-zero constraint is applied
-            let pc_n_constrained_basis = pc_n_basis - 1; // 4
-            let pgs_n_main_before_constraint = pgs_n_basis - 1; // 5 (excluding intercept)
-            let pgs_n_main_after_constraint = pgs_n_main_before_constraint - 1; // 4 (after constraint)
+            // Correct calculation for constrained main effect coefficients
+            let pgs_main_coeffs = pgs_n_basis - 2; // 6 - 1 (intercept) - 1 (constraint) = 4
+            let pc_main_coeffs = pc_n_basis - 2; // 5 - 1 (intercept) - 1 (constraint) = 3
 
-            // For interactions we use all unconstrained PGS basis functions (except intercept)
-            // multiplied by the constrained PC basis functions.
-            // In the test: 5 PGS basis funcs (excl. intercept) × 4 constrained PC basis funcs = 20 interaction coeffs
-            let pgs_bases_for_interaction = pgs_n_main_before_constraint; // 5
-            let expected_interaction_coeffs = pgs_bases_for_interaction * pc_n_constrained_basis; // 5 * 4 = 20
+            // Interaction term is based on UNCONSTRAINED PGS main basis (pgs_n_basis - 1)
+            // and CONSTRAINED PC basis (pc_n_basis - 2)
+            let pgs_interaction_bases = pgs_n_basis - 1; // 5
+            let interaction_coeffs = pgs_interaction_bases * pc_main_coeffs; // 5 * 3 = 15
 
             let expected_coeffs = 1 // intercept
-            + pgs_n_main_after_constraint // main PGS (constrained) = 4
-            + pc_n_constrained_basis // main PC (constrained) = 4
-            + expected_interaction_coeffs; // interactions = 20
+                + pgs_main_coeffs         // 4
+                + pc_main_coeffs          // 3
+                + interaction_coeffs;     // 15
+                // Total = 1 + 4 + 3 + 15 = 23
 
             assert_eq!(
                 layout.total_coeffs, expected_coeffs,
@@ -3210,7 +3209,7 @@ pub mod internal {
                     // - Constrained PC basis directly
                     // So each interaction block should have the same number of columns as the constrained PC basis
 
-                    let expected_cols = pc_n_constrained_basis;
+                    let expected_cols = pc_main_coeffs;
                     let actual_cols = block.col_range.end - block.col_range.start;
 
                     assert_eq!(
@@ -3227,9 +3226,12 @@ pub mod internal {
             }
 
             // Penalty count check
-            // Each PC main effect has one penalty, and each PGS basis function creates one interaction penalty per PC
-            let expected_penalties = config.pc_names.len() // one penalty per PC main effect
-            + pgs_bases_for_interaction * config.pc_names.len(); // interaction penalties (multiplicative: PGS bases × PCs)
+            // The PGS main effect is unpenalized intentionally.
+            // There is one penalty for each PC main effect.
+            // For each tensor product interaction, there are two penalties:
+            // one for PGS direction and one for PC direction.
+            let expected_penalties = config.pc_names.len()      // Main effects for PCs
+                                   + 2 * config.pc_names.len(); // Interaction effects (2 per PC)
 
             assert_eq!(
                 s_list.len(),
