@@ -1337,14 +1337,19 @@ pub fn solve_penalized_least_squares(
     hessian_pivoted.slice_mut(s![..rank, ..rank]).assign(&hessian_rank_part);
 
     // 3. Create the full permutation matrix `P` that maps from the final pivoted basis
-    //    back to the original basis. P_ij = 1 if original column `i` is final column `j`.
+    //    back to the original basis. This logic correctly composes the two pivots.
     let mut perm_matrix = Array2::zeros((p, p));
-    for i in 0..p {
-        // The i-th column in the final basis (after both pivots) corresponds to the
-        // `initial_pivot[rank_pivot[i]]`-th column in the original basis.
-        // This applies to ALL columns, not just the first rank columns.
+    // The first `rank` columns of the final basis correspond to the identifiable parameters.
+    // Their original positions are found by composing the two pivots.
+    for i in 0..rank {
         let original_index = initial_pivot[rank_pivot[i]];
         perm_matrix[[original_index, i]] = 1.0;
+    }
+    // The remaining `p - rank` columns are the dropped (unidentifiable) parameters.
+    // Their original positions are found via `initial_pivot` and `drop_indices`.
+    for i in 0..n_drop {
+        let original_index = initial_pivot[drop_indices[i]];
+        perm_matrix[[original_index, rank + i]] = 1.0;
     }
 
     // 4. Un-pivot the Hessian to the original basis: H_orig = P * H_pivoted * P^T
