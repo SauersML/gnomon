@@ -1441,7 +1441,10 @@ pub fn solve_penalized_least_squares(
 }
 
 /// Calculate the Frobenius norm of a matrix (sum of squares of all elements)
-fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+fn frobenius_norm<S>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64 
+where
+    S: ndarray::Data<Elem = f64>,
+{
     matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
 }
 
