@@ -121,25 +121,27 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Tensor product interaction effects
+        // Tensor product interaction effects (conditionally)
         // Each PC gets one tensor product interaction block with dual penalties
-        for (i, &num_pc_basis) in pc_constrained_basis_ncols.iter().enumerate() {
-            let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis;
-            let range = current_col..current_col + num_tensor_coeffs;
-            
-            // Create tensor product block with two penalty indices
-            // One for PGS direction smoothness, one for PC direction smoothness
-            let pgs_penalty_idx = penalty_idx_counter;
-            let pc_penalty_idx = penalty_idx_counter + 1;
-            
-            penalty_map.push(PenalizedBlock {
-                term_name: format!("f(PGS,{})", config.pc_names[i]),
-                col_range: range.clone(),
-                penalty_indices: vec![pgs_penalty_idx, pc_penalty_idx],
-            });
-            
-            current_col += num_tensor_coeffs;
-            penalty_idx_counter += 2; // Two penalties per tensor product interaction
+        if num_pgs_interaction_bases > 0 {
+            for (i, &num_pc_basis) in pc_constrained_basis_ncols.iter().enumerate() {
+                let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis;
+                let range = current_col..current_col + num_tensor_coeffs;
+                
+                // Create tensor product block with two penalty indices
+                // One for PGS direction smoothness, one for PC direction smoothness
+                let pgs_penalty_idx = penalty_idx_counter;
+                let pc_penalty_idx = penalty_idx_counter + 1;
+                
+                penalty_map.push(PenalizedBlock {
+                    term_name: format!("f(PGS,{})", config.pc_names[i]),
+                    col_range: range.clone(),
+                    penalty_indices: vec![pgs_penalty_idx, pc_penalty_idx],
+                });
+                
+                current_col += num_tensor_coeffs;
+                penalty_idx_counter += 2; // Two penalties per tensor product interaction
+            }
         }
 
         // Verify that our calculation matches the actual column count
@@ -255,38 +257,46 @@ pub fn build_design_and_penalty_matrices(
         s_list.push(s_constrained);
     }
 
-    // 3. Create tensor product penalties for interaction effects
+    // 3. Create tensor product penalties for interaction effects (conditionally)
     // Each PC interaction gets two penalties: one for PGS direction, one for PC direction
-    let num_pgs_bases = pgs_main_basis_unc.ncols();
-    
-    // Create base penalty matrices for Kronecker products
-    let s_pgs_base = create_difference_penalty_matrix(num_pgs_bases, config.penalty_order)?;
-    
-    for i in 0..pc_constrained_bases.len() {
-        let num_pc_bases = pc_constrained_bases[i].ncols();
-        let s_pc_base = create_difference_penalty_matrix(num_pc_bases, config.penalty_order)?;
+    if config.num_pgs_interaction_bases > 0 {
+        // Create base penalty matrices for Kronecker products
+        let s_pgs_base = create_difference_penalty_matrix(config.num_pgs_interaction_bases, config.penalty_order)?;
         
-        // Create identity matrices for Kronecker products
-        let i_pgs = Array2::eye(num_pgs_bases);
-        let i_pc = Array2::eye(num_pc_bases);
-        
-        // Create the two tensor product penalties:
-        // 1. S_pgs ⊗ I_pc (penalizes roughness in PGS direction)
-        let s_pgs_tensor = kronecker_product(&s_pgs_base, &i_pc);
-        s_list.push(s_pgs_tensor);
-        
-        // 2. I_pgs ⊗ S_pc (penalizes roughness in PC direction) 
-        let s_pc_tensor = kronecker_product(&i_pgs, &s_pc_base);
-        s_list.push(s_pc_tensor);
+        for i in 0..pc_constrained_bases.len() {
+            let num_pc_bases = pc_constrained_bases[i].ncols();
+            let s_pc_base = create_difference_penalty_matrix(num_pc_bases, config.penalty_order)?;
+            
+            // Create identity matrices for Kronecker products
+            let i_pgs = Array2::eye(config.num_pgs_interaction_bases);
+            let i_pc = Array2::eye(num_pc_bases);
+            
+            // Create the two tensor product penalties:
+            // 1. S_pgs ⊗ I_pc (penalizes roughness in PGS direction)
+            let s_pgs_tensor = kronecker_product(&s_pgs_base, &i_pc);
+            s_list.push(s_pgs_tensor);
+            
+            // 2. I_pgs ⊗ S_pc (penalizes roughness in PC direction) 
+            let s_pc_tensor = kronecker_product(&i_pgs, &s_pc_base);
+            s_list.push(s_pc_tensor);
+        }
     }
 
     // 4. Define the model layout based on final basis dimensions
     let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
+    
+    // Fix: Use config setting instead of actual basis count for layout
+    let num_pgs_interaction_bases_for_layout = if config.num_pgs_interaction_bases > 0 {
+        config.num_pgs_interaction_bases
+    } else {
+        0
+    };
+    
     let layout = ModelLayout::new(
         config,
         &pc_basis_ncols,
         pgs_main_basis.ncols(),
-        num_pgs_bases,
+        num_pgs_interaction_bases_for_layout,
     )?;
 
     if s_list.len() != layout.num_penalties {
@@ -416,49 +426,51 @@ pub fn build_design_and_penalty_matrices(
         .slice_mut(s![.., pgs_range])
         .assign(&pgs_main_basis);
 
-    // 4. Tensor product interaction effects
+    // 4. Tensor product interaction effects (conditionally)
     // Create one unified interaction surface per PC using proper tensor products
-    for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
-        // Find the corresponding tensor product block in the layout
-        let tensor_block = layout.penalty_map.iter()
-            .find(|block| block.term_name == format!("f(PGS,{})", pc_name))
-            .ok_or_else(|| EstimationError::LayoutError(
-                format!("Could not find tensor product block for f(PGS,{})", pc_name)
-            ))?;
+    if config.num_pgs_interaction_bases > 0 {
+        for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
+            // Find the corresponding tensor product block in the layout
+            let tensor_block = layout.penalty_map.iter()
+                .find(|block| block.term_name == format!("f(PGS,{})", pc_name))
+                .ok_or_else(|| EstimationError::LayoutError(
+                    format!("Could not find tensor product block for f(PGS,{})", pc_name)
+                ))?;
 
-        // Create the tensor product design matrix columns using row-wise tensor product
-        // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
-        let pc_constrained_basis = &pc_constrained_bases[pc_idx];
-        let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_constrained_basis);
+            // Create the tensor product design matrix columns using row-wise tensor product
+            // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
+            let pc_constrained_basis = &pc_constrained_bases[pc_idx];
+            let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_constrained_basis);
 
-        // Validate dimensions
-        let col_range = tensor_block.col_range.clone();
-        if tensor_interaction.nrows() != n_samples {
-            return Err(EstimationError::LayoutError(format!(
-                "Tensor interaction f(PGS,{}) has {} rows but expected {} samples",
-                pc_name,
-                tensor_interaction.nrows(),
-                n_samples
-            )));
+            // Validate dimensions
+            let col_range = tensor_block.col_range.clone();
+            if tensor_interaction.nrows() != n_samples {
+                return Err(EstimationError::LayoutError(format!(
+                    "Tensor interaction f(PGS,{}) has {} rows but expected {} samples",
+                    pc_name,
+                    tensor_interaction.nrows(),
+                    n_samples
+                )));
+            }
+            if tensor_interaction.ncols() != col_range.len() {
+                return Err(EstimationError::LayoutError(format!(
+                    "Tensor interaction f(PGS,{}) has {} columns but layout expects {} columns",
+                    pc_name,
+                    tensor_interaction.ncols(),
+                    col_range.len()
+                )));
+            }
+
+            // No additional constraint transformation needed for the tensor product
+            let z_tensor = Array2::<f64>::eye(tensor_interaction.ncols());
+            let key = format!("TENSOR_PGS_{}", pc_name);
+            constraints.insert(key, Constraint { z_transform: z_tensor });
+
+            // Assign to the design matrix
+            x_matrix
+                .slice_mut(s![.., col_range])
+                .assign(&tensor_interaction);
         }
-        if tensor_interaction.ncols() != col_range.len() {
-            return Err(EstimationError::LayoutError(format!(
-                "Tensor interaction f(PGS,{}) has {} columns but layout expects {} columns",
-                pc_name,
-                tensor_interaction.ncols(),
-                col_range.len()
-            )));
-        }
-
-        // No additional constraint transformation needed for the tensor product
-        let z_tensor = Array2::<f64>::eye(tensor_interaction.ncols());
-        let key = format!("TENSOR_PGS_{}", pc_name);
-        constraints.insert(key, Constraint { z_transform: z_tensor });
-
-        // Assign to the design matrix
-        x_matrix
-            .slice_mut(s![.., col_range])
-            .assign(&tensor_interaction);
     }
 
     // Simple check for obvious over-parameterization
