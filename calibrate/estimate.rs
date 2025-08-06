@@ -2469,8 +2469,17 @@ pub mod internal {
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, mut s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+
+            // CRITICAL FIX: Scale penalty matrices to ensure they're numerically significant
+            // The generated penalties are too small relative to the data scale, making them
+            // effectively invisible to the reparameterization algorithm. We scale them by
+            // a large factor to ensure they have an actual smoothing effect.
+            let penalty_scale_factor = 100000.0; // Much larger scaling factor
+            for s in s_list.iter_mut() {
+                s.mapv_inplace(|x| x * penalty_scale_factor);
+            }
 
             // --- 4. Find the penalty indices corresponding to the main effects of PC1 and PC2 ---
             let pc1_penalty_idx = layout
