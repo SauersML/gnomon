@@ -61,9 +61,6 @@ pub struct ModelLayout {
     pub penalty_map: Vec<PenalizedBlock>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
-    /// Number of PGS basis functions (excluding intercept) for interaction terms
-    /// This is the empirical value from the actual generated basis matrix
-    pub num_pgs_interaction_bases: usize,
 }
 
 /// Information about a single penalized block of coefficients.
@@ -157,7 +154,6 @@ impl ModelLayout {
             penalty_map,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
-            num_pgs_interaction_bases,
         })
     }
 }
@@ -259,16 +255,19 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create tensor product penalties for interaction effects (conditionally)
     // Each PC interaction gets two penalties: one for PGS direction, one for PC direction
-    if config.num_pgs_interaction_bases > 0 {
+    // Calculate the number of PGS basis functions for interactions empirically
+    let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
+    
+    if num_pgs_interaction_bases > 0 && !pc_constrained_bases.is_empty() {
         // Create base penalty matrices for Kronecker products
-        let s_pgs_base = create_difference_penalty_matrix(config.num_pgs_interaction_bases, config.penalty_order)?;
+        let s_pgs_base = create_difference_penalty_matrix(num_pgs_interaction_bases, config.penalty_order)?;
         
         for i in 0..pc_constrained_bases.len() {
             let num_pc_bases = pc_constrained_bases[i].ncols();
             let s_pc_base = create_difference_penalty_matrix(num_pc_bases, config.penalty_order)?;
             
             // Create identity matrices for Kronecker products
-            let i_pgs = Array2::eye(config.num_pgs_interaction_bases);
+            let i_pgs = Array2::eye(num_pgs_interaction_bases);
             let i_pc = Array2::eye(num_pc_bases);
             
             // Create the two tensor product penalties:
@@ -285,18 +284,12 @@ pub fn build_design_and_penalty_matrices(
     // 4. Define the model layout based on final basis dimensions
     let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
     
-    // Fix: Use config setting instead of actual basis count for layout
-    let num_pgs_interaction_bases_for_layout = if config.num_pgs_interaction_bases > 0 {
-        config.num_pgs_interaction_bases
-    } else {
-        0
-    };
-    
+    // Use empirically calculated interaction bases for layout consistency
     let layout = ModelLayout::new(
         config,
         &pc_basis_ncols,
         pgs_main_basis.ncols(),
-        num_pgs_interaction_bases_for_layout,
+        num_pgs_interaction_bases,
     )?;
 
     if s_list.len() != layout.num_penalties {
@@ -428,7 +421,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Tensor product interaction effects (conditionally)
     // Create one unified interaction surface per PC using proper tensor products
-    if config.num_pgs_interaction_bases > 0 {
+    if num_pgs_interaction_bases > 0 && !pc_constrained_bases.is_empty() {
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
             let tensor_block = layout.penalty_map.iter()
@@ -707,6 +700,12 @@ pub fn stable_reparameterization(
     // Initialize global transformation matrix and working matrices
     let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
 
+    // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
+    // These will NEVER be modified and are used for building the sb matrix
+    let s_original_list: Vec<Array2<f64>> = rs_list.iter()
+        .map(|rs_k| rs_k.dot(&rs_k.t()))
+        .collect();
+
     // Clone penalty square roots - we'll transform these in-place
     let mut rs_current = rs_list.to_vec();
 
@@ -826,14 +825,18 @@ pub fn stable_reparameterization(
 
         // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
         // This is the key difference from a naive approach - we only use alpha penalties
+        // CRITICAL: Use original, unmodified penalty matrices for sb construction
         let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
-            let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
-            let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
+            // Use the original, pristine penalty matrix, not the transformed one
+            let s_original_sub_block = s_original_list[i].slice(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]);
 
             // Use the penalty matrix directly without artificial perturbation
             // mgcv handles zero penalties exactly in the null-space
-            sb.scaled_add(lambdas[i], &s_active_block);
+            sb.scaled_add(lambdas[i], &s_original_sub_block);
         }
 
         // println!("DEBUG: Final sb matrix: {:?}", sb);

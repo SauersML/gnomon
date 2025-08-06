@@ -250,7 +250,6 @@ pub fn train_model(
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
-    config_with_constraints.num_pgs_interaction_bases = layout.num_pgs_interaction_bases;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -1623,7 +1622,6 @@ pub mod internal {
                 pgs_range: (-3.0, 3.0),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             (data, config)
@@ -1650,7 +1648,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0, // Will be set during training
             }
         }
 
@@ -2056,7 +2053,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             // Train the model
@@ -2465,7 +2461,6 @@ pub mod internal {
                 pgs_range: (-2.5, 2.5),
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
-                num_pgs_interaction_bases: 0, // Important: no interactions for stability
             };
 
             // --- 3. Build Model Structure ---
@@ -2758,7 +2753,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             // Test with extreme lambda values that might cause issues
@@ -2877,7 +2871,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -3086,7 +3079,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             println!(
@@ -3178,7 +3170,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-                num_pgs_interaction_bases: 0,
             };
 
             let (x, s_list, layout, _, _) =
@@ -3356,7 +3347,6 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
-                num_pgs_interaction_bases: 0,
             };
 
             // Build design and penalty matrices
@@ -4103,7 +4093,6 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pc_ranges: vec![],
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
-        num_pgs_interaction_bases: 0,
     };
 
     // 3. Train the model and expect an error
@@ -4172,7 +4161,6 @@ fn test_indefinite_hessian_detection_and_retreat() {
         pc_names: vec!["PC1".to_string()],
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
-        num_pgs_interaction_bases: 0,
     };
 
     // Try to build the matrices - if this fails, the test is still valid

@@ -1687,7 +1687,6 @@ mod tests {
             pc_names: vec![],
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            num_pgs_interaction_bases: 0,
         };
 
         // --- 3. Run the Fit ---
@@ -1852,7 +1851,6 @@ mod tests {
             penalty_map: vec![],
             total_coeffs: 2,
             num_penalties: 2,
-            num_pgs_interaction_bases: 0,
         };
 
         // Test with two different lambda values which will change the dominant penalty
@@ -1956,7 +1954,6 @@ mod tests {
             penalty_map: vec![],
             total_coeffs: 2,
             num_penalties: 2,
-            num_pgs_interaction_bases: 0,
         };
 
         // Create a simple config with values known to lead to convergence
@@ -1977,7 +1974,6 @@ mod tests {
             pc_names: vec![],
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            num_pgs_interaction_bases: 0,
         };
 
         // Test with lambda values that match the working test pattern
@@ -2095,7 +2091,6 @@ mod tests {
             pc_names: vec![],
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            num_pgs_interaction_bases: 0,
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
@@ -2218,7 +2213,6 @@ mod tests {
             pc_names: vec![],
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            num_pgs_interaction_bases: 0,
         };
 
         // === Set up inputs using helper ===
