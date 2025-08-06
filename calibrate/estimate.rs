@@ -2475,8 +2475,9 @@ pub mod internal {
             // CRITICAL FIX: Scale penalty matrices to ensure they're numerically significant
             // The generated penalties are too small relative to the data scale, making them
             // effectively invisible to the reparameterization algorithm. We scale them by
-            // a large factor to ensure they have an actual smoothing effect.
-            let penalty_scale_factor = 100000.0; // Much larger scaling factor
+            // a massive factor to ensure they have an actual smoothing effect that's
+            // measurable in the final cost function.
+            let penalty_scale_factor = 1_000_000_000.0; // Extreme scaling factor to overcome numerical issues
             for s in s_list.iter_mut() {
                 s.mapv_inplace(|x| x * penalty_scale_factor);
             }
@@ -2565,16 +2566,22 @@ pub mod internal {
             // --- 7. Key assertion: Penalizing noise (PC2) should reduce cost more than penalizing signal (PC1) ---
             // If either cost is MAX, we can't make a valid comparison
             if pc1_heavy_cost != f64::MAX && pc2_heavy_cost != f64::MAX {
-                // The cost should be lower (better) when we penalize the noise term heavily
+                let cost_difference = pc1_heavy_cost - pc2_heavy_cost;
+                let min_meaningful_difference = 1e-6; // Minimum difference to be considered significant
+                
+                // The cost should be meaningfully lower when we penalize the noise term heavily
                 assert!(
-                    pc2_heavy_cost < pc1_heavy_cost,
-                    "Penalizing the noise term (PC2) should reduce cost more than penalizing the signal term (PC1).\nPC1 heavy cost: {:.6}, PC2 heavy cost: {:.6}",
+                    cost_difference > min_meaningful_difference,
+                    "Penalizing the noise term (PC2) should reduce cost meaningfully more than penalizing the signal term (PC1).\nPC1 heavy cost: {:.12}, PC2 heavy cost: {:.12}, difference: {:.12} (required: > {:.12})",
                     pc1_heavy_cost,
-                    pc2_heavy_cost
+                    pc2_heavy_cost,
+                    cost_difference,
+                    min_meaningful_difference
                 );
 
                 println!(
-                    "✓ Test passed! Penalizing noise (PC2) reduces cost more than penalizing signal (PC1)"
+                    "✓ Test passed! Penalizing noise (PC2) reduces cost by {:.6} vs penalizing signal (PC1)",
+                    cost_difference
                 );
             } else {
                 // At least one cost computation failed - test is inconclusive
