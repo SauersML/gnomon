@@ -250,8 +250,8 @@ mod internal {
 
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
-        // For interactions, use the constrained pgs_main_basis directly
-        // Cannot reconstruct "full" basis due to dimensional reduction from constraints
+        // For interactions, use the UNconstrained pgs_main_basis (pgs_main_basis_unc) for the tensor product
+        // This matches the training code behavior in construction.rs
 
         // This closure was not used - removed
         // Previously defined a helper to fetch Z transform from model
@@ -888,21 +888,16 @@ pub fn map_coefficients(
     for block in &layout.penalty_map {
         let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
 
-        // This logic is now driven entirely by the term_name established in the layout
-        match block.term_name.as_str() {
-            name if name.starts_with("f(PC") => {
-                let pc_name = name.replace("f(", "").replace(")", "");
+        use crate::calibrate::construction::TermType;
+        // This logic is now driven entirely by the term_type established in the layout
+        match block.term_type {
+            TermType::PcMainEffect => {
+                let pc_name = block.term_name.trim_start_matches("f(").trim_end_matches(')').to_string();
                 pcs.insert(pc_name, coeffs);
             }
-            name if name.starts_with("f(PGS,") => {
+            TermType::Interaction => {
                 // Tensor product interaction: f(PGS,PC1) -> direct storage
-                interaction_effects.insert(name.to_string(), coeffs);
-            }
-            _ => {
-                return Err(EstimationError::LayoutError(format!(
-                    "Unknown term name in layout during coefficient mapping: {}",
-                    block.term_name
-                )));
+                interaction_effects.insert(block.term_name.to_string(), coeffs);
             }
         }
     }

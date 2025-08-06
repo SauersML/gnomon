@@ -50,6 +50,9 @@ pub enum BasisError {
         provided: usize,
     },
 
+    #[error("Cannot apply sum-to-zero constraint: requires at least 2 basis functions, but only {found} were provided.")]
+    InsufficientColumnsForConstraint { found: usize },
+
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] ndarray_linalg::error::LinalgError),
 }
@@ -204,7 +207,7 @@ pub fn apply_sum_to_zero_constraint(
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let k = basis_matrix.ncols();
     if k < 2 {
-        return Err(BasisError::InvalidDegree(k)); // cannot constrain a single column
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k }); // cannot constrain a single column
     }
 
     // --- build a full-rank null-space basis for 1ᵀ --------------------------

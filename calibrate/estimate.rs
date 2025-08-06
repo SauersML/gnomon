@@ -317,10 +317,11 @@ fn log_layout_info(layout: &ModelLayout) {
     let mut pc_main_count = 0;
     let mut interaction_count = 0;
     for block in &layout.penalty_map {
-        if block.term_name.starts_with("f(PC") {
-            pc_main_count += 1;
-        } else if block.term_name.starts_with("f(PGS_B") {
-            interaction_count += 1;
+        // This import might be needed if TermType is not in scope.
+        use crate::calibrate::construction::TermType;
+        match block.term_type {
+            TermType::PcMainEffect => pc_main_count += 1,
+            TermType::Interaction => interaction_count += 1,
         }
     }
     log::info!("  - PC Main Effects: {pc_main_count} terms.");
@@ -2055,6 +2056,10 @@ pub mod internal {
                 knot_vectors: std::collections::HashMap::new(),
             };
 
+            // Build the layout to programmatically find penalty indices
+            let (_, _, layout, _, _) =
+                build_design_and_penalty_matrices(&data, &config).expect("Failed to build layout for test");
+
             // Train the model
             let trained_model = train_model(&data, &config).expect("Model training should succeed");
 
@@ -2065,11 +2070,21 @@ pub mod internal {
                 trained_model.lambdas.len() >= 2,
                 "Model should have at least 2 smoothing parameters (for PC1 and PC2)"
             );
+            
+            // Programmatically find the penalty indices for PC1 (signal) and PC2 (noise)
+            let find_penalty_index = |term_name: &str| -> usize {
+                layout.penalty_map
+                    .iter()
+                    .find(|block| block.term_name == term_name)
+                    .expect(&format!("Could not find block for term '{}'", term_name))
+                    .penalty_indices[0] // Main effects have a single penalty
+            };
 
-            // The first penalty should be for PC1, second for PC2
-            // (This depends on the internal ordering - we'll make this robust)
-            let pc1_lambda = trained_model.lambdas[0];
-            let pc2_lambda = trained_model.lambdas[1];
+            let pc1_penalty_idx = find_penalty_index("f(PC1)");
+            let pc2_penalty_idx = find_penalty_index("f(PC2)");
+
+            let pc1_lambda = trained_model.lambdas[pc1_penalty_idx];
+            let pc2_lambda = trained_model.lambdas[pc2_penalty_idx];
 
             // Key assertion: The noise term (PC2) should be much more heavily penalized
             // than the signal term (PC1)
@@ -2105,11 +2120,12 @@ pub mod internal {
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
 
-            // Define a SIMPLE, ADDITIVE function (no interactions)
+            // Define an ADDITIVE + INTERACTION function to match the model
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = (pgs_val * 0.8).sin() * 0.5; // sin effect for PGS
-                let pc_effect = 0.4 * pc_val.powi(2); // quadratic effect for PC
-                0.2 + pgs_effect + pc_effect // additive combination
+                let pgs_effect = (pgs_val * 0.8).sin() * 0.5;   // sin effect for PGS
+                let pc_effect = 0.4 * pc_val.powi(2);          // quadratic effect for PC
+                let interaction_effect = 0.3 * pgs_val * pc_val; // NEW: Interaction term
+                0.2 + pgs_effect + pc_effect + interaction_effect // Additive + Interaction
             };
 
             // Generate outcomes
@@ -2200,13 +2216,13 @@ pub mod internal {
             // Assert high correlation for both components
             assert!(
                 pgs_correlation > 0.85,
-                "PGS main effect should be well recovered. Correlation: {:.4}",
+                "PGS partial dependence shape should be well recovered. Correlation: {:.4}",
                 pgs_correlation
             );
 
             assert!(
                 pc_correlation > 0.90,
-                "PC main effect should be well recovered. Correlation: {:.4}",
+                "PC partial dependence shape should be well recovered. Correlation: {:.4}",
                 pc_correlation
             );
 

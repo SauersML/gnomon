@@ -55,8 +55,6 @@ pub enum DataError {
     PolarsError(#[from] PolarsError),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("TSV parsing error: {0}")]
-    CsvError(#[from] csv::Error),
     #[error(
         "The required column '{0}' was not found in the input file. Please check spelling and case."
     )]

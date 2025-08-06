@@ -63,6 +63,13 @@ pub struct ModelLayout {
     pub num_penalties: usize,
 }
 
+/// The semantic type of a penalized term in the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TermType {
+    PcMainEffect,
+    Interaction,
+}
+
 /// Information about a single penalized block of coefficients.
 /// For tensor product interactions, a single block may have multiple penalties.
 #[derive(Clone, Debug)]
@@ -73,6 +80,8 @@ pub struct PenalizedBlock {
     /// For main effects: single element vector.
     /// For tensor product interactions: multiple elements (one per dimension).
     pub penalty_indices: Vec<usize>,
+    /// The semantic type of this term.
+    pub term_type: TermType,
 }
 
 impl ModelLayout {
@@ -108,6 +117,7 @@ impl ModelLayout {
                 term_name: format!("f({})", config.pc_names[i]),
                 col_range: range.clone(),
                 penalty_indices: vec![penalty_idx_counter],
+                term_type: TermType::PcMainEffect,
             });
             current_col += num_basis;
             penalty_idx_counter += 1;
@@ -134,6 +144,7 @@ impl ModelLayout {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
                     penalty_indices: vec![pgs_penalty_idx, pc_penalty_idx],
+                    term_type: TermType::Interaction,
                 });
                 
                 current_col += num_tensor_coeffs;
@@ -454,10 +465,8 @@ pub fn build_design_and_penalty_matrices(
                 )));
             }
 
-            // No additional constraint transformation needed for the tensor product
-            let z_tensor = Array2::<f64>::eye(tensor_interaction.ncols());
-            let key = format!("TENSOR_PGS_{}", pc_name);
-            constraints.insert(key, Constraint { z_transform: z_tensor });
+            // No constraint transformation needed for the tensor product
+            // (The constraint for tensor products was unused in prediction code)
 
             // Assign to the design matrix
             x_matrix
@@ -477,10 +486,13 @@ pub fn build_design_and_penalty_matrices(
         let mut pc_main_coeffs = 0;
         let mut interaction_coeffs = 0;
         for block in &layout.penalty_map {
-            if block.term_name.starts_with("f(PC") {
-                pc_main_coeffs += block.col_range.len();
-            } else if block.term_name.starts_with("f(PGS_B") {
-                interaction_coeffs += block.col_range.len();
+            match block.term_type {
+                TermType::PcMainEffect => {
+                    pc_main_coeffs += block.col_range.len();
+                }
+                TermType::Interaction => {
+                    interaction_coeffs += block.col_range.len();
+                }
             }
         }
 
