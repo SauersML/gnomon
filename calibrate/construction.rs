@@ -846,32 +846,19 @@ pub fn stable_reparameterization(
         // println!("DEBUG: Eigenvalues: {:?}", eigenvalues);
         // println!("DEBUG: Eigenvectors: {:?}", u);
 
-        // This rank determination logic must match mgcv's get_stableS exactly
-
-        // This rank determination logic must match mgcv's get_stableS exactly
-        // mgcv uses: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
-        // This means compare to the SMALLEST eigenvalue, not the largest
-
-        // Sort eigenvalues and get indices in ascending order (mgcv convention)
-        let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
-        sorted_indices.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
-
-        let q = eigenvalues.len();
-        let largest_eigenval = eigenvalues[sorted_indices[q - 1]]; // Last element is largest when sorted ascending
-        let rank_tolerance = largest_eigenval * r_tol;
-
-        // mgcv logic: r=1; while(r<Q && ev[Q-r-1] > ev[Q-1] * r_tol) r++;
-        // where ev[Q-1] is the largest eigenvalue (eigenvalues are in ascending order)
-        let mut r = 1;
-        while r < q && eigenvalues[sorted_indices[q - r - 1]] > rank_tolerance {
-            r += 1;
-        }
+        // Determine rank 'r' of the dominant sub-problem. This is done by counting
+        // the number of eigenvalues that are greater than a small tolerance
+        // relative to the largest eigenvalue. This correctly implements the logic
+        // from mgcv's C function `get_stableS`.
+        let max_eigenval = eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let rank_tolerance = max_eigenval * r_tol;
+        let r = eigenvalues.iter().filter(|&&ev| ev > rank_tolerance).count();
 
         log::debug!(
             "Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
             r,
             eigenvalues.len(),
-            largest_eigenval,
+            max_eigenval,
             rank_tolerance
         );
 
@@ -898,59 +885,37 @@ pub fn stable_reparameterization(
         qf.slice_mut(s![.., k_offset..k_offset + q_current])
             .assign(&qf_new);
 
-        // Step 6: Transform penalty square roots for both alpha and gamma_prime sets
-        // This is the critical in-place transformation following mgcv's get_stableS
-        for &i in gamma.iter() {
-            // Skip if penalty has no columns (zero penalty)
-            if rs_current[i].ncols() == 0 {
-                continue;
-            }
+        // Step 6: Transform ALL active penalty roots by the full eigenvector matrix U.
+        // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.
+        for &i in &gamma {
+            if rs_current[i].ncols() == 0 { continue; }
 
-            // Extract active rows
-            let c_matrix = rs_current[i]
-                .slice(s![k_offset..k_offset + q_current, ..])
-                .to_owned();
+            let c_matrix = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]).to_owned();
+            let b_matrix = u.t().dot(&c_matrix);
+            
+            // Assign the fully transformed block back into the main rs_current matrix.
+            rs_current[i]
+                .slice_mut(s![k_offset..k_offset + q_current, ..])
+                .assign(&b_matrix);
+        }
 
-            // Transform using FULL eigenvector matrix, then partition
-            let b_matrix = u.t().dot(&c_matrix); // q_current x rank_i
+        // Step 7: Partition the newly transformed space. This is the core of the algorithm.
+        // We zero out the parts of the penalty matrices that are irrelevant for subsequent,
+        // smaller sub-problems.
+        for &i in &gamma {
+            if rs_current[i].ncols() == 0 { continue; }
 
             if alpha.contains(&i) {
-                // Dominant penalties: keep only the rows corresponding to largest r eigenvalues
-                // For ascending order, these are the last r rows
-                let start_idx = q - r;
-                for (idx, &sorted_idx) in sorted_indices.iter().enumerate() {
-                    if idx >= start_idx {
-                        // This eigenvector is in the dominant set
-                        let row_offset = idx - start_idx;
-                        rs_current[i]
-                            .slice_mut(s![k_offset + row_offset, ..])
-                            .assign(&b_matrix.row(sorted_idx));
-                    }
-                }
-
-                // Zero out the null space part
+                // If a penalty was DOMINANT, its effect is now entirely within the range space
+                // (the first `r` dimensions of the new basis). Its projection onto the
+                // null space (the remaining `q_current - r` dimensions) must be zeroed out.
                 if r < q_current {
-                    rs_current[i]
-                        .slice_mut(s![k_offset + r..k_offset + q_current, ..])
-                        .fill(0.0);
+                    rs_current[i].slice_mut(s![k_offset + r.., ..]).fill(0.0);
                 }
-            } else if gamma_prime.contains(&i) {
-                // Sub-dominant penalties: keep only the rows corresponding to smallest (q-r) eigenvalues
-                // Zero out the range space part
-                rs_current[i]
-                    .slice_mut(s![k_offset..k_offset + r, ..])
-                    .fill(0.0);
-
-                // Copy rows corresponding to smallest eigenvalues
-                for (idx, &sorted_idx) in sorted_indices.iter().enumerate() {
-                    if idx < q - r {
-                        // This eigenvector is in the null space
-                        let row_offset = r + idx;
-                        rs_current[i]
-                            .slice_mut(s![k_offset + row_offset, ..])
-                            .assign(&b_matrix.row(sorted_idx));
-                    }
-                }
+            } else { // This penalty was SUB-DOMINANT (in gamma_prime).
+                // Its effect is now entirely within the null space. Its projection onto
+                // the range space must be zeroed out.
+                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..]).fill(0.0);
             }
         }
 
