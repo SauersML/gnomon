@@ -1169,6 +1169,19 @@ pub mod internal {
                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
                     let solver = RobustSolver::new(&hessian)?; // Use stabilized transformed Hessian
 
+                    // Pre-compute transformed eta and working variables from P-IRLS state
+                    let eta = x_transformed.dot(beta_transformed);
+                    let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
+                        self.y,
+                        &eta,
+                        self.config.link_function,
+                    );
+
+                    // Calculate the gradient of the unpenalized deviance w.r.t. beta
+                    // For logit link: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X'(y - μ)
+                    let residuals = &self.y() - &mu;
+                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&residuals);
+
                     // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
                     // Use transformed design matrix (same basis as Hessian)
                     let rows: Vec<_> = x_transformed.axis_iter(Axis(0)).collect();
@@ -1184,13 +1197,6 @@ pub mod internal {
                     let hat_diag = Array1::from_vec(hat_diag_par);
 
                     // 2. Compute dW/dη, which depends on the link function.
-                    // Use transformed design matrix and beta (both in transformed basis)
-                    let eta = x_transformed.dot(beta_transformed);
-                    let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
-                        self.y,
-                        &eta,
-                        self.config.link_function,
-                    );
                     let dw_deta = match self.config.link_function {
                         LinkFunction::Logit => &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu),
                         // Fallback for Identity, though this branch shouldn't be taken for Identity link
@@ -1199,24 +1205,47 @@ pub mod internal {
 
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
-                        // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         // Use transformed penalty matrix (consistent with other calculations)
                         let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
                         let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
+                        
+                        // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         let dbeta_drho_k_transformed =
                             -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
+                        // ---
+                        // Component 1: Derivative of the Penalized Deviance (MISSING TERM!)
+                        // This corresponds to `oo$D1/(2*scale)` in mgcv
+                        // ---
+                        
+                        // Calculate d(Deviance)/dρ_k using the chain rule
+                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
+                        
+                        // Calculate d(β'Sβ)/dρ_k - both indirect and direct parts
+                        // Indirect part: (∂(β'Sβ)/∂β) * (∂β/∂ρ_k) = (2Sβ)' * (∂β/∂ρ_k)
+                        let s_beta_transformed = reparam_result.s_transformed.dot(beta_transformed);
+                        let d_penalty_indirect = 2.0 * s_beta_transformed.dot(&dbeta_drho_k_transformed);
+                        // Direct part: β'(∂S/∂ρ_k)β = λ_k * β'S_kβ
+                        let d_penalty_direct = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
+                        let d_penalty_d_rho_k = d_penalty_indirect + d_penalty_direct;
+
+                        // Total derivative of the penalized deviance
+                        let d_dp_d_rho_k = d_deviance_d_rho_k + d_penalty_d_rho_k;
+                        let penalized_deviance_grad_term = 0.5 * d_dp_d_rho_k;
+
+                        // ---
+                        // Component 2: Derivative of log|H| (existing code)
+                        // This corresponds to `oo$trA1/2` in mgcv
+                        // ---
+
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
-                        // Use transformed design matrix
                         let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
 
                         // c. Calculate the weight derivative term: tr(H⁻¹ Xᵀ (∂W/∂ρₖ) X)
-                        //    = sum(diag(X H⁻¹ Xᵀ) * diag(∂W/∂ρₖ))
-                        //    diag(∂W/∂ρₖ)_ii = (∂w_i/∂η_i) * (∂η_i/∂ρ_k)
                         let dwdrho_k_diag = &dw_deta * &eta1_k;
                         let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag);
 
-                        // d. Calculate tr(H⁻¹ * S_k) using transformed penalty matrix
+                        // d. Calculate tr(H⁻¹ * S_k)
                         let mut trace_h_inv_s_k = 0.0;
                         for j in 0..s_k_transformed.ncols() {
                             let s_col = s_k_transformed.column(j);
@@ -1226,17 +1255,21 @@ pub mod internal {
                             let h_inv_col = solver.solve(&s_col.to_owned())?;
                             trace_h_inv_s_k += h_inv_col[j];
                         }
+                        let log_det_h_grad_term = 0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
 
-                        // e. Assemble the gradient of the cost function (-V_LAML)
-                        // ∇V_LAML = 0.5 * (λₖ * tr(S⁺Sₖ) - λₖ * tr(H⁻¹Sₖ) - weight_deriv_term)
-                        // cost_grad = -∇V_LAML
+                        // ---
+                        // Component 3: Derivative of log|S| 
+                        // This corresponds to `-rp$det1/2` in mgcv
+                        // ---
+                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
 
-                        // Use the stable gradient from P-IRLS reparameterization
-                        // reparam_result.det1[k] contains d/drho log|S| for the k-th smoothing parameter
-                        // The LAML gradient formula needs -0.5 * d/drho log|S|
-                        cost_gradient[k] = 0.5 * lambdas[k] * trace_h_inv_s_k
-                            + 0.5 * weight_deriv_term
-                            - 0.5 * pirls_result.reparam_result.det1[k];
+                        // ---
+                        // Final Gradient Assembly - Now Complete!
+                        // This exactly matches mgcv's formula: `REML1 <- oo$D1/2 + oo$trA1/2 - rp$det1/2`
+                        // ---
+                        cost_gradient[k] = penalized_deviance_grad_term  // Term 1: 0.5 * d(D_p)/dρ
+                                         + log_det_h_grad_term           // Term 2: 0.5 * d(log|H|)/dρ  
+                                         - log_det_s_grad_term;          // Term 3: -0.5 * d(log|S|)/dρ
                     }
                     log::debug!("LAML gradient computation finished.");
                 }

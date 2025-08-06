@@ -724,6 +724,27 @@ fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f
     unpivoted_matrix
 }
 
+/// Pivots the columns of a matrix according to a pivot vector.
+///
+/// This applies the permutation, reordering columns. For a matrix A and pivot p,
+/// the result B is such that B_j = A_{p[j]}.
+///
+/// # Parameters
+/// * `matrix`: The matrix whose columns will be permuted.
+/// * `pivot`: The permutation vector from the QR decomposition.
+fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
+    let r = matrix.nrows();
+    let c = matrix.ncols();
+    let mut pivoted_matrix = Array2::zeros((r, c));
+
+    for j in 0..c {
+        let original_col_index = pivot[j];
+        pivoted_matrix.column_mut(j).assign(&matrix.column(original_col_index));
+    }
+
+    pivoted_matrix
+}
+
 /// Drop columns from a matrix based on column indices in `drop`.
 /// This is a direct translation of `drop_cols` from mgcv's C code:
 ///
@@ -1062,13 +1083,10 @@ pub fn solve_penalized_least_squares(
     let r_rows = r1_full.nrows().min(p);
     let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
 
-    // Un-pivot the columns of R1 to restore their original order.
-    // This is the missing step from mgcv's `pivoter` function. We must un-pivot
-    // the columns of the R factor to restore their original order before proceeding.
-    // The columns of R1 are currently scrambled according to `initial_pivot`.
-    // We need to unscramble them so they align with the penalty matrix E.
-    let r1 = unpivot_columns(r1_pivoted, &initial_pivot);
-    log::debug!("Un-pivoted R1 matrix after first QR to restore original column order");
+    // DO NOT UN-PIVOT r1_pivoted. Keep it in its stable, pivoted form.
+    // The columns of R1 are currently permuted according to `initial_pivot`.
+    // This permutation is crucial for numerical stability in rank detection.
+    log::debug!("Keeping R1 matrix in pivoted order for maximum numerical stability");
 
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(&wz);
