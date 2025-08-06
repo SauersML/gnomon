@@ -3,10 +3,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 
-
-N_SAMPLES = 2000
+# --- Constants for Data Generation ---
+N_SAMPLES_TRAIN = 2000
+N_SAMPLES_TEST = 20000
 NOISE_STD_DEV = 0.5
-OUTPUT_FILENAME = 'synthetic_classification_data.csv'
+TRAIN_OUTPUT_FILENAME = 'synthetic_classification_data.csv'
+TEST_OUTPUT_FILENAME = 'test_data.csv'
 N_BINS = 20
 
 
@@ -14,6 +16,8 @@ def generate_data(n_samples, noise_std, linear_mode=False, noise_mode=False):
     # Generate common components first
     noise = np.random.normal(0, noise_std, n_samples)
 
+    # Note: The 'print' statements inside this function will now run for both
+    # training and test set generation, which is expected.
     if noise_mode:
         print(f"--- Running in PURE NOISE mode ---")
         print(f"Generating {n_samples} samples with ZERO signal...")
@@ -51,7 +55,7 @@ def create_binned_plots(df, linear_mode=False, noise_mode=False):
     Creates plots showing the binned probability of outcome=1 against each
     independent variable, adapted for the generation mode.
     """
-    print("\nGenerating plots...")
+    print("\nGenerating plots (based on the large test set)...")
     fig, axes = plt.subplots(1, 2, figsize=(15, 6), constrained_layout=True)
 
     # Determine the main title based on the mode
@@ -121,7 +125,7 @@ def main():
     Parses command-line arguments and runs the data generation and plotting.
     """
     parser = argparse.ArgumentParser(
-        description="Generate synthetic data for binary classification.",
+        description="Generate separate TRAINING and TESTING synthetic datasets for binary classification.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     # Group for mutually exclusive modes. Default is non-linear.
@@ -143,25 +147,39 @@ def main():
     )
     args = parser.parse_args()
 
-    # --- Run the logic ---
-    # The mode flags are now correctly passed to the functions.
-    final_data = generate_data(
-        N_SAMPLES,
+    # --- 1. Generate TRAINING Data ---
+    print("\n" + "="*50)
+    print("### GENERATING TRAINING DATA ###")
+    print("="*50)
+    training_data = generate_data(
+        N_SAMPLES_TRAIN,
         NOISE_STD_DEV,
         linear_mode=args.linear,
         noise_mode=args.noise
     )
+    training_data.to_csv(TRAIN_OUTPUT_FILENAME, index=False)
+    print(f"\nTraining data ({N_SAMPLES_TRAIN} rows) saved to '{TRAIN_OUTPUT_FILENAME}'")
+    print("\nTraining Data Head:")
+    print(training_data.head())
 
-    final_data.to_csv(OUTPUT_FILENAME, index=False)
+    # --- 2. Generate TESTING Data ---
+    print("\n" + "="*50)
+    print("### GENERATING TESTING DATA ###")
+    print("="*50)
+    test_data = generate_data(
+        N_SAMPLES_TEST,
+        NOISE_STD_DEV,
+        linear_mode=args.linear,
+        noise_mode=args.noise
+    )
+    test_data.to_csv(TEST_OUTPUT_FILENAME, index=False)
+    print(f"\nTest data ({N_SAMPLES_TEST} rows) saved to '{TEST_OUTPUT_FILENAME}'")
+    print("\nTest Data Outcome Distribution (should be ~50/50):")
+    print(test_data['outcome'].value_counts(normalize=True))
 
-    print(f"\nData successfully generated and saved to '{OUTPUT_FILENAME}'")
-    print("\nData Head:")
-    print(final_data.head())
-    print("\nOutcome Distribution (should be ~50/50):")
-    print(final_data['outcome'].value_counts(normalize=True))
-
+    # --- 3. Create Plots from the large, clean test set ---
     create_binned_plots(
-        final_data.copy(), # Pass a copy to avoid SettingWithCopyWarning
+        test_data.copy(), # Pass a copy to avoid SettingWithCopyWarning
         linear_mode=args.linear,
         noise_mode=args.noise
     )
