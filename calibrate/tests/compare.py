@@ -91,29 +91,46 @@ def print_performance_report(df):
     print("\n" + "="*60)
 
 def plot_prediction_comparisons(df):
-    """Generates a 1x3 plot comparing model predictions to each other and to the true outcomes."""
+    """
+    Generates a 1x3 plot comparing model predictions against each other and
+    against the true underlying probability.
+    """
     print("\n--- Generating 1x3 Prediction Comparison Scatter Plot ---")
     fig, axes = plt.subplots(1, 3, figsize=(21, 6.5))
-    fig.suptitle("Prediction Comparisons on Test Data", fontsize=20)
+    fig.suptitle("Prediction Accuracy on Test Data", fontsize=20)
 
-    # --- Plot 1: R vs. Rust ---
-    mae = np.mean(np.abs(df['r_prediction'] - df['rust_prediction']))
+    # --- Plot 1: R vs. Rust (Inter-Model Agreement) ---
+    mae_models = np.mean(np.abs(df['r_prediction'] - df['rust_prediction']))
     axes[0].scatter(df['r_prediction'], df['rust_prediction'], alpha=0.2, s=10, rasterized=True)
     axes[0].plot([0, 1], [0, 1], 'r--', label='Perfect Agreement')
-    axes[0].set(xlabel="R / mgcv Prediction", ylabel="Rust / gnomon Prediction", title=f"Model vs. Model (MAE = {mae:.4f})")
+    axes[0].set(
+        xlabel="R / mgcv Prediction",
+        ylabel="Rust / gnomon Prediction",
+        title=f"Model vs. Model (MAE = {mae_models:.4f})"
+    )
     axes[0].grid(True, linestyle='--'); axes[0].set_aspect('equal', 'box'); axes[0].legend()
 
-    # --- Plot 2: R vs. True Outcome ---
-    tjur_r = tjurs_r2(df['outcome'], df['r_prediction'])
-    axes[1].scatter(df['r_prediction'], df['outcome'], alpha=0.1, s=10, rasterized=True)
-    axes[1].set(xlabel="R / mgcv Prediction", ylabel="True Outcome", title=f"R vs. Outcome (Tjur's R² = {tjur_r:.3f})")
-    axes[1].grid(True, linestyle='--'); axes[1].set_yticks([0, 1])
+    # --- Plot 2: R vs. Ground Truth Probability (Model Accuracy) ---
+    mae_r = np.mean(np.abs(df['final_probability'] - df['r_prediction']))
+    axes[1].scatter(df['final_probability'], df['r_prediction'], alpha=0.2, s=10, rasterized=True)
+    axes[1].plot([0, 1], [0, 1], 'r--', label='Perfect Prediction')
+    axes[1].set(
+        xlabel="True Final Probability",
+        ylabel="R / mgcv Prediction",
+        title=f"R vs. Ground Truth (MAE = {mae_r:.4f})"
+    )
+    axes[1].grid(True, linestyle='--'); axes[1].set_aspect('equal', 'box'); axes[1].legend()
 
-    # --- Plot 3: Rust vs. True Outcome ---
-    tjur_rust = tjurs_r2(df['outcome'], df['rust_prediction'])
-    axes[2].scatter(df['rust_prediction'], df['outcome'], alpha=0.1, s=10, rasterized=True)
-    axes[2].set(xlabel="Rust / gnomon Prediction", ylabel="True Outcome", title=f"Rust vs. Outcome (Tjur's R² = {tjur_rust:.3f})")
-    axes[2].grid(True, linestyle='--'); axes[2].set_yticks([0, 1])
+    # --- Plot 3: Rust vs. Ground Truth Probability (Model Accuracy) ---
+    mae_rust = np.mean(np.abs(df['final_probability'] - df['rust_prediction']))
+    axes[2].scatter(df['final_probability'], df['rust_prediction'], alpha=0.2, s=10, rasterized=True)
+    axes[2].plot([0, 1], [0, 1], 'r--', label='Perfect Prediction')
+    axes[2].set(
+        xlabel="True Final Probability",
+        ylabel="Rust / gnomon Prediction",
+        title=f"Rust vs. Ground Truth (MAE = {mae_rust:.4f})"
+    )
+    axes[2].grid(True, linestyle='--'); axes[2].set_aspect('equal', 'box'); axes[2].legend()
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.show()
 
