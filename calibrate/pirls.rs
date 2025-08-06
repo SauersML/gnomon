@@ -1103,34 +1103,38 @@ pub fn solve_penalized_least_squares(
     let stage2_timer = Instant::now();
     log::debug!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
 
+    // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
+    // This ensures the columns of both matrices are aligned correctly
+    let eb_pivoted = pivot_columns(eb.view(), &initial_pivot);
+
     // Calculate Frobenius norms for scaling
-    let r_norm = frobenius_norm(&r1);
-    let eb_norm = if eb.nrows() > 0 {
-        frobenius_norm(eb)
+    let r_norm = frobenius_norm(&r1_pivoted);
+    let eb_norm = if eb_pivoted.nrows() > 0 {
+        frobenius_norm(&eb_pivoted)
     } else {
         1.0
     };
 
     log::debug!("Frobenius norms: R_norm={}, Eb_norm={}", r_norm, eb_norm);
 
-    // Create the scaled augmented matrix for numerical stability using eb for rank detection
-    // [R1/Rnorm; Eb/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
-    let eb_rows = eb.nrows();
+    // Create the scaled augmented matrix for numerical stability using pivoted matrices
+    // [R1_pivoted/Rnorm; Eb_pivoted/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
+    let eb_rows = eb_pivoted.nrows();
     let scaled_rows = r_rows + eb_rows;
     let mut scaled_matrix = Array2::zeros((scaled_rows, p));
 
-    // Fill in the scaled data part (R1/Rnorm)
+    // Fill in the scaled data part (R1_pivoted/Rnorm)
     for i in 0..r_rows {
         for j in 0..p {
-            scaled_matrix[[i, j]] = r1[[i, j]] / r_norm;
+            scaled_matrix[[i, j]] = r1_pivoted[[i, j]] / r_norm;
         }
     }
 
-    // Fill in the scaled penalty part (eb/Eb_norm) - this is for rank detection only
+    // Fill in the scaled penalty part (eb_pivoted/Eb_norm) - this is for rank detection only
     if eb_rows > 0 {
         for i in 0..eb_rows {
             for j in 0..p {
-                scaled_matrix[[r_rows + i, j]] = eb[[i, j]] / eb_norm;
+                scaled_matrix[[r_rows + i, j]] = eb_pivoted[[i, j]] / eb_norm;
             }
         }
     }
@@ -1197,16 +1201,19 @@ pub fn solve_penalized_least_squares(
         );
     }
 
-    // Create rank-reduced versions of r1 and e_transformed by dropping unidentifiable columns
-    // NOTE: We use e_transformed here, NOT eb, because this is for the final solve
-    let mut r1_dropped = Array2::zeros((r_rows, rank));
-    drop_cols(r1.view(), &drop_indices, &mut r1_dropped);
+    // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
+    let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
 
-    let e_transformed_rows = e_transformed.nrows();
+    // Create rank-reduced versions by dropping from the PIVOTED matrices
+    // NOTE: We use e_transformed_pivoted here, NOT eb_pivoted, because this is for the final solve
+    let mut r1_dropped = Array2::zeros((r_rows, rank));
+    drop_cols(r1_pivoted.view(), &drop_indices, &mut r1_dropped);
+
+    let e_transformed_rows = e_transformed_pivoted.nrows();
     let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
     if e_transformed_rows > 0 {
         drop_cols(
-            e_transformed.view(),
+            e_transformed_pivoted.view(),
             &drop_indices,
             &mut e_transformed_dropped,
         );
