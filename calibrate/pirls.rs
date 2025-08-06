@@ -1253,7 +1253,7 @@ pub fn solve_penalized_least_squares(
     }
 
     // Perform final pivoted QR on the unscaled, reduced system
-    let (q_final, r_final, pivot_final) = pivoted_qr_faer(&final_aug_matrix)?;
+    let (q_final, r_final, rank_pivot) = pivoted_qr_faer(&final_aug_matrix)?;
 
     log::debug!(
         "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
@@ -1308,85 +1308,47 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector using mgcv's approach
+    // STAGE 6: Reconstruct the full coefficient vector (ROBUST AND CORRECTED)
     //-----------------------------------------------------------------------
-
-    // STEP 1: Un-pivot the rank-sized solution using pivot_final
-    // This is exactly how mgcv does it: "for (i=0;i<rank;i++) y[pivot1[i]] = z[i];"
-    let mut beta_unpivoted = Array1::zeros(rank);
-    for i in 0..rank {
-        beta_unpivoted[pivot_final[i]] = beta_dropped[i];
-    }
-
-    // STEP 2: Inflate to full size by inserting zeros for dropped columns
-    // This matches mgcv's undrop_rows function
+    // The key is to correctly compose the two permutations. The `i`-th coefficient
+    // in our solved vector `beta_dropped` corresponds to the `rank_pivot[i]`-th
+    // column of the system *after* the `initial_pivot`. Therefore, its original
+    // column index is `initial_pivot[rank_pivot[i]]`.
+    
     let mut beta_transformed = Array1::zeros(p);
-
-    // Map the unpivoted coefficients back to the full parameter space
-    // For each position in the full vector, check if it was dropped
-    // If not dropped, copy the next value from beta_unpivoted
-    let mut src_idx = 0;
-    for dst_idx in 0..p {
-        if !drop_indices.contains(&dst_idx) {
-            beta_transformed[dst_idx] = beta_unpivoted[src_idx];
-            src_idx += 1;
-        }
-        // If dropped, leave as zero (already initialized)
+    for i in 0..rank {
+        let original_col_index = initial_pivot[rank_pivot[i]];
+        beta_transformed[original_col_index] = beta_dropped[i];
     }
+    // The remaining p - rank elements are correctly left as zero, representing the
+    // unidentifiable parameters. This logic is much simpler and more robust than the
+    // previous `drop_indices` approach.
 
     //-----------------------------------------------------------------------
-    // STAGE 7: Construct the penalized Hessian
+    // STAGE 7: Construct the penalized Hessian (ROBUST AND CORRECTED)
     //-----------------------------------------------------------------------
 
-    // Create R'R for the identifiable part
-    let r_square_scaled = r_square.mapv(|x| x); // Create a clean copy
-    let hessian_rank_part = r_square_scaled.t().dot(&r_square_scaled);
+    // 1. Create R'R for the identifiable part (rank x rank). This is the Hessian in the final, stable basis.
+    let hessian_rank_part = r_square.t().dot(&r_square);
 
-    // Create pivoted Hessian with zeros for unidentifiable directions
+    // 2. Expand it to a p x p matrix with zeros for dropped columns. This matrix is
+    //    still in the final pivoted basis defined by `rank_pivot`.
     let mut hessian_pivoted = Array2::zeros((p, p));
-    for i in 0..rank {
-        for j in 0..rank {
-            hessian_pivoted[[i, j]] = hessian_rank_part[[i, j]];
-        }
-    }
+    hessian_pivoted.slice_mut(s![..rank, ..rank]).assign(&hessian_rank_part);
 
-    // Create a permutation matrix to un-pivot the Hessian
-    // This requires a combined mapping that accounts for both dropping and pivoting
-
-    // Step 1: Map columns in the reduced system to their original indices
-    let mut orig_col_indices = Vec::with_capacity(p);
-
-    // First add the columns that weren't dropped (in order they appear in reduced system)
-    // let mut col_idx = 0;
-    for orig_idx in 0..p {
-        if !drop_indices.contains(&orig_idx) {
-            // This column wasn't dropped, record its original index
-            orig_col_indices.push(orig_idx);
-            // col_idx += 1;
-        }
-    }
-
-    // Then apply the final pivot to get the true column ordering
-    let mut permutation = Vec::with_capacity(p);
-
-    // First add the pivoted columns in the correct order
-    for i in 0..rank {
-        permutation.push(orig_col_indices[pivot_final[i]]);
-    }
-
-    // Then add the dropped columns
-    for &idx in &drop_indices {
-        permutation.push(idx);
-    }
-
-    // Build the permutation matrix
-    let mut p_mat = Array2::zeros((p, p));
+    // 3. Create the full permutation matrix `P` that maps from the final pivoted basis
+    //    back to the original basis. P_ij = 1 if original column `i` is final column `j`.
+    let mut perm_matrix = Array2::zeros((p, p));
     for i in 0..p {
-        p_mat[[permutation[i], i]] = 1.0;
+        // The i-th column in the final basis (after both pivots) corresponds to the
+        // `initial_pivot[rank_pivot[i]]`-th column in the original basis.
+        // This applies to ALL columns, not just the first rank columns.
+        let original_index = initial_pivot[rank_pivot[i]];
+        perm_matrix[[original_index, i]] = 1.0;
     }
 
-    // Un-pivot the Hessian: P * H_pivoted * P^T
-    let penalized_hessian = p_mat.dot(&hessian_pivoted).dot(&p_mat.t());
+    // 4. Un-pivot the Hessian to the original basis: H_orig = P * H_pivoted * P^T
+    let penalized_hessian = perm_matrix.dot(&hessian_pivoted).dot(&perm_matrix.t());
 
     //-----------------------------------------------------------------------
     // STAGE 8: Calculate EDF and scale parameter
