@@ -107,7 +107,8 @@ pub fn fit_model_for_fixed_rho(
     }
 
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
-    let eb = create_balanced_penalty_root(&s_list_full)?;
+    let p = x.ncols();
+    let eb = create_balanced_penalty_root(&s_list_full, p)?;
     println!(
         "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
         eb.shape()
@@ -1310,7 +1311,7 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector (ROBUST AND CORRECTED)
+    // STAGE 6: Reconstruct the full coefficient vector
     //-----------------------------------------------------------------------
     // The key is to correctly compose the two permutations. The `i`-th coefficient
     // in our solved vector `beta_dropped` corresponds to the `rank_pivot[i]`-th
@@ -1327,7 +1328,7 @@ pub fn solve_penalized_least_squares(
     // previous `drop_indices` approach.
 
     //-----------------------------------------------------------------------
-    // STAGE 7: Construct the penalized Hessian (ROBUST AND CORRECTED)
+    // STAGE 7: Construct the penalized Hessian
     //-----------------------------------------------------------------------
 
     // 1. Create R'R for the identifiable part (rank x rank). This is the Hessian in the final, stable basis.
