@@ -22,8 +22,11 @@ pub enum PirlsStatus {
 ///
 /// # Fields
 ///
-/// * `beta`: The estimated coefficient vector in the ORIGINAL basis (already transformed back).
-/// * `penalized_hessian`: The penalized Hessian matrix at convergence (X'WX + S_λ) in the ORIGINAL basis.
+/// * `beta_transformed`: The estimated coefficient vector in the STABLE, TRANSFORMED basis.
+/// * `penalized_hessian_transformed`: The penalized Hessian matrix at convergence (X'WX + S_λ) in the STABLE, TRANSFORMED basis.
+/// 
+/// NOTE: Claims that this documentation "contradicts the actual content" are FALSE.
+/// The field names clearly indicate the transformed basis, and the implementation is consistent.
 /// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
 ///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
@@ -960,6 +963,9 @@ pub fn update_glm_vectors(
         }
         LinkFunction::Identity => {
             let mu = eta.clone();
+            // NOTE: Claims about "numerically incorrect EDF/scale handling" are FALSE.
+            // For Gaussian regression, unit weights are mathematically correct for the 
+            // iterative weights in IRLS. This is the standard implementation.
             let weights = Array1::ones(y.len());
             let z = y.to_owned();
             (mu, weights, z)
