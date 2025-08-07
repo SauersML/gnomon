@@ -285,8 +285,8 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create tensor product penalties for interaction effects (conditionally)
     // Each PC interaction gets two penalties: one for PGS direction, one for PC direction
-    // Calculate the number of PGS basis functions for interactions using the UNCONSTRAINED basis
-    let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
+    // Use the number of columns from the CONSTRAINED basis for layout planning.
+    let num_pgs_interaction_bases = pgs_main_basis.ncols();
 
     if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         // Create base penalty matrices for Kronecker products
