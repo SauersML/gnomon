@@ -191,6 +191,16 @@ pub fn build_design_and_penalty_matrices(
     ),
     EstimationError,
 > {
+    // Validate PC configuration against available data
+    if config.pc_names.len() > data.pcs.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "Configuration requests {} Principal Components ({}), but the provided data file only contains {} PC columns.",
+            config.pc_names.len(),
+            config.pc_names.join(", "),
+            data.pcs.ncols()
+        )));
+    }
+    
     let n_samples = data.y.len();
 
     // Initialize constraint and knot vector storage
@@ -275,8 +285,8 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Create tensor product penalties for interaction effects (conditionally)
     // Each PC interaction gets two penalties: one for PGS direction, one for PC direction
-    // Calculate the number of PGS basis functions for interactions empirically
-    let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
+    // Calculate the number of PGS basis functions for interactions using the CONSTRAINED basis
+    let num_pgs_interaction_bases = pgs_main_basis.ncols();
 
     if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         // Create base penalty matrices for Kronecker products
@@ -467,7 +477,7 @@ pub fn build_design_and_penalty_matrices(
             // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
             let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
             let tensor_interaction =
-                row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
+                row_wise_tensor_product(&pgs_main_basis, pc_unconstrained_basis);
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
@@ -557,10 +567,20 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// and take the matrix square root. This balanced penalty is used ONLY for rank detection.
 pub fn create_balanced_penalty_root(
     s_list: &[Array2<f64>],
+    p: usize,
 ) -> Result<Array2<f64>, EstimationError> {
     if s_list.is_empty() {
-        // No penalties case - return empty matrix
-        return Ok(Array2::zeros((0, s_list.get(0).map_or(0, |s| s.nrows()))));
+        // No penalties case - return empty matrix with correct number of columns
+        return Ok(Array2::zeros((0, p)));
+    }
+    
+    // Validate penalty matrix dimensions
+    if s_list[0].nrows() != p {
+        return Err(EstimationError::LayoutError(format!(
+            "Penalty matrix dimension mismatch: expected {} columns, but found {}",
+            p,
+            s_list[0].nrows()
+        )));
     }
 
     let p = s_list[0].nrows();
