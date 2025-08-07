@@ -735,8 +735,8 @@ mod tests {
                 interaction_effects: {
                     // Both dimensions for the tensor product must be from the UNCONSTRAINED main effect bases.
                     // Unconstrained main effect = total basis functions - 1 (for the intercept part of the basis)
-                    let num_pgs_basis_funcs = pgs_basis_config.num_knots + pgs_basis_config.degree; // 6 + 3 = 9
-                    let num_pc1_basis_funcs = pc1_basis_config.num_knots + pc1_basis_config.degree; // 6 + 3 = 9
+                    let num_pgs_basis_funcs = pgs_basis_config.num_knots + pgs_basis_config.degree + 1;
+                    let num_pc1_basis_funcs = pc1_basis_config.num_knots + pc1_basis_config.degree + 1;
 
                     let mut interactions = HashMap::new();
 
