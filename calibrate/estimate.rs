@@ -3236,16 +3236,16 @@ pub mod internal {
             let pgs_main_coeffs = pgs_n_basis - 2; // 6 - 1 (intercept) - 1 (constraint) = 4
             let pc_main_coeffs = pc_n_basis - 2; // 5 - 1 (intercept) - 1 (constraint) = 3
 
-            // Interaction term is based on UNCONSTRAINED PGS main basis (pgs_n_basis - 1)
-            // and CONSTRAINED PC basis (pc_n_basis - 2)
-            let pgs_interaction_bases = pgs_n_basis - 1; // 5
-            let interaction_coeffs = pgs_interaction_bases * pc_main_coeffs; // 5 * 3 = 15
+            // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases.
+            let pgs_interaction_bases = pgs_n_basis - 1; // Unconstrained main basis: 6 - 1 = 5
+            let pc_interaction_bases = pc_n_basis - 1;   // Unconstrained main basis: 5 - 1 = 4
+            let interaction_coeffs = pgs_interaction_bases * pc_interaction_bases; // CORRECT: 5 * 4 = 20
 
             let expected_coeffs = 1 // intercept
                 + pgs_main_coeffs         // 4
                 + pc_main_coeffs          // 3
-                + interaction_coeffs;     // 15
-                // Total = 1 + 4 + 3 + 15 = 23
+                + interaction_coeffs;     // 20
+                // Total = 1 + 4 + 3 + 20 = 28
 
             assert_eq!(
                 layout.total_coeffs, expected_coeffs,

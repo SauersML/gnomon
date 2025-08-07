@@ -91,6 +91,7 @@ impl ModelLayout {
         config: &ModelConfig,
         pc_constrained_basis_ncols: &[usize],
         pgs_main_basis_ncols: usize,
+        pc_unconstrained_basis_ncols: &[usize],
         num_pgs_interaction_bases: usize,
     ) -> Result<Self, EstimationError> {
         let mut penalty_map = Vec::new();
@@ -102,8 +103,9 @@ impl ModelLayout {
         let p_pgs_main = pgs_main_basis_ncols;
         let p_pc_main: usize = pc_constrained_basis_ncols.iter().sum();
         // For tensor product interactions: each PC gets num_pgs_bases * num_pc_bases coefficients
-        let p_interactions: usize = pc_constrained_basis_ncols.iter()
-            .map(|&num_pc_basis| num_pgs_interaction_bases * num_pc_basis)
+        // CRITICAL FIX: Use UNCONSTRAINED dimensions for interaction calculations
+        let p_interactions: usize = pc_unconstrained_basis_ncols.iter()
+            .map(|&num_pc_basis_unc| num_pgs_interaction_bases * num_pc_basis_unc)
             .sum();
         let calculated_total_coeffs = 1 + p_pgs_main + p_pc_main + p_interactions;
 
@@ -131,8 +133,8 @@ impl ModelLayout {
         // Tensor product interaction effects (conditionally)
         // Each PC gets one tensor product interaction block with dual penalties
         if num_pgs_interaction_bases > 0 {
-            for (i, &num_pc_basis) in pc_constrained_basis_ncols.iter().enumerate() {
-                let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis;
+            for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
+                let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
                 let range = current_col..current_col + num_tensor_coeffs;
                 
                 // Create tensor product block with two penalty indices
@@ -220,6 +222,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 2. Generate constrained bases and unscaled penalty matrices for PCs
     let mut pc_constrained_bases = Vec::new();
+    let mut pc_unconstrained_bases_main = Vec::new();
     let mut s_list = Vec::new();
 
     // Check if we have any PCs to process
@@ -242,6 +245,7 @@ pub fn build_design_and_penalty_matrices(
         knot_vectors.insert(pc_name.clone(), pc_knots);
         // Apply sum-to-zero constraint to PC main effects (excluding intercept)
         let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
+        pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
         let (constrained_basis, z_transform) =
             basis::apply_sum_to_zero_constraint(pc_main_basis_unc)?;
         pc_constrained_bases.push(constrained_basis);
@@ -269,12 +273,12 @@ pub fn build_design_and_penalty_matrices(
     // Calculate the number of PGS basis functions for interactions empirically
     let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
     
-    if num_pgs_interaction_bases > 0 && !pc_constrained_bases.is_empty() {
+    if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         // Create base penalty matrices for Kronecker products
         let s_pgs_base = create_difference_penalty_matrix(num_pgs_interaction_bases, config.penalty_order)?;
         
-        for i in 0..pc_constrained_bases.len() {
-            let num_pc_bases = pc_constrained_bases[i].ncols();
+        for i in 0..pc_unconstrained_bases_main.len() {
+            let num_pc_bases = pc_unconstrained_bases_main[i].ncols();
             let s_pc_base = create_difference_penalty_matrix(num_pc_bases, config.penalty_order)?;
             
             // Create identity matrices for Kronecker products
@@ -293,13 +297,15 @@ pub fn build_design_and_penalty_matrices(
     }
 
     // 4. Define the model layout based on final basis dimensions
-    let pc_basis_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
+    let pc_constrained_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
+    let pc_unconstrained_ncols: Vec<usize> = pc_unconstrained_bases_main.iter().map(|b| b.ncols()).collect();
     
     // Use empirically calculated interaction bases for layout consistency
     let layout = ModelLayout::new(
         config,
-        &pc_basis_ncols,
+        &pc_constrained_ncols,
         pgs_main_basis.ncols(),
+        &pc_unconstrained_ncols,
         num_pgs_interaction_bases,
     )?;
 
@@ -432,7 +438,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Tensor product interaction effects (conditionally)
     // Create one unified interaction surface per PC using proper tensor products
-    if num_pgs_interaction_bases > 0 && !pc_constrained_bases.is_empty() {
+    if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
             let tensor_block = layout.penalty_map.iter()
@@ -443,8 +449,8 @@ pub fn build_design_and_penalty_matrices(
 
             // Create the tensor product design matrix columns using row-wise tensor product
             // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
-            let pc_constrained_basis = &pc_constrained_bases[pc_idx];
-            let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_constrained_basis);
+            let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
+            let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
@@ -718,6 +724,9 @@ pub fn stable_reparameterization(
         .map(|rs_k| rs_k.dot(&rs_k.t()))
         .collect();
 
+    // Create the WORKING copy that will be transformed
+    let mut s_current_list = s_original_list.clone();
+
     // Clone penalty square roots - we'll transform these in-place
     let mut rs_current = rs_list.to_vec();
 
@@ -837,18 +846,18 @@ pub fn stable_reparameterization(
 
         // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
         // This is the key difference from a naive approach - we only use alpha penalties
-        // CRITICAL: Use original, unmodified penalty matrices for sb construction
+        // CRITICAL: Use the CURRENTLY transformed penalty matrices for sb construction
         let mut sb = Array2::zeros((q_current, q_current));
         for &i in &alpha {
-            // Use the original, pristine penalty matrix, not the transformed one
-            let s_original_sub_block = s_original_list[i].slice(s![
+            // Use the CURRENTLY transformed matrix, not the original
+            let s_current_sub_block = s_current_list[i].slice(s![
                 k_offset..k_offset + q_current,
                 k_offset..k_offset + q_current
             ]);
 
             // Use the penalty matrix directly without artificial perturbation
             // mgcv handles zero penalties exactly in the null-space
-            sb.scaled_add(lambdas[i], &s_original_sub_block);
+            sb.scaled_add(lambdas[i], &s_current_sub_block);
         }
 
         // println!("DEBUG: Final sb matrix: {:?}", sb);
@@ -899,6 +908,25 @@ pub fn stable_reparameterization(
         let qf_new = qf_block.dot(&u); // Use full eigenvector matrix u
         qf.slice_mut(s![.., k_offset..k_offset + q_current])
             .assign(&qf_new);
+
+        // Now, apply the similarity transform to all active S_k matrices for the next iteration.
+        // This is the core of the recursive update.
+        for &i in &gamma {
+            // Extract the current sub-problem block
+            let s_sub_block = s_current_list[i].slice(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]).to_owned();
+
+            // Perform the similarity transform: U^T * S_sub * U
+            let transformed_sub_block = u.t().dot(&s_sub_block).dot(&u);
+
+            // Place it back into the full-size matrix
+            s_current_list[i].slice_mut(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]).assign(&transformed_sub_block);
+        }
 
         // Step 6: Transform ALL active penalty roots by the full eigenvector matrix U.
         // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.

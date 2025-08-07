@@ -258,6 +258,7 @@ mod internal {
 
         // 2. Generate bases for PCs using saved knot vectors if available
         let mut pc_constrained_bases = Vec::new();
+        let mut pc_unconstrained_bases_main = Vec::new();
         for i in 0..config.pc_names.len() {
             let pc_col = pcs_new.column(i);
             let pc_name = &config.pc_names[i];
@@ -275,6 +276,7 @@ mod internal {
 
             // Slice the basis to remove the intercept term, just like in the training code
             let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
+            pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
 
             // Apply the SAVED PC constraint
             let pc_name = &config.pc_names[i];
@@ -317,10 +319,10 @@ mod internal {
         if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
             // Create unified interaction surfaces using row-wise tensor products
             for (pc_idx, _pc_name) in config.pc_names.iter().enumerate() {
-                let pc_basis_con = &pc_constrained_bases[pc_idx];
+                let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
                 
                 // Create tensor product interaction using the same logic as training
-                let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_basis_con);
+                let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
                 
                 // Add all columns from this tensor product to the design matrix
                 for col in tensor_interaction.axis_iter(Axis(1)) {
@@ -711,7 +713,7 @@ mod tests {
                         (1..=pgs_dim).map(|i| i as f64).collect()
                     },
                     pcs: {
-                        // Extract PC1 dimension before using constraints
+                        // Extract PC1 dimension from constraints
                         let pc1_dim = if let Some(pc1_constraint) = constraints.get("PC1") {
                             pc1_constraint.z_transform.ncols()
                         } else {
@@ -724,22 +726,15 @@ mod tests {
                     },
                 },
                 interaction_effects: {
-                    // Extract PC1 dimension before creating interactions
-                    let pc1_dim = if let Some(pc1_constraint) = constraints.get("PC1") {
-                        pc1_constraint.z_transform.ncols()
-                    } else {
-                        9 // Default fallback
-                    };
-
-                    // For the interactions, we need to use pgs_main_basis_unc dimensions
-                    // which is the number of unconstrained basis functions excluding intercept
-                    // This will typically be pgs_basis_config.num_knots + pgs_basis_config.degree
-                    let num_pgs_basis_funcs = 6 + 3; // From pgs_basis_config
+                    // Both dimensions for the tensor product must be from the UNCONSTRAINED main effect bases.
+                    // Unconstrained main effect = total basis functions - 1 (for the intercept part of the basis)
+                    let num_pgs_basis_funcs = pgs_basis_config.num_knots + pgs_basis_config.degree; // 6 + 3 = 9
+                    let num_pc1_basis_funcs = pc1_basis_config.num_knots + pc1_basis_config.degree; // 6 + 3 = 9
 
                     let mut interactions = HashMap::new();
 
                     // Calculate the total number of interaction coefficients for the unified term
-                    let total_interaction_coeffs = num_pgs_basis_funcs * pc1_dim;
+                    let total_interaction_coeffs = num_pgs_basis_funcs * num_pc1_basis_funcs; // CORRECT: 9 * 9 = 81
 
                     // Create a single flattened vector of coefficients
                     let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)
