@@ -623,7 +623,10 @@ pub mod internal {
                     let hessian_transformed = &pirls_result.penalized_hessian_transformed;
 
                     // Transform the Hessian back to the original basis for this calculation
-                    let hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
+                    let mut hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
+
+                    // Ensure matrix is positive definite once before the loop
+                    ensure_positive_definite(&mut hessian_original)?;
 
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
@@ -631,11 +634,7 @@ pub mod internal {
                             continue;
                         }
 
-                        // Ensure matrix is positive definite before solving
-                        let mut hessian_work = hessian_original.clone(); // Use original basis Hessian
-                        ensure_positive_definite(&mut hessian_work)?;
-
-                        match hessian_work.solve(&s_col.to_owned()) {
+                        match hessian_original.solve(&s_col.to_owned()) {
                             // CORRECT: Both matrices are now in the original basis
                             Ok(h_inv_s_col) => {
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
@@ -1085,37 +1084,10 @@ pub mod internal {
                     //   Use transformed penalty matrix for consistent gradient calculation
                     //   let s_k_beta = reparam_result.rs_transformed[k].dot(beta);
 
-                    // Pre-computation for the gradient of the unpenalized deviance (RSS)
-                    // This is ∂D/∂β = -2 * Xᵀ(y - Xβ), which is needed for the chain rule.
-                    // Use transformed design matrix with transformed beta
-                    let eta = x_transformed.dot(beta_transformed);
-                    let residuals = &self.y() - &eta;
-
-                    // For the Gaussian/REML case, the gradient calculation is a direct application of the
-                    // Envelope Theorem. The inner P-IRLS loop minimizes the penalized deviance
-                    // `D_p(β, ρ) = ||y - Xβ||² + β'S(ρ)β` by choosing optimal coefficients `β*` for a
-                    // fixed set of log-smoothing parameters `ρ`.
-                    //
-                    // The Envelope Theorem (see Wainwright, 2004; Nachbar, 2023) states that the
-                    // derivative of the optimized objective function with respect to a parameter (`ρ`) equals
-                    // the partial derivative of the objective function with respect to that parameter, holding
-                    // the choice variables (`β`) fixed at their optimal values. All indirect effects, which
-                    // arise from how `β*` changes with `ρ`, sum to zero.
-                    //
-                    // In our case, the unpenalized deviance `||y - Xβ||²` does not directly depend on `ρ`. The only
-                    // direct dependence is within the penalty term `S(ρ)`. Therefore, the gradient of the
-                    // penalized deviance component of the REML score is simply the partial derivative of the
-                    // penalty term: `∂(β'S(ρ)β)/∂ρ`.
-                    //
-                    // This code correctly implements this result. By setting `deviance_grad_wrt_beta` to zero,
-                    // the `d1` calculation for the penalized deviance derivative correctly isolates only the
-                    // direct contribution from the penalty term, as prescribed by the theorem.
-                    let deviance_grad_wrt_beta =
-                        if self.config.link_function == LinkFunction::Identity {
-                            Array1::zeros(beta_transformed.len())
-                        } else {
-                            -2.0 * x_transformed.t().dot(&residuals)
-                        };
+                    // For the Gaussian/REML case, the Envelope Theorem applies: at the P-IRLS optimum,
+                    // the indirect derivative through β cancels out for the deviance part, leaving only
+                    // the direct penalty term derivative. This simplification is not available for
+                    // non-Gaussian models where the weight matrix depends on β.
 
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
@@ -1125,18 +1097,11 @@ pub mod internal {
 
                         // ---
                         // Component 1: Derivative of the Penalized Deviance
+                        // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term
                         // R/C Counterpart: `oo$D1/(2*scale*gamma)`
                         // ---
-
-                        let dbeta_drho_k_transformed =
-                            -lambdas[k] * internal::robust_solve(&hessian, &s_k_beta_transformed)?;
-
-                        let d_deviance_d_rho_k =
-                            deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
-                        let d_penalty_d_rho_k =
-                            lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
-
-                        let d1 = d_deviance_d_rho_k + d_penalty_d_rho_k; // Corresponds to oo$D1
+                        
+                        let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
                         let penalized_deviance_grad_term = d1 / (2.0 * scale);
 
                         // ---
@@ -1325,6 +1290,11 @@ pub mod internal {
             }
 
             if adjusted {
+                let min_original_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                log::warn!(
+                    "Penalized Hessian was not positive definite (min eigenvalue: {:.3e}). Adjusting for stability. This may indicate an ill-posed model.",
+                    min_original_eigenvalue
+                );
                 *hess = evecs.dot(&Array2::from_diag(&evals_mut)).dot(&evecs.t());
             }
 

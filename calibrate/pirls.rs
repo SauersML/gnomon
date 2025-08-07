@@ -802,14 +802,20 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
         );
     }
 
-    // Copy columns from source to destination, skipping the ones in drop_indices
+    // Efficient two-pointer scan over columns and sorted drop_indices (O(c + n_drop))
     let mut dst_col = 0;
+    let mut drop_ptr = 0;
+    
     for src_col in 0..c {
-        if !drop_indices.contains(&src_col) {
-            // This column wasn't dropped
-            dst.column_mut(dst_col).assign(&src.column(src_col));
-            dst_col += 1;
+        // Check if this column should be dropped
+        if drop_ptr < n_drop && drop_indices[drop_ptr] == src_col {
+            // This column is dropped; advance the drop pointer and skip copying
+            drop_ptr += 1;
+            continue;
         }
+        // Keep this column
+        dst.column_mut(dst_col).assign(&src.column(src_col));
+        dst_col += 1;
     }
 }
 
