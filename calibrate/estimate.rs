@@ -134,6 +134,9 @@ pub fn train_model(
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
 
+    // Calculate and store the initial cost for fallback comparison
+    let (initial_cost, _) = reml_state.cost_and_grad(&initial_rho);
+
     // --- Run the BFGS Optimizer ---
     // The closure is now a simple, robust method call.
     // Rationale: We store the result instead of immediately crashing with `?`
@@ -162,6 +165,15 @@ pub fn train_model(
         // helpful warning and extract `last_solution` (the best result found before
         // failure), allowing the program to continue.
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
+            // Check if the optimizer made ANY progress from the start.
+            if last_solution.final_value >= initial_cost {
+                // It failed without finding any better point. This is a hard failure.
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "BFGS line search failed to make any progress from the initial point. Initial Cost: {:.4}, Final Cost: {:.4}",
+                    initial_cost, last_solution.final_value
+                )));
+            }
+
             eprintln!(
                 "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
             );
@@ -796,10 +808,13 @@ pub mod internal {
                         Ok(grad) => {
                             let grad_norm = grad.dot(&grad).sqrt();
 
-                            // --- Robust Logging and Unconditional State Update ---
+                            // --- Correct State Management: Only Update on Actual Improvement ---
                             if eval_num == 1 {
                                 println!("\n[BFGS Initial Point]");
                                 println!("  -> Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}");
+                                // Update on the first step
+                                *self.last_cost.borrow_mut() = cost;
+                                *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else if cost < *self.last_cost.borrow() {
                                 println!("\n[BFGS Progress Step #{eval_num}]");
                                 println!(
@@ -808,16 +823,15 @@ pub mod internal {
                                     cost
                                 );
                                 println!("  -> Grad Norm: {grad_norm:.6e}");
+                                // ONLY update the state if it's a true improvement
+                                *self.last_cost.borrow_mut() = cost;
+                                *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else {
                                 println!("\n[BFGS Trial Step #{eval_num}]");
                                 println!("  -> Last Good Cost: {:.7}", *self.last_cost.borrow());
                                 println!("  -> Trial Cost:     {cost:.7} (NO IMPROVEMENT)");
+                                // DO NOT update last_cost here - this is the key fix
                             }
-
-                            // ALWAYS update the "last known good state" if this evaluation was successful.
-                            // The optimizer's line search guarantees it won't proceed with a worse point.
-                            *self.last_cost.borrow_mut() = cost;
-                            *self.last_grad_norm.borrow_mut() = grad_norm;
 
                             (cost, grad)
                         }
