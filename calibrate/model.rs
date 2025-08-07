@@ -733,15 +733,15 @@ mod tests {
                     },
                 },
                 interaction_effects: {
-                    // Both dimensions for the tensor product must be from the UNCONSTRAINED main effect bases.
-                    // Unconstrained main effect = total basis functions - 1 (for the intercept part of the basis)
-                    let num_pgs_basis_funcs = pgs_basis_config.num_knots + pgs_basis_config.degree;
-                    let num_pc1_basis_funcs = pc1_basis_config.num_knots + pc1_basis_config.degree;
+                    // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases' main effect parts.
+                    // Total basis functions = num_knots + degree + 1. Main effect part is one less.
+                    let num_pgs_basis_funcs_main = pgs_basis_config.num_knots + pgs_basis_config.degree; // 9
+                    let num_pc1_basis_funcs_main = pc1_basis_config.num_knots + pc1_basis_config.degree; // 9
 
                     let mut interactions = HashMap::new();
 
                     // Calculate the total number of interaction coefficients for the unified term
-                    let total_interaction_coeffs = num_pgs_basis_funcs * num_pc1_basis_funcs; // CORRECT: 9 * 9 = 81
+                    let total_interaction_coeffs = num_pgs_basis_funcs_main * num_pc1_basis_funcs_main; // CORRECT: 9 * 9 = 81
 
                     // Create a single flattened vector of coefficients
                     let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)
