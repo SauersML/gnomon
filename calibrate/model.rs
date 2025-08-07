@@ -150,6 +150,18 @@ impl TrainedModel {
         let x_new = internal::construct_design_matrix(p_new, pcs_new, &self.config)?;
         let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config);
 
+        // This is a critical safety check. It ensures that the number of columns in the
+        // design matrix constructed for prediction exactly matches the number of coefficients
+        // in the flattened model vector. A mismatch here would lead to silently incorrect
+        // predictions and indicates a severe bug in the model's layout logic.
+        debug_assert_eq!(
+            x_new.ncols(),
+            flattened_coeffs.len(),
+            "FATAL: Mismatch between design matrix columns ({}) and flattened coefficients ({}) during prediction. Check model layout consistency.",
+            x_new.ncols(),
+            flattened_coeffs.len()
+        );
+
         // --- 3. Compute Linear Predictor ---
         let eta = x_new.dot(&flattened_coeffs);
 
@@ -254,8 +266,11 @@ mod internal {
 
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
 
-        // For interactions, use the UNconstrained pgs_main_basis (pgs_main_basis_unc) for the tensor product
-        // This matches the training code behavior in construction.rs
+        // CRITICAL: The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
+        // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
+        // from the dimensions of the unconstrained bases. Changing this to use a constrained basis
+        // without a corresponding change to the layout logic will cause a dimension mismatch and lead
+        // to silently incorrect predictions. The debug_assert in TrainedModel::predict guards against this.
 
         // This closure was not used - removed
         // Previously defined a helper to fetch Z transform from model
@@ -327,7 +342,7 @@ mod internal {
                 let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
 
                 // For interactions, use the UNCONSTRAINED pgs_main_basis_unc for the tensor product
-                // to match the training logic and ensure dimensional consistency
+                // to match the training logic and ensure dimensional consistency (see critical comment above)
                 let tensor_interaction =
                     row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
 

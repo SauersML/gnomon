@@ -687,10 +687,10 @@ pub mod internal {
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
-                    // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + (n+M_p-1)/2 log(2πφ)
+                    // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + ((n-M_p)/2) log(2πφ)
                     let reml = dp / (2.0 * phi)
                         + 0.5 * (log_det_h - log_det_s_plus)
-                        + ((n + mp - 1.0) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                        + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
                     Ok(reml)
