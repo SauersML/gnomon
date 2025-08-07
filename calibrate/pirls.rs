@@ -739,7 +739,9 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
 
     for j in 0..c {
         let original_col_index = pivot[j];
-        pivoted_matrix.column_mut(j).assign(&matrix.column(original_col_index));
+        pivoted_matrix
+            .column_mut(j)
+            .assign(&matrix.column(original_col_index));
     }
 
     pivoted_matrix
@@ -1314,7 +1316,7 @@ pub fn solve_penalized_least_squares(
     // in our solved vector `beta_dropped` corresponds to the `rank_pivot[i]`-th
     // column of the system *after* the `initial_pivot`. Therefore, its original
     // column index is `initial_pivot[rank_pivot[i]]`.
-    
+
     let mut beta_transformed = Array1::zeros(p);
     for i in 0..rank {
         let original_col_index = initial_pivot[rank_pivot[i]];
@@ -1334,7 +1336,9 @@ pub fn solve_penalized_least_squares(
     // 2. Expand it to a p x p matrix with zeros for dropped columns. This matrix is
     //    still in the final pivoted basis defined by `rank_pivot`.
     let mut hessian_pivoted = Array2::zeros((p, p));
-    hessian_pivoted.slice_mut(s![..rank, ..rank]).assign(&hessian_rank_part);
+    hessian_pivoted
+        .slice_mut(s![..rank, ..rank])
+        .assign(&hessian_rank_part);
 
     // 3. Create the full permutation matrix `P` that maps from the final pivoted basis
     //    back to the original basis. This logic correctly composes the two pivots.
@@ -1408,7 +1412,7 @@ pub fn solve_penalized_least_squares(
 }
 
 /// Calculate the Frobenius norm of a matrix (sum of squares of all elements)
-fn frobenius_norm<S>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64 
+fn frobenius_norm<S>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64
 where
     S: ndarray::Data<Elem = f64>,
 {

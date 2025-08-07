@@ -50,7 +50,9 @@ pub enum BasisError {
         provided: usize,
     },
 
-    #[error("Cannot apply sum-to-zero constraint: requires at least 2 basis functions, but only {found} were provided.")]
+    #[error(
+        "Cannot apply sum-to-zero constraint: requires at least 2 basis functions, but only {found} were provided."
+    )]
     InsufficientColumnsForConstraint { found: usize },
 
     #[error("QR decomposition failed while applying constraints: {0}")]

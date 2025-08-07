@@ -14,7 +14,7 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let (a_rows, a_cols) = a.dim();
     let (b_rows, b_cols) = b.dim();
     let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
-    
+
     for i in 0..a_rows {
         for j in 0..a_cols {
             let a_val = a[[i, j]];
@@ -25,7 +25,7 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
             }
         }
     }
-    
+
     result
 }
 
@@ -34,12 +34,16 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 /// Each row of the result is the outer product of the corresponding rows from A and B.
 fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let n_samples = a.nrows();
-    assert_eq!(n_samples, b.nrows(), "Matrices must have same number of rows");
-    
+    assert_eq!(
+        n_samples,
+        b.nrows(),
+        "Matrices must have same number of rows"
+    );
+
     let a_cols = a.ncols();
     let b_cols = b.ncols();
     let mut result = Array2::zeros((n_samples, a_cols * b_cols));
-    
+
     for row in 0..n_samples {
         let mut col_idx = 0;
         for i in 0..a_cols {
@@ -49,7 +53,7 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
             }
         }
     }
-    
+
     result
 }
 
@@ -104,7 +108,8 @@ impl ModelLayout {
         let p_pc_main: usize = pc_constrained_basis_ncols.iter().sum();
         // For tensor product interactions: each PC gets num_pgs_bases * num_pc_bases coefficients
         // CRITICAL FIX: Use UNCONSTRAINED dimensions for interaction calculations
-        let p_interactions: usize = pc_unconstrained_basis_ncols.iter()
+        let p_interactions: usize = pc_unconstrained_basis_ncols
+            .iter()
             .map(|&num_pc_basis_unc| num_pgs_interaction_bases * num_pc_basis_unc)
             .sum();
         let calculated_total_coeffs = 1 + p_pgs_main + p_pc_main + p_interactions;
@@ -136,19 +141,19 @@ impl ModelLayout {
             for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
                 let range = current_col..current_col + num_tensor_coeffs;
-                
+
                 // Create tensor product block with two penalty indices
                 // One for PGS direction smoothness, one for PC direction smoothness
                 let pgs_penalty_idx = penalty_idx_counter;
                 let pc_penalty_idx = penalty_idx_counter + 1;
-                
+
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
                     penalty_indices: vec![pgs_penalty_idx, pc_penalty_idx],
                     term_type: TermType::Interaction,
                 });
-                
+
                 current_col += num_tensor_coeffs;
                 penalty_idx_counter += 2; // Two penalties per tensor product interaction
             }
@@ -272,25 +277,26 @@ pub fn build_design_and_penalty_matrices(
     // Each PC interaction gets two penalties: one for PGS direction, one for PC direction
     // Calculate the number of PGS basis functions for interactions empirically
     let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
-    
+
     if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         // Create base penalty matrices for Kronecker products
-        let s_pgs_base = create_difference_penalty_matrix(num_pgs_interaction_bases, config.penalty_order)?;
-        
+        let s_pgs_base =
+            create_difference_penalty_matrix(num_pgs_interaction_bases, config.penalty_order)?;
+
         for i in 0..pc_unconstrained_bases_main.len() {
             let num_pc_bases = pc_unconstrained_bases_main[i].ncols();
             let s_pc_base = create_difference_penalty_matrix(num_pc_bases, config.penalty_order)?;
-            
+
             // Create identity matrices for Kronecker products
             let i_pgs = Array2::eye(num_pgs_interaction_bases);
             let i_pc = Array2::eye(num_pc_bases);
-            
+
             // Create the two tensor product penalties:
             // 1. S_pgs ⊗ I_pc (penalizes roughness in PGS direction)
             let s_pgs_tensor = kronecker_product(&s_pgs_base, &i_pc);
             s_list.push(s_pgs_tensor);
-            
-            // 2. I_pgs ⊗ S_pc (penalizes roughness in PC direction) 
+
+            // 2. I_pgs ⊗ S_pc (penalizes roughness in PC direction)
             let s_pc_tensor = kronecker_product(&i_pgs, &s_pc_base);
             s_list.push(s_pc_tensor);
         }
@@ -298,8 +304,11 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Define the model layout based on final basis dimensions
     let pc_constrained_ncols: Vec<usize> = pc_constrained_bases.iter().map(|b| b.ncols()).collect();
-    let pc_unconstrained_ncols: Vec<usize> = pc_unconstrained_bases_main.iter().map(|b| b.ncols()).collect();
-    
+    let pc_unconstrained_ncols: Vec<usize> = pc_unconstrained_bases_main
+        .iter()
+        .map(|b| b.ncols())
+        .collect();
+
     // Use empirically calculated interaction bases for layout consistency
     let layout = ModelLayout::new(
         config,
@@ -323,7 +332,9 @@ pub fn build_design_and_penalty_matrices(
     let mut s_list_full = Vec::new();
 
     // Validate that s_list length matches the total number of penalty indices in penalty_map
-    let expected_penalty_count: usize = layout.penalty_map.iter()
+    let expected_penalty_count: usize = layout
+        .penalty_map
+        .iter()
         .map(|block| block.penalty_indices.len())
         .sum();
     if s_list.len() != expected_penalty_count {
@@ -441,16 +452,22 @@ pub fn build_design_and_penalty_matrices(
     if num_pgs_interaction_bases > 0 && !pc_unconstrained_bases_main.is_empty() {
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
-            let tensor_block = layout.penalty_map.iter()
+            let tensor_block = layout
+                .penalty_map
+                .iter()
                 .find(|block| block.term_name == format!("f(PGS,{})", pc_name))
-                .ok_or_else(|| EstimationError::LayoutError(
-                    format!("Could not find tensor product block for f(PGS,{})", pc_name)
-                ))?;
+                .ok_or_else(|| {
+                    EstimationError::LayoutError(format!(
+                        "Could not find tensor product block for f(PGS,{})",
+                        pc_name
+                    ))
+                })?;
 
             // Create the tensor product design matrix columns using row-wise tensor product
             // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
             let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
-            let tensor_interaction = row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
+            let tensor_interaction =
+                row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
@@ -512,13 +529,7 @@ pub fn build_design_and_penalty_matrices(
         });
     }
 
-    Ok((
-        x_matrix,
-        s_list_full,
-        layout,
-        constraints,
-        knot_vectors,
-    ))
+    Ok((x_matrix, s_list_full, layout, constraints, knot_vectors))
 }
 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
@@ -720,9 +731,8 @@ pub fn stable_reparameterization(
 
     // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
     // These will NEVER be modified and are used for building the sb matrix
-    let s_original_list: Vec<Array2<f64>> = rs_list.iter()
-        .map(|rs_k| rs_k.dot(&rs_k.t()))
-        .collect();
+    let s_original_list: Vec<Array2<f64>> =
+        rs_list.iter().map(|rs_k| rs_k.dot(&rs_k.t())).collect();
 
     // Create the WORKING copy that will be transformed
     let mut s_current_list = s_original_list.clone();
@@ -844,10 +854,55 @@ pub fn stable_reparameterization(
 
         // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
 
-        // Step 3: Form weighted sum of ONLY dominant penalties and eigendecompose
-        // This is the key difference from a naive approach - we only use alpha penalties
-        // CRITICAL: Use the CURRENTLY transformed penalty matrices for sb construction
-        let mut sb = Array2::zeros((q_current, q_current));
+        // Step 3a: Form SCALED sum for STABLE RANK DETECTION (following mgcv's get_stableS)
+        // This creates a lambda-independent, balanced matrix for reliable rank detection
+        let mut sb_for_rank = Array2::zeros((q_current, q_current));
+        for &i in &alpha {
+            let s_current_sub_block = s_current_list[i].slice(s![
+                k_offset..k_offset + q_current,
+                k_offset..k_offset + q_current
+            ]);
+
+            // Calculate Frobenius norm (sqrt of sum of squared elements)
+            let frob_norm = s_current_sub_block
+                .iter()
+                .map(|&x| x * x)
+                .sum::<f64>()
+                .sqrt();
+
+            // Scale by inverse norm to create a balanced matrix for rank detection
+            if frob_norm > 1e-12 {
+                // Avoid division by zero for zero-matrices
+                sb_for_rank.scaled_add(1.0 / frob_norm, &s_current_sub_block);
+            }
+        }
+
+        // Eigendecompose the balanced matrix to get stable eigenvalues for rank detection
+        let (eigenvalues_for_rank, _) = sb_for_rank
+            .eigh(UPLO::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+
+        // Determine rank 'r' using these stable eigenvalues
+        let max_eigenval = eigenvalues_for_rank
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let rank_tolerance = max_eigenval * r_tol;
+        let r = eigenvalues_for_rank
+            .iter()
+            .filter(|&&ev| ev > rank_tolerance)
+            .count();
+
+        log::debug!(
+            "Stable rank detection: found rank {} from {} eigenvalues (max_eig: {}, tol: {})",
+            r,
+            eigenvalues_for_rank.len(),
+            max_eigenval,
+            rank_tolerance
+        );
+
+        // Step 3b: Form WEIGHTED sum for TRANSFORMATION (lambda-weighted for eigenvectors)
+        // This matrix provides the eigenvectors for the similarity transform
+        let mut sb_for_transform = Array2::zeros((q_current, q_current));
         for &i in &alpha {
             // Use the CURRENTLY transformed matrix, not the original
             let s_current_sub_block = s_current_list[i].slice(s![
@@ -855,41 +910,18 @@ pub fn stable_reparameterization(
                 k_offset..k_offset + q_current
             ]);
 
-            // Use the penalty matrix directly without artificial perturbation
-            // mgcv handles zero penalties exactly in the null-space
-            sb.scaled_add(lambdas[i], &s_current_sub_block);
+            // Use lambda weighting for transformation eigenvectors
+            sb_for_transform.scaled_add(lambdas[i], &s_current_sub_block);
         }
 
-        // println!("DEBUG: Final sb matrix: {:?}", sb);
-
-        // Eigendecomposition to get rank and eigenvectors
-        let (eigenvalues, u): (Array1<f64>, Array2<f64>) = sb
+        // Eigendecomposition to get eigenvectors 'u' for the similarity transform
+        // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
+        let (_, u): (Array1<f64>, Array2<f64>) = sb_for_transform
             .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
-        // println!("DEBUG: Eigenvalues: {:?}", eigenvalues);
-        // println!("DEBUG: Eigenvectors: {:?}", u);
+        // Note: The stable rank detection debug message is already logged above
 
-        // Determine rank 'r' of the dominant sub-problem. This is done by counting
-        // the number of eigenvalues that are greater than a small tolerance
-        // relative to the largest eigenvalue. This correctly implements the logic
-        // from mgcv's C function `get_stableS`.
-        let max_eigenval = eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let rank_tolerance = max_eigenval * r_tol;
-        let r = eigenvalues.iter().filter(|&&ev| ev > rank_tolerance).count();
-
-        log::debug!(
-            "Rank determination: found rank {} from {} eigenvalues (largest eigenval: {}, tol: {})",
-            r,
-            eigenvalues.len(),
-            max_eigenval,
-            rank_tolerance
-        );
-
-        // Step 4: Check termination criterion
-        // This is the critical fix: when r == q_current on the first iteration,
-        // mgcv still performs the transformation and constructs the final outputs
-        // The key is to properly update the transformation matrices first
         log::debug!(
             "Rank detection: r={}, q_current={}, iteration={}",
             r,
@@ -897,15 +929,20 @@ pub fn stable_reparameterization(
             iteration
         );
 
-        // Step 5: Update global transformation matrix Qf
-        // For ascending order, we want the last r indices (largest eigenvalues)
-        // let selected_indices = &sorted_indices[q - r..];
+        // ---
+        // STEP 5A: REORDER THE EIGENVECTOR MATRIX `u` TO MATCH `mgcv`'s LOGIC
+        // `Eigh` returns eigenvalues in ascending order, so the eigenvectors for the range
+        // space (largest eigenvalues) are at the END of `u`. We reorder them to be first.
+        // The new basis is `U_reordered = [U_range | U_null]`.
+        // ---
+        let u_range = u.slice(s![.., q_current - r..]); // Last r columns
+        let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
+        let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])
+            .expect("Failed to reorder eigenvectors");
 
-        // Use the FULL eigenvector matrix for transformation, not truncated
-        // The transformation must be done with the full q_current x q_current matrix
-        // to maintain proper dimensions throughout the algorithm
+        // Step 5B: Update global transformation matrix Qf using the REORDERED basis
         let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
-        let qf_new = qf_block.dot(&u); // Use full eigenvector matrix u
+        let qf_new = qf_block.dot(&u_reordered);
         qf.slice_mut(s![.., k_offset..k_offset + q_current])
             .assign(&qf_new);
 
@@ -913,52 +950,68 @@ pub fn stable_reparameterization(
         // This is the core of the recursive update.
         for &i in &gamma {
             // Extract the current sub-problem block
-            let s_sub_block = s_current_list[i].slice(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]).to_owned();
+            let s_sub_block = s_current_list[i]
+                .slice(s![
+                    k_offset..k_offset + q_current,
+                    k_offset..k_offset + q_current
+                ])
+                .to_owned();
 
-            // Perform the similarity transform: U^T * S_sub * U
-            let transformed_sub_block = u.t().dot(&s_sub_block).dot(&u);
+            // Apply the similarity transform using the REORDERED basis: U_reordered^T * S_sub * U_reordered
+            let transformed_sub_block = u_reordered.t().dot(&s_sub_block).dot(&u_reordered);
 
             // Place it back into the full-size matrix
-            s_current_list[i].slice_mut(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]).assign(&transformed_sub_block);
+            s_current_list[i]
+                .slice_mut(s![
+                    k_offset..k_offset + q_current,
+                    k_offset..k_offset + q_current
+                ])
+                .assign(&transformed_sub_block);
         }
 
-        // Step 6: Transform ALL active penalty roots by the full eigenvector matrix U.
+        // Step 6: Transform ALL active penalty roots by the REORDERED eigenvector matrix U.
         // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.
         for &i in &gamma {
-            if rs_current[i].ncols() == 0 { continue; }
+            if rs_current[i].ncols() == 0 {
+                continue;
+            }
 
-            let c_matrix = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]).to_owned();
-            let b_matrix = u.t().dot(&c_matrix);
-            
+            let c_matrix = rs_current[i]
+                .slice(s![k_offset..k_offset + q_current, ..])
+                .to_owned();
+            let b_matrix = u_reordered.t().dot(&c_matrix); // U_reordered' * rS_sub
+
             // Assign the fully transformed block back into the main rs_current matrix.
             rs_current[i]
                 .slice_mut(s![k_offset..k_offset + q_current, ..])
                 .assign(&b_matrix);
         }
 
-        // Step 7: Partition the newly transformed space. This is the core of the algorithm.
-        // We zero out the parts of the penalty matrices that are irrelevant for subsequent,
-        // smaller sub-problems.
+        // ---
+        // STEP 7: CORRECTED PARTITIONING LOGIC
+        // After transforming with `u_reordered`, the first `r` rows correspond to the range
+        // space, and the last `q_current - r` rows correspond to the null space.
+        // ---
         for &i in &gamma {
-            if rs_current[i].ncols() == 0 { continue; }
+            if rs_current[i].ncols() == 0 {
+                continue;
+            }
 
             if alpha.contains(&i) {
-                // If a penalty was DOMINANT, its effect is now entirely within the range space
-                // (the first `r` dimensions of the new basis). Its projection onto the
-                // null space (the remaining `q_current - r` dimensions) must be zeroed out.
+                // DOMINANT penalty: Its effect is now entirely within the range space.
+                // We must zero out its projection onto the null space.
+                // The null space is now the LAST `q_current - r` rows of the sub-block.
                 if r < q_current {
                     rs_current[i].slice_mut(s![k_offset + r.., ..]).fill(0.0);
                 }
-            } else { // This penalty was SUB-DOMINANT (in gamma_prime).
-                // Its effect is now entirely within the null space. Its projection onto
-                // the range space must be zeroed out.
-                rs_current[i].slice_mut(s![k_offset..k_offset + r, ..]).fill(0.0);
+            } else {
+                // SUB-DOMINANT penalty (in gamma_prime).
+                // Its effect is carried forward in the null space.
+                // We must zero out its projection onto the range space.
+                // The range space is now the FIRST `r` rows of the sub-block.
+                rs_current[i]
+                    .slice_mut(s![k_offset..k_offset + r, ..])
+                    .fill(0.0);
             }
         }
 

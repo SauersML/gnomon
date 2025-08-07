@@ -1208,7 +1208,7 @@ pub mod internal {
                         // Use transformed penalty matrix (consistent with other calculations)
                         let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
                         let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
-                        
+
                         // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
                         let dbeta_drho_k_transformed =
                             -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
@@ -1217,16 +1217,19 @@ pub mod internal {
                         // Component 1: Derivative of the Penalized Deviance (MISSING TERM!)
                         // This corresponds to `oo$D1/(2*scale)` in mgcv
                         // ---
-                        
+
                         // Calculate d(Deviance)/dρ_k using the chain rule
-                        let d_deviance_d_rho_k = deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
-                        
+                        let d_deviance_d_rho_k =
+                            deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
+
                         // Calculate d(β'Sβ)/dρ_k - both indirect and direct parts
                         // Indirect part: (∂(β'Sβ)/∂β) * (∂β/∂ρ_k) = (2Sβ)' * (∂β/∂ρ_k)
                         let s_beta_transformed = reparam_result.s_transformed.dot(beta_transformed);
-                        let d_penalty_indirect = 2.0 * s_beta_transformed.dot(&dbeta_drho_k_transformed);
+                        let d_penalty_indirect =
+                            2.0 * s_beta_transformed.dot(&dbeta_drho_k_transformed);
                         // Direct part: β'(∂S/∂ρ_k)β = λ_k * β'S_kβ
-                        let d_penalty_direct = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
+                        let d_penalty_direct =
+                            lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
                         let d_penalty_d_rho_k = d_penalty_indirect + d_penalty_direct;
 
                         // Total derivative of the penalized deviance
@@ -1255,10 +1258,11 @@ pub mod internal {
                             let h_inv_col = solver.solve(&s_col.to_owned())?;
                             trace_h_inv_s_k += h_inv_col[j];
                         }
-                        let log_det_h_grad_term = 0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
+                        let log_det_h_grad_term =
+                            0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
 
                         // ---
-                        // Component 3: Derivative of log|S| 
+                        // Component 3: Derivative of log|S|
                         // This corresponds to `-rp$det1/2` in mgcv
                         // ---
                         let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
@@ -1269,7 +1273,7 @@ pub mod internal {
                         // ---
                         cost_gradient[k] = penalized_deviance_grad_term  // Term 1: 0.5 * d(D_p)/dρ
                                          + log_det_h_grad_term           // Term 2: 0.5 * d(log|H|)/dρ  
-                                         - log_det_s_grad_term;          // Term 3: -0.5 * d(log|S|)/dρ
+                                         - log_det_s_grad_term; // Term 3: -0.5 * d(log|S|)/dρ
                     }
                     log::debug!("LAML gradient computation finished.");
                 }
@@ -2090,8 +2094,8 @@ pub mod internal {
             };
 
             // Build the layout to programmatically find penalty indices
-            let (_, _, layout, _, _) =
-                build_design_and_penalty_matrices(&data, &config).expect("Failed to build layout for test");
+            let (_, _, layout, _, _) = build_design_and_penalty_matrices(&data, &config)
+                .expect("Failed to build layout for test");
 
             // Train the model
             let trained_model = train_model(&data, &config).expect("Model training should succeed");
@@ -2103,10 +2107,11 @@ pub mod internal {
                 trained_model.lambdas.len() >= 2,
                 "Model should have at least 2 smoothing parameters (for PC1 and PC2)"
             );
-            
+
             // Programmatically find the penalty indices for PC1 (signal) and PC2 (noise)
             let find_penalty_index = |term_name: &str| -> usize {
-                layout.penalty_map
+                layout
+                    .penalty_map
                     .iter()
                     .find(|block| block.term_name == term_name)
                     .expect(&format!("Could not find block for term '{}'", term_name))
@@ -2155,8 +2160,8 @@ pub mod internal {
 
             // Define an ADDITIVE + INTERACTION function to match the model
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = (pgs_val * 0.8).sin() * 0.5;   // sin effect for PGS
-                let pc_effect = 0.4 * pc_val.powi(2);          // quadratic effect for PC
+                let pgs_effect = (pgs_val * 0.8).sin() * 0.5; // sin effect for PGS
+                let pc_effect = 0.4 * pc_val.powi(2); // quadratic effect for PC
                 let interaction_effect = 0.3 * pgs_val * pc_val; // NEW: Interaction term
                 0.2 + pgs_effect + pc_effect + interaction_effect // Additive + Interaction
             };
@@ -2612,7 +2617,7 @@ pub mod internal {
             if pc1_heavy_cost != f64::MAX && pc2_heavy_cost != f64::MAX {
                 let cost_difference = pc1_heavy_cost - pc2_heavy_cost;
                 let min_meaningful_difference = 1e-6; // Minimum difference to be considered significant
-                
+
                 // The cost should be meaningfully lower when we penalize the noise term heavily
                 assert!(
                     cost_difference > min_meaningful_difference,
@@ -3238,14 +3243,14 @@ pub mod internal {
 
             // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases.
             let pgs_interaction_bases = pgs_n_basis - 1; // Unconstrained main basis: 6 - 1 = 5
-            let pc_interaction_bases = pc_n_basis - 1;   // Unconstrained main basis: 5 - 1 = 4
+            let pc_interaction_bases = pc_n_basis - 1; // Unconstrained main basis: 5 - 1 = 4
             let interaction_coeffs = pgs_interaction_bases * pc_interaction_bases; // CORRECT: 5 * 4 = 20
 
             let expected_coeffs = 1 // intercept
                 + pgs_main_coeffs         // 4
                 + pc_main_coeffs          // 3
-                + interaction_coeffs;     // 20
-                // Total = 1 + 4 + 3 + 20 = 28
+                + interaction_coeffs; // 20
+            // Total = 1 + 4 + 3 + 20 = 28
 
             assert_eq!(
                 layout.total_coeffs, expected_coeffs,

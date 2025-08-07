@@ -681,7 +681,7 @@ mod tests {
             pc_names,
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
-            };
+        };
 
         // 5. Train models
         println!("Training model on clean data...");
@@ -967,9 +967,9 @@ mod tests {
                 pgs_mean: 0.0,
                 pgs_std: 0.8,
                 proportion: 0.5,
-                admixture_proportion: 0.1,   // 10% admixed
-                admixture_target: 1,         // With population 2
-                admixture_degree: 0.3,       // 30% admixture
+                admixture_proportion: 0.1, // 10% admixed
+                admixture_target: 1,       // With population 2
+                admixture_degree: 0.3,     // 30% admixture
             },
             // Population 2 (African ancestry)
             AncestryCluster {
@@ -982,9 +982,9 @@ mod tests {
                 pgs_mean: 0.2, // Higher mean PGS
                 pgs_std: 0.9,
                 proportion: 0.3,
-                admixture_proportion: 0.15,  // 15% admixed
-                admixture_target: 0,         // With population 1
-                admixture_degree: 0.25,      // 25% admixture
+                admixture_proportion: 0.15, // 15% admixed
+                admixture_target: 0,        // With population 1
+                admixture_degree: 0.25,     // 25% admixture
             },
             // Population 3 (East Asian ancestry)
             AncestryCluster {
@@ -997,9 +997,9 @@ mod tests {
                 pgs_mean: -0.3, // Lower mean PGS
                 pgs_std: 0.7,
                 proportion: 0.2,
-                admixture_proportion: 0.05,   // 5% admixed
-                admixture_target: 0,          // With population 1
-                admixture_degree: 0.2,        // 20% admixture
+                admixture_proportion: 0.05, // 5% admixed
+                admixture_target: 0,        // With population 1
+                admixture_degree: 0.2,      // 20% admixture
             },
         ];
 
