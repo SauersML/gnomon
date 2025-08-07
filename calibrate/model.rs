@@ -326,10 +326,10 @@ mod internal {
             for pc_idx in 0..config.pc_names.len() {
                 let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
 
-                // For interactions, use the CONSTRAINED pgs_main_basis for the tensor product
-                // to ensure orthogonality with main effects
+                // For interactions, use the UNCONSTRAINED pgs_main_basis_unc for the tensor product
+                // to match the training logic and ensure dimensional consistency
                 let tensor_interaction =
-                    row_wise_tensor_product(&pgs_main_basis, pc_unconstrained_basis);
+                    row_wise_tensor_product(&pgs_main_basis_unc, pc_unconstrained_basis);
 
                 // Add all columns from this tensor product to the design matrix
                 for col in tensor_interaction.axis_iter(Axis(1)) {

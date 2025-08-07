@@ -477,7 +477,7 @@ pub fn build_design_and_penalty_matrices(
             // This replaces the flawed "dimple-maker" approach with proper 2D basis functions
             let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
             let tensor_interaction =
-                row_wise_tensor_product(&pgs_main_basis, pc_unconstrained_basis);
+                row_wise_tensor_product(&pgs_main_basis_unc, pc_unconstrained_basis);
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
