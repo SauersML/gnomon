@@ -1014,6 +1014,29 @@ pub fn stable_reparameterization(
                     .fill(0.0);
             }
         }
+        
+        // CRITICAL FIX: Apply the same zeroing to the full S matrices.
+        // This prevents dominant penalty information from contaminating the next iteration's
+        // basis calculation (the cause of the numerical instability).
+        for &i in &gamma {
+            if alpha.contains(&i) {
+                // DOMINANT penalty: Zero out its null-space block.
+                if r < q_current {
+                    // Zero out the null-space rows and columns (bottom-right block)
+                    s_current_list[i].slice_mut(s![k_offset + r.., k_offset + r..]).fill(0.0);
+                    // Zero out the off-diagonal blocks connecting range and null spaces
+                    s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset + r..]).fill(0.0);
+                    s_current_list[i].slice_mut(s![k_offset + r.., k_offset..k_offset + r]).fill(0.0);
+                }
+            } else {
+                // SUB-DOMINANT penalty: Zero out its range-space block.
+                // Zero out the range-space rows and columns (top-left block)
+                s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset..k_offset + r]).fill(0.0);
+                // Zero out the off-diagonal blocks connecting range and null spaces
+                s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset + r..]).fill(0.0);
+                s_current_list[i].slice_mut(s![k_offset + r.., k_offset..k_offset + r]).fill(0.0);
+            }
+        }
 
         // Update for next iteration
         // Update iteration variables for next loop according to mgcv
