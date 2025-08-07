@@ -329,7 +329,7 @@ mod internal {
                 // For interactions, use the UNCONSTRAINED pgs_main_basis_unc for the tensor product
                 // to match the training logic and ensure dimensional consistency
                 let tensor_interaction =
-                    row_wise_tensor_product(&pgs_main_basis_unc, pc_unconstrained_basis);
+                    row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
 
                 // Add all columns from this tensor product to the design matrix
                 for col in tensor_interaction.axis_iter(Axis(1)) {
