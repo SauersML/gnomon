@@ -575,15 +575,15 @@ pub fn create_balanced_penalty_root(
     }
     
     // Validate penalty matrix dimensions
-    if s_list[0].nrows() != p {
-        return Err(EstimationError::LayoutError(format!(
-            "Penalty matrix dimension mismatch: expected {} columns, but found {}",
-            p,
-            s_list[0].nrows()
-        )));
+    for (idx, s) in s_list.iter().enumerate() {
+        if s.nrows() != p || s.ncols() != p {
+            return Err(EstimationError::LayoutError(format!(
+                "Penalty matrix {idx} must be {p}×{p}, got {}×{}",
+                s.nrows(),
+                s.ncols()
+            )));
+        }
     }
-
-    let p = s_list[0].nrows();
     let mut s_balanced = Array2::zeros((p, p));
 
     // Scale each penalty to have unit Frobenius norm and sum them

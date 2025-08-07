@@ -207,21 +207,48 @@ pub fn create_difference_penalty_matrix(
 pub fn apply_sum_to_zero_constraint(
     basis_matrix: ArrayView2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let n = basis_matrix.nrows();
     let k = basis_matrix.ncols();
     if k < 2 {
-        return Err(BasisError::InsufficientColumnsForConstraint { found: k }); // cannot constrain a single column
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
     }
 
-    // --- build a full-rank null-space basis for 1ᵀ --------------------------
-    // Z has k rows and k-1 columns; each column sums to zero and the k-1 cols
-    // are linearly independent, so B·Z drops exactly one dof (the mean).
-    let mut z = Array2::<f64>::zeros((k, k - 1));
-    for j in 0..k - 1 {
-        z[[j, j]] = 1.0; // identity block
-        z[[k - 1, j]] = -1.0; // last row makes column sum zero
-    }
+    // c = B^T 1
+    let ones = Array1::ones(n);
+    let c = basis_matrix.t().dot(&ones); // shape k
 
-    // project the original basis
+    // Orthonormal basis for nullspace of c^T
+    // Build a k×1 matrix and compute its QR; the Q columns after the first
+    // form an orthonormal basis for the nullspace.
+    let mut c_mat = Array2::<f64>::zeros((k, 1));
+    c_mat.column_mut(0).assign(&c);
+
+    use ndarray_linalg::QR;
+    let (q, _r) = c_mat.qr().map_err(BasisError::LinalgError)?;
+    // q is k×1; build an orthonormal complement
+    // One simple way: compute full QR of an identity and remove span(c)
+    // Here, for clarity, form an orthonormal basis via SVD of the projector:
+    use ndarray_linalg::SVD;
+    let i_k = Array2::<f64>::eye(k);
+    let proj = i_k - q.dot(&q.t()); // projector onto nullspace(c^T)
+    let (_u, s, v_t) = proj.svd(true, true).map_err(BasisError::LinalgError)?;
+    let tol = s.iter().fold(0.0f64, |m, &v| m.max(v)) * 1e-10;
+    // Columns of V corresponding to singular values ~1 span the nullspace
+    let v = v_t.unwrap().t().to_owned(); // k×k
+    let mut keep: Vec<usize> = Vec::new();
+    for (i, &sv) in s.iter().enumerate() {
+        if (sv - 1.0).abs() < tol {
+            keep.push(i);
+        }
+    }
+    if keep.is_empty() {
+        return Err(BasisError::LinalgError(
+            ndarray_linalg::error::LinalgError::NotSquare { rows: k as i32, cols: k as i32 },
+        ));
+    }
+    let z = v.select(Axis(1), &keep); // k×(k-1) typically
+
+    // Constrained basis
     let constrained = basis_matrix.dot(&z);
     Ok((constrained, z))
 }

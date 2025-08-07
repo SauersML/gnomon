@@ -681,8 +681,9 @@ pub mod internal {
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
                     let log_det_s_plus = pirls_result.reparam_result.log_det;
-                    // rank calculation is implicitly handled by the stable reparameterization
-                    let mp = (self.layout.total_coeffs - self.layout.num_penalties) as f64;
+                    // Correct Mp calculation - nullspace dimension of penalty matrix
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)

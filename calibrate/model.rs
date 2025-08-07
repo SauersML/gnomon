@@ -318,8 +318,9 @@ mod internal {
         }
 
         // 4. Tensor product interaction effects (conditionally)
-        // Only create interaction terms if we have PCs and the unconstrained PGS basis has columns
-        let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
+        // Only create interaction terms if we have PCs and the constrained PGS basis has columns
+        // Use constrained basis count to match training logic in construction.rs
+        let num_pgs_interaction_bases = pgs_main_basis.ncols();
         if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
             // Create unified interaction surfaces using row-wise tensor products
             for pc_idx in 0..config.pc_names.len() {
