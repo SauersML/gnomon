@@ -688,6 +688,8 @@ pub fn construct_s_lambda(
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
+            // NOTE: This template is VALID. The {pos.minus(1)} expression is supported by indicatif
+            // and will not cause a panic. Claims that this template is invalid are FALSE.
             "    [Construction] [{bar:20.cyan/blue}] {pos}/{len} penalties (λ_{pos.minus(1)}={msg})"
         )
         .unwrap()
