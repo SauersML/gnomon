@@ -322,7 +322,7 @@ mod internal {
         let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
         if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
             // Create unified interaction surfaces using row-wise tensor products
-            for (pc_idx, _pc_name) in config.pc_names.iter().enumerate() {
+            for pc_idx in 0..config.pc_names.len() {
                 let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
 
                 // For interactions, use the CONSTRAINED pgs_main_basis for the tensor product

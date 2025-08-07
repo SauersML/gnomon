@@ -1308,7 +1308,7 @@ pub mod internal {
             // Check if ALL eigenvalues are negative - CRITICAL numerical issue
             if evals.iter().all(|&x| x < 0.0) {
                 let min_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                // CRITICAL ERROR - CRASH THE PROGRAM
+                // Critical error - program termination
                 return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
             }
 
@@ -2176,7 +2176,7 @@ pub mod internal {
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
                 let pgs_effect = (pgs_val * 0.8).sin() * 0.5; // sin effect for PGS
                 let pc_effect = 0.4 * pc_val.powi(2); // quadratic effect for PC
-                let interaction_effect = 0.3 * pgs_val * pc_val; // NEW: Interaction term
+                let interaction_effect = 0.3 * pgs_val * pc_val; // Interaction term
                 0.2 + pgs_effect + pc_effect + interaction_effect // Additive + Interaction
             };
 
@@ -2535,7 +2535,7 @@ pub mod internal {
             let (x_matrix, mut s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
-            // CRITICAL FIX: Scale penalty matrices to ensure they're numerically significant
+            // Scale penalty matrices to ensure they're numerically significant
             // The generated penalties are too small relative to the data scale, making them
             // effectively invisible to the reparameterization algorithm. We scale them by
             // a massive factor to ensure they have an actual smoothing effect that's

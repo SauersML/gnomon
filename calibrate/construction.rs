@@ -107,7 +107,7 @@ impl ModelLayout {
         let p_pgs_main = pgs_main_basis_ncols;
         let p_pc_main: usize = pc_constrained_basis_ncols.iter().sum();
         // For tensor product interactions: each PC gets num_pgs_bases * num_pc_bases coefficients
-        // CRITICAL FIX: Use UNCONSTRAINED dimensions for interaction calculations
+        // Use unconstrained dimensions for interaction calculations
         let p_interactions: usize = pc_unconstrained_basis_ncols
             .iter()
             .map(|&num_pc_basis_unc| num_pgs_interaction_bases * num_pc_basis_unc)
@@ -1008,7 +1008,7 @@ pub fn stable_reparameterization(
         }
 
         // ---
-        // STEP 7: CORRECTED PARTITIONING LOGIC
+        // Step 7: Partitioning logic
         // After transforming with `u_reordered`, the first `r` rows correspond to the range
         // space, and the last `q_current - r` rows correspond to the null space.
         // ---
@@ -1035,7 +1035,7 @@ pub fn stable_reparameterization(
             }
         }
         
-        // CRITICAL FIX: Apply the same zeroing to the full S matrices.
+        // Apply the same zeroing to the full S matrices.
         // This prevents dominant penalty information from contaminating the next iteration's
         // basis calculation (the cause of the numerical instability).
         for &i in &gamma {
