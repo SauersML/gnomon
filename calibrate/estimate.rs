@@ -4303,10 +4303,49 @@ impl From<EstimationError> for String {
     }
 }
 
+// === Centralized Test Helper Module ===
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+
+    /// Generates a realistic, non-separable binary outcome vector 'y' from a vector of predictors.
+    pub(super) fn generate_realistic_binary_data(
+        predictors: &Array1<f64>,
+        steepness: f64,
+        intercept: f64,
+        noise_level: f64,
+        rng: &mut StdRng,
+    ) -> Array1<f64> {
+        let midpoint = (predictors.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+            + predictors.iter().fold(f64::INFINITY, |a, &b| a.min(b)))
+            / 2.0;
+        predictors.mapv(|val| {
+            let logit = intercept
+                + steepness * (val - midpoint)
+                + rng.gen_range(-noise_level..noise_level);
+            let clamped_logit = logit.clamp(-10.0, 10.0);
+            let prob = 1.0 / (1.0 + (-clamped_logit).exp());
+            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        })
+    }
+
+    /// Generates a non-separable binary outcome vector 'y' from a vector of logits.
+    pub(super) fn generate_y_from_logit(logits: &Array1<f64>, rng: &mut StdRng) -> Array1<f64> {
+        logits.mapv(|logit| {
+            let clamped_logit = logit.clamp(-10.0, 10.0);
+            let prob = 1.0 / (1.0 + (-clamped_logit).exp());
+            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        })
+    }
+}
+
 // === New tests: Verify BFGS makes progress beyond the initial guess on easy data ===
 #[cfg(test)]
 mod optimizer_progress_tests {
     use super::*;
+    use super::test_helpers;
     use crate::calibrate::model::BasisConfig;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -4322,43 +4361,29 @@ mod optimizer_progress_tests {
     }
 
     fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
-        // 1) Generate well-behaved data with clear signal on PC1
+        // 1) Generate well-behaved data with a clear, non-linear signal on PC1.
+        // The PGS predictor ('p') is included but is uncorrelated with the outcome.
         let n_samples = 500;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let p = Array1::linspace(-3.0, 3.0, n_samples);
+        // Signal predictor: PC1 has a clear sine wave signal.
         let pc1 = Array1::linspace(-3.0, 3.0, n_samples);
+        // Noise predictor: PGS is random noise, uncorrelated with PC1 and the outcome.
+        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-3.0..3.0));
 
-        // Smooth, non-linear signal that requires smoothing
+        // The true, underlying, smooth signal the model should find.
         let true_signal = pc1.mapv(|x: f64| (1.5 * x).sin() * 2.0);
 
         let y = match link_function {
             LinkFunction::Logit => {
-                // Local copy of generate_realistic_binary_data to avoid cross-module visibility issues
-                fn bernoulli_from_predictor(
-                    predictors: &Array1<f64>,
-                    steepness: f64,
-                    intercept: f64,
-                    noise_level: f64,
-                    rng: &mut StdRng,
-                ) -> Array1<f64> {
-                    let min = predictors.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                    let max = predictors.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                    let midpoint = (min + max) / 2.0;
-                    predictors.mapv(|val| {
-                        let logit = intercept
-                            + steepness * (val - midpoint)
-                            + rng.gen_range(-noise_level..noise_level);
-                        let clamped = logit.clamp(-10.0, 10.0);
-                        let prob = 1.0 / (1.0 + (-clamped).exp());
-                        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-                    })
-                }
-
-                bernoulli_from_predictor(&pc1, 1.5, 0.0, 2.0, &mut rng)
+                let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.2..0.2));
+                // True log-odds = sine wave + noise. Clamp to avoid quasi-separation.
+                let true_logits = (&true_signal + &noise).mapv(|v| v.clamp(-8.0, 8.0));
+                // Use the shared, robust helper to generate a non-separable binary outcome.
+                test_helpers::generate_y_from_logit(&true_logits, &mut rng)
             }
             LinkFunction::Identity => {
-                // Continuous outcome with mild noise
+                // Continuous outcome = sine wave + mild Gaussian noise.
                 let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.2..0.2));
                 &true_signal + &noise
             }
@@ -4367,9 +4392,9 @@ mod optimizer_progress_tests {
         // Assemble PCs matrix with a single PC carrying the signal
         let mut pcs = Array2::zeros((n_samples, 1));
         pcs.column_mut(0).assign(&pc1);
-        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n_samples) };
+        let data = TrainingData { y, p, pcs, weights: Array1::ones(n_samples) };
 
-        // 2) Configure a simple, stable model: 1 PC main effect + interactions present (but with no true interaction signal)
+        // 2) Configure a simple, stable model. It includes penalties for PC1, PGS, and the interaction.
         let config = ModelConfig {
             link_function,
             penalty_order: 2,
@@ -4379,8 +4404,8 @@ mod optimizer_progress_tests {
             reml_max_iterations: 50,
             pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
             pc_basis_configs: vec![BasisConfig { num_knots: 6, degree: 3 }],
-            pgs_range: (-3.0, 3.0),
-            pc_ranges: vec![(-3.0, 3.0)],
+            pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
+            pc_ranges: vec![(-3.5, 3.5)],
             pc_names: vec!["PC1".to_string()],
             constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
