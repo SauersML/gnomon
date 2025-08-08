@@ -1493,6 +1493,7 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use super::test_helpers;
         use crate::calibrate::model::BasisConfig;
         use approx::assert_abs_diff_eq;
         use ndarray::Array;
@@ -1500,20 +1501,8 @@ pub mod internal {
         use rand;
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
-
-        /// Generates a non-separable binary outcome vector 'y' from a vector of logits.
-        ///
-        /// This is a simplified helper function that takes logits (log-odds) and produces
-        /// binary outcomes based on the corresponding probabilities, with randomization to
-        /// avoid perfect separation problems in logistic regression.
-        ///
-        /// Parameters:
-        /// - logits: Array of logit values (log-odds)
-        /// - rng: Random number generator with a fixed seed for reproducibility
-        ///
-        /// Returns:
-        /// - Array1<f64>: Binary outcome array (0.0 or 1.0 values)
-        /// Generates a realistic, non-separable binary outcome vector 'y' from a vector of predictors.
+        // The generate_realistic_binary_data and generate_y_from_logit functions
+        // have been moved to the shared test_helpers module
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
@@ -1529,30 +1518,7 @@ pub mod internal {
         ///
         /// # Returns
         /// An `Array1<f64>` of binary outcomes (0.0 or 1.0).
-        fn generate_realistic_binary_data(
-            predictors: &Array1<f64>,
-            steepness: f64,
-            intercept: f64,
-            noise_level: f64,
-            rng: &mut StdRng,
-        ) -> Array1<f64> {
-            let midpoint = (predictors.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
-                + predictors.iter().fold(f64::INFINITY, |a, &b| a.min(b)))
-                / 2.0;
-            predictors.mapv(|val| {
-                // Create a smooth logit with added noise
-                let logit = intercept
-                    + steepness * (val - midpoint)
-                    + rng.gen_range(-noise_level..noise_level);
-
-                // Clamp the logit to prevent extreme probabilities that can cause numerical instability
-                let clamped_logit = logit.clamp(-10.0, 10.0);
-                let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-
-                // Use randomization to generate the final binary outcome
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-            })
-        }
+        // Function generate_realistic_binary_data has been moved to test_helpers module
 
         /// Generates a non-separable binary outcome vector 'y' from a vector of logits.
         ///
@@ -1566,16 +1532,7 @@ pub mod internal {
         ///
         /// Returns:
         /// - Array1<f64>: Binary outcome array (0.0 or 1.0 values)
-        fn generate_y_from_logit(logits: &Array1<f64>, rng: &mut StdRng) -> Array1<f64> {
-            logits.mapv(|logit| {
-                // Clamp logits to prevent extreme probabilities that can cause instability
-                let clamped_logit = logit.clamp(-10.0, 10.0);
-                let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-
-                // Use randomization to generate the final binary outcome
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-            })
-        }
+        // Function generate_y_from_logit has been moved to test_helpers module
 
         /// Generates stable, well-posed synthetic data for testing GAM fitting.
         ///
@@ -1618,7 +1575,7 @@ pub mod internal {
                 LinkFunction::Logit => {
                     let logits = &true_signal + &noise;
                     // Use a helper that ensures non-perfect separation
-                    generate_y_from_logit(&logits, &mut rng)
+                    test_helpers::generate_y_from_logit(&logits, &mut rng)
                 }
                 LinkFunction::Identity => &true_signal + &noise,
             };
@@ -2400,7 +2357,7 @@ pub mod internal {
                 + &(&p * &pc3) * 0.2;
 
             // Generate binary outcomes
-            let y = generate_y_from_logit(&true_logits, &mut rng);
+            let y = test_helpers::generate_y_from_logit(&true_logits, &mut rng);
 
             // --- 2. Create configuration ---
             let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
@@ -3518,7 +3475,7 @@ pub mod internal {
                     LinkFunction::Identity => p.clone(), // y = p
                     LinkFunction::Logit => {
                         // Use less steep function with more noise to create class overlap
-                        generate_realistic_binary_data(&p, 2.0, 0.0, 1.5, &mut rng)
+                        test_helpers::generate_realistic_binary_data(&p, 2.0, 0.0, 1.5, &mut rng)
                     }
                 };
                 let pcs = Array2::zeros((n_samples, 0));
@@ -3626,7 +3583,7 @@ pub mod internal {
                     }
                     LinkFunction::Logit => {
                         // Use our helper function with controlled parameters to prevent separation
-                        generate_realistic_binary_data(
+                        test_helpers::generate_realistic_binary_data(
                             &p,  // predictor values
                             1.5, // moderate steepness
                             0.0, // zero intercept
