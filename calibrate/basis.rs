@@ -57,6 +57,9 @@ pub enum BasisError {
 
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] ndarray_linalg::error::LinalgError),
+
+    #[error("Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis.")]
+    ConstraintNullspaceNotFound,
 }
 
 /// Creates a B-spline basis expansion matrix and its corresponding knot vector.
