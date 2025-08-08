@@ -36,6 +36,9 @@ pub struct TrainingData {
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
+    /// The prior weights vector, from the optional 'weights' column.
+    /// If no weights column is provided, defaults to all 1.0.
+    pub weights: Array1<f64>,
 }
 
 /// A container for validated data ready for prediction.
@@ -79,15 +82,15 @@ pub enum DataError {
 
 /// Loads and validates data specifically for model training.
 pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, DataError> {
-    let (p, pcs, y_opt) = internal::load_data(path, num_pcs, true)?;
+    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true)?;
     // This unwrap is safe because we passed `include_phenotype: true`.
     let y = y_opt.unwrap();
-    Ok(TrainingData { y, p, pcs })
+    Ok(TrainingData { y, p, pcs, weights })
 }
 
 /// Loads and validates data specifically for prediction.
 pub fn load_prediction_data(path: &str, num_pcs: usize) -> Result<PredictionData, DataError> {
-    let (p, pcs, _) = internal::load_data(path, num_pcs, false)?;
+    let (p, pcs, _, _) = internal::load_data(path, num_pcs, false)?;
     Ok(PredictionData { p, pcs })
 }
 
@@ -103,7 +106,7 @@ mod internal {
         path: &str,
         num_pcs: usize,
         include_phenotype: bool,
-    ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>), DataError> {
+    ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>, Array1<f64>), DataError> {
         // --- 1. Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
@@ -146,7 +149,13 @@ mod internal {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
+        
+        // Check if optional weights column exists
+        let has_weights = columns_set.contains("weights");
         println!("All required columns found: {required_cols:?}");
+        if has_weights {
+            println!("Optional 'weights' column found.");
+        }
 
         // --- 3. Convert columns efficiently to ndarray structures ---
 
@@ -273,10 +282,58 @@ mod internal {
         let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
             .expect("PC arrays should have consistent dimensions");
 
+        // Process optional weights column
+        let weights = if has_weights {
+            let weights_series = df.column("weights")?;
+            if weights_series.null_count() > 0 {
+                return Err(DataError::MissingValuesFound("weights".to_string()));
+            }
+
+            // Convert to f64
+            let weights_casted = match weights_series.cast(&DataType::Float64) {
+                Ok(casted) => casted,
+                Err(_) => {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "f64 (numeric)",
+                        found_type: format!("{:?}", weights_series.dtype()),
+                    });
+                }
+            };
+
+            // Check for nulls AFTER casting to detect non-numeric values
+            if weights_casted.null_count() > 0 {
+                return Err(DataError::ColumnWrongType {
+                    column_name: "weights".to_string(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", weights_series.dtype()),
+                });
+            }
+
+            // Convert to ndarray
+            let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+
+            // Validate that all weights are non-negative
+            for (i, &weight) in weights_array.iter().enumerate() {
+                if weight < 0.0 {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "non-negative f64 values",
+                        found_type: format!("negative value {} at row {}", weight, i + 1),
+                    });
+                }
+            }
+
+            weights_array
+        } else {
+            // Default to all weights = 1.0
+            Array1::ones(pgs.len())
+        };
+
         println!(
             "Data validation successful: all required columns have numeric data with no missing values."
         );
-        Ok((pgs, pcs, phenotype_opt))
+        Ok((pgs, pcs, phenotype_opt, weights))
     }
 }
 

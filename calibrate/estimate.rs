@@ -127,7 +127,7 @@ pub fn train_model(
     // --- Setup the unified state and computation object ---
     // This now encapsulates everything needed for the optimization.
     let reml_state =
-        internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, config)?;
+        internal::RemlState::new(data.y.view(), x_matrix.view(), data.weights.view(), s_list, &layout, config)?;
 
     // Define the initial guess for log-smoothing parameters (rho)
     let initial_rho = Array1::from_elem(layout.num_penalties, 1.0);
@@ -247,6 +247,7 @@ pub fn train_model(
         final_rho.view(),
         reml_state.x(), // Use original X
         reml_state.y(),
+        reml_state.weights(), // Pass weights
         reml_state.rs_list_ref(), // Pass original penalty matrices
         &layout,
         config,
@@ -403,6 +404,7 @@ pub mod internal {
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
+        weights: ArrayView1<'a, f64>,
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
@@ -416,6 +418,7 @@ pub mod internal {
         pub(super) fn new(
             y: ArrayView1<'a, f64>,
             x: ArrayView2<'a, f64>,
+            weights: ArrayView1<'a, f64>,
             s_list: Vec<Array2<f64>>,
             layout: &'a ModelLayout,
             config: &'a ModelConfig,
@@ -426,6 +429,7 @@ pub mod internal {
             Ok(Self {
                 y,
                 x,
+                weights,
                 rs_list,
                 layout,
                 config,
@@ -447,6 +451,10 @@ pub mod internal {
 
         pub(super) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
             &self.rs_list
+        }
+
+        pub(super) fn weights(&self) -> ArrayView1<'a, f64> {
+            self.weights
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
@@ -475,6 +483,7 @@ pub mod internal {
                 rho.view(),
                 self.x.view(),
                 self.y,
+                self.weights,
                 &self.rs_list,
                 self.layout,
                 self.config,
@@ -1155,6 +1164,7 @@ pub mod internal {
                         self.y,
                         &eta,
                         self.config.link_function,
+                        self.weights,
                     );
 
                     // Calculate the gradient of the unpenalized deviance w.r.t. beta
@@ -1616,7 +1626,7 @@ pub mod internal {
             // Dummy PGS data (not used in this test's logic)
             let p = Array1::zeros(n_samples);
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             let config = ModelConfig {
                 link_function,
@@ -1868,7 +1878,7 @@ pub mod internal {
                 })
                 .collect();
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Train the model
             let mut config = create_test_config();
@@ -1965,12 +1975,14 @@ pub mod internal {
                 y: y.slice(ndarray::s![..n_train]).to_owned(),
                 p: p.slice(ndarray::s![..n_train]).to_owned(),
                 pcs: pcs.slice(ndarray::s![..n_train, ..]).to_owned(),
+                weights: Array1::ones(n_train),
             };
 
             let test_data = TrainingData {
                 y: y.slice(ndarray::s![n_train..]).to_owned(),
                 p: p.slice(ndarray::s![n_train..]).to_owned(),
                 pcs: pcs.slice(ndarray::s![n_train.., ..]).to_owned(),
+                weights: Array1::ones(y.len() - n_train),
             };
 
             let test_true_probabilities = Array1::from(true_probabilities[n_train..].to_vec());
@@ -2047,7 +2059,7 @@ pub mod internal {
                 }
             });
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Configure model to include both PC terms
             let config = ModelConfig {
@@ -2168,7 +2180,7 @@ pub mod internal {
                 })
                 .collect();
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Train model
             let mut config = create_test_config();
@@ -2391,7 +2403,7 @@ pub mod internal {
             let y = generate_y_from_logit(&true_logits, &mut rng);
 
             // --- 2. Create configuration ---
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
             let mut config = create_test_config();
             config.pc_names = vec!["PC1".to_string(), "PC2".to_string(), "PC3".to_string()];
             config.pc_basis_configs = vec![
@@ -2471,7 +2483,7 @@ pub mod internal {
                 signal + noise
             });
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // --- 2. Model Configuration ---
             let config = ModelConfig {
@@ -2536,7 +2548,7 @@ pub mod internal {
 
             // Create a reml_state that we'll use to evaluate costs
             let reml_state =
-                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config)
+                internal::RemlState::new(data.y.view(), x_matrix.view(), data.weights.view(), s_list, &layout, &config)
                     .unwrap();
 
             println!("Comparing costs when penalizing signal term (PC1) vs. noise term (PC2)");
@@ -2672,6 +2684,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs: Array2::zeros((n_samples, 0)), // No PCs for this simple test
+                weights: Array1::ones(n_samples),
             };
 
             // --- 2. Model Configuration ---
@@ -2770,7 +2783,7 @@ pub mod internal {
                 }
             });
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             let config = ModelConfig {
                 link_function: LinkFunction::Logit,
@@ -2812,6 +2825,7 @@ pub mod internal {
                 extreme_rho.view(),
                 x_matrix.view(),
                 data.y.view(),
+                data.weights.view(),
                 &rs_original,
                 &layout,
                 &config,
@@ -2887,7 +2901,7 @@ pub mod internal {
                 if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
             });
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Use the same config but smaller basis to speed up
             let config = ModelConfig {
@@ -2917,7 +2931,7 @@ pub mod internal {
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state =
-                internal::RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config)
+                internal::RemlState::new(data.y.view(), x_matrix.view(), data.weights.view(), s_list, &layout, &config)
                     .unwrap();
 
             // Try the initial rho = [0, 0] that causes the problem
@@ -2992,7 +3006,7 @@ pub mod internal {
             let p = Array1::zeros(n);
             let pcs = Array2::from_shape_fn((n, 8), |(i, j)| (i + j) as f64 / n as f64);
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Over-parameterized model: many knots and PCs for small dataset
             let mut config = create_test_config();
@@ -3095,7 +3109,7 @@ pub mod internal {
                 .unwrap()
                 .to_owned();
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // Create massively over-parameterized model
             let config = ModelConfig {
@@ -3187,6 +3201,7 @@ pub mod internal {
                 y: Array1::zeros(n_samples),
                 p: pgs,
                 pcs,
+                weights: Array1::ones(n_samples),
             };
 
             let config = ModelConfig {
@@ -3363,7 +3378,7 @@ pub mod internal {
             let pcs =
                 Array2::from_shape_fn((n_samples, 1), |(i, j)| if j == 0 { pc1[i] } else { 0.0 });
 
-            let training_data = TrainingData { y, p, pcs };
+            let training_data = TrainingData { y, p, pcs, weights: Array1::ones(n_samples) };
 
             // Create a minimal model config
             let config = ModelConfig {
@@ -3501,7 +3516,7 @@ pub mod internal {
                     }
                 };
                 let pcs = Array2::zeros((n_samples, 0));
-                let data = TrainingData { y, p, pcs };
+                let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
                 // 2. Define a SIMPLE config for a model with ONLY a PGS term.
                 let mut simple_config = create_test_config();
@@ -3529,6 +3544,7 @@ pub mod internal {
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
                     x_simple.view(), // Use the simple design matrix
+                    data.weights.view(),
                     s_list_simple,   // Use the simple penalty list
                     &layout_simple,  // Use the simple layout
                     &simple_config,
@@ -3615,7 +3631,7 @@ pub mod internal {
                 };
 
                 let pcs = Array2::zeros((n_samples, 0));
-                let data = TrainingData { y, p, pcs };
+                let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
                 // 1. Define a simple model config for a PGS-only model
                 let mut simple_config = create_test_config();
@@ -3637,6 +3653,7 @@ pub mod internal {
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
                     x_simple.view(),
+                    data.weights.view(),
                     s_list_simple,
                     &layout_simple,
                     &simple_config,
@@ -3797,7 +3814,7 @@ pub mod internal {
                 p_effect + pc_effect + rng.gen_range(-0.1..0.1) // Add noise
             });
 
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // 2. Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _) =
@@ -3808,6 +3825,7 @@ pub mod internal {
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
+                data.weights.view(),
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
@@ -3932,7 +3950,7 @@ pub mod internal {
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.clone();
             let pcs = Array2::zeros((n_samples, 0));
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // 1. Define a simple model config for a PGS-only model
             let mut simple_config = create_test_config();
@@ -3959,6 +3977,7 @@ pub mod internal {
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
+                data.weights.view(),
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
@@ -4030,7 +4049,7 @@ pub mod internal {
             let p = Array1::linspace(0.0, 1.0, n_samples);
             let y = p.mapv(|x| x * x); // Quadratic relationship
             let pcs = Array2::zeros((n_samples, 0));
-            let data = TrainingData { y, p, pcs };
+            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(p.len()) };
 
             // 1. Define a simple model config for a PGS-only model
             let mut simple_config = create_test_config();
@@ -4049,6 +4068,7 @@ pub mod internal {
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
+                data.weights.view(),
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
@@ -4112,7 +4132,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
     let p = Array1::linspace(-1.0, 1.0, n_samples);
     let y = p.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 }); // Perfect separation by PGS
     let pcs = Array2::zeros((n_samples, 0)); // No PCs for simplicity
-    let data = TrainingData { y, p, pcs };
+    let data = TrainingData { y, p, pcs, weights: Array1::ones(n_samples) };
 
     // 2. Configure a logit model
     let config = ModelConfig {
@@ -4177,7 +4197,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
     let y = Array1::from_shape_fn(n_samples, |i| i as f64 * 0.1);
     let p = Array1::zeros(n_samples);
     let pcs = Array2::zeros((n_samples, 1));
-    let data = TrainingData { y, p, pcs };
+    let data = TrainingData { y, p, pcs, weights: Array1::ones(n_samples) };
 
     // Create a basic config
     let config = ModelConfig {
@@ -4206,7 +4226,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
     if let Ok((x_matrix, s_list, layout, _, _)) = matrices_result {
         let reml_state_result =
-            RemlState::new(data.y.view(), x_matrix.view(), s_list, &layout, &config);
+            RemlState::new(data.y.view(), x_matrix.view(), data.weights.view(), s_list, &layout, &config);
 
         if let Ok(reml_state) = reml_state_result {
             // Test 1: Reasonable parameters should work

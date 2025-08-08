@@ -640,12 +640,14 @@ mod tests {
             y: y.clone(),
             p: pgs.clone(),
             pcs: pcs,
+            weights: Array1::ones(y.len()),
         };
 
         let data_noisy = crate::calibrate::data::TrainingData {
-            y,
+            y: y.clone(),
             p: pgs,
             pcs: pcs_noisy,
+            weights: Array1::ones(y.len()),
         };
 
         // 4. Create model configuration
