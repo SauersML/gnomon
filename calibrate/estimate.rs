@@ -4302,3 +4302,128 @@ impl From<EstimationError> for String {
         error.to_string()
     }
 }
+
+// === New tests: Verify BFGS makes progress beyond the initial guess on easy data ===
+#[cfg(test)]
+mod optimizer_progress_tests {
+    use super::*;
+    use crate::calibrate::model::BasisConfig;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn test_optimizer_makes_progress_from_initial_guess_logit() {
+        run(LinkFunction::Logit).expect("Logit progress test failed");
+    }
+
+    #[test]
+    fn test_optimizer_makes_progress_from_initial_guess_identity() {
+        run(LinkFunction::Identity).expect("Identity progress test failed");
+    }
+
+    fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
+        // 1) Generate well-behaved data with clear signal on PC1
+        let n_samples = 500;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let p = Array1::linspace(-3.0, 3.0, n_samples);
+        let pc1 = Array1::linspace(-3.0, 3.0, n_samples);
+
+        // Smooth, non-linear signal that requires smoothing
+        let true_signal = pc1.mapv(|x: f64| (1.5 * x).sin() * 2.0);
+
+        let y = match link_function {
+            LinkFunction::Logit => {
+                // Local copy of generate_realistic_binary_data to avoid cross-module visibility issues
+                fn bernoulli_from_predictor(
+                    predictors: &Array1<f64>,
+                    steepness: f64,
+                    intercept: f64,
+                    noise_level: f64,
+                    rng: &mut StdRng,
+                ) -> Array1<f64> {
+                    let min = predictors.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                    let max = predictors.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                    let midpoint = (min + max) / 2.0;
+                    predictors.mapv(|val| {
+                        let logit = intercept
+                            + steepness * (val - midpoint)
+                            + rng.gen_range(-noise_level..noise_level);
+                        let clamped = logit.clamp(-10.0, 10.0);
+                        let prob = 1.0 / (1.0 + (-clamped).exp());
+                        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                    })
+                }
+
+                bernoulli_from_predictor(&pc1, 1.5, 0.0, 2.0, &mut rng)
+            }
+            LinkFunction::Identity => {
+                // Continuous outcome with mild noise
+                let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.2..0.2));
+                &true_signal + &noise
+            }
+        };
+
+        // Assemble PCs matrix with a single PC carrying the signal
+        let mut pcs = Array2::zeros((n_samples, 1));
+        pcs.column_mut(0).assign(&pc1);
+        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n_samples) };
+
+        // 2) Configure a simple, stable model: 1 PC main effect + interactions present (but with no true interaction signal)
+        let config = ModelConfig {
+            link_function,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 150,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 50,
+            pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+            pc_basis_configs: vec![BasisConfig { num_knots: 6, degree: 3 }],
+            pgs_range: (-3.0, 3.0),
+            pc_ranges: vec![(-3.0, 3.0)],
+            pc_names: vec!["PC1".to_string()],
+            constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+        };
+
+        // 3) Build matrices and REML state to evaluate cost at specific rho
+        let (x_matrix, s_list, layout, _, _) = build_design_and_penalty_matrices(&data, &config)?;
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x_matrix.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+        )?;
+
+        // 4) Compute initial cost at the same initial rho used by train_model
+        assert!(layout.num_penalties > 0, "Model must have at least one penalty for BFGS to optimize");
+        let initial_rho = Array1::from_elem(layout.num_penalties, 1.0);
+        let initial_cost = reml_state.compute_cost(&initial_rho)?;
+        assert!(initial_cost.is_finite(), "Initial cost must be finite, got {initial_cost}");
+
+        // 5) Run full training to get optimized lambdas
+        let trained = train_model(&data, &config)?;
+        let final_rho = Array1::from_vec(trained.lambdas.clone()).mapv(f64::ln);
+
+        // 6) Compute final cost at optimized rho using the same RemlState
+        let final_cost = reml_state.compute_cost(&final_rho)?;
+        assert!(final_cost.is_finite(), "Final cost must be finite, got {final_cost}");
+
+        // 7) Assert optimizer made progress beyond the initial guess
+        assert!(
+            final_cost < initial_cost - 1e-4,
+            "Optimization failed to improve upon the initial guess. Initial: {}, Final: {}",
+            initial_cost,
+            final_cost
+        );
+
+        println!(
+            "✓ Optimizer improved cost from {:.6} to {:.6} for {:?}",
+            initial_cost, final_cost, link_function
+        );
+
+        Ok(())
+    }
+}
