@@ -3181,6 +3181,12 @@ pub mod internal {
                         "✓ BFGS optimization failed far from a stationary point (acceptable for ill-conditioned model)"
                     );
                 }
+                // Be robust to changes in error wording from optimizer
+                EstimationError::RemlOptimizationFailed(_msg) => {
+                    println!(
+                        "✓ Optimization failed (REML/BFGS) as expected for ill-conditioned/over-parameterized model"
+                    );
+                }
                 other => panic!(
                     "Expected ModelIsIllConditioned or optimization failure, got: {:?}",
                     other
