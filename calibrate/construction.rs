@@ -224,8 +224,8 @@ pub fn build_design_and_penalty_matrices(
     let (pgs_main_basis, pgs_z_transform) =
         basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
 
-    // For interactions, use the constrained pgs_main_basis directly
-    // Cannot reconstruct "full" basis due to dimensional reduction from constraints
+    // CRITICAL: For interactions, use the UNCONSTRAINED pgs_main_basis_unc for the tensor product
+    // to match the training logic and ensure dimensional consistency.
 
     // Save the PGS constraint transformation
     constraints.insert(

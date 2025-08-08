@@ -697,6 +697,7 @@ mod tests {
                 Array1::linspace(-0.5, 0.5, n_samples).to_vec(),
             )
             .unwrap(),
+            weights: Array1::ones(n_samples),
         };
 
         // Generate the correct constraints and structure using the actual model-building code

@@ -20,20 +20,25 @@ pub enum PirlsStatus {
 
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
 ///
+/// # Basis of Returned Tensors
+///
+/// **IMPORTANT:** All vector and matrix outputs in this struct (`beta_transformed`,
+/// `penalized_hessian_transformed`) are in the **stable, transformed basis**
+/// that was computed for the given set of smoothing parameters.
+///
+/// To obtain coefficients in the original, interpretable basis, the caller must
+/// back-transform them using the `qs` matrix from the `reparam_result` field:
+/// `beta_original = reparam_result.qs.dot(&beta_transformed)`
+///
 /// # Fields
 ///
 /// * `beta_transformed`: The estimated coefficient vector in the STABLE, TRANSFORMED basis.
 /// * `penalized_hessian_transformed`: The penalized Hessian matrix at convergence (X'WX + S_λ) in the STABLE, TRANSFORMED basis.
-/// 
-/// NOTE: Claims that this documentation "contradicts the actual content" are FALSE.
-/// The field names clearly indicate the transformed basis, and the implementation is consistent.
 /// * `deviance`: The final deviance value. Note that this means different things depending on the link function:
 ///    - For `LinkFunction::Identity` (Gaussian): This is the Residual Sum of Squares (RSS).
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
 /// * `final_weights`: The final IRLS weights at convergence.
-/// * `qs`: The transformation matrix that was used internally for stable reparameterization.
-/// * `log_det_s`: The stable log|S|+ from reparameterization.
-/// * `det1_s`: The stable derivative of log|S|+ w.r.t. rho.
+/// * `reparam_result`: Contains the transformation matrix (`qs`) and other reparameterization data.
 #[derive(Clone)]
 pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
@@ -76,6 +81,7 @@ pub fn fit_model_for_fixed_rho(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
+    weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>], // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
@@ -153,7 +159,7 @@ pub fn fit_model_for_fixed_rho(
     // Step 5: Initialize P-IRLS state variables in the TRANSFORMED basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = x_transformed.dot(&beta_transformed);
-    let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function);
+    let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function, weights);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
@@ -256,7 +262,7 @@ pub fn fit_model_for_fixed_rho(
 
         // Calculate trial values
         let mut eta_trial = x_transformed.dot(&beta_trial);
-        let (mut mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function);
+        let (mut mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function, weights.view());
         let mut deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
 
         // mgcv-style step halving (use while loop instead of for loop with counter)
@@ -323,7 +329,7 @@ pub fn fit_model_for_fixed_rho(
             eta_trial = x_transformed.dot(&beta_trial);
 
             // Re-evaluate
-            let update_result = update_glm_vectors(y, &eta_trial, config.link_function);
+            let update_result = update_glm_vectors(y, &eta_trial, config.link_function, weights.view());
             mu_trial = update_result.0;
             deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
 
@@ -390,7 +396,7 @@ pub fn fit_model_for_fixed_rho(
 
         eta = eta_trial;
         last_deviance = deviance_trial;
-        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function);
+        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function, weights.view());
 
         // Monitor maximum eta value (to detect separation)
         max_abs_eta = eta
@@ -933,6 +939,7 @@ pub fn update_glm_vectors(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     link: LinkFunction,
+    prior_weights: ArrayView1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     const MIN_WEIGHT: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8; // Epsilon for clamping probabilities
@@ -963,10 +970,8 @@ pub fn update_glm_vectors(
         }
         LinkFunction::Identity => {
             let mu = eta.clone();
-            // NOTE: Claims about "numerically incorrect EDF/scale handling" are FALSE.
-            // For Gaussian regression, unit weights are mathematically correct for the 
-            // iterative weights in IRLS. This is the standard implementation.
-            let weights = Array1::ones(y.len());
+            // For Gaussian models with Identity link, the iterative weights ARE the prior weights
+            let weights = prior_weights.to_owned();
             let z = y.to_owned();
             (mu, weights, z)
         }
@@ -1323,21 +1328,31 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector
+    // STAGE 6: Reconstruct the full coefficient vector (CORRECTED)
     //-----------------------------------------------------------------------
-    // The key is to correctly compose the two permutations. The `i`-th coefficient
-    // in our solved vector `beta_dropped` corresponds to the `rank_pivot[i]`-th
-    // column of the system *after* the `initial_pivot`. Therefore, its original
-    // column index is `initial_pivot[rank_pivot[i]]`.
+    // Build the list of kept column indices in the pivoted space (complement of drop_indices)
+    let mut kept_indices: Vec<usize> = Vec::with_capacity(rank);
+    if n_drop > 0 {
+        let drop_set: std::collections::HashSet<usize> = drop_indices.iter().copied().collect();
+        for j in 0..p {
+            if !drop_set.contains(&j) {
+                kept_indices.push(j);
+            }
+        }
+    } else {
+        // No drops: kept indices are 0..p
+        kept_indices.extend(0..p);
+    }
 
+    // Map coefficients from the final reduced-and-repivotted system back to original columns
     let mut beta_transformed = Array1::zeros(p);
     for i in 0..rank {
-        let original_col_index = initial_pivot[rank_pivot[i]];
+        // rank_pivot[i] indexes into kept_indices; kept_indices[...] indexes into the initial_pivoted space
+        // initial_pivot[...] maps from pivoted space back to original column index
+        let original_col_index = initial_pivot[kept_indices[rank_pivot[i]]];
         beta_transformed[original_col_index] = beta_dropped[i];
     }
-    // The remaining p - rank elements are correctly left as zero, representing the
-    // unidentifiable parameters. This logic is much simpler and more robust than the
-    // previous `drop_indices` approach.
+    // Remaining entries correspond to dropped columns and stay at zero.
 
     //-----------------------------------------------------------------------
     // STAGE 7: Construct the penalized Hessian
@@ -1354,12 +1369,12 @@ pub fn solve_penalized_least_squares(
         .assign(&hessian_rank_part);
 
     // 3. Create the full permutation matrix `P` that maps from the final pivoted basis
-    //    back to the original basis. This logic correctly composes the two pivots.
+    //    back to the original basis. Use kept_indices to correctly compose the pivots.
     let mut perm_matrix = Array2::zeros((p, p));
     // The first `rank` columns of the final basis correspond to the identifiable parameters.
     // Their original positions are found by composing the two pivots.
     for i in 0..rank {
-        let original_index = initial_pivot[rank_pivot[i]];
+        let original_index = initial_pivot[kept_indices[rank_pivot[i]]];
         perm_matrix[[original_index, i]] = 1.0;
     }
     // The remaining `p - rank` columns are the dropped (unidentifiable) parameters.
@@ -1679,6 +1694,7 @@ mod tests {
             y,
             p,
             pcs: Array2::zeros((n_samples, 0)),
+            weights: Array1::from_elem(n_samples, 1.0),
         };
 
         // --- 2. Model Configuration ---
@@ -1709,6 +1725,7 @@ mod tests {
             rho_vec.view(),
             x_matrix.view(),
             data.y.view(),
+            data.weights.view(),
             &rs_original,
             &layout,
             &config,
@@ -1949,6 +1966,9 @@ mod tests {
             // Perfect linear relationship for guaranteed convergence
             2.0 + 3.0 * ((i as f64) / (n_samples as f64))
         });
+        
+        // Create unit weights for the test
+        let weights = Array1::from_elem(n_samples, 1.0);
 
         // Create penalty matrices with DIFFERENT eigenvector structures (matching working test)
         // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²
@@ -2003,6 +2023,7 @@ mod tests {
             rho_vec1.view(),
             x.view(),
             y.view(),
+            weights.view(),
             &rs_original,
             &layout,
             &config,
@@ -2014,6 +2035,7 @@ mod tests {
             rho_vec2.view(),
             x.view(),
             y.view(),
+            weights.view(),
             &rs_original,
             &layout,
             &config,
@@ -2083,6 +2105,7 @@ mod tests {
             y,
             p,
             pcs: Array2::zeros((n_samples, 0)),
+            weights: Array1::from_elem(n_samples, 1.0),
         };
 
         // === PHASE 3: Configure a simple, stable model ===
@@ -2116,6 +2139,7 @@ mod tests {
             rho_vec.view(),
             x_matrix.view(),
             data.y.view(),
+            data.weights.view(),
             &rs_original,
             &layout,
             &config,
@@ -2205,6 +2229,7 @@ mod tests {
             y,
             p,
             pcs: Array2::zeros((n_samples, 0)),
+            weights: Array1::from_elem(n_samples, 1.0),
         };
 
         // === Use same stable model configuration ===
@@ -2236,6 +2261,7 @@ mod tests {
             rho_vec.view(),
             x_matrix.view(),
             data.y.view(),
+            data.weights.view(),
             &rs_original,
             &layout,
             &config,

@@ -522,18 +522,13 @@ mod tests {
         let model1: TrainedModel = toml::from_str(&model1_content)
             .expect("Failed to parse model 1 TOML file into TrainedModel struct");
 
-        // We can still use the check_model_properties logic with the parsed model
-        let model1_json: serde_json::Value = toml::from_str(&model1_content)?;
-
         // --- Analyze Model 2 ---
         let model2_content = std::fs::read_to_string(model_files[1].to_str().unwrap())?;
         let model2: TrainedModel = toml::from_str(&model2_content)
             .expect("Failed to parse model 2 TOML file into TrainedModel struct");
 
-        let model2_json: serde_json::Value = toml::from_str(&model2_content)?;
-
-        // Check for key model properties using the existing function
-        check_model_properties(&model1_json, &model2_json);
+        // Check for key model properties using the robust typed models
+        check_model_properties(&model1, &model2);
 
         // Call our coefficient validation functions for both models
         validate_coefficient_structure(&model1, &true_effects, "Standard");
@@ -789,74 +784,59 @@ mod tests {
     }
 
     /// Check key properties of the trained models
-    fn check_model_properties(model1: &serde_json::Value, model2: &serde_json::Value) {
+    fn check_model_properties(model1: &TrainedModel, model2: &TrainedModel) {
         // Check link function is correctly detected
-        if let Some(link1) = model1["config"]["link_function"].as_str() {
-            println!("   Model 1 link function: {}", link1);
-            assert_eq!(
-                link1, "Logit",
-                "Expected logit link function for binary outcome"
-            );
-        }
+        println!("   Model 1 link function: {:?}", model1.config.link_function);
+        assert!(
+            matches!(model1.config.link_function, LinkFunction::Logit),
+            "Expected logit link function for binary outcome"
+        );
 
-        if let Some(link2) = model2["config"]["link_function"].as_str() {
-            println!("   Model 2 link function: {}", link2);
-            assert_eq!(
-                link2, "Logit",
-                "Expected logit link function for binary outcome"
-            );
-        }
+        println!("   Model 2 link function: {:?}", model2.config.link_function);
+        assert!(
+            matches!(model2.config.link_function, LinkFunction::Logit),
+            "Expected logit link function for binary outcome"
+        );
 
         // Check for presence of key coefficient groups
-        if let Some(obj) = model1["coefficients"].as_object() {
-            assert!(obj.contains_key("intercept"), "Model 1 missing intercept");
-            assert!(
-                obj.contains_key("main_effects"),
-                "Model 1 missing main effects"
-            );
-            assert!(
-                obj.contains_key("interaction_effects"),
-                "Model 1 missing interaction effects"
-            );
-
-            // Check if main effects contain PGS and PCs
-            if let Some(main_effects) = obj["main_effects"].as_object() {
-                assert!(
-                    main_effects.contains_key("pgs"),
-                    "Model 1 missing PGS main effect"
-                );
-                assert!(
-                    main_effects.contains_key("pcs"),
-                    "Model 1 missing PC main effects"
-                );
-
-                println!("   Model 1 has expected coefficient structure");
-            }
-        }
+        assert!(model1.coefficients.intercept.is_finite(), "Model 1 missing intercept");
+        assert!(
+            !model1.coefficients.main_effects.pgs.is_empty(),
+            "Model 1 missing PGS main effect"
+        );
+        assert!(
+            !model1.coefficients.main_effects.pcs.is_empty(),
+            "Model 1 missing PC main effects"
+        );
+        assert!(
+            !model1.coefficients.interaction_effects.is_empty(),
+            "Model 1 missing interaction effects"
+        );
+        println!("   Model 1 has expected coefficient structure");
 
         // Check if smoothing parameters (lambdas) were estimated
-        if let Some(lambdas1) = model1["lambdas"].as_array() {
-            println!(
-                "   Model 1 estimated {} smoothing parameters",
-                lambdas1.len()
-            );
-            assert!(!lambdas1.is_empty(), "Model 1 has no smoothing parameters");
+        println!(
+            "   Model 1 estimated {} smoothing parameters",
+            model1.lambdas.len()
+        );
+        assert!(
+            !model1.lambdas.is_empty(),
+            "Model 1 has no smoothing parameters"
+        );
+        println!(
+            "   First few lambdas: {:.3}, {:.3}, ...",
+            *model1.lambdas.get(0).unwrap_or(&0.0),
+            *model1.lambdas.get(1).unwrap_or(&0.0)
+        );
 
-            // Print first few lambdas
-            println!(
-                "   First few lambdas: {:.3}, {:.3}, ...",
-                lambdas1.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                lambdas1.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0)
-            );
-        }
-
-        if let Some(lambdas2) = model2["lambdas"].as_array() {
-            println!(
-                "   Model 2 estimated {} smoothing parameters",
-                lambdas2.len()
-            );
-            assert!(!lambdas2.is_empty(), "Model 2 has no smoothing parameters");
-        }
+        println!(
+            "   Model 2 estimated {} smoothing parameters",
+            model2.lambdas.len()
+        );
+        assert!(
+            !model2.lambdas.is_empty(),
+            "Model 2 has no smoothing parameters"
+        );
     }
 
     /// Structure to hold the true effects used to generate synthetic data
