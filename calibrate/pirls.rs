@@ -1546,7 +1546,8 @@ fn calculate_scale(
                 .zip(residuals.iter())
                 .map(|(&w, &r)| w * r * r)
                 .sum();
-            let effective_n = weights.sum();
+            // Use the number of observations for Gaussian scale, consistent with mgcv
+            let effective_n = y.len() as f64;
             weighted_rss / (effective_n - edf).max(1.0)
         }
     }

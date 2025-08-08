@@ -218,35 +218,25 @@ pub fn apply_sum_to_zero_constraint(
     let c = basis_matrix.t().dot(&ones); // shape k
 
     // Orthonormal basis for nullspace of c^T
-    // Build a k×1 matrix and compute its QR; the Q columns after the first
-    // form an orthonormal basis for the nullspace.
+    // Build a k×1 matrix and compute its SVD; the columns of U after the first
+    // form an orthonormal basis for the nullspace, independent of QR shape.
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
 
-    use ndarray_linalg::QR;
-    let (q, _r) = c_mat.qr().map_err(BasisError::LinalgError)?;
-    // q is k×1; build an orthonormal complement
-    // One simple way: compute full QR of an identity and remove span(c)
-    // Here, for clarity, form an orthonormal basis via SVD of the projector:
     use ndarray_linalg::SVD;
-    let i_k = Array2::<f64>::eye(k);
-    let proj = i_k - q.dot(&q.t()); // projector onto nullspace(c^T)
-    let (_u, s, v_t) = proj.svd(true, true).map_err(BasisError::LinalgError)?;
-    let tol = s.iter().fold(0.0f64, |m, &v| m.max(v)) * 1e-10;
-    // Columns of V corresponding to singular values ~1 span the nullspace
-    let v = v_t.unwrap().t().to_owned(); // k×k
-    let mut keep: Vec<usize> = Vec::new();
-    for (i, &sv) in s.iter().enumerate() {
-        if (sv - 1.0).abs() < tol {
-            keep.push(i);
+    let (u_opt, _s, _vt) = c_mat
+        .svd(true, false)
+        .map_err(BasisError::LinalgError)?;
+    let u = match u_opt {
+        Some(u) => u, 
+        None => {
+            return Err(BasisError::LinalgError(
+                ndarray_linalg::error::LinalgError::NotSquare { rows: k as i32, cols: 1 },
+            ));
         }
-    }
-    if keep.is_empty() {
-        return Err(BasisError::LinalgError(
-            ndarray_linalg::error::LinalgError::NotSquare { rows: k as i32, cols: k as i32 },
-        ));
-    }
-    let z = v.select(Axis(1), &keep); // k×(k-1) typically
+    };
+    // The last k-1 columns of U span the nullspace of c^T
+    let z = u.slice(s![.., 1..]).to_owned(); // k×(k-1)
 
     // Constrained basis
     let constrained = basis_matrix.dot(&z);
