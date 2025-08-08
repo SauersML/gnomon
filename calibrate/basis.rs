@@ -231,12 +231,8 @@ pub fn apply_sum_to_zero_constraint(
         .svd(true, false)
         .map_err(BasisError::LinalgError)?;
     let u = match u_opt {
-        Some(u) => u, 
-        None => {
-            return Err(BasisError::LinalgError(
-                ndarray_linalg::error::LinalgError::NotSquare { rows: k as i32, cols: 1 },
-            ));
-        }
+        Some(u) => u,
+        None => return Err(BasisError::ConstraintNullspaceNotFound),
     };
     // The last k-1 columns of U span the nullspace of c^T
     let z = u.slice(s![.., 1..]).to_owned(); // k×(k-1)
