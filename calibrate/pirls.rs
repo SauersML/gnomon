@@ -1358,8 +1358,11 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector (CORRECTED)
+    // STAGE 6: Reconstruct the full coefficient vector (NEW, CORRECTED IMPLEMENTATION)
     //-----------------------------------------------------------------------
+    // This multi-step process correctly reverses the two pivoting and one dropping
+    // operation performed earlier, mirroring the logic in MGCV's C code.
+
     // Build the list of kept column indices in the pivoted space (complement of drop_indices)
     let mut kept_indices: Vec<usize> = Vec::with_capacity(rank);
     if n_drop > 0 {
@@ -1374,50 +1377,51 @@ pub fn solve_penalized_least_squares(
         kept_indices.extend(0..p);
     }
 
-    // Map coefficients from the final reduced-and-repivotted system back to original columns
-    let mut beta_transformed = Array1::zeros(p);
+    // Step 6a: Un-pivot the solution from the final QR space (using `rank_pivot`).
+    // This maps the solution `beta_dropped` (which corresponds to the pivoted, rank-reduced
+    // matrix) back to the order of the *kept* columns before the second pivot.
+    let mut beta_for_kept_cols = Array1::zeros(rank);
     for i in 0..rank {
-        // rank_pivot[i] indexes into kept_indices; kept_indices[...] indexes into the initial_pivoted space
-        // initial_pivot[...] maps from pivoted space back to original column index
-        let original_col_index = initial_pivot[kept_indices[rank_pivot[i]]];
-        beta_transformed[original_col_index] = beta_dropped[i];
+        beta_for_kept_cols[rank_pivot[i]] = beta_dropped[i];
     }
+
+    // Step 6b: Re-insert zeroes for the columns that were dropped for rank deficiency.
+    // This expands the vector from `rank` to `p` elements, placing coefficients
+    // into the columns that were kept after the *initial* QR.
+    let mut beta_for_initial_pivot = Array1::zeros(p);
+    for i in 0..rank {
+        // `kept_indices` holds the indices of columns that were not dropped.
+        let original_kept_index = kept_indices[i];
+        beta_for_initial_pivot[original_kept_index] = beta_for_kept_cols[i];
+    }
+
+    // Step 6c: Un-pivot from the initial QR to get the final coefficient vector.
+    // This reverses the very first pivot, restoring the coefficients to their
+    // original order in the stable (Qs-transformed) basis.
+    let mut beta_transformed = Array1::zeros(p);
+    for i in 0..p {
+        beta_transformed[initial_pivot[i]] = beta_for_initial_pivot[i];
+    }
+    // `beta_transformed` is now the final, correctly ordered solution vector.
     // Remaining entries correspond to dropped columns and stay at zero.
 
     //-----------------------------------------------------------------------
-    // STAGE 7: Construct the penalized Hessian
+    // STAGE 7: Construct the penalized Hessian (CORRECTED IMPLEMENTATION)
     //-----------------------------------------------------------------------
+    // We compute the Hessian directly in the stable basis using its definition:
+    // H_transformed = (X_transformed)' * W * (X_transformed) + S_transformed
+    // This avoids the complex and error-prone un-pivoting of the R factor.
 
-    // 1. Create R'R for the identifiable part (rank x rank). This is the Hessian in the final, stable basis.
-    let hessian_rank_part = r_square.t().dot(&r_square);
+    let sqrt_w = weights.mapv(f64::sqrt);
+    let wx_transformed = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
+    let xtwx_transformed = wx_transformed.t().dot(&wx_transformed);
 
-    // 2. Expand it to a p x p matrix with zeros for dropped columns. This matrix is
-    //    still in the final pivoted basis defined by `rank_pivot`.
-    let mut hessian_pivoted = Array2::zeros((p, p));
-    hessian_pivoted
-        .slice_mut(s![..rank, ..rank])
-        .assign(&hessian_rank_part);
+    // S_transformed = E' * E
+    let s_transformed = e_transformed.t().dot(e_transformed);
 
-    // 3. Create the full permutation matrix `P` that maps from the final pivoted basis
-    //    back to the original basis. Use kept_indices to correctly compose the pivots.
-    let mut perm_matrix = Array2::zeros((p, p));
-    // The first `rank` columns of the final basis correspond to the identifiable parameters.
-    // Their original positions are found by composing the two pivots.
-    for i in 0..rank {
-        let original_index = initial_pivot[kept_indices[rank_pivot[i]]];
-        perm_matrix[[original_index, i]] = 1.0;
-    }
-    // The remaining `p - rank` columns are the dropped (unidentifiable) parameters.
-    // Their original positions are found via `initial_pivot` and `drop_indices`.
-    for i in 0..n_drop {
-        let original_index = initial_pivot[drop_indices[i]];
-        perm_matrix[[original_index, rank + i]] = 1.0;
-    }
+    let penalized_hessian = xtwx_transformed + s_transformed;
 
-    // 4. Un-pivot the Hessian to the original basis: H_orig = P * H_pivoted * P^T
-    let penalized_hessian = perm_matrix.dot(&hessian_pivoted).dot(&perm_matrix.t());
-
-    // Debug-time guards to catch basis or pivot mismatches early
+    // Debug-time guards to verify numerical properties
     #[cfg(debug_assertions)]
     {
         use ndarray_linalg::{Cholesky, UPLO};
@@ -1436,26 +1440,11 @@ pub fn solve_penalized_least_squares(
         let rel_asym = asym_sum / (1.0 + abs_sum);
         debug_assert!(
             rel_asym < 1e-10,
-            "Penalized Hessian not symmetric; pivot/basis composition may be wrong (rel_asym={})",
+            "Penalized Hessian not symmetric (rel_asym={})",
             rel_asym
         );
 
-        // (b) Permutation orthogonality: P * P^T ~ I
-        let eye = Array2::<f64>::eye(perm_matrix.nrows());
-        let pp_t = perm_matrix.dot(&perm_matrix.t());
-        let mut ortho_err = 0.0f64;
-        for i in 0..eye.nrows() {
-            for j in 0..eye.ncols() {
-                ortho_err += (pp_t[[i, j]] - eye[[i, j]]).abs();
-            }
-        }
-        debug_assert!(
-            ortho_err < 1e-10,
-            "Permutation matrix not orthonormal; check pivot composition (err={})",
-            ortho_err
-        );
-
-        // (c) PD sanity (allow PSD): add tiny ridge then try Cholesky
+        // (b) PD sanity (allow PSD): add tiny ridge then try Cholesky
         let mut h_check = penalized_hessian.clone();
         let ridge = 1e-12;
         for i in 0..h_check.nrows() {
@@ -1463,31 +1452,9 @@ pub fn solve_penalized_least_squares(
         }
         if h_check.cholesky(UPLO::Lower).is_err() {
             log::warn!(
-                "Penalized Hessian failed Cholesky even after tiny ridge; verify basis composition."
+                "Penalized Hessian failed Cholesky even after tiny ridge; matrix may be poorly conditioned."
             );
         }
-
-        // (d) Action consistency: (X'WX + S) * beta == H * beta
-        // Rebuild XtWX and S in this basis
-        let sqrt_w = weights.mapv(|w| w.sqrt());
-        let wx_dbg = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-        let xtwx_dbg = wx_dbg.t().dot(&wx_dbg);
-        let s_lambda_dbg = e_transformed.t().dot(e_transformed);
-        let theoretical_h = xtwx_dbg + s_lambda_dbg;
-        let expected = theoretical_h.dot(&beta_transformed);
-        let actual = penalized_hessian.dot(&beta_transformed);
-        let mut num = 0.0f64;
-        let mut den = 0.0f64;
-        for i in 0..expected.len() {
-            num += (expected[i] - actual[i]).powi(2);
-            den += expected[i].powi(2);
-        }
-        let rel = (num.sqrt()) / (den.sqrt().max(1e-12));
-        debug_assert!(
-            rel < 1e-6,
-            "Hessian action on beta inconsistent with XtWX+S (rel_err={})",
-            rel
-        );
     }
 
     //-----------------------------------------------------------------------
