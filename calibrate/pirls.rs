@@ -1290,18 +1290,20 @@ pub fn solve_penalized_least_squares(
         beta_kept[rank_pivot[i]] = beta_dropped[i];
     }
 
-    // Step 6b: Re-insert zeros for the dropped columns. This expands the `rank`-dimensional
-    // `beta_kept` vector into a `p`-dimensional vector that is still ordered
-    // according to `initial_pivot`.
+    // Step 6b: Re-insert zeros for the dropped columns.
     let mut beta_pivoted_by_initial = Array1::zeros(p);
-    let mut kept_idx = 0;
-    for i in 0..p {
-        if !drop_indices.contains(&i) {
-            // This column was kept. Its coefficient comes from beta_kept.
-            beta_pivoted_by_initial[i] = beta_kept[kept_idx];
-            kept_idx += 1;
-        }
-        // else, the coefficient remains 0.0 as initialized.
+
+    // First, identify the indices of the columns that were *kept*.
+    // These are the columns from the `initial_pivot` space that were not dropped.
+    let kept_indices: Vec<usize> = (0..p)
+        .filter(|&i| !drop_indices.contains(&i))
+        .collect();
+
+    // Now, map the solved coefficients from `beta_kept` back to these specific indices.
+    // The i-th element of `beta_kept` corresponds to the i-th column that was kept.
+    for i in 0..rank {
+        let original_pivoted_index = kept_indices[i];
+        beta_pivoted_by_initial[original_pivoted_index] = beta_kept[i];
     }
 
     // Step 6c: Reverse the initial pivot to get the final coefficient vector
