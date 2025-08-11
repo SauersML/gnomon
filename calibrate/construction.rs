@@ -715,13 +715,19 @@ pub fn construct_s_lambda(
     s_lambda
 }
 
-/// Implements the exact stable reparameterization algorithm from Wood (2011) Appendix B
-/// This follows the complete recursive similarity transformation procedure
-/// Now accepts penalty square roots (rS) instead of full penalty matrices
-/// Each rs_list[i] is a p x rank_i matrix where rank_i is the rank of penalty i
+/// Implements the stable reparameterization algorithm from Wood (2011) Appendix B.
 ///
-/// The eb parameter is the pre-computed lambda-INDEPENDENT balanced penalty root
-/// for rank detection, computed once at a higher level to ensure stability.
+/// This function performs the recursive similarity transformation using
+/// penalty square roots rather than full penalty matrices. Each entry in
+/// `rs_list` is a `p × rank_k` matrix (skinny square root) for penalty `k`,
+/// where `rank_k` is the numerical rank of that penalty. The vector `lambdas`
+/// provides the smoothing parameters for each penalty, and `layout` defines
+/// the model’s coefficient block structure and sizes.
+///
+/// Note: A lambda-independent balanced penalty root (“eb”) can be computed at
+/// a higher level (see `create_balanced_penalty_root`) to assist with rank
+/// detection and diagnostics. This function does not take `eb` as a parameter;
+/// it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
     rs_list: &[Array2<f64>], // penalty square roots (each is p x rank_i)
     lambdas: &[f64],

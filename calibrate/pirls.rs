@@ -1596,15 +1596,14 @@ fn pivoted_qr_faer(
     // Step 5: Extract the consistent column permutation (pivot)
     let perm = qr.P();
 
-    // CRITICAL: This logic relies on the internal structure of faer's `Perm` object.
-    // We assume that `.arrays().0` returns the **forward** permutation vector,
-    // where `pivot[j]` contains the index of the column from the *original* matrix
-    // that is moved to the `j`-th position in the pivoted matrix (i.e., new_col_j = old_col_{pivot[j]}).
+    // CRITICAL: Extract the permutation vector that behaves as a FORWARD permutation
+    // for our `pivot_columns` logic, i.e., `B_j = A_{pivot[j]}` for B = A * P.
     //
-    // This assumption is confirmed by reviewing the `faer` source for `ColPivQr::new_imp`,
-    // which constructs the `Perm` object with `col_perm_fwd` in the first position.
-    // An inverse permutation here would silently scramble the model coefficients and Hessian.
-    let pivot: Vec<usize> = perm.arrays().0.to_vec();
+    // faer stores both forward and inverse permutations internally. Across versions,
+    // the interpretation of `.arrays().0/.1` or the `*` operator semantics can differ.
+    // We select the array that makes `pivot_columns(A, pivot)` numerically match `A * P`.
+    // Empirically (and per current faer), this corresponds to `.arrays().1`.
+    let pivot: Vec<usize> = perm.arrays().1.to_vec();
 
     // In debug builds, explicitly verify our assumption about the permutation direction.
     // This assert confirms that applying our `pivot_columns` function to the original
@@ -1622,7 +1621,7 @@ fn pivoted_qr_faer(
             for j in 0..n {
                 assert!(
                     (a_p_faer[(i, j)] - a_p_ours[[i, j]]).abs() < 1e-12,
-                    "Permutation direction assumption is INCORRECT. faer's convention may have changed."
+                    "Permutation direction assumption is INCORRECT. Try swapping perm.arrays() indices; faer's convention may have changed."
                 );
             }
         }
