@@ -151,8 +151,7 @@ impl TrainedModel {
         // --- 2. Reconstruct Mathematical Objects ---
         let x_new =
             internal::construct_design_matrix(p_new, pcs_new, &self.config, &self.coefficients)?;
-        let flattened_coeffs =
-            internal::flatten_coefficients(&self.coefficients, &self.config)?;
+        let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         // This is a critical safety check. It ensures that the number of columns in the
         // design matrix constructed for prediction exactly matches the number of coefficients
@@ -761,13 +760,16 @@ mod tests {
                 interaction_effects: {
                     // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases' main effect parts.
                     // Total basis functions = num_knots + degree + 1. Main effect part is one less.
-                    let num_pgs_basis_funcs_main = pgs_basis_config.num_knots + pgs_basis_config.degree; // 9
-                    let num_pc1_basis_funcs_main = pc1_basis_config.num_knots + pc1_basis_config.degree; // 9
+                    let num_pgs_basis_funcs_main =
+                        pgs_basis_config.num_knots + pgs_basis_config.degree; // 9
+                    let num_pc1_basis_funcs_main =
+                        pc1_basis_config.num_knots + pc1_basis_config.degree; // 9
 
                     let mut interactions = HashMap::new();
 
                     // Calculate the total number of interaction coefficients for the unified term
-                    let total_interaction_coeffs = num_pgs_basis_funcs_main * num_pc1_basis_funcs_main; // CORRECT: 9 * 9 = 81
+                    let total_interaction_coeffs =
+                        num_pgs_basis_funcs_main * num_pc1_basis_funcs_main; // CORRECT: 9 * 9 = 81
 
                     // Create a single flattened vector of coefficients
                     let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)

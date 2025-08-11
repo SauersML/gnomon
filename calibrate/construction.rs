@@ -200,7 +200,7 @@ pub fn build_design_and_penalty_matrices(
             data.pcs.ncols()
         )));
     }
-    
+
     let n_samples = data.y.len();
 
     // Initialize constraint and knot vector storage
@@ -573,7 +573,7 @@ pub fn create_balanced_penalty_root(
         // No penalties case - return empty matrix with correct number of columns
         return Ok(Array2::zeros((0, p)));
     }
-    
+
     // Validate penalty matrix dimensions
     for (idx, s) in s_list.iter().enumerate() {
         if s.nrows() != p || s.ncols() != p {
@@ -1048,7 +1048,7 @@ pub fn stable_reparameterization(
                     .fill(0.0);
             }
         }
-        
+
         // Apply the same zeroing to the full S matrices.
         // This prevents dominant penalty information from contaminating the next iteration's
         // basis calculation (the cause of the numerical instability).
@@ -1057,18 +1057,30 @@ pub fn stable_reparameterization(
                 // DOMINANT penalty: Zero out its null-space block.
                 if r < q_current {
                     // Zero out the null-space rows and columns (bottom-right block)
-                    s_current_list[i].slice_mut(s![k_offset + r.., k_offset + r..]).fill(0.0);
+                    s_current_list[i]
+                        .slice_mut(s![k_offset + r.., k_offset + r..])
+                        .fill(0.0);
                     // Zero out the off-diagonal blocks connecting range and null spaces
-                    s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset + r..]).fill(0.0);
-                    s_current_list[i].slice_mut(s![k_offset + r.., k_offset..k_offset + r]).fill(0.0);
+                    s_current_list[i]
+                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
+                        .fill(0.0);
+                    s_current_list[i]
+                        .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
+                        .fill(0.0);
                 }
             } else {
                 // SUB-DOMINANT penalty: Zero out its range-space block.
                 // Zero out the range-space rows and columns (top-left block)
-                s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset..k_offset + r]).fill(0.0);
+                s_current_list[i]
+                    .slice_mut(s![k_offset..k_offset + r, k_offset..k_offset + r])
+                    .fill(0.0);
                 // Zero out the off-diagonal blocks connecting range and null spaces
-                s_current_list[i].slice_mut(s![k_offset..k_offset + r, k_offset + r..]).fill(0.0);
-                s_current_list[i].slice_mut(s![k_offset + r.., k_offset..k_offset + r]).fill(0.0);
+                s_current_list[i]
+                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
+                    .fill(0.0);
+                s_current_list[i]
+                    .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
+                    .fill(0.0);
             }
         }
 

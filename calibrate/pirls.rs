@@ -81,7 +81,7 @@ pub fn fit_model_for_fixed_rho(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
-    weights: ArrayView1<f64>, // Prior weights vector
+    weights: ArrayView1<f64>,    // Prior weights vector
     rs_original: &[Array2<f64>], // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
@@ -174,8 +174,7 @@ pub fn fit_model_for_fixed_rho(
     let mut eta = x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) =
         update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
-    let mut last_deviance =
-        calculate_deviance(y, &mu, config.link_function, prior_weights.view());
+    let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights.view());
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
 
@@ -248,9 +247,9 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
-            &eb_transformed,      // Lambda-INDEPENDENT balanced penalty root for rank detection (NOW IN STABLE BASIS)
-            e_transformed,        // Lambda-DEPENDENT penalty root for penalty application
-            y.view(),             // Pass original response
+            &eb_transformed, // Lambda-INDEPENDENT balanced penalty root for rank detection (NOW IN STABLE BASIS)
+            e_transformed,   // Lambda-DEPENDENT penalty root for penalty application
+            y.view(),        // Pass original response
             config.link_function, // Pass link function for correct scale calculation
         )?;
 
@@ -297,9 +296,12 @@ pub fn fit_model_for_fixed_rho(
                     last_deviance = deviance_trial;
                     (mu, weights, z) =
                         update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
-                    
+
                     if step_halving_count > 0 {
-                        log::debug!("Step halving successful after {} attempts", step_halving_count);
+                        log::debug!(
+                            "Step halving successful after {} attempts",
+                            step_halving_count
+                        );
                     }
                     break; // Exit the loop
                 }
@@ -748,7 +750,7 @@ fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>
     // Efficient two-pointer scan over columns and sorted drop_indices (O(c + n_drop))
     let mut dst_col = 0;
     let mut drop_ptr = 0;
-    
+
     for src_col in 0..c {
         // Check if this column should be dropped
         if drop_ptr < n_drop && drop_indices[drop_ptr] == src_col {
@@ -885,7 +887,7 @@ pub fn update_glm_vectors(
             // Create mu and then clamp to prevent values exactly at 0 or 1
             let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
             mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
-            
+
             // --- START FIX ---
             // 1. Calculate dμ/dη, which is μ(1-μ) for the logit link.
             // This term must NOT include prior weights.
@@ -919,10 +921,9 @@ pub fn calculate_deviance(
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
         LinkFunction::Logit => {
-            let total_residual = ndarray::Zip::from(y)
-                .and(mu)
-                .and(prior_weights)
-                .fold(0.0, |acc, &yi, &mui, &wi| {
+            let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+                0.0,
+                |acc, &yi, &mui, &wi| {
                     let mui_c = mui.clamp(EPS, 1.0 - EPS);
                     // More numerically stable formulation: use difference of logs instead of log of ratio
                     let term1 = if yi > EPS {
@@ -937,7 +938,8 @@ pub fn calculate_deviance(
                         0.0
                     };
                     acc + wi * (term1 + term2)
-                });
+                },
+            );
             2.0 * total_residual
         }
         LinkFunction::Identity => {
@@ -1295,9 +1297,7 @@ pub fn solve_penalized_least_squares(
 
     // First, identify the indices of the columns that were *kept*.
     // These are the columns from the `initial_pivot` space that were not dropped.
-    let kept_indices: Vec<usize> = (0..p)
-        .filter(|&i| !drop_indices.contains(&i))
-        .collect();
+    let kept_indices: Vec<usize> = (0..p).filter(|&i| !drop_indices.contains(&i)).collect();
 
     // Now, map the solved coefficients from `beta_kept` back to these specific indices.
     // The i-th element of `beta_kept` corresponds to the i-th column that was kept.
@@ -1541,7 +1541,7 @@ fn calculate_edf(
         _ => {
             return Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
-            })
+            });
         }
     };
     let smax = s.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -2013,7 +2013,7 @@ mod tests {
             // Perfect linear relationship for guaranteed convergence
             2.0 + 3.0 * ((i as f64) / (n_samples as f64))
         });
-        
+
         // Create unit weights for the test
         let weights = Array1::from_elem(n_samples, 1.0);
 

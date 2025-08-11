@@ -58,10 +58,14 @@ pub enum BasisError {
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] ndarray_linalg::error::LinalgError),
 
-    #[error("Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis.")]
+    #[error(
+        "Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis."
+    )]
     ConstraintNullspaceNotFound,
 
-    #[error("The provided knot vector is invalid: {0}. It must be non-decreasing and contain only finite values.")]
+    #[error(
+        "The provided knot vector is invalid: {0}. It must be non-decreasing and contain only finite values."
+    )]
     InvalidKnotVector(String),
 }
 
@@ -253,9 +257,7 @@ pub fn apply_sum_to_zero_constraint(
     c_mat.column_mut(0).assign(&c);
 
     use ndarray_linalg::SVD;
-    let (u_opt, _s, _vt) = c_mat
-        .svd(true, false)
-        .map_err(BasisError::LinalgError)?;
+    let (u_opt, _s, _vt) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
     let u = match u_opt {
         Some(u) => u,
         None => return Err(BasisError::ConstraintNullspaceNotFound),

@@ -162,7 +162,7 @@ mod internal {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-        
+
         // Check if optional weights column exists
         let has_weights = columns_set.contains("weights");
         println!("All required columns found: {required_cols:?}");

@@ -786,20 +786,29 @@ mod tests {
     /// Check key properties of the trained models
     fn check_model_properties(model1: &TrainedModel, model2: &TrainedModel) {
         // Check link function is correctly detected
-        println!("   Model 1 link function: {:?}", model1.config.link_function);
+        println!(
+            "   Model 1 link function: {:?}",
+            model1.config.link_function
+        );
         assert!(
             matches!(model1.config.link_function, LinkFunction::Logit),
             "Expected logit link function for binary outcome"
         );
 
-        println!("   Model 2 link function: {:?}", model2.config.link_function);
+        println!(
+            "   Model 2 link function: {:?}",
+            model2.config.link_function
+        );
         assert!(
             matches!(model2.config.link_function, LinkFunction::Logit),
             "Expected logit link function for binary outcome"
         );
 
         // Check for presence of key coefficient groups
-        assert!(model1.coefficients.intercept.is_finite(), "Model 1 missing intercept");
+        assert!(
+            model1.coefficients.intercept.is_finite(),
+            "Model 1 missing intercept"
+        );
         assert!(
             !model1.coefficients.main_effects.pgs.is_empty(),
             "Model 1 missing PGS main effect"
