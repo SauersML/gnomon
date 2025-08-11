@@ -724,10 +724,16 @@ pub fn construct_s_lambda(
 /// provides the smoothing parameters for each penalty, and `layout` defines
 /// the model’s coefficient block structure and sizes.
 ///
-/// Note: A lambda-independent balanced penalty root (“eb”) can be computed at
-/// a higher level (see `create_balanced_penalty_root`) to assist with rank
-/// detection and diagnostics. This function does not take `eb` as a parameter;
-/// it operates solely on `rs_list`, `lambdas`, and `layout`.
+/// Rank detection follows mgcv’s balancing idea but is rebuilt at each
+/// iteration from the currently transformed sub-blocks: we form a balanced,
+/// lambda-independent sum by scaling each active penalty sub-block to unit
+/// Frobenius norm and summing them, then use its eigenvalues to determine the
+/// numerical rank. This avoids needing an `eb` argument.
+///
+/// Note: A lambda-independent balanced penalty root (“eb”) can still be
+/// computed at a higher level (see `create_balanced_penalty_root`) for
+/// diagnostics or alternative workflows. This function does not take `eb` as a
+/// parameter; it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
     rs_list: &[Array2<f64>], // penalty square roots (each is p x rank_i)
     lambdas: &[f64],
