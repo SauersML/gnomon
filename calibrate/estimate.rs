@@ -69,7 +69,7 @@ pub enum EstimationError {
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
     #[error(
-        "FATAL: Hessian matrix has all negative eigenvalues. This indicates a critical numerical instability."
+        "Hessian matrix is not positive definite (minimum eigenvalue: {min_eigenvalue:.4e}). This indicates a numerical instability."
     )]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
 
@@ -226,6 +226,19 @@ pub fn train_model(
         }
     };
 
+    // Abort if the inner loop encountered repeated numerical failures
+    const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
+    if reml_state.consecutive_cost_error_count() >= MAX_CONSECUTIVE_INNER_ERRORS {
+        let last_msg = reml_state
+            .last_cost_error_string()
+            .unwrap_or_else(|| "unknown error".to_string());
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "Aborted due to repeated inner-loop failures ({} consecutive). Last error: {}",
+            reml_state.consecutive_cost_error_count(),
+            last_msg
+        )));
+    }
+
     if !final_value.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "BFGS optimization did not find a finite solution, final value: {final_value}"
@@ -297,7 +310,7 @@ fn compute_penalty_log_det_and_rank(
 
             Ok((log_det, rank))
         }
-        Err(e) => {
+        Err(_) => {
             // Fallback to SVD if eigendecomposition fails
             match s_lambda.svd(false, false) {
                 Ok((_, svals, _)) => {
@@ -314,7 +327,7 @@ fn compute_penalty_log_det_and_rank(
 
                     Ok((log_det, rank))
                 }
-                Err(_) => Err(EstimationError::LinearSystemSolveFailed(e)),
+                Err(e_svd) => Err(EstimationError::LinearSystemSolveFailed(e_svd)),
             }
         }
     }
@@ -416,6 +429,8 @@ pub mod internal {
         eval_count: RefCell<u64>,
         last_cost: RefCell<f64>,
         last_grad_norm: RefCell<f64>,
+        consecutive_cost_errors: RefCell<usize>,
+        last_cost_error_msg: RefCell<Option<String>>,
     }
 
     impl<'a> RemlState<'a> {
@@ -441,6 +456,8 @@ pub mod internal {
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
+                consecutive_cost_errors: RefCell::new(0),
+                last_cost_error_msg: RefCell::new(None),
             })
         }
 
@@ -459,6 +476,15 @@ pub mod internal {
 
         pub(super) fn weights(&self) -> ArrayView1<'a, f64> {
             self.weights
+        }
+
+        // Expose error tracking state to parent module
+        pub(super) fn consecutive_cost_error_count(&self) -> usize {
+            *self.consecutive_cost_errors.borrow()
+        }
+
+        pub(super) fn last_cost_error_string(&self) -> Option<String> {
+            self.last_cost_error_msg.borrow().clone()
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
@@ -652,10 +678,24 @@ pub mod internal {
                             Ok(h_inv_s_col) => {
                                 trace_h_inv_s_lambda += h_inv_s_col[j];
                             }
-                            Err(e) => {
-                                log::warn!("Linear system solve failed for EDF calculation: {e:?}");
-                                trace_h_inv_s_lambda = 0.0;
-                                break;
+                            Err(e_direct) => {
+                                log::warn!(
+                                    "Linear system solve failed for EDF column {}, attempting robust fallback: {:?}",
+                                    j, e_direct
+                                );
+                                // Fallback to robust SVD-based solve
+                                match robust_solve(&hessian_original, &s_col.to_owned()) {
+                                    Ok(h_inv_s_col) => {
+                                        trace_h_inv_s_lambda += h_inv_s_col[j];
+                                    }
+                                    Err(e_fallback) => {
+                                        log::warn!(
+                                            "Robust solve also failed during EDF trace calculation: {:?}",
+                                            e_fallback
+                                        );
+                                        return Err(e_fallback);
+                                    }
+                                }
                             }
                         }
                     }
@@ -668,18 +708,16 @@ pub mod internal {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
 
-                    // log |H| = log |X'X + S_λ|
-                    let log_det_h = match pirls_result
-                        .penalized_hessian_transformed
-                        .cholesky(UPLO::Lower)
-                    {
+                    // log |H| = log |X'X + S_λ| using stabilized Hessian
+                    let mut h_for_logdet = pirls_result.penalized_hessian_transformed.clone();
+                    ensure_positive_definite(&mut h_for_logdet)?;
+                    let log_det_h = match h_for_logdet.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             log::warn!(
-                                "Cholesky failed for penalized Hessian, using eigenvalue method"
+                                "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
-                            let eigenvals = pirls_result
-                                .penalized_hessian_transformed
+                            let eigenvals = h_for_logdet
                                 .eigvals()
                                 .map_err(EstimationError::LinearSystemSolveFailed)?;
 
@@ -720,19 +758,17 @@ pub mod internal {
                     let log_det_s = pirls_result.reparam_result.log_det;
 
                     // Log-determinant of the penalized Hessian.
-                    let log_det_h = match pirls_result
-                        .penalized_hessian_transformed
-                        .cholesky(UPLO::Lower)
-                    {
+                    let mut h_for_logdet = pirls_result.penalized_hessian_transformed.clone();
+                    ensure_positive_definite(&mut h_for_logdet)?;
+                    let log_det_h = match h_for_logdet.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
                             log::warn!(
-                                "Cholesky failed for penalized Hessian, using eigenvalue method"
+                                "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
 
-                            let eigenvals = pirls_result
-                                .penalized_hessian_transformed
+                            let eigenvals = h_for_logdet
                                 .eigvals()
                                 .map_err(EstimationError::LinearSystemSolveFailed)?;
 
@@ -810,13 +846,21 @@ pub mod internal {
                 *count
             };
 
-            let safe_rho = rho_bfgs.mapv(|v| v.clamp(-15.0, 15.0));
+            let safe_rho = rho_bfgs.mapv(|v| {
+                if v.is_finite() {
+                    v.clamp(-15.0, 15.0)
+                } else {
+                    0.0
+                }
+            });
 
             // Attempt to compute the cost and gradient.
             let cost_result = self.compute_cost(&safe_rho);
 
             match cost_result {
                 Ok(cost) if cost.is_finite() => {
+                    // Reset consecutive error counter on successful finite cost
+                    *self.consecutive_cost_errors.borrow_mut() = 0;
                     match self.compute_gradient(&safe_rho) {
                         Ok(grad) => {
                             let grad_norm = grad.dot(&grad).sqrt();
@@ -878,6 +922,25 @@ pub mod internal {
                     println!("  -> Retreat gradient norm: {grad_norm:.6e}");
 
                     (cost, gradient)
+                }
+                // Explicitly handle underlying error to avoid swallowing details
+                Err(e) => {
+                    log::warn!(
+                        "[BFGS Step #{eval_num}] Underlying cost computation failed: {:?}. Retreating.",
+                        e
+                    );
+                    // Track consecutive errors so we can abort after repeated failures
+                    {
+                        let mut cnt = self.consecutive_cost_errors.borrow_mut();
+                        *cnt += 1;
+                    }
+                    *self.last_cost_error_msg.borrow_mut() = Some(format!("{:?}", e));
+                    println!(
+                        "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
+                    );
+                    // Generate a gradient that points away from problematic parameter values
+                    let retreat_gradient = safe_rho.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                    (f64::INFINITY, retreat_gradient)
                 }
                 // Cost was non-finite or an error occurred.
                 _ => {
