@@ -78,6 +78,11 @@ pub enum DataError {
         "Input file contains only {found} data rows, but at least {required} are recommended for a stable model."
     )]
     InsufficientRows { found: usize, required: usize },
+
+    #[error(
+        "Non-finite values (NaN or Infinity) were found in the required column '{0}'. This tool requires all data to be finite."
+    )]
+    NonFiniteValuesFound(String),
 }
 
 /// Loads and validates data specifically for model training.
@@ -107,6 +112,14 @@ mod internal {
         num_pcs: usize,
         include_phenotype: bool,
     ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>, Array1<f64>), DataError> {
+        // Small helper: validate that an array contains only finite values
+        fn validate_is_finite(arr: &Array1<f64>, column_name: &str) -> Result<(), DataError> {
+            if arr.iter().any(|&v| !v.is_finite()) {
+                return Err(DataError::NonFiniteValuesFound(column_name.to_string()));
+            }
+            Ok(())
+        }
+
         // --- 1. Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
@@ -189,6 +202,7 @@ mod internal {
 
             // Now convert to ndarray
             let arr = phenotype_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            validate_is_finite(&arr, "phenotype")?;
             Some(arr)
         } else {
             None
@@ -224,6 +238,7 @@ mod internal {
 
         // Now convert to ndarray
         let pgs = score_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+        validate_is_finite(&pgs, "score")?;
 
         // Process PC columns efficiently
         let mut pc_arrays = Vec::with_capacity(num_pcs);
@@ -256,6 +271,7 @@ mod internal {
 
             // Now convert to ndarray
             let arr = pc_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            validate_is_finite(&arr, pc_name)?;
             pc_arrays.push(arr);
         }
 
@@ -312,6 +328,7 @@ mod internal {
 
             // Convert to ndarray
             let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            validate_is_finite(&weights_array, "weights")?;
 
             // Validate that all weights are non-negative
             for (i, &weight) in weights_array.iter().enumerate() {
@@ -351,6 +368,32 @@ mod tests {
         writeln!(file, "{}", content)?;
         file.flush()?;
         Ok(file)
+    }
+
+    #[test]
+    fn test_non_finite_values_rejected_in_score() {
+        let header = "phenotype\tscore\tPC1";
+        let data_row = "1.0\tNaN\t0.1"; // NaN should be parsed as f64::NAN
+        let content = generate_csv_content(header, data_row, 30);
+        let file = create_test_csv(&content).unwrap();
+        let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
+        match err {
+            DataError::NonFiniteValuesFound(col) => assert_eq!(col, "score"),
+            other => panic!("Expected NonFiniteValuesFound(score), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_non_finite_values_rejected_in_pc() {
+        let header = "phenotype\tscore\tPC1";
+        let data_row = "1.0\t2.0\tNaN"; // NaN in PC1
+        let content = generate_csv_content(header, data_row, 30);
+        let file = create_test_csv(&content).unwrap();
+        let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
+        match err {
+            DataError::NonFiniteValuesFound(col) => assert_eq!(col, "PC1"),
+            other => panic!("Expected NonFiniteValuesFound(PC1), got {:?}", other),
+        }
     }
 
     /// Generates CSV content with a specified number of data rows.

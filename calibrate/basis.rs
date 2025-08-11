@@ -60,6 +60,9 @@ pub enum BasisError {
 
     #[error("Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis.")]
     ConstraintNullspaceNotFound,
+
+    #[error("The provided knot vector is invalid: {0}. It must be non-decreasing and contain only finite values.")]
+    InvalidKnotVector(String),
 }
 
 /// Creates a B-spline basis expansion matrix and its corresponding knot vector.
@@ -93,6 +96,7 @@ pub fn create_bspline_basis_with_knots(
     knot_vector: ArrayView1<f64>,
     degree: usize,
 ) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    // Validate degree
     if degree < 1 {
         return Err(BasisError::InvalidDegree(degree));
     }
@@ -105,6 +109,28 @@ pub fn create_bspline_basis_with_knots(
             required: required_knots,
             provided: knot_vector.len(),
         });
+    }
+
+    // Validate knot vector finiteness and monotonicity (non-decreasing)
+    if knot_vector.iter().any(|&k| !k.is_finite()) {
+        return Err(BasisError::InvalidKnotVector(
+            "knot vector contains non-finite (NaN or Infinity) values".to_string(),
+        ));
+    }
+    // Validate non-decreasing order without relying on Windows iterator methods
+    let mut decreasing = false;
+    if knot_vector.len() >= 2 {
+        for i in 0..(knot_vector.len() - 1) {
+            if knot_vector[i] > knot_vector[i + 1] {
+                decreasing = true;
+                break;
+            }
+        }
+    }
+    if decreasing {
+        return Err(BasisError::InvalidKnotVector(
+            "knot vector is not non-decreasing".to_string(),
+        ));
     }
 
     let num_basis_functions = knot_vector.len() - degree - 1;
@@ -295,9 +321,16 @@ mod internal {
             return Ok(Array1::from_vec(vec![]));
         }
 
-        let mut sorted_data = data.to_vec();
-        // Use `sort_unstable_by` for performance and to handle non-total-order of f64.
-        sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sorted_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
+        // Reject if all values were non-finite
+        if sorted_data.is_empty() {
+            return Err(BasisError::InsufficientDataForQuantiles {
+                num_quantiles,
+                num_points: 0,
+            });
+        }
+        // Use a total order to avoid NaN-related undefined ordering (already filtered)
+        sorted_data.sort_by(|a, b| a.total_cmp(b));
 
         let n = sorted_data.len();
         let quantiles_vec = (1..=num_quantiles)
@@ -1065,6 +1098,29 @@ mod tests {
                 assert_eq!(num_basis, 5);
             }
             _ => panic!("Expected InvalidPenaltyOrder error"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_knot_vector_monotonicity_and_finiteness() {
+        // Decreasing knot vector should be rejected
+        let knots_bad_order = array![0.0, 0.0, 2.0, 1.0, 3.0, 3.0];
+        let data = array![0.5, 1.0, 1.5];
+        match create_bspline_basis_with_knots(data.view(), knots_bad_order.view(), 1) {
+            Err(BasisError::InvalidKnotVector(msg)) => {
+                assert!(msg.contains("non-decreasing"));
+            }
+            other => panic!("Expected InvalidKnotVector (order), got {:?}", other),
+        }
+
+        // Non-finite knot vector should be rejected
+        let mut knots_non_finite = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        knots_non_finite[2] = f64::NAN;
+        match create_bspline_basis_with_knots(data.view(), knots_non_finite.view(), 1) {
+            Err(BasisError::InvalidKnotVector(msg)) => {
+                assert!(msg.contains("non-finite"));
+            }
+            other => panic!("Expected InvalidKnotVector (non-finite), got {:?}", other),
         }
     }
 }

@@ -115,6 +115,8 @@ pub enum ModelError {
         "Constraint transformation matrix missing for term '{0}'. This usually indicates a model format mismatch."
     )]
     ConstraintMissing(String),
+    #[error("Coefficient vector for term '{0}' is missing from the model file.")]
+    CoefficientMissing(String),
 }
 
 impl TrainedModel {
@@ -147,20 +149,18 @@ impl TrainedModel {
         }
 
         // --- 2. Reconstruct Mathematical Objects ---
-        let x_new = internal::construct_design_matrix(p_new, pcs_new, &self.config)?;
-        let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config);
+        let x_new =
+            internal::construct_design_matrix(p_new, pcs_new, &self.config, &self.coefficients)?;
+        let flattened_coeffs =
+            internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         // This is a critical safety check. It ensures that the number of columns in the
         // design matrix constructed for prediction exactly matches the number of coefficients
         // in the flattened model vector. A mismatch here would lead to silently incorrect
         // predictions and indicates a severe bug in the model's layout logic.
-        debug_assert_eq!(
-            x_new.ncols(),
-            flattened_coeffs.len(),
-            "FATAL: Mismatch between design matrix columns ({}) and flattened coefficients ({}) during prediction. Check model layout consistency.",
-            x_new.ncols(),
-            flattened_coeffs.len()
-        );
+        if x_new.ncols() != flattened_coeffs.len() {
+            return Err(ModelError::InternalStackingError);
+        }
 
         // --- 3. Compute Linear Predictor ---
         let eta = x_new.dot(&flattened_coeffs);
@@ -237,6 +237,7 @@ mod internal {
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
         config: &ModelConfig,
+        coeffs: &MappedCoefficients,
     ) -> Result<Array2<f64>, ModelError> {
         // 1. Generate basis for PGS using saved knot vector if available
         // Only use saved knot vectors - remove fallback to ensure consistency
@@ -333,22 +334,27 @@ mod internal {
         }
 
         // 4. Tensor product interaction effects (conditionally)
-        // Only create interaction terms if we have PCs and the constrained PGS basis has columns
-        // Use constrained basis count to match training logic in construction.rs
-        let num_pgs_interaction_bases = pgs_main_basis.ncols();
+        // Only create interaction terms if we have PCs and the UNCONSTRAINED PGS basis has columns
+        // Gate on the same basis dimension used to construct the layout (unconstrained)
+        let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
         if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
             // Create unified interaction surfaces using row-wise tensor products
             for pc_idx in 0..config.pc_names.len() {
                 let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
+                let pc_name = &config.pc_names[pc_idx];
+                let tensor_key = format!("f(PGS,{})", pc_name);
 
-                // For interactions, use the UNCONSTRAINED pgs_main_basis_unc for the tensor product
-                // to match the training logic and ensure dimensional consistency (see critical comment above)
-                let tensor_interaction =
-                    row_wise_tensor_product(&pgs_main_basis_unc.to_owned(), pc_unconstrained_basis);
+                // Only build the interaction if the trained model contains coefficients for it
+                if coeffs.interaction_effects.contains_key(&tensor_key) {
+                    let tensor_interaction = row_wise_tensor_product(
+                        &pgs_main_basis_unc.to_owned(),
+                        pc_unconstrained_basis,
+                    );
 
-                // Add all columns from this tensor product to the design matrix
-                for col in tensor_interaction.axis_iter(Axis(1)) {
-                    owned_cols.push(col.to_owned());
+                    // Add all columns from this tensor product to the design matrix
+                    for col in tensor_interaction.axis_iter(Axis(1)) {
+                        owned_cols.push(col.to_owned());
+                    }
                 }
             }
         }
@@ -364,7 +370,7 @@ mod internal {
     pub(super) fn flatten_coefficients(
         coeffs: &MappedCoefficients,
         config: &ModelConfig,
-    ) -> Array1<f64> {
+    ) -> Result<Array1<f64>, ModelError> {
         let mut flattened: Vec<f64> = Vec::new();
 
         // Order of concatenation MUST exactly match `construct_design_matrix`.
@@ -373,9 +379,12 @@ mod internal {
 
         // 2. Main PC effects (ordered by `pc_names` for determinism).
         for pc_name in &config.pc_names {
-            if let Some(c) = coeffs.main_effects.pcs.get(pc_name) {
-                flattened.extend_from_slice(c);
-            }
+            let c = coeffs
+                .main_effects
+                .pcs
+                .get(pc_name)
+                .ok_or_else(|| ModelError::CoefficientMissing(pc_name.clone()))?;
+            flattened.extend_from_slice(c);
         }
 
         // 3. Main PGS effects (for basis functions m > 0).
@@ -389,7 +398,7 @@ mod internal {
             }
         }
 
-        Array1::from_vec(flattened)
+        Ok(Array1::from_vec(flattened))
     }
 }
 
@@ -613,7 +622,8 @@ mod tests {
 
         // Use the internal flatten_coefficients function
         use super::internal::flatten_coefficients;
-        let flattened = flatten_coefficients(&coeffs, &config);
+        let flattened = flatten_coefficients(&coeffs, &config)
+            .expect("flatten_coefficients should succeed for well-formed inputs");
 
         // Verify the canonical order of flattening:
         // 1. Intercept
