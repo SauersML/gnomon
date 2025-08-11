@@ -265,158 +265,67 @@ pub fn fit_model_for_fixed_rho(
             "P-IRLS Iteration #{}: Getting solver result in transformed basis",
             iter
         );
-        let mut beta_trial = stable_result.0.beta.clone();
-
-        if !beta_trial.iter().all(|x| x.is_finite()) {
-            log::error!("Non-finite beta values at iteration {iter}: {beta_trial:?}");
-            return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: config.max_iterations,
-                last_change: f64::NAN,
-            });
-        }
-
-        // Calculate trial values
-        let mut eta_trial = x_transformed.dot(&beta_trial);
-        let (mut mu_trial, _, _) =
-            update_glm_vectors(y, &eta_trial, config.link_function, prior_weights.view());
-        let mut deviance_trial =
-            calculate_deviance(y, &mu_trial, config.link_function, prior_weights.view());
-
-        // mgcv-style step halving (use while loop instead of for loop with counter)
+        let beta_trial_initial = stable_result.0.beta.clone();
+        let mut beta_trial = beta_trial_initial.clone();
         let mut step_halving_count = 0;
+        const MAX_STEP_HALVING: usize = 30;
 
-        // Check for non-finite values or deviance increase
-        let mut valid_eta = eta_trial.iter().all(|v| v.is_finite());
-        let mut valid_mu = mu_trial.iter().all(|v| v.is_finite());
-
-        // Calculate penalty using the transformed total penalty matrix
-        let mut penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
-        let mut penalized_deviance_trial = deviance_trial + penalty_trial;
-        let mut deviance_decreased = penalized_deviance_trial <= penalized_deviance_current;
-
-        if iter > 45 {
-            eprintln!("\n[DEBUG STEP-HALVING | Iter #{}", iter);
-            eprintln!(
-                "  - Penalized Deviance (Current): {:.16e}",
-                penalized_deviance_current
-            );
-            eprintln!(
-                "  - Penalized Deviance (Trial):   {:.16e}",
-                penalized_deviance_trial
-            );
-            let diff = penalized_deviance_trial - penalized_deviance_current;
-            eprintln!("  - Difference (Trial - Current): {:.16e}", diff);
-            eprintln!("  - Deviance Decreased Flag: {}", deviance_decreased);
-            if !deviance_decreased && diff > 0.0 {
-                eprintln!(
-                    "  - >>> TRIGGERING STEP-HALVING due to a positive difference of {:.16e}",
-                    diff
-                );
-            }
-        }
-
-        // Enhanced debugging for the failing test
-        log::debug!(
-            "P-IRLS Iteration #{}: Starting values check | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}",
-            iter,
-            valid_eta,
-            valid_mu,
-            deviance_trial.is_finite(),
-            deviance_decreased
-        );
-        log::debug!(
-            "P-IRLS Iteration #{}: Deviance check | current: {:.8e}, trial: {:.8e}, change: {:.8e}",
-            iter,
-            penalized_deviance_current,
-            penalized_deviance_trial,
-            penalized_deviance_current - penalized_deviance_trial
-        );
-
-        // Step halving when: invalid values or deviance increased
-        if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
-            log::debug!("Starting step halving due to invalid values or deviance increase");
-        }
-
-        // mgcv-style while loop for step halving
-        while (!valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased)
-            && step_halving_count < 30
-        {
-            // Half the step size
-            beta_trial = &beta_current + 0.5 * (&beta_trial - &beta_current);
-            eta_trial = x_transformed.dot(&beta_trial);
-
-            // Re-evaluate
-            let update_result =
+        // Use a robust `loop` for step-halving that prioritizes numerical stability.
+        loop {
+            let eta_trial = x_transformed.dot(&beta_trial);
+            let (mu_trial, _, _) =
                 update_glm_vectors(y, &eta_trial, config.link_function, prior_weights.view());
-            mu_trial = update_result.0;
-            deviance_trial =
+            let deviance_trial =
                 calculate_deviance(y, &mu_trial, config.link_function, prior_weights.view());
 
-            // Update the penalty using the transformed total penalty matrix
-            penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
+            // First, check if the trial step resulted in a numerically valid state.
+            // This is the most important check.
+            let is_numerically_valid = eta_trial.iter().all(|v| v.is_finite())
+                && mu_trial.iter().all(|v| v.is_finite())
+                && deviance_trial.is_finite();
 
-            // Check conditions again
-            valid_eta = eta_trial.iter().all(|v| v.is_finite());
-            valid_mu = mu_trial.iter().all(|v| v.is_finite());
-            penalized_deviance_trial = deviance_trial + penalty_trial;
-            deviance_decreased = penalized_deviance_trial <= penalized_deviance_current;
+            if is_numerically_valid {
+                let penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
+                let penalized_deviance_trial = deviance_trial + penalty_trial;
 
+                // If it's valid, NOW check if the penalized deviance has decreased.
+                if penalized_deviance_trial <= penalized_deviance_current {
+                    // SUCCESS: The step is valid and improves the fit.
+                    // Update the main state variables and exit the step-halving loop.
+                    beta_transformed = beta_trial;
+                    eta = eta_trial;
+                    last_deviance = deviance_trial;
+                    (mu, weights, z) =
+                        update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
+                    
+                    if step_halving_count > 0 {
+                        log::debug!("Step halving successful after {} attempts", step_halving_count);
+                    }
+                    break; // Exit the loop
+                }
+            }
+
+            // If we reach here, it's because the step was either numerically invalid (e.g., deviance=inf)
+            // OR it was valid but increased the deviance. In both cases, we must halve the step.
             step_halving_count += 1;
+            if step_halving_count >= MAX_STEP_HALVING {
+                log::warn!(
+                    "P-IRLS failed to find a valid step after {} halvings. This often indicates model instability.",
+                    MAX_STEP_HALVING
+                );
+                return Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: config.max_iterations,
+                    last_change: f64::INFINITY,
+                });
+            }
 
-            // Enhanced debugging for all step-halving attempts
-            log::debug!(
-                "Step halving #{} | valid_eta: {}, valid_mu: {}, deviance_finite: {}, deviance_decreased: {}",
-                step_halving_count,
-                valid_eta,
-                valid_mu,
-                deviance_trial.is_finite(),
-                deviance_decreased
-            );
-            log::debug!(
-                "Step halving #{} | current: {:.8e}, trial: {:.8e}, change: {:.8e}",
-                step_halving_count,
-                penalized_deviance_current,
-                penalized_deviance_trial,
-                penalized_deviance_current - penalized_deviance_trial
-            );
+            // Halve the step towards the previous iteration's coefficients.
+            beta_trial = &beta_current + 0.5 * (&beta_trial - &beta_current);
         }
-
-        // If we couldn't find a valid step after max step halvings, fail
-        if !valid_eta || !valid_mu || !deviance_trial.is_finite() || !deviance_decreased {
-            log::warn!(
-                "P-IRLS failed to find valid step after {} halvings",
-                step_halving_count
-            );
-            // mgcv simply returns with failure in this case
-            return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: config.max_iterations,
-                last_change: if deviance_decreased {
-                    f64::NAN
-                } else {
-                    f64::INFINITY
-                },
-            });
-        }
-
-        // Log step halving info if any occurred
-        if step_halving_count > 0 {
-            log::debug!(
-                "Step halving successful after {} attempts",
-                step_halving_count
-            );
-        }
-
-        // Update all state variables atomically
-        beta_transformed = beta_trial;
 
         // Print beta norm to track coefficient growth
         let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
         println!("[P-IRLS State] Beta Norm: {:.6e}", beta_norm);
-
-        eta = eta_trial;
-        last_deviance = deviance_trial;
-        (mu, weights, z) =
-            update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
 
         // Monitor maximum eta value (to detect separation)
         max_abs_eta = eta
@@ -975,21 +884,19 @@ pub fn update_glm_vectors(
             let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
             // Create mu and then clamp to prevent values exactly at 0 or 1
             let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-            // Clamp mu to prevent it from reaching exactly 0 or 1, which is crucial for
-            // numerical stability of weights and deviance calculations
             mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
-            let weights = &prior_weights * (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
+            
+            // --- START FIX ---
+            // 1. Calculate dμ/dη, which is μ(1-μ) for the logit link.
+            // This term must NOT include prior weights.
+            let dmu_deta = &mu * &(1.0 - &mu);
 
-            // Prevent extreme values in working response z
-            let residual = &y.view() - &mu;
-            let z_adj = &residual / &weights;
-            // REMOVED: Clamping of z_adj - this was causing algorithm instability
-            // The clamping was preventing the algorithm from taking the large steps it needs
-            // when dealing with quasi-perfect separation.
-            // let z_clamped = z_adj.mapv(|v| v.clamp(-1000.0, 1000.0));
-            // Using unclamped z_adj allows the algorithm to propose proper steps
-            // and rely on the robust step-halving to handle any issues.
-            let z = &eta_clamped + &z_adj;
+            // 2. Calculate the full working weights, which DO include prior weights.
+            let weights = &prior_weights * &dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
+
+            // 3. Calculate the working response `z` CORRECTLY, using dμ/dη in the denominator.
+            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &dmu_deta);
+            // --- END FIX ---
 
             (mu, weights, z)
         }
@@ -1368,52 +1275,41 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector (NEW, CORRECTED IMPLEMENTATION)
+    // STAGE 6: Reconstruct the full coefficient vector
     //-----------------------------------------------------------------------
-    // This multi-step process correctly reverses the two pivoting and one dropping
-    // operation performed earlier, mirroring the logic in MGCV's C code.
+    // This logic correctly reverses the sequence of transformations in order:
+    // 1. Un-pivot the solution from the final QR (`rank_pivot`).
+    // 2. Re-insert zeros for the columns that were dropped (`drop_indices`).
+    // 3. Un-pivot the result from the initial QR (`initial_pivot`).
 
-    // Build the list of kept column indices in the pivoted space (complement of drop_indices)
-    let mut kept_indices: Vec<usize> = Vec::with_capacity(rank);
-    if n_drop > 0 {
-        let drop_set: std::collections::HashSet<usize> = drop_indices.iter().copied().collect();
-        for j in 0..p {
-            if !drop_set.contains(&j) {
-                kept_indices.push(j);
-            }
+    // Step 6a: Reverse the final pivot (`rank_pivot`). This maps the solved
+    // coefficients (`beta_dropped`) back to their correct positions within the
+    // space of the `rank` columns that were kept.
+    let mut beta_kept = Array1::zeros(rank);
+    for i in 0..rank {
+        beta_kept[rank_pivot[i]] = beta_dropped[i];
+    }
+
+    // Step 6b: Re-insert zeros for the dropped columns. This expands the `rank`-dimensional
+    // `beta_kept` vector into a `p`-dimensional vector that is still ordered
+    // according to `initial_pivot`.
+    let mut beta_pivoted_by_initial = Array1::zeros(p);
+    let mut kept_idx = 0;
+    for i in 0..p {
+        if !drop_indices.contains(&i) {
+            // This column was kept. Its coefficient comes from beta_kept.
+            beta_pivoted_by_initial[i] = beta_kept[kept_idx];
+            kept_idx += 1;
         }
-    } else {
-        // No drops: kept indices are 0..p
-        kept_indices.extend(0..p);
+        // else, the coefficient remains 0.0 as initialized.
     }
 
-    // Step 6a: Un-pivot the solution from the final QR space (using `rank_pivot`).
-    // This maps the solution `beta_dropped` (which corresponds to the pivoted, rank-reduced
-    // matrix) back to the order of the *kept* columns before the second pivot.
-    let mut beta_for_kept_cols = Array1::zeros(rank);
-    for i in 0..rank {
-        beta_for_kept_cols[rank_pivot[i]] = beta_dropped[i];
-    }
-
-    // Step 6b: Re-insert zeroes for the columns that were dropped for rank deficiency.
-    // This expands the vector from `rank` to `p` elements, placing coefficients
-    // into the columns that were kept after the *initial* QR.
-    let mut beta_for_initial_pivot = Array1::zeros(p);
-    for i in 0..rank {
-        // `kept_indices` holds the indices of columns that were not dropped.
-        let original_kept_index = kept_indices[i];
-        beta_for_initial_pivot[original_kept_index] = beta_for_kept_cols[i];
-    }
-
-    // Step 6c: Un-pivot from the initial QR to get the final coefficient vector.
-    // This reverses the very first pivot, restoring the coefficients to their
-    // original order in the stable (Qs-transformed) basis.
+    // Step 6c: Reverse the initial pivot to get the final coefficient vector
+    // in the original, un-pivoted order. This is the final correct solution.
     let mut beta_transformed = Array1::zeros(p);
     for i in 0..p {
-        beta_transformed[initial_pivot[i]] = beta_for_initial_pivot[i];
+        beta_transformed[initial_pivot[i]] = beta_pivoted_by_initial[i];
     }
-    // `beta_transformed` is now the final, correctly ordered solution vector.
-    // Remaining entries correspond to dropped columns and stay at zero.
 
     //-----------------------------------------------------------------------
     // STAGE 7: Construct the penalized Hessian (CORRECTED IMPLEMENTATION)
