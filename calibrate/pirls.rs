@@ -153,6 +153,16 @@ pub fn fit_model_for_fixed_rho(
         x_transformed.sum()
     );
 
+    // --- CRITICAL FIX: Transform eb to the same stable basis ---
+    // As per mgcv (Eb <- Eb%*%T), transform eb into the same stable basis as x_transformed.
+    // The transformation for a penalty root R (shape k x p) is R_new = R * Q.
+    // Here, eb is `rank x p` and qs is `p x p`, so the result is `rank x p`.
+    let eb_transformed = eb.dot(&reparam_result.qs);
+    println!(
+        "[Basis Fix] Transformed eb from original to stable basis. eb_transformed_sum: {:.4e}",
+        eb_transformed.sum()
+    );
+
     // Step 4: Extract penalty matrices using the TRULY lambda-independent eb
     // Note: eb is computed from unweighted penalties and never changes with lambda
     let s_transformed = &reparam_result.s_transformed;
@@ -238,7 +248,7 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
-            &eb,                  // Lambda-INDEPENDENT balanced penalty root for rank detection
+            &eb_transformed,      // Lambda-INDEPENDENT balanced penalty root for rank detection (NOW IN STABLE BASIS)
             e_transformed,        // Lambda-DEPENDENT penalty root for penalty application
             y.view(),             // Pass original response
             config.link_function, // Pass link function for correct scale calculation
@@ -432,7 +442,7 @@ pub fn fit_model_for_fixed_rho(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
-                    &eb,
+                    &eb_transformed,
                     e_transformed,
                     y.view(),
                     config.link_function,
@@ -535,7 +545,7 @@ pub fn fit_model_for_fixed_rho(
                             x_transformed.view(),
                             z.view(),
                             weights.view(),
-                            &eb,
+                            &eb_transformed,
                             e_transformed,
                             y.view(),
                             config.link_function,
@@ -580,7 +590,7 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(),
             z.view(),
             weights.view(),
-            &eb,
+            &eb_transformed,
             e_transformed,
             y.view(),
             config.link_function,
