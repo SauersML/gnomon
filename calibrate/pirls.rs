@@ -721,14 +721,13 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 
 /// Un-pivots the columns of a matrix according to a pivot vector.
 ///
-/// This is a direct translation of the "unpivot x" logic for columns
-/// from mgcv's `pivoter` C function. It reverses the permutation applied
-/// by a pivoted QR decomposition.
+/// This reverses the permutation `A*P` to recover `A` from `B`, where `B = A*P`.
+/// It assumes the `pivot` vector is a **forward** permutation, where `pivot[i]`
+/// is the original column index that was moved to position `i`.
 ///
 /// # Parameters
-/// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the R factor).
-/// * `pivot`: The permutation vector from the QR decomposition. `pivot[j]` is the
-///   original index of the j-th column in the pivoted matrix.
+/// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the `R` factor).
+/// * `pivot`: The forward permutation vector from the QR decomposition.
 fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     let r = pivoted_matrix.nrows();
     let c = pivoted_matrix.ncols();
@@ -750,12 +749,14 @@ fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f
 
 /// Pivots the columns of a matrix according to a pivot vector.
 ///
-/// This applies the permutation, reordering columns. For a matrix A and pivot p,
-/// the result B is such that B_j = A_{p[j]}.
+/// This applies the permutation `A*P` to get a new matrix `B`. It assumes the
+/// `pivot` vector is a **forward** permutation.
+///
+/// For a matrix A and pivot p, the result B is such that `B_j = A_{p[j]}`.
 ///
 /// # Parameters
 /// * `matrix`: The matrix whose columns will be permuted.
-/// * `pivot`: The permutation vector from the QR decomposition.
+/// * `pivot`: The forward permutation vector.
 fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     let r = matrix.nrows();
     let c = matrix.ncols();
@@ -1416,6 +1417,79 @@ pub fn solve_penalized_least_squares(
     // 4. Un-pivot the Hessian to the original basis: H_orig = P * H_pivoted * P^T
     let penalized_hessian = perm_matrix.dot(&hessian_pivoted).dot(&perm_matrix.t());
 
+    // Debug-time guards to catch basis or pivot mismatches early
+    #[cfg(debug_assertions)]
+    {
+        use ndarray_linalg::{Cholesky, UPLO};
+
+        // (a) Symmetry check (relative)
+        let mut asym_sum = 0.0f64;
+        let mut abs_sum = 0.0f64;
+        for i in 0..penalized_hessian.nrows() {
+            for j in 0..penalized_hessian.ncols() {
+                let a = penalized_hessian[[i, j]];
+                let b = penalized_hessian[[j, i]];
+                asym_sum += (a - b).abs();
+                abs_sum += a.abs();
+            }
+        }
+        let rel_asym = asym_sum / (1.0 + abs_sum);
+        debug_assert!(
+            rel_asym < 1e-10,
+            "Penalized Hessian not symmetric; pivot/basis composition may be wrong (rel_asym={})",
+            rel_asym
+        );
+
+        // (b) Permutation orthogonality: P * P^T ~ I
+        let eye = Array2::<f64>::eye(perm_matrix.nrows());
+        let pp_t = perm_matrix.dot(&perm_matrix.t());
+        let mut ortho_err = 0.0f64;
+        for i in 0..eye.nrows() {
+            for j in 0..eye.ncols() {
+                ortho_err += (pp_t[[i, j]] - eye[[i, j]]).abs();
+            }
+        }
+        debug_assert!(
+            ortho_err < 1e-10,
+            "Permutation matrix not orthonormal; check pivot composition (err={})",
+            ortho_err
+        );
+
+        // (c) PD sanity (allow PSD): add tiny ridge then try Cholesky
+        let mut h_check = penalized_hessian.clone();
+        let ridge = 1e-12;
+        for i in 0..h_check.nrows() {
+            h_check[[i, i]] += ridge;
+        }
+        if h_check.cholesky(UPLO::Lower).is_err() {
+            log::warn!(
+                "Penalized Hessian failed Cholesky even after tiny ridge; verify basis composition."
+            );
+        }
+
+        // (d) Action consistency: (X'WX + S) * beta == H * beta
+        // Rebuild XtWX and S in this basis
+        let sqrt_w = weights.mapv(|w| w.sqrt());
+        let wx_dbg = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
+        let xtwx_dbg = wx_dbg.t().dot(&wx_dbg);
+        let s_lambda_dbg = e_transformed.t().dot(e_transformed);
+        let theoretical_h = xtwx_dbg + s_lambda_dbg;
+        let expected = theoretical_h.dot(&beta_transformed);
+        let actual = penalized_hessian.dot(&beta_transformed);
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..expected.len() {
+            num += (expected[i] - actual[i]).powi(2);
+            den += expected[i].powi(2);
+        }
+        let rel = (num.sqrt()) / (den.sqrt().max(1e-12));
+        debug_assert!(
+            rel < 1e-6,
+            "Hessian action on beta inconsistent with XtWX+S (rel_err={})",
+            rel
+        );
+    }
+
     //-----------------------------------------------------------------------
     // STAGE 8: Calculate EDF and scale parameter
     //-----------------------------------------------------------------------
@@ -1521,7 +1595,38 @@ fn pivoted_qr_faer(
 
     // Step 5: Extract the consistent column permutation (pivot)
     let perm = qr.P();
+
+    // CRITICAL: This logic relies on the internal structure of faer's `Perm` object.
+    // We assume that `.arrays().0` returns the **forward** permutation vector,
+    // where `pivot[j]` contains the index of the column from the *original* matrix
+    // that is moved to the `j`-th position in the pivoted matrix (i.e., new_col_j = old_col_{pivot[j]}).
+    //
+    // This assumption is confirmed by reviewing the `faer` source for `ColPivQr::new_imp`,
+    // which constructs the `Perm` object with `col_perm_fwd` in the first position.
+    // An inverse permutation here would silently scramble the model coefficients and Hessian.
     let pivot: Vec<usize> = perm.arrays().0.to_vec();
+
+    // In debug builds, explicitly verify our assumption about the permutation direction.
+    // This assert confirms that applying our `pivot_columns` function to the original
+    // matrix `A` produces the same result as `A * P` calculated by faer.
+    #[cfg(debug_assertions)]
+    {
+        // Reconstruct A*P directly using faer's API to get the ground truth.
+        let a_p_faer = a_faer.as_ref() * perm;
+
+        // Apply our own pivoting logic.
+        let a_p_ours = pivot_columns(matrix.view(), &pivot);
+
+        // Compare the results.
+        for i in 0..m {
+            for j in 0..n {
+                assert!(
+                    (a_p_faer[(i, j)] - a_p_ours[[i, j]]).abs() < 1e-12,
+                    "Permutation direction assumption is INCORRECT. faer's convention may have changed."
+                );
+            }
+        }
+    }
 
     Ok((q, r, pivot))
 }
@@ -1533,20 +1638,58 @@ fn calculate_edf(
     x: ArrayView2<f64>,
     weights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    use ndarray_linalg::Solve;
+    use ndarray_linalg::{Cholesky, SVD, Solve, UPLO};
+
     let p = x.ncols();
-    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    let sqrt_w = weights.mapv(|w| w.sqrt());
     let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
     let xtwx = wx.t().dot(&wx);
 
-    let mut edf: f64 = 0.0;
-    for j in 0..p {
-        if let Ok(h_inv_col) = penalized_hessian.solve(&xtwx.column(j).to_owned()) {
-            edf += h_inv_col[j];
+    // Try fast, stable Cholesky-based solve for all columns at once
+    if let Ok(chol) = penalized_hessian.cholesky(UPLO::Lower) {
+        let mut edf = 0.0;
+        for j in 0..p {
+            let rhs = xtwx.column(j).to_owned();
+            let sol = chol
+                .solve(&rhs)
+                .map_err(EstimationError::LinearSystemSolveFailed)?;
+            edf += sol[j];
         }
+        return Ok(edf.max(1.0));
     }
 
-    Ok(if edf > 1.0 { edf } else { 1.0 })
+    // Fallback: SVD-based pseudo-inverse of H
+    let (maybe_u, s, maybe_vt) = penalized_hessian
+        .svd(true, true)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let (u, vt) = match (maybe_u, maybe_vt) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })
+        }
+    };
+    let smax = s.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let tol = smax * 1e-12;
+    let mut s_inv = Array2::zeros((s.len(), s.len()));
+    for i in 0..s.len() {
+        if s[i] > tol {
+            s_inv[[i, i]] = 1.0 / s[i];
+        }
+    }
+    let pinv_h = vt.t().dot(&s_inv).dot(&u.t());
+    let prod = pinv_h.dot(&xtwx);
+    let mut edf = 0.0;
+    for i in 0..p {
+        edf += prod[[i, i]];
+    }
+    if !edf.is_finite() {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    Ok(edf.max(1.0))
 }
 
 /// Calculate scale parameter correctly for different link functions
