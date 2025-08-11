@@ -968,7 +968,7 @@ pub fn update_glm_vectors(
             // Clamp mu to prevent it from reaching exactly 0 or 1, which is crucial for
             // numerical stability of weights and deviance calculations
             mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
-            let weights = (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
+            let weights = &prior_weights * (&mu * (1.0 - &mu)).mapv(|v| v.max(MIN_WEIGHT));
 
             // Prevent extreme values in working response z
             let residual = &y.view() - &mu;

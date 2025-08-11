@@ -182,7 +182,10 @@ pub fn train_model(
                 );
 
                 // Get the gradient at last_solution to ensure we're near a stationary point
-                let gradient_norm = match reml_state.compute_gradient(&last_solution.final_point) {
+                // Apply same clamping as used in cost_and_grad to ensure consistency
+                let unclamped_rho = &last_solution.final_point;
+                let safe_rho = unclamped_rho.mapv(|v| v.clamp(-15.0, 15.0));
+                let gradient_norm = match reml_state.compute_gradient(&safe_rho) {
                     Ok(grad) => grad.dot(&grad).sqrt(),
                     Err(_) => f64::INFINITY,
                 };
@@ -593,17 +596,7 @@ pub mod internal {
                     return Ok(f64::INFINITY); // Barrier: infinite cost
                 }
             }
-            let mut lambdas = p.mapv(f64::exp);
-
-            // Apply lambda floor to prevent numerical issues and infinite wiggliness
-            const LAMBDA_FLOOR: f64 = 1e-8;
-            let floored_count = lambdas.iter().filter(|&&l| l < LAMBDA_FLOOR).count();
-            if floored_count > 0 {
-                log::warn!(
-                    "Applied lambda floor to {floored_count} parameters (λ < {LAMBDA_FLOOR:.0e})"
-                );
-            }
-            lambdas.mapv_inplace(|l| l.max(LAMBDA_FLOOR));
+            let lambdas = p.mapv(f64::exp);
 
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
@@ -719,7 +712,7 @@ pub mod internal {
                             );
                             let eigenvals = h_for_logdet
                                 .eigvals()
-                                .map_err(EstimationError::LinearSystemSolveFailed)?;
+                                .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = 1e-8;
                             eigenvals
@@ -770,7 +763,7 @@ pub mod internal {
 
                             let eigenvals = h_for_logdet
                                 .eigvals()
-                                .map_err(EstimationError::LinearSystemSolveFailed)?;
+                                .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = 1e-8;
                             let stabilized_log_det: f64 = eigenvals
@@ -1255,7 +1248,7 @@ pub mod internal {
 
                     // 2. Compute dW/dη, which depends on the link function.
                     let dw_deta = match self.config.link_function {
-                        LinkFunction::Logit => &mu * (1.0 - &mu) * (1.0 - 2.0 * &mu),
+                        LinkFunction::Logit => &self.weights * (&mu * (1.0 - &mu) * (1.0 - 2.0 * &mu)),
                         // Fallback for Identity, though this branch shouldn't be taken for Identity link
                         LinkFunction::Identity => Array1::zeros(self.y.len()),
                     };
