@@ -104,6 +104,9 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
+    // Preserve a copy of prior weights for weighted deviance/scale calculations
+    let prior_weights = weights.to_owned();
+
     // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
     log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
@@ -159,8 +162,10 @@ pub fn fit_model_for_fixed_rho(
     // Step 5: Initialize P-IRLS state variables in the TRANSFORMED basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = x_transformed.dot(&beta_transformed);
-    let (mut mu, mut weights, mut z) = update_glm_vectors(y, &eta, config.link_function, weights);
-    let mut last_deviance = calculate_deviance(y, &mu, config.link_function);
+    let (mut mu, mut weights, mut z) =
+        update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
+    let mut last_deviance =
+        calculate_deviance(y, &mu, config.link_function, prior_weights.view());
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
 
@@ -262,8 +267,10 @@ pub fn fit_model_for_fixed_rho(
 
         // Calculate trial values
         let mut eta_trial = x_transformed.dot(&beta_trial);
-        let (mut mu_trial, _, _) = update_glm_vectors(y, &eta_trial, config.link_function, weights.view());
-        let mut deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
+        let (mut mu_trial, _, _) =
+            update_glm_vectors(y, &eta_trial, config.link_function, prior_weights.view());
+        let mut deviance_trial =
+            calculate_deviance(y, &mu_trial, config.link_function, prior_weights.view());
 
         // mgcv-style step halving (use while loop instead of for loop with counter)
         let mut step_halving_count = 0;
@@ -329,9 +336,11 @@ pub fn fit_model_for_fixed_rho(
             eta_trial = x_transformed.dot(&beta_trial);
 
             // Re-evaluate
-            let update_result = update_glm_vectors(y, &eta_trial, config.link_function, weights.view());
+            let update_result =
+                update_glm_vectors(y, &eta_trial, config.link_function, prior_weights.view());
             mu_trial = update_result.0;
-            deviance_trial = calculate_deviance(y, &mu_trial, config.link_function);
+            deviance_trial =
+                calculate_deviance(y, &mu_trial, config.link_function, prior_weights.view());
 
             // Update the penalty using the transformed total penalty matrix
             penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
@@ -396,7 +405,8 @@ pub fn fit_model_for_fixed_rho(
 
         eta = eta_trial;
         last_deviance = deviance_trial;
-        (mu, weights, z) = update_glm_vectors(y, &eta, config.link_function, weights.view());
+        (mu, weights, z) =
+            update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
 
         // Monitor maximum eta value (to detect separation)
         max_abs_eta = eta
@@ -456,12 +466,16 @@ pub fn fit_model_for_fixed_rho(
         let scale = match config.link_function {
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
-                // For Gaussian, scale is the estimated residual variance
-                let residuals = &mu - &y.view(); // Recompute residuals for scale calculation
-                // Use the EDF from the solver, not a naive n-p calculation.
-                // For penalized models, the correct degrees of freedom is n - edf.
+                // For Gaussian, use WEIGHTED residual variance consistent with objective
+                let residuals = &y.view() - &mu;
+                let weighted_rss: f64 = prior_weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum();
+                // Use the EDF from the solver: df = n - edf
                 let df = (x_transformed.nrows() as f64 - edf_from_solver).max(1.0);
-                residuals.dot(&residuals) / df
+                weighted_rss / df
             }
         };
 
@@ -978,29 +992,44 @@ pub fn update_glm_vectors(
     }
 }
 
-pub fn calculate_deviance(y: ArrayView1<f64>, mu: &Array1<f64>, link: LinkFunction) -> f64 {
+pub fn calculate_deviance(
+    y: ArrayView1<f64>,
+    mu: &Array1<f64>,
+    link: LinkFunction,
+    prior_weights: ArrayView1<f64>,
+) -> f64 {
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
         LinkFunction::Logit => {
-            let total_residual = ndarray::Zip::from(y).and(mu).fold(0.0, |acc, &yi, &mui| {
-                let mui_c = mui.clamp(EPS, 1.0 - EPS);
-                // More numerically stable formulation: use difference of logs instead of log of ratio
-                let term1 = if yi > EPS {
-                    yi * (yi.ln() - mui_c.ln())
-                } else {
-                    0.0
-                };
-                // More numerically stable formulation: use difference of logs instead of log of ratio
-                let term2 = if yi < 1.0 - EPS {
-                    (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
-                } else {
-                    0.0
-                };
-                acc + term1 + term2
-            });
+            let total_residual = ndarray::Zip::from(y)
+                .and(mu)
+                .and(prior_weights)
+                .fold(0.0, |acc, &yi, &mui, &wi| {
+                    let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                    // More numerically stable formulation: use difference of logs instead of log of ratio
+                    let term1 = if yi > EPS {
+                        yi * (yi.ln() - mui_c.ln())
+                    } else {
+                        0.0
+                    };
+                    // More numerically stable formulation: use difference of logs instead of log of ratio
+                    let term2 = if yi < 1.0 - EPS {
+                        (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
+                    } else {
+                        0.0
+                    };
+                    acc + wi * (term1 + term2)
+                });
             2.0 * total_residual
         }
-        LinkFunction::Identity => (&y.view() - mu).mapv(|v| v.powi(2)).sum(),
+        LinkFunction::Identity => {
+            // Weighted RSS: sum_i w_i (y_i - mu_i)^2
+            ndarray::Zip::from(y)
+                .and(mu)
+                .and(prior_weights)
+                .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
+                .sum()
+        }
     }
 }
 
