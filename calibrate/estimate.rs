@@ -167,37 +167,41 @@ pub fn train_model(
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
             // Check if the optimizer made ANY progress from the start.
             if last_solution.final_value >= initial_cost {
-                // It failed without finding any better point. This is a hard failure.
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "BFGS line search failed to make any progress from the initial point. Initial Cost: {:.4}, Final Cost: {:.4}",
+                // Treat as a warning and proceed with the last (initial) solution.
+                eprintln!(
+                    "\n[WARNING] BFGS line search failed to make any progress from the initial point."
+                );
+                eprintln!(
+                    "Initial Cost: {:.4}, Final Cost: {:.4}",
                     initial_cost, last_solution.final_value
-                )));
-            }
+                );
+                *last_solution
+            } else {
+                eprintln!(
+                    "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
+                );
 
-            eprintln!(
-                "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
-            );
+                // Get the gradient at last_solution to ensure we're near a stationary point
+                let gradient_norm = match reml_state.compute_gradient(&last_solution.final_point) {
+                    Ok(grad) => grad.dot(&grad).sqrt(),
+                    Err(_) => f64::INFINITY,
+                };
 
-            // Get the gradient at last_solution to ensure we're near a stationary point
-            let gradient_norm = match reml_state.compute_gradient(&last_solution.final_point) {
-                Ok(grad) => grad.dot(&grad).sqrt(),
-                Err(_) => f64::INFINITY,
-            };
+                // Only accept the solution if gradient norm is small enough
+                const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1000.0;
+                if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
+                        gradient_norm
+                    )));
+                }
 
-            // Only accept the solution if gradient norm is small enough
-            const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1000.0;
-            if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
+                eprintln!(
+                    "[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).",
                     gradient_norm
-                )));
+                );
+                *last_solution
             }
-
-            eprintln!(
-                "[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).",
-                gradient_norm
-            );
-            *last_solution
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
             // 1. Print the warning message.
