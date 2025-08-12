@@ -35,7 +35,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Cholesky, EigVals, Eigh, Solve, UPLO};
+use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
