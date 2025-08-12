@@ -1512,15 +1512,15 @@ fn calculate_edf(
 
     // Fast path: Cholesky solve for H^{-1} S by solving each column
     if let Ok(chol) = penalized_hessian.cholesky(UPLO::Lower) {
-        let mut tr_invH_S: f64 = 0.0;
+        let mut tr_inv_h_s: f64 = 0.0;
         for j in 0..p {
             let rhs_col = s_mat.column(j).to_owned();
             let sol_col = chol
                 .solve(&rhs_col)
                 .map_err(EstimationError::LinearSystemSolveFailed)?;
-            tr_invH_S += sol_col[j];
+            tr_inv_h_s += sol_col[j];
         }
-        let edf = (p as f64 - tr_invH_S).max(0.0).min(p as f64);
+        let edf = (p as f64 - tr_inv_h_s).max(0.0).min(p as f64);
         return Ok(edf);
     }
 
@@ -1545,9 +1545,9 @@ fn calculate_edf(
         }
     }
     let pinv_h = vt.t().dot(&s_inv).dot(&u.t());
-    let invH_S = pinv_h.dot(&s_mat);
-    let tr_invH_S: f64 = (0..p).map(|i| invH_S[[i, i]]).sum();
-    let edf = (p as f64 - tr_invH_S).clamp(0.0, p as f64);
+    let inv_h_s = pinv_h.dot(&s_mat);
+    let tr_inv_h_s: f64 = (0..p).map(|i| inv_h_s[[i, i]]).sum();
+    let edf = (p as f64 - tr_inv_h_s).clamp(0.0, p as f64);
     if !edf.is_finite() {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
