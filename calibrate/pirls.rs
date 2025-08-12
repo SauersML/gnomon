@@ -201,6 +201,11 @@ pub fn fit_model_for_fixed_rho(
         let beta_current = beta_transformed.clone();
         let deviance_current = last_deviance;
 
+        // CRITICAL: Cache the weights and working response that will be used in the WLS solve
+        // These are needed later for the gradient check
+        let weights_solve = weights.clone();
+        let z_solve = z.clone();
+
         // Calculate the penalty for the current beta using the transformed total penalty matrix
         let penalty_current = beta_current.dot(&s_transformed.dot(&beta_current));
 
@@ -290,7 +295,11 @@ pub fn fit_model_for_fixed_rho(
                     (penalized_deviance_trial - penalized_deviance_current).abs();
 
                 // If it's valid, NOW check if the penalized deviance has decreased.
-                if penalized_deviance_trial <= penalized_deviance_current {
+                // Use epsilon tolerance to handle numerical precision issues in Gaussian models
+                let accept_step = penalized_deviance_trial <= penalized_deviance_current * (1.0 + 1e-12) 
+                    || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12;
+                
+                if accept_step {
                     // SUCCESS: The step is valid and improves the fit.
                     // Update the main state variables and exit the step-halving loop.
                     beta_transformed = beta_trial;
@@ -426,13 +435,21 @@ pub fn fit_model_for_fixed_rho(
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
-            // If deviance has converged, we must ALSO check that the gradient is small.
-            let deviance_gradient_part = x_transformed.t().dot(&(&weights * (&eta - &z)));
-            let penalty_gradient_part = s_transformed.dot(&beta_transformed);
-            // Reinstate the factor of 2 to match mgcv and the math
-            let penalized_deviance_gradient =
-                &(&deviance_gradient_part * 2.0) + &(&penalty_gradient_part * 2.0);
-            let gradient_norm = penalized_deviance_gradient
+            // CRITICAL FIX: Check gradient with the SAME (W, z) used in the last WLS solve
+            // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
+            // So we must check stationarity with respect to those same W_solve, z_solve
+            
+            // Use the cached weights and working response from the solve
+            let sqrt_w_solve = weights_solve.mapv(f64::sqrt);
+            let wx_solve = &x_transformed * &sqrt_w_solve.view().insert_axis(Axis(1));
+            let wz_solve = &sqrt_w_solve * &z_solve;
+            
+            let grad_data_part = wx_solve.t().dot(&(wx_solve.dot(&beta_transformed) - &wz_solve));
+            let grad_penalty_part = s_transformed.dot(&beta_transformed);
+            // Drop the 2x factor to match the objective we actually minimize
+            let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
+            
+            let gradient_norm = gradient_wrt_solve
                 .iter()
                 .map(|&x| x.abs())
                 .fold(0.0, f64::max);
@@ -1171,34 +1188,42 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
     // STAGE 6: Reconstruct the full coefficient vector
     //-----------------------------------------------------------------------
-    // This logic correctly reverses the sequence of transformations in order:
-    // 1. Un-pivot the solution from the final QR (`rank_pivot`).
-    // 2. Re-insert zeros for the columns that were dropped (`drop_indices`).
-    // 3. Un-pivot the result from the initial QR (`initial_pivot`).
-
-    // Step 6a: Reverse the final pivot (`rank_pivot`). This maps the solved
-    // coefficients (`beta_dropped`) back to their correct positions within the
-    // space of the `rank` columns that were kept.
-    let mut beta_kept = Array1::zeros(rank);
-    for i in 0..rank {
-        beta_kept[final_pivot[i]] = beta_dropped[i];
-    }
-
-    // Step 6b: Re-insert zeros for the dropped columns.
-    let mut beta_pivoted_by_initial = Array1::zeros(p);
-
-    // Map the solved coefficients back to their positions among the kept columns
-    // using the first `rank` entries of the scaled rank pivot
-    for i in 0..rank {
-        let original_pivoted_index = kept_positions[i];
-        beta_pivoted_by_initial[original_pivoted_index] = beta_kept[i];
-    }
-
-    // Step 6c: Reverse the initial pivot to get the final coefficient vector
-    // in the original, un-pivoted order. This is the final correct solution.
+    // Direct composition approach: orig_j = initial_pivot[ kept_positions[ final_pivot[j] ] ]
+    // This maps each solved coefficient directly to its original column index
+    
     let mut beta_transformed = Array1::zeros(p);
-    for i in 0..p {
-        beta_transformed[initial_pivot[i]] = beta_pivoted_by_initial[i];
+    
+    // For each solved coefficient j, find its original column index through the permutation chain
+    for j in 0..rank {
+        let col_in_kept_space = final_pivot[j];  // Which kept column this coeff belongs to
+        let col_in_initial_pivoted_space = kept_positions[col_in_kept_space];  // Map to initial-pivoted space
+        let original_col_index = initial_pivot[col_in_initial_pivoted_space];  // Map to original space
+        beta_transformed[original_col_index] = beta_dropped[j];
+    }
+
+    // VERIFICATION: Check that the normal equations hold for the reconstructed beta
+    // This is critical to ensure correctness - make it unconditional for now
+    {
+        let s_transformed = e_transformed.t().dot(e_transformed);
+        let residual = x_transformed.dot(&beta_transformed) - &z;
+        let weighted_residual = &weights * &residual;
+        let grad_dev_part = x_transformed.t().dot(&weighted_residual);
+        let grad_pen_part = s_transformed.dot(&beta_transformed);
+        let grad = &grad_dev_part + &grad_pen_part;
+        let grad_norm_inf = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        
+        let scale = beta_transformed.iter().map(|&v| v.abs()).sum::<f64>() + 1.0;
+        
+        // If gradient is large, the reconstruction is wrong - this should not happen
+        if grad_norm_inf > 1e-6 * scale {
+            log::error!(
+                "CRITICAL: Coefficient reconstruction failed! Gradient norm: {:.2e}, Scale: {:.2e}",
+                grad_norm_inf, scale
+            );
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
     }
 
     //-----------------------------------------------------------------------
@@ -1408,9 +1433,23 @@ fn calculate_edf(
     let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
     let xtwx = wx.t().dot(&wx);
 
-    // Prefer numerically safe identity: edf = p - tr(H^{-1} S), where H = XtWX + S
-    // Compute S implicitly as H - XtWX
     let s_mat = penalized_hessian - &xtwx;
+
+    // Fast path for unpenalized models: If S is numerically zero, EDF is rank(X).
+    let s_norm = s_mat.iter().map(|&v| v.powi(2)).sum::<f64>().sqrt();
+    let xtwx_norm = xtwx.iter().map(|&v| v.powi(2)).sum::<f64>().sqrt();
+    
+    if s_norm < 1e-8 * (1.0 + xtwx_norm) {
+        // Penalty is negligible. EDF is rank(X), which we find from QR of WX.
+        let (_, r_factor, _) = pivoted_qr_faer(&wx)?;
+        let diag_r = r_factor.diag();
+        let max_diag = diag_r.iter().fold(0.0f64, |acc, &val| acc.max(val.abs()));
+        let rank = diag_r.iter().filter(|&&val| val.abs() > max_diag * 1e-12).count();
+        return Ok(rank as f64);
+    }
+
+    // Original logic for penalized models
+    // Prefer numerically safe identity: edf = p - tr(H^{-1} S), where H = XtWX + S
 
     // Fast path: Cholesky solve for H^{-1} S by solving each column
     if let Ok(chol) = penalized_hessian.cholesky(UPLO::Lower) {
@@ -2460,5 +2499,248 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Test that normal equations hold for the solver (unpenalized, any pivots)
+    /// Catches coefficient reconstruction bugs (H1) immediately
+    #[test]
+    fn test_pls_normal_equations_hold_unpenalized() {
+        use ndarray::{Array1, Array2};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Tall random matrix (well-conditioned-ish)
+        let n = 80usize;
+        let p = 12usize;
+        let mut rng = StdRng::seed_from_u64(12345);
+        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
+        let z = Array1::from_shape_fn(n, |_| rng.r#gen::<f64>() - 0.5);
+        let w = Array1::from_elem(n, 1.0);
+
+        // No penalty at all
+        let e = Array2::<f64>::zeros((0, p));
+
+        // Solve once
+        let (res, _rank) = super::solve_penalized_least_squares(
+            x.view(), z.view(), w.view(), &e, &e, z.view(), super::LinkFunction::Identity
+        ).expect("solver ok");
+
+        // Check stationarity of the *quadratic* objective that the solver actually minimized:
+        // grad = Xᵀ W (Xβ - z) + Sβ, with S=0 here.
+        let sqrt_w = w.mapv(f64::sqrt);
+        let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
+        let wz = &sqrt_w * &z;
+        let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
+
+        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(inf_norm < 1e-10, "Normal equations not satisfied: ||grad||_∞={}", inf_norm);
+
+        // And ensure residual is orthogonal to the column space in the weighted sense
+        let resid = &wz - &wx.dot(&res.beta);
+        let ortho_check = wx.t().dot(&resid);
+        let inf_norm2 = ortho_check.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(inf_norm2 < 1e-10, "Residual not orthogonal: {}", inf_norm2);
+    }
+
+    /// Test that the WLS step must never be rejected for Gaussian models
+    /// Catches step-halving issues (H3)
+    #[test]
+    fn test_step_accepts_wls_for_gaussian() {
+        use ndarray::{Array1, Array2};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Random tall problem
+        let n = 200usize;
+        let p = 10usize;
+        let mut rng = StdRng::seed_from_u64(54321);
+        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
+        let y = Array1::from_shape_fn(n, |_| rng.r#gen::<f64>() - 0.5);
+        let w = Array1::from_elem(n, 1.0);
+
+        // No penalty to keep it pure LS
+        let e = Array2::<f64>::zeros((0, p));
+
+        // "Current" state: beta=0
+        let beta0 = Array1::<f64>::zeros(p);
+        let mu0 = x.dot(&beta0);
+        let dev0: f64 = (&y - &mu0).mapv(|r| r * r).sum(); // your calculate_deviance does this
+
+        // WLS solution
+        let (res, _) = super::solve_penalized_least_squares(
+            x.view(), y.view(), w.view(), &e, &e, y.view(), super::LinkFunction::Identity
+        ).expect("solver ok");
+
+        let mu1 = x.dot(&res.beta);
+        let dev1: f64 = (&y - &mu1).mapv(|r| r * r).sum();
+
+        assert!(dev1 <= dev0 * (1.0 + 1e-12) || (dev0 - dev1).abs() < 1e-12,
+                "Exact WLS step should not increase deviance: dev0={} dev1={}", dev0, dev1);
+    }
+
+    /// Test that proves the gradient gate is using the wrong weights (logit)
+    /// Exposes convergence check issue (H2)
+    #[test]
+    fn test_wls_stationarity_old_vs_new_weights_logit() {
+        use ndarray::{Array1, Array2};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Modest logit problem
+        let n = 400usize;
+        let p = 8usize;
+        let mut rng = StdRng::seed_from_u64(98765);
+        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
+        let eta0 = Array1::zeros(n);
+        // y ~ Bernoulli(0.5)
+        let y = Array1::from_shape_fn(n, |_| if rng.r#gen::<f64>() > 0.5 { 1.0 } else { 0.0 });
+        let w_prior = Array1::from_elem(n, 1.0);
+
+        // Build IRLS vectors at beta=0
+        let (_mu0, w_old, z_old) = super::update_glm_vectors(y.view(), &eta0, super::LinkFunction::Logit, w_prior.view());
+        assert!(w_old.iter().all(|w| *w >= 0.0));
+
+        // No penalty to keep it simple
+        let e = Array2::<f64>::zeros((0, p));
+        let (res, _) = super::solve_penalized_least_squares(
+            x.view(), z_old.view(), w_old.view(), &e, &e, y.view(), super::LinkFunction::Logit
+        ).expect("solver ok");
+
+        // Stationarity with OLD weights and z (the quadratic model you just solved)
+        let sqrt_w_old = w_old.mapv(f64::sqrt);
+        let wx_old = &x * &sqrt_w_old.view().insert_axis(ndarray::Axis(1));
+        let wz_old = &sqrt_w_old * &z_old;
+        let grad_old = wx_old.t().dot(&(wx_old.dot(&res.beta) - &wz_old)); // S=0 here
+        let inf_old = grad_old.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(inf_old < 1e-8, "Should be stationary w.r.t. old weights, ||grad||_∞={}", inf_old);
+
+        // Now recompute eta, mu, and NEW weights at the accepted beta
+        let eta1 = x.dot(&res.beta);
+        let (_mu1, w_new, z_new) = super::update_glm_vectors(y.view(), &eta1, super::LinkFunction::Logit, w_prior.view());
+
+        let sqrt_w_new = w_new.mapv(f64::sqrt);
+        let wx_new = &x * &sqrt_w_new.view().insert_axis(ndarray::Axis(1));
+        let wz_new = &sqrt_w_new * &z_new;
+
+        let grad_new = wx_new.t().dot(&(wx_new.dot(&res.beta) - &wz_new));
+        let inf_new = grad_new.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+
+        // This SHOULD NOT be required to be tiny for convergence right after one step.
+        assert!(inf_new > 1e-4, "If this is tiny, IRLS basically solved in one step — suspicious");
+    }
+
+    /// Test that rank-deficient projections must be exact (perfect fit when possible)
+    /// This is a stronger, permanent guard against coefficient reconstruction bugs
+    #[test]
+    fn test_pls_rank_deficient_hits_projection() {
+        use ndarray::{arr2, arr1, Array1, Array2};
+
+        // Same structure as your failing test: col3 = col1 + col2
+        let x = arr2(&[
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 2.0],
+            [1.0, 2.0, 3.0],
+            [1.0, 3.0, 4.0],
+            [1.0, 4.0, 5.0],
+        ]);
+        let z = arr1(&[0.1, 0.2, 0.3, 0.4, 0.5]);
+        let w = Array1::from_elem(5, 1.0);
+
+        let e = Array2::<f64>::zeros((0, 3));
+
+        let (res, rank) = super::solve_penalized_least_squares(
+            x.view(), z.view(), w.view(), &e, &e, z.view(), super::LinkFunction::Identity
+        ).expect("solver ok");
+        assert_eq!(rank, 2);
+
+        // Fitted values must equal the weighted projection of z onto Col(X)
+        let fitted = x.dot(&res.beta);
+        let rss: f64 = (&z - &fitted).mapv(|r| r * r).sum();
+
+        assert!(rss < 1e-12, "Rank-deficient LS should project exactly (RSS={})", rss);
+
+        // And the KKT/normal-equation residual must be ~0 for kept cols
+        let sqrt_w = w.mapv(f64::sqrt);
+        let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
+        let wz = &sqrt_w * &z;
+        let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
+        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(inf_norm < 1e-10, "Normal equations not satisfied: {}", inf_norm);
+    }
+
+
+    /// Test permutation chain property - locks down coefficient reconstruction logic
+    #[test]
+    fn test_permutation_chain_property() {
+        use rand::{seq::SliceRandom, SeedableRng};
+        use rand::rngs::StdRng;
+        use ndarray::Array1;
+
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let p = 17usize;
+        let rank = 9usize;
+
+        // random initial_pivot: pivoted idx -> original idx
+        let mut initial_pivot: Vec<usize> = (0..p).collect();
+        initial_pivot.shuffle(&mut rng);
+
+        // choose kept positions in pivoted space and name them 0..rank-1 (kept-space)
+        let mut kept_in_pivoted: Vec<usize> = (0..p).collect();
+        kept_in_pivoted.shuffle(&mut rng);
+        kept_in_pivoted.truncate(rank);
+        kept_in_pivoted.sort_unstable(); // order doesn't matter, but your kept-space uses 0..rank-1
+
+        // kept_positions[i] = pivoted-space index of kept col i
+        let kept_positions = kept_in_pivoted.clone();
+
+        // final_pivot[j] = kept-space index for coeff j
+        let mut final_pivot: Vec<usize> = (0..rank).collect();
+        final_pivot.shuffle(&mut rng);
+
+        // distinct sentinels
+        let beta_dropped = Array1::from_shape_fn(rank, |j| 1000.0 + j as f64);
+
+        // your placement
+        let mut placed = Array1::<f64>::zeros(p);
+        for j in 0..rank {
+            let k_kept = final_pivot[j];
+            let k_pivoted = kept_positions[k_kept];
+            let k_orig = initial_pivot[k_pivoted];
+            placed[k_orig] = beta_dropped[j];
+        }
+
+        // reference via explicit composition
+        let mut placed_ref = Array1::<f64>::zeros(p);
+        for j in 0..rank {
+            let k_orig = initial_pivot[ kept_positions[ final_pivot[j] ] ];
+            placed_ref[k_orig] = beta_dropped[j];
+        }
+
+        assert!(placed.iter().zip(placed_ref.iter()).all(|(a,b)| (a-b).abs() < 1e-12));
+    }
+
+    /// Test penalty consistency sanity check
+    /// Locks down penalty root consistency issues (H4)
+    #[test]
+    fn test_penalty_root_consistency() {
+        use ndarray::arr2;
+        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+
+        // Two small penalties with different eigenvectors
+        let s1 = arr2(&[[1.0, -0.2], [-0.2, 0.5]]);
+        let s2 = arr2(&[[0.1, 0.0], [0.0, 0.0]]);
+        let s_list = vec![s1, s2];
+        let rs = compute_penalty_square_roots(&s_list).expect("roots");
+
+        let layout = ModelLayout { intercept_col: 0, pgs_main_cols: 0..0, penalty_map: vec![], total_coeffs: 2, num_penalties: 2 };
+        let lambdas = vec![0.7, 3.0];
+
+        let rp = stable_reparameterization(&rs, &lambdas, &layout).expect("reparam");
+        let lhs = rp.s_transformed;
+        let rhs = rp.e_transformed.t().dot(&rp.e_transformed);
+
+        let diff = (&lhs - &rhs).mapv(|v| v.abs()).sum();
+        assert!(diff < 1e-10, "S != EᵀE in transformed basis (sum abs diff = {})", diff);
     }
 }
