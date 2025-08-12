@@ -135,15 +135,55 @@ pub fn train_model(
         config,
     )?;
 
-    // Define the initial guess for log-smoothing parameters (rho) and map to unconstrained z
-    let initial_rho = Array1::from_elem(layout.num_penalties, 1.0);
-    // Map rho -> z via atanh(rho / 15), guarding against slight out-of-bounds
+    // Helper: map bounded rho -> unconstrained z
     fn atanh_clamped(x: f64) -> f64 { 0.5 * ((1.0 + x) / (1.0 - x)).ln() }
-    let initial_z = initial_rho.mapv(|r| {
-        // Avoid calling clamp on floats to satisfy older toolchains
-        let ratio = r / 15.0;
-        let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
-        atanh_clamped(xr)
+    fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
+        rho.mapv(|r| {
+            // Avoid calling clamp on floats to satisfy older toolchains
+            let ratio = r / 15.0;
+            let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
+            atanh_clamped(xr)
+        })
+    }
+
+    // Try a small grid of starting rhos and pick the first finite-cost one.
+    let candidates: &[f64] = &[0.0, 1.0, 2.0, -2.0, 4.0, 8.0, 10.0];
+    let mut start_z = None;
+
+    for &rho_scalar in candidates {
+        let rho_try = Array1::from_elem(layout.num_penalties, rho_scalar);
+        match reml_state.compute_cost(&rho_try) {
+            Ok(c) if c.is_finite() => {
+                start_z = Some(to_z_from_rho(&rho_try));
+                eprintln!(
+                    "[Init] Using starting rho = {:.3} (lambda ~ {:.3}) with finite cost {:.6}",
+                    rho_scalar,
+                    rho_scalar.exp(),
+                    c
+                );
+                break;
+            }
+            Ok(_) => {
+                eprintln!(
+                    "[Init] rho = {:.3} produced +inf cost; trying a safer (heavier) smoothing.",
+                    rho_scalar
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[Init] rho = {:.3} failed ({:?}); trying a safer (heavier) smoothing.",
+                    rho_scalar, e
+                );
+            }
+        }
+    }
+
+    // Fallback to previous default if none were finite (will likely be rescued by the barrier)
+    let initial_z = start_z.unwrap_or_else(|| {
+        eprintln!(
+            "[Init] Could not find a finite-cost seed; falling back to rho = 1.0 (lambda = e) and barrier handling."
+        );
+        to_z_from_rho(&Array1::from_elem(layout.num_penalties, 1.0))
     });
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
@@ -540,7 +580,20 @@ pub mod internal {
                 p.to_vec()
             );
 
-            let pirls_result = self.execute_pirls_if_needed(p)?;
+            let pirls_result = match self.execute_pirls_if_needed(p) {
+                Ok(res) => res,
+                Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                    // Inner linear algebra says "too singular" — treat as barrier.
+                    log::warn!(
+                        "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
+                    );
+                    return Ok(f64::INFINITY);
+                }
+                Err(e) => {
+                    // Other errors still bubble up
+                    return Err(e);
+                }
+            };
 
             // Check indefiniteness BEFORE proceeding with cost calculation
             // Use Cholesky decomposition as it's fastest and fails if and only if matrix is not positive-definite
@@ -590,11 +643,10 @@ pub mod internal {
                         Ok(condition_number) => {
                             if condition_number > MAX_CONDITION_NUMBER {
                                 log::warn!(
-                                    "Penalized Hessian is severely ill-conditioned: condition number = {condition_number:.2e}. Consider reducing model complexity."
+                                    "Penalized Hessian very ill-conditioned (cond={:.2e}); treating as barrier.",
+                                    condition_number
                                 );
-                                return Err(EstimationError::ModelIsIllConditioned {
-                                    condition_number,
-                                });
+                                return Ok(f64::INFINITY);
                             } else if condition_number > 1e8 {
                                 log::warn!(
                                     "Penalized Hessian is ill-conditioned but proceeding: condition number = {condition_number:.2e}"
@@ -1022,7 +1074,15 @@ pub mod internal {
 
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
-            let pirls_result = self.execute_pirls_if_needed(p)?;
+            let pirls_result = match self.execute_pirls_if_needed(p) {
+                Ok(res) => res,
+                Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                    // Push towards heavier smoothing (bigger rho). This helps retreat to a stable region.
+                    let grad = p.mapv(|rho| rho.abs() + 1.0);
+                    return Ok(grad);
+                }
+                Err(e) => return Err(e),
+            };
             self.compute_gradient_with_pirls_result(p, &pirls_result)
         }
 
