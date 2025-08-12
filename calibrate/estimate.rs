@@ -140,7 +140,9 @@ pub fn train_model(
     // Map rho -> z via atanh(rho / 15), guarding against slight out-of-bounds
     fn atanh_clamped(x: f64) -> f64 { 0.5 * ((1.0 + x) / (1.0 - x)).ln() }
     let initial_z = initial_rho.mapv(|r| {
-        let xr = (r / 15.0).clamp(-0.999_999, 0.999_999);
+        // Avoid calling clamp on floats to satisfy older toolchains
+        let ratio = r / 15.0;
+        let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
         atanh_clamped(xr)
     });
 
