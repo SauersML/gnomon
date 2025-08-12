@@ -926,19 +926,32 @@ pub fn solve_penalized_least_squares(
         e_transformed.ncols()
     );
 
-    // FAST PATH: Pure unpenalized WLS case (E has 0 rows)
-    // Use faer's built-in least squares solver to avoid manual Q/R/P reconstruction
+    // FAST PATH: Pure unpenalized WLS case (no penalty rows)
     if eb.nrows() == 0 && e_transformed.nrows() == 0 {
         println!("[PLS Solver] Using fast path for unpenalized WLS");
 
-        // Standard weighted least squares: minimize || sqrt(W) X β - sqrt(W) z ||_2
+        // Weighted design and RHS
         let sqrt_w = weights.mapv(f64::sqrt);
         let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
         let wz = &sqrt_w * &z;
 
-        // Robust LS via SVD: β = V Σ⁺ Uᵀ (sqrt(W) z)
+        // 1) Use pivoted QR only to determine rank and column ordering
+        let (_q_unused, r_factor, pivot) = pivoted_qr_faer(&wx)?;
+        let diag = r_factor.diag();
+        let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        let tol = max_diag * 1e-12;
+        let rank = diag.iter().filter(|&&v| v.abs() > tol).count();
+
+        // 2) Build submatrix from the first `rank` pivoted columns (in original index space)
+        let kept_cols = &pivot[..rank];
+        let mut wx_kept = Array2::<f64>::zeros((wx.nrows(), rank));
+        for (j_new, &j_orig) in kept_cols.iter().enumerate() {
+            wx_kept.column_mut(j_new).assign(&wx.column(j_orig));
+        }
+
+        // 3) Solve LS on the kept submatrix via SVD (β_kept = V Σ⁺ Uᵀ wz)
         use ndarray_linalg::SVD;
-        let (u_opt, s, vt_opt) = wx
+        let (u_opt, s, vt_opt) = wx_kept
             .svd(true, true)
             .map_err(EstimationError::LinearSystemSolveFailed)?;
         let (u, vt) = match (u_opt, vt_opt) {
@@ -951,23 +964,26 @@ pub fn solve_penalized_least_squares(
         };
 
         let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let tol = smax * 1e-12;
-        let rank = s.iter().filter(|&&sv| sv > tol).count();
+        let tol_svd = smax * 1e-12;
 
-        // β = V Σ⁺ Uᵀ wz (compute directly without building full Σ⁺)
+        // Compute Σ⁺ Uᵀ wz without building dense Σ⁺
         let utb = u.t().dot(&wz);
         let mut s_inv_utb = Array1::<f64>::zeros(s.len());
         for i in 0..s.len() {
-            if s[i] > tol {
+            if s[i] > tol_svd {
                 s_inv_utb[i] = utb[i] / s[i];
             }
         }
-        let beta_transformed = vt.t().dot(&s_inv_utb);
+        let beta_kept = vt.t().dot(&s_inv_utb); // length = rank
 
-        // Construct Hessian H = Xᵀ W X (since S=0)
+        // 4) Construct full beta with dropped columns set to zero
+        let mut beta_transformed = Array1::<f64>::zeros(x_transformed.ncols());
+        for (j_new, &j_orig) in kept_cols.iter().enumerate() {
+            beta_transformed[j_orig] = beta_kept[j_new];
+        }
+
+        // 5) Build Hessian H = Xᵀ W X (since S=0) and verify KKT
         let xtwx = wx.t().dot(&wx);
-
-        // KKT check in weighted form Xᵀ W (Xβ - z) == 0 (release-safe verification)
         let grad = xtwx.dot(&beta_transformed) - wx.t().dot(&wz);
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         if inf_norm > 1e-10 {
@@ -980,7 +996,7 @@ pub fn solve_penalized_least_squares(
             StablePLSResult {
                 beta: beta_transformed,
                 penalized_hessian: xtwx,
-                edf: rank as f64,
+                edf: rank as f64, // EDF = rank in unpenalized LS
                 scale: 1.0,
             },
             rank,
