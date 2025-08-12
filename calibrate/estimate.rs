@@ -311,50 +311,6 @@ pub fn train_model(
     })
 }
 
-/// Helper function to compute log determinant and rank of penalty matrix
-fn compute_penalty_log_det_and_rank(
-    s_lambda: &Array2<f64>,
-) -> Result<(f64, usize), EstimationError> {
-    use ndarray_linalg::{SVD, UPLO};
-
-    // Compute eigendecomposition for log determinant
-    match s_lambda.eigh(UPLO::Lower) {
-        Ok((eigenvalues, _)) => {
-            let tolerance = 1e-12;
-            let mut log_det = 0.0;
-            let mut rank = 0;
-
-            for &eigenval in eigenvalues.iter() {
-                if eigenval > tolerance {
-                    log_det += eigenval.ln();
-                    rank += 1;
-                }
-            }
-
-            Ok((log_det, rank))
-        }
-        Err(_) => {
-            // Fallback to SVD if eigendecomposition fails
-            match s_lambda.svd(false, false) {
-                Ok((_, svals, _)) => {
-                    let tolerance = 1e-12;
-                    let mut log_det = 0.0;
-                    let mut rank = 0;
-
-                    for &sval in svals.iter() {
-                        if sval > tolerance {
-                            log_det += sval.ln();
-                            rank += 1;
-                        }
-                    }
-
-                    Ok((log_det, rank))
-                }
-                Err(e_svd) => Err(EstimationError::LinearSystemSolveFailed(e_svd)),
-            }
-        }
-    }
-}
 
 /// Helper to log the final model structure.
 fn log_layout_info(layout: &ModelLayout) {

@@ -648,33 +648,6 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     kappa
 }
 
-/// Un-pivots the columns of a matrix according to a pivot vector.
-///
-/// This reverses the permutation `A*P` to recover `A` from `B`, where `B = A*P`.
-/// It assumes the `pivot` vector is a **forward** permutation, where `pivot[i]`
-/// is the original column index that was moved to position `i`.
-///
-/// # Parameters
-/// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the `R` factor).
-/// * `pivot`: The forward permutation vector from the QR decomposition.
-fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
-    let r = pivoted_matrix.nrows();
-    let c = pivoted_matrix.ncols();
-    let mut unpivoted_matrix = Array2::zeros((r, c));
-
-    // The C code logic `dum[*pi]= *px;` translates to:
-    // The i-th column of the pivoted matrix belongs at the `pivot[i]`-th
-    // position in the un-pivoted matrix.
-    for i in 0..c {
-        let original_col_index = pivot[i];
-        let pivoted_col = pivoted_matrix.column(i);
-        unpivoted_matrix
-            .column_mut(original_col_index)
-            .assign(&pivoted_col);
-    }
-
-    unpivoted_matrix
-}
 
 /// Pivots the columns of a matrix according to a pivot vector.
 ///
@@ -701,76 +674,6 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     pivoted_matrix
 }
 
-/// Drop columns from a matrix based on column indices in `drop`.
-/// This is a direct translation of `drop_cols` from mgcv's C code:
-///
-/// ```c
-/// void drop_cols(double *X, int r, int c, int *drop, int n_drop) {
-///   int k,j,j0,j1;  
-///   double *p,*p1,*p2;
-///   if (n_drop<=0) return;
-///   if (n_drop) { /* drop the unidentifiable columns */
-///     for (k=0;k<n_drop;k++) {
-///       j = drop[k]-k; /* target start column */
-///       j0 = drop[k]+1; /* start of block to copy */
-///       if (k<n_drop-1) j1 = drop[k+1]; else j1 = c; /* end of block to copy */
-///       for (p=X + j * r,p1=X + j0 * r,p2=X + j1 * r;p1<p2;p++,p1++) *p = *p1;
-///     }      
-///   }
-/// }
-/// ```
-///
-/// Parameters:
-/// * `src`: Source matrix with all columns (r × c)
-/// * `drop_indices`: Column indices to drop (MUST be in ascending order)
-/// * `dst`: Destination matrix with dropped columns removed (r × (c - n_drop))
-fn drop_cols(src: ArrayView2<f64>, drop_indices: &[usize], dst: &mut Array2<f64>) {
-    let r = src.nrows();
-    let c = src.ncols();
-    let n_drop = drop_indices.len();
-
-    if n_drop == 0 {
-        // If no columns to drop, just copy src to dst
-        dst.assign(&src);
-        return;
-    }
-
-    // Validate dimensions
-    assert_eq!(
-        r,
-        dst.nrows(),
-        "Source and destination must have same number of rows"
-    );
-    assert_eq!(
-        c - n_drop,
-        dst.ncols(),
-        "Destination must have c - n_drop columns"
-    );
-
-    // Ensure drop_indices is in ascending order
-    for i in 1..n_drop {
-        assert!(
-            drop_indices[i] > drop_indices[i - 1],
-            "drop_indices must be in ascending order"
-        );
-    }
-
-    // Efficient two-pointer scan over columns and sorted drop_indices (O(c + n_drop))
-    let mut dst_col = 0;
-    let mut drop_ptr = 0;
-
-    for src_col in 0..c {
-        // Check if this column should be dropped
-        if drop_ptr < n_drop && drop_indices[drop_ptr] == src_col {
-            // This column is dropped; advance the drop pointer and skip copying
-            drop_ptr += 1;
-            continue;
-        }
-        // Keep this column
-        dst.column_mut(dst_col).assign(&src.column(src_col));
-        dst_col += 1;
-    }
-}
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
@@ -1661,6 +1564,34 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
+    
+    /// Un-pivots the columns of a matrix according to a pivot vector.
+    ///
+    /// This reverses the permutation `A*P` to recover `A` from `B`, where `B = A*P`.
+    /// It assumes the `pivot` vector is a **forward** permutation, where `pivot[i]`
+    /// is the original column index that was moved to position `i`.
+    ///
+    /// # Parameters
+    /// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the `R` factor).
+    /// * `pivot`: The forward permutation vector from the QR decomposition.
+    fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
+        let r = pivoted_matrix.nrows();
+        let c = pivoted_matrix.ncols();
+        let mut unpivoted_matrix = Array2::zeros((r, c));
+
+        // The C code logic `dum[*pi]= *px;` translates to:
+        // The i-th column of the pivoted matrix belongs at the `pivot[i]`-th
+        // position in the un-pivoted matrix.
+        for i in 0..c {
+            let original_col_index = pivot[i];
+            let pivoted_col = pivoted_matrix.column(i);
+            unpivoted_matrix
+                .column_mut(original_col_index)
+                .assign(&pivoted_col);
+        }
+
+        unpivoted_matrix
+    }
 
     // === Helper types for test refactoring ===
     #[derive(Debug, Clone)]
