@@ -259,7 +259,9 @@ pub fn train_model(
     log::info!("REML optimization completed successfully");
 
     // --- Finalize the Model (same as before) ---
-    let final_lambda = final_rho.mapv(f64::exp);
+    // Clamp final rho to evaluation bounds to ensure consistency and avoid overflow in exp
+    let final_rho_clamped = final_rho.mapv(|v| v.clamp(-15.0, 15.0));
+    let final_lambda = final_rho_clamped.mapv(f64::exp);
     log::info!(
         "Final estimated smoothing parameters (lambda): {:?}",
         &final_lambda.to_vec()
@@ -270,7 +272,7 @@ pub fn train_model(
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
     let final_fit = pirls::fit_model_for_fixed_rho(
-        final_rho.view(),
+        final_rho_clamped.view(),
         reml_state.x(), // Use original X
         reml_state.y(),
         reml_state.weights(),     // Pass weights
@@ -1235,9 +1237,10 @@ pub mod internal {
                     );
 
                     // Calculate the gradient of the unpenalized deviance w.r.t. beta
-                    // For logit link: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X'(y - μ)
+                    // For weighted logit: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X' (w ∘ (y - μ))
                     let residuals = &self.y() - &mu;
-                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&residuals);
+                    let weighted_residuals = &self.weights * &residuals;
+                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&weighted_residuals);
 
                     // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
                     // Use transformed design matrix (same basis as Hessian)
@@ -1461,7 +1464,7 @@ pub mod internal {
             let eigenvalues = s.eigh(UPLO::Lower)?.0;
             return Ok(eigenvalues
                 .iter()
-                .filter(|&&eig| eig.abs() > 1e-12)
+                .filter(|&&eig| eig > 1e-12)
                 .map(|&eig| eig.ln())
                 .sum());
         }
@@ -1481,7 +1484,7 @@ pub mod internal {
             let eigenvalues = s.eigh(UPLO::Lower)?.0;
             return Ok(eigenvalues
                 .iter()
-                .filter(|&&eig| eig.abs() > TOL)
+                .filter(|&&eig| eig > TOL)
                 .map(|&eig| eig.ln())
                 .sum());
         }
@@ -1497,7 +1500,7 @@ pub mod internal {
             let (eigenvalues, _) = s.eigh(UPLO::Lower)?;
             return Ok(eigenvalues
                 .iter()
-                .filter(|&&eig| eig.abs() > TOL)
+                .filter(|&&eig| eig > TOL)
                 .map(|&eig| eig.ln())
                 .sum());
         }

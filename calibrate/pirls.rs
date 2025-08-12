@@ -267,6 +267,7 @@ pub fn fit_model_for_fixed_rho(
         let beta_trial_initial = stable_result.0.beta.clone();
         let mut beta_trial = beta_trial_initial.clone();
         let mut step_halving_count = 0;
+        let mut last_halving_change: f64 = f64::NAN;
         const MAX_STEP_HALVING: usize = 30;
 
         // Use a robust `loop` for step-halving that prioritizes numerical stability.
@@ -286,6 +287,9 @@ pub fn fit_model_for_fixed_rho(
             if is_numerically_valid {
                 let penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
                 let penalized_deviance_trial = deviance_trial + penalty_trial;
+                // Track the last attempted change for diagnostics
+                last_halving_change =
+                    (penalized_deviance_trial - penalized_deviance_current).abs();
 
                 // If it's valid, NOW check if the penalized deviance has decreased.
                 if penalized_deviance_trial <= penalized_deviance_current {
@@ -317,7 +321,11 @@ pub fn fit_model_for_fixed_rho(
                 );
                 return Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: config.max_iterations,
-                    last_change: f64::INFINITY,
+                    last_change: if last_halving_change.is_finite() {
+                        last_halving_change
+                    } else {
+                        penalized_deviance_current.abs()
+                    },
                 });
             }
 
@@ -1107,7 +1115,7 @@ pub fn solve_penalized_least_squares(
     }
 
     // Perform pivoted QR on the scaled matrix for rank determination
-    let (_, r_scaled, rank_pivot) = pivoted_qr_faer(&scaled_matrix)?;
+    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_matrix)?;
 
     // Determine rank using condition number on the scaled matrix
     let mut rank = p.min(scaled_rows);
@@ -1150,41 +1158,26 @@ pub fn solve_penalized_least_squares(
         rank
     );
 
-    // Use rank_pivot to identify columns to drop (from rank determination)
-    // These are the unidentifiable columns based on the scaled system
-    let n_drop = p - rank;
-    let mut drop_indices: Vec<usize> = Vec::with_capacity(n_drop);
-    for i in rank..p {
-        drop_indices.push(rank_pivot[i]);
-    }
-
-    // Sort drop_indices in ascending order (required for drop_cols/undrop_rows)
-    if n_drop > 0 {
-        drop_indices.sort();
-        log::debug!(
-            "Dropping {} columns due to rank deficiency: {:?}",
-            n_drop,
-            drop_indices
-        );
-    }
-
     // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
     let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
 
-    // Create rank-reduced versions by dropping from the PIVOTED matrices
-    // NOTE: We use e_transformed_pivoted here, NOT eb_pivoted, because this is for the final solve
-    let mut r1_dropped = Array2::zeros((r_rows, rank));
-    drop_cols(r1_pivoted.view(), &drop_indices, &mut r1_dropped);
+    // Apply the rank-determining pivot to the working matrices, then keep the first `rank` columns
+    // This ensures we drop by position in the rank-ordered system (Option A fix)
+    let r1_ranked = pivot_columns(r1_pivoted.view(), &rank_pivot_scaled);
+    let e_transformed_ranked = pivot_columns(e_transformed_pivoted.view(), &rank_pivot_scaled);
 
-    let e_transformed_rows = e_transformed_pivoted.nrows();
+    // Keep the first `rank` columns by position
+    let r1_dropped = r1_ranked.slice(s![.., ..rank]).to_owned();
+
+    let e_transformed_rows = e_transformed_ranked.nrows();
     let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
     if e_transformed_rows > 0 {
-        drop_cols(
-            e_transformed_pivoted.view(),
-            &drop_indices,
-            &mut e_transformed_dropped,
-        );
+        e_transformed_dropped
+            .assign(&e_transformed_ranked.slice(s![.., ..rank]));
     }
+
+    // Record kept positions in the initial pivoted order for later reconstruction
+    let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
 
     log::debug!(
         "[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]",
@@ -1220,7 +1213,7 @@ pub fn solve_penalized_least_squares(
     }
 
     // Perform final pivoted QR on the unscaled, reduced system
-    let (q_final, r_final, rank_pivot) = pivoted_qr_faer(&final_aug_matrix)?;
+    let (q_final, r_final, final_pivot) = pivoted_qr_faer(&final_aug_matrix)?;
 
     log::debug!(
         "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
@@ -1287,20 +1280,16 @@ pub fn solve_penalized_least_squares(
     // space of the `rank` columns that were kept.
     let mut beta_kept = Array1::zeros(rank);
     for i in 0..rank {
-        beta_kept[rank_pivot[i]] = beta_dropped[i];
+        beta_kept[final_pivot[i]] = beta_dropped[i];
     }
 
     // Step 6b: Re-insert zeros for the dropped columns.
     let mut beta_pivoted_by_initial = Array1::zeros(p);
 
-    // First, identify the indices of the columns that were *kept*.
-    // These are the columns from the `initial_pivot` space that were not dropped.
-    let kept_indices: Vec<usize> = (0..p).filter(|&i| !drop_indices.contains(&i)).collect();
-
-    // Now, map the solved coefficients from `beta_kept` back to these specific indices.
-    // The i-th element of `beta_kept` corresponds to the i-th column that was kept.
+    // Map the solved coefficients back to their positions among the kept columns
+    // using the first `rank` entries of the scaled rank pivot
     for i in 0..rank {
-        let original_pivoted_index = kept_indices[i];
+        let original_pivoted_index = kept_positions[i];
         beta_pivoted_by_initial[original_pivoted_index] = beta_kept[i];
     }
 
@@ -1517,20 +1506,21 @@ fn calculate_edf(
     let wx = &x * &sqrt_w.view().insert_axis(Axis(1));
     let xtwx = wx.t().dot(&wx);
 
-    // Try fast, stable Cholesky-based solve for all columns at once
+    // Prefer numerically safe identity: edf = p - tr(H^{-1} S), where H = XtWX + S
+    // Compute S implicitly as H - XtWX
+    let s_mat = penalized_hessian - &xtwx;
+
+    // Fast path: Cholesky solve for H^{-1} S
     if let Ok(chol) = penalized_hessian.cholesky(UPLO::Lower) {
-        let mut edf = 0.0;
-        for j in 0..p {
-            let rhs = xtwx.column(j).to_owned();
-            let sol = chol
-                .solve(&rhs)
-                .map_err(EstimationError::LinearSystemSolveFailed)?;
-            edf += sol[j];
-        }
-        return Ok(edf.max(1.0));
+        let invH_S = chol
+            .solve(&s_mat)
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        let tr_invH_S: f64 = (0..p).map(|i| invH_S[[i, i]]).sum();
+        let edf = (p as f64 - tr_invH_S).clamp(0.0, p as f64);
+        return Ok(edf);
     }
 
-    // Fallback: SVD-based pseudo-inverse of H
+    // Fallback: SVD-based pseudo-inverse of H and multiply by S, then trace
     let (maybe_u, s, maybe_vt) = penalized_hessian
         .svd(true, true)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -1551,17 +1541,15 @@ fn calculate_edf(
         }
     }
     let pinv_h = vt.t().dot(&s_inv).dot(&u.t());
-    let prod = pinv_h.dot(&xtwx);
-    let mut edf = 0.0;
-    for i in 0..p {
-        edf += prod[[i, i]];
-    }
+    let invH_S = pinv_h.dot(&s_mat);
+    let tr_invH_S: f64 = (0..p).map(|i| invH_S[[i, i]]).sum();
+    let edf = (p as f64 - tr_invH_S).clamp(0.0, p as f64);
     if !edf.is_finite() {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
     }
-    Ok(edf.max(1.0))
+    Ok(edf)
 }
 
 /// Calculate scale parameter correctly for different link functions
