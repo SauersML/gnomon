@@ -1249,19 +1249,8 @@ pub mod internal {
                         let d_deviance_d_rho_k =
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
 
-                        // Calculate d(β'Sβ)/dρ_k - both indirect and direct parts
-                        // Indirect part: (∂(β'Sβ)/∂β) * (∂β/∂ρ_k) = (2Sβ)' * (∂β/∂ρ_k)
-                        let s_beta_transformed = reparam_result.s_transformed.dot(beta_transformed);
-                        let d_penalty_indirect =
-                            2.0 * s_beta_transformed.dot(&dbeta_drho_k_transformed);
-                        // Direct part: β'(∂S/∂ρ_k)β = λ_k * β'S_kβ
-                        let d_penalty_direct =
-                            lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
-                        let d_penalty_d_rho_k = d_penalty_indirect + d_penalty_direct;
-
-                        // Total derivative of the penalized deviance
-                        let d_dp_d_rho_k = d_deviance_d_rho_k + d_penalty_d_rho_k;
-                        let penalized_deviance_grad_term = 0.5 * d_dp_d_rho_k;
+                        // The term now correctly represents only the unpenalized part.
+                        let penalized_deviance_grad_term = 0.5 * d_deviance_d_rho_k;
 
                         // ---
                         // Component 2: Derivative of log|H| (existing code)

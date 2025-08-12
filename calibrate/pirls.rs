@@ -81,7 +81,7 @@ pub fn fit_model_for_fixed_rho(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
-    weights: ArrayView1<f64>,    // Prior weights vector
+    prior_weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>], // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
@@ -104,8 +104,6 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Preserve a copy of prior weights for weighted deviance/scale calculations
-    let prior_weights = weights.to_owned();
 
     // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
@@ -173,8 +171,8 @@ pub fn fit_model_for_fixed_rho(
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) =
-        update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
-    let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights.view());
+        update_glm_vectors(y, &eta, config.link_function, prior_weights);
+    let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
 
@@ -274,9 +272,9 @@ pub fn fit_model_for_fixed_rho(
         loop {
             let eta_trial = x_transformed.dot(&beta_trial);
             let (mu_trial, _, _) =
-                update_glm_vectors(y, &eta_trial, config.link_function, prior_weights.view());
+                update_glm_vectors(y, &eta_trial, config.link_function, prior_weights);
             let deviance_trial =
-                calculate_deviance(y, &mu_trial, config.link_function, prior_weights.view());
+                calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
 
             // First, check if the trial step resulted in a numerically valid state.
             // This is the most important check.
@@ -299,7 +297,7 @@ pub fn fit_model_for_fixed_rho(
                     eta = eta_trial;
                     last_deviance = deviance_trial;
                     (mu, weights, z) =
-                        update_glm_vectors(y, &eta, config.link_function, prior_weights.view());
+                        update_glm_vectors(y, &eta, config.link_function, prior_weights);
 
                     if step_halving_count > 0 {
                         log::debug!(
@@ -1370,10 +1368,11 @@ fn pivoted_qr_faer(
     // Empirically (and per current faer), this corresponds to `.arrays().1`.
     let pivot: Vec<usize> = perm.arrays().1.to_vec();
 
-    // In debug builds, explicitly verify our assumption about the permutation direction.
+    // Explicitly verify our assumption about the permutation direction.
     // This assert confirms that applying our `pivot_columns` function to the original
     // matrix `A` produces the same result as `A * P` calculated by faer.
-    #[cfg(debug_assertions)]
+    // This check is now UNCONDITIONAL to prevent silent failures in release builds
+    // if the faer library changes its internal conventions.
     {
         // Reconstruct A*P directly using faer's API to get the ground truth.
         let a_p_faer = a_faer.as_ref() * perm;
