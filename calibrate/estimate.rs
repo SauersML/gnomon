@@ -3270,7 +3270,7 @@ pub mod internal {
                     );
                 }
                 // Be robust to changes in error wording from optimizer
-                EstimationError::RemlOptimizationFailed(_msg) => {
+                EstimationError::RemlOptimizationFailed(..) => {
                     println!(
                         "✓ Optimization failed (REML/BFGS) as expected for ill-conditioned/over-parameterized model"
                     );

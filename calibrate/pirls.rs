@@ -153,7 +153,7 @@ pub fn fit_model_for_fixed_rho(
         x_transformed.sum()
     );
 
-    // --- CRITICAL FIX: Transform eb to the same stable basis ---
+    // Transform eb to the same stable basis
     // As per mgcv (Eb <- Eb%*%T), transform eb into the same stable basis as x_transformed.
     // The transformation for a penalty root R (shape k x p) is R_new = R * Q.
     // Here, eb is `rank x p` and qs is `p x p`, so the result is `rank x p`.
@@ -888,7 +888,6 @@ pub fn update_glm_vectors(
             let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
             mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
 
-            // --- START FIX ---
             // 1. Calculate dμ/dη, which is μ(1-μ) for the logit link.
             // This term must NOT include prior weights.
             let dmu_deta = &mu * &(1.0 - &mu);
@@ -896,9 +895,8 @@ pub fn update_glm_vectors(
             // 2. Calculate the full working weights, which DO include prior weights.
             let weights = &prior_weights * &dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
 
-            // 3. Calculate the working response `z` CORRECTLY, using dμ/dη in the denominator.
+            // 3. Calculate the working response `z` using dμ/dη in the denominator.
             let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &dmu_deta);
-            // --- END FIX ---
 
             (mu, weights, z)
         }
@@ -1314,7 +1312,7 @@ pub fn solve_penalized_least_squares(
     }
 
     //-----------------------------------------------------------------------
-    // STAGE 7: Construct the penalized Hessian (CORRECTED IMPLEMENTATION)
+    // STAGE 7: Construct the penalized Hessian
     //-----------------------------------------------------------------------
     // We compute the Hessian directly in the stable basis using its definition:
     // H_transformed = (X_transformed)' * W * (X_transformed) + S_transformed

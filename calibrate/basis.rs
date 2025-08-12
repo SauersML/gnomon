@@ -257,7 +257,7 @@ pub fn apply_sum_to_zero_constraint(
     c_mat.column_mut(0).assign(&c);
 
     use ndarray_linalg::SVD;
-    let (u_opt, _s, _vt) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
+    let (u_opt, ..) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
     let u = match u_opt {
         Some(u) => u,
         None => return Err(BasisError::ConstraintNullspaceNotFound),
