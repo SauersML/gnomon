@@ -594,13 +594,13 @@ pub mod internal {
                 .is_err()
             {
                 // Cholesky failed, check eigenvalues to confirm indefiniteness
-                let eigenvals = pirls_result
+                let (eigenvalues, _) = pirls_result
                     .penalized_hessian_transformed
-                    .eigvals()
+                    .eigh(UPLO::Lower)
                     .map_err(EstimationError::EigendecompositionFailed)?;
 
                 // Check specifically for ALL negative eigenvalues
-                let all_negative = eigenvals.iter().all(|&x| x.re < 0.0);
+                let all_negative = eigenvalues.iter().all(|&x| x < 0.0);
 
                 if all_negative {
                     log::warn!("Critical instability detected: ALL eigenvalues are negative.");
@@ -608,7 +608,7 @@ pub mod internal {
                 }
 
                 // Original behavior for indefiniteness
-                let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 if min_eig <= 0.0 {
                     log::warn!(
                         "Indefinite Hessian detected (min eigenvalue: {min_eig}); returning infinite cost to retreat."
@@ -651,7 +651,7 @@ pub mod internal {
                     }
 
                     let n = self.y.len() as f64;
-                    let p = pirls_result.beta_transformed.len() as f64;
+                    let num_coeffs = pirls_result.beta_transformed.len() as f64;
 
                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
@@ -713,7 +713,7 @@ pub mod internal {
                             }
                         }
                     }
-                    let edf = (p - trace_h_inv_s_lambda).max(1.0);
+                    let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
                     let phi = dp / (n - edf).max(1e-8);
@@ -731,14 +731,14 @@ pub mod internal {
                             log::warn!(
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
-                            let eigenvals = h_for_logdet
-                                .eigvals()
+                            let (eigenvalues, _) = h_for_logdet
+                                .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = 1e-8;
-                            eigenvals
+                            eigenvalues
                                 .iter()
-                                .map(|&ev| (ev.re + ridge).max(ridge))
+                                .map(|&ev| (ev + ridge).max(ridge))
                                 .map(|ev| ev.ln())
                                 .sum()
                         }
@@ -782,14 +782,14 @@ pub mod internal {
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
 
-                            let eigenvals = h_for_logdet
-                                .eigvals()
+                            let (eigenvalues, _) = h_for_logdet
+                                .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = 1e-8;
-                            let stabilized_log_det: f64 = eigenvals
+                            let stabilized_log_det: f64 = eigenvalues
                                 .iter()
-                                .map(|&ev| (ev.re + ridge).max(ridge))
+                                .map(|&ev| (ev + ridge).max(ridge))
                                 .map(|ev| ev.ln())
                                 .sum();
 
@@ -830,11 +830,11 @@ pub mod internal {
                     println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
 
                     // Check if we used eigenvalues for the Hessian determinant
-                    let eigenvals = pirls_result.penalized_hessian_transformed.eigvals().ok();
+                    let eigenvals = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower).ok();
 
-                    if let Some(eigs) = eigenvals {
-                        let min_eig = eigs.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
-                        let max_eig = eigs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b.re));
+                    if let Some((evals, _)) = eigenvals {
+                        let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                        let max_eig = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
                         println!(
                             "    -> (Hessian Eigenvalues: min={min_eig:.3e}, max={max_eig:.3e})"
                         );
@@ -1097,9 +1097,9 @@ pub mod internal {
 
             // Check for severe indefiniteness in the original Hessian (before stabilization)
             // This suggests a problematic region we should retreat from
-            if let Ok(eigenvals) = hessian_transformed.eigvals() {
+            if let Ok((eigenvalues, _)) = hessian_transformed.eigh(UPLO::Lower) {
                 // Original behavior for severe indefiniteness
-                let min_eig = eigenvals.iter().fold(f64::INFINITY, |a, &b| a.min(b.re));
+                let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
                 if min_eig < SEVERE_INDEFINITENESS {
                     // The matrix was severely indefinite - signal a need to retreat
@@ -1123,7 +1123,7 @@ pub mod internal {
             let mut cost_gradient = Array1::zeros(lambdas.len());
 
             let n = self.y.len() as f64;
-            let p_coeffs = beta_transformed.len() as f64;
+            let num_coeffs = beta_transformed.len() as f64;
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
@@ -1160,7 +1160,7 @@ pub mod internal {
                             trace_h_inv_s_lambda += h_inv_col[j];
                         }
                     }
-                    let edf = (p_coeffs - trace_h_inv_s_lambda).max(1.0);
+                    let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
                     let scale = dp / (n - edf).max(1e-8);
 
                     // Three-term gradient computation following mgcv gdi1
@@ -2586,12 +2586,18 @@ pub mod internal {
             let (x_matrix, mut s_list, layout, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
+            assert!(
+                layout.num_penalties > 0,
+                "This test requires at least one penalized term to be meaningful."
+            );
+
             // Scale penalty matrices to ensure they're numerically significant
             // The generated penalties are too small relative to the data scale, making them
             // effectively invisible to the reparameterization algorithm. We scale them by
             // a massive factor to ensure they have an actual smoothing effect that's
             // measurable in the final cost function.
-            let penalty_scale_factor = 1_000_000_000.0; // Extreme scaling factor to overcome numerical issues
+            // Reduced from 1e9 to avoid numerical brittleness, while still ensuring the penalty is dominant.
+            let penalty_scale_factor = 10_000.0;
             for s in s_list.iter_mut() {
                 s.mapv_inplace(|x| x * penalty_scale_factor);
             }
