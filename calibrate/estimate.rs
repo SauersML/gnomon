@@ -135,19 +135,27 @@ pub fn train_model(
         config,
     )?;
 
-    // Define the initial guess for log-smoothing parameters (rho)
+    // Define the initial guess for log-smoothing parameters (rho) and map to unconstrained z
     let initial_rho = Array1::from_elem(layout.num_penalties, 1.0);
+    // Map rho -> z via atanh(rho / 15), guarding against slight out-of-bounds
+    fn atanh_clamped(x: f64) -> f64 { 0.5 * ((1.0 + x) / (1.0 - x)).ln() }
+    let initial_z = initial_rho.mapv(|r| {
+        let xr = (r / 15.0).clamp(-0.999_999, 0.999_999);
+        atanh_clamped(xr)
+    });
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
 
     // Calculate and store the initial cost for fallback comparison
-    let (initial_cost, _) = reml_state.cost_and_grad(&initial_rho);
+    // Evaluate cost at the unconstrained initial point (z space)
+    let (initial_cost, _) = reml_state.cost_and_grad(&initial_z);
 
     // --- Run the BFGS Optimizer ---
     // The closure is now a simple, robust method call.
     // Rationale: We store the result instead of immediately crashing with `?`
     // This allows us to inspect the error type and handle it gracefully.
-    let bfgs_result = Bfgs::new(initial_rho, |rho| reml_state.cost_and_grad(rho))
+    // Run BFGS in unconstrained space z, with mapping handled inside cost_and_grad
+    let bfgs_result = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
         .run();
@@ -189,9 +197,10 @@ pub fn train_model(
 
                 // Get the gradient at last_solution to ensure we're near a stationary point
                 // Apply same clamping as used in cost_and_grad to ensure consistency
-                let unclamped_rho = &last_solution.final_point;
-                let safe_rho = unclamped_rho.mapv(|v| v.clamp(-15.0, 15.0));
-                let gradient_norm = match reml_state.compute_gradient(&safe_rho) {
+                // Map last z to rho and check gradient norm at that bounded point
+                let z_last = &last_solution.final_point;
+                let rho_last = z_last.mapv(|v| 15.0 * v.tanh());
+                let gradient_norm = match reml_state.compute_gradient(&rho_last) {
                     Ok(grad) => grad.dot(&grad).sqrt(),
                     Err(_) => f64::INFINITY,
                 };
@@ -259,7 +268,8 @@ pub fn train_model(
     log::info!("REML optimization completed successfully");
 
     // --- Finalize the Model (same as before) ---
-    // Clamp final rho to evaluation bounds to ensure consistency and avoid overflow in exp
+    // Map final unconstrained point to bounded rho, then clamp for safety
+    let final_rho = final_rho.mapv(|v| 15.0 * v.tanh());
     let final_rho_clamped = final_rho.mapv(|v| v.clamp(-15.0, 15.0));
     let final_lambda = final_rho_clamped.mapv(f64::exp);
     log::info!(
@@ -841,6 +851,7 @@ pub mod internal {
         }
 
         /// The state-aware closure method for the BFGS optimizer.
+        /// Accepts unconstrained parameters `z`, maps to bounded `rho = 15*tanh(z)`.
         pub fn cost_and_grad(&self, rho_bfgs: &Array1<f64>) -> (f64, Array1<f64>) {
             let eval_num = {
                 let mut count = self.eval_count.borrow_mut();
@@ -848,24 +859,23 @@ pub mod internal {
                 *count
             };
 
-            let safe_rho = rho_bfgs.mapv(|v| {
-                if v.is_finite() {
-                    v.clamp(-15.0, 15.0)
-                } else {
-                    0.0
-                }
-            });
+            // Interpret input as unconstrained z; map to bounded rho via tanh
+            let z = rho_bfgs;
+            let rho = z.mapv(|v| if v.is_finite() { 15.0 * v.tanh() } else { 0.0 });
 
             // Attempt to compute the cost and gradient.
-            let cost_result = self.compute_cost(&safe_rho);
+            let cost_result = self.compute_cost(&rho);
 
             match cost_result {
                 Ok(cost) if cost.is_finite() => {
                     // Reset consecutive error counter on successful finite cost
                     *self.consecutive_cost_errors.borrow_mut() = 0;
-                    match self.compute_gradient(&safe_rho) {
+                    match self.compute_gradient(&rho) {
                         Ok(grad) => {
-                            let grad_norm = grad.dot(&grad).sqrt();
+                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = 15*(1 - tanh(z)^2)
+                            let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                            let grad_z = &grad * &jac;
+                            let grad_norm = grad_z.dot(&grad_z).sqrt();
 
                             // --- Correct State Management: Only Update on Actual Improvement ---
                             if eval_num == 1 {
@@ -892,15 +902,14 @@ pub mod internal {
                                 // DO NOT update last_cost here - this is the key fix
                             }
 
-                            (cost, grad)
+                            (cost, grad_z)
                         }
                         Err(e) => {
                             println!(
                                 "\n[BFGS FAILED Step #{eval_num}] -> Gradient calculation error: {e:?}"
                             );
                             // Generate a more informed retreat gradient rather than zeros
-                            let retreat_gradient =
-                                safe_rho.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                            let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
                             (f64::INFINITY, retreat_gradient)
                         }
                     }
@@ -912,14 +921,12 @@ pub mod internal {
                     );
 
                     // Try to get a useful gradient direction to move away from problematic region
-                    let gradient = match self.compute_gradient(&safe_rho) {
+                    let gradient = match self.compute_gradient(&rho) {
                         Ok(grad) => grad,
-                        Err(_) => {
-                            // If gradient computation fails, create a retreat direction
-                            safe_rho.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 })
-                        }
+                        Err(_) => z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 }),
                     };
-
+                    let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                    let gradient = &gradient * &jac;
                     let grad_norm = gradient.dot(&gradient).sqrt();
                     println!("  -> Retreat gradient norm: {grad_norm:.6e}");
 
@@ -941,7 +948,7 @@ pub mod internal {
                         "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
                     );
                     // Generate a gradient that points away from problematic parameter values
-                    let retreat_gradient = safe_rho.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                    let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
                     (f64::INFINITY, retreat_gradient)
                 }
                 // Cost was non-finite or an error occurred.
@@ -952,7 +959,7 @@ pub mod internal {
 
                     // For infinite costs, compute a more informed gradient instead of zeros
                     // Generate a gradient that points away from problematic parameter values
-                    let retreat_gradient = safe_rho.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                    let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
                     (f64::INFINITY, retreat_gradient)
                 }
             }
@@ -4221,8 +4228,10 @@ pub mod internal {
 
                 // Calculate numerical gradient using central difference
                 let h = 1e-6; // Small step size for numerical approximation
-                let rho_plus = &rho + h;
-                let rho_minus = &rho - h;
+                let mut rho_plus = rho.clone();
+                let mut rho_minus = rho.clone();
+                rho_plus[0] += h;
+                rho_minus[0] -= h;
                 let cost_plus = reml_state.compute_cost(&rho_plus).unwrap();
                 let cost_minus = reml_state.compute_cost(&rho_minus).unwrap();
                 let numerical_grad = (cost_plus - cost_minus) / (2.0 * h);
