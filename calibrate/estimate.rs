@@ -147,7 +147,8 @@ pub fn train_model(
     }
 
     // Try a small grid of starting rhos and pick the first finite-cost one.
-    let candidates: &[f64] = &[0.0, 1.0, 2.0, -2.0, 4.0, 8.0, 10.0];
+    // Start heavy to avoid singularity in synthetic test designs
+    let candidates: &[f64] = &[8.0, 10.0, 4.0, 2.0, 1.0, 0.0, -2.0];
     let mut start_z = None;
 
     for &rho_scalar in candidates {
@@ -595,34 +596,29 @@ pub mod internal {
                 }
             };
 
-            // Check indefiniteness BEFORE proceeding with cost calculation
-            // Use Cholesky decomposition as it's fastest and fails if and only if matrix is not positive-definite
+            // Don't barrier on non-PD; we'll stabilize and continue like mgcv
             if pirls_result
                 .penalized_hessian_transformed
                 .cholesky(UPLO::Lower)
                 .is_err()
             {
-                // Cholesky failed, check eigenvalues to confirm indefiniteness
-                let (eigenvalues, _) = pirls_result
+                if let Ok((eigs, _)) = pirls_result
                     .penalized_hessian_transformed
                     .eigh(UPLO::Lower)
-                    .map_err(EstimationError::EigendecompositionFailed)?;
-
-                // Check specifically for ALL negative eigenvalues
-                let all_negative = eigenvalues.iter().all(|&x| x < 0.0);
-
-                if all_negative {
-                    log::warn!("Critical instability detected: ALL eigenvalues are negative.");
-                    return Ok(f64::INFINITY); // Barrier: infinite cost
-                }
-
-                // Original behavior for indefiniteness
-                let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                if min_eig <= 0.0 {
+                {
+                    let all_nonpos = eigs.iter().all(|&x| x <= 0.0);
+                    if all_nonpos {
+                        // Truly pathological: everything ≤ 0
+                        return Err(EstimationError::HessianNotPositiveDefinite {
+                            min_eigenvalue: eigs
+                                .iter()
+                                .cloned()
+                                .fold(f64::INFINITY, f64::min),
+                        });
+                    }
                     log::warn!(
-                        "Indefinite Hessian detected (min eigenvalue: {min_eig}); returning infinite cost to retreat."
+                        "Penalized Hessian not PD (min eig <= 0). Proceeding with stabilized logdet."
                     );
-                    return Ok(f64::INFINITY); // Barrier: infinite cost
                 }
             }
             let lambdas = p.mapv(f64::exp);
@@ -918,8 +914,10 @@ pub mod internal {
                             println!(
                                 "\n[BFGS FAILED Step #{eval_num}] -> Gradient calculation error: {e:?}"
                             );
-                            // Generate a more informed retreat gradient rather than zeros
-                            let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
+                            // Generate retreat gradient toward heavier smoothing in rho-space
+                            let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
+                            let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                            let retreat_gradient = &retreat_rho_grad * &jac;
                             (f64::INFINITY, retreat_gradient)
                         }
                     }
@@ -957,8 +955,10 @@ pub mod internal {
                     println!(
                         "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
                     );
-                    // Generate a gradient that points away from problematic parameter values
-                    let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
+                    // Generate retreat gradient toward heavier smoothing in rho-space
+                    let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
+                    let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                    let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
                 // Cost was non-finite or an error occurred.
@@ -968,8 +968,10 @@ pub mod internal {
                     );
 
                     // For infinite costs, compute a more informed gradient instead of zeros
-                    // Generate a gradient that points away from problematic parameter values
-                    let retreat_gradient = z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 });
+                    // Generate retreat gradient toward heavier smoothing in rho-space
+                    let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
+                    let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                    let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
             }
@@ -1077,8 +1079,9 @@ pub mod internal {
             let pirls_result = match self.execute_pirls_if_needed(p) {
                 Ok(res) => res,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
-                    // Push towards heavier smoothing (bigger rho). This helps retreat to a stable region.
-                    let grad = p.mapv(|rho| rho.abs() + 1.0);
+                    // Push toward heavier smoothing: larger rho
+                    // Minimizer steps along -grad, so use negative values
+                    let grad = p.mapv(|rho| -(rho.abs() + 1.0));
                     return Ok(grad);
                 }
                 Err(e) => return Err(e),
@@ -1124,7 +1127,7 @@ pub mod internal {
                         min_eig
                     );
                     // Generate an informed retreat direction based on current parameters
-                    let retreat_grad = p.mapv(|v| if v > 0.0 { v + 1.0 } else { 1.0 });
+                    let retreat_grad = p.mapv(|v| -(v.abs() + 1.0));
                     return Ok(retreat_grad);
                 }
             }
