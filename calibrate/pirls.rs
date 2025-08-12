@@ -961,6 +961,17 @@ pub fn solve_penalized_least_squares(
             beta_transformed[pivot[j]] = beta_reduced[j];
         }
         
+        // Debug guard to catch future permutation regressions
+        #[cfg(debug_assertions)]
+        {
+            let sqrt_w = weights.mapv(f64::sqrt);
+            let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
+            let wz = &sqrt_w * &z;
+            let grad = wx.t().dot(&(wx.dot(&beta_transformed) - &wz));
+            let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+            debug_assert!(inf_norm < 1e-10, "Fast-path WLS gradient too large: {}", inf_norm);
+        }
+        
         // Construct trivial Hessian (just X'WX since S=0)
         let penalized_hessian = wx.t().dot(&wx);
         
@@ -1445,12 +1456,46 @@ fn pivoted_qr_faer(
     // CRITICAL: Extract the permutation vector that behaves as a FORWARD permutation
     // for our `pivot_columns` logic, i.e., `B_j = A_{pivot[j]}` for B = A * P.
     //
-    // faer stores both forward and inverse permutations internally. Across versions,
-    // the interpretation of `.arrays().0/.1` or the `*` operator semantics can differ.
-    // We select the array that makes `pivot_columns(A, pivot)` numerically match `A * P`.
-    // Empirically (and per current faer), this corresponds to `.arrays().1`.
-    // Use the original approach but with better error handling
-    let pivot: Vec<usize> = perm.arrays().1.to_vec();
+    // Step 5: Extract a robust forward permutation vector
+    // faer stores both forward and inverse permutations internally. Pick the one that
+    // actually matches A*P by comparing with our pivot_columns() function.
+    
+    // Build both candidate vectors
+    let (cand0, cand1) = perm.arrays();
+    let p0: Vec<usize> = cand0.to_vec();
+    let p1: Vec<usize> = cand1.to_vec();
+
+    // Ground truth using faer
+    let a_p_faer = a_faer.as_ref() * perm;
+
+    // Apply our pivot_columns with both candidates
+    let ours0 = pivot_columns(matrix.view(), &p0);
+    let ours1 = pivot_columns(matrix.view(), &p1);
+
+    // Choose the candidate that actually matches A * P
+    let mut err0 = 0.0f64;
+    let mut err1 = 0.0f64;
+    for i in 0..m {
+        for j in 0..n {
+            let v = a_p_faer[(i, j)];
+            err0 = err0.max((v - ours0[[i, j]]).abs());
+            err1 = err1.max((v - ours1[[i, j]]).abs());
+        }
+    }
+
+    let pivot: Vec<usize> = if err0 <= 1e-12 { 
+        p0 
+    } else if err1 <= 1e-12 { 
+        p1 
+    } else {
+        // If both are off by > 1e-12, pick the better and warn. This prevents hard fails in release.
+        log::warn!(
+            "Permutation direction ambiguous (errs: {:.3e}, {:.3e}); choosing best",
+            err0,
+            err1
+        );
+        if err0 < err1 { p0 } else { p1 }
+    };
 
 
     Ok((q, r, pivot))
