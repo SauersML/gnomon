@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interaction_terms_introduce_rank_deficiency() {
+    fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
         let (x, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
@@ -1352,12 +1352,12 @@ mod tests {
         let rank_tol = max_s_val * 1e-12;
         let rank = svd.1.iter().filter(|&&s| s > rank_tol).count();
 
-        // This assertion confirms the problem exists
-        assert!(rank < x.ncols(), 
-                "The design matrix with interactions should be rank-deficient before constraints are applied. Rank: {}, Columns: {}",
+        // The design matrix should be full-rank by construction
+        // The code cleverly builds interaction terms using main effect bases that already 
+        // have intercept columns removed, preventing rank deficiency from the start
+        assert_eq!(rank, x.ncols(), 
+                "The design matrix with interactions should be full-rank by construction. Rank: {}, Columns: {}",
                 rank, x.ncols());
-        
-        // NOTE TO DEVELOPER: Once you fix the identifiability issue, this assertion should be changed to `assert_eq!(rank, x.ncols())`.
     }
 
     #[test]
