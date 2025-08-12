@@ -927,60 +927,61 @@ pub fn solve_penalized_least_squares(
     );
 
     // FAST PATH: Pure unpenalized WLS case (E has 0 rows)
-    // Many test failures are with unpenalized models - use standard QLS solve
+    // Use faer's built-in least squares solver to avoid manual Q/R/P reconstruction
     if eb.nrows() == 0 && e_transformed.nrows() == 0 {
         println!("[PLS Solver] Using fast path for unpenalized WLS");
-        
-        // Standard weighted least squares: sqrt(W)X β = sqrt(W)z
+
+        // Standard weighted least squares: minimize || sqrt(W) X β - sqrt(W) z ||_2
         let sqrt_w = weights.mapv(f64::sqrt);
         let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
         let wz = &sqrt_w * &z;
-        
-        // Column-pivoted QR
-        let (q, r, pivot) = pivoted_qr_faer(&wx)?;
-        
-        // Determine rank
-        let max_diag = r.diag().iter().fold(0.0f64, |acc, &val| acc.max(val.abs()));
-        let rank = r.diag().iter().filter(|&&val| val.abs() > max_diag * 1e-12).count();
-        
-        // Solve Ry = Q'(sqrt(W)z) for the first `rank` equations
-        let qty = q.t().dot(&wz);
-        let mut beta_reduced = Array1::<f64>::zeros(rank);
-        
-        for i in (0..rank).rev() {
-            let mut sum = qty[i];
-            for j in (i + 1)..rank {
-                sum -= r[[i, j]] * beta_reduced[j];
+
+        // Robust LS via SVD: β = V Σ⁺ Uᵀ (sqrt(W) z)
+        use ndarray_linalg::SVD;
+        let (u_opt, s, vt_opt) = wx
+            .svd(true, true)
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        let (u, vt) = match (u_opt, vt_opt) {
+            (Some(u), Some(vt)) => (u, vt),
+            _ => {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                })
             }
-            beta_reduced[i] = sum / r[[i, i]];
+        };
+
+        let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let tol = smax * 1e-12;
+        let rank = s.iter().filter(|&&sv| sv > tol).count();
+
+        // β = V Σ⁺ Uᵀ wz (compute directly without building full Σ⁺)
+        let utb = u.t().dot(&wz);
+        let mut s_inv_utb = Array1::<f64>::zeros(s.len());
+        for i in 0..s.len() {
+            if s[i] > tol {
+                s_inv_utb[i] = utb[i] / s[i];
+            }
         }
-        
-        // Reconstruct full coefficient vector by unpivoting
-        let mut beta_transformed = Array1::<f64>::zeros(x_transformed.ncols());
-        for j in 0..rank {
-            beta_transformed[pivot[j]] = beta_reduced[j];
+        let beta_transformed = vt.t().dot(&s_inv_utb);
+
+        // Construct Hessian H = Xᵀ W X (since S=0)
+        let xtwx = wx.t().dot(&wx);
+
+        // KKT check in weighted form Xᵀ W (Xβ - z) == 0 (release-safe verification)
+        let grad = xtwx.dot(&beta_transformed) - wx.t().dot(&wz);
+        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        if inf_norm > 1e-10 {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
         }
-        
-        // Debug guard to catch future permutation regressions
-        #[cfg(debug_assertions)]
-        {
-            let sqrt_w = weights.mapv(f64::sqrt);
-            let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-            let wz = &sqrt_w * &z;
-            let grad = wx.t().dot(&(wx.dot(&beta_transformed) - &wz));
-            let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-            debug_assert!(inf_norm < 1e-10, "Fast-path WLS gradient too large: {}", inf_norm);
-        }
-        
-        // Construct trivial Hessian (just X'WX since S=0)
-        let penalized_hessian = wx.t().dot(&wx);
-        
+
         return Ok((
             StablePLSResult {
                 beta: beta_transformed,
-                penalized_hessian,
-                edf: rank as f64,  // EDF equals rank for unpenalized case
-                scale: 1.0,        // Not used in this path
+                penalized_hessian: xtwx,
+                edf: rank as f64,
+                scale: 1.0,
             },
             rank,
         ));
