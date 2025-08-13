@@ -153,38 +153,81 @@ pub fn train_model(
         })
     }
 
-    // Try a small grid of starting rhos and pick the first finite-cost one.
-    // Start heavy to avoid singularity in synthetic test designs
-    let candidates: &[f64] = &[8.0, 10.0, 4.0, 2.0, 1.0, 0.0, -2.0];
-    let mut start_z = None;
-
-    for &rho_scalar in candidates {
-        let rho_try = Array1::from_elem(layout.num_penalties, rho_scalar);
-        match reml_state.compute_cost(&rho_try) {
-            Ok(c) if c.is_finite() => {
-                start_z = Some(to_z_from_rho(&rho_try));
+    // Multi-start seeding with asymmetric perturbations to break symmetry
+    // This prevents the optimizer from getting trapped when PC penalties are identical
+    let mut seed_candidates = Vec::new();
+    
+    // Symmetric base seeds
+    let base_values: &[f64] = &[8.0, 4.0, 2.0, 0.0, -2.0];
+    for &val in base_values {
+        seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
+    }
+    
+    // Asymmetric seeds to break symmetry (crucial for distinguishing PC relevance)
+    if layout.num_penalties >= 2 {
+        seed_candidates.push(Array1::from(vec![8.0, 6.0])); // Heavy vs medium
+        seed_candidates.push(Array1::from(vec![6.0, 8.0])); // Medium vs heavy  
+        seed_candidates.push(Array1::from(vec![4.0, 2.0])); // Medium vs light
+        seed_candidates.push(Array1::from(vec![2.0, 4.0])); // Light vs medium
+    }
+    
+    // For higher dimensions, extend asymmetric patterns
+    if layout.num_penalties >= 4 {
+        seed_candidates.push(Array1::from(vec![8.0, 6.0, 4.0, 2.0])); // Decreasing
+        seed_candidates.push(Array1::from(vec![2.0, 4.0, 6.0, 8.0])); // Increasing  
+        seed_candidates.push(Array1::from(vec![8.0, 2.0, 8.0, 2.0])); // Alternating
+    }
+    
+    // Extend shorter seeds to match layout.num_penalties
+    for seed in &mut seed_candidates {
+        // Convert to Vec, resize, then back to Array1
+        let mut vec_seed = seed.to_vec();
+        vec_seed.resize(layout.num_penalties, 0.0); // Fill/trim to exact length
+        *seed = Array1::from_vec(vec_seed);
+    }
+    
+    // Evaluate all seeds and pick the one with minimal finite cost
+    let mut best_seed = None;
+    let mut best_cost = f64::INFINITY;
+    
+    for (i, seed) in seed_candidates.iter().enumerate() {
+        match reml_state.compute_cost(seed) {
+            Ok(c) if c.is_finite() && c < best_cost => {
+                best_cost = c;
+                best_seed = Some((seed.clone(), i));
                 eprintln!(
-                    "[Init] Using starting rho = {:.3} (lambda ~ {:.3}) with finite cost {:.6}",
-                    rho_scalar,
-                    rho_scalar.exp(),
-                    c
+                    "[Seed {}] rho = {:?} -> cost = {:.6} (NEW BEST)",
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
                 );
-                break;
+            }
+            Ok(c) if c.is_finite() => {
+                eprintln!(
+                    "[Seed {}] rho = {:?} -> cost = {:.6}",
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
+                );
             }
             Ok(_) => {
                 eprintln!(
-                    "[Init] rho = {:.3} produced +inf cost; trying a safer (heavier) smoothing.",
-                    rho_scalar
+                    "[Seed {}] rho = {:?} -> +inf cost",
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>()
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "[Init] rho = {:.3} failed ({:?}); trying a safer (heavier) smoothing.",
-                    rho_scalar, e
+                    "[Seed {}] rho = {:?} -> failed ({:?})",
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), e
                 );
             }
         }
     }
+    
+    let start_z = if let Some((best_rho, best_idx)) = best_seed {
+        eprintln!("[Init] Using asymmetric seed #{} with cost {:.6}", best_idx, best_cost);
+        Some(to_z_from_rho(&best_rho))
+    } else {
+        eprintln!("[Init] All seeds failed, falling back to neutral rho=0");
+        Some(to_z_from_rho(&Array1::zeros(layout.num_penalties)))
+    };
 
     // Fallback to previous default if none were finite (will likely be rescued by the barrier)
     let initial_z = start_z.unwrap_or_else(|| {
