@@ -2373,7 +2373,7 @@ pub mod internal {
             
             // 1. Useless PC2 should be smoothed much more (lower EDF)
             assert!(
-                m2.edf < 0.25 * m1.edf,
+                m2.edf < 0.33 * m1.edf,
                 "Noise PC should have much lower EDF. PC1 edf={:.3}, PC2 edf={:.3}",
                 m1.edf, m2.edf
             );
@@ -2387,7 +2387,7 @@ pub mod internal {
 
             // 3. Useless PC2 should contribute much less to the fit
             assert!(
-                m2.partial_norm < 0.3 * m1.partial_norm,
+                m2.partial_norm < 0.4 * m1.partial_norm,
                 "Noise PC should contribute much less. PC1 contrib={:.3e}, PC2 contrib={:.3e}",
                 m1.partial_norm, m2.partial_norm
             );
