@@ -345,7 +345,7 @@ mod internal {
         // 4. Tensor product interaction effects - Range × Range only (functional ANOVA)
         if let Some(pgs_range_transform) = config.range_transforms.get("pgs") {
             let pgs_range_basis = pgs_main_basis_unc.dot(pgs_range_transform);
-            
+
             for pc_idx in 0..config.pc_names.len() {
                 let pc_name = &config.pc_names[pc_idx];
                 let tensor_key = format!("f(PGS,{})", pc_name);
@@ -354,8 +354,10 @@ mod internal {
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
                     if let Some(pc_range_transform) = config.range_transforms.get(pc_name) {
                         // Use Range × Range tensor product (fully penalized by construction)
-                        let pc_range_basis = pc_unconstrained_bases_main[pc_idx].dot(pc_range_transform);
-                        let tensor_interaction = row_wise_tensor_product(&pgs_range_basis, &pc_range_basis);
+                        let pc_range_basis =
+                            pc_unconstrained_bases_main[pc_idx].dot(pc_range_transform);
+                        let tensor_interaction =
+                            row_wise_tensor_product(&pgs_range_basis, &pc_range_basis);
 
                         // Add all columns from this tensor product to the design matrix
                         for col in tensor_interaction.axis_iter(Axis(1)) {
@@ -570,7 +572,7 @@ mod tests {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,

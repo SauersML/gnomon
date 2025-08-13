@@ -156,13 +156,13 @@ pub fn train_model(
     // Multi-start seeding with asymmetric perturbations to break symmetry
     // This prevents the optimizer from getting trapped when PC penalties are identical
     let mut seed_candidates = Vec::new();
-    
+
     // Symmetric base seeds
     let base_values: &[f64] = &[8.0, 4.0, 2.0, 0.0, -2.0];
     for &val in base_values {
         seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
     }
-    
+
     // Asymmetric seeds to break symmetry (crucial for distinguishing PC relevance)
     if layout.num_penalties >= 2 {
         seed_candidates.push(Array1::from(vec![8.0, 6.0])); // Heavy vs medium
@@ -170,14 +170,14 @@ pub fn train_model(
         seed_candidates.push(Array1::from(vec![4.0, 2.0])); // Medium vs light
         seed_candidates.push(Array1::from(vec![2.0, 4.0])); // Light vs medium
     }
-    
+
     // For higher dimensions, extend asymmetric patterns
     if layout.num_penalties >= 4 {
         seed_candidates.push(Array1::from(vec![8.0, 6.0, 4.0, 2.0])); // Decreasing
         seed_candidates.push(Array1::from(vec![2.0, 4.0, 6.0, 8.0])); // Increasing  
         seed_candidates.push(Array1::from(vec![8.0, 2.0, 8.0, 2.0])); // Alternating
     }
-    
+
     // Extend shorter seeds to match layout.num_penalties
     for seed in &mut seed_candidates {
         // Convert to Vec, resize, then back to Array1
@@ -185,11 +185,11 @@ pub fn train_model(
         vec_seed.resize(layout.num_penalties, 0.0); // Fill/trim to exact length
         *seed = Array1::from_vec(vec_seed);
     }
-    
+
     // Evaluate all seeds and pick the one with minimal finite cost
     let mut best_seed = None;
     let mut best_cost = f64::INFINITY;
-    
+
     for (i, seed) in seed_candidates.iter().enumerate() {
         match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() && c < best_cost => {
@@ -197,32 +197,50 @@ pub fn train_model(
                 best_seed = Some((seed.clone(), i));
                 eprintln!(
                     "[Seed {}] rho = {:?} -> cost = {:.6} (NEW BEST)",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>(),
+                    c
                 );
             }
             Ok(c) if c.is_finite() => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> cost = {:.6}",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>(),
+                    c
                 );
             }
             Ok(_) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> +inf cost",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>()
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>()
                 );
             }
             Err(e) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> failed ({:?})",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), e
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>(),
+                    e
                 );
             }
         }
     }
-    
+
     let start_z = if let Some((best_rho, best_idx)) = best_seed {
-        eprintln!("[Init] Using asymmetric seed #{} with cost {:.6}", best_idx, best_cost);
+        eprintln!(
+            "[Init] Using asymmetric seed #{} with cost {:.6}",
+            best_idx, best_cost
+        );
         Some(to_z_from_rho(&best_rho))
     } else {
         eprintln!("[Init] All seeds failed, falling back to neutral rho=0");
@@ -256,7 +274,7 @@ pub fn train_model(
     // Rationale: This `match` block is the new control structure. It allows us
     // to define different behaviors for a successful run vs. a failed run.
     let BfgsSolution {
-        final_point: final_z,  // FIXED: This is the unconstrained parameter z, not rho
+        final_point: final_z, // FIXED: This is the unconstrained parameter z, not rho
         final_value,
         iterations,
         ..
@@ -480,14 +498,15 @@ pub mod internal {
         fn solve_matrix(&self, rhs_matrix: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
             match self {
                 RobustSolver::Cholesky(stored_matrix) => {
-                    // Efficient batch solve using single Cholesky factorization 
+                    // Efficient batch solve using single Cholesky factorization
                     let chol = stored_matrix
                         .cholesky(UPLO::Lower)
                         .map_err(EstimationError::LinearSystemSolveFailed)?;
-                    
+
                     let mut solution = Array2::zeros(rhs_matrix.raw_dim());
                     for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
-                        let sol_col = chol.solve(&rhs_col.to_owned())
+                        let sol_col = chol
+                            .solve(&rhs_col.to_owned())
                             .map_err(EstimationError::LinearSystemSolveFailed)?;
                         solution.column_mut(j).assign(&sol_col);
                     }
@@ -755,7 +774,9 @@ pub mod internal {
                     let qs = &pirls_result.reparam_result.qs;
 
                     // Transform the stabilized Hessian back to original basis for EDF calculation
-                    let hessian_original = qs.dot(&pirls_result.stabilized_hessian_transformed).dot(&qs.t());
+                    let hessian_original = qs
+                        .dot(&pirls_result.stabilized_hessian_transformed)
+                        .dot(&qs.t());
 
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
@@ -800,13 +821,17 @@ pub mod internal {
                     }
 
                     // log |H| = log |X'X + S_λ| using SINGLE stabilized Hessian from P-IRLS
-                    let log_det_h = match pirls_result.stabilized_hessian_transformed.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result
+                        .stabilized_hessian_transformed
+                        .cholesky(UPLO::Lower)
+                    {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             log::warn!(
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
-                            let (eigenvalues, _) = pirls_result.stabilized_hessian_transformed
+                            let (eigenvalues, _) = pirls_result
+                                .stabilized_hessian_transformed
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
@@ -847,7 +872,10 @@ pub mod internal {
                     let log_det_s = pirls_result.reparam_result.log_det;
 
                     // Log-determinant of the penalized Hessian using SINGLE stabilized Hessian from P-IRLS
-                    let log_det_h = match pirls_result.stabilized_hessian_transformed.cholesky(UPLO::Lower) {
+                    let log_det_h = match pirls_result
+                        .stabilized_hessian_transformed
+                        .cholesky(UPLO::Lower)
+                    {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
@@ -855,7 +883,8 @@ pub mod internal {
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
 
-                            let (eigenvalues, _) = pirls_result.stabilized_hessian_transformed
+                            let (eigenvalues, _) = pirls_result
+                                .stabilized_hessian_transformed
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
@@ -1241,7 +1270,9 @@ pub mod internal {
                     }
 
                     // Transform Hessian back to original basis for this calculation
-                    let hessian_original = qs.dot(&pirls_result.stabilized_hessian_transformed).dot(&qs.t());
+                    let hessian_original = qs
+                        .dot(&pirls_result.stabilized_hessian_transformed)
+                        .dot(&qs.t());
 
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_original.ncols() {
@@ -1352,7 +1383,7 @@ pub mod internal {
                             // Single factorization, then solve H C = X^T for C (p x N)
                             let xt = x_transformed.t().to_owned(); // (p x N)
                             let c = solver.solve_matrix(&xt)?; // H^{-1} X^T, shape (p x N)
-                            
+
                             // Compute diagonal: hat[i] = X[i,:] · C[:,i] for each observation i
                             (0..x_transformed.nrows())
                                 .map(|i| x_transformed.row(i).dot(&c.column(i)))
@@ -1453,7 +1484,6 @@ pub mod internal {
             Ok(cost_gradient)
         }
     }
-
 
     /// Robust solve using QR/SVD approach similar to mgcv's implementation
     /// This avoids the singularity issues that plague direct matrix inversion
@@ -1753,7 +1783,7 @@ pub mod internal {
                 pgs_range: (-3.0, 3.0),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             };
 
             (data, config)
@@ -1780,7 +1810,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             }
         }
 
@@ -2949,7 +2979,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
@@ -3074,7 +3104,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -3299,7 +3329,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             };
 
             println!(
@@ -3398,7 +3428,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+                range_transforms: HashMap::new(),
             };
 
             let (x, s_list, layout, _, _, _) =
@@ -4365,7 +4395,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pc_ranges: vec![],
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
+        range_transforms: HashMap::new(),
     };
 
     // 3. Train the model and expect an error
@@ -4643,7 +4673,8 @@ mod optimizer_progress_tests {
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _, _, _) = build_design_and_penalty_matrices(&data, &config)?;
+        let (x_matrix, s_list, layout, _, _, _) =
+            build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),

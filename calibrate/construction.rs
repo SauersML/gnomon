@@ -222,9 +222,10 @@ pub fn build_design_and_penalty_matrices(
 
     // Create PGS penalty matrix and decompose into null/range spaces
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-    let s_pgs_base = create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
+    let s_pgs_base =
+        create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
     let (_z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_base, 1e-12)?;
-    
+
     // For policy mode: PGS main effect remains unpenalized (use full unconstrained basis)
     // Apply sum-to-zero constraint to maintain identifiability
     let (pgs_main_basis, pgs_z_transform) =
@@ -263,22 +264,23 @@ pub fn build_design_and_penalty_matrices(
 
         // Save PC knot vector
         knot_vectors.insert(pc_name.clone(), pc_knots);
-        
+
         // Functional ANOVA decomposition: use range-only basis for PC main effects
         let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
         pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
-        
+
         // Create penalty matrix and decompose into null/range spaces
-        let s_pc_base = create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
+        let s_pc_base =
+            create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
         let (_z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_base, 1e-12)?;
-        
+
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
         pc_range_bases.push(pc_range_basis);
-        
+
         // Store PC range transformation for interactions and main effects
         range_transforms.insert(pc_name.clone(), z_range_pc.clone());
-        
+
         // Store the actual range transformation for backward compatibility
         // This allows prediction fallback to work correctly when range_transforms is empty
         constraints.insert(
@@ -291,8 +293,11 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Calculate layout first to determine matrix dimensions
     let pc_range_ncols: Vec<usize> = pc_range_bases.iter().map(|b| b.ncols()).collect();
-    let pgs_range_ncols = range_transforms.get("pgs").map(|rt| rt.ncols()).unwrap_or(0);
-    
+    let pgs_range_ncols = range_transforms
+        .get("pgs")
+        .map(|rt| rt.ncols())
+        .unwrap_or(0);
+
     let layout = ModelLayout::new(
         config,
         &pc_range_ncols,
@@ -305,18 +310,18 @@ pub fn build_design_and_penalty_matrices(
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
     let mut s_list = Vec::with_capacity(layout.num_penalties);
-    
+
     // Initialize all penalty matrices as zeros
     for _ in 0..layout.num_penalties {
         s_list.push(Array2::zeros((p, p)));
     }
-    
+
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
         let penalty_idx = block.penalty_indices[0]; // Each block has exactly one penalty index
         let col_range = block.col_range.clone();
         let range_len = col_range.len();
-        
+
         // Set identity penalty for this specific block
         s_list[penalty_idx]
             .slice_mut(s![col_range.clone(), col_range])
@@ -391,7 +396,7 @@ pub fn build_design_and_penalty_matrices(
         // Get PGS range basis for interactions
         let pgs_range_transform = range_transforms.get("pgs").unwrap();
         let pgs_range_basis = pgs_main_basis_unc.dot(pgs_range_transform);
-        
+
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
             let tensor_block = layout
@@ -467,7 +472,14 @@ pub fn build_design_and_penalty_matrices(
         });
     }
 
-    Ok((x_matrix, s_list, layout, constraints, knot_vectors, range_transforms))
+    Ok((
+        x_matrix,
+        s_list,
+        layout,
+        constraints,
+        knot_vectors,
+        range_transforms,
+    ))
 }
 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
@@ -694,8 +706,7 @@ pub fn stable_reparameterization(
 
     // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
     // These will NEVER be modified and are used for building the sb matrix
-    let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| rs_k.t().dot(rs_k)).collect();
+    let s_original_list: Vec<Array2<f64>> = rs_list.iter().map(|rs_k| rs_k.t().dot(rs_k)).collect();
 
     // Create the WORKING copy that will be transformed
     let mut s_current_list = s_original_list.clone();
@@ -1269,23 +1280,27 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, _range_transforms) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, _, _, _range_transforms) =
+            build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
-        
+
         // PGS main is still unpenalized and sum-to-zero constrained
-        let pgs_main_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // 6 - 1 - 1 = 4
-        
+        let pgs_main_coeffs =
+            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // 6 - 1 - 1 = 4
+
         // PC1 main is now range-only (penalized part only)
         // Range dimension = main basis cols - null space dimension
-        let pc1_main_basis_cols = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree; // 5 - 1 = 4
+        let pc1_main_basis_cols =
+            config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree; // 5 - 1 = 4
         let r_pc = pc1_main_basis_cols - config.penalty_order; // 4 - 2 = 2
-        
+
         // Interaction is R×R (both dimensions use range-only)
-        let pgs_main_basis_cols = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree; // 6 - 1 = 5  
+        let pgs_main_basis_cols =
+            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree; // 6 - 1 = 5  
         let r_pgs = pgs_main_basis_cols - config.penalty_order; // 5 - 2 = 3
         let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
-        
+
         let expected_total_coeffs = 1 + pgs_main_coeffs + r_pc + interaction_coeffs; // 1 + 4 + 2 + 6 = 13
         let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction
 
@@ -1335,7 +1350,8 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (_, s_list, layout, _, _, _) =
+            build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3: Expect grouped penalties - total of 2 penalty matrices
         assert_eq!(
@@ -1359,19 +1375,20 @@ mod tests {
 
         let interaction_penalty_idx = interaction_block.penalty_indices[0];
         assert_eq!(
-            interaction_penalty_idx,
-            1,
+            interaction_penalty_idx, 1,
             "Interaction should use penalty index 1 (PC mains use 0)"
         );
 
         // Verify penalty matrix structure
         let s_interactions = &s_list[1]; // Interaction penalty matrix
-        let s_pc_mains = &s_list[0];     // PC main effects penalty matrix
+        let s_pc_mains = &s_list[0]; // PC main effects penalty matrix
 
         // Check that interaction penalty matrix has identity on interaction blocks and zeros elsewhere
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
-                if interaction_block.col_range.contains(&r) && interaction_block.col_range.contains(&c) {
+                if interaction_block.col_range.contains(&r)
+                    && interaction_block.col_range.contains(&c)
+                {
                     // Within interaction block: should be identity (1 on diagonal, 0 off-diagonal)
                     if r == c {
                         assert_abs_diff_eq!(s_interactions[[r, c]], 1.0, epsilon = 1e-12);

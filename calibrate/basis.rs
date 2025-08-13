@@ -272,7 +272,7 @@ pub fn apply_sum_to_zero_constraint(
 }
 
 /// Decomposes a penalty matrix S into its null-space and whitened range-space components.
-/// This is used for functional ANOVA decomposition in GAMs to separate unpenalized 
+/// This is used for functional ANOVA decomposition in GAMs to separate unpenalized
 /// and penalized subspaces of a basis.
 ///
 /// # Arguments
@@ -288,9 +288,7 @@ pub fn null_range_whiten(
     s_1d: &Array2<f64>,
     tol: f64,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let (evals, evecs) = s_1d
-        .eigh(UPLO::Lower)
-        .map_err(BasisError::LinalgError)?;
+    let (evals, evecs) = s_1d.eigh(UPLO::Lower).map_err(BasisError::LinalgError)?;
 
     let mut idx_n = Vec::new();
     let mut idx_r = Vec::new();
@@ -321,11 +319,11 @@ fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
     let nrows = matrix.nrows();
     let ncols = indices.len();
     let mut result = Array2::zeros((nrows, ncols));
-    
+
     for (j, &col_idx) in indices.iter().enumerate() {
         result.column_mut(j).assign(&matrix.column(col_idx));
     }
-    
+
     result
 }
 

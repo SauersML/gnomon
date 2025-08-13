@@ -3,7 +3,7 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{UPLO, Eigh};
+use ndarray_linalg::{Eigh, UPLO};
 use std::time::Instant;
 
 /// The status of the P-IRLS convergence.
@@ -1509,10 +1509,10 @@ fn pivoted_qr_faer(
 
     // Try candidate p0
     let a_p0 = pivot_columns(matrix.view(), &p0);
-    
+
     // Try candidate p1
     let a_p1 = pivot_columns(matrix.view(), &p1);
-    
+
     // FIXED: Use relative error for scale-robust comparison
     let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
         let diff_norm = (a_p - &qr_product).mapv(|x| x * x).sum().sqrt();
@@ -1521,10 +1521,10 @@ fn pivoted_qr_faer(
         let denom = (a_norm + qr_norm + 1e-16).max(1e-16); // Avoid division by zero
         diff_norm / denom
     };
-    
+
     let err0 = compute_relative_error(&a_p0);
     let err1 = compute_relative_error(&a_p1);
-    
+
     let pivot: Vec<usize> = if err0 < 1e-12 {
         p0
     } else if err1 < 1e-12 {
