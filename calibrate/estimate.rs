@@ -1410,46 +1410,6 @@ pub mod internal {
         }
     }
 
-    /// Ensures a matrix is positive definite by adjusting negative eigenvalues
-    fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
-        if let Ok((evals, evecs)) = hess.eigh(UPLO::Lower) {
-            // Check if ALL eigenvalues are negative - CRITICAL numerical issue
-            if evals.iter().all(|&x| x < 0.0) {
-                let min_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                // Critical error - program termination
-                return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
-            }
-
-            // Original behavior for other cases
-            let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
-            let mut adjusted = false;
-            let mut evals_mut = evals.clone();
-
-            for eval in evals_mut.iter_mut() {
-                if *eval < thresh {
-                    *eval = thresh;
-                    adjusted = true;
-                }
-            }
-
-            if adjusted {
-                let min_original_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                log::warn!(
-                    "Penalized Hessian was not positive definite (min eigenvalue: {:.3e}). Adjusting for stability. This may indicate an ill-posed model.",
-                    min_original_eigenvalue
-                );
-                *hess = evecs.dot(&Array2::from_diag(&evals_mut)).dot(&evecs.t());
-            }
-
-            Ok(())
-        } else {
-            // Fallback: add small ridge to diagonal
-            for i in 0..hess.nrows() {
-                hess[[i, i]] += 1e-6;
-            }
-            Ok(())
-        }
-    }
 
     /// Robust solve using QR/SVD approach similar to mgcv's implementation
     /// This avoids the singularity issues that plague direct matrix inversion
