@@ -31,6 +31,36 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     result
 }
 
+/// Helper function to fill Kronecker diagonal penalty matrices
+/// For kron(diag_a, I_b): puts diag_a[i] for each PC coefficient within PGS block i
+/// For kron(I_a, diag_b): puts diag_b[j] for each PGS coefficient within PC block j
+fn fill_kron_diag(
+    target: &mut ndarray::Array2<f64>,
+    col_range: std::ops::Range<usize>,
+    diag_a: &ndarray::Array1<f64>, // length r_a (PGS dimension)
+    diag_b: &ndarray::Array1<f64>, // length r_b (PC dimension)
+    kronecker_type: &str, // "pgs_dir" or "pc_dir"
+) {
+    let r_a = diag_a.len();
+    let r_b = diag_b.len();
+    assert_eq!(col_range.len(), r_a * r_b);
+    
+    for ia in 0..r_a {
+        for ib in 0..r_b {
+            let k = ia * r_b + ib; // Row-major flattening
+            let idx = col_range.start + k;
+            
+            let penalty_value = match kronecker_type {
+                "pgs_dir" => diag_a[ia], // kron(D_pgs, I_pc): penalize PGS direction
+                "pc_dir" => diag_b[ib],  // kron(I_pgs, D_pc): penalize PC direction
+                _ => panic!("Invalid kronecker_type: {}", kronecker_type),
+            };
+            
+            target[[idx, idx]] = penalty_value;
+        }
+    }
+}
+
 /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
 /// This creates the design matrix columns for tensor product interactions.
 /// Each row of the result is the outer product of the corresponding rows from A and B.
@@ -176,7 +206,7 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, and range transformations.
+/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, range transformations, and interaction range transformations.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
@@ -188,6 +218,7 @@ pub fn build_design_and_penalty_matrices(
         HashMap<String, Constraint>,
         HashMap<String, Array1<f64>>,
         HashMap<String, Array2<f64>>,
+        HashMap<String, Array2<f64>>, // Added: interaction_range_transforms
     ),
     EstimationError,
 > {
@@ -207,6 +238,7 @@ pub fn build_design_and_penalty_matrices(
     let mut constraints = HashMap::new();
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
+    let mut interaction_range_transforms = HashMap::new();
 
     // 1. Generate basis for PGS and apply sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
@@ -225,6 +257,20 @@ pub fn build_design_and_penalty_matrices(
     let s_pgs_base =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
     let (_z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_base, 1e-12)?;
+    
+    // Store unwhitened range eigenvectors for interaction penalties
+    let (pgs_evals, pgs_evecs) = s_pgs_base
+        .eigh(ndarray_linalg::UPLO::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    let tol = 1e-12;
+    let pgs_range_idxs: Vec<usize> = pgs_evals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &d)| if d > tol { Some(i) } else { None })
+        .collect();
+    let u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
+    let d_pgs_range = ndarray::Array1::from_iter(pgs_range_idxs.iter().map(|&i| pgs_evals[i]));
+    interaction_range_transforms.insert("pgs".to_string(), u_pgs_range.to_owned());
 
     // For policy mode: PGS main effect remains unpenalized (use full unconstrained basis)
     // Apply sum-to-zero constraint to maintain identifiability
@@ -245,6 +291,7 @@ pub fn build_design_and_penalty_matrices(
     // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases = Vec::new();
     let mut pc_unconstrained_bases_main = Vec::new();
+    let mut pc_eigenvalue_diags = Vec::new(); // Store diagonal eigenvalue matrices for interactions
 
     // Check if we have any PCs to process
     if config.pc_names.is_empty() {
@@ -273,6 +320,21 @@ pub fn build_design_and_penalty_matrices(
         let s_pc_base =
             create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
         let (_z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_base, 1e-12)?;
+
+        // Store unwhitened range eigenvectors and eigenvalue diagonal for interaction penalties
+        let (pc_evals, pc_evecs) = s_pc_base
+            .eigh(ndarray_linalg::UPLO::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let pc_range_idxs: Vec<usize> = pc_evals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if d > tol { Some(i) } else { None })
+            .collect();
+        let u_pc_range = pc_evecs.select(ndarray::Axis(1), &pc_range_idxs);
+        let d_pc_range = ndarray::Array1::from_iter(pc_range_idxs.iter().map(|&i| pc_evals[i]));
+        
+        interaction_range_transforms.insert(pc_name.clone(), u_pc_range.to_owned());
+        pc_eigenvalue_diags.push(d_pc_range);
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
@@ -330,13 +392,51 @@ pub fn build_design_and_penalty_matrices(
                     .assign(&Array2::eye(range_len));
             }
             TermType::Interaction => {
-                // Interactions have two penalty indices (PGS-dir and PC-dir)
-                // For now, use identity penalties - TODO: implement proper Kronecker-sum
-                for &penalty_idx in &block.penalty_indices {
-                    s_list[penalty_idx]
-                        .slice_mut(s![col_range.clone(), col_range])
-                        .assign(&Array2::eye(range_len));
+                // Interactions have two penalty indices: PGS-dir and PC-dir
+                // Build proper Kronecker-sum penalties: kron(D_pgs, I_pc) + kron(I_pgs, D_pc)
+                if block.penalty_indices.len() != 2 {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Interaction block {} should have exactly 2 penalty indices, found {}",
+                        block.term_name, block.penalty_indices.len()
+                    )));
                 }
+                
+                // Extract PC index from term name "f(PGS,PC1)" -> PC1
+                let pc_name = block.term_name
+                    .strip_prefix("f(PGS,")
+                    .and_then(|s| s.strip_suffix(")"))
+                    .ok_or_else(|| EstimationError::LayoutError(format!(
+                        "Invalid interaction term name: {}", block.term_name
+                    )))?;
+                
+                // Find PC index in the config
+                let pc_idx = config.pc_names
+                    .iter()
+                    .position(|name| name == pc_name)
+                    .ok_or_else(|| EstimationError::LayoutError(format!(
+                        "PC name {} not found in config", pc_name
+                    )))?;
+
+                let pgs_penalty_idx = block.penalty_indices[0]; // PGS direction penalty
+                let pc_penalty_idx = block.penalty_indices[1];  // PC direction penalty
+                
+                // Fill PGS-direction penalty: kron(D_pgs, I_pc)
+                fill_kron_diag(
+                    &mut s_list[pgs_penalty_idx],
+                    col_range.clone(),
+                    &d_pgs_range,
+                    &ndarray::Array1::ones(pc_eigenvalue_diags[pc_idx].len()),
+                    "pgs_dir",
+                );
+                
+                // Fill PC-direction penalty: kron(I_pgs, D_pc)
+                fill_kron_diag(
+                    &mut s_list[pc_penalty_idx],
+                    col_range.clone(),
+                    &ndarray::Array1::ones(d_pgs_range.len()),
+                    &pc_eigenvalue_diags[pc_idx],
+                    "pc_dir",
+                );
             }
         }
     }
@@ -492,6 +592,7 @@ pub fn build_design_and_penalty_matrices(
         constraints,
         knot_vectors,
         range_transforms,
+        interaction_range_transforms,
     ))
 }
 
