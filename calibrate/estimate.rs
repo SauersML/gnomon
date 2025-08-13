@@ -3703,8 +3703,6 @@ pub mod internal {
 
             let (x, s_list, layout, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            // Explicitly drop unused variables
-            // Unused variables removed
 
             // Calculate the true basis function counts
             let pgs_n_basis =
@@ -3712,20 +3710,25 @@ pub mod internal {
             let pc_n_basis =
                 config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5
 
-            // Correct calculation for constrained main effect coefficients
+            // PGS main effect is unpenalized with sum-to-zero constraint
             let pgs_main_coeffs = pgs_n_basis - 2; // 6 - 1 (intercept) - 1 (constraint) = 4
-            let pc_main_coeffs = pc_n_basis - 2; // 5 - 1 (intercept) - 1 (constraint) = 3
 
-            // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases.
-            let pgs_interaction_bases = pgs_n_basis - 1; // Unconstrained main basis: 6 - 1 = 5
-            let pc_interaction_bases = pc_n_basis - 1; // Unconstrained main basis: 5 - 1 = 4
-            let interaction_coeffs = pgs_interaction_bases * pc_interaction_bases; // CORRECT: 5 * 4 = 20
+            // PC main effect uses ONLY the range space (functional ANOVA decomposition)
+            // Range dimension = unconstrained cols - penalty_order
+            let pc_unconstrained_cols = pc_n_basis - 1; // 5 - 1 = 4 (remove intercept)
+            let pc_main_coeffs = pc_unconstrained_cols - config.penalty_order; // 4 - 2 = 2
+
+            // Interaction is Range × Range for functional ANOVA decomposition
+            let pgs_unconstrained_cols = pgs_n_basis - 1; // 6 - 1 = 5 (remove intercept)
+            let pgs_range_dim = pgs_unconstrained_cols - config.penalty_order; // 5 - 2 = 3
+            let pc_range_dim = pc_unconstrained_cols - config.penalty_order; // 4 - 2 = 2
+            let interaction_coeffs = pgs_range_dim * pc_range_dim; // 3 * 2 = 6
 
             let expected_coeffs = 1 // intercept
                 + pgs_main_coeffs         // 4
-                + pc_main_coeffs          // 3
-                + interaction_coeffs; // 20
-            // Total = 1 + 4 + 3 + 20 = 28
+                + pc_main_coeffs          // 2
+                + interaction_coeffs; // 6
+            // Total = 1 + 4 + 2 + 6 = 13
 
             assert_eq!(
                 layout.total_coeffs, expected_coeffs,
@@ -3736,30 +3739,6 @@ pub mod internal {
                 expected_coeffs,
                 "Design matrix column count mismatch"
             );
-
-            // Verify the structure of interaction blocks with pre-centering
-            for block in &layout.penalty_map {
-                if block.term_name.starts_with("f(PGS_B") {
-                    // With pure pre-centering, the interaction tensor product uses:
-                    // - Unconstrained PGS basis column as weight
-                    // - Constrained PC basis directly
-                    // So each interaction block should have the same number of columns as the constrained PC basis
-
-                    let expected_cols = pc_main_coeffs;
-                    let actual_cols = block.col_range.end - block.col_range.start;
-
-                    assert_eq!(
-                        actual_cols, expected_cols,
-                        "Interaction block {} has wrong number of columns. Expected {}, got {}",
-                        block.term_name, expected_cols, actual_cols
-                    );
-
-                    println!(
-                        "Verified interaction block {} has correct size: {}",
-                        block.term_name, actual_cols
-                    );
-                }
-            }
 
             // Penalty count check
             // The PGS main effect is unpenalized intentionally.

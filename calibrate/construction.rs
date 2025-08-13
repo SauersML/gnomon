@@ -821,7 +821,7 @@ pub fn stable_reparameterization(
         // Increment iteration counter
         iteration += 1;
 
-        log::debug!(
+        println!(
             "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
             iteration,
             gamma.len(),
@@ -832,7 +832,7 @@ pub fn stable_reparameterization(
             break;
         }
 
-        log::debug!(
+        println!(
             "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
             iteration,
             gamma.len(),
@@ -856,8 +856,8 @@ pub fn stable_reparameterization(
             // FIXED: Extract active columns from penalty square root (rank x p convention)
             let rs_active_cols = rs_current[i].slice(s![.., k_offset..k_offset + q_current]);
 
-            // Skip if penalty has no columns (zero penalty)
-            if rs_current[i].ncols() == 0 {
+            // Skip if penalty has no rows (zero rank penalty)
+            if rs_current[i].nrows() == 0 || q_current == 0 {
                 frob_norms.push((i, 0.0));
                 continue;
             }
@@ -1050,7 +1050,7 @@ pub fn stable_reparameterization(
         // Step 6: Transform ALL active penalty roots by the REORDERED eigenvector matrix U.
         // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.
         for &i in &gamma {
-            if rs_current[i].ncols() == 0 {
+            if rs_current[i].nrows() == 0 || q_current == 0 {
                 continue;
             }
 
@@ -1072,7 +1072,7 @@ pub fn stable_reparameterization(
         // space, and the last `q_current - r` rows correspond to the null space.
         // ---
         for &i in &gamma {
-            if rs_current[i].ncols() == 0 {
+            if rs_current[i].nrows() == 0 || q_current == 0 {
                 continue;
             }
 

@@ -819,7 +819,7 @@ mod tests {
                     interactions
                 },
             },
-            lambdas: vec![0.1, 0.2], // Option 3: 2 grouped penalties (PC mains, interactions)
+            lambdas: vec![0.1, 0.2, 0.3], // Match layout.num_penalties: 1 PC main + 2 interaction penalties
         };
 
         // Create a temporary file for testing
