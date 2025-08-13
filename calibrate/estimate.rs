@@ -136,12 +136,20 @@ pub fn train_model(
     )?;
 
     // Helper: map bounded rho -> unconstrained z
-    fn atanh_clamped(x: f64) -> f64 { 0.5 * ((1.0 + x) / (1.0 - x)).ln() }
+    fn atanh_clamped(x: f64) -> f64 {
+        0.5 * ((1.0 + x) / (1.0 - x)).ln()
+    }
     fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
         rho.mapv(|r| {
             // Avoid calling clamp on floats to satisfy older toolchains
             let ratio = r / 15.0;
-            let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
+            let xr = if ratio < -0.999_999 {
+                -0.999_999
+            } else if ratio > 0.999_999 {
+                0.999_999
+            } else {
+                ratio
+            };
             atanh_clamped(xr)
         })
     }
@@ -351,7 +359,6 @@ pub fn train_model(
         lambdas: final_lambda.to_vec(),
     })
 }
-
 
 /// Helper to log the final model structure.
 fn log_layout_info(layout: &ModelLayout) {
@@ -602,18 +609,13 @@ pub mod internal {
                 .cholesky(UPLO::Lower)
                 .is_err()
             {
-                if let Ok((eigs, _)) = pirls_result
-                    .penalized_hessian_transformed
-                    .eigh(UPLO::Lower)
+                if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower)
                 {
                     let all_nonpos = eigs.iter().all(|&x| x <= 0.0);
                     if all_nonpos {
                         // Truly pathological: everything ≤ 0
                         return Err(EstimationError::HessianNotPositiveDefinite {
-                            min_eigenvalue: eigs
-                                .iter()
-                                .cloned()
-                                .fold(f64::INFINITY, f64::min),
+                            min_eigenvalue: eigs.iter().cloned().fold(f64::INFINITY, f64::min),
                         });
                     }
                     log::warn!(
@@ -834,7 +836,10 @@ pub mod internal {
                     println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
 
                     // Check if we used eigenvalues for the Hessian determinant
-                    let eigenvals = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower).ok();
+                    let eigenvals = pirls_result
+                        .penalized_hessian_transformed
+                        .eigh(UPLO::Lower)
+                        .ok();
 
                     if let Some((evals, _)) = eigenvals {
                         let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
@@ -931,7 +936,13 @@ pub mod internal {
                     // Try to get a useful gradient direction to move away from problematic region
                     let gradient = match self.compute_gradient(&rho) {
                         Ok(grad) => grad,
-                        Err(_) => z.mapv(|v| if v.is_finite() { v.signum().max(0.0) + 1.0 } else { 1.0 }),
+                        Err(_) => z.mapv(|v| {
+                            if v.is_finite() {
+                                v.signum().max(0.0) + 1.0
+                            } else {
+                                1.0
+                            }
+                        }),
                     };
                     let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
                     let gradient = &gradient * &jac;

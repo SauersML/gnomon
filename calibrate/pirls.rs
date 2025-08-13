@@ -82,7 +82,7 @@ pub fn fit_model_for_fixed_rho(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
-    rs_original: &[Array2<f64>], // Original, untransformed penalty square roots
+    rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
@@ -103,7 +103,6 @@ pub fn fit_model_for_fixed_rho(
     if !lambdas.is_empty() {
         println!("Lambdas: {:?}", lambdas);
     }
-
 
     // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
@@ -291,14 +290,14 @@ pub fn fit_model_for_fixed_rho(
                 let penalty_trial = beta_trial.dot(&s_transformed.dot(&beta_trial));
                 let penalized_deviance_trial = deviance_trial + penalty_trial;
                 // Track the last attempted change for diagnostics
-                last_halving_change =
-                    (penalized_deviance_trial - penalized_deviance_current).abs();
+                last_halving_change = (penalized_deviance_trial - penalized_deviance_current).abs();
 
                 // If it's valid, NOW check if the penalized deviance has decreased.
                 // Use epsilon tolerance to handle numerical precision issues in Gaussian models
-                let accept_step = penalized_deviance_trial <= penalized_deviance_current * (1.0 + 1e-12) 
+                let accept_step = penalized_deviance_trial
+                    <= penalized_deviance_current * (1.0 + 1e-12)
                     || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12;
-                
+
                 if accept_step {
                     // SUCCESS: The step is valid and improves the fit.
                     // Update the main state variables and exit the step-halving loop.
@@ -438,17 +437,19 @@ pub fn fit_model_for_fixed_rho(
             // CRITICAL FIX: Check gradient with the SAME (W, z) used in the last WLS solve
             // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
             // So we must check stationarity with respect to those same W_solve, z_solve
-            
+
             // Use the cached weights and working response from the solve
             let sqrt_w_solve = weights_solve.mapv(f64::sqrt);
             let wx_solve = &x_transformed * &sqrt_w_solve.view().insert_axis(Axis(1));
             let wz_solve = &sqrt_w_solve * &z_solve;
-            
-            let grad_data_part = wx_solve.t().dot(&(wx_solve.dot(&beta_transformed) - &wz_solve));
+
+            let grad_data_part = wx_solve
+                .t()
+                .dot(&(wx_solve.dot(&beta_transformed) - &wz_solve));
             let grad_penalty_part = s_transformed.dot(&beta_transformed);
             // Drop the 2x factor to match the objective we actually minimize
             let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
-            
+
             let gradient_norm = gradient_wrt_solve
                 .iter()
                 .map(|&x| x.abs())
@@ -611,7 +612,10 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     for k in (0..c).rev() {
         let r_kk = r_matrix[[k, k]];
         // Use relative epsilon instead of exact zero check
-        let max_diag = r_matrix.diag().iter().fold(0.0f64, |acc, &val| acc.max(val.abs()));
+        let max_diag = r_matrix
+            .diag()
+            .iter()
+            .fold(0.0f64, |acc, &val| acc.max(val.abs()));
         let eps = 1e-16f64.max(max_diag * 1e-14);
         if r_kk.abs() <= eps {
             // Return large finite number instead of infinity to allow rank reduction
@@ -667,7 +671,6 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     kappa
 }
 
-
 /// Pivots the columns of a matrix according to a pivot vector.
 ///
 /// This applies the permutation `A*P` to get a new matrix `B`. It assumes the
@@ -693,7 +696,6 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
 
     pivoted_matrix
 }
-
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
@@ -959,7 +961,7 @@ pub fn solve_penalized_least_squares(
             _ => {
                 return Err(EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
-                })
+                });
             }
         };
 
@@ -1172,8 +1174,7 @@ pub fn solve_penalized_least_squares(
     let e_transformed_rows = e_transformed_ranked.nrows();
     let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
     if e_transformed_rows > 0 {
-        e_transformed_dropped
-            .assign(&e_transformed_ranked.slice(s![.., ..rank]));
+        e_transformed_dropped.assign(&e_transformed_ranked.slice(s![.., ..rank]));
     }
 
     // Record kept positions in the initial pivoted order for later reconstruction
@@ -1257,12 +1258,19 @@ pub fn solve_penalized_least_squares(
         }
 
         // Use relative tolerance for diagonal check, or trust Stage 2 rank detection
-        let max_diag = r_square.diag().iter().fold(0.0f64, |acc, &val| acc.max(val.abs()));
+        let max_diag = r_square
+            .diag()
+            .iter()
+            .fold(0.0f64, |acc, &val| acc.max(val.abs()));
         let tol = (max_diag + 1.0) * 1e-14;
         if r_square[[i, i]].abs() < tol {
             // This should not happen with proper rank detection in Stage 2
-            log::warn!("Tiny diagonal {} at position {}, but continuing with Stage 2 rank={}", 
-                      r_square[[i, i]], i, rank);
+            log::warn!(
+                "Tiny diagonal {} at position {}, but continuing with Stage 2 rank={}",
+                r_square[[i, i]],
+                i,
+                rank
+            );
             // Set coefficient to zero and continue instead of erroring
             beta_dropped[i] = 0.0;
             continue;
@@ -1276,14 +1284,14 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
     // Direct composition approach: orig_j = initial_pivot[ kept_positions[ final_pivot[j] ] ]
     // This maps each solved coefficient directly to its original column index
-    
+
     let mut beta_transformed = Array1::zeros(p);
-    
+
     // For each solved coefficient j, find its original column index through the permutation chain
     for j in 0..rank {
-        let col_in_kept_space = final_pivot[j];  // Which kept column this coeff belongs to
-        let col_in_initial_pivoted_space = kept_positions[col_in_kept_space];  // Map to initial-pivoted space
-        let original_col_index = initial_pivot[col_in_initial_pivoted_space];  // Map to original space
+        let col_in_kept_space = final_pivot[j]; // Which kept column this coeff belongs to
+        let col_in_initial_pivoted_space = kept_positions[col_in_kept_space]; // Map to initial-pivoted space
+        let original_col_index = initial_pivot[col_in_initial_pivoted_space]; // Map to original space
         beta_transformed[original_col_index] = beta_dropped[j];
     }
 
@@ -1297,14 +1305,15 @@ pub fn solve_penalized_least_squares(
         let grad_pen_part = s_transformed.dot(&beta_transformed);
         let grad = &grad_dev_part + &grad_pen_part;
         let grad_norm_inf = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        
+
         let scale = beta_transformed.iter().map(|&v| v.abs()).sum::<f64>() + 1.0;
-        
+
         // If gradient is large, the reconstruction is wrong - this should not happen
         if grad_norm_inf > 1e-6 * scale {
             log::error!(
                 "CRITICAL: Coefficient reconstruction failed! Gradient norm: {:.2e}, Scale: {:.2e}",
-                grad_norm_inf, scale
+                grad_norm_inf,
+                scale
             );
             return Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
@@ -1500,7 +1509,6 @@ fn pivoted_qr_faer(
         )));
     };
 
-
     Ok((q, r, pivot))
 }
 
@@ -1523,13 +1531,16 @@ fn calculate_edf(
     // Fast path for unpenalized models: If S is numerically zero, EDF is rank(X).
     let s_norm = s_mat.iter().map(|&v| v.powi(2)).sum::<f64>().sqrt();
     let xtwx_norm = xtwx.iter().map(|&v| v.powi(2)).sum::<f64>().sqrt();
-    
+
     if s_norm < 1e-8 * (1.0 + xtwx_norm) {
         // Penalty is negligible. EDF is rank(X), which we find from QR of WX.
         let (_, r_factor, _) = pivoted_qr_faer(&wx)?;
         let diag_r = r_factor.diag();
         let max_diag = diag_r.iter().fold(0.0f64, |acc, &val| acc.max(val.abs()));
-        let rank = diag_r.iter().filter(|&&val| val.abs() > max_diag * 1e-12).count();
+        let rank = diag_r
+            .iter()
+            .filter(|&&val| val.abs() > max_diag * 1e-12)
+            .count();
         return Ok(rank as f64);
     }
 
@@ -1687,7 +1698,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
-    
+
     /// Un-pivots the columns of a matrix according to a pivot vector.
     ///
     /// This reverses the permutation `A*P` to recover `A` from `B`, where `B = A*P`.
@@ -2607,8 +2618,15 @@ mod tests {
 
         // Solve once
         let (res, _rank) = super::solve_penalized_least_squares(
-            x.view(), z.view(), w.view(), &e, &e, z.view(), super::LinkFunction::Identity
-        ).expect("solver ok");
+            x.view(),
+            z.view(),
+            w.view(),
+            &e,
+            &e,
+            z.view(),
+            super::LinkFunction::Identity,
+        )
+        .expect("solver ok");
 
         // Check stationarity of the *quadratic* objective that the solver actually minimized:
         // grad = Xᵀ W (Xβ - z) + Sβ, with S=0 here.
@@ -2618,7 +2636,11 @@ mod tests {
         let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
 
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(inf_norm < 1e-10, "Normal equations not satisfied: ||grad||_∞={}", inf_norm);
+        assert!(
+            inf_norm < 1e-10,
+            "Normal equations not satisfied: ||grad||_∞={}",
+            inf_norm
+        );
 
         // And ensure residual is orthogonal to the column space in the weighted sense
         let resid = &wz - &wx.dot(&res.beta);
@@ -2653,14 +2675,25 @@ mod tests {
 
         // WLS solution
         let (res, _) = super::solve_penalized_least_squares(
-            x.view(), y.view(), w.view(), &e, &e, y.view(), super::LinkFunction::Identity
-        ).expect("solver ok");
+            x.view(),
+            y.view(),
+            w.view(),
+            &e,
+            &e,
+            y.view(),
+            super::LinkFunction::Identity,
+        )
+        .expect("solver ok");
 
         let mu1 = x.dot(&res.beta);
         let dev1: f64 = (&y - &mu1).mapv(|r| r * r).sum();
 
-        assert!(dev1 <= dev0 * (1.0 + 1e-12) || (dev0 - dev1).abs() < 1e-12,
-                "Exact WLS step should not increase deviance: dev0={} dev1={}", dev0, dev1);
+        assert!(
+            dev1 <= dev0 * (1.0 + 1e-12) || (dev0 - dev1).abs() < 1e-12,
+            "Exact WLS step should not increase deviance: dev0={} dev1={}",
+            dev0,
+            dev1
+        );
     }
 
     /// Test that proves the gradient gate is using the wrong weights (logit)
@@ -2682,14 +2715,22 @@ mod tests {
         let w_prior = Array1::from_elem(n, 1.0);
 
         // Build IRLS vectors at beta=0
-        let (_mu0, w_old, z_old) = super::update_glm_vectors(y.view(), &eta0, super::LinkFunction::Logit, w_prior.view());
+        let (_mu0, w_old, z_old) =
+            super::update_glm_vectors(y.view(), &eta0, super::LinkFunction::Logit, w_prior.view());
         assert!(w_old.iter().all(|w| *w >= 0.0));
 
         // No penalty to keep it simple
         let e = Array2::<f64>::zeros((0, p));
         let (res, _) = super::solve_penalized_least_squares(
-            x.view(), z_old.view(), w_old.view(), &e, &e, y.view(), super::LinkFunction::Logit
-        ).expect("solver ok");
+            x.view(),
+            z_old.view(),
+            w_old.view(),
+            &e,
+            &e,
+            y.view(),
+            super::LinkFunction::Logit,
+        )
+        .expect("solver ok");
 
         // Stationarity with OLD weights and z (the quadratic model you just solved)
         let sqrt_w_old = w_old.mapv(f64::sqrt);
@@ -2697,11 +2738,16 @@ mod tests {
         let wz_old = &sqrt_w_old * &z_old;
         let grad_old = wx_old.t().dot(&(wx_old.dot(&res.beta) - &wz_old)); // S=0 here
         let inf_old = grad_old.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(inf_old < 1e-8, "Should be stationary w.r.t. old weights, ||grad||_∞={}", inf_old);
+        assert!(
+            inf_old < 1e-8,
+            "Should be stationary w.r.t. old weights, ||grad||_∞={}",
+            inf_old
+        );
 
         // Now recompute eta, mu, and NEW weights at the accepted beta
         let eta1 = x.dot(&res.beta);
-        let (_mu1, w_new, z_new) = super::update_glm_vectors(y.view(), &eta1, super::LinkFunction::Logit, w_prior.view());
+        let (_mu1, w_new, z_new) =
+            super::update_glm_vectors(y.view(), &eta1, super::LinkFunction::Logit, w_prior.view());
 
         let sqrt_w_new = w_new.mapv(f64::sqrt);
         let wx_new = &x * &sqrt_w_new.view().insert_axis(ndarray::Axis(1));
@@ -2711,14 +2757,17 @@ mod tests {
         let inf_new = grad_new.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
 
         // This SHOULD NOT be required to be tiny for convergence right after one step.
-        assert!(inf_new > 1e-4, "If this is tiny, IRLS basically solved in one step — suspicious");
+        assert!(
+            inf_new > 1e-4,
+            "If this is tiny, IRLS basically solved in one step — suspicious"
+        );
     }
 
     /// Test that rank-deficient projections must be exact (perfect fit when possible)
     /// This is a stronger, permanent guard against coefficient reconstruction bugs
     #[test]
     fn test_pls_rank_deficient_hits_projection() {
-        use ndarray::{arr2, arr1, Array1, Array2};
+        use ndarray::{Array1, Array2, arr1, arr2};
 
         // Same structure as your failing test: col3 = col1 + col2
         let x = arr2(&[
@@ -2734,15 +2783,26 @@ mod tests {
         let e = Array2::<f64>::zeros((0, 3));
 
         let (res, rank) = super::solve_penalized_least_squares(
-            x.view(), z.view(), w.view(), &e, &e, z.view(), super::LinkFunction::Identity
-        ).expect("solver ok");
+            x.view(),
+            z.view(),
+            w.view(),
+            &e,
+            &e,
+            z.view(),
+            super::LinkFunction::Identity,
+        )
+        .expect("solver ok");
         assert_eq!(rank, 2);
 
         // Fitted values must equal the weighted projection of z onto Col(X)
         let fitted = x.dot(&res.beta);
         let rss: f64 = (&z - &fitted).mapv(|r| r * r).sum();
 
-        assert!(rss < 1e-12, "Rank-deficient LS should project exactly (RSS={})", rss);
+        assert!(
+            rss < 1e-12,
+            "Rank-deficient LS should project exactly (RSS={})",
+            rss
+        );
 
         // And the KKT/normal-equation residual must be ~0 for kept cols
         let sqrt_w = w.mapv(f64::sqrt);
@@ -2750,16 +2810,19 @@ mod tests {
         let wz = &sqrt_w * &z;
         let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(inf_norm < 1e-10, "Normal equations not satisfied: {}", inf_norm);
+        assert!(
+            inf_norm < 1e-10,
+            "Normal equations not satisfied: {}",
+            inf_norm
+        );
     }
-
 
     /// Test permutation chain property - locks down coefficient reconstruction logic
     #[test]
     fn test_permutation_chain_property() {
-        use rand::{seq::SliceRandom, SeedableRng};
-        use rand::rngs::StdRng;
         use ndarray::Array1;
+        use rand::rngs::StdRng;
+        use rand::{SeedableRng, seq::SliceRandom};
 
         let mut rng = StdRng::seed_from_u64(42);
 
@@ -2798,19 +2861,26 @@ mod tests {
         // reference via explicit composition
         let mut placed_ref = Array1::<f64>::zeros(p);
         for j in 0..rank {
-            let k_orig = initial_pivot[ kept_positions[ final_pivot[j] ] ];
+            let k_orig = initial_pivot[kept_positions[final_pivot[j]]];
             placed_ref[k_orig] = beta_dropped[j];
         }
 
-        assert!(placed.iter().zip(placed_ref.iter()).all(|(a,b)| (a-b).abs() < 1e-12));
+        assert!(
+            placed
+                .iter()
+                .zip(placed_ref.iter())
+                .all(|(a, b)| (a - b).abs() < 1e-12)
+        );
     }
 
     /// Test penalty consistency sanity check
     /// Locks down penalty root consistency issues (H4)
     #[test]
     fn test_penalty_root_consistency() {
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+        };
         use ndarray::arr2;
-        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
 
         // Two small penalties with different eigenvectors
         let s1 = arr2(&[[1.0, -0.2], [-0.2, 0.5]]);
@@ -2818,7 +2888,13 @@ mod tests {
         let s_list = vec![s1, s2];
         let rs = compute_penalty_square_roots(&s_list).expect("roots");
 
-        let layout = ModelLayout { intercept_col: 0, pgs_main_cols: 0..0, penalty_map: vec![], total_coeffs: 2, num_penalties: 2 };
+        let layout = ModelLayout {
+            intercept_col: 0,
+            pgs_main_cols: 0..0,
+            penalty_map: vec![],
+            total_coeffs: 2,
+            num_penalties: 2,
+        };
         let lambdas = vec![0.7, 3.0];
 
         let rp = stable_reparameterization(&rs, &lambdas, &layout).expect("reparam");
@@ -2826,7 +2902,11 @@ mod tests {
         let rhs = rp.e_transformed.t().dot(&rp.e_transformed);
 
         let diff = (&lhs - &rhs).mapv(|v| v.abs()).sum();
-        assert!(diff < 1e-10, "S != EᵀE in transformed basis (sum abs diff = {})", diff);
+        assert!(
+            diff < 1e-10,
+            "S != EᵀE in transformed basis (sum abs diff = {})",
+            diff
+        );
     }
 
     /// This test verifies that the permutation logic in `pivoted_qr_faer` is correct
@@ -2838,7 +2918,7 @@ mod tests {
     #[test]
     fn test_pivoted_qr_permutation_is_reliable() {
         use ndarray::arr2;
-        
+
         // 1. SETUP: Create a matrix that is tricky to pivot.
         // It's nearly rank-deficient, with highly correlated columns, forcing a non-trivial pivot.
         // This is representative of the design matrices created in the model tests.
@@ -2850,8 +2930,7 @@ mod tests {
         ]);
 
         // 2. EXECUTION: Call the function under test.
-        let (q, r, pivot) =
-            pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
+        let (q, r, pivot) = pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
 
         // 3. VERIFICATION: Check if the fundamental QR identity holds.
         // First, apply the permutation to the original matrix 'a'.

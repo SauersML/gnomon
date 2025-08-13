@@ -1239,20 +1239,23 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, LinalgErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::model::{BasisConfig, ModelConfig, LinkFunction};
     use crate::calibrate::data::TrainingData;
-    use ndarray::{Array1, Array2};
-    use rand::{Rng, SeedableRng};
-    use rand::rngs::StdRng;
+    use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
     use approx::assert_abs_diff_eq;
+    use ndarray::{Array1, Array2};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     /// Helper function to create test data for construction tests
-    fn create_test_data_for_construction(n_samples: usize, num_pcs: usize) -> (TrainingData, ModelConfig) {
+    fn create_test_data_for_construction(
+        n_samples: usize,
+        num_pcs: usize,
+    ) -> (TrainingData, ModelConfig) {
         let mut rng = StdRng::seed_from_u64(12345);
-        
+
         // Generate PGS data (standard normal)
         let p: Array1<f64> = (0..n_samples).map(|_| rng.gen_range(-2.0..2.0)).collect();
-        
+
         // Generate PC data if requested
         let pcs = if num_pcs > 0 {
             let mut pc_data = Array2::zeros((n_samples, num_pcs));
@@ -1265,42 +1268,52 @@ mod tests {
         } else {
             Array2::zeros((n_samples, 0))
         };
-        
+
         // Generate simple response (linear combination for simplicity)
-        let y: Array1<f64> = (0..n_samples).map(|i| {
-            let mut response = 0.5 * p[i];
-            for j in 0..num_pcs {
-                response += 0.3 * pcs[[i, j]];
-            }
-            response + rng.gen_range(-0.1..0.1) // small noise
-        }).collect();
-        
+        let y: Array1<f64> = (0..n_samples)
+            .map(|i| {
+                let mut response = 0.5 * p[i];
+                for j in 0..num_pcs {
+                    response += 0.3 * pcs[[i, j]];
+                }
+                response + rng.gen_range(-0.1..0.1) // small noise
+            })
+            .collect();
+
         // Calculate ranges before moving data into struct
-        let pgs_range = (p.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
-                        p.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)));
-        
-        let pc_ranges = (0..num_pcs).map(|j| {
-            let col = pcs.column(j);
-            (col.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
-             col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)))
-        }).collect();
-        
+        let pgs_range = (
+            p.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            p.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+        );
+
+        let pc_ranges = (0..num_pcs)
+            .map(|j| {
+                let col = pcs.column(j);
+                (
+                    col.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+                    col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+                )
+            })
+            .collect();
+
         let weights = Array1::ones(n_samples);
         let data = TrainingData { y, p, pcs, weights };
-        
+
         // Create config with known parameters - need to provide all required fields
         let pgs_basis_config = BasisConfig {
             num_knots: 5,
             degree: 3,
         };
-        
-        let pc_basis_configs = (0..num_pcs).map(|_| BasisConfig {
-            num_knots: 4,
-            degree: 3,
-        }).collect();
-        
+
+        let pc_basis_configs = (0..num_pcs)
+            .map(|_| BasisConfig {
+                num_knots: 4,
+                degree: 3,
+            })
+            .collect();
+
         let pc_names: Vec<String> = (0..num_pcs).map(|i| format!("PC{}", i + 1)).collect();
-        
+
         let config = ModelConfig {
             link_function: LinkFunction::Identity,
             penalty_order: 2,
@@ -1316,7 +1329,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
         };
-        
+
         (data, config)
     }
 
@@ -1324,21 +1337,38 @@ mod tests {
     fn test_matrix_and_layout_dimensions_are_consistent() {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
-        
+
         let (x, s_list, layout, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Theoretical calculation of dimensions
-        let pgs_main_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;
-        let pc_main_coeffs = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree - 1;
-        let interaction_coeffs = (config.pgs_basis_config.num_knots + config.pgs_basis_config.degree) * 
-                                 (config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree);
+        let pgs_main_coeffs =
+            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;
+        let pc_main_coeffs =
+            config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree - 1;
+        let interaction_coeffs = (config.pgs_basis_config.num_knots
+            + config.pgs_basis_config.degree)
+            * (config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree);
         let expected_total_coeffs = 1 + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
         let expected_num_penalties = 1 + 2; // 1 for PC main + 2 for interaction
 
-        assert_eq!(layout.total_coeffs, expected_total_coeffs, "Layout total coefficient count is wrong.");
-        assert_eq!(x.ncols(), expected_total_coeffs, "Design matrix column count is wrong.");
-        assert_eq!(layout.num_penalties, expected_num_penalties, "Layout penalty count is wrong.");
-        assert_eq!(s_list.len(), expected_num_penalties, "Number of generated penalty matrices is wrong.");
+        assert_eq!(
+            layout.total_coeffs, expected_total_coeffs,
+            "Layout total coefficient count is wrong."
+        );
+        assert_eq!(
+            x.ncols(),
+            expected_total_coeffs,
+            "Design matrix column count is wrong."
+        );
+        assert_eq!(
+            layout.num_penalties, expected_num_penalties,
+            "Layout penalty count is wrong."
+        );
+        assert_eq!(
+            s_list.len(),
+            expected_num_penalties,
+            "Number of generated penalty matrices is wrong."
+        );
     }
 
     #[test]
@@ -1353,45 +1383,65 @@ mod tests {
         let rank = svd.1.iter().filter(|&&s| s > rank_tol).count();
 
         // The design matrix should be full-rank by construction
-        // The code cleverly builds interaction terms using main effect bases that already 
+        // The code cleverly builds interaction terms using main effect bases that already
         // have intercept columns removed, preventing rank deficiency from the start
-        assert_eq!(rank, x.ncols(), 
-                "The design matrix with interactions should be full-rank by construction. Rank: {}, Columns: {}",
-                rank, x.ncols());
+        assert_eq!(
+            rank,
+            x.ncols(),
+            "The design matrix with interactions should be full-rank by construction. Rank: {}, Columns: {}",
+            rank,
+            x.ncols()
+        );
     }
 
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
         let (_, s_list, layout, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
-        
-        let interaction_block = layout.penalty_map.iter()
+
+        let interaction_block = layout
+            .penalty_map
+            .iter()
             .find(|b| b.term_type == TermType::Interaction)
             .expect("Interaction block not found in layout");
 
-        assert_eq!(interaction_block.penalty_indices.len(), 2, "Interaction term must have two penalties.");
+        assert_eq!(
+            interaction_block.penalty_indices.len(),
+            2,
+            "Interaction term must have two penalties."
+        );
 
         let pgs_penalty_idx = interaction_block.penalty_indices[0];
         let pc_penalty_idx = interaction_block.penalty_indices[1];
-        
+
         let s_pgs_dir = &s_list[pgs_penalty_idx];
         let s_pc_dir = &s_list[pc_penalty_idx];
 
         // The two penalty matrices must be different
         let diff = (s_pgs_dir - s_pc_dir).mapv(|x| x.abs()).sum();
-        assert!(diff > 1e-9, "The two interaction penalties should not be identical.");
+        assert!(
+            diff > 1e-9,
+            "The two interaction penalties should not be identical."
+        );
 
         // Check that penalties are confined to the correct block
         for s_matrix in [s_pgs_dir, s_pc_dir] {
             for r in 0..layout.total_coeffs {
                 for c in 0..layout.total_coeffs {
-                    if !interaction_block.col_range.contains(&r) || !interaction_block.col_range.contains(&c) {
+                    if !interaction_block.col_range.contains(&r)
+                        || !interaction_block.col_range.contains(&c)
+                    {
                         assert_abs_diff_eq!(s_matrix[[r, c]], 0.0, epsilon = 1e-12);
                     }
                 }
             }
-            let block_norm = s_matrix.slice(s![interaction_block.col_range.clone(), interaction_block.col_range.clone()])
-                                     .mapv(|x| x.abs()).sum();
+            let block_norm = s_matrix
+                .slice(s![
+                    interaction_block.col_range.clone(),
+                    interaction_block.col_range.clone()
+                ])
+                .mapv(|x| x.abs())
+                .sum();
             assert!(block_norm > 1e-9, "Penalty block should be non-zero.");
         }
     }
@@ -1399,15 +1449,24 @@ mod tests {
     #[test]
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
-        
+
         let (_, _, layout, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        let pgs_main_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;
+        let pgs_main_coeffs =
+            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;
         let expected_total_coeffs = 1 + pgs_main_coeffs; // Intercept + PGS main effect
 
         assert_eq!(layout.total_coeffs, expected_total_coeffs);
-        assert!(layout.penalty_map.iter().all(|b| b.term_type != TermType::Interaction), 
-                "No interaction terms should exist in a PGS-only model.");
-        assert_eq!(layout.num_penalties, 0, "PGS-only model should have no penalties.");
+        assert!(
+            layout
+                .penalty_map
+                .iter()
+                .all(|b| b.term_type != TermType::Interaction),
+            "No interaction terms should exist in a PGS-only model."
+        );
+        assert_eq!(
+            layout.num_penalties, 0,
+            "PGS-only model should have no penalties."
+        );
     }
 }
