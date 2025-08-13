@@ -238,7 +238,7 @@ pub fn train_model(
     
     // CRITICAL: Always prefer asymmetric seeds to break optimizer symmetry trap
     let start_z = if let Some((asym_rho, asym_cost, asym_idx)) = best_asymmetric_seed {
-        if let Some((sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
+        if let Some((_sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
             if sym_cost < asym_cost {
                 eprintln!(
                     "[Init] WARNING: Best seed was symmetric (#{}, cost={:.6}). \
