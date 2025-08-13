@@ -36,7 +36,6 @@ use crate::calibrate::pirls::{self, PirlsResult};
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -214,7 +213,7 @@ pub fn train_model(
     // Rationale: This `match` block is the new control structure. It allows us
     // to define different behaviors for a successful run vs. a failed run.
     let BfgsSolution {
-        final_point: final_rho,
+        final_point: final_z,  // FIXED: This is the unconstrained parameter z, not rho
         final_value,
         iterations,
         ..
@@ -320,7 +319,7 @@ pub fn train_model(
 
     // --- Finalize the Model (same as before) ---
     // Map final unconstrained point to bounded rho, then clamp for safety
-    let final_rho = final_rho.mapv(|v| 15.0 * v.tanh());
+    let final_rho = final_z.mapv(|v| 15.0 * v.tanh());
     let final_rho_clamped = final_rho.mapv(|v| v.clamp(-15.0, 15.0));
     let final_lambda = final_rho_clamped.mapv(f64::exp);
     log::info!(
@@ -431,6 +430,34 @@ pub mod internal {
                         .map_err(EstimationError::LinearSystemSolveFailed)
                 }
                 RobustSolver::Fallback(stored_matrix) => robust_solve(stored_matrix, rhs),
+            }
+        }
+
+        fn solve_matrix(&self, rhs_matrix: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
+            match self {
+                RobustSolver::Cholesky(stored_matrix) => {
+                    // Efficient batch solve using single Cholesky factorization 
+                    let chol = stored_matrix
+                        .cholesky(UPLO::Lower)
+                        .map_err(EstimationError::LinearSystemSolveFailed)?;
+                    
+                    let mut solution = Array2::zeros(rhs_matrix.raw_dim());
+                    for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
+                        let sol_col = chol.solve(&rhs_col.to_owned())
+                            .map_err(EstimationError::LinearSystemSolveFailed)?;
+                        solution.column_mut(j).assign(&sol_col);
+                    }
+                    Ok(solution)
+                }
+                RobustSolver::Fallback(stored_matrix) => {
+                    // Fallback: solve each column individually
+                    let mut solution = Array2::zeros(rhs_matrix.raw_dim());
+                    for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
+                        let sol_col = robust_solve(stored_matrix, &rhs_col.to_owned())?;
+                        solution.column_mut(j).assign(&sol_col);
+                    }
+                    Ok(solution)
+                }
             }
         }
     }
@@ -656,6 +683,10 @@ pub mod internal {
                         }
                     }
 
+                    // STRATEGIC DESIGN DECISION: Use unweighted sample count for mgcv compatibility
+                    // In standard WLS theory, one might use sum(weights) as effective sample size.
+                    // However, mgcv deliberately uses the unweighted count 'n.true' in gam.fit3.
+                    // We maintain this behavior for strict mgcv compatibility.
                     let n = self.y.len() as f64;
                     let num_coeffs = pirls_result.beta_transformed.len() as f64;
 
@@ -670,7 +701,7 @@ pub mod internal {
                     let mut s_lambda_original =
                         Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
-                        let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
+                        let s_k = self.rs_list[k].t().dot(&self.rs_list[k]);
                         s_lambda_original.scaled_add(lambdas[k], &s_k);
                     }
 
@@ -678,13 +709,9 @@ pub mod internal {
 
                     // Get the transformation matrix and transformed Hessian
                     let qs = &pirls_result.reparam_result.qs;
-                    let hessian_transformed = &pirls_result.penalized_hessian_transformed;
 
-                    // Transform the Hessian back to the original basis for this calculation
-                    let mut hessian_original = qs.dot(hessian_transformed).dot(&qs.t());
-
-                    // Ensure matrix is positive definite once before the loop
-                    ensure_positive_definite(&mut hessian_original)?;
+                    // Transform the stabilized Hessian back to original basis for EDF calculation
+                    let hessian_original = qs.dot(&pirls_result.stabilized_hessian_transformed).dot(&qs.t());
 
                     for j in 0..s_lambda_original.ncols() {
                         let s_col = s_lambda_original.column(j);
@@ -728,16 +755,14 @@ pub mod internal {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
 
-                    // log |H| = log |X'X + S_λ| using stabilized Hessian
-                    let mut h_for_logdet = pirls_result.penalized_hessian_transformed.clone();
-                    ensure_positive_definite(&mut h_for_logdet)?;
-                    let log_det_h = match h_for_logdet.cholesky(UPLO::Lower) {
+                    // log |H| = log |X'X + S_λ| using SINGLE stabilized Hessian from P-IRLS
+                    let log_det_h = match pirls_result.stabilized_hessian_transformed.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             log::warn!(
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
-                            let (eigenvalues, _) = h_for_logdet
+                            let (eigenvalues, _) = pirls_result.stabilized_hessian_transformed
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
@@ -777,10 +802,8 @@ pub mod internal {
                     // Log-determinant of the penalty matrix - use stable value from P-IRLS
                     let log_det_s = pirls_result.reparam_result.log_det;
 
-                    // Log-determinant of the penalized Hessian.
-                    let mut h_for_logdet = pirls_result.penalized_hessian_transformed.clone();
-                    ensure_positive_definite(&mut h_for_logdet)?;
-                    let log_det_h = match h_for_logdet.cholesky(UPLO::Lower) {
+                    // Log-determinant of the penalized Hessian using SINGLE stabilized Hessian from P-IRLS
+                    let log_det_h = match pirls_result.stabilized_hessian_transformed.cholesky(UPLO::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
@@ -788,7 +811,7 @@ pub mod internal {
                                 "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
                             );
 
-                            let (eigenvalues, _) = h_for_logdet
+                            let (eigenvalues, _) = pirls_result.stabilized_hessian_transformed
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
@@ -813,7 +836,7 @@ pub mod internal {
                     let mut s_lambda_original =
                         Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
-                        let s_k = self.rs_list[k].dot(&self.rs_list[k].t());
+                        let s_k = self.rs_list[k].t().dot(&self.rs_list[k]);
                         s_lambda_original.scaled_add(lambdas[k], &s_k);
                     }
 
@@ -1117,13 +1140,9 @@ pub mod internal {
             let x_transformed = self.x.dot(qs);
             let rs_transformed = &reparam_result.rs_transformed;
 
-            // --- Proactive Hessian Stabilization ---
-            // Create a mutable copy of the Hessian to work with.
-            let mut hessian = hessian_transformed.clone();
-
-            // Proactively check and stabilize the Hessian using the existing helper function.
-            ensure_positive_definite(&mut hessian)?;
-            // All subsequent code will now use the GUARANTEED STABLE `hessian` matrix.
+            // --- Use Single Stabilized Hessian from P-IRLS ---
+            // CRITICAL: Use the same stabilized Hessian as cost function for consistency
+            let hessian = &pirls_result.stabilized_hessian_transformed;
 
             // Check for severe indefiniteness in the original Hessian (before stabilization)
             // This suggests a problematic region we should retreat from
@@ -1173,12 +1192,12 @@ pub mod internal {
                     let mut s_lambda_original =
                         Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     for k in 0..lambdas.len() {
-                        let s_k_original = self.rs_list[k].dot(&self.rs_list[k].t());
+                        let s_k_original = self.rs_list[k].t().dot(&self.rs_list[k]);
                         s_lambda_original.scaled_add(lambdas[k], &s_k_original);
                     }
 
                     // Transform Hessian back to original basis for this calculation
-                    let hessian_original = qs.dot(&hessian).dot(&qs.t());
+                    let hessian_original = qs.dot(&pirls_result.stabilized_hessian_transformed).dot(&qs.t());
 
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_original.ncols() {
@@ -1210,7 +1229,7 @@ pub mod internal {
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
-                        let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
+                        let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
                         let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
 
                         // ---
@@ -1220,7 +1239,7 @@ pub mod internal {
                         // ---
 
                         let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
-                        let penalized_deviance_grad_term = d1 / (2.0 * scale);
+                        let deviance_grad_term = d1 / (2.0 * scale);
 
                         // ---
                         // Component 2: Derivative of the Penalized Hessian Determinant
@@ -1254,7 +1273,7 @@ pub mod internal {
                         // in `gam.fit3.R`, which is the gradient of the cost function that `newton` MINIMIZES.
                         // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`
                         // ---
-                        cost_gradient[k] = penalized_deviance_grad_term  // Corresponds to `+ oo$D1/...`
+                        cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
                                          + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
                                          - log_det_s_grad_term; // Corresponds to `- rp$det1/2`
                     }
@@ -1281,19 +1300,32 @@ pub mod internal {
                     let weighted_residuals = &self.weights * &residuals;
                     let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&weighted_residuals);
 
-                    // 1. Compute diagonal of the hat matrix: diag(X * H⁻¹ * Xᵀ)
-                    // Use transformed design matrix (same basis as Hessian)
-                    let rows: Vec<_> = x_transformed.axis_iter(Axis(0)).collect();
-                    let hat_diag_par: Vec<f64> = rows
-                        .into_par_iter()
-                        .map(|row| -> Result<f64, EstimationError> {
-                            // Solve H c_i = x_iᵀ to get c_i = H⁻¹ x_iᵀ
-                            let c_i = solver.solve(&row.to_owned())?;
-                            // The diagonal element is x_i * c_i = x_i H⁻¹ x_iᵀ
-                            Ok(row.dot(&c_i))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let hat_diag = Array1::from_vec(hat_diag_par);
+                    // FIXED: Efficient batched computation of hat matrix diagonal
+                    // Instead of N individual solves, use single factorization + batched solve
+                    // Compute H C = X^T, then diag(hat) = diag(X C) = sum over i of X[i,:] * C[:,i]
+                    let hat_diag = match &solver {
+                        RobustSolver::Cholesky(_) => {
+                            // Single factorization, then solve H C = X^T for C (p x N)
+                            let xt = x_transformed.t().to_owned(); // (p x N)
+                            let c = solver.solve_matrix(&xt)?; // H^{-1} X^T, shape (p x N)
+                            
+                            // Compute diagonal: hat[i] = X[i,:] · C[:,i] for each observation i
+                            (0..x_transformed.nrows())
+                                .map(|i| x_transformed.row(i).dot(&c.column(i)))
+                                .collect::<Vec<_>>()
+                        }
+                        RobustSolver::Fallback(_) => {
+                            // Fallback: per-row solves (avoid ArrayView threading issues)
+                            (0..x_transformed.nrows())
+                                .map(|i| {
+                                    let xi = x_transformed.row(i).to_owned(); // owned
+                                    let ci = solver.solve(&xi)?; // H^{-1} x_i^T
+                                    Ok(xi.dot(&ci))
+                                })
+                                .collect::<Result<Vec<_>, EstimationError>>()?
+                        }
+                    };
+                    let hat_diag = Array1::from_vec(hat_diag);
 
                     // 2. Compute dW/dη, which depends on the link function.
                     let dw_deta = match self.config.link_function {
@@ -1307,7 +1339,7 @@ pub mod internal {
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
-                        let s_k_transformed = rs_transformed[k].dot(&rs_transformed[k].t());
+                        let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
                         let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
 
                         // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
@@ -1323,8 +1355,8 @@ pub mod internal {
                         let d_deviance_d_rho_k =
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
 
-                        // The term now correctly represents only the unpenalized part.
-                        let penalized_deviance_grad_term = 0.5 * d_deviance_d_rho_k;
+                        // FIXED: Correctly named - this is only the unpenalized deviance derivative
+                        let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
 
                         // ---
                         // Component 2: Derivative of log|H| (existing code)
@@ -1361,7 +1393,7 @@ pub mod internal {
                         // Final Gradient Assembly - Now Complete!
                         // This exactly matches mgcv's formula: `REML1 <- oo$D1/2 + oo$trA1/2 - rp$det1/2`
                         // ---
-                        cost_gradient[k] = penalized_deviance_grad_term  // Term 1: 0.5 * d(D_p)/dρ
+                        cost_gradient[k] = deviance_grad_term  // Term 1: 0.5 * d(D)/dρ (unpenalized)
                                          + log_det_h_grad_term           // Term 2: 0.5 * d(log|H|)/dρ  
                                          - log_det_s_grad_term; // Term 3: -0.5 * d(log|S|)/dρ
                     }

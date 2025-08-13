@@ -3,6 +3,7 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray_linalg::{UPLO, Eigh};
 use std::time::Instant;
 
 /// The status of the P-IRLS convergence.
@@ -44,6 +45,8 @@ pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
     pub beta_transformed: Array1<f64>,
     pub penalized_hessian_transformed: Array2<f64>,
+    // CRITICAL: Single stabilized Hessian for consistent cost/gradient computation
+    pub stabilized_hessian_transformed: Array2<f64>,
 
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
@@ -109,9 +112,10 @@ pub fn fit_model_for_fixed_rho(
     log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
 
     // Reconstruct full penalty matrices from square roots for balanced penalty creation
+    // STANDARDIZED: With rank x p roots, use S = R^T * R
     let mut s_list_full = Vec::with_capacity(rs_original.len());
     for rs in rs_original {
-        let s_full = rs.dot(&rs.t());
+        let s_full = rs.t().dot(rs);
         s_list_full.push(s_full);
     }
 
@@ -379,10 +383,15 @@ pub fn fit_model_for_fixed_rho(
             // Calculate the stable penalty term using the transformed quantities
             let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
+            // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
+            let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+            ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+
             // Populate the new PirlsResult struct with stable, transformed quantities
             return Ok(PirlsResult {
                 beta_transformed: beta_transformed.clone(),
                 penalized_hessian_transformed,
+                stabilized_hessian_transformed,
                 deviance: last_deviance,
                 stable_penalty_term,
                 final_weights: weights,
@@ -492,10 +501,15 @@ pub fn fit_model_for_fixed_rho(
                 let stable_penalty_term =
                     beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
+                // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
+                let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+                ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+
                 // Populate the new PirlsResult struct with stable, transformed quantities
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
+                    stabilized_hessian_transformed,
                     deviance: last_deviance,
                     stable_penalty_term,
                     final_weights: weights,
@@ -542,10 +556,15 @@ pub fn fit_model_for_fixed_rho(
         last_iter
     );
 
+    // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
+    let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+    ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+
     // Return with MaxIterationsReached status
     Ok(PirlsResult {
         beta_transformed,
         penalized_hessian_transformed,
+        stabilized_hessian_transformed,
         deviance: last_deviance,
         stable_penalty_term,
         final_weights: weights,
@@ -609,17 +628,18 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 
     let mut y_inf = 0.0;
 
+    // FIXED: Compute max_diag once outside the loop (performance improvement)
+    let max_diag = r_matrix
+        .diag()
+        .iter()
+        .fold(0.0f64, |acc, &val| acc.max(val.abs()));
+    let eps = 1e-16f64.max(max_diag * 1e-14);
+
     for k in (0..c).rev() {
         let r_kk = r_matrix[[k, k]];
-        // Use relative epsilon instead of exact zero check
-        let max_diag = r_matrix
-            .diag()
-            .iter()
-            .fold(0.0f64, |acc, &val| acc.max(val.abs()));
-        let eps = 1e-16f64.max(max_diag * 1e-14);
         if r_kk.abs() <= eps {
-            // Return large finite number instead of infinity to allow rank reduction
-            return 1.0 / f64::MIN_POSITIVE;
+            // FIXED: Return large finite number instead of infinity to avoid overflow
+            return 1e300;
         }
         let yp = (1.0 - p[k]) / r_kk;
         let ym = (-1.0 - p[k]) / r_kk;
@@ -1489,15 +1509,25 @@ fn pivoted_qr_faer(
 
     // Try candidate p0
     let a_p0 = pivot_columns(matrix.view(), &p0);
-    let err0 = (&a_p0 - &qr_product).mapv(|x| x.abs()).sum();
-
+    
     // Try candidate p1
     let a_p1 = pivot_columns(matrix.view(), &p1);
-    let err1 = (&a_p1 - &qr_product).mapv(|x| x.abs()).sum();
-
-    let pivot: Vec<usize> = if err0 < 1e-9 {
+    
+    // FIXED: Use relative error for scale-robust comparison
+    let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
+        let diff_norm = (a_p - &qr_product).mapv(|x| x * x).sum().sqrt();
+        let a_norm = a_p.mapv(|x| x * x).sum().sqrt();
+        let qr_norm = qr_product.mapv(|x| x * x).sum().sqrt();
+        let denom = (a_norm + qr_norm + 1e-16).max(1e-16); // Avoid division by zero
+        diff_norm / denom
+    };
+    
+    let err0 = compute_relative_error(&a_p0);
+    let err1 = compute_relative_error(&a_p1);
+    
+    let pivot: Vec<usize> = if err0 < 1e-12 {
         p0
-    } else if err1 < 1e-9 {
+    } else if err1 < 1e-12 {
         p1
     } else {
         // This case should not be reached with a correct library, but as a fallback,
@@ -1619,7 +1649,10 @@ fn calculate_scale(
                 .zip(residuals.iter())
                 .map(|(&w, &r)| w * r * r)
                 .sum();
-            // Use the number of observations for Gaussian scale, consistent with mgcv
+            // STRATEGIC DESIGN DECISION: Use unweighted observation count for mgcv compatibility
+            // Standard WLS theory suggests using sum(weights) as effective sample size,
+            // but mgcv's gam.fit3 uses 'n.true' (unweighted count) in the denominator.
+            // We maintain this behavior for strict mgcv compatibility.
             let effective_n = y.len() as f64;
             weighted_rss / (effective_n - edf).max(1.0)
         }
@@ -2957,5 +2990,47 @@ mod tests {
             "The reconstruction error is too large ({:e}), which indicates the permutation vector is incorrect. The contract A*P = Q*R is violated.",
             reconstruction_error_norm
         );
+    }
+}
+
+/// Ensures a matrix is positive definite by adjusting negative eigenvalues
+/// CRITICAL: This function must be used consistently for both cost and gradient
+fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
+    if let Ok((evals, evecs)) = hess.eigh(UPLO::Lower) {
+        // Check if ALL eigenvalues are negative - CRITICAL numerical issue
+        if evals.iter().all(|&x| x < 0.0) {
+            let min_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            // Critical error - program termination
+            return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
+        }
+
+        // Original behavior for other cases
+        let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
+        let mut adjusted = false;
+        let mut evals_mut = evals.clone();
+
+        for eval in evals_mut.iter_mut() {
+            if *eval < thresh {
+                *eval = thresh;
+                adjusted = true;
+            }
+        }
+
+        if adjusted {
+            let min_original_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            log::warn!(
+                "Penalized Hessian was not positive definite (min eigenvalue: {:.3e}). Adjusting for stability. This may indicate an ill-posed model.",
+                min_original_eigenvalue
+            );
+            *hess = evecs.dot(&Array2::from_diag(&evals_mut)).dot(&evecs.t());
+        }
+
+        Ok(())
+    } else {
+        // Fallback: add small ridge to diagonal
+        for i in 0..hess.nrows() {
+            hess[[i, i]] += 1e-6;
+        }
+        Ok(())
     }
 }

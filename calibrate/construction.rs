@@ -624,7 +624,8 @@ pub fn create_balanced_penalty_root(
 }
 
 /// Computes penalty square roots from full penalty matrices using eigendecomposition
-/// Returns "skinny" matrices of dimension p x rank_k where rank_k is the rank of each penalty
+/// Returns "skinny" matrices of dimension rank_k x p where rank_k is the rank of each penalty
+/// STANDARDIZED: All penalty roots use rank x p convention with S = R^T * R
 pub fn compute_penalty_square_roots(
     s_list: &[Array2<f64>],
 ) -> Result<Vec<Array2<f64>>, EstimationError> {
@@ -643,23 +644,23 @@ pub fn compute_penalty_square_roots(
         let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
         if rank_k == 0 {
-            // Zero penalty matrix - return p x 0 matrix
-            rs_list.push(Array2::zeros((p, 0)));
+            // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)
+            rs_list.push(Array2::zeros((0, p)));
             continue;
         }
 
-        // Create skinny square root matrix: rS = V * diag(sqrt(λ))
-        // Only include eigenvectors corresponding to positive eigenvalues
-        let mut rs = Array2::zeros((p, rank_k));
-        let mut col_idx = 0;
+        // STANDARDIZED: Create rank x p square root matrix where S = rs^T * rs
+        // Each row is sqrt(eigenvalue) * eigenvector^T
+        let mut rs = Array2::zeros((rank_k, p));
+        let mut row_idx = 0;
 
         for (i, &eigenval) in eigenvalues.iter().enumerate() {
             if eigenval > tolerance {
                 let sqrt_eigenval = eigenval.sqrt();
                 let eigenvec = eigenvectors.column(i);
-                // Each column of rs is sqrt(eigenvalue) * eigenvector
-                rs.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
-                col_idx += 1;
+                // Each row of rs is sqrt(eigenvalue) * eigenvector^T
+                rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
+                row_idx += 1;
             }
         }
 
@@ -735,7 +736,7 @@ pub fn construct_s_lambda(
 /// diagnostics or alternative workflows. This function does not take `eb` as a
 /// parameter; it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>], // penalty square roots (each is p x rank_i)
+    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
@@ -766,7 +767,7 @@ pub fn stable_reparameterization(
     // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
     // These will NEVER be modified and are used for building the sb matrix
     let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| rs_k.dot(&rs_k.t())).collect();
+        rs_list.iter().map(|rs_k| rs_k.t().dot(rs_k)).collect();
 
     // Create the WORKING copy that will be transformed
     let mut s_current_list = s_original_list.clone();
@@ -817,8 +818,8 @@ pub fn stable_reparameterization(
         let mut max_omega: f64 = 0.0;
 
         for &i in &gamma {
-            // Extract active rows from penalty square root (columns stay the same)
-            let rs_active_rows = rs_current[i].slice(s![k_offset..k_offset + q_current, ..]);
+            // FIXED: Extract active columns from penalty square root (rank x p convention)
+            let rs_active_cols = rs_current[i].slice(s![.., k_offset..k_offset + q_current]);
 
             // Skip if penalty has no columns (zero penalty)
             if rs_current[i].ncols() == 0 {
@@ -826,8 +827,8 @@ pub fn stable_reparameterization(
                 continue;
             }
 
-            // Form the active sub-block of full penalty matrix S_i = rS_i * rS_i^T
-            let s_active_block = rs_active_rows.dot(&rs_active_rows.t());
+            // FIXED: Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
+            let s_active_block = rs_active_cols.t().dot(&rs_active_cols);
 
             // The Frobenius norm is the sqrt of sum of squares of matrix elements
             let frob_norm = s_active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
@@ -1010,14 +1011,15 @@ pub fn stable_reparameterization(
                 continue;
             }
 
+            // FIXED: For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
             let c_matrix = rs_current[i]
-                .slice(s![k_offset..k_offset + q_current, ..])
+                .slice(s![.., k_offset..k_offset + q_current])
                 .to_owned();
-            let b_matrix = u_reordered.t().dot(&c_matrix); // U_reordered' * rS_sub
+            let b_matrix = c_matrix.dot(&u_reordered); // rS_sub * U_reordered
 
             // Assign the fully transformed block back into the main rs_current matrix.
             rs_current[i]
-                .slice_mut(s![k_offset..k_offset + q_current, ..])
+                .slice_mut(s![.., k_offset..k_offset + q_current])
                 .assign(&b_matrix);
         }
 
@@ -1033,18 +1035,18 @@ pub fn stable_reparameterization(
 
             if alpha.contains(&i) {
                 // DOMINANT penalty: Its effect is now entirely within the range space.
-                // We must zero out its projection onto the null space.
-                // The null space is now the LAST `q_current - r` rows of the sub-block.
+                // FIXED: For rank×p roots, zero out the null space COLUMNS (not rows)
+                // The null space is now the LAST `q_current - r` columns of the sub-block.
                 if r < q_current {
-                    rs_current[i].slice_mut(s![k_offset + r.., ..]).fill(0.0);
+                    rs_current[i].slice_mut(s![.., k_offset + r..]).fill(0.0);
                 }
             } else {
                 // SUB-DOMINANT penalty (in gamma_prime).
                 // Its effect is carried forward in the null space.
-                // We must zero out its projection onto the range space.
-                // The range space is now the FIRST `r` rows of the sub-block.
+                // FIXED: For rank×p roots, zero out the range space COLUMNS (not rows)
+                // The range space is now the FIRST `r` columns of the sub-block.
                 rs_current[i]
-                    .slice_mut(s![k_offset..k_offset + r, ..])
+                    .slice_mut(s![.., k_offset..k_offset + r])
                     .fill(0.0);
             }
         }
@@ -1118,8 +1120,8 @@ pub fn stable_reparameterization(
     // Step 2: Construct the final transformed total penalty matrix
     let mut s_transformed = Array2::zeros((p, p));
     for i in 0..m {
-        // Form full penalty from transformed root: S_k = rS_k * rS_k^T
-        let s_k_transformed = final_rs_transformed[i].dot(&final_rs_transformed[i].t());
+        // Form full penalty from transformed root: S_k = rS_k^T * rS_k
+        let s_k_transformed = final_rs_transformed[i].t().dot(&final_rs_transformed[i]);
         s_transformed.scaled_add(lambdas[i], &s_k_transformed);
     }
 
@@ -1177,7 +1179,7 @@ pub fn stable_reparameterization(
 
     // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
     for k in 0..lambdas.len() {
-        let s_k_transformed = final_rs_transformed[k].dot(&final_rs_transformed[k].t());
+        let s_k_transformed = final_rs_transformed[k].t().dot(&final_rs_transformed[k]);
         let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
         let trace: f64 = s_plus_times_s_k.diag().sum();
         det1[k] = lambdas[k] * trace;
