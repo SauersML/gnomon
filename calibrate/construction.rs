@@ -137,7 +137,7 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Tensor product interaction effects (each gets its own unique penalty index)
+        // Tensor product interaction effects (each gets two penalty indices: PGS-dir and PC-dir)
         if num_pgs_interaction_bases > 0 {
             for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
@@ -146,16 +146,16 @@ impl ModelLayout {
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
-                    penalty_indices: vec![_penalty_idx_counter], // Each interaction gets unique penalty index
+                    penalty_indices: vec![_penalty_idx_counter, _penalty_idx_counter + 1], // Two penalties: PGS-dir, PC-dir
                     term_type: TermType::Interaction,
                 });
 
                 current_col += num_tensor_coeffs;
-                _penalty_idx_counter += 1; // Increment for next penalty
+                _penalty_idx_counter += 2; // Increment by 2 for tensor-product penalty
             }
         }
 
-        // Total number of individual penalties: one per PC main + one per interaction
+        // Total number of individual penalties: one per PC main + two per interaction (PGS-dir + PC-dir)
         // _penalty_idx_counter has already been incremented to the correct total
 
         // Verify that our calculation matches the actual column count
@@ -306,7 +306,7 @@ pub fn build_design_and_penalty_matrices(
         pgs_range_ncols, // Use PGS range size for interactions
     )?;
 
-    // 4. Create individual penalty matrices - one per PC main and one per interaction
+    // 4. Create individual penalty matrices - one per PC main and two per interaction
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
     let mut s_list = Vec::with_capacity(layout.num_penalties);
@@ -318,14 +318,27 @@ pub fn build_design_and_penalty_matrices(
 
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
-        let penalty_idx = block.penalty_indices[0]; // Each block has exactly one penalty index
         let col_range = block.col_range.clone();
         let range_len = col_range.len();
 
-        // Set identity penalty for this specific block
-        s_list[penalty_idx]
-            .slice_mut(s![col_range.clone(), col_range])
-            .assign(&Array2::eye(range_len));
+        match block.term_type {
+            TermType::PcMainEffect => {
+                // Main effects have single penalty index
+                let penalty_idx = block.penalty_indices[0];
+                s_list[penalty_idx]
+                    .slice_mut(s![col_range.clone(), col_range])
+                    .assign(&Array2::eye(range_len));
+            }
+            TermType::Interaction => {
+                // Interactions have two penalty indices (PGS-dir and PC-dir)
+                // For now, use identity penalties - TODO: implement proper Kronecker-sum
+                for &penalty_idx in &block.penalty_indices {
+                    s_list[penalty_idx]
+                        .slice_mut(s![col_range.clone(), col_range])
+                        .assign(&Array2::eye(range_len));
+                }
+            }
+        }
     }
 
     // Range transformations will be returned directly to the caller
@@ -500,7 +513,6 @@ pub struct ReparamResult {
     pub e_transformed: Array2<f64>,
 }
 
-use indicatif::{ProgressBar, ProgressStyle};
 
 /// Creates a lambda-independent balanced penalty root for stable rank detection
 /// This follows mgcv's approach: scale each penalty to unit Frobenius norm, sum them,
@@ -620,38 +632,15 @@ pub fn construct_s_lambda(
     let p = layout.total_coeffs;
     let mut s_lambda = Array2::zeros((p, p));
 
-    let total = s_list.len();
-    if total == 0 {
+    if s_list.is_empty() {
         return s_lambda;
     }
 
-    // Create a progress bar
-    let pb = ProgressBar::new(total as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            // NOTE: This template is VALID. The {pos.minus(1)} expression is supported by indicatif
-            // and will not cause a panic. Claims that this template is invalid are FALSE.
-            "    [Construction] [{bar:20.cyan/blue}] {pos}/{len} penalties (λ_{pos.minus(1)}={msg})"
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  ")
-    );
-
     // Simple weighted sum since all matrices are now p × p
     for (i, s_k) in s_list.iter().enumerate() {
-        // Format lambda value in scientific notation
-        let lambda_formatted = format!("{:.2e}", lambdas[i]);
-        pb.set_message(lambda_formatted);
-
         // Add weighted penalty matrix
         s_lambda.scaled_add(lambdas[i], s_k);
-
-        // Update progress
-        pb.inc(1);
     }
-
-    // Finish progress bar
-    pb.finish_and_clear();
 
     s_lambda
 }
@@ -909,6 +898,14 @@ pub fn stable_reparameterization(
         // space (largest eigenvalues) are at the END of `u`. We reorder them to be first.
         // The new basis is `U_reordered = [U_range | U_null]`.
         // ---
+        
+        // Guard against r == 0 to avoid empty slicing
+        if r == 0 {
+            // No range directions identified this iteration; switch to gamma' and continue
+            gamma = gamma_prime;
+            continue;
+        }
+        
         let u_range = u.slice(s![.., q_current - r..]); // Last r columns
         let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
         let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])

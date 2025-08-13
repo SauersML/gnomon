@@ -66,6 +66,10 @@ pub struct ModelConfig {
     /// Maps variable names (e.g., "pgs", "PC1") to their range-space transformation matrices
     #[serde(default)] // For backward compatibility with models that don't have this field
     pub range_transforms: HashMap<String, Array2<f64>>,
+    /// Range transformation matrices for interaction terms (unwhitened eigenvectors)
+    /// Maps variable names (e.g., "pgs", "PC1") to their unwhitened range eigenvectors for interactions
+    #[serde(default)] // For backward compatibility with models that don't have this field
+    pub interaction_range_transforms: HashMap<String, Array2<f64>>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
