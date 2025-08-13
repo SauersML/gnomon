@@ -1,4 +1,5 @@
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray_linalg::{Eigh, UPLO};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -268,6 +269,64 @@ pub fn apply_sum_to_zero_constraint(
     // Constrained basis
     let constrained = basis_matrix.dot(&z);
     Ok((constrained, z))
+}
+
+/// Decomposes a penalty matrix S into its null-space and whitened range-space components.
+/// This is used for functional ANOVA decomposition in GAMs to separate unpenalized 
+/// and penalized subspaces of a basis.
+///
+/// # Arguments
+/// * `s_1d`: The 1D penalty matrix (typically a difference penalty matrix)
+/// * `tol`: Tolerance for determining zero eigenvalues (typically 1e-12)
+///
+/// # Returns
+/// A tuple of transformation matrices: (Z_null, Z_range_whiten) where:
+/// - `Z_null`: Orthogonal basis for the null space (unpenalized functions)
+/// - `Z_range_whiten`: Whitened basis for the range space (penalized functions)
+///   In these coordinates, the penalty becomes an identity matrix.
+pub fn null_range_whiten(
+    s_1d: &Array2<f64>,
+    tol: f64,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let (evals, evecs) = s_1d
+        .eigh(UPLO::Lower)
+        .map_err(BasisError::LinalgError)?;
+
+    let mut idx_n = Vec::new();
+    let mut idx_r = Vec::new();
+    for (i, &d) in evals.iter().enumerate() {
+        if d.abs() <= tol {
+            idx_n.push(i);
+        } else {
+            idx_r.push(i);
+        }
+    }
+
+    // Build basis for the null space (unpenalized part)
+    let z_null = select_columns(&evecs, &idx_n);
+
+    // Build whitened basis for the range space (penalized part)
+    let mut d_inv_sqrt = Array2::<f64>::zeros((idx_r.len(), idx_r.len()));
+    for (j, &i) in idx_r.iter().enumerate() {
+        d_inv_sqrt[[j, j]] = 1.0 / evals[i].sqrt();
+    }
+    let z_range_whiten = select_columns(&evecs, &idx_r).dot(&d_inv_sqrt);
+
+    Ok((z_null, z_range_whiten))
+}
+
+/// Helper function to select specific columns from a matrix by index.
+/// This is needed because ndarray doesn't have a direct way to select non-contiguous columns.
+fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
+    let nrows = matrix.nrows();
+    let ncols = indices.len();
+    let mut result = Array2::zeros((nrows, ncols));
+    
+    for (j, &col_idx) in indices.iter().enumerate() {
+        result.column_mut(j).assign(&matrix.column(col_idx));
+    }
+    
+    result
 }
 
 /// Internal module for implementation details not exposed in the public API.

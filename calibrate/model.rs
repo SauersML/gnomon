@@ -62,6 +62,10 @@ pub struct ModelConfig {
     pub constraints: HashMap<String, Constraint>,
     /// Knot vectors used during training, required for exact reproduction during prediction
     pub knot_vectors: HashMap<String, Array1<f64>>,
+    /// Range transformation matrices for functional ANOVA decomposition
+    /// Maps variable names (e.g., "pgs", "PC1") to their range-space transformation matrices
+    #[serde(default)] // For backward compatibility with models that don't have this field
+    pub range_transforms: HashMap<String, Array2<f64>>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -275,8 +279,8 @@ mod internal {
         // This closure was not used - removed
         // Previously defined a helper to fetch Z transform from model
 
-        // 2. Generate bases for PCs using saved knot vectors if available
-        let mut pc_constrained_bases = Vec::new();
+        // 2. Generate range-only bases for PCs (functional ANOVA approach)
+        let mut pc_range_bases = Vec::new();
         let mut pc_unconstrained_bases_main = Vec::new();
         for i in 0..config.pc_names.len() {
             let pc_col = pcs_new.column(i);
@@ -297,20 +301,26 @@ mod internal {
             let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
             pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
 
-            // Apply the SAVED PC constraint
-            let pc_name = &config.pc_names[i];
-            let pc_z = &config
-                .constraints
-                .get(pc_name)
-                .ok_or_else(|| ModelError::ConstraintMissing(pc_name.clone()))?
-                .z_transform;
+            // Apply the SAVED range transformation for functional ANOVA
+            if let Some(range_transform) = config.range_transforms.get(pc_name) {
+                // Use range-only transformation for PC main effects (fully penalized)
+                let pc_range_basis = pc_main_basis_unc.dot(range_transform);
+                pc_range_bases.push(pc_range_basis);
+            } else {
+                // Fallback to old constraint approach for backward compatibility
+                let pc_z = &config
+                    .constraints
+                    .get(pc_name)
+                    .ok_or_else(|| ModelError::ConstraintMissing(pc_name.clone()))?
+                    .z_transform;
 
-            // Check that dimensions match before matrix multiplication
-            if pc_main_basis_unc.ncols() != pc_z.nrows() {
-                return Err(ModelError::InternalStackingError);
+                // Check that dimensions match before matrix multiplication
+                if pc_main_basis_unc.ncols() != pc_z.nrows() {
+                    return Err(ModelError::InternalStackingError);
+                }
+
+                pc_range_bases.push(pc_main_basis_unc.dot(pc_z)); // Fallback constrained
             }
-
-            pc_constrained_bases.push(pc_main_basis_unc.dot(pc_z)); // Now constrained
         }
 
         // 3. Assemble the design matrix following the canonical order
@@ -320,8 +330,8 @@ mod internal {
         // 1. Intercept
         owned_cols.push(Array1::ones(n_samples));
 
-        // 2. Main PC effects
-        for pc_basis in &pc_constrained_bases {
+        // 2. Main PC effects (using range-only bases for functional ANOVA)
+        for pc_basis in &pc_range_bases {
             for col in pc_basis.axis_iter(Axis(1)) {
                 owned_cols.push(col.to_owned());
             }
@@ -332,27 +342,56 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Tensor product interaction effects (conditionally)
-        // Only create interaction terms if we have PCs and the UNCONSTRAINED PGS basis has columns
-        // Gate on the same basis dimension used to construct the layout (unconstrained)
-        let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
-        if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
-            // Create unified interaction surfaces using row-wise tensor products
+        // 4. Tensor product interaction effects - Range × Range only (functional ANOVA)
+        if let Some(pgs_range_transform) = config.range_transforms.get("pgs") {
+            let pgs_range_basis = pgs_main_basis_unc.dot(pgs_range_transform);
+            
             for pc_idx in 0..config.pc_names.len() {
-                let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
                 let pc_name = &config.pc_names[pc_idx];
                 let tensor_key = format!("f(PGS,{})", pc_name);
 
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
-                    let tensor_interaction = row_wise_tensor_product(
-                        &pgs_main_basis_unc.to_owned(),
-                        pc_unconstrained_basis,
-                    );
+                    if let Some(pc_range_transform) = config.range_transforms.get(pc_name) {
+                        // Use Range × Range tensor product (fully penalized by construction)
+                        let pc_range_basis = pc_unconstrained_bases_main[pc_idx].dot(pc_range_transform);
+                        let tensor_interaction = row_wise_tensor_product(&pgs_range_basis, &pc_range_basis);
 
-                    // Add all columns from this tensor product to the design matrix
-                    for col in tensor_interaction.axis_iter(Axis(1)) {
-                        owned_cols.push(col.to_owned());
+                        // Add all columns from this tensor product to the design matrix
+                        for col in tensor_interaction.axis_iter(Axis(1)) {
+                            owned_cols.push(col.to_owned());
+                        }
+                    } else {
+                        // Fallback to old approach for backward compatibility
+                        let tensor_interaction = row_wise_tensor_product(
+                            &pgs_main_basis_unc.to_owned(),
+                            &pc_unconstrained_bases_main[pc_idx],
+                        );
+
+                        for col in tensor_interaction.axis_iter(Axis(1)) {
+                            owned_cols.push(col.to_owned());
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback to old approach for backward compatibility
+            let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
+            if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
+                for pc_idx in 0..config.pc_names.len() {
+                    let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
+                    let pc_name = &config.pc_names[pc_idx];
+                    let tensor_key = format!("f(PGS,{})", pc_name);
+
+                    if coeffs.interaction_effects.contains_key(&tensor_key) {
+                        let tensor_interaction = row_wise_tensor_product(
+                            &pgs_main_basis_unc.to_owned(),
+                            pc_unconstrained_basis,
+                        );
+
+                        for col in tensor_interaction.axis_iter(Axis(1)) {
+                            owned_cols.push(col.to_owned());
+                        }
                     }
                 }
             }
@@ -462,6 +501,7 @@ mod tests {
                     knots.insert("pgs".to_string(), knot_vector.clone());
                     knots
                 },
+                range_transforms: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -530,6 +570,7 @@ mod tests {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -617,6 +658,7 @@ mod tests {
             pc_names: vec!["PC1".to_string(), "PC2".to_string()], // Order matters for flattening
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
         };
 
         // Use the internal flatten_coefficients function
@@ -693,6 +735,7 @@ mod tests {
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+            range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
         };
 
         // Create a dummy dataset for generating the correct model structure
@@ -709,8 +752,8 @@ mod tests {
             weights: Array1::ones(n_samples),
         };
 
-        // Generate the correct constraints and structure using the actual model-building code
-        let (_, _, layout, constraints, knot_vectors) =
+        // Generate the correct constraints, structure, and range transforms using the actual model-building code
+        let (_, _, layout, constraints, knot_vectors, range_transforms) =
             crate::calibrate::construction::build_design_and_penalty_matrices(
                 &dummy_data,
                 &model_config,
@@ -733,6 +776,7 @@ mod tests {
                 pc_names: vec!["PC1".to_string()],
                 constraints: constraints.clone(), // Clone to avoid ownership issues
                 knot_vectors, // Use the knot vectors generated by the model-building code
+                range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -745,12 +789,8 @@ mod tests {
                         (1..=pgs_dim).map(|i| i as f64).collect()
                     },
                     pcs: {
-                        // Extract PC1 dimension from constraints
-                        let pc1_dim = if let Some(pc1_constraint) = constraints.get("PC1") {
-                            pc1_constraint.z_transform.ncols()
-                        } else {
-                            9 // Default fallback
-                        };
+                        // Use range dimension for PC1 (Option 3)
+                        let pc1_dim = range_transforms.get("PC1").unwrap().ncols();
 
                         let mut pc_map = HashMap::new();
                         pc_map.insert("PC1".to_string(), (1..=pc1_dim).map(|i| i as f64).collect());
@@ -758,18 +798,14 @@ mod tests {
                     },
                 },
                 interaction_effects: {
-                    // The interaction term's size depends on the UNCONSTRAINED dimensions of the marginal bases' main effect parts.
-                    // Total basis functions = num_knots + degree + 1. Main effect part is one less.
-                    let num_pgs_basis_funcs_main =
-                        pgs_basis_config.num_knots + pgs_basis_config.degree; // 9
-                    let num_pc1_basis_funcs_main =
-                        pc1_basis_config.num_knots + pc1_basis_config.degree; // 9
+                    // Option 3: Interaction term uses Range × Range dimensions
+                    let r_pgs = range_transforms.get("pgs").unwrap().ncols();
+                    let r_pc1 = range_transforms.get("PC1").unwrap().ncols();
 
                     let mut interactions = HashMap::new();
 
-                    // Calculate the total number of interaction coefficients for the unified term
-                    let total_interaction_coeffs =
-                        num_pgs_basis_funcs_main * num_pc1_basis_funcs_main; // CORRECT: 9 * 9 = 81
+                    // Calculate the total number of interaction coefficients for Range × Range
+                    let total_interaction_coeffs = r_pgs * r_pc1;
 
                     // Create a single flattened vector of coefficients
                     let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)
@@ -781,7 +817,7 @@ mod tests {
                     interactions
                 },
             },
-            lambdas: vec![0.1, 0.2],
+            lambdas: vec![0.1, 0.2], // Option 3: 2 grouped penalties (PC mains, interactions)
         };
 
         // Create a temporary file for testing

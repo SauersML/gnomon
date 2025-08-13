@@ -115,7 +115,7 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    let (x_matrix, s_list, layout, constraints, knot_vectors) =
+    let (x_matrix, s_list, layout, constraints, knot_vectors, range_transforms) =
         build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
     eprintln!(
@@ -351,6 +351,7 @@ pub fn train_model(
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
     config_with_constraints.knot_vectors = knot_vectors;
+    config_with_constraints.range_transforms = range_transforms;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -1709,6 +1710,7 @@ pub mod internal {
                 pgs_range: (-3.0, 3.0),
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             };
 
             (data, config)
@@ -1735,6 +1737,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             }
         }
 
@@ -2152,10 +2155,11 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
             };
 
             // Build the layout to programmatically find penalty indices
-            let (_, _, layout, _, _) = build_design_and_penalty_matrices(&data, &config)
+            let (_, _, layout, _, _, _) = build_design_and_penalty_matrices(&data, &config)
                 .expect("Failed to build layout for test");
 
             // Train the model
@@ -2591,10 +2595,11 @@ pub mod internal {
                 pgs_range: (-2.5, 2.5),
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, mut s_list, layout, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             assert!(
@@ -2901,10 +2906,11 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3025,10 +3031,11 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _) =
+            let (x_matrix, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3249,6 +3256,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             };
 
             println!(
@@ -3347,9 +3355,10 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _) =
+            let (x, s_list, layout, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
             // Explicitly drop unused variables
             // Unused variables removed
@@ -3529,10 +3538,11 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string()],
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
+                range_transforms: Default::default(),
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _) =
+            let (x_matrix, s_list, layout, constraints, _, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3660,7 +3670,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3782,7 +3792,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3960,7 +3970,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4109,7 +4119,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4213,7 +4223,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4312,6 +4322,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pc_ranges: vec![],
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
     };
 
     // 3. Train the model and expect an error
@@ -4385,11 +4396,12 @@ fn test_indefinite_hessian_detection_and_retreat() {
         pc_names: vec!["PC1".to_string()],
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
+        range_transforms: std::collections::HashMap::new(),
     };
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4584,10 +4596,11 @@ mod optimizer_progress_tests {
             pc_names: vec!["PC1".to_string()],
             constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _, _) = build_design_and_penalty_matrices(&data, &config)?;
+        let (x_matrix, s_list, layout, _, _, _) = build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),
