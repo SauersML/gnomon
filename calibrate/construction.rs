@@ -1368,6 +1368,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            interaction_range_transforms: HashMap::new(),
         };
 
         (data, config)
@@ -1378,7 +1379,7 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, _range_transforms) =
+        let (x, s_list, layout, _, _, _range_transforms, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
@@ -1425,7 +1426,7 @@ mod tests {
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (x, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Calculate numerical rank via SVD
         let svd = x.svd(false, false).expect("SVD failed");
@@ -1448,7 +1449,7 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _) =
+        let (_, s_list, layout, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3: Expect grouped penalties - total of 2 penalty matrices
@@ -1528,7 +1529,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (_, _, layout, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
             config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;

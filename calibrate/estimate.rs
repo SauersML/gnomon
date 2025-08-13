@@ -1808,6 +1808,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             };
 
             (data, config)
@@ -1835,6 +1836,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             }
         }
 
@@ -2322,6 +2324,7 @@ pub mod internal {
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
+                interaction_range_transforms: Default::default(),
             };
 
             let (x, s_list, layout, _, _, _, _) =
@@ -2457,6 +2460,7 @@ pub mod internal {
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
+                interaction_range_transforms: Default::default(),
             };
 
             let (x, s_list, layout, _, _, _, _) =
@@ -3241,6 +3245,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
@@ -3366,6 +3371,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -3591,6 +3597,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             };
 
             println!(
@@ -3690,6 +3697,7 @@ pub mod internal {
                 constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             };
 
             let (x, s_list, layout, _, _, _, _) =
@@ -3873,6 +3881,7 @@ pub mod internal {
                 constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
+                interaction_range_transforms: Default::default(),
             };
 
             // Build design and penalty matrices
@@ -4931,6 +4940,7 @@ mod optimizer_progress_tests {
             constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
+            interaction_range_transforms: std::collections::HashMap::new(),
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
