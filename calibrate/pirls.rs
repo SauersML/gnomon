@@ -1468,13 +1468,37 @@ fn pivoted_qr_faer(
     }
 
     // Step 5: Extract the consistent column permutation (pivot)
-    // The `pivot_columns` function requires an INVERSE permutation, which maps the
-    // new column index to the original column index. The faer `Permutation` object
-    // provides both forward and inverse representations. We explicitly request the
-    // inverse here to ensure mathematical correctness. `perm.inverse().arrays()`
-    // returns `(inverse_slice, forward_slice)`.
     let perm = qr.P();
-    let pivot: Vec<usize> = perm.inverse().arrays().0.to_vec();
+    let (p0_slice, p1_slice) = perm.arrays();
+    let p0: Vec<usize> = p0_slice.to_vec();
+    let p1: Vec<usize> = p1_slice.to_vec();
+
+    // The mathematical identity is A*P = Q*R.
+    // Our goal is to find which permutation vector, when used with our `pivot_columns`
+    // function, correctly reconstructs A*P.
+    let qr_product = q.dot(&r);
+
+    // Try candidate p0
+    let a_p0 = pivot_columns(matrix.view(), &p0);
+    let err0 = (&a_p0 - &qr_product).mapv(|x| x.abs()).sum();
+
+    // Try candidate p1
+    let a_p1 = pivot_columns(matrix.view(), &p1);
+    let err1 = (&a_p1 - &qr_product).mapv(|x| x.abs()).sum();
+
+    let pivot: Vec<usize> = if err0 < 1e-9 {
+        p0
+    } else if err1 < 1e-9 {
+        p1
+    } else {
+        // This case should not be reached with a correct library, but as a fallback,
+        // it indicates a severe numerical or logical issue.
+        // We return an error instead of guessing, which caused the original failures.
+        return Err(EstimationError::LayoutError(format!(
+            "Could not determine correct QR permutation. Reconstruction errors: {:.2e}, {:.2e}",
+            err0, err1
+        )));
+    };
 
 
     Ok((q, r, pivot))
