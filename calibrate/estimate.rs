@@ -186,65 +186,87 @@ pub fn train_model(
         *seed = Array1::from_vec(vec_seed);
     }
 
-    // Evaluate all seeds and pick the one with minimal finite cost
-    let mut best_seed = None;
-    let mut best_cost = f64::INFINITY;
-
+    // Evaluate all seeds, separating symmetric from asymmetric candidates
+    let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+    let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+    
     for (i, seed) in seed_candidates.iter().enumerate() {
-        match reml_state.compute_cost(seed) {
-            Ok(c) if c.is_finite() && c < best_cost => {
-                best_cost = c;
-                best_seed = Some((seed.clone(), i));
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> cost = {:.6} (NEW BEST)",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    c
-                );
-            }
+        let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> cost = {:.6}",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    c
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
                 );
+                c
             }
             Ok(_) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> +inf cost",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>()
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>()
                 );
+                continue;
             }
             Err(e) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> failed ({:?})",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    e
+                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), e
                 );
+                continue;
+            }
+        };
+        
+        // Check if seed is symmetric (all penalties equal within tiny tolerance)
+        let is_symmetric = if seed.len() < 2 {
+            true
+        } else {
+            let first_val = seed[0];
+            seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
+        };
+        
+        if is_symmetric {
+            if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                best_symmetric_seed = Some((seed.clone(), cost, i));
+                eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
+            }
+        } else {
+            if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                best_asymmetric_seed = Some((seed.clone(), cost, i));
+                eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
             }
         }
     }
-
-    let start_z = if let Some((best_rho, best_idx)) = best_seed {
+    
+    // CRITICAL: Always prefer asymmetric seeds to break optimizer symmetry trap
+    let start_z = if let Some((asym_rho, asym_cost, asym_idx)) = best_asymmetric_seed {
+        if let Some((sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
+            if sym_cost < asym_cost {
+                eprintln!(
+                    "[Init] WARNING: Best seed was symmetric (#{}, cost={:.6}). \
+                     Overriding with best asymmetric seed (#{}, cost={:.6}) to break symmetry trap!",
+                    sym_idx, sym_cost, asym_idx, asym_cost
+                );
+            } else {
+                eprintln!("[Init] Using best asymmetric seed #{} (cost = {:.6})", asym_idx, asym_cost);
+            }
+        } else {
+            eprintln!("[Init] Using only viable asymmetric seed #{} (cost = {:.6})", asym_idx, asym_cost);
+        }
+        Some(to_z_from_rho(&asym_rho))
+    } else if let Some((sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
         eprintln!(
-            "[Init] Using asymmetric seed #{} with cost {:.6}",
-            best_idx, best_cost
+            "[Init] WARNING: Only symmetric seeds worked. Using #{} (cost = {:.6}). \
+             Optimizer may get trapped in symmetry!",
+            sym_idx, sym_cost
         );
-        Some(to_z_from_rho(&best_rho))
+        Some(to_z_from_rho(&sym_rho))
     } else {
-        eprintln!("[Init] All seeds failed, falling back to neutral rho=0");
-        Some(to_z_from_rho(&Array1::zeros(layout.num_penalties)))
+        eprintln!("[Init] All seeds failed, falling back to neutral asymmetric rho");
+        // Even the fallback should be asymmetric
+        let mut fallback_rho = Array1::zeros(layout.num_penalties);
+        for i in 0..fallback_rho.len() {
+            fallback_rho[i] = (i as f64) * 0.1; // Small asymmetric perturbation
+        }
+        Some(to_z_from_rho(&fallback_rho))
     };
 
     // Fallback to previous default if none were finite (will likely be rescued by the barrier)
