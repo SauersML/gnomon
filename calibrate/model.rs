@@ -346,9 +346,9 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Tensor product interaction effects - Range × Range only (functional ANOVA)
-        if let Some(pgs_range_transform) = config.range_transforms.get("pgs") {
-            let pgs_range_basis = pgs_main_basis_unc.dot(pgs_range_transform);
+        // 4. Tensor product interaction effects - Use UNWHITENED eigenvectors (functional ANOVA)
+        if let Some(u_pgs) = config.interaction_range_transforms.get("pgs") {
+            let pgs_int_basis = pgs_main_basis_unc.dot(u_pgs);
 
             for pc_idx in 0..config.pc_names.len() {
                 let pc_name = &config.pc_names[pc_idx];
@@ -356,27 +356,18 @@ mod internal {
 
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
-                    if let Some(pc_range_transform) = config.range_transforms.get(pc_name) {
-                        // Use Range × Range tensor product (fully penalized by construction)
-                        let pc_range_basis =
-                            pc_unconstrained_bases_main[pc_idx].dot(pc_range_transform);
-                        let tensor_interaction =
-                            row_wise_tensor_product(&pgs_range_basis, &pc_range_basis);
+                    let u_pc = config
+                        .interaction_range_transforms
+                        .get(pc_name)
+                        .ok_or_else(|| ModelError::InternalStackingError)?;
+                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(u_pc);
 
-                        // Add all columns from this tensor product to the design matrix
-                        for col in tensor_interaction.axis_iter(Axis(1)) {
-                            owned_cols.push(col.to_owned());
-                        }
-                    } else {
-                        // Fallback to old approach for backward compatibility
-                        let tensor_interaction = row_wise_tensor_product(
-                            &pgs_main_basis_unc.to_owned(),
-                            &pc_unconstrained_bases_main[pc_idx],
-                        );
+                    let tensor_interaction =
+                        row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
-                        for col in tensor_interaction.axis_iter(Axis(1)) {
-                            owned_cols.push(col.to_owned());
-                        }
+                    // Add all columns from this tensor product to the design matrix
+                    for col in tensor_interaction.axis_iter(Axis(1)) {
+                        owned_cols.push(col.to_owned());
                     }
                 }
             }

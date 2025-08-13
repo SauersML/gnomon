@@ -292,6 +292,7 @@ pub fn build_design_and_penalty_matrices(
     let mut pc_range_bases = Vec::new();
     let mut pc_unconstrained_bases_main = Vec::new();
     let mut pc_eigenvalue_diags = Vec::new(); // Store diagonal eigenvalue matrices for interactions
+    let mut pc_u_ranges: Vec<Array2<f64>> = Vec::new(); // Store unwhitened U matrices for interactions
 
     // Check if we have any PCs to process
     if config.pc_names.is_empty() {
@@ -334,6 +335,7 @@ pub fn build_design_and_penalty_matrices(
         let d_pc_range = ndarray::Array1::from_iter(pc_range_idxs.iter().map(|&i| pc_evals[i]));
         
         interaction_range_transforms.insert(pc_name.clone(), u_pc_range.to_owned());
+        pc_u_ranges.push(u_pc_range.to_owned());
         pc_eigenvalue_diags.push(d_pc_range);
 
         // PC main effect uses ONLY the range (penalized) part
@@ -506,9 +508,13 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Tensor product interaction effects - Range × Range only (fully penalized)
     if pgs_range_ncols > 0 && !pc_range_bases.is_empty() {
-        // Get PGS range basis for interactions
-        let pgs_range_transform = range_transforms.get("pgs").unwrap();
-        let pgs_range_basis = pgs_main_basis_unc.dot(pgs_range_transform);
+        // Use UNWHITENED eigenvectors for interactions (to match Kronecker-sum penalties)
+        let u_pgs = interaction_range_transforms
+            .get("pgs")
+            .ok_or_else(|| EstimationError::LayoutError(
+                "Missing 'pgs' in interaction_range_transforms".to_string()
+            ))?;
+        let pgs_int_basis = pgs_main_basis_unc.dot(u_pgs);
 
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
@@ -523,10 +529,10 @@ pub fn build_design_and_penalty_matrices(
                     ))
                 })?;
 
-            // Create Range × Range tensor product (guarantees full penalization)
-            let pc_range_transform = range_transforms.get(pc_name).unwrap();
-            let pc_range_basis = pc_unconstrained_bases_main[pc_idx].dot(pc_range_transform);
-            let tensor_interaction = row_wise_tensor_product(&pgs_range_basis, &pc_range_basis);
+            // Use UNWHITENED eigenvectors for PC interaction basis (matches penalty construction)
+            let u_pc = &pc_u_ranges[pc_idx];
+            let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(u_pc);
+            let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
@@ -815,7 +821,7 @@ pub fn stable_reparameterization(
         // Increment iteration counter
         iteration += 1;
 
-        println!(
+        log::debug!(
             "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
             iteration,
             gamma.len(),
@@ -1401,7 +1407,7 @@ mod tests {
         let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
 
         let expected_total_coeffs = 1 + pgs_main_coeffs + r_pc + interaction_coeffs; // 1 + 4 + 2 + 6 = 13
-        let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction
+        let expected_num_penalties = 3; // Individual: 1 for PC1 main + 2 for PC1×PGS interaction (PGS-dir + PC-dir)
 
         assert_eq!(
             layout.total_coeffs, expected_total_coeffs,
@@ -1452,11 +1458,11 @@ mod tests {
         let (_, s_list, layout, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // Option 3: Expect grouped penalties - total of 2 penalty matrices
+        // Expect two-penalty-per-interaction structure: 1 PC main + 2 interaction penalties = 3 total
         assert_eq!(
             s_list.len(),
-            2,
-            "Option 3 should have exactly 2 grouped penalty matrices"
+            3,
+            "Should have exactly 3 penalty matrices: 1 PC main + 2 interaction (PGS-dir + PC-dir)"
         );
 
         let interaction_block = layout
@@ -1465,38 +1471,56 @@ mod tests {
             .find(|b| b.term_type == TermType::Interaction)
             .expect("Interaction block not found in layout");
 
-        // Option 3: Each block now has only 1 penalty index (grouped)
+        // Each interaction block now has 2 penalty indices: PGS-dir and PC-dir
         assert_eq!(
             interaction_block.penalty_indices.len(),
-            1,
-            "Interaction term should have one grouped penalty index"
+            2,
+            "Interaction term should have two penalty indices (PGS-dir and PC-dir)"
         );
 
-        let interaction_penalty_idx = interaction_block.penalty_indices[0];
-        assert_eq!(
-            interaction_penalty_idx, 1,
-            "Interaction should use penalty index 1 (PC mains use 0)"
-        );
+        let [pgs_penalty_idx, pc_penalty_idx] = [
+            interaction_block.penalty_indices[0],
+            interaction_block.penalty_indices[1],
+        ];
 
-        // Verify penalty matrix structure
-        let s_interactions = &s_list[1]; // Interaction penalty matrix
-        let s_pc_mains = &s_list[0]; // PC main effects penalty matrix
+        // Verify penalty matrix structure - both interaction penalties should be different
+        let s_pgs = &s_list[pgs_penalty_idx]; // PGS-direction penalty
+        let s_pc = &s_list[pc_penalty_idx]; // PC-direction penalty  
+        let s_pc_main = &s_list[0]; // PC main effects penalty matrix
 
-        // Check that interaction penalty matrix has identity on interaction blocks and zeros elsewhere
+        // Check that the two interaction penalty matrices are structurally different
+        // They should have different diagonal patterns reflecting Kronecker-sum structure
+        let mut pgs_pc_difference_found = false;
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
                 if interaction_block.col_range.contains(&r)
                     && interaction_block.col_range.contains(&c)
+                    && r == c // Check diagonal elements
                 {
-                    // Within interaction block: should be identity (1 on diagonal, 0 off-diagonal)
-                    if r == c {
-                        assert_abs_diff_eq!(s_interactions[[r, c]], 1.0, epsilon = 1e-12);
-                    } else {
-                        assert_abs_diff_eq!(s_interactions[[r, c]], 0.0, epsilon = 1e-12);
+                    if (s_pgs[[r, c]] - s_pc[[r, c]]).abs() > 1e-12 {
+                        pgs_pc_difference_found = true;
+                        break;
                     }
-                } else {
-                    // Outside interaction block: should be zero
-                    assert_abs_diff_eq!(s_interactions[[r, c]], 0.0, epsilon = 1e-12);
+                }
+            }
+            if pgs_pc_difference_found {
+                break;
+            }
+        }
+        assert!(
+            pgs_pc_difference_found,
+            "PGS-direction and PC-direction penalty matrices should be different (not identical)"
+        );
+
+        // Check that both interaction penalties are zero outside the interaction block
+        for penalty_matrix in [s_pgs, s_pc] {
+            for r in 0..layout.total_coeffs {
+                for c in 0..layout.total_coeffs {
+                    if !interaction_block.col_range.contains(&r)
+                        || !interaction_block.col_range.contains(&c)
+                    {
+                        assert_abs_diff_eq!(penalty_matrix[[r, c]], 0.0, epsilon = 1e-12);
+                    }
                 }
             }
         }
@@ -1513,13 +1537,13 @@ mod tests {
                 if pc_main_block.col_range.contains(&r) && pc_main_block.col_range.contains(&c) {
                     // Within PC main block: should be identity
                     if r == c {
-                        assert_abs_diff_eq!(s_pc_mains[[r, c]], 1.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_main[[r, c]], 1.0, epsilon = 1e-12);
                     } else {
-                        assert_abs_diff_eq!(s_pc_mains[[r, c]], 0.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_main[[r, c]], 0.0, epsilon = 1e-12);
                     }
                 } else {
                     // Outside PC main block: should be zero
-                    assert_abs_diff_eq!(s_pc_mains[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_pc_main[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
