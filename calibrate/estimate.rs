@@ -236,37 +236,37 @@ pub fn train_model(
         }
     }
     
-    // CRITICAL: Always prefer asymmetric seeds to break optimizer symmetry trap
-    let start_z = if let Some((asym_rho, asym_cost, asym_idx)) = best_asymmetric_seed {
-        if let Some((_sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
-            if sym_cost < asym_cost {
-                eprintln!(
-                    "[Init] WARNING: Best seed was symmetric (#{}, cost={:.6}). \
-                     Overriding with best asymmetric seed (#{}, cost={:.6}) to break symmetry trap!",
-                    sym_idx, sym_cost, asym_idx, asym_cost
-                );
-            } else {
+    // Select the seed with the lowest cost (best fit)
+    let start_z = match (best_asymmetric_seed, best_symmetric_seed) {
+        (Some((asym_rho, asym_cost, asym_idx)), Some((sym_rho, sym_cost, sym_idx))) => {
+            // Both asymmetric and symmetric seeds available - choose the one with lower cost
+            if asym_cost <= sym_cost {
                 eprintln!("[Init] Using best asymmetric seed #{} (cost = {:.6})", asym_idx, asym_cost);
+                Some(to_z_from_rho(&asym_rho))
+            } else {
+                eprintln!("[Init] Using best symmetric seed #{} (cost = {:.6})", sym_idx, sym_cost);
+                Some(to_z_from_rho(&sym_rho))
             }
-        } else {
+        }
+        (Some((asym_rho, asym_cost, asym_idx)), None) => {
+            // Only asymmetric seed available
             eprintln!("[Init] Using only viable asymmetric seed #{} (cost = {:.6})", asym_idx, asym_cost);
+            Some(to_z_from_rho(&asym_rho))
         }
-        Some(to_z_from_rho(&asym_rho))
-    } else if let Some((sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
-        eprintln!(
-            "[Init] WARNING: Only symmetric seeds worked. Using #{} (cost = {:.6}). \
-             Optimizer may get trapped in symmetry!",
-            sym_idx, sym_cost
-        );
-        Some(to_z_from_rho(&sym_rho))
-    } else {
-        eprintln!("[Init] All seeds failed, falling back to neutral asymmetric rho");
-        // Even the fallback should be asymmetric
-        let mut fallback_rho = Array1::zeros(layout.num_penalties);
-        for i in 0..fallback_rho.len() {
-            fallback_rho[i] = (i as f64) * 0.1; // Small asymmetric perturbation
+        (None, Some((sym_rho, sym_cost, sym_idx))) => {
+            // Only symmetric seed available
+            eprintln!("[Init] Using only viable symmetric seed #{} (cost = {:.6})", sym_idx, sym_cost);
+            Some(to_z_from_rho(&sym_rho))
         }
-        Some(to_z_from_rho(&fallback_rho))
+        (None, None) => {
+            // No viable seeds - use fallback
+            eprintln!("[Init] All seeds failed, falling back to neutral asymmetric rho");
+            let mut fallback_rho = Array1::zeros(layout.num_penalties);
+            for i in 0..fallback_rho.len() {
+                fallback_rho[i] = (i as f64) * 0.1; // Small asymmetric perturbation
+            }
+            Some(to_z_from_rho(&fallback_rho))
+        }
     };
 
     // Fallback to previous default if none were finite (will likely be rescued by the barrier)
