@@ -1468,51 +1468,13 @@ fn pivoted_qr_faer(
     }
 
     // Step 5: Extract the consistent column permutation (pivot)
+    // The `pivot_columns` function requires an INVERSE permutation, which maps the
+    // new column index to the original column index. The faer `Permutation` object
+    // provides both forward and inverse representations. We explicitly request the
+    // inverse here to ensure mathematical correctness. `perm.inverse().arrays()`
+    // returns `(inverse_slice, forward_slice)`.
     let perm = qr.P();
-
-    // CRITICAL: Extract the permutation vector that behaves as a FORWARD permutation
-    // for our `pivot_columns` logic, i.e., `B_j = A_{pivot[j]}` for B = A * P.
-    //
-    // Step 5: Extract a robust forward permutation vector
-    // faer stores both forward and inverse permutations internally. Pick the one that
-    // actually matches A*P by comparing with our pivot_columns() function.
-    
-    // Build both candidate vectors
-    let (cand0, cand1) = perm.arrays();
-    let p0: Vec<usize> = cand0.to_vec();
-    let p1: Vec<usize> = cand1.to_vec();
-
-    // Ground truth using faer
-    let a_p_faer = a_faer.as_ref() * perm;
-
-    // Apply our pivot_columns with both candidates
-    let ours0 = pivot_columns(matrix.view(), &p0);
-    let ours1 = pivot_columns(matrix.view(), &p1);
-
-    // Choose the candidate that actually matches A * P
-    let mut err0 = 0.0f64;
-    let mut err1 = 0.0f64;
-    for i in 0..m {
-        for j in 0..n {
-            let v = a_p_faer[(i, j)];
-            err0 = err0.max((v - ours0[[i, j]]).abs());
-            err1 = err1.max((v - ours1[[i, j]]).abs());
-        }
-    }
-
-    let pivot: Vec<usize> = if err0 <= 1e-12 { 
-        p0 
-    } else if err1 <= 1e-12 { 
-        p1 
-    } else {
-        // If both are off by > 1e-12, pick the better and warn. This prevents hard fails in release.
-        log::warn!(
-            "Permutation direction ambiguous (errs: {:.3e}, {:.3e}); choosing best",
-            err0,
-            err1
-        );
-        if err0 < err1 { p0 } else { p1 }
-    };
+    let pivot: Vec<usize> = perm.inverse().arrays().0.to_vec();
 
 
     Ok((q, r, pivot))
@@ -2841,5 +2803,56 @@ mod tests {
 
         let diff = (&lhs - &rhs).mapv(|v| v.abs()).sum();
         assert!(diff < 1e-10, "S != EᵀE in transformed basis (sum abs diff = {})", diff);
+    }
+
+    /// This test verifies that the permutation logic in `pivoted_qr_faer` is correct
+    /// and mathematically sound.
+    ///
+    /// It works by checking the fundamental mathematical identity of a pivoted QR decomposition: A*P = Q*R.
+    /// If the permutation P is correct, the identity will hold, and the reconstruction error
+    /// || A*P - Q*R || will be small (close to machine precision).
+    #[test]
+    fn test_pivoted_qr_permutation_is_reliable() {
+        use ndarray::arr2;
+        
+        // 1. SETUP: Create a matrix that is tricky to pivot.
+        // It's nearly rank-deficient, with highly correlated columns, forcing a non-trivial pivot.
+        // This is representative of the design matrices created in the model tests.
+        let a = arr2(&[
+            [1.0, 2.0, 3.0, 1.0000001],
+            [4.0, 5.0, 9.0, 4.0000002],
+            [6.0, 7.0, 13.0, 6.0000003],
+            [8.0, 9.0, 17.0, 8.0000004],
+        ]);
+
+        // 2. EXECUTION: Call the function under test.
+        let (q, r, pivot) =
+            pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
+
+        // 3. VERIFICATION: Check if the fundamental QR identity holds.
+        // First, apply the permutation to the original matrix 'a'.
+        let a_pivoted = pivot_columns(a.view(), &pivot);
+
+        // Then, compute Q*R using the results from the function.
+        let qr_product = q.dot(&r);
+
+        // Calculate the reconstruction error. If the pivot is correct, this should be near zero.
+        let reconstruction_error_matrix = &a_pivoted - &qr_product;
+        let reconstruction_error_norm = reconstruction_error_matrix.mapv(|x| x.abs()).sum();
+
+        println!("Matrix A:\n{:?}", a);
+        println!("Permutation P: {:?}", pivot);
+        println!("Reconstructed A*P (from pivot):\n{:?}", a_pivoted);
+        println!("Q*R Product:\n{:?}", qr_product);
+        println!("Reconstruction Error Norm: {}", reconstruction_error_norm);
+
+        // 4. ASSERTION: The reconstruction error must be small, proving the pivot is correct.
+        // A correct implementation should have an error norm close to machine epsilon (~1e-15).
+        // An error norm greater than 1e-6 would be a definitive failure.
+        assert!(
+            reconstruction_error_norm < 1e-6,
+            "The reconstruction error is too large ({:e}), which indicates the permutation vector is incorrect. The contract A*P = Q*R is violated.",
+            reconstruction_error_norm
+        );
     }
 }
