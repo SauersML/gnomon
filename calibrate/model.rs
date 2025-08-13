@@ -508,6 +508,7 @@ mod tests {
                     knots
                 },
                 range_transforms: HashMap::new(),
+                interaction_range_transforms: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -666,6 +667,7 @@ mod tests {
             constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            interaction_range_transforms: HashMap::new(),
         };
 
         // Use the internal flatten_coefficients function
@@ -743,6 +745,7 @@ mod tests {
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+            interaction_range_transforms: HashMap::new(),
         };
 
         // Create a dummy dataset for generating the correct model structure

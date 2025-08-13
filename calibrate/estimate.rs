@@ -2934,6 +2934,7 @@ pub mod internal {
                 constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                interaction_range_transforms: std::collections::HashMap::new(),
             };
 
             // --- 3. Build Model Structure ---
@@ -4666,6 +4667,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
+        interaction_range_transforms: HashMap::new(),
     };
 
     // 3. Train the model and expect an error
@@ -4740,6 +4742,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
+        interaction_range_transforms: std::collections::HashMap::new(),
     };
 
     // Try to build the matrices - if this fails, the test is still valid

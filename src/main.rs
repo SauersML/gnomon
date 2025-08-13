@@ -139,6 +139,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
+        interaction_range_transforms: std::collections::HashMap::new(),
     };
 
     // Train the final model
