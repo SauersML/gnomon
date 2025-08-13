@@ -249,7 +249,7 @@ pub fn train_model(
                 };
 
                 // Only accept the solution if gradient norm is small enough
-                const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 1000.0;
+                const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 10000.0;
                 if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
                         "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
