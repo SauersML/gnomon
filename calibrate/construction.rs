@@ -1269,7 +1269,7 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, range_transforms) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, _, _, _range_transforms) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
         
