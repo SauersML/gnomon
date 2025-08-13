@@ -119,16 +119,17 @@ impl ModelLayout {
         let intercept_col = current_col;
         current_col += 1;
 
-        // Main effect for each PC (all share penalty index 0 due to grouping)
+        // Main effect for each PC (each gets its own unique penalty index)
         for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
             let range = current_col..current_col + num_basis;
             penalty_map.push(PenalizedBlock {
                 term_name: format!("f({})", config.pc_names[i]),
                 col_range: range.clone(),
-                penalty_indices: vec![0], // All PC mains share penalty index 0
+                penalty_indices: vec![_penalty_idx_counter], // Each PC main gets unique penalty index
                 term_type: TermType::PcMainEffect,
             });
             current_col += num_basis;
+            _penalty_idx_counter += 1; // Increment for next penalty
         }
 
         // Main effect for PGS (non-constant basis terms)
@@ -136,7 +137,7 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Tensor product interaction effects (all share penalty index 1 due to grouping)
+        // Tensor product interaction effects (each gets its own unique penalty index)
         if num_pgs_interaction_bases > 0 {
             for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
@@ -145,24 +146,17 @@ impl ModelLayout {
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
-                    penalty_indices: vec![1], // All interactions share penalty index 1
+                    penalty_indices: vec![_penalty_idx_counter], // Each interaction gets unique penalty index
                     term_type: TermType::Interaction,
                 });
 
                 current_col += num_tensor_coeffs;
+                _penalty_idx_counter += 1; // Increment for next penalty
             }
         }
 
-        // With penalty grouping, we have at most 2 penalties: 
-        // 0 for PC mains (if any), 1 for interactions (if any)
-        let has_pc_mains = !pc_constrained_basis_ncols.is_empty();
-        let has_interactions = num_pgs_interaction_bases > 0 && !pc_constrained_basis_ncols.is_empty();
-        _penalty_idx_counter = match (has_pc_mains, has_interactions) {
-            (true, true) => 2,   // Both PC mains and interactions
-            (true, false) => 1,  // Only PC mains
-            (false, true) => 1,  // Only interactions (shouldn't happen in practice)
-            (false, false) => 0, // No penalties
-        };
+        // Total number of individual penalties: one per PC main + one per interaction
+        // _penalty_idx_counter has already been incremented to the correct total
 
         // Verify that our calculation matches the actual column count
         if current_col != calculated_total_coeffs {
@@ -295,12 +289,10 @@ pub fn build_design_and_penalty_matrices(
         );
     }
 
-    // 3. Penalty grouping setup: Create grouped penalty matrices
-    // This reduces the number of smoothing parameters from O(#PCs) to just 2-3
+    // 3. Calculate layout first to determine matrix dimensions
     let pc_range_ncols: Vec<usize> = pc_range_bases.iter().map(|b| b.ncols()).collect();
     let pgs_range_ncols = range_transforms.get("pgs").map(|rt| rt.ncols()).unwrap_or(0);
     
-    // Calculate layout first to determine matrix dimensions for penalty grouping
     let layout = ModelLayout::new(
         config,
         &pc_range_ncols,
@@ -309,40 +301,26 @@ pub fn build_design_and_penalty_matrices(
         pgs_range_ncols, // Use PGS range size for interactions
     )?;
 
-    // 4. Create grouped penalty matrices with identity penalties in whitened coordinates
+    // 4. Create individual penalty matrices - one per PC main and one per interaction
+    // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
-    let mut s_pc_main_total = Array2::zeros((p, p));
-    let mut s_inter_total = Array2::zeros((p, p));
+    let mut s_list = Vec::with_capacity(layout.num_penalties);
     
-    // Add identity penalties for PC main effects (grouped)
+    // Initialize all penalty matrices as zeros
+    for _ in 0..layout.num_penalties {
+        s_list.push(Array2::zeros((p, p)));
+    }
+    
+    // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
-        if block.term_type == crate::calibrate::construction::TermType::PcMainEffect {
-            let col_range = block.col_range.clone();
-            let range_len = col_range.len();
-            s_pc_main_total
-                .slice_mut(s![col_range.clone(), col_range])
-                .assign(&Array2::eye(range_len));
-        }
-    }
-    
-    // Add identity penalties for interaction effects (grouped)
-    for block in &layout.penalty_map {
-        if block.term_type == crate::calibrate::construction::TermType::Interaction {
-            let col_range = block.col_range.clone();
-            let range_len = col_range.len();
-            s_inter_total
-                .slice_mut(s![col_range.clone(), col_range])
-                .assign(&Array2::eye(range_len));
-        }
-    }
-    
-    // Build the final penalty list (reduced from many to just 2)
-    let mut s_list = Vec::new();
-    if s_pc_main_total.iter().any(|&v: &f64| v.abs() > 0.0) {
-        s_list.push(s_pc_main_total);
-    }
-    if s_inter_total.iter().any(|&v: &f64| v.abs() > 0.0) {
-        s_list.push(s_inter_total);
+        let penalty_idx = block.penalty_indices[0]; // Each block has exactly one penalty index
+        let col_range = block.col_range.clone();
+        let range_len = col_range.len();
+        
+        // Set identity penalty for this specific block
+        s_list[penalty_idx]
+            .slice_mut(s![col_range.clone(), col_range])
+            .assign(&Array2::eye(range_len));
     }
 
     // Range transformations will be returned directly to the caller
@@ -1293,20 +1271,23 @@ mod tests {
 
         let (x, s_list, layout, _, _, range_transforms) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // Option 3 dimensional calculation using range transforms
-        let pgs_main_coeffs =
-            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // Unchanged (sum-to-zero constrained)
+        // Option 3 dimensional calculation - direct computation based on basis sizes and null space
         
-        // PC main coeffs = range dimension (fully penalized)
-        let r_pc = range_transforms.get("PC1").unwrap().ncols();
-        let pc_main_coeffs = r_pc;
+        // PGS main is still unpenalized and sum-to-zero constrained
+        let pgs_main_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // 6 - 1 - 1 = 4
         
-        // Interaction coeffs = r_pgs × r_pc (Range × Range tensor product)
-        let r_pgs = range_transforms.get("pgs").unwrap().ncols();
-        let interaction_coeffs = r_pgs * r_pc;
+        // PC1 main is now range-only (penalized part only)
+        // Range dimension = main basis cols - null space dimension
+        let pc1_main_basis_cols = config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree; // 5 - 1 = 4
+        let r_pc = pc1_main_basis_cols - config.penalty_order; // 4 - 2 = 2
         
-        let expected_total_coeffs = 1 + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
-        let expected_num_penalties = 2; // Grouped: 1 for all PC mains, 1 for all interactions
+        // Interaction is R×R (both dimensions use range-only)
+        let pgs_main_basis_cols = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree; // 6 - 1 = 5  
+        let r_pgs = pgs_main_basis_cols - config.penalty_order; // 5 - 2 = 3
+        let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
+        
+        let expected_total_coeffs = 1 + pgs_main_coeffs + r_pc + interaction_coeffs; // 1 + 4 + 2 + 6 = 13
+        let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction
 
         assert_eq!(
             layout.total_coeffs, expected_total_coeffs,
