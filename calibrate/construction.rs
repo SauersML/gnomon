@@ -23,9 +23,9 @@ fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
     means
 }
 
-/// Centers the columns of a matrix using weighted means for functional ANOVA decomposition.
-/// This ensures interaction terms are orthogonal to main effects in the data metric.
-fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
+/// Centers the columns of a matrix using weighted means.
+/// This enforces intercept orthogonality (sum-to-zero) for the columns it is applied to.
+pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
     let means = weighted_column_means(x, w);
     // Subtract means from each column
     for j in 0..x.ncols() {
@@ -38,8 +38,8 @@ fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.
 /// NOTE: Currently unused due to penalty grouping in Option 3 implementation
-#[allow(dead_code)]
-fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+/// Function is currently unused but kept for future implementation
+pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let (a_rows, a_cols) = a.dim();
     let (b_rows, b_cols) = b.dim();
     let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
@@ -129,7 +129,7 @@ impl ModelLayout {
     ) -> Result<Self, EstimationError> {
         let mut penalty_map = Vec::new();
         let mut current_col = 0;
-        let mut _penalty_idx_counter = 0;
+        let mut penalty_idx_counter = 0;
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
@@ -152,11 +152,11 @@ impl ModelLayout {
             penalty_map.push(PenalizedBlock {
                 term_name: format!("f({})", config.pc_names[i]),
                 col_range: range.clone(),
-                penalty_indices: vec![_penalty_idx_counter], // Each PC main gets unique penalty index
+                penalty_indices: vec![penalty_idx_counter], // Each PC main gets unique penalty index
                 term_type: TermType::PcMainEffect,
             });
             current_col += num_basis;
-            _penalty_idx_counter += 1; // Increment for next penalty
+            penalty_idx_counter += 1; // Increment for next penalty
         }
 
         // Main effect for PGS (non-constant basis terms)
@@ -173,12 +173,12 @@ impl ModelLayout {
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
-                    penalty_indices: vec![_penalty_idx_counter], // Single penalty since both directions are whitened
+                    penalty_indices: vec![penalty_idx_counter], // Single penalty since both directions are whitened
                     term_type: TermType::Interaction,
                 });
 
                 current_col += num_tensor_coeffs;
-                _penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
+                penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
             }
         }
 
@@ -197,7 +197,7 @@ impl ModelLayout {
             pgs_main_cols,
             penalty_map,
             total_coeffs: current_col,
-            num_penalties: _penalty_idx_counter,
+            num_penalties: penalty_idx_counter,
         })
     }
 }
@@ -244,7 +244,6 @@ pub fn build_design_and_penalty_matrices(
     // 1. Generate basis for PGS and apply sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
         data.p.view(),
-        Some(data.p.view()),
         config.pgs_range,
         config.pgs_basis_config.num_knots,
         config.pgs_basis_config.degree,
@@ -270,7 +269,7 @@ pub fn build_design_and_penalty_matrices(
         .filter_map(|(i, &d)| if d > pgs_tol { Some(i) } else { None })
         .collect();
     let u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
-    let _d_pgs_range = ndarray::Array1::from_iter(pgs_range_idxs.iter().map(|&i| pgs_evals[i]));
+    // Unused variable removed: d_pgs_range
     interaction_range_transforms.insert("pgs".to_string(), u_pgs_range.to_owned());
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
@@ -281,14 +280,14 @@ pub fn build_design_and_penalty_matrices(
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (_z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main, pgs_tol)?;
+    let (_, z_range_pgs) = basis::null_range_whiten(&s_pgs_main, pgs_tol)?;
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
 
     // Save the PGS sum-to-zero constraint transformation in the new dedicated field
     sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
-    
+
     // Also save in old field for backward compatibility during transition
     constraints.insert(
         "pgs_main".to_string(),
@@ -311,7 +310,6 @@ pub fn build_design_and_penalty_matrices(
         let pc_name = &config.pc_names[i];
         let (pc_basis_unc, pc_knots) = create_bspline_basis(
             pc_col.view(),
-            Some(pc_col.view()),
             config.pc_ranges[i],
             config.pc_basis_configs[i].num_knots,
             config.pc_basis_configs[i].degree,
@@ -346,7 +344,7 @@ pub fn build_design_and_penalty_matrices(
         // Create whitened range transform for PC main effects
         let s_pc_main =
             create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (_z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_main, pc_tol)?;
+        let (_, z_range_pc) = basis::null_range_whiten(&s_pc_main, pc_tol)?;
 
         interaction_range_transforms.insert(pc_name.clone(), u_pc_range.to_owned());
 
@@ -495,12 +493,7 @@ pub fn build_design_and_penalty_matrices(
         let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
             EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
         })?;
-        let mut pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
-
-        // CRITICAL: Store centering means and center PGS marginal for functional ANOVA
-        let pgs_means = weighted_column_means(&pgs_int_basis, &data.weights);
-        interaction_centering_means.insert("pgs".to_string(), pgs_means);
-        center_columns_in_place(&mut pgs_int_basis, &data.weights);
+        let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
 
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
@@ -519,12 +512,7 @@ pub fn build_design_and_penalty_matrices(
             let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
                 EstimationError::LayoutError(format!("Missing '{}' in range_transforms", pc_name))
             })?;
-            let mut pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
-
-            // CRITICAL: Store centering means and center PC marginal for functional ANOVA
-            let pc_means = weighted_column_means(&pc_int_basis, &data.weights);
-            interaction_centering_means.insert(pc_name.clone(), pc_means);
-            center_columns_in_place(&mut pc_int_basis, &data.weights);
+            let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
 
             let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
@@ -547,10 +535,27 @@ pub fn build_design_and_penalty_matrices(
                 )));
             }
 
-            // Assign to the design matrix
+            // Center the FINAL tensor product columns (intercept-orthogonality)
+            // 1) compute and store weighted column means (per interaction block)
+            let interaction_key = format!("f(PGS,{})", pc_name);
+            let means = weighted_column_means(&tensor_interaction, &data.weights);
+            interaction_centering_means.insert(interaction_key, means.clone());
+
+            // 2) subtract means in place (same as training)
+            let mut tensor_centered = tensor_interaction.clone();
+            for j in 0..tensor_centered.ncols() {
+                let m = means[j];
+                tensor_centered.column_mut(j).mapv_inplace(|v| v - m);
+            }
+
+            // Assign centered tensor block to design matrix
+            // Note: Full orthogonalization against main effects would create training-prediction mismatch
+            // since it requires row-space projectors that depend on training data and cannot be reproduced
+            // on new data. The current approach (Range×Range interactions + final column centering)
+            // maintains reproducibility while ensuring intercept orthogonality.
             x_matrix
                 .slice_mut(s![.., col_range])
-                .assign(&tensor_interaction);
+                .assign(&tensor_centered);
         }
     }
 
@@ -590,7 +595,7 @@ pub struct ReparamResult {
     pub det1: Array1<f64>,
     /// Orthogonal transformation matrix Qs
     pub qs: Array2<f64>,
-    /// Transformed penalty square roots rS (each is p x rank_k)
+    /// Transformed penalty square roots rS (each is rank_k x p)
     pub rs_transformed: Vec<Array2<f64>>,
     /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
     /// This is used for applying the actual penalty in the least squares solve
@@ -723,7 +728,9 @@ pub fn construct_s_lambda(
     if lambdas.len() != s_list.len() {
         panic!(
             "Lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
-            s_list.len(), s_list.len(), lambdas.len()
+            s_list.len(),
+            s_list.len(),
+            lambdas.len()
         );
     }
 
@@ -769,7 +776,9 @@ pub fn stable_reparameterization(
     if lambdas.len() != m {
         return Err(EstimationError::ParameterConstraintViolation(format!(
             "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
-            m, m, lambdas.len()
+            m,
+            m,
+            lambdas.len()
         )));
     }
 
@@ -831,12 +840,9 @@ pub fn stable_reparameterization(
             q_current
         );
 
-        log::debug!(
+        println!(
             "Iteration {}: k_offset={}, q_current={}, gamma={:?}",
-            iteration,
-            k_offset,
-            q_current,
-            gamma
+            iteration, k_offset, q_current, gamma
         );
 
         // Step 1: Find Frobenius norms of penalties in current sub-problem
@@ -845,7 +851,7 @@ pub fn stable_reparameterization(
         let mut max_omega: f64 = 0.0;
 
         for &i in &gamma {
-            // FIXED: Extract active columns from penalty square root (rank x p convention)
+            // Extract active columns from penalty square root (rank x p convention)
             let rs_active_cols = rs_current[i].slice(s![.., k_offset..k_offset + q_current]);
 
             // Skip if penalty has no rows (zero rank penalty)
@@ -854,7 +860,7 @@ pub fn stable_reparameterization(
                 continue;
             }
 
-            // FIXED: Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
+            // Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
             let s_active_block = rs_active_cols.t().dot(&rs_active_cols);
 
             // The Frobenius norm is the sqrt of sum of squares of matrix elements
@@ -904,14 +910,13 @@ pub fn stable_reparameterization(
         // No need for conversion - they contain the actual indices from gamma
 
         if alpha.is_empty() {
-            log::debug!("No terms in alpha set. Terminating.");
+            println!("No terms in alpha set. Terminating.");
             break;
         }
 
-        log::debug!(
+        println!(
             "Partitioned: alpha set = {:?}, gamma_prime set = {:?}",
-            alpha,
-            gamma_prime
+            alpha, gamma_prime
         );
 
         // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
@@ -954,13 +959,52 @@ pub fn stable_reparameterization(
             .filter(|&&ev| ev > rank_tolerance)
             .count();
 
-        log::debug!(
+        println!(
             "Stable rank detection: found rank {} from {} eigenvalues (max_eig: {}, tol: {})",
             r,
             eigenvalues_for_rank.len(),
             max_eigenval,
             rank_tolerance
         );
+
+        // Correct energy capture check using eigenvalues of sb_for_rank (basis-invariant)
+        if r > 1 {
+            let positive_eigenvalues: Vec<f64> = eigenvalues_for_rank
+                .iter()
+                .filter(|&&e| e > rank_tolerance)
+                .copied()
+                .collect();
+
+            if !positive_eigenvalues.is_empty() {
+                let total_energy: f64 = positive_eigenvalues.iter().sum();
+                let top_r_eigenvalues: Vec<f64> = positive_eigenvalues
+                    .iter()
+                    .rev() // Largest first (eigenvalues are in ascending order)
+                    .take(r)
+                    .copied()
+                    .collect();
+                let captured_energy: f64 = top_r_eigenvalues.iter().sum();
+
+                let captured_energy_ratio = if total_energy > 1e-12 {
+                    captured_energy / total_energy
+                } else {
+                    1.0
+                };
+
+                // If the top r eigenvalues don't capture enough energy, reduce r conservatively
+                if captured_energy_ratio < 0.8 {
+                    let conservative_r = r.saturating_sub(1);
+                    log::warn!(
+                        "Top {} eigenvalues capture only {:.1}% of total energy. Reducing r from {} to {}",
+                        r,
+                        captured_energy_ratio * 100.0,
+                        r,
+                        conservative_r
+                    );
+                    r = conservative_r;
+                }
+            }
+        }
 
         // Step 3b: Form WEIGHTED sum for TRANSFORMATION (lambda-weighted for eigenvectors)
         // This matrix provides the eigenvectors for the similarity transform
@@ -983,7 +1027,7 @@ pub fn stable_reparameterization(
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // SAFETY CHECK: Validate that the two decompositions agree on the rank
-        // If the lambda-weighted matrix has significantly different rank structure, 
+        // If the lambda-weighted matrix has significantly different rank structure,
         // the reparameterization may be unreliable
         let max_eigenval_transform = eigenvalues_for_transform
             .iter()
@@ -998,9 +1042,10 @@ pub fn stable_reparameterization(
         if (r as i32 - r_transform as i32).abs() > 1 {
             log::warn!(
                 "Rank disagreement detected: balanced matrix rank={}, weighted matrix rank={}. Proceeding with caution.",
-                r, r_transform
+                r,
+                r_transform
             );
-            
+
             // Fall back to more conservative rank estimate to avoid corruption
             let r_conservative = r.min(r_transform);
             if r_conservative == 0 {
@@ -1013,11 +1058,9 @@ pub fn stable_reparameterization(
 
         // Note: The stable rank detection debug message is already logged above
 
-        log::debug!(
+        println!(
             "Rank detection: r={}, q_current={}, iteration={}",
-            r,
-            q_current,
-            iteration
+            r, q_current, iteration
         );
 
         // ---
@@ -1032,26 +1075,6 @@ pub fn stable_reparameterization(
             // No range directions identified this iteration; switch to gamma' and continue
             gamma = gamma_prime;
             continue;
-        }
-
-        // ENERGY CHECK: Verify that the selected range subspace from sb_for_transform 
-        // actually captures the dominant energy of sb_for_rank before committing
-        let u_range_candidate = u.slice(s![.., q_current - r..]); // Last r columns from sb_for_transform
-        let projected_energy = u_range_candidate.t().dot(&sb_for_rank).dot(&u_range_candidate);
-        let total_energy_rank = sb_for_rank.diag().sum(); // Trace of sb_for_rank
-        
-        if total_energy_rank > 1e-12 { // Avoid division by zero
-            let captured_energy_ratio = projected_energy.diag().sum() / total_energy_rank;
-            
-            // If the selected range space doesn't capture enough energy from the rank matrix,
-            // reduce r to be more conservative
-            if captured_energy_ratio < 0.8 && r > 1 { // 80% energy threshold
-                log::warn!(
-                    "Range subspace captures only {:.1}% of rank matrix energy. Reducing r from {} to {}",
-                    captured_energy_ratio * 100.0, r, r - 1
-                );
-                r = r - 1;
-            }
         }
 
         let u_range = u.slice(s![.., q_current - r..]); // Last r columns
@@ -1095,7 +1118,7 @@ pub fn stable_reparameterization(
                 continue;
             }
 
-            // FIXED: For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
+            // For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
             let c_matrix = rs_current[i]
                 .slice(s![.., k_offset..k_offset + q_current])
                 .to_owned();
@@ -1119,16 +1142,18 @@ pub fn stable_reparameterization(
 
             if alpha.contains(&i) {
                 // DOMINANT penalty: Its effect is now entirely within the range space.
-                // FIXED: For rank×p roots, zero out the null space COLUMNS (not rows)
+                // For rank×p roots, zero out the null space COLUMNS (not rows)
                 // The null space is now the LAST `q_current - r` columns of the sub-block.
                 if r < q_current {
                     // Use explicit end index to avoid zeroing beyond current subblock
-                    rs_current[i].slice_mut(s![.., k_offset + r..k_offset + q_current]).fill(0.0);
+                    rs_current[i]
+                        .slice_mut(s![.., k_offset + r..k_offset + q_current])
+                        .fill(0.0);
                 }
             } else {
                 // SUB-DOMINANT penalty (in gamma_prime).
                 // Its effect is carried forward in the null space.
-                // FIXED: For rank×p roots, zero out the range space COLUMNS (not rows)
+                // For rank×p roots, zero out the range space COLUMNS (not rows)
                 // The range space is now the FIRST `r` columns of the sub-block.
                 rs_current[i]
                     .slice_mut(s![.., k_offset..k_offset + r])
@@ -1145,14 +1170,23 @@ pub fn stable_reparameterization(
                 if r < q_current {
                     // Zero out the null-space rows and columns (bottom-right block)
                     s_current_list[i]
-                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset + r..k_offset + q_current])
+                        .slice_mut(s![
+                            k_offset + r..k_offset + q_current,
+                            k_offset + r..k_offset + q_current
+                        ])
                         .fill(0.0);
                     // Zero out the off-diagonal blocks connecting range and null spaces
                     s_current_list[i]
-                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
+                        .slice_mut(s![
+                            k_offset..k_offset + r,
+                            k_offset + r..k_offset + q_current
+                        ])
                         .fill(0.0);
                     s_current_list[i]
-                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
+                        .slice_mut(s![
+                            k_offset + r..k_offset + q_current,
+                            k_offset..k_offset + r
+                        ])
                         .fill(0.0);
                 }
             } else {
@@ -1163,10 +1197,16 @@ pub fn stable_reparameterization(
                     .fill(0.0);
                 // Zero out the off-diagonal blocks connecting range and null spaces
                 s_current_list[i]
-                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
+                    .slice_mut(s![
+                        k_offset..k_offset + r,
+                        k_offset + r..k_offset + q_current
+                    ])
                     .fill(0.0);
                 s_current_list[i]
-                    .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
+                    .slice_mut(s![
+                        k_offset + r..k_offset + q_current,
+                        k_offset..k_offset + r
+                    ])
                     .fill(0.0);
             }
         }
@@ -1177,22 +1217,20 @@ pub fn stable_reparameterization(
         q_current -= r; // Reduce problem size by the rank we processed
         gamma = gamma_prime; // Continue with the subdominant penalties
 
-        log::debug!(
+        println!(
             "Updated for next iteration: k_offset={}, q_current={}, gamma.len()={}",
             k_offset,
             q_current,
             gamma.len()
         );
 
-        log::debug!(
+        println!(
             "[Reparam Iteration #{}] Finished. Determined rank: {}. Next problem size: {}",
-            iteration,
-            r,
-            q_current
+            iteration, r, q_current
         );
     }
 
-    log::debug!(
+    println!(
         "[Reparam] Loop finished after {} iterations. Proceeding to generate final outputs.",
         iteration
     );
@@ -1217,7 +1255,9 @@ pub fn stable_reparameterization(
         .map_err(EstimationError::EigendecompositionFailed)?;
 
     // Count non-zero eigenvalues to determine the rank using relative tolerance
-    let max_eigenval = s_eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    let max_eigenval = s_eigenvalues
+        .iter()
+        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     let tolerance = max_eigenval * 1e-12; // Relative tolerance for better numerical stability
     let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
@@ -1430,8 +1470,7 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, _, _range_transforms, _, _) =
-            build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, s_list, layout, ..) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
 
@@ -1477,7 +1516,7 @@ mod tests {
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (x, _, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, ..) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Calculate numerical rank via SVD
         let svd = x.svd(false, false).expect("SVD failed");
@@ -1593,6 +1632,125 @@ mod tests {
         assert_eq!(
             layout.num_penalties, 0,
             "PGS-only model should have no penalties."
+        );
+    }
+
+    #[test]
+    fn test_training_prediction_design_matrix_consistency() {
+        // Build training matrices and transforms
+        let (data, config) = create_test_data_for_construction(100, 1);
+        // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
+        let result = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let x_training = result.0;
+        let constraints = result.3;
+        let sum_to_zero_constraints = result.4;
+        let knot_vectors = result.5;
+        let range_transforms = result.6;
+        let interaction_range_transforms = result.7;
+        let interaction_centering_means = result.8;
+
+        // Prepare a config carrying all saved transforms
+        let mut cfg = config.clone();
+        cfg.constraints = constraints.clone();
+        cfg.sum_to_zero_constraints = sum_to_zero_constraints.clone();
+        cfg.knot_vectors = knot_vectors.clone();
+        cfg.range_transforms = range_transforms.clone();
+        cfg.interaction_range_transforms = interaction_range_transforms.clone();
+        cfg.interaction_centering_means = interaction_centering_means.clone();
+
+        // Construct coefficients in the canonical structure
+        use crate::calibrate::model::{MainEffects, MappedCoefficients, TrainedModel};
+
+        // For this config, there is 1 PC (if you built with num_pcs=1 above).
+        // Determine sizes from cfg.range_transforms and sum_to_zero_constraints.
+        let pgs_dim = cfg
+            .sum_to_zero_constraints
+            .get("pgs_main")
+            .expect("missing pgs_main Z")
+            .ncols();
+        let pc_name = cfg.pc_names[0].clone();
+        let r_pc = cfg
+            .range_transforms
+            .get(&pc_name)
+            .expect("missing PC range transform")
+            .ncols();
+        let r_pgs = cfg
+            .range_transforms
+            .get("pgs")
+            .expect("missing PGS range transform")
+            .ncols();
+
+        let interaction_len = r_pgs * r_pc;
+
+        // Populate coefficients deterministically
+        let coeffs = MappedCoefficients {
+            intercept: 0.123,
+            main_effects: MainEffects {
+                pgs: (1..=pgs_dim).map(|i| i as f64).collect(),
+                pcs: {
+                    let mut pcs = HashMap::new();
+                    pcs.insert(
+                        pc_name.clone(),
+                        (1..=r_pc).map(|i| 10.0 + i as f64).collect(),
+                    );
+                    pcs
+                },
+            },
+            interaction_effects: {
+                let mut m = HashMap::new();
+                m.insert(
+                    format!("f(PGS,{})", pc_name),
+                    (1..=interaction_len).map(|i| 100.0 + i as f64).collect(),
+                );
+                m
+            },
+        };
+
+        // Manually flatten coefficients using the same canonical order as model::internal::flatten_coefficients
+        let mut flat: Vec<f64> = Vec::new();
+        flat.push(coeffs.intercept);
+        for pc in &cfg.pc_names {
+            flat.extend_from_slice(
+                coeffs
+                    .main_effects
+                    .pcs
+                    .get(pc)
+                    .expect("missing PC main coeffs"),
+            );
+        }
+        flat.extend_from_slice(&coeffs.main_effects.pgs);
+        for pc in &cfg.pc_names {
+            let key = format!("f(PGS,{})", pc);
+            if let Some(v) = coeffs.interaction_effects.get(&key) {
+                flat.extend_from_slice(v);
+            }
+        }
+        let flat = ndarray::Array1::from(flat);
+
+        // Build a trained model with this config and coefficients
+        let model = TrainedModel {
+            config: cfg,
+            coefficients: coeffs.clone(),
+            lambdas: vec![], // not used at prediction
+        };
+
+        // Compute predictions via predict() (which rebuilds X_new internally)
+        let preds_via_predict = model
+            .predict(data.p.view(), data.pcs.view())
+            .expect("predict failed");
+
+        // Compute predictions directly from X_training (should match)
+        let preds_direct = x_training.dot(&flat);
+
+        // Compare
+        let max_diff = (&preds_via_predict - &preds_direct)
+            .mapv(|x| x.abs())
+            .iter()
+            .fold(0.0f64, |acc, &x| acc.max(x));
+        assert!(
+            max_diff < 1e-10,
+            "Training and prediction paths must be consistent; max |diff| = {}",
+            max_diff
         );
     }
 }

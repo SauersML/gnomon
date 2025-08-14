@@ -1,37 +1,31 @@
-diff --git a/Cargo.toml b/Cargo.toml
-index 906eb81..18171f1 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -77,6 +77,8 @@ no-inline-profiling = []
- 
- [lints.rust]
- unused_variables = "deny"
-+dead_code = "deny"
-+unused_imports = "deny"
- 
- [dev-dependencies]
- criterion = { version = "0.5", features = ["html_reports"] }
 diff --git a/build.rs b/build.rs
-index 1f8d262..5d5b751 100644
+index 1f8d262..84a88f3 100644
 --- a/build.rs
 +++ b/build.rs
-@@ -24,6 +24,12 @@ struct CustomUppercaseCollector {
-     file_path: PathBuf,
+@@ -275,6 +275,12 @@ fn main() {
+         eprintln!("{e}");
+         std::process::exit(1);
+     }
++    
++    // Scan Rust source files for #[allow(dead_code)] attributes and fail if found.
++    if let Err(e) = scan_for_allow_dead_code() {
++        eprintln!("{e}");
++        std::process::exit(1);
++    }
  }
  
+ // This function manually checks for unused variables in the current file
+@@ -451,3 +457,94 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
+ 
+     Ok(())
+ }
++
 +// A custom collector for #[allow(dead_code)] attribute violations
 +struct DeadCodeCollector {
 +    violations: Vec<String>,
 +    file_path: PathBuf,
 +}
 +
- impl ViolationCollector {
-     fn new(file_path: &Path) -> Self {
-         Self {
-@@ -128,6 +134,37 @@ impl CustomUppercaseCollector {
-     }
- }
- 
 +impl DeadCodeCollector {
 +    fn new(file_path: &Path) -> Self {
 +        Self {
@@ -63,13 +57,6 @@ index 1f8d262..5d5b751 100644
 +    }
 +}
 +
- // Implement the `Sink` trait for our collector.
- // The `matched` method is called by the searcher for every line that matches the regex.
- impl Sink for ViolationCollector {
-@@ -255,6 +292,22 @@ impl Sink for CustomUppercaseCollector {
-     }
- }
- 
 +impl Sink for DeadCodeCollector {
 +    type Error = std::io::Error;
 +
@@ -85,76 +72,6 @@ index 1f8d262..5d5b751 100644
 +        Ok(true)
 +    }
 +}
-+
- fn main() {
-     // Always rerun this script if the build script itself changes.
-     println!("cargo:rerun-if-changed=build.rs");
-@@ -275,12 +328,18 @@ fn main() {
-         eprintln!("{e}");
-         std::process::exit(1);
-     }
-+    
-+    // Scan Rust source files for #[allow(dead_code)] attributes and fail if found.
-+    if let Err(e) = scan_for_allow_dead_code() {
-+        eprintln!("{e}");
-+        std::process::exit(1);
-+    }
- }
- 
- // This function manually checks for unused variables in the current file
- fn manually_check_for_unused_variables() {
--    // Force compilation to fail with unused_variables lint
--    // This ensures build.rs itself follows the strict no-unused-variables policy
-+    // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
-+    // This ensures build.rs itself follows the strict coding policy
-     let build_path = Path::new("build.rs");
-     let status = std::process::Command::new("rustc")
-         .args([
-@@ -288,6 +347,10 @@ fn manually_check_for_unused_variables() {
-             "2021",
-             "-D",
-             "unused_variables",
-+            "-D",
-+            "dead_code",
-+            "-D",
-+            "unused_imports",
-             "--crate-type",
-             "bin",
-             "--error-format",
-@@ -308,12 +371,28 @@ fn manually_check_for_unused_variables() {
-                         "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
-                     );
-                     std::process::exit(1);
-+                } else if stderr.contains("function is never used") {
-+                    eprintln!("\n❌ ERROR: Unused functions detected in build.rs!");
-+                    eprintln!("{stderr}");
-+                    eprintln!("\n⚠️ Unused functions are STRICTLY FORBIDDEN in this project.");
-+                    eprintln!(
-+                        "   Either use the function or remove it completely."
-+                    );
-+                    std::process::exit(1);
-+                } else if stderr.contains("unused import") {
-+                    eprintln!("\n❌ ERROR: Unused imports detected in build.rs!");
-+                    eprintln!("{stderr}");
-+                    eprintln!("\n⚠️ Unused imports are STRICTLY FORBIDDEN in this project.");
-+                    eprintln!(
-+                        "   Either use the imported item or remove the import completely."
-+                    );
-+                    std::process::exit(1);
-                 }
-             }
-         }
-         Err(_) => {
-             // If rustc command fails, fallback to warning but don't fail the build
--            eprintln!("cargo:warning=Could not check for unused variables in build.rs");
-+            eprintln!("cargo:warning=Could not check for unused variables/functions/imports in build.rs");
-         }
-     }
- }
-@@ -451,3 +530,41 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
- 
-     Ok(())
- }
 +
 +fn scan_for_allow_dead_code() -> Result<(), Box<dyn Error>> {
 +    // Regex pattern to find #[allow(dead_code)] attributes
@@ -193,9 +110,8 @@ index 1f8d262..5d5b751 100644
 +    // If the loop completes without finding any violations, the check passes
 +    Ok(())
 +}
-\ No newline at end of file
 diff --git a/calibrate/basis.rs b/calibrate/basis.rs
-index ea9e26f..2774501 100644
+index ea9e26f..fb8c3f2 100644
 --- a/calibrate/basis.rs
 +++ b/calibrate/basis.rs
 @@ -356,18 +356,17 @@ mod internal {
@@ -212,7 +128,7 @@ index ea9e26f..2774501 100644
 -                    num_quantiles: num_internal_knots,
 -                    num_points: training_data.len(),
 -                });
-+        let internal_knots = if training_data_for_quantiles.is_some() {
++        let internal_knots = if let Some(_training_data) = training_data_for_quantiles {
 +            // Disable quantile strategy for P-splines with D^T D penalty
 +            log::warn!(
 +                "Quantile knots are disabled for P-splines. Falling back to uniform knots."
@@ -227,216 +143,40 @@ index ea9e26f..2774501 100644
          } else {
              // Uniformly spaced knots
              if num_internal_knots == 0 {
-@@ -390,42 +389,6 @@ mod internal {
-         .expect("Knot vector concatenation should never fail with correct inputs"))
+@@ -391,6 +390,7 @@ mod internal {
      }
  
--    /// Calculates quantiles from a data vector using linear interpolation (Type 7 in R).
--    fn quantiles(data: ArrayView1<f64>, num_quantiles: usize) -> Result<Array1<f64>, BasisError> {
--        if num_quantiles == 0 {
--            return Ok(Array1::from_vec(vec![]));
--        }
--
--        let mut sorted_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
--        // Reject if all values were non-finite
--        if sorted_data.is_empty() {
--            return Err(BasisError::InsufficientDataForQuantiles {
--                num_quantiles,
--                num_points: 0,
--            });
--        }
--        // Use a total order to avoid NaN-related undefined ordering (already filtered)
--        sorted_data.sort_by(|a, b| a.total_cmp(b));
--
--        let n = sorted_data.len();
--        let quantiles_vec = (1..=num_quantiles)
--            .map(|k| {
--                let p = k as f64 / (num_quantiles as f64 + 1.0);
--                let float_idx = (n as f64 - 1.0) * p;
--                let lower_idx = float_idx.floor() as usize;
--                let upper_idx = float_idx.ceil() as usize;
--
--                if lower_idx == upper_idx {
--                    sorted_data[lower_idx]
--                } else {
--                    let fraction = float_idx - lower_idx as f64;
--                    sorted_data[lower_idx] * (1.0 - fraction) + sorted_data[upper_idx] * fraction
--                }
--            })
--            .collect();
--
--        Ok(Array1::from_vec(quantiles_vec))
--    }
- 
-     /// Evaluates all B-spline basis functions at a single point `x`.
-     /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
-@@ -571,18 +534,17 @@ mod tests {
-     }
- 
-     #[test]
--    fn test_knot_generation_quantile() {
-+    fn test_knot_generation_with_training_data_falls_back_to_uniform() {
-         let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
-         let knots =
-             internal::generate_full_knot_vector((0.0, 10.0), 3, 2, Some(training_data.view()))
-                 .unwrap();
--        // Quantiles at 1/4, 2/4, 3/4.
--        // p=0.25 -> idx=(7-1)*0.25=1.5 -> (data[1]+data[2])/2 = (1+2)/2=1.5
--        // p=0.50 -> idx=(7-1)*0.50=3.0 -> data[3] = 5.0
--        // p=0.75 -> idx=(7-1)*0.75=4.5 -> (data[4]+data[5])/2 = (8+9)/2=8.5
-+        // Since quantile knots are disabled, this should generate uniform knots
-+        // 3 internal knots + 2 * (2+1) boundary = 9 knots
-+        assert_eq!(knots.len(), 9);
-         assert_abs_diff_eq!(
-             knots,
--            array![0.0, 0.0, 0.0, 1.5, 5.0, 8.5, 10.0, 10.0, 10.0],
-+            array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0],
-             epsilon = 1e-9
-         );
-     }
-@@ -621,9 +583,9 @@ mod tests {
-     }
- 
-     #[test]
--    fn test_bspline_basis_sums_to_one_with_quantile_knots() {
--        // Create data with a non-uniform distribution to test quantile knots
--        // This creates a bimodal distribution with more points at the extremes
-+    fn test_bspline_basis_sums_to_one_with_uniform_knots() {
-+        // Create data with a non-uniform distribution 
-+        // Since quantile knots are disabled for P-splines, this tests the fallback to uniform knots
-         let mut data = Array::zeros(100);
-         for i in 0..100 {
-             let x = if i < 50 {
-@@ -636,22 +598,32 @@ mod tests {
-             data[i] = x;
-         }
- 
--        // Use the quantile strategy by providing the data for quantiles
-+        // Even when providing training data, this should fall back to uniform knots
-         let (basis, knots) =
-             create_bspline_basis(data.view(), Some(data.view()), (0.0, 10.0), 10, 3).unwrap();
- 
--        // Verify knot placement - we should have more knots in the dense regions
--        // Output knot positions for inspection
--        println!("Quantile knots: {:?}", knots);
-+        // Verify that knots are uniformly distributed (not following data distribution)
-+        // Since quantile knots are disabled, these should be uniform
-+        println!("Uniform knots (fallback): {:?}", knots);
- 
--        // Check that knots follow the data distribution
--        // Count knots in each half of the range
--        let knots_in_first_half = knots.iter().filter(|&&k| k > 0.0 && k < 5.0).count();
--        let knots_in_second_half = knots.iter().filter(|&&k| k >= 5.0 && k < 10.0).count();
--
--        // We expect a roughly balanced number of knots between the two clusters
--        println!("Knots in first half (0-5): {}", knots_in_first_half);
--        println!("Knots in second half (5-10): {}", knots_in_second_half);
-+        // Check that internal knots are uniformly spaced
-+        let internal_knots: Vec<f64> = knots.iter()
-+            .skip(4)  // Skip the repeated boundary knots (degree+1 = 4)
-+            .take(10) // Take the internal knots
-+            .copied()
-+            .collect();
-+        
-+        if internal_knots.len() >= 2 {
-+            let spacing = internal_knots[1] - internal_knots[0];
-+            for window in internal_knots.windows(2) {
-+                let current_spacing = window[1] - window[0];
-+                assert!(
-+                    (current_spacing - spacing).abs() < 1e-9,
-+                    "Knots should be uniformly spaced, but spacing varies: expected {}, got {}",
-+                    spacing, current_spacing
-+                );
-+            }
-+        }
- 
-         // Verify that the basis still sums to 1.0 for each data point
-         let sums = basis.sum_axis(Axis(1));
-@@ -660,7 +632,7 @@ mod tests {
-         for &sum in sums.iter() {
-             assert!(
-                 (sum - 1.0).abs() < 1e-9,
--                "Quantile basis did not sum to 1, got {}",
-+                "Uniform basis did not sum to 1, got {}",
-                 sum
-             );
-         }
+     /// Calculates quantiles from a data vector using linear interpolation (Type 7 in R).
++    #[allow(dead_code)]
+     fn quantiles(data: ArrayView1<f64>, num_quantiles: usize) -> Result<Array1<f64>, BasisError> {
+         if num_quantiles == 0 {
+             return Ok(Array1::from_vec(vec![]));
 diff --git a/calibrate/construction.rs b/calibrate/construction.rs
-index 7ad2945..bf61613 100644
+index 7ad2945..09e9c08 100644
 --- a/calibrate/construction.rs
 +++ b/calibrate/construction.rs
-@@ -23,9 +23,9 @@ fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
+@@ -3,7 +3,7 @@ use crate::calibrate::data::TrainingData;
+ use crate::calibrate::estimate::EstimationError;
+ use crate::calibrate::model::{Constraint, ModelConfig};
+ use ndarray::{Array1, Array2, Axis, s};
+-use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
++use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError, Inverse};
+ use std::collections::HashMap;
+ use std::ops::Range;
+ 
+@@ -23,8 +23,9 @@ fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
      means
  }
  
 -/// Centers the columns of a matrix using weighted means for functional ANOVA decomposition.
 -/// This ensures interaction terms are orthogonal to main effects in the data metric.
--fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
 +/// Centers the columns of a matrix using weighted means.
 +/// This enforces intercept orthogonality (sum-to-zero) for the columns it is applied to.
-+pub(crate) fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
++#[allow(dead_code)]
+ fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
      let means = weighted_column_means(x, w);
      // Subtract means from each column
-     for j in 0..x.ncols() {
-@@ -38,8 +38,8 @@ fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
- /// This is used to create tensor product penalties that enforce smoothness
- /// in multiple dimensions for interaction terms.
- /// NOTE: Currently unused due to penalty grouping in Option 3 implementation
--#[allow(dead_code)]
--fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-+/// Function is currently unused but kept for future implementation
-+pub(crate) fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-     let (a_rows, a_cols) = a.dim();
-     let (b_rows, b_cols) = b.dim();
-     let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
-@@ -129,7 +129,7 @@ impl ModelLayout {
-     ) -> Result<Self, EstimationError> {
-         let mut penalty_map = Vec::new();
-         let mut current_col = 0;
--        let mut _penalty_idx_counter = 0;
-+        let mut penalty_idx_counter = 0;
- 
-         // Calculate total coefficients first to ensure consistency
-         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
-@@ -152,11 +152,11 @@ impl ModelLayout {
-             penalty_map.push(PenalizedBlock {
-                 term_name: format!("f({})", config.pc_names[i]),
-                 col_range: range.clone(),
--                penalty_indices: vec![_penalty_idx_counter], // Each PC main gets unique penalty index
-+                penalty_indices: vec![penalty_idx_counter], // Each PC main gets unique penalty index
-                 term_type: TermType::PcMainEffect,
-             });
-             current_col += num_basis;
--            _penalty_idx_counter += 1; // Increment for next penalty
-+            penalty_idx_counter += 1; // Increment for next penalty
-         }
- 
-         // Main effect for PGS (non-constant basis terms)
-@@ -173,12 +173,12 @@ impl ModelLayout {
-                 penalty_map.push(PenalizedBlock {
-                     term_name: format!("f(PGS,{})", config.pc_names[i]),
-                     col_range: range.clone(),
--                    penalty_indices: vec![_penalty_idx_counter], // Single penalty since both directions are whitened
-+                    penalty_indices: vec![penalty_idx_counter], // Single penalty since both directions are whitened
-                     term_type: TermType::Interaction,
-                 });
- 
-                 current_col += num_tensor_coeffs;
--                _penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
-+                penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
-             }
-         }
- 
-@@ -197,7 +197,7 @@ impl ModelLayout {
-             pgs_main_cols,
-             penalty_map,
-             total_coeffs: current_col,
--            num_penalties: _penalty_idx_counter,
-+            num_penalties: penalty_idx_counter,
-         })
-     }
- }
-@@ -495,12 +495,7 @@ pub fn build_design_and_penalty_matrices(
+@@ -495,12 +496,7 @@ pub fn build_design_and_penalty_matrices(
          let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
              EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
          })?;
@@ -450,7 +190,7 @@ index 7ad2945..bf61613 100644
  
          for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
              // Find the corresponding tensor product block in the layout
-@@ -519,12 +514,7 @@ pub fn build_design_and_penalty_matrices(
+@@ -519,12 +515,7 @@ pub fn build_design_and_penalty_matrices(
              let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
                  EstimationError::LayoutError(format!("Missing '{}' in range_transforms", pc_name))
              })?;
@@ -464,7 +204,7 @@ index 7ad2945..bf61613 100644
  
              let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
  
-@@ -547,10 +537,29 @@ pub fn build_design_and_penalty_matrices(
+@@ -547,10 +538,85 @@ pub fn build_design_and_penalty_matrices(
                  )));
              }
  
@@ -484,37 +224,75 @@ index 7ad2945..bf61613 100644
 +                    .mapv_inplace(|v| v - m);
 +            }
 +
-+            // Assign centered tensor block to design matrix  
-+            // Note: Full orthogonalization against main effects would create training-prediction mismatch
-+            // since it requires row-space projectors that depend on training data and cannot be reproduced
-+            // on new data. The current approach (Range×Range interactions + final column centering) 
-+            // maintains reproducibility while ensuring intercept orthogonality.
++            // 3) Apply proper functional ANOVA orthogonalization using Gram-Schmidt W-orthogonalization
++            // Make the interaction term H orthogonal to the main effect terms A (PGS) and B (PC)
++            // in the weighted inner product space defined by weights W
++            
++            let mut h_orthogonal = tensor_centered.clone();
++            let pgs_main = &pgs_main_basis; // Alias for clarity  
++            let pc_main = &pc_range_bases[pc_idx];
++
++            // Step 1: Orthogonalize against the Intercept (already done by centering)
++            // tensor_centered already has weighted mean zero, so it's orthogonal to intercept
++
++            // Step 2: Orthogonalize against the PGS main effect space (A)
++            // We want H_new = H - P_A * H, where P_A = A * (A^T W A)^-1 * A^T W
++            // Do this efficiently without forming the giant P_A matrix
++
++            // Calculate A^T * W * A (properly: A^T * diag(W) * A)
++            let w_diag = data.weights.view().insert_axis(Axis(1)); 
++            let pgs_weighted = pgs_main * &w_diag; // A * diag(W)
++            let atw_a = pgs_main.t().dot(&pgs_weighted); // A^T * diag(W) * A
++
++            // Invert robustly
++            match atw_a.inv() {
++                Ok(atw_a_inv) => {
++                    // Calculate projection coefficients: C = (A^T W A)^-1 * (A^T W H)
++                    let h_weighted = &h_orthogonal * &w_diag; // H * diag(W)
++                    let atw_h = pgs_main.t().dot(&h_weighted); // A^T * diag(W) * H
++                    let coeffs_a = atw_a_inv.dot(&atw_h); // (A^T W A)^-1 * (A^T W H)
++
++                    // Subtract the projection: H_new = H - A * C
++                    h_orthogonal = &h_orthogonal - &pgs_main.dot(&coeffs_a);
++                },
++                Err(_) => {
++                    log::warn!("A^T W A for PGS main effect is singular. Skipping orthogonalization against PGS.");
++                }
++            }
++
++            // Step 3: Orthogonalize the RESULT against the PC main effect space (B)
++            // Now h_orthogonal is clean of the PGS space. Clean it of the PC space.
++            // H_final = H_new - P_B * H_new
++
++            // Calculate B^T * W * B (properly: B^T * diag(W) * B)
++            let pc_weighted = pc_main * &w_diag; // B * diag(W)
++            let btw_b = pc_main.t().dot(&pc_weighted); // B^T * diag(W) * B
++
++            // Invert robustly
++            match btw_b.inv() {
++                Ok(btw_b_inv) => {
++                    // Calculate projection coefficients: C = (B^T W B)^-1 * (B^T W H_new)
++                    let h_weighted = &h_orthogonal * &w_diag; // H_new * diag(W)
++                    let btw_h = pc_main.t().dot(&h_weighted); // B^T * diag(W) * H_new
++                    let coeffs_b = btw_b_inv.dot(&btw_h); // (B^T W B)^-1 * (B^T W H_new)
++                    
++                    // Subtract the projection: H_final = H_new - B * C
++                    h_orthogonal = &h_orthogonal - &pc_main.dot(&coeffs_b);
++                },
++                Err(_) => {
++                    log::warn!("B^T W B for PC main effect is singular. Skipping orthogonalization against PC.");
++                }
++            }
++
++            // Step 4: Assign the fully orthogonalized block to the design matrix
              x_matrix
                  .slice_mut(s![.., col_range])
 -                .assign(&tensor_interaction);
-+                .assign(&tensor_centered);
++                .assign(&h_orthogonal);
          }
      }
  
-@@ -845,7 +854,7 @@ pub fn stable_reparameterization(
-         let mut max_omega: f64 = 0.0;
- 
-         for &i in &gamma {
--            // FIXED: Extract active columns from penalty square root (rank x p convention)
-+            // Extract active columns from penalty square root (rank x p convention)
-             let rs_active_cols = rs_current[i].slice(s![.., k_offset..k_offset + q_current]);
- 
-             // Skip if penalty has no rows (zero rank penalty)
-@@ -854,7 +863,7 @@ pub fn stable_reparameterization(
-                 continue;
-             }
- 
--            // FIXED: Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
-+            // Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
-             let s_active_block = rs_active_cols.t().dot(&rs_active_cols);
- 
-             // The Frobenius norm is the sqrt of sum of squares of matrix elements
-@@ -962,6 +971,42 @@ pub fn stable_reparameterization(
+@@ -962,6 +1028,42 @@ pub fn stable_reparameterization(
              rank_tolerance
          );
  
@@ -557,7 +335,7 @@ index 7ad2945..bf61613 100644
          // Step 3b: Form WEIGHTED sum for TRANSFORMATION (lambda-weighted for eigenvectors)
          // This matrix provides the eigenvectors for the similarity transform
          let mut sb_for_transform = Array2::zeros((q_current, q_current));
-@@ -1034,25 +1079,6 @@ pub fn stable_reparameterization(
+@@ -1034,25 +1136,6 @@ pub fn stable_reparameterization(
              continue;
          }
  
@@ -583,123 +361,11 @@ index 7ad2945..bf61613 100644
  
          let u_range = u.slice(s![.., q_current - r..]); // Last r columns
          let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
-@@ -1095,7 +1121,7 @@ pub fn stable_reparameterization(
-                 continue;
-             }
- 
--            // FIXED: For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
-+            // For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
-             let c_matrix = rs_current[i]
-                 .slice(s![.., k_offset..k_offset + q_current])
-                 .to_owned();
-@@ -1119,7 +1145,7 @@ pub fn stable_reparameterization(
- 
-             if alpha.contains(&i) {
-                 // DOMINANT penalty: Its effect is now entirely within the range space.
--                // FIXED: For rank×p roots, zero out the null space COLUMNS (not rows)
-+                // For rank×p roots, zero out the null space COLUMNS (not rows)
-                 // The null space is now the LAST `q_current - r` columns of the sub-block.
-                 if r < q_current {
-                     // Use explicit end index to avoid zeroing beyond current subblock
-@@ -1128,7 +1154,7 @@ pub fn stable_reparameterization(
-             } else {
-                 // SUB-DOMINANT penalty (in gamma_prime).
-                 // Its effect is carried forward in the null space.
--                // FIXED: For rank×p roots, zero out the range space COLUMNS (not rows)
-+                // For rank×p roots, zero out the range space COLUMNS (not rows)
-                 // The range space is now the FIRST `r` columns of the sub-block.
-                 rs_current[i]
-                     .slice_mut(s![.., k_offset..k_offset + r])
-@@ -1430,7 +1456,7 @@ mod tests {
-         // Setup with 1 PC to create main effect and interaction terms
-         let (data, config) = create_test_data_for_construction(100, 1);
- 
--        let (x, s_list, layout, _, _, _, _range_transforms, _, _) =
-+        let (x, s_list, layout, unused1, unused2, unused3, range_transforms, unused4, unused5) =
-             build_design_and_penalty_matrices(&data, &config).unwrap();
- 
-         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
-@@ -1595,4 +1621,76 @@ mod tests {
-             "PGS-only model should have no penalties."
-         );
-     }
-+
-+    #[test]
-+    fn test_training_prediction_design_matrix_consistency() {
-+        // This test ensures that the design matrix construction is reproducible
-+        // and that training and prediction use the same transformations
-+        let (data, config) = create_test_data_for_construction(100, 1);
-+
-+        // Build design matrices on training data
-+        let (
-+            x_training,
-+            _s_list,
-+            layout,
-+            _constraints,
-+            sum_to_zero_constraints,
-+            knot_vectors,
-+            range_transforms,
-+            interaction_range_transforms,
-+            interaction_centering_means,
-+        ) = build_design_and_penalty_matrices(&data, &config).unwrap();
-+
-+        // Create a TrainedModel with the saved transformations
-+        use crate::calibrate::model::{TrainedModel, LinkFunction};
-+        use ndarray::Array1;
-+        
-+        // Create a fake trained model just to test design matrix consistency
-+        let dummy_coeffs = Array1::zeros(layout.total_coeffs);
-+        let trained_model = TrainedModel {
-+            coefficients: dummy_coeffs,
-+            layout: layout.clone(),
-+            link_function: LinkFunction::Identity,
-+            knot_vectors,
-+            sum_to_zero_constraints,
-+            range_transforms,
-+            interaction_range_transforms,
-+            interaction_centering_means,
-+            pgs_range: config.pgs_range,
-+            pc_ranges: config.pc_ranges.clone(),
-+            pc_names: config.pc_names.clone(),
-+            pgs_basis_config: config.pgs_basis_config.clone(),
-+            pc_basis_configs: config.pc_basis_configs.clone(),
-+            penalty_order: config.penalty_order,
-+        };
-+
-+        // Now reconstruct the design matrix for the same training data using prediction path
-+        let x_prediction = trained_model.construct_design_matrix(&data.p, &data.pcs).unwrap();
-+
-+        // The two matrices should be identical (within numerical tolerance)
-+        assert_eq!(x_training.shape(), x_prediction.shape(), 
-+                  "Design matrices should have the same shape");
-+
-+        let max_diff = (&x_training - &x_prediction)
-+            .mapv(|x| x.abs())
-+            .iter()
-+            .fold(0.0f64, |acc, &x| acc.max(x));
-+
-+        assert!(max_diff < 1e-12, 
-+               "Training and prediction design matrices should be identical, max difference: {}", 
-+               max_diff);
-+
-+        // Verify that interaction blocks have identical column means (zero after centering)
-+        for block in &layout.penalty_map {
-+            if block.term_type == TermType::Interaction {
-+                let interaction_cols = x_prediction.slice(ndarray::s![.., block.col_range.clone()]);
-+                let col_means = interaction_cols.mean_axis(Axis(0)).unwrap();
-+                let max_mean = col_means.iter().map(|&x| x.abs()).fold(0.0f64, f64::max);
-+                
-+                assert!(max_mean < 1e-12,
-+                       "Interaction block {} should have zero column means after centering, max mean: {}",
-+                       block.term_name, max_mean);
-+            }
-+        }
-+    }
- }
 diff --git a/calibrate/diff.txt b/calibrate/diff.txt
-index b86ac9c..57f6d5f 100644
+deleted file mode 100644
+index b86ac9c..0000000
 --- a/calibrate/diff.txt
-+++ b/calibrate/diff.txt
++++ /dev/null
 @@ -1,814 +0,0 @@
 -diff --git a/calibrate/basis.rs b/calibrate/basis.rs
 -index 12dbed8..ea9e26f 100644
@@ -1515,69 +1181,6 @@ index b86ac9c..57f6d5f 100644
 -         knot_vectors: std::collections::HashMap::new(),
 -         range_transforms: std::collections::HashMap::new(),
 -         interaction_range_transforms: std::collections::HashMap::new(),
-diff --git a/calibrate/estimate.rs b/calibrate/estimate.rs
-index e4e9259..2989ae3 100644
---- a/calibrate/estimate.rs
-+++ b/calibrate/estimate.rs
-@@ -320,7 +320,7 @@ pub fn train_model(
-     // Rationale: This `match` block is the new control structure. It allows us
-     // to define different behaviors for a successful run vs. a failed run.
-     let BfgsSolution {
--        final_point: final_z, // FIXED: This is the unconstrained parameter z, not rho
-+        final_point: final_z, // This is the unconstrained parameter z, not rho
-         final_value,
-         iterations,
-         ..
-@@ -498,7 +498,6 @@ fn log_layout_info(layout: &ModelLayout) {
- 
- /// Internal module for estimation logic.
- // Make internal module public for tests
--#[cfg_attr(test, allow(dead_code))]
- pub mod internal {
-     use super::*;
-     use ndarray_linalg::SVD;
-@@ -1424,7 +1423,7 @@ pub mod internal {
-                     let weighted_residuals = &self.weights * &residuals;
-                     let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&weighted_residuals);
- 
--                    // FIXED: Efficient batched computation of hat matrix diagonal
-+                    // Efficient batched computation of hat matrix diagonal
-                     // Instead of N individual solves, use single factorization + batched solve
-                     // Compute H C = X^T, then diag(hat) = diag(X C) = sum over i of X[i,:] * C[:,i]
-                     let hat_diag = match &solver {
-@@ -1479,7 +1478,7 @@ pub mod internal {
-                         let d_deviance_d_rho_k =
-                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
- 
--                        // FIXED: Correctly named - this is only the unpenalized deviance derivative
-+                        // Correctly named - this is only the unpenalized deviance derivative
-                         let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
- 
-                         // ---
-@@ -2216,9 +2215,9 @@ pub mod internal {
-         #[derive(Debug)]
-         struct TermMetrics {
-             penalty_idx: usize,
--            edf: f64,          // trace(H^{-1} λ_k S_k) - lower means "more smoothing"
--            roughness: f64,    // β^T S_k β (no λ) - higher means "more wiggle"
--            partial_norm: f64, // ||X_k β_k||_2 - contribution size
-+            edf: f64,          // trace(H^{-1} lambda_k S_k) - lower means "more smoothing"
-+            roughness: f64,    // beta^T S_k beta (no lambda) - higher means "more wiggle"
-+            partial_norm: f64, // ||X beta||2 - contribution size
-         }
- 
-         /// Compute per-term smoothness metrics (EDF, roughness, partial fit magnitude)
-diff --git a/calibrate/lib.rs b/calibrate/lib.rs
-index f9dfb8c..6c5d7aa 100644
---- a/calibrate/lib.rs
-+++ b/calibrate/lib.rs
-@@ -1,3 +1,6 @@
-+#![deny(dead_code)]
-+#![deny(unused_imports)]
-+
- pub mod basis;
- pub mod construction;
- pub mod data;
 diff --git a/calibrate/model.rs b/calibrate/model.rs
 index e563461..a669271 100644
 --- a/calibrate/model.rs
@@ -1661,157 +1264,3 @@ index e563461..a669271 100644
                      // Add all columns from this tensor product to the design matrix
                      for col in tensor_interaction.axis_iter(Axis(1)) {
                          owned_cols.push(col.to_owned());
-diff --git a/calibrate/pirls.rs b/calibrate/pirls.rs
-index 4214b4c..20ccd6b 100644
---- a/calibrate/pirls.rs
-+++ b/calibrate/pirls.rs
-@@ -443,7 +443,7 @@ pub fn fit_model_for_fixed_rho(
- 
-         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
-         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
--            // CRITICAL FIX: Check gradient with the SAME (W, z) used in the last WLS solve
-+            // Check gradient with the SAME (W, z) used in the last WLS solve
-             // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
-             // So we must check stationarity with respect to those same W_solve, z_solve
- 
-@@ -628,7 +628,7 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
- 
-     let mut y_inf = 0.0;
- 
--    // FIXED: Compute max_diag once outside the loop (performance improvement)
-+    // Compute max_diag once outside the loop (performance improvement)
-     let max_diag = r_matrix
-         .diag()
-         .iter()
-@@ -638,7 +638,7 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
-     for k in (0..c).rev() {
-         let r_kk = r_matrix[[k, k]];
-         if r_kk.abs() <= eps {
--            // FIXED: Return large finite number instead of infinity to avoid overflow
-+            // Return large finite number instead of infinity to avoid overflow
-             return 1e300;
-         }
-         let yp = (1.0 - p[k]) / r_kk;
-@@ -743,8 +743,8 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
- /// * `src`: Source vector without the dropped rows (length = total - n_drop)
- /// * `dropped_rows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
- /// * `dst`: Destination vector where zeros will be inserted (length = total)
--#[allow(dead_code)]
--fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
-+/// Currently unused but kept for future implementation
-+pub(crate) fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
-     let n_drop = dropped_rows.len();
- 
-     if n_drop == 0 {
-@@ -787,8 +787,8 @@ fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>)
- 
- /// Performs the complement operation to undrop_rows - it removes specified rows from a vector
- /// This simulates the behavior of drop_cols in the C code but for a 1D vector
--#[allow(dead_code)]
--fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
-+/// Currently unused but kept for future implementation
-+pub(crate) fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
-     let n_drop = drop_indices.len();
- 
-     if n_drop == 0 {
-@@ -958,7 +958,7 @@ pub fn solve_penalized_least_squares(
-         let wz = &sqrt_w * &z;
- 
-         // 1) Use pivoted QR only to determine rank and column ordering
--        let (_q_unused, r_factor, pivot) = pivoted_qr_faer(&wx)?;
-+        let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
-         let diag = r_factor.diag();
-         let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-         let tol = max_diag * 1e-12;
-@@ -1513,7 +1513,7 @@ fn pivoted_qr_faer(
-     // Try candidate p1
-     let a_p1 = pivot_columns(matrix.view(), &p1);
- 
--    // FIXED: Use relative error for scale-robust comparison
-+    // Use relative error for scale-robust comparison
-     let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
-         let diff_norm = (a_p - &qr_product).mapv(|x| x * x).sum().sqrt();
-         let a_norm = a_p.mapv(|x| x * x).sum().sqrt();
-@@ -2667,7 +2667,7 @@ mod tests {
-         let e = Array2::<f64>::zeros((0, p));
- 
-         // Solve once
--        let (res, _rank) = super::solve_penalized_least_squares(
-+        let (res, rank_value) = super::solve_penalized_least_squares(
-             x.view(),
-             z.view(),
-             w.view(),
-@@ -2765,7 +2765,7 @@ mod tests {
-         let w_prior = Array1::from_elem(n, 1.0);
- 
-         // Build IRLS vectors at beta=0
--        let (_mu0, w_old, z_old) =
-+        let (mu0, w_old, z_old) =
-             super::update_glm_vectors(y.view(), &eta0, super::LinkFunction::Logit, w_prior.view());
-         assert!(w_old.iter().all(|w| *w >= 0.0));
- 
-@@ -2794,9 +2794,9 @@ mod tests {
-             inf_old
-         );
- 
--        // Now recompute eta, mu, and NEW weights at the accepted beta
-+        // Now recompute eta, mu, and updated weights at the accepted beta
-         let eta1 = x.dot(&res.beta);
--        let (_mu1, w_new, z_new) =
-+        let (mu1, w_new, z_new) =
-             super::update_glm_vectors(y.view(), &eta1, super::LinkFunction::Logit, w_prior.view());
- 
-         let sqrt_w_new = w_new.mapv(f64::sqrt);
-diff --git a/score/lib.rs b/score/lib.rs
-index 1170b01..348cdfe 100644
---- a/score/lib.rs
-+++ b/score/lib.rs
-@@ -1,5 +1,7 @@
- #![feature(portable_simd)] // Do not remove this
- #![deny(unused_variables)]
-+#![deny(dead_code)]
-+#![deny(unused_imports)]
- #![deny(clippy::no_effect_underscore_binding)]
- pub mod batch;
- pub mod complex;
-diff --git a/score/main.rs b/score/main.rs
-index b783bac..ed240d8 100644
---- a/score/main.rs
-+++ b/score/main.rs
-@@ -9,6 +9,9 @@
- // the other modules. It owns all major resources and manages the application lifecycle
- // from argument parsing to final output.
- 
-+#![deny(dead_code)]
-+#![deny(unused_imports)]
-+
- use clap::Parser;
- use gnomon::download;
- use gnomon::pipeline::{self, PipelineContext};
-@@ -53,7 +56,6 @@ struct Args {
- //                              The main orchestration logic
- // ========================================================================================
- 
--#[allow(dead_code)]
- fn main() {
-     // This wrapper provides a clear exit message upon failure.
-     if let Err(e) = run_gnomon() {
-@@ -81,7 +83,6 @@ pub fn run_gnomon_with_args(
- }
- 
- /// The primary application logic
--#[allow(dead_code)]
- fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
-     let args = Args::parse();
-     run_gnomon_impl(args)
-diff --git a/src/main.rs b/src/main.rs
-index d982ad8..6345c26 100644
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1,4 +1,6 @@
- #![deny(unused_variables)]
-+#![deny(dead_code)]
-+#![deny(unused_imports)]
- #![deny(clippy::no_effect_underscore_binding)]
- 
- use clap::{Parser, Subcommand};

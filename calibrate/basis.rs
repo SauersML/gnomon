@@ -1,23 +1,11 @@
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use ndarray_linalg::{Eigh, UPLO};
 
-use serde::{Deserialize, Serialize};
+// Imports removed: use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
-
-/// Defines the strategy for placing the internal knots of a spline.
-/// This is part of the public API and will be saved in the model configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KnotStrategy {
-    /// Place knots uniformly across the specified `data_range`.
-    /// This is deterministic and suitable for prediction.
-    Uniform,
-    /// Place knots at the quantiles of the provided `training_data_for_quantiles`.
-    /// This adapts to the data's distribution and is recommended for model training.
-    Quantile,
-}
 
 /// A comprehensive error type for all operations within the basis module.
 #[derive(Error, Debug)]
@@ -27,15 +15,6 @@ pub enum BasisError {
 
     #[error("Data range is invalid: start ({0}) must be less than or equal to end ({1}).")]
     InvalidRange(f64, f64),
-
-    #[error("Quantile strategy requires a non-empty training data set for quantile calculation.")]
-    QuantileDataMissing,
-
-    #[error("Cannot compute {num_quantiles} quantiles from only {num_points} data points.")]
-    InsufficientDataForQuantiles {
-        num_quantiles: usize,
-        num_points: usize,
-    },
 
     #[error(
         "Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis})."
@@ -75,32 +54,20 @@ pub enum BasisError {
     InvalidKnotVector(String),
 }
 
-/// Creates a B-spline basis expansion matrix and its corresponding knot vector.
-///
-/// This is the primary workhorse function, implementing a numerically stable
-/// version of the Cox-de Boor algorithm for evaluation.
+/// Creates a B-spline basis matrix using a pre-computed knot vector.
+/// This function is used during prediction to ensure exact reproduction of training basis.
 ///
 /// # Arguments
 ///
-/// * `data`: A 1D view of the data points to be transformed (e.g., a single vector
-///   of PGS values or a single Principal Component).
-/// * `training_data_for_quantiles`: An `Option` containing a view of the *original,
-///   full training dataset column*. This is **required** and must be `Some` when
-///   `knot_strategy` is `Quantile`. It is ignored otherwise.
-/// * `data_range`: A tuple `(min, max)` defining the boundaries for knot placement.
-///   **Crucially, this must always be the range of the original training data**,
-///   even when making predictions on new data, to ensure a consistent basis.
-/// * `num_internal_knots`: The number of knots to place *between* the boundaries.
+/// * `data`: A 1D view of the data points to be transformed.
+/// * `knot_vector`: The knot vector to use for basis generation.
 /// * `degree`: The degree of the B-spline polynomials (e.g., 3 for cubic).
 ///
 /// # Returns
 ///
 /// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
 /// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
-///     The number of basis functions is `num_internal_knots + degree + 1`.
-/// 2.  The **full knot vector** used to generate the basis. This is needed for the penalty matrix.
-/// Creates a B-spline basis matrix using a pre-computed knot vector.
-/// This function is used during prediction to ensure exact reproduction of training basis.
+/// 2.  A copy of the **knot vector** used.
 pub fn create_bspline_basis_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -155,9 +122,38 @@ pub fn create_bspline_basis_with_knots(
     Ok((basis_matrix, knot_vector.to_owned()))
 }
 
+/// Creates a B-spline basis expansion matrix with uniformly spaced knots.
+///
+/// This function creates B-splines optimized for P-splines with D^T D penalties.
+/// Uniform knot spacing ensures mathematical consistency between the penalty
+/// structure and the basis functions, providing optimal numerical stability
+/// and performance for penalized regression.
+///
+/// # Arguments
+///
+/// * `data`: A 1D view of the data points to be transformed (e.g., PGS values
+///   or Principal Component values).
+/// * `data_range`: A tuple `(min, max)` defining the boundaries for knot placement.
+///   **This must always be the range of the original training data**, even when
+///   making predictions on new data, to ensure consistent basis functions.
+/// * `num_internal_knots`: The number of knots to place uniformly between the boundaries.
+/// * `degree`: The degree of the B-spline polynomials (e.g., 3 for cubic splines).
+///
+/// # Returns
+///
+/// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
+/// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
+///     The number of basis functions is `num_internal_knots + degree + 1`.
+/// 2.  The **knot vector**, containing all knots including repeated boundary knots.
+///
+/// # Mathematical Background
+///
+/// The B-spline basis functions are defined recursively via the Cox-de Boor formula.
+/// The resulting basis matrix has the partition of unity property: each row sums to 1.
+/// Uniform knot spacing ensures that the discrete difference penalty D^T D has the
+/// correct mathematical interpretation as a discrete approximation to derivatives.
 pub fn create_bspline_basis(
     data: ArrayView1<f64>,
-    training_data_for_quantiles: Option<ArrayView1<f64>>,
     data_range: (f64, f64),
     num_internal_knots: usize,
     degree: usize,
@@ -169,12 +165,7 @@ pub fn create_bspline_basis(
         return Err(BasisError::InvalidRange(data_range.0, data_range.1));
     }
 
-    let knot_vector = internal::generate_full_knot_vector(
-        data_range,
-        num_internal_knots,
-        degree,
-        training_data_for_quantiles,
-    )?;
+    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
 
     // The number of B-spline basis functions for a given knot vector and degree `d` is
     // n = k - d - 1, where k is the number of knots.
@@ -259,7 +250,10 @@ pub fn apply_sum_to_zero_constraint(
     let constraint_vector = match weights {
         Some(w) => {
             if w.len() != n {
-                return Err(BasisError::WeightsDimensionMismatch { expected: n, found: w.len() });
+                return Err(BasisError::WeightsDimensionMismatch {
+                    expected: n,
+                    found: w.len(),
+                });
             }
             w.to_owned()
         }
@@ -352,30 +346,15 @@ mod internal {
         data_range: (f64, f64),
         num_internal_knots: usize,
         degree: usize,
-        training_data_for_quantiles: Option<ArrayView1<f64>>,
     ) -> Result<Array1<f64>, BasisError> {
         let (min_val, max_val) = data_range;
 
-        let internal_knots = if let Some(training_data) = training_data_for_quantiles {
-            // Quantile-based knots
-            if training_data.is_empty() {
-                return Err(BasisError::QuantileDataMissing);
-            }
-            if training_data.len() < num_internal_knots {
-                return Err(BasisError::InsufficientDataForQuantiles {
-                    num_quantiles: num_internal_knots,
-                    num_points: training_data.len(),
-                });
-            }
-            quantiles(training_data, num_internal_knots)?
+        // Always use uniformly spaced knots (optimized for P-splines with D^T D penalty)
+        let internal_knots = if num_internal_knots == 0 {
+            Array1::from_vec(vec![])
         } else {
-            // Uniformly spaced knots
-            if num_internal_knots == 0 {
-                Array1::from_vec(vec![])
-            } else {
-                let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
-                Array::from_iter((1..=num_internal_knots).map(|i| min_val + i as f64 * h))
-            }
+            let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
+            Array::from_iter((1..=num_internal_knots).map(|i| min_val + i as f64 * h))
         };
 
         // B-splines require `degree + 1` repeated knots at each boundary.
@@ -388,43 +367,6 @@ mod internal {
             &[min_knots.view(), internal_knots.view(), max_knots.view()],
         )
         .expect("Knot vector concatenation should never fail with correct inputs"))
-    }
-
-    /// Calculates quantiles from a data vector using linear interpolation (Type 7 in R).
-    fn quantiles(data: ArrayView1<f64>, num_quantiles: usize) -> Result<Array1<f64>, BasisError> {
-        if num_quantiles == 0 {
-            return Ok(Array1::from_vec(vec![]));
-        }
-
-        let mut sorted_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
-        // Reject if all values were non-finite
-        if sorted_data.is_empty() {
-            return Err(BasisError::InsufficientDataForQuantiles {
-                num_quantiles,
-                num_points: 0,
-            });
-        }
-        // Use a total order to avoid NaN-related undefined ordering (already filtered)
-        sorted_data.sort_by(|a, b| a.total_cmp(b));
-
-        let n = sorted_data.len();
-        let quantiles_vec = (1..=num_quantiles)
-            .map(|k| {
-                let p = k as f64 / (num_quantiles as f64 + 1.0);
-                let float_idx = (n as f64 - 1.0) * p;
-                let lower_idx = float_idx.floor() as usize;
-                let upper_idx = float_idx.ceil() as usize;
-
-                if lower_idx == upper_idx {
-                    sorted_data[lower_idx]
-                } else {
-                    let fraction = float_idx - lower_idx as f64;
-                    sorted_data[lower_idx] * (1.0 - fraction) + sorted_data[upper_idx] * fraction
-                }
-            })
-            .collect();
-
-        Ok(Array1::from_vec(quantiles_vec))
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
@@ -560,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_knot_generation_uniform() {
-        let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2, None).unwrap();
+        let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
         // 3 internal + 2 * (2+1) boundary = 9 knots
         assert_eq!(knots.len(), 9);
         assert_abs_diff_eq!(
@@ -571,18 +513,16 @@ mod tests {
     }
 
     #[test]
-    fn test_knot_generation_quantile() {
-        let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
-        let knots =
-            internal::generate_full_knot_vector((0.0, 10.0), 3, 2, Some(training_data.view()))
-                .unwrap();
-        // Quantiles at 1/4, 2/4, 3/4.
-        // p=0.25 -> idx=(7-1)*0.25=1.5 -> (data[1]+data[2])/2 = (1+2)/2=1.5
-        // p=0.50 -> idx=(7-1)*0.50=3.0 -> data[3] = 5.0
-        // p=0.75 -> idx=(7-1)*0.75=4.5 -> (data[4]+data[5])/2 = (8+9)/2=8.5
+    fn test_knot_generation_with_training_data_falls_back_to_uniform() {
+        // Note: training_data is no longer needed since we're not passing it to generate_full_knot_vector
+        // let training_data = array![0., 1., 2., 5., 8., 9., 10.]; // 7 points
+        let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
+        // Since quantile knots are disabled, this should generate uniform knots
+        // 3 internal knots + 2 * (2+1) boundary = 9 knots
+        assert_eq!(knots.len(), 9);
         assert_abs_diff_eq!(
             knots,
-            array![0.0, 0.0, 0.0, 1.5, 5.0, 8.5, 10.0, 10.0, 10.0],
+            array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0],
             epsilon = 1e-9
         );
     }
@@ -606,7 +546,7 @@ mod tests {
     #[test]
     fn test_bspline_basis_sums_to_one() {
         let data = Array::linspace(0.1, 9.9, 100);
-        let (basis, _) = create_bspline_basis(data.view(), None, (0.0, 10.0), 10, 3).unwrap();
+        let (basis, _) = create_bspline_basis(data.view(), (0.0, 10.0), 10, 3).unwrap();
 
         let sums = basis.sum_axis(Axis(1));
 
@@ -621,9 +561,9 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_basis_sums_to_one_with_quantile_knots() {
-        // Create data with a non-uniform distribution to test quantile knots
-        // This creates a bimodal distribution with more points at the extremes
+    fn test_bspline_basis_sums_to_one_with_uniform_knots() {
+        // Create data with a non-uniform distribution
+        // Since quantile knots are disabled for P-splines, this tests the fallback to uniform knots
         let mut data = Array::zeros(100);
         for i in 0..100 {
             let x = if i < 50 {
@@ -636,22 +576,33 @@ mod tests {
             data[i] = x;
         }
 
-        // Use the quantile strategy by providing the data for quantiles
-        let (basis, knots) =
-            create_bspline_basis(data.view(), Some(data.view()), (0.0, 10.0), 10, 3).unwrap();
+        // Even when providing training data, this should fall back to uniform knots
+        let (basis, knots) = create_bspline_basis(data.view(), (0.0, 10.0), 10, 3).unwrap();
 
-        // Verify knot placement - we should have more knots in the dense regions
-        // Output knot positions for inspection
-        println!("Quantile knots: {:?}", knots);
+        // Verify that knots are uniformly distributed (not following data distribution)
+        // Since quantile knots are disabled, these should be uniform
+        println!("Uniform knots (fallback): {:?}", knots);
 
-        // Check that knots follow the data distribution
-        // Count knots in each half of the range
-        let knots_in_first_half = knots.iter().filter(|&&k| k > 0.0 && k < 5.0).count();
-        let knots_in_second_half = knots.iter().filter(|&&k| k >= 5.0 && k < 10.0).count();
+        // Check that internal knots are uniformly spaced
+        let internal_knots: Vec<f64> = knots
+            .iter()
+            .skip(4) // Skip the repeated boundary knots (degree+1 = 4)
+            .take(10) // Take the internal knots
+            .copied()
+            .collect();
 
-        // We expect a roughly balanced number of knots between the two clusters
-        println!("Knots in first half (0-5): {}", knots_in_first_half);
-        println!("Knots in second half (5-10): {}", knots_in_second_half);
+        if internal_knots.len() >= 2 {
+            let spacing = internal_knots[1] - internal_knots[0];
+            for window in internal_knots.windows(2) {
+                let current_spacing = window[1] - window[0];
+                assert!(
+                    (current_spacing - spacing).abs() < 1e-9,
+                    "Knots should be uniformly spaced, but spacing varies: expected {}, got {}",
+                    spacing,
+                    current_spacing
+                );
+            }
+        }
 
         // Verify that the basis still sums to 1.0 for each data point
         let sums = basis.sum_axis(Axis(1));
@@ -660,7 +611,7 @@ mod tests {
         for &sum in sums.iter() {
             assert!(
                 (sum - 1.0).abs() < 1e-9,
-                "Quantile basis did not sum to 1, got {}",
+                "Uniform basis did not sum to 1, got {}",
                 sum
             );
         }
@@ -1047,17 +998,12 @@ mod tests {
         let degree = 3;
         let num_internal_knots = 5;
 
-        let (basis_unc, _) = create_bspline_basis(
-            data.view(),
-            Some(data.view()),
-            (0.0, 1.0),
-            num_internal_knots,
-            degree,
-        )
-        .unwrap();
+        let (basis_unc, _) =
+            create_bspline_basis(data.view(), (0.0, 1.0), num_internal_knots, degree).unwrap();
 
         let main_basis_unc = basis_unc.slice(s![.., 1..]);
-        let (main_basis_con, z_transform) = apply_sum_to_zero_constraint(main_basis_unc, None).unwrap();
+        let (main_basis_con, z_transform) =
+            apply_sum_to_zero_constraint(main_basis_unc, None).unwrap();
 
         let intercept_coeff = 0.5;
         let num_con_coeffs = main_basis_con.ncols();
@@ -1074,7 +1020,6 @@ mod tests {
         // Calculate the prediction for this single point from scratch.
         let (raw_basis_at_point, _) = create_bspline_basis(
             array![test_point_on_grid_x].view(),
-            Some(data.view()),
             (0.0, 1.0),
             num_internal_knots,
             degree,
@@ -1099,7 +1044,6 @@ mod tests {
         // Calculate the prediction for this single off-grid point.
         let (raw_basis_off_grid, _) = create_bspline_basis(
             array![test_point_off_grid_x].view(),
-            Some(data.view()),
             (0.0, 1.0),
             num_internal_knots,
             degree,
@@ -1135,12 +1079,12 @@ mod tests {
 
     #[test]
     fn test_error_conditions() {
-        match create_bspline_basis(array![].view(), None, (0.0, 10.0), 5, 0).unwrap_err() {
+        match create_bspline_basis(array![].view(), (0.0, 10.0), 5, 0).unwrap_err() {
             BasisError::InvalidDegree(deg) => assert_eq!(deg, 0),
             _ => panic!("Expected InvalidDegree error"),
         }
 
-        match create_bspline_basis(array![].view(), None, (10.0, 0.0), 5, 1).unwrap_err() {
+        match create_bspline_basis(array![].view(), (10.0, 0.0), 5, 1).unwrap_err() {
             BasisError::InvalidRange(start, end) => {
                 assert_eq!(start, 10.0);
                 assert_eq!(end, 0.0);
@@ -1148,24 +1092,21 @@ mod tests {
             _ => panic!("Expected InvalidRange error"),
         }
 
-        match create_bspline_basis(
-            array![].view(),
-            Some(array![1., 2.].view()),
+        // Test uniform fallback (quantile knots are disabled for P-splines)
+        let (_, knots_uniform) = create_bspline_basis(
+            array![].view(), // empty evaluation set is fine
             (0.0, 10.0),
-            3,
-            1,
+            3, // num_internal_knots
+            1, // degree
         )
-        .unwrap_err()
-        {
-            BasisError::InsufficientDataForQuantiles {
-                num_quantiles,
-                num_points,
-            } => {
-                assert_eq!(num_quantiles, 3);
-                assert_eq!(num_points, 2);
-            }
-            _ => panic!("Expected InsufficientDataForQuantiles error"),
-        }
+        .unwrap();
+
+        // Uniform fallback: boundary repeated degree+1=2 times => 2 + 3 + 2 = 7 knots
+        assert_abs_diff_eq!(
+            knots_uniform,
+            array![0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0],
+            epsilon = 1e-9
+        );
 
         match create_difference_penalty_matrix(5, 5).unwrap_err() {
             BasisError::InvalidPenaltyOrder { order, num_basis } => {

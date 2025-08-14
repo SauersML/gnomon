@@ -1,4 +1,6 @@
 #![deny(unused_variables)]
+#![deny(dead_code)]
+#![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
 use clap::{Parser, Subcommand};

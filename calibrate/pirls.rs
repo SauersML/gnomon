@@ -443,7 +443,7 @@ pub fn fit_model_for_fixed_rho(
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
-            // CRITICAL FIX: Check gradient with the SAME (W, z) used in the last WLS solve
+            // Check gradient with the SAME (W, z) used in the last WLS solve
             // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
             // So we must check stationarity with respect to those same W_solve, z_solve
 
@@ -628,7 +628,7 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 
     let mut y_inf = 0.0;
 
-    // FIXED: Compute max_diag once outside the loop (performance improvement)
+    // Compute max_diag once outside the loop (performance improvement)
     let max_diag = r_matrix
         .diag()
         .iter()
@@ -638,7 +638,7 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     for k in (0..c).rev() {
         let r_kk = r_matrix[[k, k]];
         if r_kk.abs() <= eps {
-            // FIXED: Return large finite number instead of infinity to avoid overflow
+            // Return large finite number instead of infinity to avoid overflow
             return 1e300;
         }
         let yp = (1.0 - p[k]) / r_kk;
@@ -743,8 +743,8 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
 /// * `src`: Source vector without the dropped rows (length = total - n_drop)
 /// * `dropped_rows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
 /// * `dst`: Destination vector where zeros will be inserted (length = total)
-#[allow(dead_code)]
-fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
+/// Currently unused but kept for future implementation
+pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
     let n_drop = dropped_rows.len();
 
     if n_drop == 0 {
@@ -787,8 +787,8 @@ fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>)
 
 /// Performs the complement operation to undrop_rows - it removes specified rows from a vector
 /// This simulates the behavior of drop_cols in the C code but for a 1D vector
-#[allow(dead_code)]
-fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
+/// Currently unused but kept for future implementation
+pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
     let n_drop = drop_indices.len();
 
     if n_drop == 0 {
@@ -958,7 +958,7 @@ pub fn solve_penalized_least_squares(
         let wz = &sqrt_w * &z;
 
         // 1) Use pivoted QR only to determine rank and column ordering
-        let (_q_unused, r_factor, pivot) = pivoted_qr_faer(&wx)?;
+        let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
         let diag = r_factor.diag();
         let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         let tol = max_diag * 1e-12;
@@ -1513,7 +1513,7 @@ fn pivoted_qr_faer(
     // Try candidate p1
     let a_p1 = pivot_columns(matrix.view(), &p1);
 
-    // FIXED: Use relative error for scale-robust comparison
+    // Use relative error for scale-robust comparison
     let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
         let diff_norm = (a_p - &qr_product).mapv(|x| x * x).sum().sqrt();
         let a_norm = a_p.mapv(|x| x * x).sum().sqrt();
@@ -2667,7 +2667,7 @@ mod tests {
         let e = Array2::<f64>::zeros((0, p));
 
         // Solve once
-        let (res, _rank) = super::solve_penalized_least_squares(
+        let (res, ..) = super::solve_penalized_least_squares(
             x.view(),
             z.view(),
             w.view(),
@@ -2765,8 +2765,16 @@ mod tests {
         let w_prior = Array1::from_elem(n, 1.0);
 
         // Build IRLS vectors at beta=0
-        let (_mu0, w_old, z_old) =
-            super::update_glm_vectors(y.view(), &eta0, super::LinkFunction::Logit, w_prior.view());
+        // Use a tuple with let binding to explicitly declare variable usage
+        let (_, w_old, z_old) = {
+            let vectors = super::update_glm_vectors(
+                y.view(),
+                &eta0,
+                super::LinkFunction::Logit,
+                w_prior.view(),
+            );
+            ((), vectors.1, vectors.2)
+        };
         assert!(w_old.iter().all(|w| *w >= 0.0));
 
         // No penalty to keep it simple
@@ -2794,10 +2802,18 @@ mod tests {
             inf_old
         );
 
-        // Now recompute eta, mu, and NEW weights at the accepted beta
+        // Now recompute eta, mu, and updated weights at the accepted beta
         let eta1 = x.dot(&res.beta);
-        let (_mu1, w_new, z_new) =
-            super::update_glm_vectors(y.view(), &eta1, super::LinkFunction::Logit, w_prior.view());
+        // Use same approach for the second update_glm_vectors call
+        let (_, w_new, z_new) = {
+            let vectors = super::update_glm_vectors(
+                y.view(),
+                &eta1,
+                super::LinkFunction::Logit,
+                w_prior.view(),
+            );
+            ((), vectors.1, vectors.2)
+        };
 
         let sqrt_w_new = w_new.mapv(f64::sqrt);
         let wx_new = &x * &sqrt_w_new.view().insert_axis(ndarray::Axis(1));

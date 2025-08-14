@@ -1,3 +1,6 @@
+#![deny(dead_code)]
+#![deny(unused_imports)]
+
 pub mod basis;
 pub mod construction;
 pub mod data;

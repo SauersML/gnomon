@@ -9,6 +9,9 @@
 // the other modules. It owns all major resources and manages the application lifecycle
 // from argument parsing to final output.
 
+#![deny(dead_code)]
+#![deny(unused_imports)]
+
 use clap::Parser;
 use gnomon::download;
 use gnomon::pipeline::{self, PipelineContext};
@@ -53,18 +56,8 @@ struct Args {
 //                              The main orchestration logic
 // ========================================================================================
 
-#[allow(dead_code)]
-fn main() {
-    // This wrapper provides a clear exit message upon failure.
-    if let Err(e) = run_gnomon() {
-        eprintln!("Gnomon failed.");
-        eprintln!("--------------------------------------------------");
-        eprintln!("{e}");
-        eprintln!("--------------------------------------------------");
-        eprintln!("Due to this fatal error, no output file was generated.");
-        std::process::exit(1);
-    }
-}
+// Main function removed as it's now called through the main binary's subcommand system
+// and was causing dead_code warnings.
 
 /// Public interface for calling gnomon with explicit arguments
 pub fn run_gnomon_with_args(
@@ -81,11 +74,7 @@ pub fn run_gnomon_with_args(
 }
 
 /// The primary application logic
-#[allow(dead_code)]
-fn run_gnomon() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let args = Args::parse();
-    run_gnomon_impl(args)
-}
+// Function removed to eliminate dead code warnings
 
 /// Core implementation that takes args as parameter
 fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {

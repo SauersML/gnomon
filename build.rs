@@ -24,6 +24,12 @@ struct CustomUppercaseCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for #[allow(dead_code)] attribute violations
+struct DeadCodeCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 impl ViolationCollector {
     fn new(file_path: &Path) -> Self {
         Self {
@@ -123,6 +129,40 @@ impl CustomUppercaseCollector {
 
         error_msg.push_str("\n⚠️ Comments where all alphabetic characters are uppercase are STRICTLY FORBIDDEN in this project.\n");
         error_msg.push_str("   STRONGLY CONSIDER deleting the comment completely.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl DeadCodeCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} #[allow(dead_code)] attributes in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ #[allow(dead_code)] attributes are STRICTLY FORBIDDEN in this project.\n",
+        );
+        error_msg
+            .push_str("   Either use the code (removing the attribute) or remove it completely.\n");
 
         Some(error_msg)
     }
@@ -255,6 +295,22 @@ impl Sink for CustomUppercaseCollector {
     }
 }
 
+impl Sink for DeadCodeCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        // Get the line number and the content of the matched line.
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Format the violation string
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        // Return `Ok(true)` to continue searching for more matches in the same file.
+        Ok(true)
+    }
+}
+
 fn main() {
     // Always rerun this script if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
@@ -275,12 +331,18 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+
+    // Scan Rust source files for #[allow(dead_code)] attributes and fail if found.
+    if let Err(e) = scan_for_allow_dead_code() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
 
 // This function manually checks for unused variables in the current file
 fn manually_check_for_unused_variables() {
-    // Force compilation to fail with unused_variables lint
-    // This ensures build.rs itself follows the strict no-unused-variables policy
+    // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
+    // This ensures build.rs itself follows the strict coding policy
     let build_path = Path::new("build.rs");
     let status = std::process::Command::new("rustc")
         .args([
@@ -288,6 +350,10 @@ fn manually_check_for_unused_variables() {
             "2021",
             "-D",
             "unused_variables",
+            "-D",
+            "dead_code",
+            "-D",
+            "unused_imports",
             "--crate-type",
             "bin",
             "--error-format",
@@ -308,12 +374,26 @@ fn manually_check_for_unused_variables() {
                         "   Either use the variable or remove it completely. Underscore prefixes are NOT allowed."
                     );
                     std::process::exit(1);
+                } else if stderr.contains("function is never used") {
+                    eprintln!("\n❌ ERROR: Unused functions detected in build.rs!");
+                    eprintln!("{stderr}");
+                    eprintln!("\n⚠️ Unused functions are STRICTLY FORBIDDEN in this project.");
+                    eprintln!("   Either use the function or remove it completely.");
+                    std::process::exit(1);
+                } else if stderr.contains("unused import") {
+                    eprintln!("\n❌ ERROR: Unused imports detected in build.rs!");
+                    eprintln!("{stderr}");
+                    eprintln!("\n⚠️ Unused imports are STRICTLY FORBIDDEN in this project.");
+                    eprintln!("   Either use the imported item or remove the import completely.");
+                    std::process::exit(1);
                 }
             }
         }
         Err(_) => {
             // If rustc command fails, fallback to warning but don't fail the build
-            eprintln!("cargo:warning=Could not check for unused variables in build.rs");
+            eprintln!(
+                "cargo:warning=Could not check for unused variables/functions/imports in build.rs"
+            );
         }
     }
 }
@@ -449,5 +529,43 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn scan_for_allow_dead_code() -> Result<(), Box<dyn Error>> {
+    // Regex pattern to find #[allow(dead_code)] attributes
+    let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
+    let matcher = RegexMatcher::new_line_matcher(pattern)?;
+    let mut searcher = Searcher::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+
+        // Check if we can read the file
+        match std::fs::read_to_string(path) {
+            Ok(_) => {}         // File exists and can be read
+            Err(_) => continue, // Skip files we can't read
+        };
+
+        // Create a collector for each file
+        let mut collector = DeadCodeCollector::new(path);
+
+        // Search the file using our regex matcher and collector sink
+        searcher.search_path(&matcher, path, &mut collector)?;
+
+        // Process results
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            // If violations were found, return the error
+            return Err(error_message.into());
+        }
+    }
+
+    // If the loop completes without finding any violations, the check passes
     Ok(())
 }

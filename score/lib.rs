@@ -1,5 +1,7 @@
 #![feature(portable_simd)] // Do not remove this
 #![deny(unused_variables)]
+#![deny(dead_code)]
+#![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 pub mod batch;
 pub mod complex;
