@@ -1849,6 +1849,7 @@ mod tests {
             pc_ranges: vec![],
             pc_names: vec![],
             constraints: HashMap::new(),
+            sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -1857,7 +1858,7 @@ mod tests {
 
         // --- 3. Run the Fit ---
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = arr1(&[0.0]);
+        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
@@ -2056,7 +2057,7 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
@@ -2144,6 +2145,7 @@ mod tests {
             pc_ranges: vec![],
             pc_names: vec![],
             constraints: HashMap::new(),
+            sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -2267,6 +2269,7 @@ mod tests {
             pc_ranges: vec![],
             pc_names: vec![],
             constraints: HashMap::new(),
+            sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -2276,8 +2279,8 @@ mod tests {
         // === PHASE 4: Prepare inputs for the target function ===
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
 
-        // This is the exact parameter value that caused `inf` in other tests.
-        let rho_vec = arr1(&[0.0]);
+        // Size rho vector to match actual number of penalties
+        let rho_vec = Array1::<f64>::zeros(rs_original.len());
 
         // === PHASE 5: Execute the target function ===
         let pirls_result = fit_model_for_fixed_rho(
@@ -2394,6 +2397,7 @@ mod tests {
             pc_ranges: vec![],
             pc_names: vec![],
             constraints: HashMap::new(),
+            sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -2402,7 +2406,7 @@ mod tests {
 
         // === Set up inputs using helper ===
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = arr1(&[0.0]); // Same parameter value
+        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         // === Execute P-IRLS ===
         let pirls_result = fit_model_for_fixed_rho(

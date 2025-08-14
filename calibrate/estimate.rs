@@ -52,6 +52,9 @@ pub enum EstimationError {
     #[error("Eigendecomposition failed: {0}")]
     EigendecompositionFailed(ndarray_linalg::error::LinalgError),
 
+    #[error("Parameter constraint violation: {0}")]
+    ParameterConstraintViolation(String),
+
     #[error(
         "The P-IRLS inner loop did not converge within {max_iterations} iterations. Last deviance change was {last_change:.6e}."
     )]
@@ -120,6 +123,7 @@ pub fn train_model(
         s_list,
         layout,
         constraints,
+        sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
         interaction_range_transforms,
@@ -453,6 +457,7 @@ pub fn train_model(
         crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
     config_with_constraints.constraints = constraints;
+    config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.range_transforms = range_transforms;
     config_with_constraints.interaction_range_transforms = interaction_range_transforms;
@@ -1826,6 +1831,7 @@ pub mod internal {
                 },
                 pgs_range: (-3.0, 3.0),
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -1855,6 +1861,7 @@ pub mod internal {
                 pc_ranges: vec![(-3.0, 3.0)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -2350,13 +2357,14 @@ pub mod internal {
                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 constraints: Default::default(),
+                sum_to_zero_constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
                 interaction_centering_means: Default::default(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2504,13 +2512,14 @@ pub mod internal {
                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 constraints: Default::default(),
+                sum_to_zero_constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
                 interaction_centering_means: Default::default(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2992,6 +3001,7 @@ pub mod internal {
                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 pgs_range: (-2.5, 2.5),
                 constraints: std::collections::HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
                 interaction_range_transforms: std::collections::HashMap::new(),
@@ -2999,7 +3009,7 @@ pub mod internal {
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             assert!(
@@ -3305,6 +3315,7 @@ pub mod internal {
                 pc_ranges: vec![(-4.0, 4.0)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -3312,7 +3323,7 @@ pub mod internal {
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3432,6 +3443,7 @@ pub mod internal {
                 pc_ranges: vec![(-3.0, 3.0)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -3439,7 +3451,7 @@ pub mod internal {
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3659,6 +3671,7 @@ pub mod internal {
                 pc_ranges: vec![(-1.0, 1.0)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -3768,6 +3781,7 @@ pub mod internal {
                 pc_ranges: vec![(-0.5, 0.5)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: Default::default(),
+                sum_to_zero_constraints: Default::default(),
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
@@ -3775,7 +3789,7 @@ pub mod internal {
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _, _, _) =
+            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3903,7 +3917,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4025,7 +4039,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4203,7 +4217,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4352,7 +4366,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4456,7 +4470,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4554,6 +4568,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pgs_range: (-1.0, 1.0),
         pc_ranges: vec![],
         constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
         interaction_range_transforms: HashMap::new(),
@@ -4630,6 +4645,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         pc_ranges: vec![(-1.0, 1.0)],
         pc_names: vec!["PC1".to_string()],
         constraints: std::collections::HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
         interaction_range_transforms: std::collections::HashMap::new(),
@@ -4638,7 +4654,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4832,6 +4848,7 @@ mod optimizer_progress_tests {
             pc_ranges: vec![(-3.5, 3.5)],
             pc_names: vec!["PC1".to_string()],
             constraints: std::collections::HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
             interaction_range_transforms: std::collections::HashMap::new(),
@@ -4839,7 +4856,7 @@ mod optimizer_progress_tests {
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),

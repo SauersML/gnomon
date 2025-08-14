@@ -137,6 +137,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         pc_ranges,
         pc_names,
         constraints: std::collections::HashMap::new(),
+        sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
         interaction_range_transforms: std::collections::HashMap::new(),

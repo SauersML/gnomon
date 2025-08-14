@@ -203,7 +203,7 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, range transformations, interaction range transformations, and interaction centering means.
+/// Returns the design matrix, penalty matrices, model layout, constraint transformations, sum-to-zero constraints, knot vectors, range transformations, interaction range transformations, and interaction centering means.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
@@ -213,6 +213,7 @@ pub fn build_design_and_penalty_matrices(
         Vec<Array2<f64>>,
         ModelLayout,
         HashMap<String, Constraint>,
+        HashMap<String, Array2<f64>>, // Added: sum_to_zero_constraints
         HashMap<String, Array1<f64>>,
         HashMap<String, Array2<f64>>,
         HashMap<String, Array2<f64>>, // Added: interaction_range_transforms
@@ -234,6 +235,7 @@ pub fn build_design_and_penalty_matrices(
 
     // Initialize constraint, knot vector, and range transform storage
     let mut constraints = HashMap::new();
+    let mut sum_to_zero_constraints = HashMap::new();
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
     let mut interaction_range_transforms = HashMap::new();
@@ -274,7 +276,7 @@ pub fn build_design_and_penalty_matrices(
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
     let (pgs_main_basis, pgs_z_transform) =
-        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
+        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc, Some(data.weights.view()))?;
 
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
@@ -284,7 +286,10 @@ pub fn build_design_and_penalty_matrices(
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
 
-    // Save the PGS constraint transformation
+    // Save the PGS sum-to-zero constraint transformation in the new dedicated field
+    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
+    
+    // Also save in old field for backward compatibility during transition
     constraints.insert(
         "pgs_main".to_string(),
         Constraint {
@@ -566,6 +571,7 @@ pub fn build_design_and_penalty_matrices(
         s_list,
         layout,
         constraints,
+        sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
         interaction_range_transforms,
@@ -713,6 +719,14 @@ pub fn construct_s_lambda(
         return s_lambda;
     }
 
+    // CRITICAL VALIDATION: lambdas length must match number of penalty matrices
+    if lambdas.len() != s_list.len() {
+        panic!(
+            "Lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
+            s_list.len(), s_list.len(), lambdas.len()
+        );
+    }
+
     // Simple weighted sum since all matrices are now p × p
     for (i, s_k) in s_list.iter().enumerate() {
         // Add weighted penalty matrix
@@ -750,6 +764,14 @@ pub fn stable_reparameterization(
     // println!("DEBUG: rs_list: {:?}", rs_list);
     let p = layout.total_coeffs;
     let m = rs_list.len(); // Number of penalty square roots
+
+    // CRITICAL VALIDATION: lambdas length must match number of penalties
+    if lambdas.len() != m {
+        return Err(EstimationError::ParameterConstraintViolation(format!(
+            "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
+            m, m, lambdas.len()
+        )));
+    }
 
     if m == 0 {
         return Ok(ReparamResult {
@@ -927,7 +949,7 @@ pub fn stable_reparameterization(
             .iter()
             .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         let rank_tolerance = max_eigenval * r_tol;
-        let r = eigenvalues_for_rank
+        let mut r = eigenvalues_for_rank
             .iter()
             .filter(|&&ev| ev > rank_tolerance)
             .count();
@@ -956,9 +978,38 @@ pub fn stable_reparameterization(
 
         // Eigendecomposition to get eigenvectors 'u' for the similarity transform
         // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
-        let (_, u): (Array1<f64>, Array2<f64>) = sb_for_transform
+        let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = sb_for_transform
             .eigh(UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
+
+        // SAFETY CHECK: Validate that the two decompositions agree on the rank
+        // If the lambda-weighted matrix has significantly different rank structure, 
+        // the reparameterization may be unreliable
+        let max_eigenval_transform = eigenvalues_for_transform
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let rank_tolerance_transform = max_eigenval_transform * r_tol;
+        let r_transform = eigenvalues_for_transform
+            .iter()
+            .filter(|&&ev| ev > rank_tolerance_transform)
+            .count();
+
+        // Check for significant disagreement between the two rank estimates
+        if (r as i32 - r_transform as i32).abs() > 1 {
+            log::warn!(
+                "Rank disagreement detected: balanced matrix rank={}, weighted matrix rank={}. Proceeding with caution.",
+                r, r_transform
+            );
+            
+            // Fall back to more conservative rank estimate to avoid corruption
+            let r_conservative = r.min(r_transform);
+            if r_conservative == 0 {
+                gamma = gamma_prime;
+                continue;
+            }
+            // Use the conservative rank for the remainder of this iteration
+            r = r_conservative;
+        }
 
         // Note: The stable rank detection debug message is already logged above
 
@@ -981,6 +1032,26 @@ pub fn stable_reparameterization(
             // No range directions identified this iteration; switch to gamma' and continue
             gamma = gamma_prime;
             continue;
+        }
+
+        // ENERGY CHECK: Verify that the selected range subspace from sb_for_transform 
+        // actually captures the dominant energy of sb_for_rank before committing
+        let u_range_candidate = u.slice(s![.., q_current - r..]); // Last r columns from sb_for_transform
+        let projected_energy = u_range_candidate.t().dot(&sb_for_rank).dot(&u_range_candidate);
+        let total_energy_rank = sb_for_rank.diag().sum(); // Trace of sb_for_rank
+        
+        if total_energy_rank > 1e-12 { // Avoid division by zero
+            let captured_energy_ratio = projected_energy.diag().sum() / total_energy_rank;
+            
+            // If the selected range space doesn't capture enough energy from the rank matrix,
+            // reduce r to be more conservative
+            if captured_energy_ratio < 0.8 && r > 1 { // 80% energy threshold
+                log::warn!(
+                    "Range subspace captures only {:.1}% of rank matrix energy. Reducing r from {} to {}",
+                    captured_energy_ratio * 100.0, r, r - 1
+                );
+                r = r - 1;
+            }
         }
 
         let u_range = u.slice(s![.., q_current - r..]); // Last r columns
@@ -1051,7 +1122,8 @@ pub fn stable_reparameterization(
                 // FIXED: For rank×p roots, zero out the null space COLUMNS (not rows)
                 // The null space is now the LAST `q_current - r` columns of the sub-block.
                 if r < q_current {
-                    rs_current[i].slice_mut(s![.., k_offset + r..]).fill(0.0);
+                    // Use explicit end index to avoid zeroing beyond current subblock
+                    rs_current[i].slice_mut(s![.., k_offset + r..k_offset + q_current]).fill(0.0);
                 }
             } else {
                 // SUB-DOMINANT penalty (in gamma_prime).
@@ -1073,14 +1145,14 @@ pub fn stable_reparameterization(
                 if r < q_current {
                     // Zero out the null-space rows and columns (bottom-right block)
                     s_current_list[i]
-                        .slice_mut(s![k_offset + r.., k_offset + r..])
+                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset + r..k_offset + q_current])
                         .fill(0.0);
                     // Zero out the off-diagonal blocks connecting range and null spaces
                     s_current_list[i]
-                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
+                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
                         .fill(0.0);
                     s_current_list[i]
-                        .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
+                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
                         .fill(0.0);
                 }
             } else {
@@ -1091,10 +1163,10 @@ pub fn stable_reparameterization(
                     .fill(0.0);
                 // Zero out the off-diagonal blocks connecting range and null spaces
                 s_current_list[i]
-                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
+                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
                     .fill(0.0);
                 s_current_list[i]
-                    .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
+                    .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
                     .fill(0.0);
             }
         }
@@ -1144,8 +1216,9 @@ pub fn stable_reparameterization(
         .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
 
-    // Count non-zero eigenvalues to determine the rank
-    let tolerance = 1e-12;
+    // Count non-zero eigenvalues to determine the rank using relative tolerance
+    let max_eigenval = s_eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    let tolerance = max_eigenval * 1e-12; // Relative tolerance for better numerical stability
     let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
     // Construct the lambda-DEPENDENT penalty square root matrix
@@ -1342,6 +1415,7 @@ mod tests {
             pc_ranges,
             pc_names,
             constraints: HashMap::new(),
+            sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -1356,7 +1430,7 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, _range_transforms, _, _) =
+        let (x, s_list, layout, _, _, _, _range_transforms, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
@@ -1403,7 +1477,7 @@ mod tests {
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (x, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, _, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Calculate numerical rank via SVD
         let svd = x.svd(false, false).expect("SVD failed");
@@ -1426,7 +1500,7 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
@@ -1501,7 +1575,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _, _) =
+        let (_, _, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =

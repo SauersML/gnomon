@@ -58,8 +58,14 @@ pub struct ModelConfig {
 
     /// A map from a term name (e.g., "PC1", "pgs_main") to its constraint transformation.
     /// Use an Option because not all terms might be constrained.
+    /// DEPRECATED: This field contains mixed semantics and should be phased out.
+    /// Use sum_to_zero_constraints for new sum-to-zero transforms.
     #[serde(default)] // For backward compatibility with old models that don't have this field
     pub constraints: HashMap<String, Constraint>,
+    /// Sum-to-zero constraint transformations (separate from range transforms)
+    /// Maps term names (e.g., "pgs_main") to their sum-to-zero transformation matrices
+    #[serde(default)] // For backward compatibility with models that don't have this field
+    pub sum_to_zero_constraints: HashMap<String, Array2<f64>>,
     /// Knot vectors used during training, required for exact reproduction during prediction
     pub knot_vectors: HashMap<String, Array1<f64>>,
     /// Range transformation matrices for functional ANOVA decomposition
@@ -68,6 +74,8 @@ pub struct ModelConfig {
     pub range_transforms: HashMap<String, Array2<f64>>,
     /// Range transformation matrices for interaction terms (unwhitened eigenvectors)
     /// Maps variable names (e.g., "pgs", "PC1") to their unwhitened range eigenvectors for interactions
+    /// DEPRECATED: This field is computed but never used during prediction. 
+    /// The prediction code uses range_transforms instead. Consider removing in a future version.
     #[serde(default)] // For backward compatibility with models that don't have this field
     pub interaction_range_transforms: HashMap<String, Array2<f64>>,
     /// Weighted column means used for centering interaction marginals during training
@@ -119,6 +127,8 @@ pub enum ModelError {
     MismatchedPcCount { found: usize, expected: usize },
     #[error("Underlying basis function generation failed during prediction: {0}")]
     BasisError(#[from] basis::BasisError),
+    #[error("Dimension mismatch: {0}")]
+    DimensionMismatch(String),
     #[error(
         "Internal error: failed to stack design matrix columns or constraint matrix dimensions don't match basis dimensions during prediction."
     )]
@@ -250,6 +260,13 @@ mod internal {
         config: &ModelConfig,
         coeffs: &MappedCoefficients,
     ) -> Result<Array2<f64>, ModelError> {
+        // CRITICAL: Validate that prediction data dimensions are consistent
+        if p_new.len() != pcs_new.nrows() {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Sample count mismatch: p_new has {} samples but pcs_new has {} rows",
+                p_new.len(), pcs_new.nrows()
+            )));
+        }
         // 1. Generate basis for PGS using saved knot vector if available
         // Only use saved knot vectors - remove fallback to ensure consistency
         let saved_knots = config
@@ -263,13 +280,19 @@ mod internal {
             config.pgs_basis_config.degree,
         )?;
 
-        // Apply the SAVED PGS constraint
+        // Apply the SAVED PGS constraint - prefer new sum_to_zero_constraints field
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let pgs_z = &config
-            .constraints
-            .get("pgs_main")
-            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
-            .z_transform;
+        let pgs_z = if let Some(z_transform) = config.sum_to_zero_constraints.get("pgs_main") {
+            // Use the new dedicated sum-to-zero constraints field
+            z_transform
+        } else {
+            // Fallback to old constraints field for backward compatibility
+            &config
+                .constraints
+                .get("pgs_main")
+                .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
+                .z_transform
+        };
 
         // Check that dimensions match before matrix multiplication
         if pgs_main_basis_unc.ncols() != pgs_z.nrows() {
@@ -366,12 +389,18 @@ mod internal {
 
             // Apply the stored centering from training to maintain consistency
             if let Some(pgs_means) = config.interaction_centering_means.get("pgs") {
+                // CRITICAL: Enforce exact length match to prevent partial centering
+                if pgs_int_basis.ncols() != pgs_means.len() {
+                    return Err(ModelError::DimensionMismatch(format!(
+                        "PGS interaction basis has {} columns but {} stored means",
+                        pgs_int_basis.ncols(), pgs_means.len()
+                    )));
+                }
+                
                 // Subtract the stored means from each column (same as training)
                 for j in 0..pgs_int_basis.ncols() {
-                    if j < pgs_means.len() {
-                        let mean_val = pgs_means[j];
-                        pgs_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
-                    }
+                    let mean_val = pgs_means[j];
+                    pgs_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
                 }
             }
 
@@ -395,12 +424,18 @@ mod internal {
 
                     // Apply the stored centering from training to maintain consistency
                     if let Some(pc_means) = config.interaction_centering_means.get(pc_name) {
+                        // CRITICAL: Enforce exact length match to prevent partial centering
+                        if pc_int_basis.ncols() != pc_means.len() {
+                            return Err(ModelError::DimensionMismatch(format!(
+                                "{} interaction basis has {} columns but {} stored means",
+                                pc_name, pc_int_basis.ncols(), pc_means.len()
+                            )));
+                        }
+                        
                         // Subtract the stored means from each column (same as training)
                         for j in 0..pc_int_basis.ncols() {
-                            if j < pc_means.len() {
-                                let mean_val = pc_means[j];
-                                pc_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
-                            }
+                            let mean_val = pc_means[j];
+                            pc_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
                         }
                     }
 
@@ -506,7 +541,7 @@ mod tests {
         .unwrap();
         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
         let (_, z_transform) =
-            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view()).unwrap();
+            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view(), None).unwrap();
 
         let model = TrainedModel {
             config: ModelConfig {
@@ -539,6 +574,7 @@ mod tests {
                     knots.insert("pgs".to_string(), knot_vector.clone());
                     knots
                 },
+                sum_to_zero_constraints: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
@@ -609,6 +645,7 @@ mod tests {
                 pc_ranges: vec![(-1.0, 1.0)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
@@ -699,6 +736,7 @@ mod tests {
             pc_ranges: vec![(0.0, 1.0), (0.0, 1.0)],
             pc_names: vec!["PC1".to_string(), "PC2".to_string()], // Order matters for flattening
             constraints: HashMap::new(),
+                sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
@@ -778,6 +816,7 @@ mod tests {
             pc_ranges: vec![(-0.5, 0.5)],
             pc_names: vec!["PC1".to_string()],
             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+            sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             interaction_range_transforms: HashMap::new(),
@@ -804,6 +843,7 @@ mod tests {
             _,
             layout,
             constraints,
+            sum_to_zero_constraints,
             knot_vectors,
             range_transforms,
             interaction_range_transforms,
@@ -829,6 +869,7 @@ mod tests {
                 pc_ranges: vec![(-0.5, 0.5)],
                 pc_names: vec!["PC1".to_string()],
                 constraints: constraints.clone(), // Clone to avoid ownership issues
+                sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
                 knot_vectors, // Use the knot vectors generated by the model-building code
                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
                 interaction_range_transforms: interaction_range_transforms.clone(),

@@ -56,6 +56,11 @@ pub enum BasisError {
     )]
     InsufficientColumnsForConstraint { found: usize },
 
+    #[error(
+        "Weights dimension mismatch: expected {expected} weights to match basis matrix rows, but got {found}."
+    )]
+    WeightsDimensionMismatch { expected: usize, found: usize },
+
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] ndarray_linalg::error::LinalgError),
 
@@ -228,11 +233,13 @@ pub fn create_difference_penalty_matrix(
 
 /// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
 ///
-/// This is achieved by reparameterizing the basis to be orthogonal to the intercept.
+/// This is achieved by reparameterizing the basis to be orthogonal to the weighted intercept.
 /// In GAMs, this constraint removes the confounding between the intercept and smooth functions.
+/// For weighted models (e.g., GLM-IRLS), the constraint is B^T W 1 = 0 instead of B^T 1 = 0.
 ///
 /// # Arguments
 /// * `basis_matrix`: An `ArrayView2<f64>` of the original, unconstrained basis matrix.
+/// * `weights`: Optional weights for the constraint. If None, uses unweighted constraint.
 ///
 /// # Returns
 /// A tuple containing:
@@ -240,6 +247,7 @@ pub fn create_difference_penalty_matrix(
 /// 2. The transformation matrix `Z` used to create it.
 pub fn apply_sum_to_zero_constraint(
     basis_matrix: ArrayView2<f64>,
+    weights: Option<ArrayView1<f64>>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = basis_matrix.nrows();
     let k = basis_matrix.ncols();
@@ -247,9 +255,17 @@ pub fn apply_sum_to_zero_constraint(
         return Err(BasisError::InsufficientColumnsForConstraint { found: k });
     }
 
-    // c = B^T 1
-    let ones = Array1::ones(n);
-    let c = basis_matrix.t().dot(&ones); // shape k
+    // c = B^T w (weighted constraint) or B^T 1 (unweighted constraint)
+    let constraint_vector = match weights {
+        Some(w) => {
+            if w.len() != n {
+                return Err(BasisError::WeightsDimensionMismatch { expected: n, found: w.len() });
+            }
+            w.to_owned()
+        }
+        None => Array1::ones(n),
+    };
+    let c = basis_matrix.t().dot(&constraint_vector); // shape k
 
     // Orthonormal basis for nullspace of c^T
     // Build a k×1 matrix and compute its SVD; the columns of U after the first
@@ -1041,7 +1057,7 @@ mod tests {
         .unwrap();
 
         let main_basis_unc = basis_unc.slice(s![.., 1..]);
-        let (main_basis_con, z_transform) = apply_sum_to_zero_constraint(main_basis_unc).unwrap();
+        let (main_basis_con, z_transform) = apply_sum_to_zero_constraint(main_basis_unc, None).unwrap();
 
         let intercept_coeff = 0.5;
         let num_con_coeffs = main_basis_con.ncols();

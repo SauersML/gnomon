@@ -1,0 +1,814 @@
+diff --git a/calibrate/basis.rs b/calibrate/basis.rs
+index 12dbed8..ea9e26f 100644
+--- a/calibrate/basis.rs
++++ b/calibrate/basis.rs
+@@ -56,6 +56,11 @@ pub enum BasisError {
+     )]
+     InsufficientColumnsForConstraint { found: usize },
+ 
++    #[error(
++        "Weights dimension mismatch: expected {expected} weights to match basis matrix rows, but got {found}."
++    )]
++    WeightsDimensionMismatch { expected: usize, found: usize },
++
+     #[error("QR decomposition failed while applying constraints: {0}")]
+     LinalgError(#[from] ndarray_linalg::error::LinalgError),
+ 
+@@ -228,11 +233,13 @@ pub fn create_difference_penalty_matrix(
+ 
+ /// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
+ ///
+-/// This is achieved by reparameterizing the basis to be orthogonal to the intercept.
++/// This is achieved by reparameterizing the basis to be orthogonal to the weighted intercept.
+ /// In GAMs, this constraint removes the confounding between the intercept and smooth functions.
++/// For weighted models (e.g., GLM-IRLS), the constraint is B^T W 1 = 0 instead of B^T 1 = 0.
+ ///
+ /// # Arguments
+ /// * `basis_matrix`: An `ArrayView2<f64>` of the original, unconstrained basis matrix.
++/// * `weights`: Optional weights for the constraint. If None, uses unweighted constraint.
+ ///
+ /// # Returns
+ /// A tuple containing:
+@@ -240,6 +247,7 @@ pub fn create_difference_penalty_matrix(
+ /// 2. The transformation matrix `Z` used to create it.
+ pub fn apply_sum_to_zero_constraint(
+     basis_matrix: ArrayView2<f64>,
++    weights: Option<ArrayView1<f64>>,
+ ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+     let n = basis_matrix.nrows();
+     let k = basis_matrix.ncols();
+@@ -247,9 +255,17 @@ pub fn apply_sum_to_zero_constraint(
+         return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+     }
+ 
+-    // c = B^T 1
+-    let ones = Array1::ones(n);
+-    let c = basis_matrix.t().dot(&ones); // shape k
++    // c = B^T w (weighted constraint) or B^T 1 (unweighted constraint)
++    let constraint_vector = match weights {
++        Some(w) => {
++            if w.len() != n {
++                return Err(BasisError::WeightsDimensionMismatch { expected: n, found: w.len() });
++            }
++            w.to_owned()
++        }
++        None => Array1::ones(n),
++    };
++    let c = basis_matrix.t().dot(&constraint_vector); // shape k
+ 
+     // Orthonormal basis for nullspace of c^T
+     // Build a k×1 matrix and compute its SVD; the columns of U after the first
+@@ -1041,7 +1057,7 @@ mod tests {
+         .unwrap();
+ 
+         let main_basis_unc = basis_unc.slice(s![.., 1..]);
+-        let (main_basis_con, z_transform) = apply_sum_to_zero_constraint(main_basis_unc).unwrap();
++        let (main_basis_con, z_transform) = apply_sum_to_zero_constraint(main_basis_unc, None).unwrap();
+ 
+         let intercept_coeff = 0.5;
+         let num_con_coeffs = main_basis_con.ncols();
+diff --git a/calibrate/construction.rs b/calibrate/construction.rs
+index 6035532..6c7bfc4 100644
+--- a/calibrate/construction.rs
++++ b/calibrate/construction.rs
+@@ -203,7 +203,7 @@ impl ModelLayout {
+ }
+ 
+ /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
+-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, range transformations, interaction range transformations, and interaction centering means.
++/// Returns the design matrix, penalty matrices, model layout, constraint transformations, sum-to-zero constraints, knot vectors, range transformations, interaction range transformations, and interaction centering means.
+ pub fn build_design_and_penalty_matrices(
+     data: &TrainingData,
+     config: &ModelConfig,
+@@ -213,6 +213,7 @@ pub fn build_design_and_penalty_matrices(
+         Vec<Array2<f64>>,
+         ModelLayout,
+         HashMap<String, Constraint>,
++        HashMap<String, Array2<f64>>, // Added: sum_to_zero_constraints
+         HashMap<String, Array1<f64>>,
+         HashMap<String, Array2<f64>>,
+         HashMap<String, Array2<f64>>, // Added: interaction_range_transforms
+@@ -234,6 +235,7 @@ pub fn build_design_and_penalty_matrices(
+ 
+     // Initialize constraint, knot vector, and range transform storage
+     let mut constraints = HashMap::new();
++    let mut sum_to_zero_constraints = HashMap::new();
+     let mut knot_vectors = HashMap::new();
+     let mut range_transforms = HashMap::new();
+     let mut interaction_range_transforms = HashMap::new();
+@@ -273,8 +275,12 @@ pub fn build_design_and_penalty_matrices(
+ 
+     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
+     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
++    // NOTE: Using training weights for sum-to-zero constraint (consistent with interaction centering).
++    // For full IRLS consistency, this should ideally use IRLS weights from the final iteration,
++    // requiring constraint updates during fitting (mgcv-style). Current approach is simpler
++    // and consistent with other parts of the functional ANOVA decomposition.
+     let (pgs_main_basis, pgs_z_transform) =
+-        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
++        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc, Some(data.weights.view()))?;
+ 
+     // Create whitened range transform for PGS (used if switching to whitened interactions)
+     let s_pgs_main =
+@@ -284,7 +290,10 @@ pub fn build_design_and_penalty_matrices(
+     // Store PGS range transformation for interactions and potential future penalized PGS
+     range_transforms.insert("pgs".to_string(), z_range_pgs);
+ 
+-    // Save the PGS constraint transformation
++    // Save the PGS sum-to-zero constraint transformation in the new dedicated field
++    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
++    
++    // Also save in old field for backward compatibility during transition
+     constraints.insert(
+         "pgs_main".to_string(),
+         Constraint {
+@@ -566,6 +575,7 @@ pub fn build_design_and_penalty_matrices(
+         s_list,
+         layout,
+         constraints,
++        sum_to_zero_constraints,
+         knot_vectors,
+         range_transforms,
+         interaction_range_transforms,
+@@ -713,6 +723,14 @@ pub fn construct_s_lambda(
+         return s_lambda;
+     }
+ 
++    // CRITICAL VALIDATION: lambdas length must match number of penalty matrices
++    if lambdas.len() != s_list.len() {
++        panic!(
++            "Lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
++            s_list.len(), s_list.len(), lambdas.len()
++        );
++    }
++
+     // Simple weighted sum since all matrices are now p × p
+     for (i, s_k) in s_list.iter().enumerate() {
+         // Add weighted penalty matrix
+@@ -751,6 +769,14 @@ pub fn stable_reparameterization(
+     let p = layout.total_coeffs;
+     let m = rs_list.len(); // Number of penalty square roots
+ 
++    // CRITICAL VALIDATION: lambdas length must match number of penalties
++    if lambdas.len() != m {
++        return Err(EstimationError::ParameterConstraintViolation(format!(
++            "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
++            m, m, lambdas.len()
++        )));
++    }
++
+     if m == 0 {
+         return Ok(ReparamResult {
+             s_transformed: Array2::zeros((p, p)),
+@@ -927,7 +953,7 @@ pub fn stable_reparameterization(
+             .iter()
+             .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+         let rank_tolerance = max_eigenval * r_tol;
+-        let r = eigenvalues_for_rank
++        let mut r = eigenvalues_for_rank
+             .iter()
+             .filter(|&&ev| ev > rank_tolerance)
+             .count();
+@@ -956,10 +982,39 @@ pub fn stable_reparameterization(
+ 
+         // Eigendecomposition to get eigenvectors 'u' for the similarity transform
+         // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
+-        let (_, u): (Array1<f64>, Array2<f64>) = sb_for_transform
++        let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = sb_for_transform
+             .eigh(UPLO::Lower)
+             .map_err(EstimationError::EigendecompositionFailed)?;
+ 
++        // SAFETY CHECK: Validate that the two decompositions agree on the rank
++        // If the lambda-weighted matrix has significantly different rank structure, 
++        // the reparameterization may be unreliable
++        let max_eigenval_transform = eigenvalues_for_transform
++            .iter()
++            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
++        let rank_tolerance_transform = max_eigenval_transform * r_tol;
++        let r_transform = eigenvalues_for_transform
++            .iter()
++            .filter(|&&ev| ev > rank_tolerance_transform)
++            .count();
++
++        // Check for significant disagreement between the two rank estimates
++        if (r as i32 - r_transform as i32).abs() > 1 {
++            log::warn!(
++                "Rank disagreement detected: balanced matrix rank={}, weighted matrix rank={}. Proceeding with caution.",
++                r, r_transform
++            );
++            
++            // Fall back to more conservative rank estimate to avoid corruption
++            let r_conservative = r.min(r_transform);
++            if r_conservative == 0 {
++                gamma = gamma_prime;
++                continue;
++            }
++            // Use the conservative rank for the remainder of this iteration
++            r = r_conservative;
++        }
++
+         // Note: The stable rank detection debug message is already logged above
+ 
+         log::debug!(
+@@ -983,6 +1038,26 @@ pub fn stable_reparameterization(
+             continue;
+         }
+ 
++        // ENERGY CHECK: Verify that the selected range subspace from sb_for_transform 
++        // actually captures the dominant energy of sb_for_rank before committing
++        let u_range_candidate = u.slice(s![.., q_current - r..]); // Last r columns from sb_for_transform
++        let projected_energy = u_range_candidate.t().dot(&sb_for_rank).dot(&u_range_candidate);
++        let total_energy_rank = sb_for_rank.diag().sum(); // Trace of sb_for_rank
++        
++        if total_energy_rank > 1e-12 { // Avoid division by zero
++            let captured_energy_ratio = projected_energy.diag().sum() / total_energy_rank;
++            
++            // If the selected range space doesn't capture enough energy from the rank matrix,
++            // reduce r to be more conservative
++            if captured_energy_ratio < 0.8 && r > 1 { // 80% energy threshold
++                log::warn!(
++                    "Range subspace captures only {:.1}% of rank matrix energy. Reducing r from {} to {}",
++                    captured_energy_ratio * 100.0, r, r - 1
++                );
++                r = r - 1;
++            }
++        }
++
+         let u_range = u.slice(s![.., q_current - r..]); // Last r columns
+         let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
+         let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])
+@@ -1051,7 +1126,8 @@ pub fn stable_reparameterization(
+                 // FIXED: For rank×p roots, zero out the null space COLUMNS (not rows)
+                 // The null space is now the LAST `q_current - r` columns of the sub-block.
+                 if r < q_current {
+-                    rs_current[i].slice_mut(s![.., k_offset + r..]).fill(0.0);
++                    // Use explicit end index to avoid zeroing beyond current subblock
++                    rs_current[i].slice_mut(s![.., k_offset + r..k_offset + q_current]).fill(0.0);
+                 }
+             } else {
+                 // SUB-DOMINANT penalty (in gamma_prime).
+@@ -1073,14 +1149,14 @@ pub fn stable_reparameterization(
+                 if r < q_current {
+                     // Zero out the null-space rows and columns (bottom-right block)
+                     s_current_list[i]
+-                        .slice_mut(s![k_offset + r.., k_offset + r..])
++                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset + r..k_offset + q_current])
+                         .fill(0.0);
+                     // Zero out the off-diagonal blocks connecting range and null spaces
+                     s_current_list[i]
+-                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
++                        .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
+                         .fill(0.0);
+                     s_current_list[i]
+-                        .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
++                        .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
+                         .fill(0.0);
+                 }
+             } else {
+@@ -1091,10 +1167,10 @@ pub fn stable_reparameterization(
+                     .fill(0.0);
+                 // Zero out the off-diagonal blocks connecting range and null spaces
+                 s_current_list[i]
+-                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..])
++                    .slice_mut(s![k_offset..k_offset + r, k_offset + r..k_offset + q_current])
+                     .fill(0.0);
+                 s_current_list[i]
+-                    .slice_mut(s![k_offset + r.., k_offset..k_offset + r])
++                    .slice_mut(s![k_offset + r..k_offset + q_current, k_offset..k_offset + r])
+                     .fill(0.0);
+             }
+         }
+@@ -1144,8 +1220,9 @@ pub fn stable_reparameterization(
+         .eigh(UPLO::Lower)
+         .map_err(EstimationError::EigendecompositionFailed)?;
+ 
+-    // Count non-zero eigenvalues to determine the rank
+-    let tolerance = 1e-12;
++    // Count non-zero eigenvalues to determine the rank using relative tolerance
++    let max_eigenval = s_eigenvalues.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
++    let tolerance = max_eigenval * 1e-12; // Relative tolerance for better numerical stability
+     let penalty_rank = s_eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+ 
+     // Construct the lambda-DEPENDENT penalty square root matrix
+@@ -1342,6 +1419,7 @@ mod tests {
+             pc_ranges,
+             pc_names,
+             constraints: HashMap::new(),
++            sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+@@ -1356,7 +1434,7 @@ mod tests {
+         // Setup with 1 PC to create main effect and interaction terms
+         let (data, config) = create_test_data_for_construction(100, 1);
+ 
+-        let (x, s_list, layout, _, _, _range_transforms, _, _) =
++        let (x, s_list, layout, _, _, _, _range_transforms, _, _) =
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
+@@ -1403,7 +1481,7 @@ mod tests {
+     #[test]
+     fn test_interaction_design_matrix_is_full_rank() {
+         let (data, config) = create_test_data_for_construction(100, 1);
+-        let (x, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
++        let (x, _, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         // Calculate numerical rank via SVD
+         let svd = x.svd(false, false).expect("SVD failed");
+@@ -1426,7 +1504,7 @@ mod tests {
+     #[test]
+     fn test_interaction_term_has_correct_penalty_structure() {
+         let (data, config) = create_test_data_for_construction(100, 1);
+-        let (_, s_list, layout, _, _, _, _, _) =
++        let (_, s_list, layout, _, _, _, _, _, _) =
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
+@@ -1501,7 +1579,7 @@ mod tests {
+     fn test_construction_with_no_pcs() {
+         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
+ 
+-        let (_, _, layout, _, _, _, _, _) =
++        let (_, _, layout, _, _, _, _, _, _) =
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         let pgs_main_coeffs =
+diff --git a/calibrate/estimate.rs b/calibrate/estimate.rs
+index ebd6020..e4e9259 100644
+--- a/calibrate/estimate.rs
++++ b/calibrate/estimate.rs
+@@ -52,6 +52,9 @@ pub enum EstimationError {
+     #[error("Eigendecomposition failed: {0}")]
+     EigendecompositionFailed(ndarray_linalg::error::LinalgError),
+ 
++    #[error("Parameter constraint violation: {0}")]
++    ParameterConstraintViolation(String),
++
+     #[error(
+         "The P-IRLS inner loop did not converge within {max_iterations} iterations. Last deviance change was {last_change:.6e}."
+     )]
+@@ -120,6 +123,7 @@ pub fn train_model(
+         s_list,
+         layout,
+         constraints,
++        sum_to_zero_constraints,
+         knot_vectors,
+         range_transforms,
+         interaction_range_transforms,
+@@ -453,6 +457,7 @@ pub fn train_model(
+         crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+     let mut config_with_constraints = config.clone();
+     config_with_constraints.constraints = constraints;
++    config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
+     config_with_constraints.knot_vectors = knot_vectors;
+     config_with_constraints.range_transforms = range_transforms;
+     config_with_constraints.interaction_range_transforms = interaction_range_transforms;
+@@ -1826,6 +1831,7 @@ pub mod internal {
+                 },
+                 pgs_range: (-3.0, 3.0),
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -1855,6 +1861,7 @@ pub mod internal {
+                 pc_ranges: vec![(-3.0, 3.0)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -2350,13 +2357,14 @@ pub mod internal {
+                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
+                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
+                 constraints: Default::default(),
++                sum_to_zero_constraints: Default::default(),
+                 knot_vectors: Default::default(),
+                 range_transforms: Default::default(),
+                 interaction_range_transforms: Default::default(),
+                 interaction_centering_means: Default::default(),
+             };
+ 
+-            let (x, s_list, layout, _, _, _, _, _) =
++            let (x, s_list, layout, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Get P-IRLS result at a reasonable smoothing level
+@@ -2504,13 +2512,14 @@ pub mod internal {
+                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
+                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
+                 constraints: Default::default(),
++                sum_to_zero_constraints: Default::default(),
+                 knot_vectors: Default::default(),
+                 range_transforms: Default::default(),
+                 interaction_range_transforms: Default::default(),
+                 interaction_centering_means: Default::default(),
+             };
+ 
+-            let (x, s_list, layout, _, _, _, _, _) =
++            let (x, s_list, layout, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Get P-IRLS result at a reasonable smoothing level
+@@ -2992,6 +3001,7 @@ pub mod internal {
+                 pc_names: vec!["PC1".to_string(), "PC2".to_string()],
+                 pgs_range: (-2.5, 2.5),
+                 constraints: std::collections::HashMap::new(),
++                sum_to_zero_constraints: std::collections::HashMap::new(),
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_range_transforms: std::collections::HashMap::new(),
+@@ -2999,7 +3009,7 @@ pub mod internal {
+             };
+ 
+             // --- 3. Build Model Structure ---
+-            let (x_matrix, mut s_list, layout, _, _, _, _, _) =
++            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             assert!(
+@@ -3305,6 +3315,7 @@ pub mod internal {
+                 pc_ranges: vec![(-4.0, 4.0)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -3312,7 +3323,7 @@ pub mod internal {
+             };
+ 
+             // Test with extreme lambda values that might cause issues
+-            let (x_matrix, s_list, layout, _, _, _, _, _) =
++            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Try with very large lambda values (exp(10) ~ 22000)
+@@ -3432,6 +3443,7 @@ pub mod internal {
+                 pc_ranges: vec![(-3.0, 3.0)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -3439,7 +3451,7 @@ pub mod internal {
+             };
+ 
+             // Test that we can at least compute cost without getting infinity
+-            let (x_matrix, s_list, layout, _, _, _, _, _) =
++            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             let reml_state = internal::RemlState::new(
+@@ -3659,6 +3671,7 @@ pub mod internal {
+                 pc_ranges: vec![(-1.0, 1.0)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -3768,6 +3781,7 @@ pub mod internal {
+                 pc_ranges: vec![(-0.5, 0.5)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: Default::default(),
++                sum_to_zero_constraints: Default::default(),
+                 knot_vectors: Default::default(),
+                 range_transforms: Default::default(),
+                 interaction_range_transforms: Default::default(),
+@@ -3775,7 +3789,7 @@ pub mod internal {
+             };
+ 
+             // Build design and penalty matrices
+-            let (x_matrix, s_list, layout, constraints, _, _, _, _) =
++            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
+                 internal::build_design_and_penalty_matrices(&training_data, &config)
+                     .expect("Failed to build design matrix");
+ 
+@@ -3903,7 +3917,7 @@ pub mod internal {
+                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
+ 
+                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
+-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
++                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+                     });
+@@ -4025,7 +4039,7 @@ pub mod internal {
+                 simple_config.pgs_basis_config.num_knots = 3;
+ 
+                 // 2. Generate consistent structures using the canonical function
+-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
++                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+                     });
+@@ -4203,7 +4217,7 @@ pub mod internal {
+             };
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
++            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4352,7 +4366,7 @@ pub mod internal {
+             simple_config.pgs_basis_config.num_knots = 3;
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
++            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4456,7 +4470,7 @@ pub mod internal {
+             simple_config.pgs_basis_config.num_knots = 3;
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
++            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4554,6 +4568,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
+         pgs_range: (-1.0, 1.0),
+         pc_ranges: vec![],
+         constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+         knot_vectors: HashMap::new(),
+         range_transforms: HashMap::new(),
+         interaction_range_transforms: HashMap::new(),
+@@ -4630,6 +4645,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
+         pc_ranges: vec![(-1.0, 1.0)],
+         pc_names: vec!["PC1".to_string()],
+         constraints: std::collections::HashMap::new(),
++                sum_to_zero_constraints: std::collections::HashMap::new(),
+         knot_vectors: std::collections::HashMap::new(),
+         range_transforms: std::collections::HashMap::new(),
+         interaction_range_transforms: std::collections::HashMap::new(),
+@@ -4638,7 +4654,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
+ 
+     // Try to build the matrices - if this fails, the test is still valid
+     let matrices_result = build_design_and_penalty_matrices(&data, &config);
+-    if let Ok((x_matrix, s_list, layout, _, _, _, _, _)) = matrices_result {
++    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
+         let reml_state_result = RemlState::new(
+             data.y.view(),
+             x_matrix.view(),
+@@ -4832,6 +4848,7 @@ mod optimizer_progress_tests {
+             pc_ranges: vec![(-3.5, 3.5)],
+             pc_names: vec!["PC1".to_string()],
+             constraints: std::collections::HashMap::new(),
++                sum_to_zero_constraints: std::collections::HashMap::new(),
+             knot_vectors: std::collections::HashMap::new(),
+             range_transforms: std::collections::HashMap::new(),
+             interaction_range_transforms: std::collections::HashMap::new(),
+@@ -4839,7 +4856,7 @@ mod optimizer_progress_tests {
+         };
+ 
+         // 3) Build matrices and REML state to evaluate cost at specific rho
+-        let (x_matrix, s_list, layout, _, _, _, _, _) =
++        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+             build_design_and_penalty_matrices(&data, &config)?;
+         let reml_state = internal::RemlState::new(
+             data.y.view(),
+diff --git a/calibrate/model.rs b/calibrate/model.rs
+index cbe76ea..e563461 100644
+--- a/calibrate/model.rs
++++ b/calibrate/model.rs
+@@ -58,8 +58,14 @@ pub struct ModelConfig {
+ 
+     /// A map from a term name (e.g., "PC1", "pgs_main") to its constraint transformation.
+     /// Use an Option because not all terms might be constrained.
++    /// DEPRECATED: This field contains mixed semantics and should be phased out.
++    /// Use sum_to_zero_constraints for new sum-to-zero transforms.
+     #[serde(default)] // For backward compatibility with old models that don't have this field
+     pub constraints: HashMap<String, Constraint>,
++    /// Sum-to-zero constraint transformations (separate from range transforms)
++    /// Maps term names (e.g., "pgs_main") to their sum-to-zero transformation matrices
++    #[serde(default)] // For backward compatibility with models that don't have this field
++    pub sum_to_zero_constraints: HashMap<String, Array2<f64>>,
+     /// Knot vectors used during training, required for exact reproduction during prediction
+     pub knot_vectors: HashMap<String, Array1<f64>>,
+     /// Range transformation matrices for functional ANOVA decomposition
+@@ -68,6 +74,8 @@ pub struct ModelConfig {
+     pub range_transforms: HashMap<String, Array2<f64>>,
+     /// Range transformation matrices for interaction terms (unwhitened eigenvectors)
+     /// Maps variable names (e.g., "pgs", "PC1") to their unwhitened range eigenvectors for interactions
++    /// DEPRECATED: This field is computed but never used during prediction. 
++    /// The prediction code uses range_transforms instead. Consider removing in a future version.
+     #[serde(default)] // For backward compatibility with models that don't have this field
+     pub interaction_range_transforms: HashMap<String, Array2<f64>>,
+     /// Weighted column means used for centering interaction marginals during training
+@@ -119,6 +127,8 @@ pub enum ModelError {
+     MismatchedPcCount { found: usize, expected: usize },
+     #[error("Underlying basis function generation failed during prediction: {0}")]
+     BasisError(#[from] basis::BasisError),
++    #[error("Dimension mismatch: {0}")]
++    DimensionMismatch(String),
+     #[error(
+         "Internal error: failed to stack design matrix columns or constraint matrix dimensions don't match basis dimensions during prediction."
+     )]
+@@ -250,6 +260,13 @@ mod internal {
+         config: &ModelConfig,
+         coeffs: &MappedCoefficients,
+     ) -> Result<Array2<f64>, ModelError> {
++        // CRITICAL: Validate that prediction data dimensions are consistent
++        if p_new.len() != pcs_new.nrows() {
++            return Err(ModelError::DimensionMismatch(format!(
++                "Sample count mismatch: p_new has {} samples but pcs_new has {} rows",
++                p_new.len(), pcs_new.nrows()
++            )));
++        }
+         // 1. Generate basis for PGS using saved knot vector if available
+         // Only use saved knot vectors - remove fallback to ensure consistency
+         let saved_knots = config
+@@ -263,13 +280,19 @@ mod internal {
+             config.pgs_basis_config.degree,
+         )?;
+ 
+-        // Apply the SAVED PGS constraint
++        // Apply the SAVED PGS constraint - prefer new sum_to_zero_constraints field
+         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
+-        let pgs_z = &config
+-            .constraints
+-            .get("pgs_main")
+-            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
+-            .z_transform;
++        let pgs_z = if let Some(z_transform) = config.sum_to_zero_constraints.get("pgs_main") {
++            // Use the new dedicated sum-to-zero constraints field
++            z_transform
++        } else {
++            // Fallback to old constraints field for backward compatibility
++            &config
++                .constraints
++                .get("pgs_main")
++                .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
++                .z_transform
++        };
+ 
+         // Check that dimensions match before matrix multiplication
+         if pgs_main_basis_unc.ncols() != pgs_z.nrows() {
+@@ -366,12 +389,18 @@ mod internal {
+ 
+             // Apply the stored centering from training to maintain consistency
+             if let Some(pgs_means) = config.interaction_centering_means.get("pgs") {
++                // CRITICAL: Enforce exact length match to prevent partial centering
++                if pgs_int_basis.ncols() != pgs_means.len() {
++                    return Err(ModelError::DimensionMismatch(format!(
++                        "PGS interaction basis has {} columns but {} stored means",
++                        pgs_int_basis.ncols(), pgs_means.len()
++                    )));
++                }
++                
+                 // Subtract the stored means from each column (same as training)
+                 for j in 0..pgs_int_basis.ncols() {
+-                    if j < pgs_means.len() {
+-                        let mean_val = pgs_means[j];
+-                        pgs_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+-                    }
++                    let mean_val = pgs_means[j];
++                    pgs_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+                 }
+             }
+ 
+@@ -395,12 +424,18 @@ mod internal {
+ 
+                     // Apply the stored centering from training to maintain consistency
+                     if let Some(pc_means) = config.interaction_centering_means.get(pc_name) {
++                        // CRITICAL: Enforce exact length match to prevent partial centering
++                        if pc_int_basis.ncols() != pc_means.len() {
++                            return Err(ModelError::DimensionMismatch(format!(
++                                "{} interaction basis has {} columns but {} stored means",
++                                pc_name, pc_int_basis.ncols(), pc_means.len()
++                            )));
++                        }
++                        
+                         // Subtract the stored means from each column (same as training)
+                         for j in 0..pc_int_basis.ncols() {
+-                            if j < pc_means.len() {
+-                                let mean_val = pc_means[j];
+-                                pc_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+-                            }
++                            let mean_val = pc_means[j];
++                            pc_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+                         }
+                     }
+ 
+@@ -506,7 +541,7 @@ mod tests {
+         .unwrap();
+         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
+         let (_, z_transform) =
+-            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view()).unwrap();
++            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view(), None).unwrap();
+ 
+         let model = TrainedModel {
+             config: ModelConfig {
+@@ -539,6 +574,7 @@ mod tests {
+                     knots.insert("pgs".to_string(), knot_vector.clone());
+                     knots
+                 },
++                sum_to_zero_constraints: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+                 interaction_centering_means: HashMap::new(),
+@@ -609,6 +645,7 @@ mod tests {
+                 pc_ranges: vec![(-1.0, 1.0)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_range_transforms: HashMap::new(),
+@@ -699,6 +736,7 @@ mod tests {
+             pc_ranges: vec![(0.0, 1.0), (0.0, 1.0)],
+             pc_names: vec!["PC1".to_string(), "PC2".to_string()], // Order matters for flattening
+             constraints: HashMap::new(),
++                sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+@@ -778,6 +816,7 @@ mod tests {
+             pc_ranges: vec![(-0.5, 0.5)],
+             pc_names: vec!["PC1".to_string()],
+             constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
++            sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+             interaction_range_transforms: HashMap::new(),
+@@ -804,6 +843,7 @@ mod tests {
+             _,
+             layout,
+             constraints,
++            sum_to_zero_constraints,
+             knot_vectors,
+             range_transforms,
+             interaction_range_transforms,
+@@ -829,6 +869,7 @@ mod tests {
+                 pc_ranges: vec![(-0.5, 0.5)],
+                 pc_names: vec!["PC1".to_string()],
+                 constraints: constraints.clone(), // Clone to avoid ownership issues
++                sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
+                 knot_vectors, // Use the knot vectors generated by the model-building code
+                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
+                 interaction_range_transforms: interaction_range_transforms.clone(),
+diff --git a/calibrate/pirls.rs b/calibrate/pirls.rs
+index b785e61..01d8b02 100644
+--- a/calibrate/pirls.rs
++++ b/calibrate/pirls.rs
+@@ -1849,6 +1849,7 @@ mod tests {
+             pc_ranges: vec![],
+             pc_names: vec![],
+             constraints: HashMap::new(),
++            sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+@@ -2056,7 +2057,7 @@ mod tests {
+         data: &TrainingData,
+         config: &ModelConfig,
+     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
+-        let (x_matrix, s_list, layout, _, _, _, _, _) =
++        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+             build_design_and_penalty_matrices(data, config)?;
+         let rs_original = compute_penalty_square_roots(&s_list)?;
+         Ok((x_matrix, rs_original, layout))
+@@ -2144,6 +2145,7 @@ mod tests {
+             pc_ranges: vec![],
+             pc_names: vec![],
+             constraints: HashMap::new(),
++            sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+@@ -2267,6 +2269,7 @@ mod tests {
+             pc_ranges: vec![],
+             pc_names: vec![],
+             constraints: HashMap::new(),
++            sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+@@ -2394,6 +2397,7 @@ mod tests {
+             pc_ranges: vec![],
+             pc_names: vec![],
+             constraints: HashMap::new(),
++            sum_to_zero_constraints: HashMap::new(),
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_range_transforms: HashMap::new(),
+diff --git a/src/main.rs b/src/main.rs
+index 12d92a2..d982ad8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -137,6 +137,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+         pc_ranges,
+         pc_names,
+         constraints: std::collections::HashMap::new(),
++        sum_to_zero_constraints: std::collections::HashMap::new(),
+         knot_vectors: std::collections::HashMap::new(),
+         range_transforms: std::collections::HashMap::new(),
+         interaction_range_transforms: std::collections::HashMap::new(),
