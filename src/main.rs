@@ -140,6 +140,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
         interaction_range_transforms: std::collections::HashMap::new(),
+        interaction_centering_means: std::collections::HashMap::new(),
     };
 
     // Train the final model

@@ -115,8 +115,16 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    let (x_matrix, s_list, layout, constraints, knot_vectors, range_transforms, interaction_range_transforms) =
-        build_design_and_penalty_matrices(data, config)?;
+    let (
+        x_matrix,
+        s_list,
+        layout,
+        constraints,
+        knot_vectors,
+        range_transforms,
+        interaction_range_transforms,
+        interaction_centering_means,
+    ) = build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -189,32 +197,43 @@ pub fn train_model(
     // Evaluate all seeds, separating symmetric from asymmetric candidates
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-    
+
     for (i, seed) in seed_candidates.iter().enumerate() {
         let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> cost = {:.6}",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), c
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>(),
+                    c
                 );
                 c
             }
             Ok(_) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> +inf cost",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>()
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>()
                 );
                 continue;
             }
             Err(e) => {
                 eprintln!(
                     "[Seed {}] rho = {:?} -> failed ({:?})",
-                    i, seed.iter().map(|&x| format!("{:.1}", x)).collect::<Vec<_>>(), e
+                    i,
+                    seed.iter()
+                        .map(|&x| format!("{:.1}", x))
+                        .collect::<Vec<_>>(),
+                    e
                 );
                 continue;
             }
         };
-        
+
         // Check if seed is symmetric (all penalties equal within tiny tolerance)
         let is_symmetric = if seed.len() < 2 {
             true
@@ -222,7 +241,7 @@ pub fn train_model(
             let first_val = seed[0];
             seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
         };
-        
+
         if is_symmetric {
             if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
                 best_symmetric_seed = Some((seed.clone(), cost, i));
@@ -235,7 +254,7 @@ pub fn train_model(
             }
         }
     }
-    
+
     // Robust asymmetric preference to avoid symmetry trap
     let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
         (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
@@ -437,6 +456,7 @@ pub fn train_model(
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.range_transforms = range_transforms;
     config_with_constraints.interaction_range_transforms = interaction_range_transforms;
+    config_with_constraints.interaction_centering_means = interaction_centering_means;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -1809,6 +1829,7 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             };
 
             (data, config)
@@ -1837,6 +1858,7 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             }
         }
 
@@ -2187,9 +2209,9 @@ pub mod internal {
         #[derive(Debug)]
         struct TermMetrics {
             penalty_idx: usize,
-            edf: f64,         // trace(H^{-1} λ_k S_k) - lower means "more smoothing"
-            roughness: f64,   // β^T S_k β (no λ) - higher means "more wiggle"
-            partial_norm: f64 // ||X_k β_k||_2 - contribution size
+            edf: f64,          // trace(H^{-1} λ_k S_k) - lower means "more smoothing"
+            roughness: f64,    // β^T S_k β (no λ) - higher means "more wiggle"
+            partial_norm: f64, // ||X_k β_k||_2 - contribution size
         }
 
         /// Compute per-term smoothness metrics (EDF, roughness, partial fit magnitude)
@@ -2269,7 +2291,7 @@ pub mod internal {
         /// **Test 3: The Automatic Smoothing Test (Most Informative!)**
         /// Verifies the core "magic" of GAMs: that the REML/LAML optimization automatically
         /// identifies and penalizes irrelevant "noise" predictors.
-        /// 
+        ///
         /// This test now measures what we actually care about: smoothness (EDF) and wiggle (roughness)
         /// rather than raw lambda values which aren't directly comparable across terms.
         #[test]
@@ -2279,7 +2301,7 @@ pub mod internal {
 
             // PC1 is the signal - has a clear nonlinear effect
             let pc1 = Array1::linspace(-1.5, 1.5, n_samples);
-            
+
             // PC2 is pure noise - has NO effect on the outcome
             let pc2 = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
 
@@ -2289,10 +2311,10 @@ pub mod internal {
             pcs.column_mut(1).assign(&pc2);
 
             // Generate outcomes that depend ONLY on PC1 (nonlinear signal)
-            let y = pc1.mapv(|x| (std::f64::consts::PI * x).sin()) +
-                    Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.05..0.05));
+            let y = pc1.mapv(|x| (std::f64::consts::PI * x).sin())
+                + Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.05..0.05));
 
-            // Random PGS values 
+            // Random PGS values
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
 
             let data = TrainingData {
@@ -2315,8 +2337,14 @@ pub mod internal {
                     degree: 3,
                 },
                 pc_basis_configs: vec![
-                    BasisConfig { num_knots: 6, degree: 3 }, // same basis for both PCs
-                    BasisConfig { num_knots: 6, degree: 3 },
+                    BasisConfig {
+                        num_knots: 6,
+                        degree: 3,
+                    }, // same basis for both PCs
+                    BasisConfig {
+                        num_knots: 6,
+                        degree: 3,
+                    },
                 ],
                 pgs_range: (-2.0, 2.0),
                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
@@ -2325,9 +2353,10 @@ pub mod internal {
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
+                interaction_centering_means: Default::default(),
             };
 
-            let (x, s_list, layout, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2338,7 +2367,8 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
             let pirls = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -2349,7 +2379,8 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             // Compute per-term metrics
             let lambdas = rho.mapv(f64::exp);
@@ -2373,31 +2404,40 @@ pub mod internal {
             let m2 = metrics.iter().find(|m| m.penalty_idx == pc2_idx).unwrap();
 
             println!("=== Smoothness Analysis ===");
-            println!("PC1 (signal): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}", 
-                     m1.edf, m1.roughness, m1.partial_norm);
-            println!("PC2 (noise):  EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}", 
-                     m2.edf, m2.roughness, m2.partial_norm);
+            println!(
+                "PC1 (signal): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}",
+                m1.edf, m1.roughness, m1.partial_norm
+            );
+            println!(
+                "PC2 (noise):  EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}",
+                m2.edf, m2.roughness, m2.partial_norm
+            );
 
             // Key assertions: Test what we actually care about!
             // Note: With fixed equal λ=1, EDFs will be similar. Focus on roughness and contribution.
-            
+
             // 1. Useless PC2 should have near-zero wiggle (roughness)
             assert!(
                 m2.roughness.abs() < 0.1 * m1.roughness.abs() + 1e-8,
                 "Noise PC should have near-zero wiggle. PC1 rough={:.3e}, PC2 rough={:.3e}",
-                m1.roughness, m2.roughness
+                m1.roughness,
+                m2.roughness
             );
 
             // 2. Useless PC2 should contribute much less to the fit (now computed correctly)
             assert!(
                 m2.partial_norm < 0.4 * m1.partial_norm,
                 "Noise PC should contribute much less. PC1 contrib={:.3e}, PC2 contrib={:.3e}",
-                m1.partial_norm, m2.partial_norm
+                m1.partial_norm,
+                m2.partial_norm
             );
 
             // 3. Optional: weak EDF assertion (don't expect big differences with λ=1)
             // With equal λ and similar penalty structure, EDFs should be close
-            println!("  EDF comparison (equal λ=1): PC1={:.3}, PC2={:.3}", m1.edf, m2.edf);
+            println!(
+                "  EDF comparison (equal λ=1): PC1={:.3}, PC2={:.3}",
+                m1.edf, m2.edf
+            );
 
             println!("✓ Automatic smoothing test passed!");
             println!("  PC1 flexibility (EDF): {:.3}", m1.edf);
@@ -2428,7 +2468,7 @@ pub mod internal {
             let f2 = pc2.mapv(|x| 0.3 * x * x); // Gentle quadratic
             let y = &f1 + &f2 + Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.05..0.05));
 
-            // Random PGS values 
+            // Random PGS values
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
 
             let data = TrainingData {
@@ -2451,8 +2491,14 @@ pub mod internal {
                     degree: 3,
                 },
                 pc_basis_configs: vec![
-                    BasisConfig { num_knots: 8, degree: 3 }, // More knots for high-curvature PC1
-                    BasisConfig { num_knots: 8, degree: 3 }, // Same basis size for fair comparison
+                    BasisConfig {
+                        num_knots: 8,
+                        degree: 3,
+                    }, // More knots for high-curvature PC1
+                    BasisConfig {
+                        num_knots: 8,
+                        degree: 3,
+                    }, // Same basis size for fair comparison
                 ],
                 pgs_range: (-2.0, 2.0),
                 pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
@@ -2461,9 +2507,10 @@ pub mod internal {
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
+                interaction_centering_means: Default::default(),
             };
 
-            let (x, s_list, layout, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2474,7 +2521,8 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
             let pirls = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -2485,7 +2533,8 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
-            ).unwrap();
+            )
+            .unwrap();
 
             // Compute per-term metrics
             let lambdas = rho.mapv(f64::exp);
@@ -2509,23 +2558,31 @@ pub mod internal {
             let m2 = metrics.iter().find(|m| m.penalty_idx == pc2_idx).unwrap();
 
             println!("=== Relative Smoothness Analysis ===");
-            println!("PC1 (wiggly): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}", 
-                     m1.edf, m1.roughness, m1.partial_norm);
-            println!("PC2 (smooth): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}", 
-                     m2.edf, m2.roughness, m2.partial_norm);
+            println!(
+                "PC1 (wiggly): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}",
+                m1.edf, m1.roughness, m1.partial_norm
+            );
+            println!(
+                "PC2 (smooth): EDF={:.3}, Roughness={:.3e}, Partial norm={:.3e}",
+                m2.edf, m2.roughness, m2.partial_norm
+            );
 
             // Key assertions: Test relative smoothness allocation
             // Note: With fixed λ=1, focus on roughness and contribution rather than EDF
-            
+
             // 1. High-curvature PC1 should have more roughness
             assert!(
                 m1.roughness > m2.roughness,
                 "Wiggly PC1 should have more roughness than smooth PC2. PC1 rough={:.3e}, PC2 rough={:.3e}",
-                m1.roughness, m2.roughness
+                m1.roughness,
+                m2.roughness
             );
 
             // 2. Optional: EDF comparison (may be close with λ=1)
-            println!("  EDF comparison (λ=1): PC1={:.3}, PC2={:.3}", m1.edf, m2.edf);
+            println!(
+                "  EDF comparison (λ=1): PC1={:.3}, PC2={:.3}",
+                m1.edf, m2.edf
+            );
 
             // 3. Both should contribute meaningfully (unlike the noise test)
             assert!(
@@ -2543,7 +2600,10 @@ pub mod internal {
             println!("  PC1 (wiggly) flexibility (EDF): {:.3}", m1.edf);
             println!("  PC2 (smooth) flexibility (EDF): {:.3}", m2.edf);
             println!("  EDF ratio (PC1/PC2): {:.1}x", m1.edf / m2.edf.max(1e-8));
-            println!("  Roughness ratio (PC1/PC2): {:.1}x", m1.roughness / m2.roughness.max(1e-8));
+            println!(
+                "  Roughness ratio (PC1/PC2): {:.1}x",
+                m1.roughness / m2.roughness.max(1e-8)
+            );
         }
 
         /// **Test 4: Component Dissection Test**
@@ -2935,10 +2995,11 @@ pub mod internal {
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
                 interaction_range_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             assert!(
@@ -3247,10 +3308,11 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3373,10 +3435,11 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3599,6 +3662,7 @@ pub mod internal {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             };
 
             println!(
@@ -3663,161 +3727,6 @@ pub mod internal {
             println!("✓ Proactive singularity detection test passed!");
         }
 
-        #[test]
-        fn test_layout_and_matrix_construction() {
-            let n_samples = 500;
-            let pgs = Array::linspace(0.0, 1.0, n_samples);
-            let pcs = Array::linspace(0.1, 0.9, n_samples)
-                .into_shape_with_order((n_samples, 1))
-                .unwrap();
-            let data = TrainingData {
-                y: Array1::zeros(n_samples),
-                p: pgs,
-                pcs,
-                weights: Array1::ones(n_samples),
-            };
-
-            let config = ModelConfig {
-                link_function: LinkFunction::Identity,
-                penalty_order: 2,
-                convergence_tolerance: 1e-7,
-                max_iterations: 10,
-                reml_convergence_tolerance: 1e-3,
-                reml_max_iterations: 10,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 2,
-                    degree: 3,
-                }, // 2+3+1 = 6 basis functions
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 1,
-                    degree: 3,
-                }], // 1+3+1 = 5 basis functions
-                pgs_range: (0.0, 1.0),
-                pc_ranges: vec![(0.0, 1.0)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
-            };
-
-            let (x, s_list, layout, _, _, _, _) =
-                build_design_and_penalty_matrices(&data, &config).unwrap();
-
-            // Calculate the true basis function counts
-            let pgs_n_basis =
-                config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1; // 6
-            let pc_n_basis =
-                config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree + 1; // 5
-
-            // PGS main effect is unpenalized with sum-to-zero constraint
-            let pgs_main_coeffs = pgs_n_basis - 2; // 6 - 1 (intercept) - 1 (constraint) = 4
-
-            // PC main effect uses ONLY the range space (functional ANOVA decomposition)
-            // Range dimension = unconstrained cols - penalty_order
-            let pc_unconstrained_cols = pc_n_basis - 1; // 5 - 1 = 4 (remove intercept)
-            let pc_main_coeffs = pc_unconstrained_cols - config.penalty_order; // 4 - 2 = 2
-
-            // Interaction is Range × Range for functional ANOVA decomposition
-            let pgs_unconstrained_cols = pgs_n_basis - 1; // 6 - 1 = 5 (remove intercept)
-            let pgs_range_dim = pgs_unconstrained_cols - config.penalty_order; // 5 - 2 = 3
-            let pc_range_dim = pc_unconstrained_cols - config.penalty_order; // 4 - 2 = 2
-            let interaction_coeffs = pgs_range_dim * pc_range_dim; // 3 * 2 = 6
-
-            let expected_coeffs = 1 // intercept
-                + pgs_main_coeffs         // 4
-                + pc_main_coeffs          // 2
-                + interaction_coeffs; // 6
-            // Total = 1 + 4 + 2 + 6 = 13
-
-            assert_eq!(
-                layout.total_coeffs, expected_coeffs,
-                "Total coefficient count mismatch"
-            );
-            assert_eq!(
-                x.ncols(),
-                expected_coeffs,
-                "Design matrix column count mismatch"
-            );
-
-            // Penalty count check
-            // The PGS main effect is unpenalized intentionally.
-            // There is one penalty for each PC main effect.
-            // For each tensor product interaction, there are two penalties:
-            // one for PGS direction and one for PC direction.
-            let expected_penalties = config.pc_names.len()      // Main effects for PCs
-                                   + 2 * config.pc_names.len(); // Interaction effects (2 per PC)
-
-            assert_eq!(
-                s_list.len(),
-                expected_penalties,
-                "Penalty list count mismatch"
-            );
-            assert_eq!(
-                layout.num_penalties, expected_penalties,
-                "Layout penalty count mismatch"
-            );
-
-            // Verify that S matrices have correct dimensions
-            // All matrices in s_list should be full-sized p×p matrices with embedded blocks
-            for (i, s) in s_list.iter().enumerate() {
-                assert_eq!(s.nrows(), s.ncols(), "Penalty matrix {} is not square", i);
-
-                // All penalty matrices should be full-sized (p × p)
-                assert_eq!(
-                    s.nrows(),
-                    layout.total_coeffs,
-                    "Penalty matrix {} should be full-sized ({} × {}), got {} × {}",
-                    i,
-                    layout.total_coeffs,
-                    layout.total_coeffs,
-                    s.nrows(),
-                    s.ncols()
-                );
-
-                // Find the corresponding block to verify the non-zero structure
-                let block = layout
-                    .penalty_map
-                    .iter()
-                    .find(|b| b.penalty_indices.contains(&i))
-                    .expect(&format!(
-                        "Could not find layout block for penalty index {}",
-                        i
-                    ));
-
-                // Verify the non-zero block is in the correct position
-                let block_submatrix = s.slice(ndarray::s![
-                    block.col_range.clone(),
-                    block.col_range.clone()
-                ]);
-                let non_zero_count = block_submatrix.iter().filter(|&&x| x.abs() > 1e-12).count();
-
-                assert!(
-                    non_zero_count > 0,
-                    "Penalty matrix {} should have non-zero entries in block for term '{}'",
-                    i,
-                    block.term_name
-                );
-
-                // Verify areas outside the block are mostly zero
-                let mut outside_block_non_zeros = 0;
-                for (row, col) in ndarray::indices(s.dim()) {
-                    if !block.col_range.contains(&row) || !block.col_range.contains(&col) {
-                        if s[[row, col]].abs() > 1e-12 {
-                            outside_block_non_zeros += 1;
-                        }
-                    }
-                }
-
-                assert!(
-                    outside_block_non_zeros == 0,
-                    "Penalty matrix {} should only have non-zero entries in its designated block, but found {} non-zero entries outside block for term '{}'",
-                    i,
-                    outside_block_non_zeros,
-                    block.term_name
-                );
-            }
-        }
         /// Tests that the design matrix is correctly built using pure pre-centering for the interaction terms.
         #[test]
         fn test_pure_precentering_interaction() {
@@ -3862,10 +3771,11 @@ pub mod internal {
                 knot_vectors: Default::default(),
                 range_transforms: Default::default(),
                 interaction_range_transforms: Default::default(),
+                interaction_centering_means: Default::default(),
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _, _) =
+            let (x_matrix, s_list, layout, constraints, _, _, _, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3993,7 +3903,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4115,7 +4025,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4293,7 +4203,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4442,7 +4352,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4546,7 +4456,7 @@ pub mod internal {
             simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4647,6 +4557,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
         interaction_range_transforms: HashMap::new(),
+        interaction_centering_means: HashMap::new(),
     };
 
     // 3. Train the model and expect an error
@@ -4722,11 +4633,12 @@ fn test_indefinite_hessian_detection_and_retreat() {
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
         interaction_range_transforms: std::collections::HashMap::new(),
+        interaction_centering_means: std::collections::HashMap::new(),
     };
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4923,10 +4835,11 @@ mod optimizer_progress_tests {
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
             interaction_range_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),

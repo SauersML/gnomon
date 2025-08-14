@@ -7,6 +7,33 @@ use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
 
+/// Computes weighted column means for functional ANOVA decomposition.
+/// Returns the weighted means that would be subtracted by center_columns_in_place.
+fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
+    let w_sum = w.sum();
+    if w_sum <= 0.0 {
+        return Array1::zeros(x.ncols());
+    }
+    // Weighted column means: m_j = (w^T x_j) / sum(w)
+    let mut means = Array1::zeros(x.ncols());
+    for j in 0..x.ncols() {
+        let col = x.column(j);
+        means[j] = w.iter().zip(col).map(|(wi, xi)| wi * xi).sum::<f64>() / w_sum;
+    }
+    means
+}
+
+/// Centers the columns of a matrix using weighted means for functional ANOVA decomposition.
+/// This ensures interaction terms are orthogonal to main effects in the data metric.
+fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
+    let means = weighted_column_means(x, w);
+    // Subtract means from each column
+    for j in 0..x.ncols() {
+        let m = means[j];
+        x.column_mut(j).mapv_inplace(|v| v - m);
+    }
+}
+
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.
@@ -29,36 +56,6 @@ fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     }
 
     result
-}
-
-/// Helper function to fill Kronecker diagonal penalty matrices
-/// For kron(diag_a, I_b): puts diag_a[i] for each PC coefficient within PGS block i
-/// For kron(I_a, diag_b): puts diag_b[j] for each PGS coefficient within PC block j
-fn fill_kron_diag(
-    target: &mut ndarray::Array2<f64>,
-    col_range: std::ops::Range<usize>,
-    diag_a: &ndarray::Array1<f64>, // length r_a (PGS dimension)
-    diag_b: &ndarray::Array1<f64>, // length r_b (PC dimension)
-    kronecker_type: &str, // "pgs_dir" or "pc_dir"
-) {
-    let r_a = diag_a.len();
-    let r_b = diag_b.len();
-    assert_eq!(col_range.len(), r_a * r_b);
-    
-    for ia in 0..r_a {
-        for ib in 0..r_b {
-            let k = ia * r_b + ib; // Row-major flattening
-            let idx = col_range.start + k;
-            
-            let penalty_value = match kronecker_type {
-                "pgs_dir" => diag_a[ia], // kron(D_pgs, I_pc): penalize PGS direction
-                "pc_dir" => diag_b[ib],  // kron(I_pgs, D_pc): penalize PC direction
-                _ => panic!("Invalid kronecker_type: {}", kronecker_type),
-            };
-            
-            target[[idx, idx]] = penalty_value;
-        }
-    }
 }
 
 /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
@@ -167,7 +164,7 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Tensor product interaction effects (each gets two penalty indices: PGS-dir and PC-dir)
+        // Tensor product interaction effects (each gets one penalty since we use whitened marginals)
         if num_pgs_interaction_bases > 0 {
             for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
@@ -176,16 +173,16 @@ impl ModelLayout {
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_names[i]),
                     col_range: range.clone(),
-                    penalty_indices: vec![_penalty_idx_counter, _penalty_idx_counter + 1], // Two penalties: PGS-dir, PC-dir
+                    penalty_indices: vec![_penalty_idx_counter], // Single penalty since both directions are whitened
                     term_type: TermType::Interaction,
                 });
 
                 current_col += num_tensor_coeffs;
-                _penalty_idx_counter += 2; // Increment by 2 for tensor-product penalty
+                _penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
             }
         }
 
-        // Total number of individual penalties: one per PC main + two per interaction (PGS-dir + PC-dir)
+        // Total number of individual penalties: one per PC main + one per interaction (whitened)
         // _penalty_idx_counter has already been incremented to the correct total
 
         // Verify that our calculation matches the actual column count
@@ -206,7 +203,7 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, range transformations, and interaction range transformations.
+/// Returns the design matrix, penalty matrices, model layout, constraint transformations, knot vectors, range transformations, interaction range transformations, and interaction centering means.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
@@ -219,6 +216,7 @@ pub fn build_design_and_penalty_matrices(
         HashMap<String, Array1<f64>>,
         HashMap<String, Array2<f64>>,
         HashMap<String, Array2<f64>>, // Added: interaction_range_transforms
+        HashMap<String, Array1<f64>>, // Added: interaction_centering_means
     ),
     EstimationError,
 > {
@@ -239,6 +237,7 @@ pub fn build_design_and_penalty_matrices(
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
     let mut interaction_range_transforms = HashMap::new();
+    let mut interaction_centering_means = HashMap::new();
 
     // 1. Generate basis for PGS and apply sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
@@ -252,30 +251,35 @@ pub fn build_design_and_penalty_matrices(
     // Save PGS knot vector
     knot_vectors.insert("pgs".to_string(), pgs_knots);
 
-    // Create PGS penalty matrix and decompose into null/range spaces
-    let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-    let s_pgs_base =
-        create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (_z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_base, 1e-12)?;
-    
-    // Store unwhitened range eigenvectors for interaction penalties
-    let (pgs_evals, pgs_evecs) = s_pgs_base
+    // Build PGS penalty on FULL basis (not arbitrarily sliced)
+    let s_pgs_full = create_difference_penalty_matrix(pgs_basis_unc.ncols(), config.penalty_order)?;
+
+    // Decompose full penalty to get range/null spaces correctly
+    let (pgs_evals, pgs_evecs) = s_pgs_full
         .eigh(ndarray_linalg::UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    let tol = 1e-12;
+
+    // Use relative tolerance for robust null/range separation
+    let max_pgs_eval = pgs_evals.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
+    let pgs_tol = max_pgs_eval * 1e-12;
     let pgs_range_idxs: Vec<usize> = pgs_evals
         .iter()
         .enumerate()
-        .filter_map(|(i, &d)| if d > tol { Some(i) } else { None })
+        .filter_map(|(i, &d)| if d > pgs_tol { Some(i) } else { None })
         .collect();
     let u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
-    let d_pgs_range = ndarray::Array1::from_iter(pgs_range_idxs.iter().map(|&i| pgs_evals[i]));
+    let _d_pgs_range = ndarray::Array1::from_iter(pgs_range_idxs.iter().map(|&i| pgs_evals[i]));
     interaction_range_transforms.insert("pgs".to_string(), u_pgs_range.to_owned());
 
-    // For policy mode: PGS main effect remains unpenalized (use full unconstrained basis)
-    // Apply sum-to-zero constraint to maintain identifiability
+    // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
+    let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
     let (pgs_main_basis, pgs_z_transform) =
         basis::apply_sum_to_zero_constraint(pgs_main_basis_unc)?;
+
+    // Create whitened range transform for PGS (used if switching to whitened interactions)
+    let s_pgs_main =
+        create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
+    let (_z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main, pgs_tol)?;
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
@@ -291,8 +295,6 @@ pub fn build_design_and_penalty_matrices(
     // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases = Vec::new();
     let mut pc_unconstrained_bases_main = Vec::new();
-    let mut pc_eigenvalue_diags = Vec::new(); // Store diagonal eigenvalue matrices for interactions
-    let mut pc_u_ranges: Vec<Array2<f64>> = Vec::new(); // Store unwhitened U matrices for interactions
 
     // Check if we have any PCs to process
     if config.pc_names.is_empty() {
@@ -313,30 +315,35 @@ pub fn build_design_and_penalty_matrices(
         // Save PC knot vector
         knot_vectors.insert(pc_name.clone(), pc_knots);
 
-        // Functional ANOVA decomposition: use range-only basis for PC main effects
-        let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
-        pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
+        // Build PC penalty on FULL basis (not arbitrarily sliced)
+        let s_pc_full =
+            create_difference_penalty_matrix(pc_basis_unc.ncols(), config.penalty_order)?;
 
-        // Create penalty matrix and decompose into null/range spaces
-        let s_pc_base =
-            create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (_z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_base, 1e-12)?;
-
-        // Store unwhitened range eigenvectors and eigenvalue diagonal for interaction penalties
-        let (pc_evals, pc_evecs) = s_pc_base
+        // Decompose full penalty to get range/null spaces correctly
+        let (pc_evals, pc_evecs) = s_pc_full
             .eigh(ndarray_linalg::UPLO::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
+
+        // Use relative tolerance for robust null/range separation
+        let max_pc_eval = pc_evals.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
+        let pc_tol = max_pc_eval * 1e-12;
         let pc_range_idxs: Vec<usize> = pc_evals
             .iter()
             .enumerate()
-            .filter_map(|(i, &d)| if d > tol { Some(i) } else { None })
+            .filter_map(|(i, &d)| if d > pc_tol { Some(i) } else { None })
             .collect();
         let u_pc_range = pc_evecs.select(ndarray::Axis(1), &pc_range_idxs);
-        let d_pc_range = ndarray::Array1::from_iter(pc_range_idxs.iter().map(|&i| pc_evals[i]));
-        
+
+        // For PC main effects: use non-intercept columns for whitened range basis
+        let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
+        pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
+
+        // Create whitened range transform for PC main effects
+        let s_pc_main =
+            create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
+        let (_z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_main, pc_tol)?;
+
         interaction_range_transforms.insert(pc_name.clone(), u_pc_range.to_owned());
-        pc_u_ranges.push(u_pc_range.to_owned());
-        pc_eigenvalue_diags.push(d_pc_range);
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
@@ -394,51 +401,22 @@ pub fn build_design_and_penalty_matrices(
                     .assign(&Array2::eye(range_len));
             }
             TermType::Interaction => {
-                // Interactions have two penalty indices: PGS-dir and PC-dir
-                // Build proper Kronecker-sum penalties: kron(D_pgs, I_pc) + kron(I_pgs, D_pc)
-                if block.penalty_indices.len() != 2 {
+                // Interactions now have single penalty index since both marginals are whitened
+                if block.penalty_indices.len() != 1 {
                     return Err(EstimationError::LayoutError(format!(
-                        "Interaction block {} should have exactly 2 penalty indices, found {}",
-                        block.term_name, block.penalty_indices.len()
+                        "Interaction block {} should have exactly 1 penalty index, found {}",
+                        block.term_name,
+                        block.penalty_indices.len()
                     )));
                 }
-                
-                // Extract PC index from term name "f(PGS,PC1)" -> PC1
-                let pc_name = block.term_name
-                    .strip_prefix("f(PGS,")
-                    .and_then(|s| s.strip_suffix(")"))
-                    .ok_or_else(|| EstimationError::LayoutError(format!(
-                        "Invalid interaction term name: {}", block.term_name
-                    )))?;
-                
-                // Find PC index in the config
-                let pc_idx = config.pc_names
-                    .iter()
-                    .position(|name| name == pc_name)
-                    .ok_or_else(|| EstimationError::LayoutError(format!(
-                        "PC name {} not found in config", pc_name
-                    )))?;
 
-                let pgs_penalty_idx = block.penalty_indices[0]; // PGS direction penalty
-                let pc_penalty_idx = block.penalty_indices[1];  // PC direction penalty
-                
-                // Fill PGS-direction penalty: kron(D_pgs, I_pc)
-                fill_kron_diag(
-                    &mut s_list[pgs_penalty_idx],
-                    col_range.clone(),
-                    &d_pgs_range,
-                    &ndarray::Array1::ones(pc_eigenvalue_diags[pc_idx].len()),
-                    "pgs_dir",
-                );
-                
-                // Fill PC-direction penalty: kron(I_pgs, D_pc)
-                fill_kron_diag(
-                    &mut s_list[pc_penalty_idx],
-                    col_range.clone(),
-                    &ndarray::Array1::ones(d_pgs_range.len()),
-                    &pc_eigenvalue_diags[pc_idx],
-                    "pc_dir",
-                );
+                let penalty_idx = block.penalty_indices[0]; // Single penalty for whitened interaction
+
+                // Since we use WHITENED marginals for interactions, penalty is identity matrix
+                // This creates proper scale consistency between main effects and interactions
+                s_list[penalty_idx]
+                    .slice_mut(s![col_range.clone(), col_range])
+                    .assign(&Array2::eye(range_len));
             }
         }
     }
@@ -508,13 +486,16 @@ pub fn build_design_and_penalty_matrices(
 
     // 4. Tensor product interaction effects - Range × Range only (fully penalized)
     if pgs_range_ncols > 0 && !pc_range_bases.is_empty() {
-        // Use UNWHITENED eigenvectors for interactions (to match Kronecker-sum penalties)
-        let u_pgs = interaction_range_transforms
-            .get("pgs")
-            .ok_or_else(|| EstimationError::LayoutError(
-                "Missing 'pgs' in interaction_range_transforms".to_string()
-            ))?;
-        let pgs_int_basis = pgs_main_basis_unc.dot(u_pgs);
+        // Use WHITENED marginals for interactions to match main effect scaling
+        let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
+            EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
+        })?;
+        let mut pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
+
+        // CRITICAL: Store centering means and center PGS marginal for functional ANOVA
+        let pgs_means = weighted_column_means(&pgs_int_basis, &data.weights);
+        interaction_centering_means.insert("pgs".to_string(), pgs_means);
+        center_columns_in_place(&mut pgs_int_basis, &data.weights);
 
         for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
             // Find the corresponding tensor product block in the layout
@@ -529,9 +510,17 @@ pub fn build_design_and_penalty_matrices(
                     ))
                 })?;
 
-            // Use UNWHITENED eigenvectors for PC interaction basis (matches penalty construction)
-            let u_pc = &pc_u_ranges[pc_idx];
-            let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(u_pc);
+            // Use WHITENED PC marginal for scale consistency with main effects
+            let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
+                EstimationError::LayoutError(format!("Missing '{}' in range_transforms", pc_name))
+            })?;
+            let mut pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
+
+            // CRITICAL: Store centering means and center PC marginal for functional ANOVA
+            let pc_means = weighted_column_means(&pc_int_basis, &data.weights);
+            interaction_centering_means.insert(pc_name.clone(), pc_means);
+            center_columns_in_place(&mut pc_int_basis, &data.weights);
+
             let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
             // Validate dimensions
@@ -560,35 +549,16 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
-    // Simple check for obvious over-parameterization
+    // Warning for over-parameterization (but continue - penalized regression handles p > n)
     let n_samples = data.y.len();
     let n_coeffs = x_matrix.ncols();
     if n_coeffs > n_samples {
-        log::warn!("Model is over-parameterized: {n_coeffs} coefficients for {n_samples} samples");
-
-        // Calculate the breakdown for the new, informative error message
-        let pgs_main_coeffs = layout.pgs_main_cols.len();
-        let mut pc_main_coeffs = 0;
-        let mut interaction_coeffs = 0;
-        for block in &layout.penalty_map {
-            match block.term_type {
-                TermType::PcMainEffect => {
-                    pc_main_coeffs += block.col_range.len();
-                }
-                TermType::Interaction => {
-                    interaction_coeffs += block.col_range.len();
-                }
-            }
-        }
-
-        return Err(EstimationError::ModelOverparameterized {
-            num_coeffs: n_coeffs,
-            num_samples: n_samples,
-            intercept_coeffs: 1,
-            pgs_main_coeffs,
-            pc_main_coeffs,
-            interaction_coeffs,
-        });
+        log::warn!(
+            "Model is over-parameterized: {} coefficients for {} samples. \
+             Relying on penalties and stable reparameterization to handle p > n.",
+            n_coeffs,
+            n_samples
+        );
     }
 
     Ok((
@@ -599,6 +569,7 @@ pub fn build_design_and_penalty_matrices(
         knot_vectors,
         range_transforms,
         interaction_range_transforms,
+        interaction_centering_means,
     ))
 }
 
@@ -619,7 +590,6 @@ pub struct ReparamResult {
     /// This is used for applying the actual penalty in the least squares solve
     pub e_transformed: Array2<f64>,
 }
-
 
 /// Creates a lambda-independent balanced penalty root for stable rank detection
 /// This follows mgcv's approach: scale each penalty to unit Frobenius norm, sum them,
@@ -1005,14 +975,14 @@ pub fn stable_reparameterization(
         // space (largest eigenvalues) are at the END of `u`. We reorder them to be first.
         // The new basis is `U_reordered = [U_range | U_null]`.
         // ---
-        
+
         // Guard against r == 0 to avoid empty slicing
         if r == 0 {
             // No range directions identified this iteration; switch to gamma' and continue
             gamma = gamma_prime;
             continue;
         }
-        
+
         let u_range = u.slice(s![.., q_current - r..]); // Last r columns
         let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
         let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])
@@ -1375,6 +1345,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
         };
 
         (data, config)
@@ -1385,7 +1356,7 @@ mod tests {
         // Setup with 1 PC to create main effect and interaction terms
         let (data, config) = create_test_data_for_construction(100, 1);
 
-        let (x, s_list, layout, _, _, _range_transforms, _) =
+        let (x, s_list, layout, _, _, _range_transforms, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Option 3 dimensional calculation - direct computation based on basis sizes and null space
@@ -1407,7 +1378,7 @@ mod tests {
         let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
 
         let expected_total_coeffs = 1 + pgs_main_coeffs + r_pc + interaction_coeffs; // 1 + 4 + 2 + 6 = 13
-        let expected_num_penalties = 3; // Individual: 1 for PC1 main + 2 for PC1×PGS interaction (PGS-dir + PC-dir)
+        let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction (whitened)
 
         assert_eq!(
             layout.total_coeffs, expected_total_coeffs,
@@ -1432,7 +1403,7 @@ mod tests {
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (x, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (x, _, _, _, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Calculate numerical rank via SVD
         let svd = x.svd(false, false).expect("SVD failed");
@@ -1455,14 +1426,14 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // Expect two-penalty-per-interaction structure: 1 PC main + 2 interaction penalties = 3 total
+        // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
         assert_eq!(
             s_list.len(),
-            3,
-            "Should have exactly 3 penalty matrices: 1 PC main + 2 interaction (PGS-dir + PC-dir)"
+            2,
+            "Should have exactly 2 penalty matrices: 1 PC main + 1 interaction (whitened)"
         );
 
         let interaction_block = layout
@@ -1471,56 +1442,33 @@ mod tests {
             .find(|b| b.term_type == TermType::Interaction)
             .expect("Interaction block not found in layout");
 
-        // Each interaction block now has 2 penalty indices: PGS-dir and PC-dir
+        // Each interaction block now has 1 penalty index since marginals are whitened
         assert_eq!(
             interaction_block.penalty_indices.len(),
-            2,
-            "Interaction term should have two penalty indices (PGS-dir and PC-dir)"
+            1,
+            "Interaction term should have one penalty index (whitened marginals)"
         );
 
-        let [pgs_penalty_idx, pc_penalty_idx] = [
-            interaction_block.penalty_indices[0],
-            interaction_block.penalty_indices[1],
-        ];
+        let interaction_penalty_idx = interaction_block.penalty_indices[0];
 
-        // Verify penalty matrix structure - both interaction penalties should be different
-        let s_pgs = &s_list[pgs_penalty_idx]; // PGS-direction penalty
-        let s_pc = &s_list[pc_penalty_idx]; // PC-direction penalty  
+        // Verify penalty matrix structure - single identity penalty for whitened interaction
+        let s_interaction = &s_list[interaction_penalty_idx]; // Single interaction penalty
         let s_pc_main = &s_list[0]; // PC main effects penalty matrix
 
-        // Check that the two interaction penalty matrices are structurally different
-        // They should have different diagonal patterns reflecting Kronecker-sum structure
-        let mut pgs_pc_difference_found = false;
+        // Check that the interaction penalty is identity on the interaction block
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
                 if interaction_block.col_range.contains(&r)
                     && interaction_block.col_range.contains(&c)
-                    && r == c // Check diagonal elements
                 {
-                    if (s_pgs[[r, c]] - s_pc[[r, c]]).abs() > 1e-12 {
-                        pgs_pc_difference_found = true;
-                        break;
+                    if r == c {
+                        assert_abs_diff_eq!(s_interaction[[r, c]], 1.0, epsilon = 1e-12);
+                    } else {
+                        assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
                     }
-                }
-            }
-            if pgs_pc_difference_found {
-                break;
-            }
-        }
-        assert!(
-            pgs_pc_difference_found,
-            "PGS-direction and PC-direction penalty matrices should be different (not identical)"
-        );
-
-        // Check that both interaction penalties are zero outside the interaction block
-        for penalty_matrix in [s_pgs, s_pc] {
-            for r in 0..layout.total_coeffs {
-                for c in 0..layout.total_coeffs {
-                    if !interaction_block.col_range.contains(&r)
-                        || !interaction_block.col_range.contains(&c)
-                    {
-                        assert_abs_diff_eq!(penalty_matrix[[r, c]], 0.0, epsilon = 1e-12);
-                    }
+                } else {
+                    // Outside interaction block should be zero
+                    assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
@@ -1553,7 +1501,8 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (_, _, layout, _, _, _, _, _) =
+            build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
             config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;

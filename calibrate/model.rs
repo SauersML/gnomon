@@ -70,6 +70,10 @@ pub struct ModelConfig {
     /// Maps variable names (e.g., "pgs", "PC1") to their unwhitened range eigenvectors for interactions
     #[serde(default)] // For backward compatibility with models that don't have this field
     pub interaction_range_transforms: HashMap<String, Array2<f64>>,
+    /// Weighted column means used for centering interaction marginals during training
+    /// Maps variable names (e.g., "pgs", "PC1") to their weighted column means for ANOVA centering
+    #[serde(default)] // For backward compatibility with models that don't have this field
+    pub interaction_centering_means: HashMap<String, Array1<f64>>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -307,6 +311,11 @@ mod internal {
 
             // Apply the SAVED range transformation for functional ANOVA
             if let Some(range_transform) = config.range_transforms.get(pc_name) {
+                // Check dimensions before matrix multiplication to prevent panic
+                if pc_main_basis_unc.ncols() != range_transform.nrows() {
+                    return Err(ModelError::InternalStackingError);
+                }
+
                 // Use range-only transformation for PC main effects (fully penalized)
                 let pc_range_basis = pc_main_basis_unc.dot(range_transform);
                 pc_range_bases.push(pc_range_basis);
@@ -346,9 +355,25 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Tensor product interaction effects - Use UNWHITENED eigenvectors (functional ANOVA)
-        if let Some(u_pgs) = config.interaction_range_transforms.get("pgs") {
-            let pgs_int_basis = pgs_main_basis_unc.dot(u_pgs);
+        // 4. Tensor product interaction effects - Use WHITENED basis for consistency with training
+        if let Some(z_range_pgs_pred) = config.range_transforms.get("pgs") {
+            // Check dimensions before matrix multiplication to prevent panic
+            if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
+                return Err(ModelError::InternalStackingError);
+            }
+
+            let mut pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs_pred);
+
+            // Apply the stored centering from training to maintain consistency
+            if let Some(pgs_means) = config.interaction_centering_means.get("pgs") {
+                // Subtract the stored means from each column (same as training)
+                for j in 0..pgs_int_basis.ncols() {
+                    if j < pgs_means.len() {
+                        let mean_val = pgs_means[j];
+                        pgs_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+                    }
+                }
+            }
 
             for pc_idx in 0..config.pc_names.len() {
                 let pc_name = &config.pc_names[pc_idx];
@@ -356,14 +381,30 @@ mod internal {
 
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
-                    let u_pc = config
-                        .interaction_range_transforms
+                    let z_range_pc_pred = config
+                        .range_transforms
                         .get(pc_name)
                         .ok_or_else(|| ModelError::InternalStackingError)?;
-                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(u_pc);
 
-                    let tensor_interaction =
-                        row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
+                    // Check dimensions before matrix multiplication to prevent panic
+                    if pc_unconstrained_bases_main[pc_idx].ncols() != z_range_pc_pred.nrows() {
+                        return Err(ModelError::InternalStackingError);
+                    }
+
+                    let mut pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc_pred);
+
+                    // Apply the stored centering from training to maintain consistency
+                    if let Some(pc_means) = config.interaction_centering_means.get(pc_name) {
+                        // Subtract the stored means from each column (same as training)
+                        for j in 0..pc_int_basis.ncols() {
+                            if j < pc_means.len() {
+                                let mean_val = pc_means[j];
+                                pc_int_basis.column_mut(j).mapv_inplace(|v| v - mean_val);
+                            }
+                        }
+                    }
+
+                    let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
                     // Add all columns from this tensor product to the design matrix
                     for col in tensor_interaction.axis_iter(Axis(1)) {
@@ -500,6 +541,7 @@ mod tests {
                 },
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -570,6 +612,7 @@ mod tests {
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
                 interaction_range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -659,6 +702,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
         };
 
         // Use the internal flatten_coefficients function
@@ -737,6 +781,7 @@ mod tests {
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             interaction_range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
         };
 
         // Create a dummy dataset for generating the correct model structure
@@ -754,12 +799,20 @@ mod tests {
         };
 
         // Generate the correct constraints, structure, and range transforms using the actual model-building code
-        let (_, _, layout, constraints, knot_vectors, range_transforms, interaction_range_transforms) =
-            crate::calibrate::construction::build_design_and_penalty_matrices(
-                &dummy_data,
-                &model_config,
-            )
-            .expect("Failed to build model matrices");
+        let (
+            _,
+            _,
+            layout,
+            constraints,
+            knot_vectors,
+            range_transforms,
+            interaction_range_transforms,
+            interaction_centering_means,
+        ) = crate::calibrate::construction::build_design_and_penalty_matrices(
+            &dummy_data,
+            &model_config,
+        )
+        .expect("Failed to build model matrices");
 
         // Now we can create a test model with the correct structure
         let original_model = TrainedModel {
@@ -779,6 +832,7 @@ mod tests {
                 knot_vectors, // Use the knot vectors generated by the model-building code
                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
                 interaction_range_transforms: interaction_range_transforms.clone(),
+                interaction_centering_means: interaction_centering_means.clone(),
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -819,7 +873,7 @@ mod tests {
                     interactions
                 },
             },
-            lambdas: vec![0.1, 0.2, 0.3], // Match layout.num_penalties: 1 PC main + 2 interaction penalties
+            lambdas: vec![0.1, 0.2], // Match layout.num_penalties: 1 PC main + 1 interaction penalty
         };
 
         // Create a temporary file for testing
