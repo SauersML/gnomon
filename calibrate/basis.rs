@@ -16,6 +16,9 @@ pub enum BasisError {
     #[error("Data range is invalid: start ({0}) must be less than or equal to end ({1}).")]
     InvalidRange(f64, f64),
 
+    #[error("Data range has zero width (min equals max) but {0} internal knots were requested, which would create coincident knots.")]
+    DegenerateRange(usize),
+
     #[error(
         "Penalty order ({order}) must be positive and less than the number of basis functions ({num_basis})."
     )]
@@ -164,6 +167,12 @@ pub fn create_bspline_basis(
     if data_range.0 > data_range.1 {
         return Err(BasisError::InvalidRange(data_range.0, data_range.1));
     }
+    
+    // Check for degenerate range case: when min == max but internal knots > 0
+    // This would create mathematically degenerate coincident knots
+    if data_range.0 == data_range.1 && num_internal_knots > 0 {
+        return Err(BasisError::DegenerateRange(num_internal_knots));
+    }
 
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
 
@@ -287,7 +296,8 @@ pub fn apply_sum_to_zero_constraint(
 ///
 /// # Arguments
 /// * `s_1d`: The 1D penalty matrix (typically a difference penalty matrix)
-/// * `tol`: Tolerance for determining zero eigenvalues (typically 1e-12)
+/// * `tol`: Fallback tolerance if the maximum eigenvalue is zero (typically 1e-12)
+///         A relative tolerance of max_eigenvalue * 1e-12 is used by default
 ///
 /// # Returns
 /// A tuple of transformation matrices: (Z_null, Z_range_whiten) where:
@@ -300,13 +310,18 @@ pub fn null_range_whiten(
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let (evals, evecs) = s_1d.eigh(UPLO::Lower).map_err(BasisError::LinalgError)?;
 
+    // Calculate a relative tolerance based on the maximum eigenvalue
+    // This is more robust than using a fixed absolute tolerance
+    let max_eig = evals.iter().fold(0.0f64, |max_val, &val| max_val.max(val));
+    let relative_tol = if max_eig > 0.0 { max_eig * 1e-12 } else { tol };
+    
     let mut idx_n = Vec::new();
     let mut idx_r = Vec::new();
     for (i, &d) in evals.iter().enumerate() {
-        if d.abs() <= tol {
-            idx_n.push(i);
-        } else {
+        if d > relative_tol {
             idx_r.push(i);
+        } else {
+            idx_n.push(i);
         }
     }
 
@@ -316,7 +331,8 @@ pub fn null_range_whiten(
     // Build whitened basis for the range space (penalized part)
     let mut d_inv_sqrt = Array2::<f64>::zeros((idx_r.len(), idx_r.len()));
     for (j, &i) in idx_r.iter().enumerate() {
-        d_inv_sqrt[[j, j]] = 1.0 / evals[i].sqrt();
+        // Use max(evals[i], 0.0) to ensure we don't try to take sqrt of a negative number
+        d_inv_sqrt[[j, j]] = 1.0 / (evals[i].max(0.0)).sqrt();
     }
     let z_range_whiten = select_columns(&evecs, &idx_r).dot(&d_inv_sqrt);
 
@@ -348,6 +364,12 @@ mod internal {
         degree: usize,
     ) -> Result<Array1<f64>, BasisError> {
         let (min_val, max_val) = data_range;
+        
+        // Double-check for degenerate range - this should be caught by the public function
+        // but we add it here as a defensive measure
+        if min_val == max_val && num_internal_knots > 0 {
+            return Err(BasisError::DegenerateRange(num_internal_knots));
+        }
 
         // Always use uniformly spaced knots (optimized for P-splines with D^T D penalty)
         let internal_knots = if num_internal_knots == 0 {
@@ -1091,6 +1113,19 @@ mod tests {
             }
             _ => panic!("Expected InvalidRange error"),
         }
+        
+        // Test degenerate range detection
+        match create_bspline_basis(array![].view(), (5.0, 5.0), 3, 1).unwrap_err() {
+            BasisError::DegenerateRange(num_knots) => {
+                assert_eq!(num_knots, 3);
+            }
+            err => panic!("Expected DegenerateRange error, got {:?}", err),
+        }
+        
+        // Special case: Zero-width range is allowed when num_internal_knots = 0
+        // This creates a valid but trivial basis
+        let result = create_bspline_basis(array![].view(), (5.0, 5.0), 0, 1);
+        assert!(result.is_ok(), "Zero-width range with no internal knots should be valid");
 
         // Test uniform fallback (quantile knots are disabled for P-splines)
         let (_, knots_uniform) = create_bspline_basis(
