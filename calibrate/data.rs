@@ -36,8 +36,7 @@ pub struct TrainingData {
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
-    /// The prior weights vector, from the optional 'weights' column.
-    /// If no weights column is provided, defaults to all 1.0.
+    /// The prior weights vector, from the required 'weights' column.
     pub weights: Array1<f64>,
 }
 
@@ -83,6 +82,11 @@ pub enum DataError {
         "Non-finite values (NaN or Infinity) were found in the required column '{0}'. This tool requires all data to be finite."
     )]
     NonFiniteValuesFound(String),
+
+    #[error(
+        "Required 'weights' column was not found in the input file. Sample weights must be explicitly provided."
+    )]
+    WeightsColumnRequired,
 }
 
 /// Loads and validates data specifically for model training.
@@ -163,11 +167,11 @@ mod internal {
             }
         }
 
-        // Check if optional weights column exists
+        // Check if required weights column exists
         let has_weights = columns_set.contains("weights");
         println!("All required columns found: {required_cols:?}");
         if has_weights {
-            println!("Optional 'weights' column found.");
+            println!("Required 'weights' column found.");
         }
 
         // --- 3. Convert columns efficiently to ndarray structures ---
@@ -298,54 +302,53 @@ mod internal {
         let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
             .expect("PC arrays should have consistent dimensions");
 
-        // Process optional weights column
-        let weights = if has_weights {
-            let weights_series = df.column("weights")?;
-            if weights_series.null_count() > 0 {
-                return Err(DataError::MissingValuesFound("weights".to_string()));
-            }
+        // Process weights column (now required)
+        if !has_weights {
+            return Err(DataError::WeightsColumnRequired);
+        }
+        
+        let weights_series = df.column("weights")?;
+        if weights_series.null_count() > 0 {
+            return Err(DataError::MissingValuesFound("weights".to_string()));
+        }
 
-            // Convert to f64
-            let weights_casted = match weights_series.cast(&DataType::Float64) {
-                Ok(casted) => casted,
-                Err(_) => {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", weights_series.dtype()),
-                    });
-                }
-            };
-
-            // Check for nulls AFTER casting to detect non-numeric values
-            if weights_casted.null_count() > 0 {
+        // Convert to f64
+        let weights_casted = match weights_series.cast(&DataType::Float64) {
+            Ok(casted) => casted,
+            Err(_) => {
                 return Err(DataError::ColumnWrongType {
                     column_name: "weights".to_string(),
                     expected_type: "f64 (numeric)",
                     found_type: format!("{:?}", weights_series.dtype()),
                 });
             }
-
-            // Convert to ndarray
-            let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
-            validate_is_finite(&weights_array, "weights")?;
-
-            // Validate that all weights are non-negative
-            for (i, &weight) in weights_array.iter().enumerate() {
-                if weight < 0.0 {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "non-negative f64 values",
-                        found_type: format!("negative value {} at row {}", weight, i + 1),
-                    });
-                }
-            }
-
-            weights_array
-        } else {
-            // Default to all weights = 1.0
-            Array1::ones(pgs.len())
         };
+
+        // Check for nulls AFTER casting to detect non-numeric values
+        if weights_casted.null_count() > 0 {
+            return Err(DataError::ColumnWrongType {
+                column_name: "weights".to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", weights_series.dtype()),
+            });
+        }
+
+        // Convert to ndarray
+        let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+        validate_is_finite(&weights_array, "weights")?;
+
+        // Validate that all weights are non-negative
+        for (i, &weight) in weights_array.iter().enumerate() {
+            if weight < 0.0 {
+                return Err(DataError::ColumnWrongType {
+                    column_name: "weights".to_string(),
+                    expected_type: "non-negative f64 values",
+                    found_type: format!("negative value {} at row {}", weight, i + 1),
+                });
+            }
+        }
+
+        let weights = weights_array;
 
         println!(
             "Data validation successful: all required columns have numeric data with no missing values."
@@ -410,8 +413,8 @@ mod tests {
 
     #[test]
     fn test_load_training_data_success() {
-        // Create test data that only includes required columns (no extra_col)
-        let header = "phenotype\tscore\tPC1\tPC2";
+        // Create test data that includes required columns including weights
+        let header = "phenotype\tscore\tPC1\tPC2\tweights";
 
         // Generate varied test data with different values in each row
         let mut rows = Vec::with_capacity(31);
@@ -419,11 +422,12 @@ mod tests {
 
         for i in 0..30 {
             let row = format!(
-                "{:.2}\t{:.2}\t{:.3}\t{:.3}",
+                "{:.2}\t{:.2}\t{:.3}\t{:.3}\t{:.1}",
                 i as f64 / 10.0,
                 (i as f64 + 5.0) / 10.0,
                 (i as f64 - 2.0) / 20.0,
-                (i as f64 + 3.0) / 15.0
+                (i as f64 + 3.0) / 15.0,
+                1.0 // Add weight of 1.0 for each row
             );
             rows.push(row);
         }
@@ -458,8 +462,8 @@ mod tests {
 
     #[test]
     fn test_pcs_matrix_structure_with_custom_data() {
-        // Create test data with different values for each row
-        let custom_header = "phenotype\tscore\tPC1\tPC2";
+        // Create test data with different values for each row including weights
+        let custom_header = "phenotype\tscore\tPC1\tPC2\tweights";
 
         // Generate 20 rows with a clear pattern to meet the minimum row requirement
         let mut custom_rows = Vec::with_capacity(21);
@@ -467,11 +471,12 @@ mod tests {
 
         for i in 0..20 {
             let row = format!(
-                "{:.1}\t{:.1}\t{:.1}\t{:.1}",
+                "{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}",
                 i as f64 / 10.0,
                 (i as f64 + 1.0) / 10.0,
                 (i as f64 + 2.0) / 10.0,
-                (i as f64 + 3.0) / 10.0
+                (i as f64 + 3.0) / 10.0,
+                1.0 // Add weight of 1.0 for each row
             );
             custom_rows.push(row); // Push the owned String, not a reference
         }
@@ -494,9 +499,9 @@ mod tests {
 
     #[test]
     fn test_load_prediction_data_success() {
-        // Create test data that only includes required columns (no extra_col)
-        let header = "score\tPC1";
-        let data_row = "1.5\t0.1";
+        // Create test data that includes required columns including weights
+        let header = "score\tPC1\tweights";
+        let data_row = "1.5\t0.1\t1.0"; // Added dummy weight
         let content = generate_csv_content(header, data_row, 30);
         let file = create_test_csv(&content).unwrap();
         let data = load_prediction_data(file.path().to_str().unwrap(), 1).unwrap();

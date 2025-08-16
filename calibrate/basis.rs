@@ -296,8 +296,6 @@ pub fn apply_sum_to_zero_constraint(
 ///
 /// # Arguments
 /// * `s_1d`: The 1D penalty matrix (typically a difference penalty matrix)
-/// * `tol`: Fallback tolerance if the maximum eigenvalue is zero (typically 1e-12)
-///         A relative tolerance of max_eigenvalue * 1e-12 is used by default
 ///
 /// # Returns
 /// A tuple of transformation matrices: (Z_null, Z_range_whiten) where:
@@ -306,14 +304,13 @@ pub fn apply_sum_to_zero_constraint(
 ///   In these coordinates, the penalty becomes an identity matrix.
 pub fn null_range_whiten(
     s_1d: &Array2<f64>,
-    tol: f64,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let (evals, evecs) = s_1d.eigh(UPLO::Lower).map_err(BasisError::LinalgError)?;
 
     // Calculate a relative tolerance based on the maximum eigenvalue
     // This is more robust than using a fixed absolute tolerance
     let max_eig = evals.iter().fold(0.0f64, |max_val, &val| max_val.max(val));
-    let relative_tol = if max_eig > 0.0 { max_eig * 1e-12 } else { tol };
+    let relative_tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
     
     let mut idx_n = Vec::new();
     let mut idx_r = Vec::new();

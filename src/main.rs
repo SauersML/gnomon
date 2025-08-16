@@ -105,22 +105,23 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             .join(", ")
     );
 
-    // Generate PC names
-    let pc_names: Vec<String> = (1..=args.num_pcs).map(|i| format!("PC{i}")).collect();
-
     // Create basis configurations
     let pgs_basis_config = BasisConfig {
         num_knots: args.pgs_knots,
         degree: args.pgs_degree,
     };
 
-    let pc_basis_configs = vec![
-        BasisConfig {
-            num_knots: args.pc_knots,
-            degree: args.pc_degree,
-        };
-        args.num_pcs
-    ];
+    // Create PC configs with names, ranges, and basis configs
+    let pc_configs = (0..args.num_pcs).map(|i| {
+        gnomon::calibrate::model::PrincipalComponentConfig {
+            name: format!("PC{}", i+1),
+            basis_config: BasisConfig {
+                num_knots: args.pc_knots,
+                degree: args.pc_degree,
+            },
+            range: pc_ranges[i],
+        }
+    }).collect();
 
     // Lambda values are now estimated automatically via REML
     println!("Training model with REML estimation of smoothing parameters");
@@ -134,15 +135,11 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
         pgs_basis_config,
-        pc_basis_configs,
+        pc_configs,
         pgs_range,
-        pc_ranges,
-        pc_names,
-        constraints: std::collections::HashMap::new(),
         sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
-        interaction_range_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
     };
 
@@ -163,7 +160,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load trained model
     let model = TrainedModel::load(&args.model)?;
-    let num_pcs = model.config.pc_names.len();
+    let num_pcs = model.config.pc_configs.len();
 
     println!("Model expects {num_pcs} PCs");
 

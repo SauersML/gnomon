@@ -1,7 +1,7 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::model::{Constraint, ModelConfig};
+use crate::calibrate::model::ModelConfig;
 use ndarray::{Array1, Array2, Axis, s};
 use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
@@ -150,7 +150,7 @@ impl ModelLayout {
         for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
             let range = current_col..current_col + num_basis;
             penalty_map.push(PenalizedBlock {
-                term_name: format!("f({})", config.pc_names[i]),
+                term_name: format!("f({})", config.pc_configs[i].name),
                 col_range: range.clone(),
                 penalty_indices: vec![penalty_idx_counter], // Each PC main gets unique penalty index
                 term_type: TermType::PcMainEffect,
@@ -171,7 +171,7 @@ impl ModelLayout {
                 let range = current_col..current_col + num_tensor_coeffs;
 
                 penalty_map.push(PenalizedBlock {
-                    term_name: format!("f(PGS,{})", config.pc_names[i]),
+                    term_name: format!("f(PGS,{})", config.pc_configs[i].name),
                     col_range: range.clone(),
                     penalty_indices: vec![penalty_idx_counter], // Single penalty since both directions are whitened
                     term_type: TermType::Interaction,
@@ -203,42 +203,39 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, constraint transformations, sum-to-zero constraints, knot vectors, range transformations, interaction range transformations, and interaction centering means.
+/// Returns the design matrix, penalty matrices, model layout, sum-to-zero constraints, knot vectors, range transformations, and interaction centering means.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<
     (
-        Array2<f64>,
-        Vec<Array2<f64>>,
-        ModelLayout,
-        HashMap<String, Constraint>,
-        HashMap<String, Array2<f64>>, // Added: sum_to_zero_constraints
-        HashMap<String, Array1<f64>>,
-        HashMap<String, Array2<f64>>,
-        HashMap<String, Array2<f64>>, // Added: interaction_range_transforms
-        HashMap<String, Array1<f64>>, // Added: interaction_centering_means
+        Array2<f64>,                  // design matrix
+        Vec<Array2<f64>>,             // penalty matrices
+        ModelLayout,                  // model layout
+        HashMap<String, Array2<f64>>, // sum_to_zero_constraints
+        HashMap<String, Array1<f64>>, // knot_vectors
+        HashMap<String, Array2<f64>>, // range_transforms
+        HashMap<String, Array1<f64>>, // interaction_centering_means
     ),
     EstimationError,
 > {
     // Validate PC configuration against available data
-    if config.pc_names.len() > data.pcs.ncols() {
+    if config.pc_configs.len() > data.pcs.ncols() {
+        let pc_names: Vec<String> = config.pc_configs.iter().map(|pc| pc.name.clone()).collect();
         return Err(EstimationError::InvalidInput(format!(
             "Configuration requests {} Principal Components ({}), but the provided data file only contains {} PC columns.",
-            config.pc_names.len(),
-            config.pc_names.join(", "),
+            config.pc_configs.len(),
+            pc_names.join(", "),
             data.pcs.ncols()
         )));
     }
 
     let n_samples = data.y.len();
 
-    // Initialize constraint, knot vector, and range transform storage
-    let mut constraints = HashMap::new();
+    // Initialize knot vector, sum-to-zero constraint, and range transform storage
     let mut sum_to_zero_constraints = HashMap::new();
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
-    let mut interaction_range_transforms = HashMap::new();
     let mut interaction_centering_means = HashMap::new();
 
     // 1. Generate basis for PGS and apply sum-to-zero constraint
@@ -268,9 +265,8 @@ pub fn build_design_and_penalty_matrices(
         .enumerate()
         .filter_map(|(i, &d)| if d > pgs_tol { Some(i) } else { None })
         .collect();
-    let u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
+    let _u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
     // Unused variable removed: d_pgs_range
-    interaction_range_transforms.insert("pgs".to_string(), u_pgs_range.to_owned());
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -280,39 +276,32 @@ pub fn build_design_and_penalty_matrices(
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (_, z_range_pgs) = basis::null_range_whiten(&s_pgs_main, pgs_tol)?;
+    let (_, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
 
-    // Save the PGS sum-to-zero constraint transformation in the new dedicated field
-    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
-
-    // Also save in old field for backward compatibility during transition
-    constraints.insert(
-        "pgs_main".to_string(),
-        Constraint {
-            z_transform: pgs_z_transform,
-        },
-    );
+    // Save the PGS sum-to-zero constraint transformation
+    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform);
 
     // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases = Vec::new();
     let mut pc_unconstrained_bases_main = Vec::new();
 
     // Check if we have any PCs to process
-    if config.pc_names.is_empty() {
+    if config.pc_configs.is_empty() {
         log::info!("No PCs provided; building PGS-only model.");
     }
 
-    for i in 0..config.pc_names.len() {
+    for i in 0..config.pc_configs.len() {
         let pc_col = data.pcs.column(i);
-        let pc_name = &config.pc_names[i];
+        let pc_config = &config.pc_configs[i];
+        let pc_name = &pc_config.name;
         let (pc_basis_unc, pc_knots) = create_bspline_basis(
             pc_col.view(),
-            config.pc_ranges[i],
-            config.pc_basis_configs[i].num_knots,
-            config.pc_basis_configs[i].degree,
+            pc_config.range,
+            pc_config.basis_config.num_knots,
+            pc_config.basis_config.degree,
         )?;
 
         // Save PC knot vector
@@ -335,7 +324,7 @@ pub fn build_design_and_penalty_matrices(
             .enumerate()
             .filter_map(|(i, &d)| if d > pc_tol { Some(i) } else { None })
             .collect();
-        let u_pc_range = pc_evecs.select(ndarray::Axis(1), &pc_range_idxs);
+        let _u_pc_range = pc_evecs.select(ndarray::Axis(1), &pc_range_idxs);
 
         // For PC main effects: use non-intercept columns for whitened range basis
         let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
@@ -344,25 +333,14 @@ pub fn build_design_and_penalty_matrices(
         // Create whitened range transform for PC main effects
         let s_pc_main =
             create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (_, z_range_pc) = basis::null_range_whiten(&s_pc_main, pc_tol)?;
-
-        interaction_range_transforms.insert(pc_name.clone(), u_pc_range.to_owned());
+        let (_, z_range_pc) = basis::null_range_whiten(&s_pc_main)?;
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
         pc_range_bases.push(pc_range_basis);
 
         // Store PC range transformation for interactions and main effects
-        range_transforms.insert(pc_name.clone(), z_range_pc.clone());
-
-        // Store the actual range transformation for backward compatibility
-        // This allows prediction fallback to work correctly when range_transforms is empty
-        constraints.insert(
-            pc_name.clone(),
-            Constraint {
-                z_transform: z_range_pc.clone(),
-            },
-        );
+        range_transforms.insert(pc_name.clone(), z_range_pc);
     }
 
     // 3. Calculate layout first to determine matrix dimensions
@@ -434,7 +412,8 @@ pub fn build_design_and_penalty_matrices(
     x_matrix.column_mut(layout.intercept_col).fill(1.0);
 
     // 2. Main PC effects - use range-only bases (fully penalized)
-    for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
+    for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
+        let pc_name = &pc_config.name;
         for block in &layout.penalty_map {
             if block.term_name == format!("f({pc_name})") {
                 let col_range = block.col_range.clone();
@@ -495,7 +474,8 @@ pub fn build_design_and_penalty_matrices(
         })?;
         let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
 
-        for (pc_idx, pc_name) in config.pc_names.iter().enumerate() {
+        for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
+            let pc_name = &pc_config.name;
             // Find the corresponding tensor product block in the layout
             let tensor_block = layout
                 .penalty_map
@@ -575,11 +555,9 @@ pub fn build_design_and_penalty_matrices(
         x_matrix,
         s_list,
         layout,
-        constraints,
         sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
-        interaction_range_transforms,
         interaction_centering_means,
     ))
 }
@@ -640,7 +618,12 @@ pub fn create_balanced_penalty_root(
         .eigh(ndarray_linalg::UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
 
-    let tolerance = 1e-12;
+    // Find the maximum eigenvalue to create a relative tolerance
+    let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+    
+    // Define a relative tolerance. Use an absolute fallback for zero matrices.
+    let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+    
     let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
     if penalty_rank == 0 {
@@ -680,7 +663,12 @@ pub fn compute_penalty_square_roots(
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // Count positive eigenvalues to determine rank
-        let tolerance = 1e-12;
+        // Find the maximum eigenvalue to create a relative tolerance
+        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+        
+        // Define a relative tolerance. Use an absolute fallback for zero matrices.
+        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+        
         let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
         if rank_k == 0 {
@@ -1414,7 +1402,7 @@ mod tests {
             p.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
         );
 
-        let pc_ranges = (0..num_pcs)
+        let pc_ranges: Vec<_> = (0..num_pcs)
             .map(|j| {
                 let col = pcs.column(j);
                 (
@@ -1433,14 +1421,22 @@ mod tests {
             degree: 3,
         };
 
-        let pc_basis_configs = (0..num_pcs)
-            .map(|_| BasisConfig {
-                num_knots: 4,
-                degree: 3,
+        // Create PrincipalComponentConfig objects for each PC
+        let pc_configs: Vec<_> = (0..num_pcs)
+            .map(|i| {
+                let pc_range = pc_ranges[i];
+                let pc_basis_config = BasisConfig {
+                    num_knots: 4,
+                    degree: 3,
+                };
+                let pc_name = format!("PC{}", i + 1);
+                crate::calibrate::model::PrincipalComponentConfig {
+                    name: pc_name,
+                    basis_config: pc_basis_config,
+                    range: pc_range,
+                }
             })
             .collect();
-
-        let pc_names: Vec<String> = (0..num_pcs).map(|i| format!("PC{}", i + 1)).collect();
 
         let config = ModelConfig {
             link_function: LinkFunction::Identity,
@@ -1450,15 +1446,11 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 100,
             pgs_basis_config,
-            pc_basis_configs,
+            pc_configs,
             pgs_range,
-            pc_ranges,
-            pc_names,
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -1481,7 +1473,7 @@ mod tests {
         // PC1 main is now range-only (penalized part only)
         // Range dimension = main basis cols - null space dimension
         let pc1_main_basis_cols =
-            config.pc_basis_configs[0].num_knots + config.pc_basis_configs[0].degree; // 5 - 1 = 4
+            config.pc_configs[0].basis_config.num_knots + config.pc_configs[0].basis_config.degree; // 5 - 1 = 4
         let r_pc = pc1_main_basis_cols - config.penalty_order; // 4 - 2 = 2
 
         // Interaction is R×R (both dimensions use range-only)
@@ -1539,7 +1531,7 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
@@ -1614,7 +1606,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _, _, _) =
+        let (_, _, layout, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
@@ -1640,22 +1632,14 @@ mod tests {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
         // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
-        let result = build_design_and_penalty_matrices(&data, &config).unwrap();
-        let x_training = result.0;
-        let constraints = result.3;
-        let sum_to_zero_constraints = result.4;
-        let knot_vectors = result.5;
-        let range_transforms = result.6;
-        let interaction_range_transforms = result.7;
-        let interaction_centering_means = result.8;
+        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means) = 
+            build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms
         let mut cfg = config.clone();
-        cfg.constraints = constraints.clone();
         cfg.sum_to_zero_constraints = sum_to_zero_constraints.clone();
         cfg.knot_vectors = knot_vectors.clone();
         cfg.range_transforms = range_transforms.clone();
-        cfg.interaction_range_transforms = interaction_range_transforms.clone();
         cfg.interaction_centering_means = interaction_centering_means.clone();
 
         // Construct coefficients in the canonical structure
@@ -1668,7 +1652,7 @@ mod tests {
             .get("pgs_main")
             .expect("missing pgs_main Z")
             .ncols();
-        let pc_name = cfg.pc_names[0].clone();
+        let pc_name = cfg.pc_configs[0].name.clone();
         let r_pc = cfg
             .range_transforms
             .get(&pc_name)
@@ -1709,7 +1693,8 @@ mod tests {
         // Manually flatten coefficients using the same canonical order as model::internal::flatten_coefficients
         let mut flat: Vec<f64> = Vec::new();
         flat.push(coeffs.intercept);
-        for pc in &cfg.pc_names {
+        for pc_config in &cfg.pc_configs {
+            let pc = &pc_config.name;
             flat.extend_from_slice(
                 coeffs
                     .main_effects
@@ -1719,7 +1704,8 @@ mod tests {
             );
         }
         flat.extend_from_slice(&coeffs.main_effects.pgs);
-        for pc in &cfg.pc_names {
+        for pc_config in &cfg.pc_configs {
+            let pc = &pc_config.name;
             let key = format!("f(PGS,{})", pc);
             if let Some(v) = coeffs.interaction_effects.get(&key) {
                 flat.extend_from_slice(v);

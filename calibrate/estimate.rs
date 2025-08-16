@@ -122,11 +122,9 @@ pub fn train_model(
         x_matrix,
         s_list,
         layout,
-        constraints,
         sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
-        interaction_range_transforms,
         interaction_centering_means,
     ) = build_design_and_penalty_matrices(data, config)?;
     log_layout_info(&layout);
@@ -456,11 +454,9 @@ pub fn train_model(
     let mapped_coefficients =
         crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
     let mut config_with_constraints = config.clone();
-    config_with_constraints.constraints = constraints;
     config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.range_transforms = range_transforms;
-    config_with_constraints.interaction_range_transforms = interaction_range_transforms;
     config_with_constraints.interaction_centering_means = interaction_centering_means;
 
     Ok(TrainedModel {
@@ -965,8 +961,14 @@ pub mod internal {
                         s_lambda_original.scaled_add(lambdas[k], &s_k);
                     }
 
+                    // Determine numerical rank of S_λ using a relative tolerance
+                    // tol = max_sv * 1e-12 (with absolute fallback for zero matrices)
                     let rank = match s_lambda_original.svd(false, false) {
-                        Ok((_, svals, _)) => svals.iter().filter(|&&sv| sv > 1e-8).count(),
+                        Ok((_, svals, _)) => {
+                            let max_sv = svals.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+                            let tol = if max_sv > 0.0 { max_sv * 1e-12 } else { 1e-12 };
+                            svals.iter().filter(|&&sv| sv > tol).count()
+                        }
                         Err(_) => self.layout.total_coeffs, // fallback to full rank
                     };
                     let mp = (self.layout.total_coeffs - rank) as f64;
@@ -1711,7 +1713,7 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::calibrate::model::BasisConfig;
+        use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
         // The generate_realistic_binary_data and generate_y_from_logit functions
@@ -1815,7 +1817,7 @@ pub mod internal {
             };
 
             // Train the model
-            let mut config = ModelConfig {
+            let config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
@@ -1826,19 +1828,22 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 3,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    }
+                ],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.pgs_basis_config.num_knots = 3;
-            config.pc_basis_configs[0].num_knots = 3;
 
             let trained_model = train_model(&data, &config).expect("Model training should succeed");
 
@@ -1943,7 +1948,7 @@ pub mod internal {
             let test_true_probabilities = Array1::from(true_probabilities[n_train..].to_vec());
 
             // Train model only on training data
-            let mut config = ModelConfig {
+            let config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
@@ -1954,19 +1959,22 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 3,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    }
+                ],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.pgs_basis_config.num_knots = 3;
-            config.pc_basis_configs[0].num_knots = 3;
 
             let trained_model =
                 train_model(&train_data, &config).expect("Model training should succeed");
@@ -2054,28 +2062,32 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![
-                    BasisConfig {
-                        num_knots: 6,
-                        degree: 3,
-                    }, // same basis for both PCs
-                    BasisConfig {
-                        num_knots: 6,
-                        degree: 3,
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 6,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC2".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 6,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
                     },
                 ],
                 pgs_range: (-2.0, 2.0),
-                pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
-                pc_names: vec!["PC1".to_string(), "PC2".to_string()],
-                constraints: Default::default(),
-                sum_to_zero_constraints: Default::default(),
-                knot_vectors: Default::default(),
-                range_transforms: Default::default(),
-                interaction_range_transforms: Default::default(),
-                interaction_centering_means: Default::default(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2154,32 +2166,27 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
-                },
-                pc_basis_configs: vec![
-                    BasisConfig {
-                        num_knots: 8,
-                        degree: 3,
-                    }, // More knots for high-curvature PC1
-                    BasisConfig {
-                        num_knots: 8,
-                        degree: 3,
-                    }, // Same basis size for fair comparison
+                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                        range: (-1.5, 1.5),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC2".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                        range: (-1.5, 1.5),
+                    },
                 ],
                 pgs_range: (-2.0, 2.0),
-                pc_ranges: vec![(-1.5, 1.5), (-1.5, 1.5)],
-                pc_names: vec!["PC1".to_string(), "PC2".to_string()],
-                constraints: Default::default(),
-                sum_to_zero_constraints: Default::default(),
-                knot_vectors: Default::default(),
-                range_transforms: Default::default(),
-                interaction_range_transforms: Default::default(),
-                interaction_centering_means: Default::default(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2268,7 +2275,7 @@ pub mod internal {
             };
 
             // Train model
-            let mut config = ModelConfig {
+            let config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
@@ -2276,22 +2283,23 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 pgs_basis_config: BasisConfig {
-                    num_knots: 3,
+                    num_knots: 4, // More knots for better shape recovery
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 4, // More knots for better shape recovery
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.pgs_basis_config.num_knots = 4; // More knots for better shape recovery
-            config.pc_basis_configs[0].num_knots = 4;
 
             let trained_model = train_model(&data, &config).expect("Model training should succeed");
 
@@ -2515,7 +2523,7 @@ pub mod internal {
                 pcs,
                 weights: Array1::ones(p.len()),
             };
-            let mut config = ModelConfig {
+            let config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
@@ -2526,26 +2534,38 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 6,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC2".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 6,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC3".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 6,
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    },
+                ],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.pc_names = vec!["PC1".to_string(), "PC2".to_string(), "PC3".to_string()];
-            config.pc_basis_configs = vec![
-                BasisConfig {
-                    num_knots: 6,
-                    degree: 3
-                };
-                3
-            ];
-            config.pc_ranges = vec![(-2.0, 2.0); 3];
 
             // --- 3. Train model ---
             let model_result = train_model(&data, &config);
@@ -2634,29 +2654,33 @@ pub mod internal {
                     num_knots: 2, // Fewer knots for stability
                     degree: 2,    // Lower degree for stability
                 },
-                pc_basis_configs: vec![
-                    BasisConfig {
-                        num_knots: 2,
-                        degree: 2,
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 2,
+                            degree: 2,
+                        },
+                        range: (-1.5, 1.5),
                     }, // PC1 - simplified
-                    BasisConfig {
-                        num_knots: 2,
-                        degree: 2,
+                    PrincipalComponentConfig {
+                        name: "PC2".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 2,
+                            degree: 2,
+                        },
+                        range: (-1.5, 1.5),
                     }, // PC2 - same basis size as PC1
                 ],
-                pc_ranges: vec![(-2.0, 2.0), (-1.5, 1.5)],
-                pc_names: vec!["PC1".to_string(), "PC2".to_string()],
                 pgs_range: (-2.5, 2.5),
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             assert!(
@@ -2852,20 +2876,15 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.pc_names.clear();
-            config.pc_basis_configs.clear();
-            config.pc_ranges.clear();
+            // Clear PC configurations
+            config.pc_configs.clear();
             config.pgs_basis_config.num_knots = 4; // A reasonable number of knots
 
             // --- 3. TRAIN THE MODEL (using the existing `train_model` function) ---
@@ -2975,23 +2994,23 @@ pub mod internal {
                     num_knots: 2,
                     degree: 3,
                 },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 1,
-                    degree: 3,
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 1,
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
                 }],
                 pgs_range: (-6.0, 6.0),
-                pc_ranges: vec![(-4.0, 4.0)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: HashMap::new(),
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3103,23 +3122,23 @@ pub mod internal {
                     num_knots: 3, // Smaller than original 5
                     degree: 3,
                 },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 2, // Smaller than original 4
-                    degree: 3,
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 2, // Smaller than original 4
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
                 }],
                 pgs_range: (-3.0, 3.0),
-                pc_ranges: vec![(-3.0, 3.0)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: HashMap::new(),
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3212,45 +3231,66 @@ pub mod internal {
             };
 
             // Over-parameterized model: many knots and PCs for small dataset
-            let mut config = ModelConfig {
-                link_function: LinkFunction::Logit,
+            let config = ModelConfig {
+                link_function: LinkFunction::Identity,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 pgs_basis_config: BasisConfig {
-                    num_knots: 3,
+                    num_knots: 15, // Too many knots for small data
                     degree: 3,
                 },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                // Add many PC terms to induce singularity
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC2".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC3".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC4".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC5".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC6".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC7".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                    PrincipalComponentConfig {
+                        name: "PC8".to_string(),
+                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        range: (0.0, 1.0),
+                    },
+                ],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            config.link_function = LinkFunction::Identity;
-            config.pgs_basis_config.num_knots = 15; // Too many knots for small data
-            // Add many PC terms
-            config.pc_names = vec![
-                "PC1".to_string(),
-                "PC2".to_string(),
-                "PC3".to_string(),
-                "PC4".to_string(),
-                "PC5".to_string(),
-                "PC6".to_string(),
-                "PC7".to_string(),
-                "PC8".to_string(),
-            ];
-            config.pc_basis_configs = vec![
-            BasisConfig { num_knots: 8, degree: 2 }; 8 // Many knots per PC
-        ];
-            config.pc_ranges = vec![(0.0, 1.0); 8];
             // This creates way too many parameters for 30 data points
 
             println!(
@@ -3352,19 +3392,21 @@ pub mod internal {
                     num_knots: 6, // Reduced to avoid ModelOverparameterized
                     degree: 3,
                 },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 5, // Reduced to avoid ModelOverparameterized
-                    degree: 3,
-                }],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 5, // Reduced to avoid ModelOverparameterized
+                            degree: 3,
+                        },
+                        range: (-1.5, 1.5),
+                    },
+                ],
                 pgs_range: (0.0, 1.0),
-                pc_ranges: vec![(-1.0, 1.0)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: HashMap::new(),
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
             };
 
             println!(
@@ -3462,23 +3504,22 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
-                }],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                        range: (-1.5, 1.5),
+                    },
+                ],
                 pgs_range: (0.0, 1.0),
-                pc_ranges: vec![(-0.5, 0.5)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: Default::default(),
-                sum_to_zero_constraints: Default::default(),
-                knot_vectors: Default::default(),
-                range_transforms: Default::default(),
-                interaction_range_transforms: Default::default(),
-                interaction_centering_means: Default::default(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3511,7 +3552,7 @@ pub mod internal {
             for (key, constraint) in constraints.iter() {
                 if key.starts_with("INT_P") {
                     // Check that the constraint is an identity matrix
-                    let z = &constraint.z_transform;
+                    let z = constraint;
                     assert_eq!(
                         z.nrows(),
                         z.ncols(),
@@ -3605,29 +3646,19 @@ pub mod internal {
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
-                    pgs_basis_config: BasisConfig {
-                        num_knots: 3,
-                        degree: 3,
-                    },
-                    pc_basis_configs: vec![],
-                    pc_names: vec![],
+                    pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    pc_configs: vec![],
                     pgs_range: (-1.0, 1.0),
-                    pc_ranges: vec![],
-                    constraints: std::collections::HashMap::new(),
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
-                    interaction_range_transforms: std::collections::HashMap::new(),
                     interaction_centering_means: std::collections::HashMap::new(),
                 };
                 simple_config.link_function = link_function;
-                simple_config.pc_names = vec![]; // Remove PCs from the model definition
-                simple_config.pc_basis_configs = vec![];
-                simple_config.pc_ranges = vec![];
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3742,37 +3773,26 @@ pub mod internal {
 
                 // 1. Define a simple model config for a PGS-only model
                 let mut simple_config = ModelConfig {
-                    link_function: LinkFunction::Logit,
+                    link_function: link_function,
                     penalty_order: 2,
                     convergence_tolerance: 1e-6,
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
-                    pgs_basis_config: BasisConfig {
-                        num_knots: 3,
-                        degree: 3,
-                    },
-                    pc_basis_configs: vec![],
-                    pc_names: vec![],
+                    pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    pc_configs: vec![],
                     pgs_range: (-1.0, 1.0),
-                    pc_ranges: vec![],
-                    constraints: std::collections::HashMap::new(),
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
-                    interaction_range_transforms: std::collections::HashMap::new(),
                     interaction_centering_means: std::collections::HashMap::new(),
                 };
-                simple_config.link_function = link_function;
-                simple_config.pc_names = vec![]; // No PCs in this model
-                simple_config.pc_basis_configs = vec![];
-                simple_config.pc_ranges = vec![];
 
                 // Use a simple basis with fewer knots to reduce complexity
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -3915,37 +3935,25 @@ pub mod internal {
             let n_samples = 100; // Increased from 20 for better conditioning
 
             // 1. Define a simple model config for the test
-            let mut simple_config = ModelConfig {
-                link_function: LinkFunction::Logit,
+            let simple_config = ModelConfig {
+                link_function: LinkFunction::Identity, // Use Identity for simpler test
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
-                },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pgs_basis_config: BasisConfig { num_knots: 2, degree: 3 },
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig { num_knots: 2, degree: 3 },
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            simple_config.link_function = LinkFunction::Identity; // Use Identity for simpler test
-            // Limit to 1 PC to reduce model complexity
-            simple_config.pc_names = vec!["PC1".to_string()];
-            simple_config.pc_basis_configs = vec![BasisConfig {
-                num_knots: 2,
-                degree: 3,
-            }];
-            simple_config.pc_ranges = vec![(-1.5, 1.5)];
-            simple_config.pgs_basis_config.num_knots = 2; // Fewer knots → fewer penalties
 
             // Create data with non-collinear predictors to avoid perfect collinearity
             use rand::prelude::*;
@@ -3971,7 +3979,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4112,36 +4120,24 @@ pub mod internal {
             };
 
             // 1. Define a simple model config for a PGS-only model
-            let mut simple_config = ModelConfig {
-                link_function: LinkFunction::Logit,
+            let simple_config = ModelConfig {
+                link_function: LinkFunction::Identity,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
-                },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            simple_config.link_function = LinkFunction::Identity;
-            simple_config.pc_names = vec![]; // No PCs in this model
-            simple_config.pc_basis_configs = vec![];
-            simple_config.pc_ranges = vec![];
-            simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4237,36 +4233,24 @@ pub mod internal {
             };
 
             // 1. Define a simple model config for a PGS-only model
-            let mut simple_config = ModelConfig {
-                link_function: LinkFunction::Logit,
+            let simple_config = ModelConfig {
+                link_function: LinkFunction::Identity,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
-                },
-                pc_basis_configs: vec![],
-                pc_names: vec![],
+                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![],
-                constraints: std::collections::HashMap::new(),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-                interaction_range_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
             };
-            simple_config.link_function = LinkFunction::Identity;
-            simple_config.pc_names = vec![]; // No PCs in this model
-            simple_config.pc_basis_configs = vec![];
-            simple_config.pc_ranges = vec![];
-            simple_config.pgs_basis_config.num_knots = 3;
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4362,15 +4346,11 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
             num_knots: 5,
             degree: 3,
         },
-        pc_basis_configs: vec![],
-        pc_names: vec![],
+        pc_configs: vec![],
         pgs_range: (-1.0, 1.0),
-        pc_ranges: vec![],
-        constraints: HashMap::new(),
         sum_to_zero_constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
-        interaction_range_transforms: HashMap::new(),
         interaction_centering_means: HashMap::new(),
     };
 
@@ -4436,24 +4416,24 @@ fn test_indefinite_hessian_detection_and_retreat() {
             num_knots: 3,
             degree: 3,
         },
-        pc_basis_configs: vec![BasisConfig {
-            num_knots: 3,
-            degree: 3,
+        pc_configs: vec![crate::calibrate::model::PrincipalComponentConfig {
+            name: "PC1".to_string(),
+            basis_config: BasisConfig {
+                num_knots: 3,
+                degree: 3,
+            },
+            range: (-1.0, 1.0),
         }],
         pgs_range: (-1.0, 1.0),
-        pc_ranges: vec![(-1.0, 1.0)],
-        pc_names: vec!["PC1".to_string()],
-        constraints: std::collections::HashMap::new(),
         sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
-        interaction_range_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
     };
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4575,6 +4555,7 @@ mod optimizer_progress_tests {
     use super::test_helpers;
     use super::*;
     use crate::calibrate::model::BasisConfig;
+    use crate::calibrate::model::PrincipalComponentConfig;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -4639,23 +4620,22 @@ mod optimizer_progress_tests {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_basis_configs: vec![BasisConfig {
-                num_knots: 6,
-                degree: 3,
-            }],
+            pc_configs: vec![
+                PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig { num_knots: 6, degree: 3 },
+                    range: (-1.5, 1.5),
+                },
+            ],
             pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
-            pc_ranges: vec![(-3.5, 3.5)],
-            pc_names: vec!["PC1".to_string()],
-            constraints: std::collections::HashMap::new(),
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
-            interaction_range_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),

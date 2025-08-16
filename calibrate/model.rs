@@ -29,6 +29,19 @@ pub struct BasisConfig {
     pub degree: usize,
 }
 
+/// Configuration for a single Principal Component, bundling related data together.
+/// This makes invalid states unrepresentable by ensuring each PC has all required
+/// configuration elements together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalComponentConfig {
+    /// Name of this principal component (e.g., "PC1")
+    pub name: String,
+    /// Basis configuration for this principal component
+    pub basis_config: BasisConfig,
+    /// Value range for this principal component
+    pub range: (f64, f64),
+}
+
 /// Holds the transformation matrix for a sum-to-zero constraint.
 /// This is serializable so it can be saved to the TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,39 +61,22 @@ pub struct ModelConfig {
     pub reml_convergence_tolerance: f64,
     pub reml_max_iterations: u64,
     pub pgs_basis_config: BasisConfig,
-    pub pc_basis_configs: Vec<BasisConfig>,
+    /// Bundled configuration for each principal component.
+    /// This ensures that for each PC, we have the correct basis config, name, and range together.
+    pub pc_configs: Vec<PrincipalComponentConfig>,
     // Data-dependent parameters saved from training are crucial for prediction.
     pub pgs_range: (f64, f64),
-    pub pc_ranges: Vec<(f64, f64)>,
-    /// Defines the canonical order for Principal Components. This order is strictly
-    /// enforced during both model fitting and prediction to ensure correctness.
-    pub pc_names: Vec<String>,
 
-    /// A map from a term name (e.g., "PC1", "pgs_main") to its constraint transformation.
-    /// Use an Option because not all terms might be constrained.
-    /// DEPRECATED: This field contains mixed semantics and should be phased out.
-    /// Use sum_to_zero_constraints for new sum-to-zero transforms.
-    #[serde(default)] // For backward compatibility with old models that don't have this field
-    pub constraints: HashMap<String, Constraint>,
     /// Sum-to-zero constraint transformations (separate from range transforms)
     /// Maps term names (e.g., "pgs_main") to their sum-to-zero transformation matrices
-    #[serde(default)] // For backward compatibility with models that don't have this field
     pub sum_to_zero_constraints: HashMap<String, Array2<f64>>,
     /// Knot vectors used during training, required for exact reproduction during prediction
     pub knot_vectors: HashMap<String, Array1<f64>>,
     /// Range transformation matrices for functional ANOVA decomposition
     /// Maps variable names (e.g., "pgs", "PC1") to their range-space transformation matrices
-    #[serde(default)] // For backward compatibility with models that don't have this field
     pub range_transforms: HashMap<String, Array2<f64>>,
-    /// Range transformation matrices for interaction terms (unwhitened eigenvectors)
-    /// Maps variable names (e.g., "pgs", "PC1") to their unwhitened range eigenvectors for interactions
-    /// DEPRECATED: This field is computed but never used during prediction.
-    /// The prediction code uses range_transforms instead. Consider removing in a future version.
-    #[serde(default)] // For backward compatibility with models that don't have this field
-    pub interaction_range_transforms: HashMap<String, Array2<f64>>,
     /// Weighted column means used for centering interaction marginals during training
     /// Maps variable names (e.g., "pgs", "PC1") to their weighted column means for ANOVA centering
-    #[serde(default)] // For backward compatibility with models that don't have this field
     pub interaction_centering_means: HashMap<String, Array1<f64>>,
 }
 
@@ -152,7 +148,7 @@ impl TrainedModel {
     /// # Arguments
     /// * `p_new`: A 1D array view of new PGS values.
     /// * `pcs_new`: A 2D array view of new PC values, with shape `[n_samples, n_pcs]`.
-    ///              The order of PC columns must match `config.pc_names`.
+    ///              The order of PC columns must match `config.pc_configs` names.
     ///
     /// # Returns
     /// A `Result` containing an `Array1<f64>` of predicted outcomes (e.g., probabilities
@@ -163,10 +159,10 @@ impl TrainedModel {
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         // --- 1. Validate Inputs ---
-        if pcs_new.ncols() != self.config.pc_names.len() {
+        if pcs_new.ncols() != self.config.pc_configs.len() {
             return Err(ModelError::MismatchedPcCount {
                 found: pcs_new.ncols(),
-                expected: self.config.pc_names.len(),
+                expected: self.config.pc_configs.len(),
             });
         }
 
@@ -283,17 +279,9 @@ mod internal {
 
         // Apply the SAVED PGS constraint - prefer new sum_to_zero_constraints field
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let pgs_z = if let Some(z_transform) = config.sum_to_zero_constraints.get("pgs_main") {
-            // Use the new dedicated sum-to-zero constraints field
-            z_transform
-        } else {
-            // Fallback to old constraints field for backward compatibility
-            &config
-                .constraints
-                .get("pgs_main")
-                .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?
-                .z_transform
-        };
+        let pgs_z = config.sum_to_zero_constraints
+            .get("pgs_main")
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?;
 
         // Check that dimensions match before matrix multiplication
         if pgs_main_basis_unc.ncols() != pgs_z.nrows() {
@@ -314,9 +302,9 @@ mod internal {
         // 2. Generate range-only bases for PCs (functional ANOVA approach)
         let mut pc_range_bases = Vec::new();
         let mut pc_unconstrained_bases_main = Vec::new();
-        for i in 0..config.pc_names.len() {
+        for i in 0..config.pc_configs.len() {
             let pc_col = pcs_new.column(i);
-            let pc_name = &config.pc_names[i];
+            let pc_name = &config.pc_configs[i].name;
             // Only use saved knot vectors - remove fallback to ensure consistency
             let saved_knots = config
                 .knot_vectors
@@ -326,7 +314,7 @@ mod internal {
             let (pc_basis_unc, _) = basis::create_bspline_basis_with_knots(
                 pc_col,
                 saved_knots.view(),
-                config.pc_basis_configs[i].degree,
+                config.pc_configs[i].basis_config.degree,
             )?;
 
             // Slice the basis to remove the intercept term, just like in the training code
@@ -344,19 +332,8 @@ mod internal {
                 let pc_range_basis = pc_main_basis_unc.dot(range_transform);
                 pc_range_bases.push(pc_range_basis);
             } else {
-                // Fallback to old constraint approach for backward compatibility
-                let pc_z = &config
-                    .constraints
-                    .get(pc_name)
-                    .ok_or_else(|| ModelError::ConstraintMissing(pc_name.clone()))?
-                    .z_transform;
-
-                // Check that dimensions match before matrix multiplication
-                if pc_main_basis_unc.ncols() != pc_z.nrows() {
-                    return Err(ModelError::InternalStackingError);
-                }
-
-                pc_range_bases.push(pc_main_basis_unc.dot(pc_z)); // Fallback constrained
+                // No range transform found for this PC
+                return Err(ModelError::ConstraintMissing(format!("range transform for {}", pc_name)));
             }
         }
 
@@ -379,8 +356,13 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Tensor product interaction effects - Use WHITENED basis for consistency with training
-        if let Some(z_range_pgs_pred) = config.range_transforms.get("pgs") {
+        // 4. Tensor product interaction effects - only if PCs are present
+        if !config.pc_configs.is_empty() {
+            // Use WHITENED basis for consistency with training
+            let z_range_pgs_pred = config.range_transforms
+                .get("pgs")
+                .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?;
+
             // Check dimensions before matrix multiplication to prevent panic
             if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
                 return Err(ModelError::InternalStackingError);
@@ -388,8 +370,8 @@ mod internal {
 
             let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs_pred);
 
-            for pc_idx in 0..config.pc_names.len() {
-                let pc_name = &config.pc_names[pc_idx];
+            for pc_idx in 0..config.pc_configs.len() {
+                let pc_name = &config.pc_configs[pc_idx].name;
                 let tensor_key = format!("f(PGS,{})", pc_name);
 
                 // Only build the interaction if the trained model contains coefficients for it
@@ -410,26 +392,23 @@ mod internal {
                         row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
                     // Apply stored per-interaction centering
-                    if let Some(means) = config.interaction_centering_means.get(&tensor_key) {
-                        if tensor_interaction.ncols() != means.len() {
-                            return Err(ModelError::DimensionMismatch(format!(
-                                "Interaction {} has {} columns but {} stored means",
-                                tensor_key,
-                                tensor_interaction.ncols(),
-                                means.len()
-                            )));
-                        }
-                        for j in 0..tensor_interaction.ncols() {
-                            let m = means[j];
-                            tensor_interaction.column_mut(j).mapv_inplace(|v| v - m);
-                        }
-                    } else {
-                        // Backward-compatibility fallback: if old models only stored marginal means,
-                        // issue a warning
-                        log::warn!(
-                            "No stored interaction centering means for {}. Proceeding uncentered.",
-                            tensor_key
-                        );
+                    let means = config.interaction_centering_means
+                        .get(&tensor_key)
+                        .ok_or_else(|| ModelError::DimensionMismatch(format!(
+                            "No centering means found for interaction {}", tensor_key)))?;
+
+                    if tensor_interaction.ncols() != means.len() {
+                        return Err(ModelError::DimensionMismatch(format!(
+                            "Interaction {} has {} columns but {} stored means",
+                            tensor_key,
+                            tensor_interaction.ncols(),
+                            means.len()
+                        )));
+                    }
+
+                    for j in 0..tensor_interaction.ncols() {
+                        let m = means[j];
+                        tensor_interaction.column_mut(j).mapv_inplace(|v| v - m);
                     }
 
                     // Add all columns from this tensor product to the design matrix
@@ -438,28 +417,8 @@ mod internal {
                     }
                 }
             }
-        } else {
-            // Fallback to old approach for backward compatibility
-            let num_pgs_interaction_bases = pgs_main_basis_unc.ncols();
-            if num_pgs_interaction_bases > 0 && !config.pc_names.is_empty() {
-                for pc_idx in 0..config.pc_names.len() {
-                    let pc_unconstrained_basis = &pc_unconstrained_bases_main[pc_idx];
-                    let pc_name = &config.pc_names[pc_idx];
-                    let tensor_key = format!("f(PGS,{})", pc_name);
-
-                    if coeffs.interaction_effects.contains_key(&tensor_key) {
-                        let tensor_interaction = row_wise_tensor_product(
-                            &pgs_main_basis_unc.to_owned(),
-                            pc_unconstrained_basis,
-                        );
-
-                        for col in tensor_interaction.axis_iter(Axis(1)) {
-                            owned_cols.push(col.to_owned());
-                        }
-                    }
-                }
-            }
         }
+        // No fallback - only modern approach is supported now
 
         // Stack all column views into the final design matrix
         let col_views: Vec<_> = owned_cols.iter().map(Array1::view).collect();
@@ -479,8 +438,9 @@ mod internal {
         // 1. Intercept
         flattened.push(coeffs.intercept);
 
-        // 2. Main PC effects (ordered by `pc_names` for determinism).
-        for pc_name in &config.pc_names {
+        // 2. Main PC effects (ordered by pc_configs for determinism).
+        for pc_config in &config.pc_configs {
+            let pc_name = &pc_config.name;
             let c = coeffs
                 .main_effects
                 .pcs
@@ -493,8 +453,8 @@ mod internal {
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
         // 4. Tensor product interaction effects (ordered by PC)
-        for pc_name in &config.pc_names {
-            let tensor_key = format!("f(PGS,{})", pc_name);
+        for pc_config in &config.pc_configs {
+            let tensor_key = format!("f(PGS,{})", pc_config.name);
             if let Some(tensor_coeffs) = coeffs.interaction_effects.get(&tensor_key) {
                 flattened.extend_from_slice(tensor_coeffs);
             }
@@ -546,18 +506,11 @@ mod tests {
                     num_knots: 1, // Number of internal knots
                     degree,
                 },
-                pc_basis_configs: vec![],
+                pc_configs: vec![],
                 pgs_range: (0.0, 1.0),
-                pc_ranges: vec![],
-                pc_names: vec![],
-                constraints: {
+                sum_to_zero_constraints: {
                     let mut constraints = HashMap::new();
-                    constraints.insert(
-                        "pgs_main".to_string(),
-                        Constraint {
-                            z_transform: z_transform.clone(),
-                        },
-                    );
+                    constraints.insert("pgs_main".to_string(), z_transform.clone());
                     constraints
                 },
                 knot_vectors: {
@@ -565,9 +518,7 @@ mod tests {
                     knots.insert("pgs".to_string(), knot_vector.clone());
                     knots
                 },
-                sum_to_zero_constraints: HashMap::new(),
                 range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
             },
             coefficients: MappedCoefficients {
@@ -628,18 +579,20 @@ mod tests {
                     num_knots: 2,
                     degree: 1,
                 },
-                pc_basis_configs: vec![BasisConfig {
-                    num_knots: 2,
-                    degree: 1,
-                }],
+                pc_configs: vec![
+                    PrincipalComponentConfig {
+                        name: "PC1".to_string(),
+                        basis_config: BasisConfig {
+                            num_knots: 2,
+                            degree: 1,
+                        },
+                        range: (-1.0, 1.0),
+                    }
+                ],
                 pgs_range: (-2.0, 2.0),
-                pc_ranges: vec![(-1.0, 1.0)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: HashMap::new(),
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
-                interaction_range_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
             },
             coefficients: MappedCoefficients {
@@ -713,24 +666,28 @@ mod tests {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_basis_configs: vec![
-                BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
+            pc_configs: vec![
+                PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
+                    range: (0.0, 1.0),
                 },
-                BasisConfig {
-                    num_knots: 3,
-                    degree: 3,
+                PrincipalComponentConfig {
+                    name: "PC2".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
+                    range: (0.0, 1.0),
                 },
             ],
             pgs_range: (0.0, 1.0),
-            pc_ranges: vec![(0.0, 1.0), (0.0, 1.0)],
-            pc_names: vec!["PC1".to_string(), "PC2".to_string()], // Order matters for flattening
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -741,7 +698,7 @@ mod tests {
 
         // Verify the canonical order of flattening:
         // 1. Intercept
-        // 2. PC main effects (ordered by config.pc_names)
+        // 2. PC main effects (ordered by config.pc_configs)
         // 3. PGS main effects
         // 4. Interaction effects (PGS basis function 1, then PC1, PC2, etc.; then PGS basis function 2...)
 
@@ -802,15 +759,17 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             pgs_basis_config: pgs_basis_config.clone(),
-            pc_basis_configs: vec![pc1_basis_config.clone()],
+            pc_configs: vec![
+                PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: pc1_basis_config.clone(),
+                    range: (-0.5, 0.5),
+                }
+            ],
             pgs_range: (-1.0, 1.0),
-            pc_ranges: vec![(-0.5, 0.5)],
-            pc_names: vec!["PC1".to_string()],
-            constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -833,11 +792,9 @@ mod tests {
             _,
             _,
             layout,
-            constraints,
             sum_to_zero_constraints,
             knot_vectors,
             range_transforms,
-            interaction_range_transforms,
             interaction_centering_means,
         ) = crate::calibrate::construction::build_design_and_penalty_matrices(
             &dummy_data,
@@ -855,15 +812,15 @@ mod tests {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 pgs_basis_config: pgs_basis_config.clone(),
-                pc_basis_configs: vec![pc1_basis_config.clone()],
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: pc1_basis_config.clone(),
+                    range: (-0.5, 0.5),
+                }],
                 pgs_range: (-1.0, 1.0),
-                pc_ranges: vec![(-0.5, 0.5)],
-                pc_names: vec!["PC1".to_string()],
-                constraints: constraints.clone(), // Clone to avoid ownership issues
                 sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
                 knot_vectors, // Use the knot vectors generated by the model-building code
                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
-                interaction_range_transforms: interaction_range_transforms.clone(),
                 interaction_centering_means: interaction_centering_means.clone(),
             },
             coefficients: MappedCoefficients {
@@ -940,19 +897,23 @@ mod tests {
             loaded_model.config.pgs_basis_config.degree,
             original_model.config.pgs_basis_config.degree
         );
-        assert_eq!(loaded_model.config.pc_names, original_model.config.pc_names);
+        assert_eq!(loaded_model.config.pc_configs.len(), original_model.config.pc_configs.len());
+        // Check that each PC config matches
+        for i in 0..loaded_model.config.pc_configs.len() {
+            assert_eq!(loaded_model.config.pc_configs[i].name, original_model.config.pc_configs[i].name);
+            assert_eq!(loaded_model.config.pc_configs[i].range, original_model.config.pc_configs[i].range);
+            assert_eq!(loaded_model.config.pc_configs[i].basis_config.num_knots, 
+                      original_model.config.pc_configs[i].basis_config.num_knots);
+            assert_eq!(loaded_model.config.pc_configs[i].basis_config.degree, 
+                      original_model.config.pc_configs[i].basis_config.degree);
+        }
         assert_eq!(
             loaded_model.config.pgs_range,
             original_model.config.pgs_range
         );
-        assert_eq!(
-            loaded_model.config.pc_ranges,
-            original_model.config.pc_ranges
-        );
 
-        // 2. Check constraint transformations exist
-        assert!(loaded_model.config.constraints.contains_key("pgs_main"));
-        assert!(loaded_model.config.constraints.contains_key("PC1"));
+        // 2. Check sum_to_zero_constraints transformations exist for PGS main effect only
+        assert!(loaded_model.config.sum_to_zero_constraints.contains_key("pgs_main"));
 
         // 3. Check coefficient values
         assert_eq!(

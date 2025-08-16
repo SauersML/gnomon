@@ -845,11 +845,16 @@ pub fn update_glm_vectors(
             // This term must NOT include prior weights.
             let dmu_deta = &mu * &(1.0 - &mu);
 
-            // 2. Calculate the full working weights, which DO include prior weights.
-            let weights = &prior_weights * &dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
+            // 2. Create a single, clamped "effective derivative" for consistency.
+            // Use the SAME clamped derivative for both weights and working response
+            let eff_dmu_deta = dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
+            
+            // 3. Calculate the full working weights, which DO include prior weights.
+            let weights = &prior_weights * &eff_dmu_deta;
 
-            // 3. Calculate the working response `z` using dμ/dη in the denominator.
-            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &dmu_deta);
+            // 4. Calculate the working response `z` using the same clamped derivative.
+            // CRITICAL: Use eff_dmu_deta (clamped) for consistency with weights
+            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &eff_dmu_deta);
 
             (mu, weights, z)
         }
@@ -1684,7 +1689,12 @@ pub fn compute_final_penalized_hessian(
         .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
 
-    let tolerance = 1e-12;
+    // Find the maximum eigenvalue to create a relative tolerance
+    let max_eigenval = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+    
+    // Define a relative tolerance. Use an absolute fallback for zero matrices.
+    let tolerance = if max_eigenval > 0.0 { max_eigenval * 1e-12 } else { 1e-12 };
+    
     let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
     let mut e = Array2::zeros((p, rank_s));
@@ -1844,15 +1854,11 @@ mod tests {
                 num_knots: 5,
                 degree: 3,
             },
-            pc_basis_configs: vec![],
+            pc_configs: vec![],
             pgs_range: (-2.0, 2.0),
-            pc_ranges: vec![],
-            pc_names: vec![],
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -2057,7 +2063,7 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
             build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
@@ -2140,15 +2146,11 @@ mod tests {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_basis_configs: vec![],
+            pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
-            pc_ranges: vec![],
-            pc_names: vec![],
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -2264,15 +2266,11 @@ mod tests {
                 num_knots: 5,
                 degree: 3,
             }, // Stable basis
-            pc_basis_configs: vec![], // PGS-only model
+            pc_configs: vec![], // PGS-only model
             pgs_range: (-2.0, 2.0),   // Match the data
-            pc_ranges: vec![],
-            pc_names: vec![],
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
@@ -2392,15 +2390,11 @@ mod tests {
                 num_knots: 5,
                 degree: 3,
             },
-            pc_basis_configs: vec![],
+            pc_configs: vec![],
             pgs_range: (-2.0, 2.0),
-            pc_ranges: vec![],
-            pc_names: vec![],
-            constraints: HashMap::new(),
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
-            interaction_range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
         };
 
