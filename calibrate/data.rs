@@ -91,7 +91,7 @@ pub enum DataError {
 
 /// Loads and validates data specifically for model training.
 pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, DataError> {
-    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true)?;
+    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, true)?;
     // This unwrap is safe because we passed `include_phenotype: true`.
     let y = y_opt.unwrap();
     Ok(TrainingData { y, p, pcs, weights })
@@ -99,7 +99,7 @@ pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, Da
 
 /// Loads and validates data specifically for prediction.
 pub fn load_prediction_data(path: &str, num_pcs: usize) -> Result<PredictionData, DataError> {
-    let (p, pcs, _, _) = internal::load_data(path, num_pcs, false)?;
+    let (p, pcs, _, _) = internal::load_data(path, num_pcs, false, false)?;
     Ok(PredictionData { p, pcs })
 }
 
@@ -115,6 +115,7 @@ mod internal {
         path: &str,
         num_pcs: usize,
         include_phenotype: bool,
+        require_weights: bool,
     ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>, Array1<f64>), DataError> {
         // Small helper: validate that an array contains only finite values
         fn validate_is_finite(arr: &Array1<f64>, column_name: &str) -> Result<(), DataError> {
@@ -302,53 +303,88 @@ mod internal {
         let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
             .expect("PC arrays should have consistent dimensions");
 
-        // Process weights column (now required)
-        if !has_weights {
-            return Err(DataError::WeightsColumnRequired);
-        }
-        
-        let weights_series = df.column("weights")?;
-        if weights_series.null_count() > 0 {
-            return Err(DataError::MissingValuesFound("weights".to_string()));
-        }
+        // Process weights column
+        let weights = if require_weights {
+            if !has_weights {
+                return Err(DataError::WeightsColumnRequired);
+            }
 
-        // Convert to f64
-        let weights_casted = match weights_series.cast(&DataType::Float64) {
-            Ok(casted) => casted,
-            Err(_) => {
+            let weights_series = df.column("weights")?;
+            if weights_series.null_count() > 0 {
+                return Err(DataError::MissingValuesFound("weights".to_string()));
+            }
+
+            // Convert to f64
+            let weights_casted = match weights_series.cast(&DataType::Float64) {
+                Ok(casted) => casted,
+                Err(_) => {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "f64 (numeric)",
+                        found_type: format!("{:?}", weights_series.dtype()),
+                    });
+                }
+            };
+
+            // Check for nulls AFTER casting to detect non-numeric values
+            if weights_casted.null_count() > 0 {
                 return Err(DataError::ColumnWrongType {
                     column_name: "weights".to_string(),
                     expected_type: "f64 (numeric)",
                     found_type: format!("{:?}", weights_series.dtype()),
                 });
             }
-        };
 
-        // Check for nulls AFTER casting to detect non-numeric values
-        if weights_casted.null_count() > 0 {
-            return Err(DataError::ColumnWrongType {
-                column_name: "weights".to_string(),
-                expected_type: "f64 (numeric)",
-                found_type: format!("{:?}", weights_series.dtype()),
-            });
-        }
+            // Convert to ndarray
+            let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            validate_is_finite(&weights_array, "weights")?;
 
-        // Convert to ndarray
-        let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
-        validate_is_finite(&weights_array, "weights")?;
-
-        // Validate that all weights are non-negative
-        for (i, &weight) in weights_array.iter().enumerate() {
-            if weight < 0.0 {
-                return Err(DataError::ColumnWrongType {
-                    column_name: "weights".to_string(),
-                    expected_type: "non-negative f64 values",
-                    found_type: format!("negative value {} at row {}", weight, i + 1),
-                });
+            // Validate that all weights are non-negative
+            for (i, &weight) in weights_array.iter().enumerate() {
+                if weight < 0.0 {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "non-negative f64 values",
+                        found_type: format!("negative value {} at row {}", weight, i + 1),
+                    });
+                }
             }
-        }
 
-        let weights = weights_array;
+            weights_array
+        } else {
+            // If weights are not required and not present, default to 1.0 per row
+            if has_weights {
+                let weights_series = df.column("weights")?;
+                if weights_series.null_count() > 0 {
+                    return Err(DataError::MissingValuesFound("weights".to_string()));
+                }
+
+                let weights_casted = match weights_series.cast(&DataType::Float64) {
+                    Ok(casted) => casted,
+                    Err(_) => {
+                        return Err(DataError::ColumnWrongType {
+                            column_name: "weights".to_string(),
+                            expected_type: "f64 (numeric)",
+                            found_type: format!("{:?}", weights_series.dtype()),
+                        });
+                    }
+                };
+
+                if weights_casted.null_count() > 0 {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "f64 (numeric)",
+                        found_type: format!("{:?}", weights_series.dtype()),
+                    });
+                }
+
+                let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+                validate_is_finite(&weights_array, "weights")?;
+                weights_array
+            } else {
+                Array1::from_elem(pgs.len(), 1.0)
+            }
+        };
 
         println!(
             "Data validation successful: all required columns have numeric data with no missing values."
