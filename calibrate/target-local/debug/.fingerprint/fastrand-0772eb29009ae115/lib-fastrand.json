@@ -1,0 +1,1 @@
+{"rustc":1067337683978236270,"features":"[]","declared_features":"[]","target":8765442898592472698,"profile":15657897354478470176,"path":18379403035629199307,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/fastrand-0772eb29009ae115/dep-lib-fastrand","checksum":false}}],"rustflags":["-C","target-cpu=native"],"config":2069994364910194474,"compile_kind":0}

@@ -1867,6 +1867,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
         };
 
         // --- 3. Run the Fit ---
@@ -2070,7 +2071,7 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
+        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
             build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
@@ -2159,6 +2160,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
         };
 
         // Test with lambda values that match the working test pattern
@@ -2279,6 +2281,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
@@ -2403,6 +2406,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
         };
 
         // === Set up inputs using helper ===

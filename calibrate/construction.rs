@@ -203,7 +203,9 @@ impl ModelLayout {
 }
 
 /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
-/// Returns the design matrix, penalty matrices, model layout, sum-to-zero constraints, knot vectors, range transformations, and interaction centering means.
+/// Returns the design matrix, penalty matrices, model layout, sum-to-zero constraints,
+/// knot vectors, range transformations, interaction centering means, and interaction
+/// orthogonalization maps (Alpha) for pure-interaction construction.
 pub fn build_design_and_penalty_matrices(
     data: &TrainingData,
     config: &ModelConfig,
@@ -216,6 +218,7 @@ pub fn build_design_and_penalty_matrices(
         HashMap<String, Array1<f64>>, // knot_vectors
         HashMap<String, Array2<f64>>, // range_transforms
         HashMap<String, Array1<f64>>, // interaction_centering_means
+        HashMap<String, Array2<f64>>, // interaction_orth_alpha (per interaction block)
     ),
     EstimationError,
 > {
@@ -237,6 +240,7 @@ pub fn build_design_and_penalty_matrices(
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
     let mut interaction_centering_means = HashMap::new();
+    let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
 
     // 1. Generate basis for PGS and apply sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
@@ -515,27 +519,85 @@ pub fn build_design_and_penalty_matrices(
                 )));
             }
 
-            // Center the FINAL tensor product columns (intercept-orthogonality)
-            // 1) compute and store weighted column means (per interaction block)
-            let interaction_key = format!("f(PGS,{})", pc_name);
-            let means = weighted_column_means(&tensor_interaction, &data.weights);
-            interaction_centering_means.insert(interaction_key, means.clone());
+            // Build main-effect matrix M = [Intercept | PGS_main | PC_main_for_this_pc]
+            // Extract intercept
+            let intercept = x_matrix.slice(s![.., layout.intercept_col..layout.intercept_col + 1]).to_owned();
+            // Extract PGS main columns
+            let pgs_main = x_matrix.slice(s![.., layout.pgs_main_cols.clone()]).to_owned();
+            // Extract this PC's main effect columns
+            let pc_block = layout
+                .penalty_map
+                .iter()
+                .find(|block| block.term_type == TermType::PcMainEffect
+                    && block.term_name == format!("f({})", pc_name))
+                .ok_or_else(|| EstimationError::LayoutError(format!(
+                    "Could not locate main-effect block for {} while building interaction orthogonalization",
+                    pc_name
+                )))?;
+            let pc_main = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
 
-            // 2) subtract means in place (same as training)
-            let mut tensor_centered = tensor_interaction.clone();
-            for j in 0..tensor_centered.ncols() {
+            // Stack M columns in the order [Intercept | PGS_main | PC_main]
+            let m_cols: Vec<Array1<f64>> = intercept
+                .axis_iter(Axis(1))
+                .chain(pgs_main.axis_iter(Axis(1)))
+                .chain(pc_main.axis_iter(Axis(1)))
+                .map(|c| c.to_owned())
+                .collect();
+            let m_matrix = ndarray::stack(Axis(1), &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>())
+                .map_err(|_| EstimationError::LayoutError("Failed to assemble interaction M matrix".to_string()))?;
+
+            // Weighted projection: Alpha = (M^T W M)^+ (M^T W T)
+            let w_sqrt = data.weights.mapv(|wi| wi.sqrt());
+            let mw = &m_matrix * &w_sqrt.view().insert_axis(Axis(1));
+            let tw = &tensor_interaction * &w_sqrt.view().insert_axis(Axis(1));
+
+            // Compute Gram matrix and RHS
+            let gram = mw.t().dot(&mw);
+            let rhs = mw.t().dot(&tw);
+
+            // Pseudo-inverse via SVD
+            let (u_opt, s, vt_opt) = gram
+                .svd(true, true)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let (u, vt) = match (u_opt, vt_opt) {
+                (Some(u), Some(vt)) => (u, vt),
+                _ => {
+                    return Err(EstimationError::LayoutError(
+                        "SVD did not return U/VT for interaction orthogonalization".to_string(),
+                    ));
+                }
+            };
+            let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            let tol = smax * 1e-12;
+            // Construct Σ^+ as diagonal with thresholding
+            let mut s_inv = Array2::zeros((s.len(), s.len()));
+            for i in 0..s.len() {
+                if s[i] > tol { s_inv[[i, i]] = 1.0 / s[i]; }
+            }
+            let gram_pinv = vt.t().dot(&s_inv).dot(&u.t());
+            let alpha = gram_pinv.dot(&rhs); // shape: m_cols x t_cols
+
+            // Orthogonalize tensor columns to the space spanned by M
+            let tensor_orth = &tensor_interaction - &m_matrix.dot(&alpha);
+
+            // Now center the orthogonalized tensor columns (intercept-orthogonality) and store means
+            let interaction_key = format!("f(PGS,{})", pc_name);
+            let means = weighted_column_means(&tensor_orth, &data.weights);
+            interaction_centering_means.insert(interaction_key.clone(), means.clone());
+
+            let mut tensor_orth_centered = tensor_orth.clone();
+            for j in 0..tensor_orth_centered.ncols() {
                 let m = means[j];
-                tensor_centered.column_mut(j).mapv_inplace(|v| v - m);
+                tensor_orth_centered.column_mut(j).mapv_inplace(|v| v - m);
             }
 
-            // Assign centered tensor block to design matrix
-            // Note: Full orthogonalization against main effects would create training-prediction mismatch
-            // since it requires row-space projectors that depend on training data and cannot be reproduced
-            // on new data. The current approach (Range×Range interactions + final column centering)
-            // maintains reproducibility while ensuring intercept orthogonality.
+            // Save Alpha for use at prediction time
+            interaction_orth_alpha.insert(interaction_key, alpha);
+
+            // Assign the orthogonalized and centered tensor block to design matrix
             x_matrix
                 .slice_mut(s![.., col_range])
-                .assign(&tensor_centered);
+                .assign(&tensor_orth_centered);
         }
     }
 
@@ -559,6 +621,7 @@ pub fn build_design_and_penalty_matrices(
         knot_vectors,
         range_transforms,
         interaction_centering_means,
+        interaction_orth_alpha,
     ))
 }
 
@@ -1452,6 +1515,7 @@ mod tests {
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
         };
 
         (data, config)
@@ -1531,7 +1595,7 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
@@ -1606,7 +1670,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _) =
+        let (_, _, layout, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
@@ -1632,7 +1696,7 @@ mod tests {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
         // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
-        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means) = 
+        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means, _) = 
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms

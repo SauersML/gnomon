@@ -1,0 +1,1 @@
+{"rustc":1067337683978236270,"features":"[]","declared_features":"[]","target":2950882673546901684,"profile":15657897354478470176,"path":1141416558355646708,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/infer-e4ded63cc50be4d6/dep-lib-infer","checksum":false}}],"rustflags":["-C","target-cpu=native"],"config":2069994364910194474,"compile_kind":0}
