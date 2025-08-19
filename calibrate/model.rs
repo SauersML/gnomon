@@ -315,14 +315,13 @@ mod internal {
         // Start from the unconstrained PGS basis (drop intercept col).
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
 
-        // Require both transform matrices - no fallbacks
+        // Require sum-to-zero constraint for PGS main effect
         let pgs_z = config
             .sum_to_zero_constraints
             .get("pgs_main")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?;
-        let z_range_pgs = config.range_transforms
-            .get("pgs")
-            .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?;
+            
+        // Note: z_range_pgs is still required for interactions later, but not needed for main effects
 
         // Target width must match trained coefficient count
         let pgs_coef_len = coeffs.main_effects.pgs.len();
