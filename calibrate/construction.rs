@@ -1710,8 +1710,8 @@ mod tests {
     fn test_predict_linear_equals_x_beta() {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
-        // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
-        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, pc_null_transforms, interaction_centering_means, _) = 
+        // Capture interaction_orth_alpha from the return tuple
+        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, pc_null_transforms, interaction_centering_means, interaction_orth_alpha) = 
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms
@@ -1721,6 +1721,7 @@ mod tests {
         cfg.range_transforms = range_transforms.clone();
         cfg.pc_null_transforms = pc_null_transforms.clone();
         cfg.interaction_centering_means = interaction_centering_means.clone();
+        cfg.interaction_orth_alpha = interaction_orth_alpha.clone(); // Add the captured map to the configuration
 
         // Construct coefficients in the canonical structure
         use crate::calibrate::model::{MainEffects, MappedCoefficients, TrainedModel};
