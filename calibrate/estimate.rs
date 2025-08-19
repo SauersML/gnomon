@@ -168,7 +168,8 @@ pub fn train_model(
     let mut seed_candidates = Vec::new();
 
     // Symmetric base seeds
-    let base_values: &[f64] = &[8.0, 4.0, 2.0, 0.0, -2.0];
+    // Include genuinely small-λ seeds to encourage exploration away from heavy smoothing
+    let base_values: &[f64] = &[8.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0];
     for &val in base_values {
         seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
     }
@@ -336,7 +337,6 @@ pub fn train_model(
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
             // Check if the optimizer made ANY progress from the start.
             if last_solution.final_value >= initial_cost {
-                // Treat as a warning and proceed with the last (initial) solution.
                 eprintln!(
                     "\n[WARNING] BFGS line search failed to make any progress from the initial point."
                 );
@@ -344,7 +344,51 @@ pub fn train_model(
                     "Initial Cost: {:.4}, Final Cost: {:.4}",
                     initial_cost, last_solution.final_value
                 );
-                *last_solution
+
+                // Small-λ restart: try a low-smoothing seed to escape the heavy-smoothing wall
+                eprintln!(
+                    "[INFO] Attempting a small-λ restart from rho = -4 for all penalties..."
+                );
+                let small_rho = Array1::from_elem(layout.num_penalties, -4.0);
+                let alt_start_z = to_z_from_rho(&small_rho);
+                let alt_bfgs = Bfgs::new(alt_start_z, |z| reml_state.cost_and_grad(z))
+                    .with_tolerance(config.reml_convergence_tolerance)
+                    .with_max_iterations(config.reml_max_iterations as usize)
+                    .run();
+
+                match alt_bfgs {
+                    Ok(alt_solution) => {
+                        eprintln!(
+                            "[INFO] Small-λ restart finished. Choosing the better of two solutions."
+                        );
+                        let fv0 = last_solution.final_value;
+                        let fv1 = alt_solution.final_value;
+                        // Prefer lower cost; if effectively tied, prefer the small-λ solution to avoid EDF≈0 fits
+                        let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
+                        if fv1 < fv0 || rel_diff < 1e-6 {
+                            alt_solution
+                        } else {
+                            *last_solution
+                        }
+                    }
+                    Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution: alt_last, .. }) => {
+                        eprintln!(
+                            "[INFO] Small-λ restart also hit line search failure. Comparing best-so-far solutions."
+                        );
+                        let fv0 = last_solution.final_value;
+                        let fv1 = alt_last.final_value;
+                        let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
+                        if fv1 < fv0 || rel_diff < 1e-6 {
+                            *alt_last
+                        } else {
+                            *last_solution
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("[INFO] Small-λ restart failed. Proceeding with the initial solution.");
+                        *last_solution
+                    }
+                }
             } else {
                 eprintln!(
                     "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
