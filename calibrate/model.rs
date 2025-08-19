@@ -326,26 +326,27 @@ mod internal {
 
         // Target width must match trained coefficient count
         let pgs_coef_len = coeffs.main_effects.pgs.len();
+        
+        // CRITICAL: For PGS main effect, we use ONLY the sum-to-zero constraint transform.
+        // The range transform (z_range_pgs) is used ONLY for interaction terms.
 
-        // Check shapes: B_unc (N x m), Z_range (m x r), Z (r x c)
+        // Check shapes: B_unc (N x m), Z (m x c)
         let m = pgs_main_basis_unc.ncols();
-        let r = z_range_pgs.ncols();
         let c = pgs_z.ncols();
 
         // Verify dimensions match before matrix multiplication
-        if m != z_range_pgs.nrows() || r != pgs_z.nrows() || c != pgs_coef_len {
+        if m != pgs_z.nrows() || c != pgs_coef_len {
             return Err(ModelError::DimensionMismatch(format!(
-                "PGS basis transform dimensions mismatch: B_unc {}×{}, Z_range {}×{}, Z {}×{}, coefs {}",
+                "PGS basis transform dimensions mismatch: B_unc {}×{}, Z {}×{}, coefs {}",
                 pgs_main_basis_unc.nrows(), m,
-                z_range_pgs.nrows(), r,
                 pgs_z.nrows(), c,
                 pgs_coef_len
             )));
         }
 
-        // Apply full transform: whiten then constrain
-        let pgs_whitened = pgs_main_basis_unc.dot(z_range_pgs);
-        let pgs_main_basis = pgs_whitened.dot(pgs_z);
+        // Apply ONLY the sum-to-zero constraint to PGS main effect basis
+        // This matches the training behavior in construction.rs
+        let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z);
 
         // CRITICAL: The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
         // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
