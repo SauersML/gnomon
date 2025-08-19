@@ -391,6 +391,12 @@ mod internal {
     /// Evaluates all B-spline basis functions at a single point `x`.
     /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
     /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
+    ///
+    /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Robust Geometric
+    /// Clamping (RGC) provides geometric projection. This function must honor the
+    /// provided `x` value. For out-of-domain `x`, we select the boundary span so the
+    /// basis evaluates consistently (yielding zeros except at boundaries), without
+    /// altering `x` itself.
     pub(super) fn evaluate_splines_at_point(
         x: f64,
         degree: usize,
@@ -399,27 +405,30 @@ mod internal {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
 
-        // Clamp x to the valid domain defined by the knots.
-        // The valid domain for a spline of degree `d` is between knot `t_d` and `t_{n+1}`
-        // where n is the number of basis functions.
-        let x_clamped = x.clamp(knots[degree], knots[num_basis]);
+        // Select the knot span `mu` as if x were in-domain, but without changing x.
+        // For x above the upper boundary, use the last valid span. For x below the
+        // lower boundary, use the first valid span. Otherwise, find the span normally.
+        let x_eval = x;
 
         // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
         // This search is robust and correctly handles the half-open interval convention
         // and the special case for the upper boundary.
         let mu = {
             // Special case for the upper boundary, where the interval is closed.
-            if x_clamped >= knots[num_basis] {
+            if x_eval >= knots[num_basis] {
                 // If x is at or beyond the last knot of the spline's support,
                 // it belongs to the last valid span. num_basis = (num_knots - degree - 1)
                 num_basis - 1
+            } else if x_eval < knots[degree] {
+                // Below the lower boundary: choose the first valid span
+                degree
             } else {
                 // Search for the span in the relevant part of the knot vector.
                 // Can be optimized with binary search, but linear is fine and robust.
                 // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
                 // The `>=` is crucial for correctly handling the half-open interval definition when x falls exactly on a knot.
                 let mut span = degree;
-                while span < num_basis && x_clamped >= knots[span + 1] {
+                while span < num_basis && x_eval >= knots[span + 1] {
                     span += 1;
                 }
                 span
@@ -437,8 +446,8 @@ mod internal {
 
         // Iteratively compute values for higher degrees (d=1 to degree)
         for d in 1..=degree {
-            left[d] = x_clamped - knots[mu + 1 - d];
-            right[d] = knots[mu + d] - x_clamped;
+            left[d] = x_eval - knots[mu + 1 - d];
+            right[d] = knots[mu + d] - x_eval;
 
             let mut saved = 0.0;
 

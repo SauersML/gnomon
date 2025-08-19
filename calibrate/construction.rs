@@ -670,6 +670,23 @@ pub fn build_design_and_penalty_matrices(
             n_coeffs,
             n_samples
         );
+        
+        // FIX: Add an early check for severe ill-conditioning in the design matrix
+        log::warn!("Checking condition number of design matrix X due to over-parameterization.");
+        match calculate_condition_number(&x_matrix) {
+            Ok(cond) if cond > 1e9 => { // Lower threshold to catch severe problems earlier
+                log::error!("Design matrix is severely ill-conditioned (condition number > 1e9). Aborting.");
+                return Err(EstimationError::ModelIsIllConditioned { condition_number: cond });
+            }
+            Ok(cond) => {
+                log::warn!("Condition number is high ({:.2e}) but proceeding, relying on penalties for regularization.", cond);
+            }
+            Err(_) => {
+                // SVD failing is a definitive sign of a problem.
+                log::error!("SVD failed during condition number check. Aborting.");
+                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+            }
+        }
     }
 
     Ok((
@@ -1804,6 +1821,7 @@ mod tests {
             config: cfg,
             coefficients: coeffs.clone(),
             lambdas: vec![], // not used at prediction
+            hull: None,
         };
 
         // Compute predictions via predict_linear() (which rebuilds X_new internally)

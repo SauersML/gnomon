@@ -31,6 +31,7 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
+use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
@@ -597,10 +598,30 @@ pub fn train_model(
     config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
     config_with_constraints.pc_null_transforms = pc_null_transforms;
 
+    // Build Robust Geometric Clamping hull from training predictors
+    let hull_opt = {
+        let n = data.p.len();
+        let d = 1 + config.pc_configs.len();
+        let mut x_raw = ndarray::Array2::zeros((n, d));
+        x_raw.column_mut(0).assign(&data.p);
+        if d > 1 {
+            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+        }
+        match build_peeled_hull(&x_raw, 3) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                println!("RGC hull construction skipped: {}", e);
+                None
+            }
+        }
+    };
+
     Ok(TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
+        hull: hull_opt,
     })
 }
 

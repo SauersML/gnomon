@@ -1,4 +1,5 @@
 use crate::calibrate::basis::{self};
+use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
@@ -114,6 +115,9 @@ pub struct TrainedModel {
     pub coefficients: MappedCoefficients,
     /// Estimated smoothing parameters from REML
     pub lambdas: Vec<f64>,
+    /// Robust geometric clamping hull (optional for backwards compatibility)
+    #[serde(default)]
+    pub hull: Option<PeeledHull>,
 }
 
 /// Custom error type for model loading, saving, and prediction.
@@ -172,9 +176,27 @@ impl TrainedModel {
             });
         }
 
-        // --- 2. Reconstruct Mathematical Objects ---
-        let x_new =
-            internal::construct_design_matrix(p_new, pcs_new, &self.config, &self.coefficients)?;
+        // --- 2. Robust Geometric Clamping (if hull available) ---
+        // Assemble raw predictors, optionally project, and split back
+        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+        let (x_corr, num_projected) = if let Some(hull) = &self.hull {
+            hull.project_if_needed(raw.view())
+        } else {
+            (raw, 0)
+        };
+        if x_corr.nrows() > 0 && num_projected > 0 {
+            let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
+            println!(
+                "[RGC] Projected {} of {} points ({:.1}%).",
+                num_projected,
+                x_corr.nrows(),
+                rate
+            );
+        }
+        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+
+        // --- 3. Reconstruct Mathematical Objects ---
+        let x_new = internal::construct_design_matrix(p_corr.view(), pcs_corr.view(), &self.config, &self.coefficients)?;
         let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         // This is a critical safety check. It ensures that the number of columns in the
@@ -185,10 +207,10 @@ impl TrainedModel {
             return Err(ModelError::InternalStackingError);
         }
 
-        // --- 3. Compute Linear Predictor ---
+        // --- 4. Compute Linear Predictor ---
         let eta = x_new.dot(&flattened_coeffs);
 
-        // --- 4. Apply Inverse Link Function ---
+        // --- 5. Apply Inverse Link Function ---
         let predictions = match self.config.link_function {
             LinkFunction::Logit => {
                 // Clamp eta to prevent numerical overflow in exp(), just like in pirls.rs
@@ -223,8 +245,25 @@ impl TrainedModel {
             });
         }
 
-        let x_new =
-            internal::construct_design_matrix(p_new, pcs_new, &self.config, &self.coefficients)?;
+        // Assemble raw predictors, optionally project, and split back
+        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+        let (x_corr, num_projected) = if let Some(hull) = &self.hull {
+            hull.project_if_needed(raw.view())
+        } else {
+            (raw, 0)
+        };
+        if x_corr.nrows() > 0 && num_projected > 0 {
+            let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
+            println!(
+                "[RGC] Projected {} of {} points ({:.1}%).",
+                num_projected,
+                x_corr.nrows(),
+                rate
+            );
+        }
+        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+
+        let x_new = internal::construct_design_matrix(p_corr.view(), pcs_corr.view(), &self.config, &self.coefficients)?;
         let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         if x_new.ncols() != flattened_coeffs.len() {
@@ -253,6 +292,40 @@ impl TrainedModel {
 /// Internal module for prediction-specific implementation details.
 mod internal {
     use super::*;
+    // no extra imports
+
+    /// Assemble raw predictors into an n x d matrix [PGS | PC1 | PC2 | ...]
+    pub(super) fn assemble_raw_from_p_and_pcs(
+        p: ArrayView1<f64>,
+        pcs: ArrayView2<f64>,
+    ) -> Array2<f64> {
+        let n = p.len();
+        let d = 1 + pcs.ncols();
+        let mut x = Array2::zeros((n, d));
+        // first column is p
+        x.column_mut(0).assign(&p);
+        // remaining are pcs
+        if pcs.ncols() > 0 {
+            x.slice_mut(s![.., 1..]).assign(&pcs);
+        }
+        x
+    }
+
+    /// Split raw matrix [PGS | PCs...] into (p, pcs)
+    pub(super) fn split_p_and_pcs_from_raw(x: ArrayView2<f64>) -> (Array1<f64>, Array2<f64>) {
+        let n = x.nrows();
+        let d = x.ncols();
+        let mut p = Array1::zeros(n);
+        p.assign(&x.column(0));
+        let pcs = if d > 1 {
+            x.slice(s![.., 1..]).to_owned()
+        } else {
+            Array2::zeros((n, 0))
+        };
+        (p, pcs)
+    }
+
+    // (projection helper removed; call hull.project_if_needed directly)
 
     /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
     /// This creates the design matrix columns for tensor product interactions.
@@ -628,6 +701,7 @@ mod tests {
                 interaction_effects: HashMap::new(),
             },
             lambdas: vec![],
+            hull: None,
         };
 
         // --- Define Test Points ---
@@ -703,6 +777,7 @@ mod tests {
                 interaction_effects: HashMap::new(),
             },
             lambdas: vec![],
+            hull: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -974,6 +1049,7 @@ mod tests {
                 },
             },
             lambdas: vec![0.1, 0.2], // Match layout.num_penalties: 1 PC main + 1 interaction penalty
+            hull: None,
         };
 
         // Create a temporary file for testing
