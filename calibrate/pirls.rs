@@ -51,6 +51,9 @@ pub struct PirlsResult {
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
 
+    // Effective degrees of freedom at the solution
+    pub edf: f64,
+
     // The penalty term, calculated stably within P-IRLS
     // This is beta_transformed' * S_transformed * beta_transformed
     pub stable_penalty_term: f64,
@@ -393,6 +396,9 @@ pub fn fit_model_for_fixed_rho(
                 penalized_hessian_transformed,
                 stabilized_hessian_transformed,
                 deviance: last_deviance,
+                edf: if let Some((ref result, _)) = last_stable_result {
+                    result.edf
+                } else { 0.0 },
                 stable_penalty_term,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
@@ -511,6 +517,7 @@ pub fn fit_model_for_fixed_rho(
                     penalized_hessian_transformed,
                     stabilized_hessian_transformed,
                     deviance: last_deviance,
+                    edf: edf_from_solver,
                     stable_penalty_term,
                     final_weights: weights,
                     status: PirlsStatus::Converged,
@@ -566,6 +573,7 @@ pub fn fit_model_for_fixed_rho(
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
         deviance: last_deviance,
+        edf: if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 },
         stable_penalty_term,
         final_weights: weights,
         status: PirlsStatus::MaxIterationsReached,

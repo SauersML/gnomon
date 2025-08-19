@@ -480,7 +480,7 @@ pub fn train_model(
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
-    let final_fit = pirls::fit_model_for_fixed_rho(
+    let mut final_fit = pirls::fit_model_for_fixed_rho(
         final_rho_clamped.view(),
         reml_state.x(), // Use original X
         reml_state.y(),
@@ -489,6 +489,39 @@ pub fn train_model(
         &layout,
         config,
     )?;
+
+    // Fallback to avoid degenerate EDF≈0 solutions for Logit: if EDF is tiny, try a small-λ direct fit
+    if matches!(config.link_function, LinkFunction::Logit) && final_fit.edf < 1.0 {
+        eprintln!(
+            "[INFO] Final fit has EDF ≈ {:.2}. Trying small-λ fallback (rho=-4) to avoid flat solutions...",
+            final_fit.edf
+        );
+        let small_rho = Array1::from_elem(layout.num_penalties, -4.0);
+        if let Ok(alt_fit) = pirls::fit_model_for_fixed_rho(
+            small_rho.view(),
+            reml_state.x(),
+            reml_state.y(),
+            reml_state.weights(),
+            reml_state.rs_list_ref(),
+            &layout,
+            config,
+        ) {
+            // Prefer alternative if it achieves meaningful flexibility and comparable or better deviance
+            let dev_improves = alt_fit.deviance <= final_fit.deviance * 1.02;
+            if alt_fit.edf >= 1.0 && dev_improves {
+                eprintln!(
+                    "[INFO] Adopting small-λ fallback: edf {:.2} (vs {:.2}), deviance {:.4} (vs {:.4})",
+                    alt_fit.edf, final_fit.edf, alt_fit.deviance, final_fit.deviance
+                );
+                final_fit = alt_fit;
+            } else {
+                eprintln!(
+                    "[INFO] Keeping original fit: alt edf {:.2}, alt dev {:.4}, orig edf {:.2}, orig dev {:.4}",
+                    alt_fit.edf, alt_fit.deviance, final_fit.edf, final_fit.deviance
+                );
+            }
+        }
+    }
 
     // Transform the final, optimal coefficients from the stable basis
     // back to the original, interpretable basis.
