@@ -242,6 +242,37 @@ pub fn build_design_and_penalty_matrices(
     ),
     EstimationError,
 > {
+    // PRE-EMPTIVE CHECK: Calculate the potential number of coefficients BEFORE building any matrices
+    let n_samples = data.y.len();
+    
+    // Calculate coefficients for each term based on the config
+    let pgs_basis_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1;
+    let intercept_coeffs = 1;
+    let pgs_main_coeffs = pgs_basis_coeffs - 1;
+    
+    let mut pc_main_coeffs = 0;
+    let mut interaction_coeffs = 0;
+    for pc_config in &config.pc_configs {
+        let pc_basis_coeffs = pc_config.basis_config.num_knots + pc_config.basis_config.degree + 1;
+        pc_main_coeffs += pc_basis_coeffs - 1;
+        interaction_coeffs += (pgs_basis_coeffs - 1) * (pc_basis_coeffs - 1);
+    }
+    
+    let num_coeffs = intercept_coeffs + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
+    
+    if num_coeffs > n_samples {
+        // FAIL FAST before any expensive calculations
+        log::error!("Model is severely over-parameterized: {} coefficients for {} samples", num_coeffs, n_samples);
+        return Err(EstimationError::ModelOverparameterized {
+            num_coeffs,
+            num_samples: n_samples,
+            intercept_coeffs,
+            pgs_main_coeffs,
+            pc_main_coeffs,
+            interaction_coeffs,
+        });
+    }
+    
     // Validate PC configuration against available data
     if config.pc_configs.len() > data.pcs.ncols() {
         let pc_names: Vec<String> = config.pc_configs.iter().map(|pc| pc.name.clone()).collect();
@@ -660,29 +691,25 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
-    // Warning for over-parameterization (but continue - penalized regression handles p > n)
+    // Verify the final number of coefficients matches our pre-check estimate
     let n_samples = data.y.len();
     let n_coeffs = x_matrix.ncols();
     if n_coeffs > n_samples {
         log::warn!(
             "Model is over-parameterized: {} coefficients for {} samples. \
-             Relying on penalties and stable reparameterization to handle p > n.",
+             This should have been caught by the pre-emptive check.",
             n_coeffs,
             n_samples
         );
-        
-        // FIX: Add an early check for severe ill-conditioning in the design matrix
-        log::warn!("Checking condition number of design matrix X due to over-parameterization.");
+        // Keep a lightweight condition number check as a backstop
+        // This should rarely be reached due to the pre-emptive check
         match calculate_condition_number(&x_matrix) {
-            Ok(cond) if cond > 1e9 => { // Lower threshold to catch severe problems earlier
+            Ok(cond) if cond > 1e9 => {
                 log::error!("Design matrix is severely ill-conditioned (condition number > 1e9). Aborting.");
                 return Err(EstimationError::ModelIsIllConditioned { condition_number: cond });
             }
-            Ok(cond) => {
-                log::warn!("Condition number is high ({:.2e}) but proceeding, relying on penalties for regularization.", cond);
-            }
+            Ok(_) => {},
             Err(_) => {
-                // SVD failing is a definitive sign of a problem.
                 log::error!("SVD failed during condition number check. Aborting.");
                 return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
             }
