@@ -202,7 +202,24 @@ pub fn train_model(
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
 
+    // --- START MODIFICATION ---
+    // Add a check to only run the gradient check once, e.g., using a static flag.
+    // This prevents it from running every time train_model is called in a larger program.
+    use std::sync::Once;
+    static GRADIENT_CHECK_ONCE: Once = Once::new();
+    // --- END MODIFICATION ---
+
     for (i, seed) in seed_candidates.iter().enumerate() {
+
+        // --- START MODIFICATION ---
+        // Perform the gradient check for selected seeds.
+        // The `call_once` ensures this diagnostic only runs the first time train_model is executed.
+        GRADIENT_CHECK_ONCE.call_once(|| {
+            if [1, 4, 7].contains(&i) && i < seed_candidates.len() {
+                 check_gradient_for_seed(&reml_state, seed, i);
+            }
+        });
+        // --- END MODIFICATION ---
         let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
                 eprintln!(
@@ -346,49 +363,103 @@ pub fn train_model(
                     initial_cost, last_solution.final_value
                 );
 
-                // Small-λ restart: try a low-smoothing seed to escape the heavy-smoothing wall
-                eprintln!(
-                    "[INFO] Attempting a small-λ restart from rho = -4 for all penalties..."
-                );
-                let small_rho = Array1::from_elem(layout.num_penalties, -4.0);
-                let alt_start_z = to_z_from_rho(&small_rho);
-                let alt_bfgs = Bfgs::new(alt_start_z, |z| reml_state.cost_and_grad(z))
-                    .with_tolerance(config.reml_convergence_tolerance)
-                    .with_max_iterations(config.reml_max_iterations as usize)
-                    .run();
+                // Small-λ restarts: try several asymmetric seeds to escape symmetry traps
+                eprintln!("[INFO] Attempting small-λ asymmetric restarts...");
 
-                match alt_bfgs {
-                    Ok(alt_solution) => {
-                        eprintln!(
-                            "[INFO] Small-λ restart finished. Choosing the better of two solutions."
-                        );
-                        let fv0 = last_solution.final_value;
-                        let fv1 = alt_solution.final_value;
-                        // Prefer lower cost; if effectively tied, prefer the small-λ solution to avoid EDF≈0 fits
-                        let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
-                        if fv1 < fv0 || rel_diff < 1e-6 {
-                            alt_solution
-                        } else {
-                            *last_solution
-                        }
+                // Build deterministic asymmetric restart seeds in rho-space
+                let mut restart_rhos: Vec<Array1<f64>> = Vec::new();
+                // Always include the symmetric -4 baseline to match previous behavior
+                restart_rhos.push(Array1::from_elem(layout.num_penalties, -4.0));
+                // If there are at least 2 penalties, add a few asymmetric patterns
+                if layout.num_penalties >= 2 {
+                    // Pattern A: [-4, -6, -4, -6, ...]
+                    let mut a = Array1::zeros(layout.num_penalties);
+                    for i in 0..layout.num_penalties {
+                        a[i] = if i % 2 == 0 { -4.0 } else { -6.0 };
                     }
-                    Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution: alt_last, .. }) => {
-                        eprintln!(
-                            "[INFO] Small-λ restart also hit line search failure. Comparing best-so-far solutions."
-                        );
-                        let fv0 = last_solution.final_value;
-                        let fv1 = alt_last.final_value;
-                        let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
-                        if fv1 < fv0 || rel_diff < 1e-6 {
-                            *alt_last
-                        } else {
-                            *last_solution
-                        }
+                    restart_rhos.push(a);
+
+                    // Pattern B: [-2, -4, -2, -4, ...]
+                    let mut b = Array1::zeros(layout.num_penalties);
+                    for i in 0..layout.num_penalties {
+                        b[i] = if i % 2 == 0 { -2.0 } else { -4.0 };
                     }
-                    Err(_) => {
-                        eprintln!("[INFO] Small-λ restart failed. Proceeding with the initial solution.");
+                    restart_rhos.push(b);
+
+                    // Pattern C: a single heavier push along first coordinate
+                    let mut c = Array1::from_elem(layout.num_penalties, -4.0);
+                    c[0] = -8.0;
+                    restart_rhos.push(c);
+                }
+
+                // Evaluate each restart with a short BFGS run and require small gradient norm
+                let short_iters = (config.reml_max_iterations as usize).min(50).max(10);
+                let mut best_alt: Option<BfgsSolution> = None;
+                let mut best_alt_grad_norm: f64 = f64::INFINITY;
+                let mut best_alt_value: f64 = f64::INFINITY;
+
+                for (idx, rho_seed) in restart_rhos.iter().enumerate() {
+                    let start_z = to_z_from_rho(rho_seed);
+                    eprintln!("  - Restart #{idx}: rho seed = {:?}", rho_seed);
+                    let run = Bfgs::new(start_z, |z| reml_state.cost_and_grad(z))
+                        .with_tolerance(config.reml_convergence_tolerance)
+                        .with_max_iterations(short_iters)
+                        .run();
+
+                    let candidate = match run {
+                        Ok(sol) => sol,
+                        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution: ls, .. }) => {
+                            *ls
+                        }
+                        Err(_) => continue,
+                    };
+
+                    // Compute gradient norm at candidate's rho to ensure near-stationarity
+                    let rho_cand = candidate.final_point.mapv(|v| 15.0 * v.tanh());
+                    let grad_norm = match reml_state.compute_gradient(&rho_cand) {
+                        Ok(g) => g.dot(&g).sqrt(),
+                        Err(_) => f64::INFINITY,
+                    };
+
+                    eprintln!(
+                        "    -> cand value = {:.6}, grad_norm = {:.3e}",
+                        candidate.final_value, grad_norm
+                    );
+
+                    // Track best candidate by value, with gradient-norm tie-breaker
+                    if candidate.final_value < best_alt_value
+                        || (candidate.final_value - best_alt_value).abs() <= 1e-9
+                            && grad_norm < best_alt_grad_norm
+                    {
+                        best_alt_value = candidate.final_value;
+                        best_alt_grad_norm = grad_norm;
+                        best_alt = Some(candidate);
+                    }
+                }
+
+                // Acceptance rule: require not only lower cost but also reasonably small gradient
+                // Use a moderate threshold — we’re escaping a flat valley but still want near-stationarity
+                const GRAD_NORM_ACCEPT: f64 = 1e3;
+                if let Some(alt) = best_alt {
+                    let fv0 = last_solution.final_value;
+                    let fv1 = alt.final_value;
+                    let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
+                    if (fv1 < fv0 || rel_diff < 1e-6) && best_alt_grad_norm <= GRAD_NORM_ACCEPT {
+                        eprintln!(
+                            "[INFO] Accepting asymmetric restart (Δcost={:.3e}, grad_norm={:.2e}).",
+                            fv0 - fv1,
+                            best_alt_grad_norm
+                        );
+                        alt
+                    } else {
+                        eprintln!(
+                            "[INFO] Rejecting restarts (insufficient improvement or large gradient). Keeping original."
+                        );
                         *last_solution
                     }
+                } else {
+                    eprintln!("[INFO] All restarts failed. Proceeding with the initial solution.");
+                    *last_solution
                 }
             } else {
                 eprintln!(
@@ -513,6 +584,83 @@ pub fn train_model(
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
     })
+}
+
+// ADD THIS HELPER FUNCTION
+/// Computes the gradient of the LAML cost function using the central finite-difference method.
+fn compute_fd_gradient(
+    reml_state: &internal::RemlState,
+    rho: &Array1<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    let epsilon = 1e-7;
+    let mut fd_grad = Array1::zeros(rho.len());
+
+    for i in 0..rho.len() {
+        let mut rho_plus = rho.clone();
+        rho_plus[i] += epsilon / 2.0;
+
+        let mut rho_minus = rho.clone();
+        rho_minus[i] -= epsilon / 2.0;
+
+        // compute_cost returns the value to be *minimized* (-LAML), which is what we need.
+        let cost_plus = reml_state.compute_cost(&rho_plus)?;
+        let cost_minus = reml_state.compute_cost(&rho_minus)?;
+
+        fd_grad[i] = (cost_plus - cost_minus) / epsilon;
+    }
+
+    Ok(fd_grad)
+}
+
+// ADD THIS HELPER FUNCTION
+/// Computes and prints the cosine similarity between the analytical and finite-difference gradients.
+fn check_gradient_for_seed(
+    reml_state: &internal::RemlState,
+    rho: &Array1<f64>,
+    seed_index: usize,
+) {
+    println!("\n--- Gradient Check for Seed #{} ---", seed_index);
+    println!("  ρ = {:?}", rho.to_vec());
+
+    // 1. Get the analytical gradient
+    let g_analytic = match reml_state.compute_gradient(rho) {
+        Ok(grad) => grad,
+        Err(e) => {
+            println!("  ERROR: Failed to compute analytical gradient: {:?}", e);
+            return;
+        }
+    };
+
+    // 2. Get the finite-difference gradient
+    let g_fd = match compute_fd_gradient(reml_state, rho) {
+        Ok(grad) => grad,
+        Err(e) => {
+            println!("  ERROR: Failed to compute finite-difference gradient: {:?}", e);
+            return;
+        }
+    };
+
+    // 3. Compute cosine similarity
+    let dot_product = g_analytic.dot(&g_fd);
+    let norm_analytic = g_analytic.dot(&g_analytic).sqrt();
+    let norm_fd = g_fd.dot(&g_fd).sqrt();
+
+    let cosine_similarity = if norm_analytic * norm_fd > 1e-12 {
+        dot_product / (norm_analytic * norm_fd)
+    } else {
+        // Handle cases where one or both gradients are zero
+        if norm_analytic < 1e-12 && norm_fd < 1e-12 {
+            1.0 // Both zero, perfectly aligned
+        } else {
+            0.0 // One is zero, the other isn't; orthogonal
+        }
+    };
+
+    // 4. Print the results
+    println!("  Analytical Gradient : {:?}", g_analytic.to_vec());
+    println!("  Finite Diff Gradient: {:?}", g_fd.to_vec());
+    println!("  Cosine Similarity   : {:.8}", cosine_similarity);
+    println!("-------------------------------------\n");
 }
 
 /// Helper to log the final model structure.
@@ -1001,26 +1149,11 @@ pub mod internal {
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
                     let phi = 1.0; // Logit family typically has dispersion parameter = 1
 
-                    // Compute null space dimension using original penalty matrices
-                    // Sum all the penalty matrices weighted by lambda
-                    let mut s_lambda_original =
-                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
-                    for k in 0..lambdas.len() {
-                        let s_k = self.rs_list[k].t().dot(&self.rs_list[k]);
-                        s_lambda_original.scaled_add(lambdas[k], &s_k);
-                    }
-
-                    // Determine numerical rank of S_λ using a relative tolerance
-                    // tol = max_sv * 1e-12 (with absolute fallback for zero matrices)
-                    let rank = match s_lambda_original.svd(false, false) {
-                        Ok((_, svals, _)) => {
-                            let max_sv = svals.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                            let tol = if max_sv > 0.0 { max_sv * 1e-12 } else { 1e-12 };
-                            svals.iter().filter(|&&sv| sv > tol).count()
-                        }
-                        Err(_) => self.layout.total_coeffs, // fallback to full rank
-                    };
-                    let mp = (self.layout.total_coeffs - rank) as f64;
+                    // Compute null space dimension using the TRANSFORMED, STABLE basis
+                    // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
+                    // to determine M_p robustly, avoiding contamination from dominant penalties.
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
