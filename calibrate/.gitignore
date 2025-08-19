@@ -1,0 +1,2 @@
+# Ignore local build artifacts
+calibrate/target-local/
