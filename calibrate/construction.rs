@@ -91,6 +91,8 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 pub struct ModelLayout {
     pub intercept_col: usize,
     pub pgs_main_cols: Range<usize>,
+    /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
+    pub pc_null_cols: Vec<Range<usize>>,  
     pub penalty_map: Vec<PenalizedBlock>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
@@ -122,7 +124,8 @@ impl ModelLayout {
     /// Enforces strict dimensional consistency across the entire GAM system.
     pub fn new(
         config: &ModelConfig,
-        pc_constrained_basis_ncols: &[usize],
+        pc_null_basis_ncols: &[usize],
+        pc_range_basis_ncols: &[usize],
         pgs_main_basis_ncols: usize,
         pc_unconstrained_basis_ncols: &[usize],
         num_pgs_interaction_bases: usize,
@@ -130,11 +133,16 @@ impl ModelLayout {
         let mut penalty_map = Vec::new();
         let mut current_col = 0;
         let mut penalty_idx_counter = 0;
+        let mut pc_null_cols: Vec<Range<usize>> = Vec::with_capacity(config.pc_configs.len());
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
         let p_pgs_main = pgs_main_basis_ncols;
-        let p_pc_main: usize = pc_constrained_basis_ncols.iter().sum();
+        let p_pc_main: usize = pc_null_basis_ncols
+            .iter()
+            .zip(pc_range_basis_ncols.iter())
+            .map(|(n_null, n_range)| n_null + n_range)
+            .sum();
         // For tensor product interactions: each PC gets num_pgs_bases * num_pc_bases coefficients
         // Use unconstrained dimensions for interaction calculations
         let p_interactions: usize = pc_unconstrained_basis_ncols
@@ -146,16 +154,26 @@ impl ModelLayout {
         let intercept_col = current_col;
         current_col += 1;
 
-        // Main effect for each PC (each gets its own unique penalty index)
-        for (i, &num_basis) in pc_constrained_basis_ncols.iter().enumerate() {
-            let range = current_col..current_col + num_basis;
+        // Main effect for each PC (first reserve null/unpenalized, then range/penalized)
+        for (i, (&n_null, &n_range)) in pc_null_basis_ncols
+            .iter()
+            .zip(pc_range_basis_ncols.iter())
+            .enumerate()
+        {
+            // Null-space (unpenalized)
+            let null_range = current_col..current_col + n_null;
+            pc_null_cols.push(null_range.clone());
+            current_col += n_null;
+
+            // Range-space (penalized)
+            let range = current_col..current_col + n_range;
             penalty_map.push(PenalizedBlock {
                 term_name: format!("f({})", config.pc_configs[i].name),
                 col_range: range.clone(),
                 penalty_indices: vec![penalty_idx_counter], // Each PC main gets unique penalty index
                 term_type: TermType::PcMainEffect,
             });
-            current_col += num_basis;
+            current_col += n_range;
             penalty_idx_counter += 1; // Increment for next penalty
         }
 
@@ -195,6 +213,7 @@ impl ModelLayout {
         Ok(ModelLayout {
             intercept_col,
             pgs_main_cols,
+            pc_null_cols,
             penalty_map,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
@@ -217,6 +236,7 @@ pub fn build_design_and_penalty_matrices(
         HashMap<String, Array2<f64>>, // sum_to_zero_constraints
         HashMap<String, Array1<f64>>, // knot_vectors
         HashMap<String, Array2<f64>>, // range_transforms
+        HashMap<String, Array2<f64>>, // pc_null_transforms
         HashMap<String, Array1<f64>>, // interaction_centering_means
         HashMap<String, Array2<f64>>, // interaction_orth_alpha (per interaction block)
     ),
@@ -239,6 +259,7 @@ pub fn build_design_and_penalty_matrices(
     let mut sum_to_zero_constraints = HashMap::new();
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
+    let mut pc_null_transforms: HashMap<String, Array2<f64>> = HashMap::new();
     let mut interaction_centering_means = HashMap::new();
     let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
 
@@ -290,6 +311,7 @@ pub fn build_design_and_penalty_matrices(
 
     // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases = Vec::new();
+    let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::new();
     let mut pc_unconstrained_bases_main = Vec::new();
 
     // Check if we have any PCs to process
@@ -337,11 +359,20 @@ pub fn build_design_and_penalty_matrices(
         // Create whitened range transform for PC main effects
         let s_pc_main =
             create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (_, z_range_pc) = basis::null_range_whiten(&s_pc_main)?;
+        let (z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_main)?;
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
         pc_range_bases.push(pc_range_basis);
+
+        // Build null-space (if any)
+        if z_null_pc.ncols() > 0 {
+            let pc_null_basis = pc_main_basis_unc.dot(&z_null_pc);
+            pc_null_bases.push(Some(pc_null_basis));
+            pc_null_transforms.insert(pc_name.clone(), z_null_pc);
+        } else {
+            pc_null_bases.push(None);
+        }
 
         // Store PC range transformation for interactions and main effects
         range_transforms.insert(pc_name.clone(), z_range_pc);
@@ -349,6 +380,10 @@ pub fn build_design_and_penalty_matrices(
 
     // 3. Calculate layout first to determine matrix dimensions
     let pc_range_ncols: Vec<usize> = pc_range_bases.iter().map(|b| b.ncols()).collect();
+    let pc_null_ncols: Vec<usize> = pc_null_bases
+        .iter()
+        .map(|opt| opt.as_ref().map_or(0, |b| b.ncols()))
+        .collect();
     let pgs_range_ncols = range_transforms
         .get("pgs")
         .map(|rt| rt.ncols())
@@ -356,6 +391,7 @@ pub fn build_design_and_penalty_matrices(
 
     let layout = ModelLayout::new(
         config,
+        &pc_null_ncols,
         &pc_range_ncols,
         pgs_main_basis.ncols(),
         &pc_range_ncols, // Use range ncols for interactions too
@@ -415,15 +451,40 @@ pub fn build_design_and_penalty_matrices(
     // 1. Intercept - always the first column
     x_matrix.column_mut(layout.intercept_col).fill(1.0);
 
-    // 2. Main PC effects - use range-only bases (fully penalized)
+    // 2. Main PC effects: first unpenalized null-space (if any), then penalized range
     for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
         let pc_name = &pc_config.name;
+        // Fill null-space columns
+        let null_cols = &layout.pc_null_cols[pc_idx];
+        if null_cols.len() > 0 {
+            if let Some(null_basis) = &pc_null_bases[pc_idx] {
+                if null_basis.nrows() != n_samples {
+                    return Err(EstimationError::LayoutError(format!(
+                        "PC null basis {} has {} rows but expected {} samples",
+                        pc_name,
+                        null_basis.nrows(),
+                        n_samples
+                    )));
+                }
+                if null_basis.ncols() != null_cols.len() {
+                    return Err(EstimationError::LayoutError(format!(
+                        "PC null basis {} has {} columns but layout expects {} columns",
+                        pc_name,
+                        null_basis.ncols(),
+                        null_cols.len()
+                    )));
+                }
+                x_matrix
+                    .slice_mut(s![.., null_cols.clone()])
+                    .assign(null_basis);
+            }
+        }
+        // Fill penalized range-space columns
         for block in &layout.penalty_map {
             if block.term_name == format!("f({pc_name})") {
                 let col_range = block.col_range.clone();
                 let pc_basis = &pc_range_bases[pc_idx];
 
-                // Validate dimensions before assignment
                 if pc_basis.nrows() != n_samples {
                     return Err(EstimationError::LayoutError(format!(
                         "PC range basis {} has {} rows but expected {} samples",
@@ -440,7 +501,6 @@ pub fn build_design_and_penalty_matrices(
                         col_range.len()
                     )));
                 }
-
                 x_matrix.slice_mut(s![.., col_range]).assign(pc_basis);
                 break;
             }
@@ -519,12 +579,11 @@ pub fn build_design_and_penalty_matrices(
                 )));
             }
 
-            // Build main-effect matrix M = [Intercept | PGS_main | PC_main_for_this_pc]
-            // Extract intercept
+            // Build main-effect matrix M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
+            // Extract intercept and PGS main
             let intercept = x_matrix.slice(s![.., layout.intercept_col..layout.intercept_col + 1]).to_owned();
-            // Extract PGS main columns
             let pgs_main = x_matrix.slice(s![.., layout.pgs_main_cols.clone()]).to_owned();
-            // Extract this PC's main effect columns
+            // Extract this PC's main effect columns: null then range
             let pc_block = layout
                 .penalty_map
                 .iter()
@@ -534,15 +593,21 @@ pub fn build_design_and_penalty_matrices(
                     "Could not locate main-effect block for {} while building interaction orthogonalization",
                     pc_name
                 )))?;
-            let pc_main = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
+            let pc_null_cols = &layout.pc_null_cols[pc_idx];
+            let pc_null = if pc_null_cols.len() > 0 {
+                Some(x_matrix.slice(s![.., pc_null_cols.clone()]).to_owned())
+            } else {
+                None
+            };
+            let pc_range = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
 
-            // Stack M columns in the order [Intercept | PGS_main | PC_main]
-            let m_cols: Vec<Array1<f64>> = intercept
-                .axis_iter(Axis(1))
-                .chain(pgs_main.axis_iter(Axis(1)))
-                .chain(pc_main.axis_iter(Axis(1)))
-                .map(|c| c.to_owned())
-                .collect();
+            // Stack M columns in the order [Intercept | PGS_main | PC_null | PC_range]
+            let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
+            m_cols.extend(pgs_main.axis_iter(Axis(1)).map(|c| c.to_owned()));
+            if let Some(pc_n) = pc_null.as_ref() {
+                m_cols.extend(pc_n.axis_iter(Axis(1)).map(|c| c.to_owned()));
+            }
+            m_cols.extend(pc_range.axis_iter(Axis(1)).map(|c| c.to_owned()));
             let m_matrix = ndarray::stack(Axis(1), &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>())
                 .map_err(|_| EstimationError::LayoutError("Failed to assemble interaction M matrix".to_string()))?;
 
@@ -620,6 +685,7 @@ pub fn build_design_and_penalty_matrices(
         sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
+        pc_null_transforms,
         interaction_centering_means,
         interaction_orth_alpha,
     ))
@@ -1515,6 +1581,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -1535,11 +1602,12 @@ mod tests {
         let pgs_main_coeffs =
             config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // 6 - 1 - 1 = 4
 
-        // PC1 main is now range-only (penalized part only)
-        // Range dimension = main basis cols - null space dimension
+        // PC1 main now includes unpenalized null-space (after dropping intercept) and penalized range
+        // Range dimension = main basis cols - null space dimension; Null dim ≈ penalty_order - 1
         let pc1_main_basis_cols =
             config.pc_configs[0].basis_config.num_knots + config.pc_configs[0].basis_config.degree; // 5 - 1 = 4
         let r_pc = pc1_main_basis_cols - config.penalty_order; // 4 - 2 = 2
+        let n_pc = if config.penalty_order > 0 { config.penalty_order - 1 } else { 0 }; // for order=2 -> 1
 
         // Interaction is R×R (both dimensions use range-only)
         let pgs_main_basis_cols =
@@ -1547,7 +1615,7 @@ mod tests {
         let r_pgs = pgs_main_basis_cols - config.penalty_order; // 5 - 2 = 3
         let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
 
-        let expected_total_coeffs = 1 + pgs_main_coeffs + r_pc + interaction_coeffs; // 1 + 4 + 2 + 6 = 13
+        let expected_total_coeffs = 1 + pgs_main_coeffs + (n_pc + r_pc) + interaction_coeffs; // 1 + 4 + (1+2) + 6 = 14
         let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction (whitened)
 
         assert_eq!(
@@ -1596,7 +1664,7 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
@@ -1671,7 +1739,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _, _) =
+        let (_, _, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
@@ -1697,7 +1765,7 @@ mod tests {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
         // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
-        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means, _) = 
+        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, pc_null_transforms, interaction_centering_means, _) = 
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms
@@ -1705,6 +1773,7 @@ mod tests {
         cfg.sum_to_zero_constraints = sum_to_zero_constraints.clone();
         cfg.knot_vectors = knot_vectors.clone();
         cfg.range_transforms = range_transforms.clone();
+        cfg.pc_null_transforms = pc_null_transforms.clone();
         cfg.interaction_centering_means = interaction_centering_means.clone();
 
         // Construct coefficients in the canonical structure
@@ -1723,6 +1792,11 @@ mod tests {
             .get(&pc_name)
             .expect("missing PC range transform")
             .ncols();
+        let n_pc = cfg
+            .pc_null_transforms
+            .get(&pc_name)
+            .map(|z| z.ncols())
+            .unwrap_or(0);
         let r_pgs = cfg
             .range_transforms
             .get("pgs")
@@ -1738,10 +1812,10 @@ mod tests {
                 pgs: (1..=pgs_dim).map(|i| i as f64).collect(),
                 pcs: {
                     let mut pcs = HashMap::new();
-                    pcs.insert(
-                        pc_name.clone(),
-                        (1..=r_pc).map(|i| 10.0 + i as f64).collect(),
-                    );
+                    let mut v: Vec<f64> = Vec::new();
+                    for i in 1..=n_pc { v.push(10.0 + i as f64); }
+                    for i in 1..=r_pc { v.push(20.0 + i as f64); }
+                    pcs.insert(pc_name.clone(), v);
                     pcs
                 },
             },

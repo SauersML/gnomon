@@ -82,6 +82,11 @@ pub struct ModelConfig {
     /// Keyed by interaction term name (e.g., "f(PGS,PC1)"). Shape: m_cols x t_cols.
     #[serde(default)]
     pub interaction_orth_alpha: HashMap<String, Array2<f64>>,
+    /// Null-space transformation matrices for PC main effects (unpenalized part).
+    /// Maps PC name to Z_null (columns span the penalty null space after dropping intercept).
+    /// Optional for backward compatibility with older models.
+    #[serde(default)]
+    pub pc_null_transforms: HashMap<String, Array2<f64>>,
 }
 
 /// A structured representation of the fitted model coefficients, designed for
@@ -363,8 +368,9 @@ mod internal {
         // This closure was not used - removed
         // Previously defined a helper to fetch Z transform from model
 
-        // 2. Generate range-only bases for PCs (functional ANOVA approach)
+        // 2. Generate bases for PCs (functional ANOVA decomposition: null + range)
         let mut pc_range_bases = Vec::new();
+        let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::new();
         let mut pc_unconstrained_bases_main = Vec::new();
         for i in 0..config.pc_configs.len() {
             let pc_col = pcs_new.column(i);
@@ -385,7 +391,7 @@ mod internal {
             let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
             pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
 
-            // Apply the SAVED range transformation for functional ANOVA
+            // Apply the SAVED null and range transformations for functional ANOVA
             if let Some(range_transform) = config.range_transforms.get(pc_name) {
                 // Check dimensions before matrix multiplication to prevent panic
                 if pc_main_basis_unc.ncols() != range_transform.nrows() {
@@ -395,6 +401,16 @@ mod internal {
                 // Use range-only transformation for PC main effects (fully penalized)
                 let pc_range_basis = pc_main_basis_unc.dot(range_transform);
                 pc_range_bases.push(pc_range_basis);
+                // Build optional null-space basis if present
+                if let Some(z_null) = config.pc_null_transforms.get(pc_name) {
+                    if pc_main_basis_unc.ncols() != z_null.nrows() {
+                        return Err(ModelError::InternalStackingError);
+                    }
+                    let pc_null_basis = pc_main_basis_unc.dot(z_null);
+                    pc_null_bases.push(Some(pc_null_basis));
+                } else {
+                    pc_null_bases.push(None);
+                }
             } else {
                 // No range transform found for this PC
                 return Err(ModelError::ConstraintMissing(format!("range transform for {}", pc_name)));
@@ -408,9 +424,14 @@ mod internal {
         // 1. Intercept
         owned_cols.push(Array1::ones(n_samples));
 
-        // 2. Main PC effects (using range-only bases for functional ANOVA)
-        for pc_basis in &pc_range_bases {
-            for col in pc_basis.axis_iter(Axis(1)) {
+        // 2. Main PC effects per PC: null first (if any), then range
+        for pc_idx in 0..config.pc_configs.len() {
+            if let Some(ref null_basis) = pc_null_bases[pc_idx] {
+                for col in null_basis.axis_iter(Axis(1)) {
+                    owned_cols.push(col.to_owned());
+                }
+            }
+            for col in pc_range_bases[pc_idx].axis_iter(Axis(1)) {
                 owned_cols.push(col.to_owned());
             }
         }
@@ -457,16 +478,15 @@ mod internal {
 
                     // Apply stored orthogonalization to remove main-effect components (pure interaction)
                     if let Some(alpha) = config.interaction_orth_alpha.get(&tensor_key) {
-                        // Build M = [Intercept | PGS_main | PC_main_for_this_pc]
+                        // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
                         let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
-                        // PGS_main is `pgs_main_basis` from above
-                        // PC_main_for_this_pc is `pc_range_bases[pc_idx]` from above
-                        let m_cols: Vec<Array1<f64>> = intercept
-                            .axis_iter(Axis(1))
-                            .chain(pgs_main_basis.axis_iter(Axis(1)))
-                            .chain(pc_range_bases[pc_idx].axis_iter(Axis(1)))
-                            .map(|c| c.to_owned())
-                            .collect();
+                        // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
+                        let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
+                        m_cols.extend(pgs_main_basis.axis_iter(Axis(1)).map(|c| c.to_owned()));
+                        if let Some(ref pc_null) = pc_null_bases[pc_idx] {
+                            m_cols.extend(pc_null.axis_iter(Axis(1)).map(|c| c.to_owned()));
+                        }
+                        m_cols.extend(pc_range_bases[pc_idx].axis_iter(Axis(1)).map(|c| c.to_owned()));
                         let m_matrix = ndarray::stack(
                             Axis(1),
                             &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>(),
@@ -619,6 +639,7 @@ mod tests {
                     knots
                 },
                 range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
             },
@@ -694,6 +715,7 @@ mod tests {
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
             },
@@ -790,6 +812,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -873,6 +896,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -899,6 +923,7 @@ mod tests {
             sum_to_zero_constraints,
             knot_vectors,
             range_transforms,
+            pc_null_transforms,
             interaction_centering_means,
             interaction_orth_alpha,
         ) = crate::calibrate::construction::build_design_and_penalty_matrices(
@@ -926,6 +951,7 @@ mod tests {
                 sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
                 knot_vectors, // Use the knot vectors generated by the model-building code
                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
+                pc_null_transforms: pc_null_transforms.clone(),
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
             },
@@ -940,16 +966,20 @@ mod tests {
                         (1..=pgs_dim).map(|i| i as f64).collect()
                     },
                     pcs: {
-                        // Use range dimension for PC1 (Option 3)
-                        let pc1_dim = range_transforms.get("PC1").unwrap().ncols();
+                        // Use null + range dimension for PC1
+                        let pc1_dim_null = pc_null_transforms.get("PC1").map(|z| z.ncols()).unwrap_or(0);
+                        let pc1_dim_range = range_transforms.get("PC1").unwrap().ncols();
 
                         let mut pc_map = HashMap::new();
-                        pc_map.insert("PC1".to_string(), (1..=pc1_dim).map(|i| i as f64).collect());
+                        pc_map.insert(
+                            "PC1".to_string(),
+                            (1..=(pc1_dim_null + pc1_dim_range)).map(|i| i as f64).collect(),
+                        );
                         pc_map
                     },
                 },
                 interaction_effects: {
-                    // Option 3: Interaction term uses Range × Range dimensions
+                    // Interaction term uses Range × Range dimensions
                     let r_pgs = range_transforms.get("pgs").unwrap().ncols();
                     let r_pc1 = range_transforms.get("PC1").unwrap().ncols();
 
@@ -1116,11 +1146,12 @@ pub fn map_coefficients(
         pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
     }
 
+    // Iterate penalized blocks; for each PC main effect, prepend associated null-space coeffs
+    let mut pc_main_idx = 0usize;
     for block in &layout.penalty_map {
         let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
 
         use crate::calibrate::construction::TermType;
-        // This logic is now driven entirely by the term_type established in the layout
         match block.term_type {
             TermType::PcMainEffect => {
                 let pc_name = block
@@ -1128,10 +1159,19 @@ pub fn map_coefficients(
                     .trim_start_matches("f(")
                     .trim_end_matches(')')
                     .to_string();
-                pcs.insert(pc_name, coeffs);
+
+                // Fetch corresponding null-space coefficients (if any) by index
+                let null_range = &layout.pc_null_cols[pc_main_idx];
+                let mut full = Vec::new();
+                if null_range.len() > 0 {
+                    full.extend_from_slice(&beta.slice(s![null_range.clone()]).to_vec());
+                }
+                full.extend_from_slice(&coeffs);
+                pcs.insert(pc_name, full);
+
+                pc_main_idx += 1;
             }
             TermType::Interaction => {
-                // Tensor product interaction: f(PGS,PC1) -> direct storage
                 interaction_effects.insert(block.term_name.to_string(), coeffs);
             }
         }

@@ -125,6 +125,7 @@ pub fn train_model(
         sum_to_zero_constraints,
         knot_vectors,
         range_transforms,
+        pc_null_transforms,
         interaction_centering_means,
         interaction_orth_alpha,
     ) = build_design_and_penalty_matrices(data, config)?;
@@ -578,6 +579,7 @@ pub fn train_model(
     config_with_constraints.range_transforms = range_transforms;
     config_with_constraints.interaction_centering_means = interaction_centering_means;
     config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+    config_with_constraints.pc_null_transforms = pc_null_transforms;
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -2053,6 +2055,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -2185,6 +2188,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -2297,11 +2301,12 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2397,11 +2402,12 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -2513,6 +2519,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -2783,6 +2790,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -2896,12 +2904,13 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
             // --- 3. Build Model Structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             assert!(
@@ -3102,6 +3111,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -3228,12 +3238,13 @@ pub mod internal {
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3357,12 +3368,13 @@ pub mod internal {
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3513,6 +3525,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -3631,6 +3644,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -3741,12 +3755,13 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3879,6 +3894,7 @@ pub mod internal {
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
+                    pc_null_transforms: std::collections::HashMap::new(),
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
                 };
@@ -3886,7 +3902,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4013,15 +4029,16 @@ pub mod internal {
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-    };
+                    pc_null_transforms: std::collections::HashMap::new(),
+                    interaction_centering_means: std::collections::HashMap::new(),
+                    interaction_orth_alpha: std::collections::HashMap::new(),
+                };
 
                 // Use a simple basis with fewer knots to reduce complexity
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                     panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                 });
@@ -4181,6 +4198,7 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
@@ -4209,7 +4227,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4363,12 +4381,13 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+        pc_null_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
         interaction_orth_alpha: std::collections::HashMap::new(),
     };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4477,12 +4496,13 @@ pub mod internal {
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4583,6 +4603,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         sum_to_zero_constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
+        pc_null_transforms: HashMap::new(),
         interaction_centering_means: HashMap::new(),
         interaction_orth_alpha: HashMap::new(),
     };
@@ -4661,13 +4682,14 @@ fn test_indefinite_hessian_detection_and_retreat() {
         sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
+        pc_null_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
         interaction_orth_alpha: std::collections::HashMap::new(),
     };
 
     // Try to build the matrices - if this fails, the test is still valid
             let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4865,12 +4887,13 @@ mod optimizer_progress_tests {
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),
@@ -4968,12 +4991,13 @@ mod gradient_validation_tests {
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
         // Build matrices and create REML state
-        let (x, s_list, layout, _sum_to_zero, _knots, _ranges, _int_means, _alphas) =
+        let (x, s_list, layout, _sum_to_zero, _knots, _ranges, _pc_null, _int_means, _alphas) =
             build_design_and_penalty_matrices(&data, &config).expect("matrix build");
         assert!(layout.num_penalties > 0, "Model must have at least one penalty");
 

@@ -1866,6 +1866,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -2030,6 +2031,7 @@ mod tests {
         let layout = ModelLayout {
             intercept_col: 0,
             pgs_main_cols: 0..0,
+            pc_null_cols: vec![],
             penalty_map: vec![],
             total_coeffs: 2,
             num_penalties: 2,
@@ -2071,7 +2073,7 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
             build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
@@ -2137,6 +2139,7 @@ mod tests {
         let layout = ModelLayout {
             intercept_col: 0,
             pgs_main_cols: 0..0,
+            pc_null_cols: vec![],
             penalty_map: vec![],
             total_coeffs: 2,
             num_penalties: 2,
@@ -2159,6 +2162,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -2280,6 +2284,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -2405,6 +2410,7 @@ mod tests {
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
         };
@@ -2962,6 +2968,7 @@ mod tests {
         let layout = ModelLayout {
             intercept_col: 0,
             pgs_main_cols: 0..0,
+            pc_null_cols: vec![],
             penalty_map: vec![],
             total_coeffs: 2,
             num_penalties: 2,

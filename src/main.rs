@@ -142,6 +142,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         range_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
         interaction_orth_alpha: std::collections::HashMap::new(),
+        pc_null_transforms: std::collections::HashMap::new(),
     };
 
     // Train the final model
