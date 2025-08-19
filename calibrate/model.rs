@@ -309,18 +309,50 @@ mod internal {
             config.pgs_basis_config.degree,
         )?;
 
-        // Apply the SAVED PGS constraint - prefer new sum_to_zero_constraints field
+        // Build PGS main basis to MATCH TRAINING exactly.
+        // Start from the unconstrained PGS basis (drop intercept col).
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-        let pgs_z = config.sum_to_zero_constraints
+
+        // Saved transforms
+        let pgs_z = config
+            .sum_to_zero_constraints
             .get("pgs_main")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?;
+        let z_range_pgs_opt = config.range_transforms.get("pgs");
 
-        // Check that dimensions match before matrix multiplication
-        if pgs_main_basis_unc.ncols() != pgs_z.nrows() {
-            return Err(ModelError::InternalStackingError);
-        }
+        // Target width must match trained coefficient count
+        let pgs_coef_len = coeffs.main_effects.pgs.len();
 
-        let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z); // Now constrained
+        // Try: whiten then constrain; else whiten-only; else constrain-only; else error
+        let pgs_main_basis = if let Some(z_range_pgs) = z_range_pgs_opt {
+            // Check shapes: B_unc (N x m), Z_range (m x r), Z (r x c)
+            let m = pgs_main_basis_unc.ncols();
+            let r = z_range_pgs.ncols();
+            let c = pgs_z.ncols();
+
+            let shapes_ok = m == z_range_pgs.nrows()
+                && r == pgs_z.nrows()
+                && c == pgs_coef_len;
+
+            if shapes_ok {
+                let pgs_whitened = pgs_main_basis_unc.dot(z_range_pgs);
+                pgs_whitened.dot(pgs_z)
+            } else if r == pgs_coef_len && m == z_range_pgs.nrows() {
+                // Whiten only matches coefficients
+                pgs_main_basis_unc.dot(z_range_pgs)
+            } else if pgs_z.ncols() == pgs_coef_len && pgs_z.nrows() == m {
+                // Constrain only matches coefficients
+                pgs_main_basis_unc.dot(pgs_z)
+            } else {
+                return Err(ModelError::InternalStackingError);
+            }
+        } else {
+            // No range transform stored; fall back to constrain-only
+            if pgs_z.ncols() != pgs_coef_len || pgs_main_basis_unc.ncols() != pgs_z.nrows() {
+                return Err(ModelError::InternalStackingError);
+            }
+            pgs_main_basis_unc.dot(pgs_z)
+        };
 
         // CRITICAL: The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
         // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
