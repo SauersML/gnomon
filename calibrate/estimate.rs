@@ -439,13 +439,24 @@ pub fn train_model(
                 }
 
                 // Acceptance rule: require not only lower cost but also reasonably small gradient
-                // Use a moderate threshold — we’re escaping a flat valley but still want near-stationarity
-                const GRAD_NORM_ACCEPT: f64 = 1e3;
+                // Use a scale-aware threshold based on the convergence tolerance and current cost magnitude
+                // This prevents accepting solutions with large gradients that can lock in over-smoothed estimates
+                let cost_scale = 0.1 + last_solution.final_value.abs();
+                let grad_tol = config.reml_convergence_tolerance * cost_scale;
+                // Use a moderate multiple of the tolerance - not as strict as final convergence
+                // but still require reasonable near-stationarity
+                let grad_norm_accept = 10.0 * grad_tol;
+                
                 if let Some(alt) = best_alt {
                     let fv0 = last_solution.final_value;
                     let fv1 = alt.final_value;
                     let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
-                    if (fv1 < fv0 || rel_diff < 1e-6) && best_alt_grad_norm <= GRAD_NORM_ACCEPT {
+                    
+                    // Meaningful improvement OR close values with better gradient
+                    let cost_improved = fv1 < fv0 - 1e-6 * cost_scale;
+                    let similar_cost_better_grad = rel_diff < 1e-6 && best_alt_grad_norm < best_alt_grad_norm * 0.9;
+                    
+                    if (cost_improved || similar_cost_better_grad) && best_alt_grad_norm <= grad_norm_accept {
                         eprintln!(
                             "[INFO] Accepting asymmetric restart (Δcost={:.3e}, grad_norm={:.2e}).",
                             fv0 - fv1,
@@ -478,8 +489,13 @@ pub fn train_model(
                 };
 
                 // Only accept the solution if gradient norm is small enough
-                const MAX_GRAD_NORM_AFTER_LS_FAIL: f64 = 10000.0;
-                if gradient_norm > MAX_GRAD_NORM_AFTER_LS_FAIL {
+                // Use a scale-aware threshold based on the convergence tolerance and current cost magnitude
+                let cost_scale = 0.1 + last_solution.final_value.abs();
+                let grad_tol = config.reml_convergence_tolerance * cost_scale;
+                // More generous threshold than restart acceptance but still require some stationarity
+                let max_grad_norm = 50.0 * grad_tol;
+                
+                if gradient_norm > max_grad_norm {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
                         "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
                         gradient_norm
@@ -1007,57 +1023,60 @@ pub mod internal {
                     let dp = rss + penalty; // Correct penalized deviance
 
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
-                    // Need to build S_lambda for EDF calculation (not for penalty - that's stable)
-                    let mut s_lambda_original =
-                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
-                    for k in 0..lambdas.len() {
-                        let s_k = self.rs_list[k].t().dot(&self.rs_list[k]);
-                        s_lambda_original.scaled_add(lambdas[k], &s_k);
-                    }
-
+                    // Work directly in the transformed basis for efficiency and numerical stability
+                    // This avoids transforming matrices back to the original basis unnecessarily
+                    let hessian_t = &pirls_result.stabilized_hessian_transformed;
+                    let rs_transformed = &pirls_result.reparam_result.rs_transformed;
+                    
+                    // Initialize trace accumulator
                     let mut trace_h_inv_s_lambda = 0.0;
-
-                    // Get the transformation matrix and transformed Hessian
-                    let qs = &pirls_result.reparam_result.qs;
-
-                    // Transform the stabilized Hessian back to original basis for EDF calculation
-                    let hessian_original = qs
-                        .dot(&pirls_result.stabilized_hessian_transformed)
-                        .dot(&qs.t());
-
-                    for j in 0..s_lambda_original.ncols() {
-                        let s_col = s_lambda_original.column(j);
-                        if s_col.iter().all(|&x| x == 0.0) {
-                            continue;
-                        }
-
-                        match hessian_original.solve(&s_col.to_owned()) {
-                            // CORRECT: Both matrices are now in the original basis
-                            Ok(h_inv_s_col) => {
-                                trace_h_inv_s_lambda += h_inv_s_col[j];
+                    
+                    // Directly use the transformed penalty matrices (already whitened)
+                    for k in 0..lambdas.len() {
+                        // Form the kth penalty matrix in the transformed basis: S_k^t = rs_transformed[k]ᵀ * rs_transformed[k]
+                        let s_k_t = rs_transformed[k].t().dot(&rs_transformed[k]);
+                        
+                        // Scale by lambda before computing trace
+                        let s_k_scaled = s_k_t.mapv(|x| x * lambdas[k]);
+                        
+                        // Solve H_t X = S_k_scaled for each column and accumulate trace
+                        for j in 0..s_k_scaled.ncols() {
+                            let s_col = s_k_scaled.column(j);
+                            
+                            // Skip zero columns for efficiency
+                            if s_col.iter().all(|&x| x == 0.0) {
+                                continue;
                             }
-                            Err(e_direct) => {
-                                log::warn!(
-                                    "Linear system solve failed for EDF column {}, attempting robust fallback: {:?}",
-                                    j,
-                                    e_direct
-                                );
-                                // Fallback to robust SVD-based solve
-                                match robust_solve(&hessian_original, &s_col.to_owned()) {
-                                    Ok(h_inv_s_col) => {
-                                        trace_h_inv_s_lambda += h_inv_s_col[j];
-                                    }
-                                    Err(e_fallback) => {
-                                        log::warn!(
-                                            "Robust solve also failed during EDF trace calculation: {:?}",
-                                            e_fallback
-                                        );
-                                        return Err(e_fallback);
+                            
+                            match hessian_t.solve(&s_col.to_owned()) {
+                                Ok(h_inv_s_col) => {
+                                    // Add diagonal element to trace
+                                    trace_h_inv_s_lambda += h_inv_s_col[j];
+                                }
+                                Err(e_direct) => {
+                                    log::warn!(
+                                        "Linear system solve failed for EDF column {}, attempting robust fallback: {:?}",
+                                        j,
+                                        e_direct
+                                    );
+                                    // Fallback to robust SVD-based solve
+                                    match robust_solve(hessian_t, &s_col.to_owned()) {
+                                        Ok(h_inv_s_col) => {
+                                            trace_h_inv_s_lambda += h_inv_s_col[j];
+                                        }
+                                        Err(e_fallback) => {
+                                            log::warn!(
+                                                "Robust solve also failed during EDF trace calculation: {:?}",
+                                                e_fallback
+                                            );
+                                            return Err(e_fallback);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)

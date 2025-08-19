@@ -511,27 +511,7 @@ mod internal {
                         tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
                     }
 
-                    // Apply stored per-interaction centering
-                    let means = config.interaction_centering_means
-                        .get(&tensor_key)
-                        .ok_or_else(|| ModelError::DimensionMismatch(format!(
-                            "No centering means found for interaction {}", tensor_key)))?;
-
-                    if tensor_interaction.ncols() != means.len() {
-                        return Err(ModelError::DimensionMismatch(format!(
-                            "Interaction {} has {} columns but {} stored means",
-                            tensor_key,
-                            tensor_interaction.ncols(),
-                            means.len()
-                        )));
-                    }
-
-                    for j in 0..tensor_interaction.ncols() {
-                        let m = means[j];
-                        tensor_interaction.column_mut(j).mapv_inplace(|v| v - m);
-                    }
-
-                    // Add all columns from this tensor product to the design matrix
+                    // Add all columns from this tensor product to the design matrix (no extra centering)
                     for col in tensor_interaction.axis_iter(Axis(1)) {
                         owned_cols.push(col.to_owned());
                     }

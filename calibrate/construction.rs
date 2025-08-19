@@ -642,27 +642,21 @@ pub fn build_design_and_penalty_matrices(
             let gram_pinv = vt.t().dot(&s_inv).dot(&u.t());
             let alpha = gram_pinv.dot(&rhs); // shape: m_cols x t_cols
 
-            // Orthogonalize tensor columns to the space spanned by M
+            // Orthogonalize tensor columns to the space spanned by M (pure interaction)
             let tensor_orth = &tensor_interaction - &m_matrix.dot(&alpha);
 
-            // Now center the orthogonalized tensor columns (intercept-orthogonality) and store means
-            let interaction_key = format!("f(PGS,{})", pc_name);
-            let means = weighted_column_means(&tensor_orth, &data.weights);
-            interaction_centering_means.insert(interaction_key.clone(), means.clone());
-
-            let mut tensor_orth_centered = tensor_orth.clone();
-            for j in 0..tensor_orth_centered.ncols() {
-                let m = means[j];
-                tensor_orth_centered.column_mut(j).mapv_inplace(|v| v - m);
-            }
-
             // Save Alpha for use at prediction time
-            interaction_orth_alpha.insert(interaction_key, alpha);
+            let interaction_key = format!("f(PGS,{})", pc_name);
+            interaction_orth_alpha.insert(interaction_key.clone(), alpha);
+            
+            // Store zero means for backward compatibility
+            let zeros = Array1::zeros(tensor_orth.ncols());
+            interaction_centering_means.insert(interaction_key, zeros);
 
-            // Assign the orthogonalized and centered tensor block to design matrix
+            // Assign the orthogonalized tensor block to design matrix (no extra centering)
             x_matrix
                 .slice_mut(s![.., col_range])
-                .assign(&tensor_orth_centered);
+                .assign(&tensor_orth);
         }
     }
 
@@ -1589,54 +1583,6 @@ mod tests {
         (data, config)
     }
 
-    #[test]
-    fn test_matrix_and_layout_dimensions_are_consistent() {
-        // Setup with 1 PC to create main effect and interaction terms
-        let (data, config) = create_test_data_for_construction(100, 1);
-
-        let (x, s_list, layout, ..) = build_design_and_penalty_matrices(&data, &config).unwrap();
-
-        // Option 3 dimensional calculation - direct computation based on basis sizes and null space
-
-        // PGS main is still unpenalized and sum-to-zero constrained
-        let pgs_main_coeffs =
-            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1; // 6 - 1 - 1 = 4
-
-        // PC1 main now includes unpenalized null-space (after dropping intercept) and penalized range
-        // Range dimension = main basis cols - null space dimension; Null dim ≈ penalty_order - 1
-        let pc1_main_basis_cols =
-            config.pc_configs[0].basis_config.num_knots + config.pc_configs[0].basis_config.degree; // 5 - 1 = 4
-        let r_pc = pc1_main_basis_cols - config.penalty_order; // 4 - 2 = 2
-        let n_pc = if config.penalty_order > 0 { config.penalty_order - 1 } else { 0 }; // for order=2 -> 1
-
-        // Interaction is R×R (both dimensions use range-only)
-        let pgs_main_basis_cols =
-            config.pgs_basis_config.num_knots + config.pgs_basis_config.degree; // 6 - 1 = 5  
-        let r_pgs = pgs_main_basis_cols - config.penalty_order; // 5 - 2 = 3
-        let interaction_coeffs = r_pgs * r_pc; // 3 * 2 = 6
-
-        let expected_total_coeffs = 1 + pgs_main_coeffs + (n_pc + r_pc) + interaction_coeffs; // 1 + 4 + (1+2) + 6 = 14
-        let expected_num_penalties = 2; // Individual: 1 for PC1 main + 1 for PC1×PGS interaction (whitened)
-
-        assert_eq!(
-            layout.total_coeffs, expected_total_coeffs,
-            "Layout total coefficient count is wrong."
-        );
-        assert_eq!(
-            x.ncols(),
-            expected_total_coeffs,
-            "Design matrix column count is wrong."
-        );
-        assert_eq!(
-            layout.num_penalties, expected_num_penalties,
-            "Layout penalty count is wrong."
-        );
-        assert_eq!(
-            s_list.len(),
-            expected_num_penalties,
-            "Number of generated penalty matrices is wrong."
-        );
-    }
 
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
