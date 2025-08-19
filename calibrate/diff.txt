@@ -1,0 +1,677 @@
+ calibrate/.gitignore      |   2 +
+ calibrate/construction.rs | 100 ++++++++++++++++++++++++++++++++++++---------
+ calibrate/estimate.rs     | 101 +++++++++++++++++++++-------------------------
+ calibrate/model.rs        |  46 +++++++++++++++++++++
+ calibrate/pirls.rs        |   6 ++-
+ src/main.rs               |   1 +
+ 6 files changed, 183 insertions(+), 73 deletions(-)
+
+diff --git a/calibrate/.gitignore b/calibrate/.gitignore
+new file mode 100644
+index 0000000..9212661
+--- /dev/null
++++ b/calibrate/.gitignore
+@@ -0,0 +1,2 @@
++# Ignore local build artifacts
++calibrate/target-local/
+diff --git a/calibrate/construction.rs b/calibrate/construction.rs
+index fa17a38..1486f37 100644
+--- a/calibrate/construction.rs
++++ b/calibrate/construction.rs
+@@ -203,7 +203,9 @@ impl ModelLayout {
+ }
+ 
+ /// Constructs the design matrix `X` and a list of individual penalty matrices `S_i`.
+-/// Returns the design matrix, penalty matrices, model layout, sum-to-zero constraints, knot vectors, range transformations, and interaction centering means.
++/// Returns the design matrix, penalty matrices, model layout, sum-to-zero constraints,
++/// knot vectors, range transformations, interaction centering means, and interaction
++/// orthogonalization maps (Alpha) for pure-interaction construction.
+ pub fn build_design_and_penalty_matrices(
+     data: &TrainingData,
+     config: &ModelConfig,
+@@ -216,6 +218,7 @@ pub fn build_design_and_penalty_matrices(
+         HashMap<String, Array1<f64>>, // knot_vectors
+         HashMap<String, Array2<f64>>, // range_transforms
+         HashMap<String, Array1<f64>>, // interaction_centering_means
++        HashMap<String, Array2<f64>>, // interaction_orth_alpha (per interaction block)
+     ),
+     EstimationError,
+ > {
+@@ -237,6 +240,7 @@ pub fn build_design_and_penalty_matrices(
+     let mut knot_vectors = HashMap::new();
+     let mut range_transforms = HashMap::new();
+     let mut interaction_centering_means = HashMap::new();
++    let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
+ 
+     // 1. Generate basis for PGS and apply sum-to-zero constraint
+     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
+@@ -515,27 +519,85 @@ pub fn build_design_and_penalty_matrices(
+                 )));
+             }
+ 
+-            // Center the FINAL tensor product columns (intercept-orthogonality)
+-            // 1) compute and store weighted column means (per interaction block)
++            // Build main-effect matrix M = [Intercept | PGS_main | PC_main_for_this_pc]
++            // Extract intercept
++            let intercept = x_matrix.slice(s![.., layout.intercept_col..layout.intercept_col + 1]).to_owned();
++            // Extract PGS main columns
++            let pgs_main = x_matrix.slice(s![.., layout.pgs_main_cols.clone()]).to_owned();
++            // Extract this PC's main effect columns
++            let pc_block = layout
++                .penalty_map
++                .iter()
++                .find(|block| block.term_type == TermType::PcMainEffect
++                    && block.term_name == format!("f({})", pc_name))
++                .ok_or_else(|| EstimationError::LayoutError(format!(
++                    "Could not locate main-effect block for {} while building interaction orthogonalization",
++                    pc_name
++                )))?;
++            let pc_main = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
++
++            // Stack M columns in the order [Intercept | PGS_main | PC_main]
++            let m_cols: Vec<Array1<f64>> = intercept
++                .axis_iter(Axis(1))
++                .chain(pgs_main.axis_iter(Axis(1)))
++                .chain(pc_main.axis_iter(Axis(1)))
++                .map(|c| c.to_owned())
++                .collect();
++            let m_matrix = ndarray::stack(Axis(1), &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>())
++                .map_err(|_| EstimationError::LayoutError("Failed to assemble interaction M matrix".to_string()))?;
++
++            // Weighted projection: Alpha = (M^T W M)^+ (M^T W T)
++            let w_sqrt = data.weights.mapv(|wi| wi.sqrt());
++            let mw = &m_matrix * &w_sqrt.view().insert_axis(Axis(1));
++            let tw = &tensor_interaction * &w_sqrt.view().insert_axis(Axis(1));
++
++            // Compute Gram matrix and RHS
++            let gram = mw.t().dot(&mw);
++            let rhs = mw.t().dot(&tw);
++
++            // Pseudo-inverse via SVD
++            let (u_opt, s, vt_opt) = gram
++                .svd(true, true)
++                .map_err(EstimationError::EigendecompositionFailed)?;
++            let (u, vt) = match (u_opt, vt_opt) {
++                (Some(u), Some(vt)) => (u, vt),
++                _ => {
++                    return Err(EstimationError::LayoutError(
++                        "SVD did not return U/VT for interaction orthogonalization".to_string(),
++                    ));
++                }
++            };
++            let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
++            let tol = smax * 1e-12;
++            // Construct Σ^+ as diagonal with thresholding
++            let mut s_inv = Array2::zeros((s.len(), s.len()));
++            for i in 0..s.len() {
++                if s[i] > tol { s_inv[[i, i]] = 1.0 / s[i]; }
++            }
++            let gram_pinv = vt.t().dot(&s_inv).dot(&u.t());
++            let alpha = gram_pinv.dot(&rhs); // shape: m_cols x t_cols
++
++            // Orthogonalize tensor columns to the space spanned by M
++            let tensor_orth = &tensor_interaction - &m_matrix.dot(&alpha);
++
++            // Now center the orthogonalized tensor columns (intercept-orthogonality) and store means
+             let interaction_key = format!("f(PGS,{})", pc_name);
+-            let means = weighted_column_means(&tensor_interaction, &data.weights);
+-            interaction_centering_means.insert(interaction_key, means.clone());
++            let means = weighted_column_means(&tensor_orth, &data.weights);
++            interaction_centering_means.insert(interaction_key.clone(), means.clone());
+ 
+-            // 2) subtract means in place (same as training)
+-            let mut tensor_centered = tensor_interaction.clone();
+-            for j in 0..tensor_centered.ncols() {
++            let mut tensor_orth_centered = tensor_orth.clone();
++            for j in 0..tensor_orth_centered.ncols() {
+                 let m = means[j];
+-                tensor_centered.column_mut(j).mapv_inplace(|v| v - m);
++                tensor_orth_centered.column_mut(j).mapv_inplace(|v| v - m);
+             }
+ 
+-            // Assign centered tensor block to design matrix
+-            // Note: Full orthogonalization against main effects would create training-prediction mismatch
+-            // since it requires row-space projectors that depend on training data and cannot be reproduced
+-            // on new data. The current approach (Range×Range interactions + final column centering)
+-            // maintains reproducibility while ensuring intercept orthogonality.
++            // Save Alpha for use at prediction time
++            interaction_orth_alpha.insert(interaction_key, alpha);
++
++            // Assign the orthogonalized and centered tensor block to design matrix
+             x_matrix
+                 .slice_mut(s![.., col_range])
+-                .assign(&tensor_centered);
++                .assign(&tensor_orth_centered);
+         }
+     }
+ 
+@@ -559,6 +621,7 @@ pub fn build_design_and_penalty_matrices(
+         knot_vectors,
+         range_transforms,
+         interaction_centering_means,
++        interaction_orth_alpha,
+     ))
+ }
+ 
+@@ -1452,6 +1515,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         (data, config)
+@@ -1531,7 +1595,7 @@ mod tests {
+     #[test]
+     fn test_interaction_term_has_correct_penalty_structure() {
+         let (data, config) = create_test_data_for_construction(100, 1);
+-        let (_, s_list, layout, _, _, _, _) =
++        let (_, s_list, layout, _, _, _, _, _) =
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
+@@ -1606,7 +1670,7 @@ mod tests {
+     fn test_construction_with_no_pcs() {
+         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
+ 
+-        let (_, _, layout, _, _, _, _) =
++        let (_, _, layout, _, _, _, _, _) =
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         let pgs_main_coeffs =
+@@ -1632,7 +1696,7 @@ mod tests {
+         // Build training matrices and transforms
+         let (data, config) = create_test_data_for_construction(100, 1);
+         // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
+-        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means) = 
++        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, interaction_centering_means, _) = 
+             build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+         // Prepare a config carrying all saved transforms
+diff --git a/calibrate/estimate.rs b/calibrate/estimate.rs
+index ea947d7..d226459 100644
+--- a/calibrate/estimate.rs
++++ b/calibrate/estimate.rs
+@@ -126,6 +126,7 @@ pub fn train_model(
+         knot_vectors,
+         range_transforms,
+         interaction_centering_means,
++        interaction_orth_alpha,
+     ) = build_design_and_penalty_matrices(data, config)?;
+     log_layout_info(&layout);
+     eprintln!(
+@@ -480,7 +481,7 @@ pub fn train_model(
+ 
+     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
+     // and return the result along with the transformation matrix used.
+-    let mut final_fit = pirls::fit_model_for_fixed_rho(
++    let final_fit = pirls::fit_model_for_fixed_rho(
+         final_rho_clamped.view(),
+         reml_state.x(), // Use original X
+         reml_state.y(),
+@@ -490,38 +491,8 @@ pub fn train_model(
+         config,
+     )?;
+ 
+-    // Fallback to avoid degenerate EDF≈0 solutions for Logit: if EDF is tiny, try a small-λ direct fit
+-    if matches!(config.link_function, LinkFunction::Logit) && final_fit.edf < 1.0 {
+-        eprintln!(
+-            "[INFO] Final fit has EDF ≈ {:.2}. Trying small-λ fallback (rho=-4) to avoid flat solutions...",
+-            final_fit.edf
+-        );
+-        let small_rho = Array1::from_elem(layout.num_penalties, -4.0);
+-        if let Ok(alt_fit) = pirls::fit_model_for_fixed_rho(
+-            small_rho.view(),
+-            reml_state.x(),
+-            reml_state.y(),
+-            reml_state.weights(),
+-            reml_state.rs_list_ref(),
+-            &layout,
+-            config,
+-        ) {
+-            // Prefer alternative if it achieves meaningful flexibility and comparable or better deviance
+-            let dev_improves = alt_fit.deviance <= final_fit.deviance * 1.02;
+-            if alt_fit.edf >= 1.0 && dev_improves {
+-                eprintln!(
+-                    "[INFO] Adopting small-λ fallback: edf {:.2} (vs {:.2}), deviance {:.4} (vs {:.4})",
+-                    alt_fit.edf, final_fit.edf, alt_fit.deviance, final_fit.deviance
+-                );
+-                final_fit = alt_fit;
+-            } else {
+-                eprintln!(
+-                    "[INFO] Keeping original fit: alt edf {:.2}, alt dev {:.4}, orig edf {:.2}, orig dev {:.4}",
+-                    alt_fit.edf, alt_fit.deviance, final_fit.edf, final_fit.deviance
+-                );
+-            }
+-        }
+-    }
++    // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
++    // Keep the REML-chosen smoothing; log-only diagnostics can be added upstream if needed.
+ 
+     // Transform the final, optimal coefficients from the stable basis
+     // back to the original, interpretable basis.
+@@ -535,6 +506,7 @@ pub fn train_model(
+     config_with_constraints.knot_vectors = knot_vectors;
+     config_with_constraints.range_transforms = range_transforms;
+     config_with_constraints.interaction_centering_means = interaction_centering_means;
++    config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+ 
+     Ok(TrainedModel {
+         config: config_with_constraints,
+@@ -1920,6 +1892,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             let trained_model = train_model(&data, &config).expect("Model training should succeed");
+@@ -2051,6 +2024,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             let trained_model =
+@@ -2162,9 +2136,10 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+-            let (x, s_list, layout, _, _, _, _) =
++            let (x, s_list, layout, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Get P-IRLS result at a reasonable smoothing level
+@@ -2261,9 +2236,10 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+-            let (x, s_list, layout, _, _, _, _) =
++            let (x, s_list, layout, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Get P-IRLS result at a reasonable smoothing level
+@@ -2376,6 +2352,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             let trained_model = train_model(&data, &config).expect("Model training should succeed");
+@@ -2645,6 +2622,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             // --- 3. Train model ---
+@@ -2757,10 +2735,11 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             // --- 3. Build Model Structure ---
+-            let (x_matrix, mut s_list, layout, _, _, _, _) =
++            let (x_matrix, mut s_list, layout, _, _, _, _, _) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             assert!(
+@@ -2962,6 +2941,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+             // Clear PC configurations
+             config.pc_configs.clear();
+@@ -3087,10 +3067,11 @@ pub mod internal {
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_centering_means: HashMap::new(),
++                interaction_orth_alpha: HashMap::new(),
+             };
+ 
+             // Test with extreme lambda values that might cause issues
+-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
++            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             // Try with very large lambda values (exp(10) ~ 22000)
+@@ -3215,10 +3196,11 @@ pub mod internal {
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_centering_means: HashMap::new(),
++                interaction_orth_alpha: HashMap::new(),
+             };
+ 
+             // Test that we can at least compute cost without getting infinity
+-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
++            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+                 build_design_and_penalty_matrices(&data, &config).unwrap();
+ 
+             let reml_state = internal::RemlState::new(
+@@ -3370,6 +3352,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+             // This creates way too many parameters for 30 data points
+ 
+@@ -3487,6 +3470,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             println!(
+@@ -3596,10 +3580,11 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             // Build design and penalty matrices
+-            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
++            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+                 internal::build_design_and_penalty_matrices(&training_data, &config)
+                     .expect("Failed to build design matrix");
+ 
+@@ -3733,12 +3718,13 @@ pub mod internal {
+                     knot_vectors: std::collections::HashMap::new(),
+                     range_transforms: std::collections::HashMap::new(),
+                     interaction_centering_means: std::collections::HashMap::new(),
++                    interaction_orth_alpha: std::collections::HashMap::new(),
+                 };
+                 simple_config.link_function = link_function;
+                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
+ 
+                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
+-                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
++                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+                     });
+@@ -3865,17 +3851,18 @@ pub mod internal {
+                     sum_to_zero_constraints: std::collections::HashMap::new(),
+                     knot_vectors: std::collections::HashMap::new(),
+                     range_transforms: std::collections::HashMap::new(),
+-                    interaction_centering_means: std::collections::HashMap::new(),
+-                };
++        interaction_centering_means: std::collections::HashMap::new(),
++        interaction_orth_alpha: std::collections::HashMap::new(),
++    };
+ 
+                 // Use a simple basis with fewer knots to reduce complexity
+                 simple_config.pgs_basis_config.num_knots = 3;
+ 
+                 // 2. Generate consistent structures using the canonical function
+-                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
+-                    build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+-                        panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+-                    });
++            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
++                build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
++                    panic!("Matrix build failed for {:?}: {:?}", link_function, e)
++                });
+ 
+                 // 3. Create RemlState with the consistent objects
+                 let reml_state = internal::RemlState::new(
+@@ -4033,6 +4020,7 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             // Create data with non-collinear predictors to avoid perfect collinearity
+@@ -4059,7 +4047,7 @@ pub mod internal {
+             };
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
++            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4213,11 +4201,12 @@ pub mod internal {
+                 sum_to_zero_constraints: std::collections::HashMap::new(),
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+-                interaction_centering_means: std::collections::HashMap::new(),
+-            };
++        interaction_centering_means: std::collections::HashMap::new(),
++        interaction_orth_alpha: std::collections::HashMap::new(),
++    };
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
++            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4327,10 +4316,11 @@ pub mod internal {
+                 knot_vectors: std::collections::HashMap::new(),
+                 range_transforms: std::collections::HashMap::new(),
+                 interaction_centering_means: std::collections::HashMap::new(),
++                interaction_orth_alpha: std::collections::HashMap::new(),
+             };
+ 
+             // 2. Generate consistent structures using the canonical function
+-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple) =
++            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+                 build_design_and_penalty_matrices(&data, &simple_config)
+                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
+ 
+@@ -4432,6 +4422,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
+         knot_vectors: HashMap::new(),
+         range_transforms: HashMap::new(),
+         interaction_centering_means: HashMap::new(),
++        interaction_orth_alpha: HashMap::new(),
+     };
+ 
+     // 3. Train the model and expect an error
+@@ -4509,11 +4500,12 @@ fn test_indefinite_hessian_detection_and_retreat() {
+         knot_vectors: std::collections::HashMap::new(),
+         range_transforms: std::collections::HashMap::new(),
+         interaction_centering_means: std::collections::HashMap::new(),
++        interaction_orth_alpha: std::collections::HashMap::new(),
+     };
+ 
+     // Try to build the matrices - if this fails, the test is still valid
+-    let matrices_result = build_design_and_penalty_matrices(&data, &config);
+-    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means)) = matrices_result {
++            let matrices_result = build_design_and_penalty_matrices(&data, &config);
++    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha)) = matrices_result {
+         let reml_state_result = RemlState::new(
+             data.y.view(),
+             x_matrix.view(),
+@@ -4712,10 +4704,11 @@ mod optimizer_progress_tests {
+             knot_vectors: std::collections::HashMap::new(),
+             range_transforms: std::collections::HashMap::new(),
+             interaction_centering_means: std::collections::HashMap::new(),
++            interaction_orth_alpha: std::collections::HashMap::new(),
+         };
+ 
+         // 3) Build matrices and REML state to evaluate cost at specific rho
+-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
++        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+             build_design_and_penalty_matrices(&data, &config)?;
+         let reml_state = internal::RemlState::new(
+             data.y.view(),
+diff --git a/calibrate/model.rs b/calibrate/model.rs
+index f52dde6..1bc7762 100644
+--- a/calibrate/model.rs
++++ b/calibrate/model.rs
+@@ -78,6 +78,10 @@ pub struct ModelConfig {
+     /// Weighted column means used for centering interaction marginals during training
+     /// Maps variable names (e.g., "pgs", "PC1") to their weighted column means for ANOVA centering
+     pub interaction_centering_means: HashMap<String, Array1<f64>>,
++    /// Linear maps that orthogonalize each interaction block against the main effects (pure ti())
++    /// Keyed by interaction term name (e.g., "f(PGS,PC1)"). Shape: m_cols x t_cols.
++    #[serde(default)]
++    pub interaction_orth_alpha: HashMap<String, Array2<f64>>,
+ }
+ 
+ /// A structured representation of the fitted model coefficients, designed for
+@@ -419,6 +423,42 @@ mod internal {
+                     let mut tensor_interaction =
+                         row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
+ 
++                    // Apply stored orthogonalization to remove main-effect components (pure interaction)
++                    if let Some(alpha) = config.interaction_orth_alpha.get(&tensor_key) {
++                        // Build M = [Intercept | PGS_main | PC_main_for_this_pc]
++                        let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
++                        // PGS_main is `pgs_main_basis` from above
++                        // PC_main_for_this_pc is `pc_range_bases[pc_idx]` from above
++                        let m_cols: Vec<Array1<f64>> = intercept
++                            .axis_iter(Axis(1))
++                            .chain(pgs_main_basis.axis_iter(Axis(1)))
++                            .chain(pc_range_bases[pc_idx].axis_iter(Axis(1)))
++                            .map(|c| c.to_owned())
++                            .collect();
++                        let m_matrix = ndarray::stack(
++                            Axis(1),
++                            &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>(),
++                        )
++                        .map_err(|_| ModelError::InternalStackingError)?;
++
++                        // Dimension check: alpha: m_cols x t_cols
++                        if m_matrix.ncols() != alpha.nrows()
++                            || tensor_interaction.ncols() != alpha.ncols()
++                        {
++                            return Err(ModelError::DimensionMismatch(format!(
++                                "Orth map dims mismatch for {}: M {}x{}, alpha {}x{}, T {}x{}",
++                                tensor_key,
++                                m_matrix.nrows(),
++                                m_matrix.ncols(),
++                                alpha.nrows(),
++                                alpha.ncols(),
++                                tensor_interaction.nrows(),
++                                tensor_interaction.ncols()
++                            )));
++                        }
++                        tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
++                    }
++
+                     // Apply stored per-interaction centering
+                     let means = config.interaction_centering_means
+                         .get(&tensor_key)
+@@ -548,6 +588,7 @@ mod tests {
+                 },
+                 range_transforms: HashMap::new(),
+                 interaction_centering_means: HashMap::new(),
++                interaction_orth_alpha: HashMap::new(),
+             },
+             coefficients: MappedCoefficients {
+                 intercept: 0.5, // Added an intercept for a more complete test
+@@ -622,6 +663,7 @@ mod tests {
+                 knot_vectors: HashMap::new(),
+                 range_transforms: HashMap::new(),
+                 interaction_centering_means: HashMap::new(),
++                interaction_orth_alpha: HashMap::new(),
+             },
+             coefficients: MappedCoefficients {
+                 intercept: 0.0,
+@@ -717,6 +759,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // Use the internal flatten_coefficients function
+@@ -799,6 +842,7 @@ mod tests {
+             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // Create a dummy dataset for generating the correct model structure
+@@ -824,6 +868,7 @@ mod tests {
+             knot_vectors,
+             range_transforms,
+             interaction_centering_means,
++            interaction_orth_alpha,
+         ) = crate::calibrate::construction::build_design_and_penalty_matrices(
+             &dummy_data,
+             &model_config,
+@@ -850,6 +895,7 @@ mod tests {
+                 knot_vectors, // Use the knot vectors generated by the model-building code
+                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
+                 interaction_centering_means: interaction_centering_means.clone(),
++                interaction_orth_alpha: interaction_orth_alpha.clone(),
+             },
+             coefficients: MappedCoefficients {
+                 intercept: 0.5,
+diff --git a/calibrate/pirls.rs b/calibrate/pirls.rs
+index 1102a6b..51b337e 100644
+--- a/calibrate/pirls.rs
++++ b/calibrate/pirls.rs
+@@ -1867,6 +1867,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // --- 3. Run the Fit ---
+@@ -2070,7 +2071,7 @@ mod tests {
+         data: &TrainingData,
+         config: &ModelConfig,
+     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
+-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means) =
++        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+             build_design_and_penalty_matrices(data, config)?;
+         let rs_original = compute_penalty_square_roots(&s_list)?;
+         Ok((x_matrix, rs_original, layout))
+@@ -2159,6 +2160,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // Test with lambda values that match the working test pattern
+@@ -2279,6 +2281,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // === PHASE 4: Prepare inputs for the target function ===
+@@ -2403,6 +2406,7 @@ mod tests {
+             knot_vectors: HashMap::new(),
+             range_transforms: HashMap::new(),
+             interaction_centering_means: HashMap::new(),
++            interaction_orth_alpha: HashMap::new(),
+         };
+ 
+         // === Set up inputs using helper ===
+diff --git a/src/main.rs b/src/main.rs
+index f2aa42f..c749bbe 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -141,6 +141,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+         knot_vectors: std::collections::HashMap::new(),
+         range_transforms: std::collections::HashMap::new(),
+         interaction_centering_means: std::collections::HashMap::new(),
++        interaction_orth_alpha: std::collections::HashMap::new(),
+     };
+ 
+     // Train the final model
