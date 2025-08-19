@@ -91,7 +91,8 @@ pub enum DataError {
 
 /// Loads and validates data specifically for model training.
 pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, DataError> {
-    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, true)?;
+    // Do not require an explicit 'weights' column. If missing, default to 1.0.
+    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, false)?;
     // This unwrap is safe because we passed `include_phenotype: true`.
     let y = y_opt.unwrap();
     Ok(TrainingData { y, p, pcs, weights })
