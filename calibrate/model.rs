@@ -80,12 +80,9 @@ pub struct ModelConfig {
     pub interaction_centering_means: HashMap<String, Array1<f64>>,
     /// Linear maps that orthogonalize each interaction block against the main effects (pure ti())
     /// Keyed by interaction term name (e.g., "f(PGS,PC1)"). Shape: m_cols x t_cols.
-    #[serde(default)]
     pub interaction_orth_alpha: HashMap<String, Array2<f64>>,
     /// Null-space transformation matrices for PC main effects (unpenalized part).
     /// Maps PC name to Z_null (columns span the penalty null space after dropping intercept).
-    /// Optional for backward compatibility with older models.
-    #[serde(default)]
     pub pc_null_transforms: HashMap<String, Array2<f64>>,
 }
 
@@ -318,46 +315,37 @@ mod internal {
         // Start from the unconstrained PGS basis (drop intercept col).
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
 
-        // Saved transforms
+        // Require both transform matrices - no fallbacks
         let pgs_z = config
             .sum_to_zero_constraints
             .get("pgs_main")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?;
-        let z_range_pgs_opt = config.range_transforms.get("pgs");
+        let z_range_pgs = config.range_transforms
+            .get("pgs")
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?;
 
         // Target width must match trained coefficient count
         let pgs_coef_len = coeffs.main_effects.pgs.len();
 
-        // Try: whiten then constrain; else whiten-only; else constrain-only; else error
-        let pgs_main_basis = if let Some(z_range_pgs) = z_range_pgs_opt {
-            // Check shapes: B_unc (N x m), Z_range (m x r), Z (r x c)
-            let m = pgs_main_basis_unc.ncols();
-            let r = z_range_pgs.ncols();
-            let c = pgs_z.ncols();
+        // Check shapes: B_unc (N x m), Z_range (m x r), Z (r x c)
+        let m = pgs_main_basis_unc.ncols();
+        let r = z_range_pgs.ncols();
+        let c = pgs_z.ncols();
 
-            let shapes_ok = m == z_range_pgs.nrows()
-                && r == pgs_z.nrows()
-                && c == pgs_coef_len;
+        // Verify dimensions match before matrix multiplication
+        if m != z_range_pgs.nrows() || r != pgs_z.nrows() || c != pgs_coef_len {
+            return Err(ModelError::DimensionMismatch(format!(
+                "PGS basis transform dimensions mismatch: B_unc {}×{}, Z_range {}×{}, Z {}×{}, coefs {}",
+                pgs_main_basis_unc.nrows(), m,
+                z_range_pgs.nrows(), r,
+                pgs_z.nrows(), c,
+                pgs_coef_len
+            )));
+        }
 
-            if shapes_ok {
-                let pgs_whitened = pgs_main_basis_unc.dot(z_range_pgs);
-                pgs_whitened.dot(pgs_z)
-            } else if r == pgs_coef_len && m == z_range_pgs.nrows() {
-                // Whiten only matches coefficients
-                pgs_main_basis_unc.dot(z_range_pgs)
-            } else if pgs_z.ncols() == pgs_coef_len && pgs_z.nrows() == m {
-                // Constrain only matches coefficients
-                pgs_main_basis_unc.dot(pgs_z)
-            } else {
-                return Err(ModelError::InternalStackingError);
-            }
-        } else {
-            // No range transform stored; fall back to constrain-only
-            if pgs_z.ncols() != pgs_coef_len || pgs_main_basis_unc.ncols() != pgs_z.nrows() {
-                return Err(ModelError::InternalStackingError);
-            }
-            pgs_main_basis_unc.dot(pgs_z)
-        };
+        // Apply full transform: whiten then constrain
+        let pgs_whitened = pgs_main_basis_unc.dot(z_range_pgs);
+        let pgs_main_basis = pgs_whitened.dot(pgs_z);
 
         // CRITICAL: The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
         // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
@@ -401,16 +389,22 @@ mod internal {
                 // Use range-only transformation for PC main effects (fully penalized)
                 let pc_range_basis = pc_main_basis_unc.dot(range_transform);
                 pc_range_bases.push(pc_range_basis);
-                // Build optional null-space basis if present
-                if let Some(z_null) = config.pc_null_transforms.get(pc_name) {
-                    if pc_main_basis_unc.ncols() != z_null.nrows() {
-                        return Err(ModelError::InternalStackingError);
-                    }
-                    let pc_null_basis = pc_main_basis_unc.dot(z_null);
-                    pc_null_bases.push(Some(pc_null_basis));
-                } else {
-                    pc_null_bases.push(None);
+                // Get the required null-space transform
+                let z_null = config.pc_null_transforms.get(pc_name)
+                    .ok_or_else(|| ModelError::ConstraintMissing(format!("pc_null_transform for {}", pc_name)))?;
+                
+                if pc_main_basis_unc.ncols() != z_null.nrows() {
+                    return Err(ModelError::DimensionMismatch(format!(
+                        "PC null transform dimensions mismatch for {}: basis {}×{}, transform {}×{}",
+                        pc_name,
+                        pc_main_basis_unc.nrows(), pc_main_basis_unc.ncols(),
+                        z_null.nrows(), z_null.ncols()
+                    )));
                 }
+                
+                // Build null-space basis (may have 0 columns if PC has no null space)
+                let pc_null_basis = pc_main_basis_unc.dot(z_null);
+                pc_null_bases.push(if z_null.ncols() > 0 { Some(pc_null_basis) } else { None });
             } else {
                 // No range transform found for this PC
                 return Err(ModelError::ConstraintMissing(format!("range transform for {}", pc_name)));
@@ -477,39 +471,40 @@ mod internal {
                         row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
                     // Apply stored orthogonalization to remove main-effect components (pure interaction)
-                    if let Some(alpha) = config.interaction_orth_alpha.get(&tensor_key) {
-                        // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
-                        let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
-                        // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
-                        let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
-                        m_cols.extend(pgs_main_basis.axis_iter(Axis(1)).map(|c| c.to_owned()));
-                        if let Some(ref pc_null) = pc_null_bases[pc_idx] {
-                            m_cols.extend(pc_null.axis_iter(Axis(1)).map(|c| c.to_owned()));
-                        }
-                        m_cols.extend(pc_range_bases[pc_idx].axis_iter(Axis(1)).map(|c| c.to_owned()));
-                        let m_matrix = ndarray::stack(
-                            Axis(1),
-                            &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>(),
-                        )
-                        .map_err(|_| ModelError::InternalStackingError)?;
-
-                        // Dimension check: alpha: m_cols x t_cols
-                        if m_matrix.ncols() != alpha.nrows()
-                            || tensor_interaction.ncols() != alpha.ncols()
-                        {
-                            return Err(ModelError::DimensionMismatch(format!(
-                                "Orth map dims mismatch for {}: M {}x{}, alpha {}x{}, T {}x{}",
-                                tensor_key,
-                                m_matrix.nrows(),
-                                m_matrix.ncols(),
-                                alpha.nrows(),
-                                alpha.ncols(),
-                                tensor_interaction.nrows(),
-                                tensor_interaction.ncols()
-                            )));
-                        }
-                        tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
+                    let alpha = config.interaction_orth_alpha.get(&tensor_key)
+                        .ok_or_else(|| ModelError::ConstraintMissing(format!("interaction_orth_alpha for {}", tensor_key)))?;
+                    
+                    // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
+                    let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
+                    // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
+                    let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
+                    m_cols.extend(pgs_main_basis.axis_iter(Axis(1)).map(|c| c.to_owned()));
+                    if let Some(ref pc_null) = pc_null_bases[pc_idx] {
+                        m_cols.extend(pc_null.axis_iter(Axis(1)).map(|c| c.to_owned()));
                     }
+                    m_cols.extend(pc_range_bases[pc_idx].axis_iter(Axis(1)).map(|c| c.to_owned()));
+                    let m_matrix = ndarray::stack(
+                        Axis(1),
+                        &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>(),
+                    )
+                    .map_err(|_| ModelError::InternalStackingError)?;
+
+                    // Dimension check: alpha: m_cols x t_cols
+                    if m_matrix.ncols() != alpha.nrows()
+                        || tensor_interaction.ncols() != alpha.ncols()
+                    {
+                        return Err(ModelError::DimensionMismatch(format!(
+                            "Orth map dims mismatch for {}: M {}x{}, alpha {}x{}, T {}x{}",
+                            tensor_key,
+                            m_matrix.nrows(),
+                            m_matrix.ncols(),
+                            alpha.nrows(),
+                            alpha.ncols(),
+                            tensor_interaction.nrows(),
+                            tensor_interaction.ncols()
+                        )));
+                    }
+                    tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
 
                     // Add all columns from this tensor product to the design matrix (no extra centering)
                     for col in tensor_interaction.axis_iter(Axis(1)) {
