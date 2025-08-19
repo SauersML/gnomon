@@ -830,7 +830,9 @@ pub fn update_glm_vectors(
     link: LinkFunction,
     prior_weights: ArrayView1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    const MIN_WEIGHT: f64 = 1e-6;
+    // Smaller floor for Fisher weights to preserve geometry; slightly larger floor for z denom
+    const MIN_WEIGHT: f64 = 1e-12;
+    const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8; // Epsilon for clamping probabilities
 
     match link {
@@ -845,16 +847,13 @@ pub fn update_glm_vectors(
             // This term must NOT include prior weights.
             let dmu_deta = &mu * &(1.0 - &mu);
 
-            // 2. Create a single, clamped "effective derivative" for consistency.
-            // Use the SAME clamped derivative for both weights and working response
-            let eff_dmu_deta = dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
-            
-            // 3. Calculate the full working weights, which DO include prior weights.
-            let weights = &prior_weights * &eff_dmu_deta;
+            // 2a. Weights: use true Fisher weights with a tiny floor to avoid literal zeros
+            let fisher_w = dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
+            let weights = &prior_weights * &fisher_w;
 
-            // 4. Calculate the working response `z` using the same clamped derivative.
-            // CRITICAL: Use eff_dmu_deta (clamped) for consistency with weights
-            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &eff_dmu_deta);
+            // 2b. Working response denominator: allow a slightly larger floor for stability
+            let denom_z = dmu_deta.mapv(|v| v.max(MIN_D_FOR_Z));
+            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &denom_z);
 
             (mu, weights, z)
         }

@@ -1838,7 +1838,7 @@ pub mod internal {
                         range: (-1.5, 1.5),
                     }
                 ],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -1969,7 +1969,7 @@ pub mod internal {
                         range: (-1.5, 1.5),
                     }
                 ],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -2294,7 +2294,7 @@ pub mod internal {
                     },
                     range: (-1.5, 1.5),
                 }],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -2428,13 +2428,16 @@ pub mod internal {
             let mut last_fpr: f64 = 0.0;
 
             let mut i = 0;
+            let tie_eps: f64 = 1e-12;
             while i < pairs.len() {
                 // Handle ties: Process all data points with the same prediction score together.
                 let current_score = pairs[i].0;
                 let mut tp_in_tie_group = 0.0;
                 let mut fp_in_tie_group = 0.0;
 
-                while i < pairs.len() && *pairs[i].0 == *current_score {
+                while i < pairs.len()
+                    && (pairs[i].0 - current_score).abs() <= tie_eps
+                {
                     if *pairs[i].1 > 0.5 {
                         // It's a positive outcome
                         tp_in_tie_group += 1.0;
@@ -2560,7 +2563,7 @@ pub mod internal {
                         range: (-1.5, 1.5),
                     },
                 ],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-3.0, 3.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -2877,7 +2880,7 @@ pub mod internal {
                     degree: 3,
                 },
                 pc_configs: vec![],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3648,7 +3651,7 @@ pub mod internal {
                     reml_max_iterations: 20,
                     pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
                     pc_configs: vec![],
-                    pgs_range: (-1.0, 1.0),
+                    pgs_range: (-2.0, 2.0),
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
@@ -3948,7 +3951,7 @@ pub mod internal {
                     basis_config: BasisConfig { num_knots: 2, degree: 3 },
                     range: (-1.5, 1.5),
                 }],
-                pgs_range: (-1.0, 1.0),
+                pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -4624,7 +4627,7 @@ mod optimizer_progress_tests {
                 PrincipalComponentConfig {
                     name: "PC1".to_string(),
                     basis_config: BasisConfig { num_knots: 6, degree: 3 },
-                    range: (-1.5, 1.5),
+                    range: (-3.0, 3.0),
                 },
             ],
             pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness

@@ -200,6 +200,34 @@ impl TrainedModel {
         Ok(predictions)
     }
 
+    /// Returns the linear predictor (η = Xβ) for new data without applying the inverse link.
+    ///
+    /// This is useful for diagnostics and tests that want to validate design-matrix
+    /// consistency (e.g., checking that training-time `X.dot(beta)` equals prediction-time
+    /// reconstruction). For logistic models, prefer `predict` for probabilities.
+    pub fn predict_linear(
+        &self,
+        p_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<Array1<f64>, ModelError> {
+        if pcs_new.ncols() != self.config.pc_configs.len() {
+            return Err(ModelError::MismatchedPcCount {
+                found: pcs_new.ncols(),
+                expected: self.config.pc_configs.len(),
+            });
+        }
+
+        let x_new =
+            internal::construct_design_matrix(p_new, pcs_new, &self.config, &self.coefficients)?;
+        let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
+
+        if x_new.ncols() != flattened_coeffs.len() {
+            return Err(ModelError::InternalStackingError);
+        }
+
+        Ok(x_new.dot(&flattened_coeffs))
+    }
+
     /// Saves the trained model to a file in a human-readable TOML format.
     pub fn save(&self, path: &str) -> Result<(), ModelError> {
         let toml_string = toml::to_string_pretty(self)?;

@@ -1628,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_prediction_design_matrix_consistency() {
+    fn test_predict_linear_equals_x_beta() {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
         // Use destructuring and explicitly name variables, but ignore with _ for the unused ones
@@ -1720,10 +1720,10 @@ mod tests {
             lambdas: vec![], // not used at prediction
         };
 
-        // Compute predictions via predict() (which rebuilds X_new internally)
+        // Compute predictions via predict_linear() (which rebuilds X_new internally)
         let preds_via_predict = model
-            .predict(data.p.view(), data.pcs.view())
-            .expect("predict failed");
+            .predict_linear(data.p.view(), data.pcs.view())
+            .expect("predict_linear failed");
 
         // Compute predictions directly from X_training (should match)
         let preds_direct = x_training.dot(&flat);
