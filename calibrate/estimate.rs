@@ -1052,6 +1052,27 @@ pub mod internal {
                         laml, -laml
                     );
 
+                    // Diagnostics: effective degrees of freedom via tr(H^{-1} S_λ)
+                    // Compute in the transformed basis for consistency (H and S_λ are available)
+                    let s_lambda_transformed = &pirls_result.reparam_result.s_transformed;
+                    let hessian_t = &pirls_result.stabilized_hessian_transformed;
+                    let mut trace_h_inv_s_lambda = 0.0;
+                    for j in 0..s_lambda_transformed.ncols() {
+                        let s_col = s_lambda_transformed.column(j);
+                        if s_col.iter().all(|&x| x == 0.0) {
+                            continue;
+                        }
+                        if let Ok(h_inv_col) = internal::robust_solve(hessian_t, &s_col.to_owned()) {
+                            trace_h_inv_s_lambda += h_inv_col[j];
+                        }
+                    }
+                    let p_eff = pirls_result.beta_transformed.len() as f64;
+                    let edf = p_eff - trace_h_inv_s_lambda;
+                    println!(
+                        "[GNOMON COST] EDF diag: p = {:.3}, tr(H^-1 Sλ) = {:.6}, edf = {:.6}",
+                        p_eff, trace_h_inv_s_lambda, edf
+                    );
+
                     eprintln!("    [Debug] LAML score calculated: {laml:.6}");
 
                     // Return negative LAML score for minimization
@@ -1237,16 +1258,13 @@ pub mod internal {
         ///
         /// # Key Distinction Between REML and LAML Gradients
         ///
-        /// For Gaussian models (REML), the gradient includes the term (β̂ᵀS_kβ̂)/σ².
-        ///
-        /// For non-Gaussian models (LAML), the β̂ᵀS_kβ̂ term is exactly canceled by other terms
-        /// arising from the derivative of log|H_p| through its dependency on β̂. This cancellation
-        /// is derived in Wood (2011, Appendix D) and results in a simplified gradient formula that
-        /// does not include the explicit beta term.
-        ///
-        /// In essence, when differentiating the full LAML score with respect to smoothing parameters,
-        /// indirect effects through β̂ create terms that precisely cancel the explicit β̂ᵀS_kβ̂ term.
-        /// This is not an approximation but an exact mathematical result from the total derivative.
+        /// - Gaussian (REML): by the envelope theorem the indirect β̂ terms vanish. The deviance
+        ///   contribution reduces to the penalty-only derivative, yielding the familiar
+        ///   (β̂ᵀS_kβ̂)/σ² piece in the gradient.
+        /// - Non-Gaussian (LAML): there is no cancellation of the penalty derivative within the
+        ///   deviance component. The derivative of the penalized deviance must include both
+        ///   d(D)/dρ_k and d(βᵀSβ)/dρ_k. Our implementation follows mgcv’s gdi1: we add the penalty
+        ///   derivative to the deviance derivative before applying the 1/2 factor.
 
         // 1.  Start with the chain rule.  For any λₖ,
         //     dV/dλₖ = ∂V/∂λₖ  (holding β̂ fixed)  +  (∂V/∂β̂)ᵀ · (∂β̂/∂λₖ).
@@ -1515,6 +1533,8 @@ pub mod internal {
                     };
 
                     // --- Loop through penalties to compute each gradient component ---
+                    // Pre-fetch S_λ in the transformed basis to compute the penalty derivative
+                    let s_lambda = &pirls_result.reparam_result.s_transformed;
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
                         let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
@@ -1525,16 +1545,25 @@ pub mod internal {
                             -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
                         // ---
-                        // Component 1: Derivative of the Penalized Deviance (MISSING TERM!)
-                        // This corresponds to `oo$D1/(2*scale)` in mgcv
+                        // Component 1: Derivative of the Penalized Deviance (complete)
+                        // This corresponds to `oo$D1/2` in mgcv; for LAML we must include
+                        // both the unpenalized deviance derivative and the penalty derivative.
                         // ---
 
                         // Calculate d(Deviance)/dρ_k using the chain rule
                         let d_deviance_d_rho_k =
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
 
-                        // Correctly named - this is only the unpenalized deviance derivative
-                        let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
+                        // Add the missing penalty derivative: d(β' S β)/dρ_k
+                        // = 2 (dβ/dρ_k)' S_λ β + β' (∂S_λ/∂ρ_k) β, with ∂S_λ/∂ρ_k = λ_k S_k
+                        let s_lambda_beta = s_lambda.dot(beta_transformed);
+                        let dbl_term = 2.0 * dbeta_drho_k_transformed.dot(&s_lambda_beta);
+                        let beta_t_sk_beta = beta_transformed.dot(&s_k_beta_transformed);
+                        let d_s_term = lambdas[k] * beta_t_sk_beta;
+                        let d_penalty_d_rho_k = dbl_term + d_s_term;
+
+                        // Final penalized deviance derivative contribution
+                        let deviance_grad_term = 0.5 * (d_deviance_d_rho_k + d_penalty_d_rho_k);
 
                         // ---
                         // Component 2: Derivative of log|H| (existing code)
@@ -4756,5 +4785,100 @@ mod optimizer_progress_tests {
         );
 
         Ok(())
+    }
+}
+
+// === Numerical gradient validation for LAML ===
+#[cfg(test)]
+mod gradient_validation_tests {
+    use super::*;
+    use super::test_helpers;
+    use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn test_laml_gradient_matches_finite_difference() {
+        // Small, well-behaved binary dataset to avoid separation
+        let n = 120;
+        let mut rng = StdRng::seed_from_u64(123);
+        let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
+        // Include one penalized PC term so the model has at least one smoothing parameter
+        let pc1 = Array1::from_shape_fn(n, |_| rng.gen_range(-1.5..1.5));
+        let mut pcs = Array2::zeros((n, 1));
+        pcs.column_mut(0).assign(&pc1);
+        // Generate probabilities from a gentle logit to avoid extremes
+        // Avoid method-based clamp to prevent type ambiguity on older toolchains
+        let logits = p.mapv(|v| {
+            let t = 0.8_f64 * v;
+            t.max(-6.0).min(6.0)
+        });
+        let y = test_helpers::generate_y_from_logit(&logits, &mut rng);
+        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n) };
+
+        let config = ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 20,
+            pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
+            pc_configs: vec![
+                PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    range: (-1.5, 1.5),
+                }
+            ],
+            pgs_range: (-2.0, 2.0),
+            sum_to_zero_constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
+            interaction_orth_alpha: std::collections::HashMap::new(),
+        };
+
+        // Build matrices and create REML state
+        let (x, s_list, layout, _sum_to_zero, _knots, _ranges, _int_means, _alphas) =
+            build_design_and_penalty_matrices(&data, &config).expect("matrix build");
+        assert!(layout.num_penalties > 0, "Model must have at least one penalty");
+
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+        ).expect("state");
+
+        // Evaluate at rho = 0 (λ = 1)
+        let rho0 = Array1::zeros(layout.num_penalties);
+        let analytic = reml_state.compute_gradient(&rho0).expect("analytic grad");
+
+        // Central-difference numerical gradient of the cost
+        let h = 1e-6;
+        let mut numeric = Array1::zeros(layout.num_penalties);
+        for k in 0..layout.num_penalties {
+            let mut rp = rho0.clone();
+            rp[k] += h;
+            let mut rm = rho0.clone();
+            rm[k] -= h;
+            let fp = reml_state.compute_cost(&rp).expect("cost+");
+            let fm = reml_state.compute_cost(&rm).expect("cost-");
+            numeric[k] = (fp - fm) / (2.0 * h);
+        }
+
+        // Compare with a tight relative tolerance
+        for k in 0..layout.num_penalties {
+            let denom = numeric[k].abs().max(1.0);
+            let rel_err = (analytic[k] - numeric[k]).abs() / denom;
+            assert!(
+                rel_err < 1e-5,
+                "k={}: analytic={:.6e}, numeric={:.6e}, rel_err={:.3e}",
+                k, analytic[k], numeric[k], rel_err
+            );
+        }
     }
 }

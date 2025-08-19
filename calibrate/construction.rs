@@ -845,7 +845,8 @@ pub fn stable_reparameterization(
     }
 
     // Wood (2011) Appendix B: get_stableS algorithm
-    let eps = 1e-4; // A much more robust tolerance for partitioning
+    // Use a tighter tolerance for α/γ partitioning to better match mgcv
+    let eps = 1e-7; // robust partitioning tolerance (was 1e-4)
     // println!("DEBUG: eps = {}", eps);
     let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
 
