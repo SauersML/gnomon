@@ -3,6 +3,7 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::ModelConfig;
 use ndarray::{Array1, Array2, Axis, s};
+use ndarray::parallel::prelude::*;
 use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -10,17 +11,12 @@ use std::ops::Range;
 /// Computes weighted column means for functional ANOVA decomposition.
 /// Returns the weighted means that would be subtracted by center_columns_in_place.
 fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
-    let w_sum = w.sum();
-    if w_sum <= 0.0 {
+    let denom = w.sum();
+    if denom <= 0.0 {
         return Array1::zeros(x.ncols());
     }
-    // Weighted column means: m_j = (w^T x_j) / sum(w)
-    let mut means = Array1::zeros(x.ncols());
-    for j in 0..x.ncols() {
-        let col = x.column(j);
-        means[j] = w.iter().zip(col).map(|(wi, xi)| wi * xi).sum::<f64>() / w_sum;
-    }
-    means
+    // Vectorized: means = (X^T w) / sum(w)
+    x.t().dot(w) / denom
 }
 
 /// Centers the columns of a matrix using weighted means.
@@ -42,6 +38,9 @@ pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
 pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let (a_rows, a_cols) = a.dim();
     let (b_rows, b_cols) = b.dim();
+    if a_rows == 0 || a_cols == 0 || b_rows == 0 || b_cols == 0 {
+        return Array2::zeros((a_rows * b_rows, a_cols * b_cols));
+    }
     let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
 
     for i in 0..a_rows {
@@ -71,18 +70,27 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
     let a_cols = a.ncols();
     let b_cols = b.ncols();
-    let mut result = Array2::zeros((n_samples, a_cols * b_cols));
-
-    for row in 0..n_samples {
-        let mut col_idx = 0;
-        for i in 0..a_cols {
-            for j in 0..b_cols {
-                result[[row, col_idx]] = a[[row, i]] * b[[row, j]];
-                col_idx += 1;
-            }
-        }
+    // Trivial early return for degenerate shapes
+    if n_samples == 0 || a_cols == 0 || b_cols == 0 {
+        return Array2::zeros((n_samples, a_cols * b_cols));
     }
-
+    let mut result = Array2::zeros((n_samples, a_cols * b_cols));
+    result
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(r, mut row)| {
+            let ar = a.row(r);
+            let br = b.row(r);
+            let mut k = 0;
+            for i in 0..a_cols {
+                let ai = ar[i];
+                for j in 0..b_cols {
+                    row[k] = ai * br[j];
+                    k += 1;
+                }
+            }
+        });
     result
 }
 
@@ -94,6 +102,9 @@ pub struct ModelLayout {
     /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
     pub pc_null_cols: Vec<Range<usize>>,  
     pub penalty_map: Vec<PenalizedBlock>,
+    /// Direct indices to avoid string lookups in hot paths
+    pub pc_main_block_idx: Vec<usize>,
+    pub interaction_block_idx: Vec<usize>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
 }
@@ -134,6 +145,7 @@ impl ModelLayout {
         let mut current_col = 0;
         let mut penalty_idx_counter = 0;
         let mut pc_null_cols: Vec<Range<usize>> = Vec::with_capacity(config.pc_configs.len());
+        let mut pc_main_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
@@ -154,6 +166,13 @@ impl ModelLayout {
         let intercept_col = current_col;
         current_col += 1;
 
+        // Reserve capacities to avoid reallocations
+        // Estimated number of penalized blocks: one per PC main effect, plus one per interaction (if enabled)
+        let estimated_penalized_blocks = config.pc_configs.len()
+            + if num_pgs_interaction_bases > 0 { config.pc_configs.len() } else { 0 };
+        penalty_map.reserve_exact(estimated_penalized_blocks);
+        pc_null_cols.reserve_exact(config.pc_configs.len());
+
         // Main effect for each PC (first reserve null/unpenalized, then range/penalized)
         for (i, (&n_null, &n_range)) in pc_null_basis_ncols
             .iter()
@@ -173,6 +192,7 @@ impl ModelLayout {
                 penalty_indices: vec![penalty_idx_counter], // Each PC main gets unique penalty index
                 term_type: TermType::PcMainEffect,
             });
+            pc_main_block_idx.push(penalty_map.len() - 1);
             current_col += n_range;
             penalty_idx_counter += 1; // Increment for next penalty
         }
@@ -183,6 +203,7 @@ impl ModelLayout {
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
         // Tensor product interaction effects (each gets one penalty since we use whitened marginals)
+        let mut interaction_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
         if num_pgs_interaction_bases > 0 {
             for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
@@ -195,6 +216,7 @@ impl ModelLayout {
                     term_type: TermType::Interaction,
                 });
 
+                interaction_block_idx.push(penalty_map.len() - 1);
                 current_col += num_tensor_coeffs;
                 penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
             }
@@ -215,6 +237,8 @@ impl ModelLayout {
             pgs_main_cols,
             pc_null_cols,
             penalty_map,
+            pc_main_block_idx,
+            interaction_block_idx,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
         })
@@ -294,6 +318,15 @@ pub fn build_design_and_penalty_matrices(
     let mut interaction_centering_means = HashMap::new();
     let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
 
+    // Reserve capacities to avoid rehashing/reallocation
+    let n_pcs = config.pc_configs.len();
+    // +1 for PGS entries where applicable
+    knot_vectors.reserve(n_pcs + 1);
+    range_transforms.reserve(n_pcs + 1);
+    pc_null_transforms.reserve(n_pcs);
+    interaction_centering_means.reserve(n_pcs);
+    interaction_orth_alpha.reserve(n_pcs);
+
     // 1. Generate basis for PGS and apply sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
         data.p.view(),
@@ -325,9 +358,9 @@ pub fn build_design_and_penalty_matrices(
     sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform);
 
     // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
-    let mut pc_range_bases = Vec::new();
-    let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::new();
-    let mut pc_unconstrained_bases_main = Vec::new();
+    let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
+    let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
+    let mut pc_unconstrained_bases_main: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
 
     // Check if we have any PCs to process
     if config.pc_configs.is_empty() {
@@ -409,15 +442,13 @@ pub fn build_design_and_penalty_matrices(
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
         let col_range = block.col_range.clone();
-        let range_len = col_range.len();
+        let _range_len = col_range.len();
 
         match block.term_type {
             TermType::PcMainEffect => {
                 // Main effects have single penalty index
                 let penalty_idx = block.penalty_indices[0];
-                s_list[penalty_idx]
-                    .slice_mut(s![col_range.clone(), col_range])
-                    .assign(&Array2::eye(range_len));
+                for j in col_range.clone() { s_list[penalty_idx][[j, j]] = 1.0; }
             }
             TermType::Interaction => {
                 // Interactions now have single penalty index since both marginals are whitened
@@ -433,9 +464,7 @@ pub fn build_design_and_penalty_matrices(
 
                 // Since we use WHITENED marginals for interactions, penalty is identity matrix
                 // This creates proper scale consistency between main effects and interactions
-                s_list[penalty_idx]
-                    .slice_mut(s![col_range.clone(), col_range])
-                    .assign(&Array2::eye(range_len));
+                for j in col_range.clone() { s_list[penalty_idx][[j, j]] = 1.0; }
             }
         }
     }
@@ -535,20 +564,14 @@ pub fn build_design_and_penalty_matrices(
             EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
         })?;
         let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
+        // Precompute sqrt(weights) once for this section
+        let w_sqrt = data.weights.mapv(f64::sqrt);
+        let w_col = w_sqrt.view().insert_axis(Axis(1));
 
         for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
             let pc_name = &pc_config.name;
-            // Find the corresponding tensor product block in the layout
-            let tensor_block = layout
-                .penalty_map
-                .iter()
-                .find(|block| block.term_name == format!("f(PGS,{})", pc_name))
-                .ok_or_else(|| {
-                    EstimationError::LayoutError(format!(
-                        "Could not find tensor product block for f(PGS,{})",
-                        pc_name
-                    ))
-                })?;
+            // Directly index the corresponding tensor product block
+            let tensor_block = &layout.penalty_map[layout.interaction_block_idx[pc_idx]];
 
             // Use WHITENED PC marginal for scale consistency with main effects
             let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
@@ -582,15 +605,7 @@ pub fn build_design_and_penalty_matrices(
             let intercept = x_matrix.slice(s![.., layout.intercept_col..layout.intercept_col + 1]).to_owned();
             let pgs_main = x_matrix.slice(s![.., layout.pgs_main_cols.clone()]).to_owned();
             // Extract this PC's main effect columns: null then range
-            let pc_block = layout
-                .penalty_map
-                .iter()
-                .find(|block| block.term_type == TermType::PcMainEffect
-                    && block.term_name == format!("f({})", pc_name))
-                .ok_or_else(|| EstimationError::LayoutError(format!(
-                    "Could not locate main-effect block for {} while building interaction orthogonalization",
-                    pc_name
-                )))?;
+            let pc_block = &layout.penalty_map[layout.pc_main_block_idx[pc_idx]];
             let pc_null_cols = &layout.pc_null_cols[pc_idx];
             let pc_null = if pc_null_cols.len() > 0 {
                 Some(x_matrix.slice(s![.., pc_null_cols.clone()]).to_owned())
@@ -599,20 +614,28 @@ pub fn build_design_and_penalty_matrices(
             };
             let pc_range = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
 
-            // Stack M columns in the order [Intercept | PGS_main | PC_null | PC_range]
-            let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
-            m_cols.extend(pgs_main.axis_iter(Axis(1)).map(|c| c.to_owned()));
+            // Preallocate M = [Intercept | PGS_main | PC_null (opt) | PC_range]
+            let m_cols = 1 + pgs_main.ncols() + pc_null.as_ref().map_or(0, |z| z.ncols()) + pc_range.ncols();
+            let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
+            let mut offset = 0;
+            // Intercept
+            m_matrix.slice_mut(s![.., offset..offset + 1]).assign(&intercept);
+            offset += 1;
+            // PGS_main
+            m_matrix.slice_mut(s![.., offset..offset + pgs_main.ncols()]).assign(&pgs_main);
+            offset += pgs_main.ncols();
+            // PC_null
             if let Some(pc_n) = pc_null.as_ref() {
-                m_cols.extend(pc_n.axis_iter(Axis(1)).map(|c| c.to_owned()));
+                m_matrix.slice_mut(s![.., offset..offset + pc_n.ncols()]).assign(pc_n);
+                offset += pc_n.ncols();
             }
-            m_cols.extend(pc_range.axis_iter(Axis(1)).map(|c| c.to_owned()));
-            let m_matrix = ndarray::stack(Axis(1), &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>())
-                .map_err(|_| EstimationError::LayoutError("Failed to assemble interaction M matrix".to_string()))?;
+            // PC_range
+            m_matrix.slice_mut(s![.., offset..offset + pc_range.ncols()]).assign(&pc_range);
 
             // Weighted projection: Alpha = (M^T W M)^+ (M^T W T)
-            let w_sqrt = data.weights.mapv(|wi| wi.sqrt());
-            let mw = &m_matrix * &w_sqrt.view().insert_axis(Axis(1));
-            let tw = &tensor_interaction * &w_sqrt.view().insert_axis(Axis(1));
+            // Reuse precomputed weight column once
+            let mw = &m_matrix * &w_col;
+            let tw = &tensor_interaction * &w_col;
 
             // Compute Gram matrix and RHS
             let gram = mw.t().dot(&mw);

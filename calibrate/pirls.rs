@@ -2085,6 +2085,8 @@ mod tests {
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             penalty_map: vec![],
+            pc_main_block_idx: vec![],
+            interaction_block_idx: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };
@@ -2193,6 +2195,8 @@ mod tests {
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             penalty_map: vec![],
+            pc_main_block_idx: vec![],
+            interaction_block_idx: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };
@@ -3038,6 +3042,8 @@ mod tests {
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             penalty_map: vec![],
+            pc_main_block_idx: vec![],
+            interaction_block_idx: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };
