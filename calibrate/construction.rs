@@ -306,23 +306,7 @@ pub fn build_design_and_penalty_matrices(
     knot_vectors.insert("pgs".to_string(), pgs_knots);
 
     // Build PGS penalty on FULL basis (not arbitrarily sliced)
-    let s_pgs_full = create_difference_penalty_matrix(pgs_basis_unc.ncols(), config.penalty_order)?;
-
-    // Decompose full penalty to get range/null spaces correctly
-    let (pgs_evals, pgs_evecs) = s_pgs_full
-        .eigh(ndarray_linalg::UPLO::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-
-    // Use relative tolerance for robust null/range separation
-    let max_pgs_eval = pgs_evals.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
-    let pgs_tol = max_pgs_eval * 1e-12;
-    let pgs_range_idxs: Vec<usize> = pgs_evals
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &d)| if d > pgs_tol { Some(i) } else { None })
-        .collect();
-    let _u_pgs_range = pgs_evecs.select(ndarray::Axis(1), &pgs_range_idxs);
-    // Unused variable removed: d_pgs_range
+    // Note: previous eigen-decomposition and range extraction were unused and removed
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -364,24 +348,7 @@ pub fn build_design_and_penalty_matrices(
         // Save PC knot vector
         knot_vectors.insert(pc_name.clone(), pc_knots);
 
-        // Build PC penalty on FULL basis (not arbitrarily sliced)
-        let s_pc_full =
-            create_difference_penalty_matrix(pc_basis_unc.ncols(), config.penalty_order)?;
-
-        // Decompose full penalty to get range/null spaces correctly
-        let (pc_evals, pc_evecs) = s_pc_full
-            .eigh(ndarray_linalg::UPLO::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-
-        // Use relative tolerance for robust null/range separation
-        let max_pc_eval = pc_evals.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
-        let pc_tol = max_pc_eval * 1e-12;
-        let pc_range_idxs: Vec<usize> = pc_evals
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &d)| if d > pc_tol { Some(i) } else { None })
-            .collect();
-        let _u_pc_range = pc_evecs.select(ndarray::Axis(1), &pc_range_idxs);
+        // Note: previous eigen-decomposition and range extraction were unused and removed
 
         // For PC main effects: use non-intercept columns for whitened range basis
         let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);

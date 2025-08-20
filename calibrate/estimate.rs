@@ -204,24 +204,19 @@ pub fn train_model(
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
 
-    // --- START MODIFICATION ---
-    // Add a check to only run the gradient check once, e.g., using a static flag.
-    // This prevents it from running every time train_model is called in a larger program.
+    // Run the gradient check at most once using a static flag.
     use std::sync::Once;
     static GRADIENT_CHECK_ONCE: Once = Once::new();
-    // --- END MODIFICATION ---
+    // end one-time gradient check setup
 
     for (i, seed) in seed_candidates.iter().enumerate() {
-
-        // --- START MODIFICATION ---
-        // Perform the gradient check for selected seeds.
-        // The `call_once` ensures this diagnostic only runs the first time train_model is executed.
+        // Perform the gradient check for selected seeds using call_once.
         GRADIENT_CHECK_ONCE.call_once(|| {
             if [1, 4, 7].contains(&i) && i < seed_candidates.len() {
                  check_gradient_for_seed(&reml_state, seed, i);
             }
         });
-        // --- END MODIFICATION ---
+        // end per-seed gradient check block
         let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
                 eprintln!(
@@ -625,7 +620,6 @@ pub fn train_model(
     })
 }
 
-// ADD THIS HELPER FUNCTION
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
 fn compute_fd_gradient(
     reml_state: &internal::RemlState,
@@ -651,7 +645,6 @@ fn compute_fd_gradient(
     Ok(fd_grad)
 }
 
-// ADD THIS HELPER FUNCTION
 /// Computes and prints the cosine similarity between the analytical and finite-difference gradients.
 fn check_gradient_for_seed(
     reml_state: &internal::RemlState,
@@ -3284,7 +3277,7 @@ pub mod internal {
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Try with very large lambda values (exp(10) ~ 22000)
@@ -3414,7 +3407,7 @@ pub mod internal {
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             let reml_state = internal::RemlState::new(
@@ -3801,7 +3794,7 @@ pub mod internal {
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
 
@@ -3942,7 +3935,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-                let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4078,7 +4071,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                     panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                 });
@@ -4267,7 +4260,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4427,7 +4420,7 @@ pub mod internal {
     };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4542,7 +4535,7 @@ pub mod internal {
             };
 
             // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _sum_to_zero_constraints_simple, _knot_vectors_simple, _range_transforms_simple, _pc_null_transforms_simple, _interaction_centering_means_simple, _interaction_orth_alpha_simple) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -4729,7 +4722,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Try to build the matrices - if this fails, the test is still valid
             let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -4933,7 +4926,7 @@ mod optimizer_progress_tests {
         };
 
         // 3) Build matrices and REML state to evaluate cost at specific rho
-        let (x_matrix, s_list, layout, _sum_to_zero_constraints, _knot_vectors, _range_transforms, _pc_null_transforms, _interaction_centering_means, _interaction_orth_alpha) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
             data.y.view(),
@@ -5046,7 +5039,7 @@ mod gradient_validation_tests {
             &config,
         ).expect("state");
         
-        // --- 2. THE FIX: Use a larger step size for the numerical gradient ---
+        // Step 2: use a larger step size for the numerical gradient
         
         // Evaluate at rho = 0 (λ = 1)
         let rho0 = Array1::zeros(layout.num_penalties);

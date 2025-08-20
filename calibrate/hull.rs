@@ -63,7 +63,7 @@ impl PeeledHull {
         let mut x = y.to_owned();
         let mut p_corr: Vec<Array1<f64>> = (0..m).map(|_| Array1::zeros(d)).collect();
 
-        for _cycle in 0..max_cycles {
+        for _ in 0..max_cycles {
             let x_prev = x.clone();
             for (i, (a, b)) in self.facets.iter().enumerate() {
                 // y_i = x + p_i
@@ -184,7 +184,6 @@ pub fn build_peeled_hull(data: &Array2<f64>, peels: usize) -> Result<PeeledHull,
     }
 
     // Copy working set of points
-    let _indices: Vec<usize> = (0..n).collect();
     let mut current = data.clone();
 
     // Deterministic direction set: ±e_i plus a set of pseudo-random unit vectors
