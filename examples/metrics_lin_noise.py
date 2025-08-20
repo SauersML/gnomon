@@ -37,8 +37,8 @@ def calculate_and_store_metrics(model_name, y_true, y_prob, pc_values, results_l
     
     groups = {
         'Global': np.ones_like(y_true, dtype=bool),
-        'Bottom 20% PC (Low Noise)': pc_values <= bottom_thresh,
-        'Top 20% PC (High Noise)': pc_values >= top_thresh
+        'Bottom 20% of Individuals (Low PC)': pc_values <= bottom_thresh,
+        'Top 20% of Individuals (High PC)': pc_values >= top_thresh
     }
     
     for group_name, mask in groups.items():
@@ -86,19 +86,24 @@ plt.rcParams.update({'font.family': 'sans-serif', 'font.weight': 'bold', 'axes.l
 COLOR_GAM_FIT, COLOR_EMPIRICAL, COLOR_LINEAR_FAIL = '#333333', '#0072B2', '#D55E00'
 np.random.seed(42)
 
-# --- REVISED DATA GENERATION with 100K SAMPLES ---
-print("--- Generating Simulated Data ---")
+# --- REVISED DATA GENERATION with SKEWED PC DISTRIBUTION ---
+print("--- Generating Simulated Data with Skewed PC Distribution ---")
 N = 100000
 beta, gamma, sigma_g_sq = 0.8, 0.4, 1.0
 c0_std, c1_std = 0.05, 5.0
 
-PC = np.random.uniform(0, 1, N)
+target_quantile, target_prob = 0.2, 0.8
+k = np.log(target_prob) / np.log(target_quantile)
+u = np.random.uniform(0, 1, N)
+PC = u**(1/k)
+
 G = np.random.normal(0, np.sqrt(sigma_g_sq), N)
 P = G + np.random.normal(0, c0_std + c1_std * PC, N)
 prob_Y = 1 / (1 + np.exp(-(beta * G + gamma * PC)))
 Y = np.random.binomial(1, prob_Y)
 
-print(f"Generated {N} samples with a STEEP noise gradient.")
+print(f"Generated {N} samples with a STEEP noise gradient and SKEWED PC distribution.")
+print(f"Verification: Percentage of samples with PC <= {target_quantile}: {np.mean(PC <= target_quantile):.2%}")
 print(f"Overall prevalence of the outcome: {np.mean(Y):.2%}\n")
 
 # --- 2. Data Splitting (50/50 split) ---
@@ -139,8 +144,8 @@ bottom_thresh = np.percentile(PC_test, 20)
 top_thresh = np.percentile(PC_test, 80)
 groups_masks = {
     'Global': np.ones_like(Y_test, dtype=bool),
-    'Bottom 20% PC (Low Noise)': PC_test <= bottom_thresh,
-    'Top 20% PC (High Noise)': PC_test >= top_thresh
+    'Bottom 20% of Individuals (Low PC)': PC_test <= bottom_thresh,
+    'Top 20% of Individuals (High PC)': PC_test >= top_thresh
 }
 n_boots = 2000
 
@@ -197,8 +202,12 @@ pred_p1_link = np.log(probs_p1 / (1 - probs_p1))
 gam_derived_coefficient = pred_p1_link - pred_p0_link
 ax2.plot(pc_smooth, gam_derived_coefficient, color=COLOR_GAM_FIT, linewidth=8, label='GAM-derived Coefficient', zorder=10)
 
+# --- FIX IS HERE ---
+# Create the 3-feature data for the linear interaction model
 X_linear_train = np.c_[P_train, PC_train, P_train * PC_train]
+# Train the model on the correct 3-feature data
 lin_model = LogisticRegression(solver='liblinear').fit(X_linear_train, Y_train)
+# Unpack the 3 coefficients correctly
 coef_p, _, coef_int = lin_model.coef_[0]
 linear_fit_coefficient = coef_p + coef_int * pc_smooth
 ax2.plot(pc_smooth, linear_fit_coefficient, color=COLOR_LINEAR_FAIL, linestyle='--', linewidth=6, label='Misspecified Linear Fit', zorder=8)
@@ -220,7 +229,7 @@ ax2.set_xlabel('Principal Component Value')
 ax2.set_ylabel('Effective PGS Coefficient\n(on Log-Odds Scale)')
 ax2.legend(loc='upper right')
 ax2.grid(True, which='both', linestyle=':', linewidth=1.0)
-ax2.set_ylim(0, max(np.nanmax(empirical_coeffs), np.nanmax(gam_derived_coefficient)) * 1.2)
+ax2.set_ylim(0, max(np.nanmax(empirical_coeffs), np.nanmax(gam_derived_coefficient)) * 1.2 if not np.all(np.isnan(empirical_coeffs)) else 1.0)
 
 # --- 7. Final Touches ---
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
