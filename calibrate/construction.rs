@@ -442,7 +442,6 @@ pub fn build_design_and_penalty_matrices(
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
         let col_range = block.col_range.clone();
-        let _range_len = col_range.len();
 
         match block.term_type {
             TermType::PcMainEffect => {
