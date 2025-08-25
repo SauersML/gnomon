@@ -1782,7 +1782,8 @@ pub mod internal {
                                          + log_det_h_grad_term
                                          - log_det_s_grad_term;
                     }
-                    log::debug!("LAML gradient computation finished (mgcv-style assembly).");
+                    // mgcv-style assembly
+                    log::debug!("LAML gradient computation finished.");
                 }
             }
 
