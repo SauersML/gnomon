@@ -512,47 +512,46 @@ pub fn train_model(
                 };
 
                 // If we've already improved relative to the initial cost, accept the
-                // best-so-far parameters regardless of gradient size. The progress
-                // criterion matches downstream tests and avoids aborting after a
-                // non-improving trial step with large gradients.
+                // best-so-far parameters regardless of gradient size. Otherwise, fall
+                // back to the gradient-norm acceptance below.
                 if last_solution.final_value < initial_cost - 1e-9 {
                     eprintln!(
                         "[INFO] Accepting improved best-so-far solution despite large gradients (initial: {:.6}, best: {:.6}).",
                         initial_cost, last_solution.final_value
                     );
-                    return *last_solution;
+                    *last_solution
+                } else {
+                    // Only accept the solution if gradient norm is small enough
+                    // Use a scale-aware threshold and Jacobian-aware scaling between spaces
+                    let cost_scale = 0.1 + last_solution.final_value.abs();
+                    let grad_tol = config.reml_convergence_tolerance * cost_scale;
+                    let max_grad_norm_rho = 50.0 * grad_tol;
+                    let jac_max = z_last
+                        .iter()
+                        .map(|v| 15.0 * (1.0 - v.tanh().powi(2)))
+                        .fold(0.0f64, |a, b| a.max(b.abs()));
+                    let max_grad_norm_z = jac_max * max_grad_norm_rho;
+
+                    // Log both gradient norms for diagnostics
+                    eprintln!(
+                        "[Diag] Line-search stop gradients: ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
+                        gradient_norm_z, gradient_norm_rho
+                    );
+
+                    if gradient_norm_z > max_grad_norm_z && gradient_norm_rho > max_grad_norm_rho {
+                        return Err(EstimationError::RemlOptimizationFailed(format!(
+                            "Line-search failed far from a stationary point in z-space. ||grad_z||: {:.2e}",
+                            gradient_norm_z
+                        )));
+                    }
+
+                    eprintln!(
+                        "[INFO] Accepting the best parameters found as the final result (||grad_z||: {:.2e}, ||grad_rho||: {:.2e}).",
+                        gradient_norm_z,
+                        gradient_norm_rho
+                    );
+                    *last_solution
                 }
-
-                // Only accept the solution if gradient norm is small enough
-                // Use a scale-aware threshold and Jacobian-aware scaling between spaces
-                let cost_scale = 0.1 + last_solution.final_value.abs();
-                let grad_tol = config.reml_convergence_tolerance * cost_scale;
-                let max_grad_norm_rho = 50.0 * grad_tol;
-                let jac_max = z_last
-                    .iter()
-                    .map(|v| 15.0 * (1.0 - v.tanh().powi(2)))
-                    .fold(0.0f64, |a, b| a.max(b.abs()));
-                let max_grad_norm_z = jac_max * max_grad_norm_rho;
-
-                // Log both gradient norms for diagnostics
-                eprintln!(
-                    "[Diag] Line-search stop gradients: ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
-                    gradient_norm_z, gradient_norm_rho
-                );
-
-                if gradient_norm_z > max_grad_norm_z && gradient_norm_rho > max_grad_norm_rho {
-                    return Err(EstimationError::RemlOptimizationFailed(format!(
-                        "Line-search failed far from a stationary point in z-space. ||grad_z||: {:.2e}",
-                        gradient_norm_z
-                    )));
-                }
-
-                eprintln!(
-                    "[INFO] Accepting the best parameters found as the final result (||grad_z||: {:.2e}, ||grad_rho||: {:.2e}).",
-                    gradient_norm_z,
-                    gradient_norm_rho
-                );
-                *last_solution
             }
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
