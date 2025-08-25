@@ -204,19 +204,16 @@ pub fn train_model(
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
 
-    // Run the gradient check at most once using a static flag.
-    use std::sync::Once;
-    static GRADIENT_CHECK_ONCE: Once = Once::new();
-    // end one-time gradient check setup
+    // Decide a single seed index for a one-off gradient check (if available)
+    let grad_check_idx = [1usize, 4, 7]
+        .into_iter()
+        .find(|&k| k < seed_candidates.len());
 
     for (i, seed) in seed_candidates.iter().enumerate() {
-        // Perform the gradient check for selected seeds using call_once.
-        GRADIENT_CHECK_ONCE.call_once(|| {
-            if [1, 4, 7].contains(&i) && i < seed_candidates.len() {
-                 check_gradient_for_seed(&reml_state, seed, i);
-            }
-        });
-        // end per-seed gradient check block
+        // Perform the gradient check once for the chosen seed index, if present.
+        if Some(i) == grad_check_idx {
+            check_gradient_for_seed(&reml_state, seed, i);
+        }
         let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
                 eprintln!(
@@ -392,8 +389,25 @@ pub fn train_model(
                 // Evaluate each restart with a short BFGS run and require small gradient norm
                 let short_iters = (config.reml_max_iterations as usize).min(50).max(10);
                 let mut best_alt: Option<BfgsSolution> = None;
-                let mut best_alt_grad_norm: f64 = f64::INFINITY;
+                let mut best_alt_grad_norm_z: f64 = f64::INFINITY;
                 let mut best_alt_value: f64 = f64::INFINITY;
+
+                // Helper to compute gradient norms at a given z (optimizer space)
+                fn grad_norms_in_z_and_rho(
+                    state: &internal::RemlState,
+                    z: &Array1<f64>,
+                ) -> (f64, f64) {
+                    let rho = z.mapv(|v| 15.0 * v.tanh());
+                    let g_rho = match state.compute_gradient(&rho) {
+                        Ok(g) => g,
+                        Err(_) => return (f64::INFINITY, f64::INFINITY),
+                    };
+                    let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                    let g_z = &g_rho * &jac;
+                    let norm_z = g_z.dot(&g_z).sqrt();
+                    let norm_rho = g_rho.dot(&g_rho).sqrt();
+                    (norm_z, norm_rho)
+                }
 
                 for (idx, rho_seed) in restart_rhos.iter().enumerate() {
                     let start_z = to_z_from_rho(rho_seed);
@@ -411,37 +425,44 @@ pub fn train_model(
                         Err(_) => continue,
                     };
 
-                    // Compute gradient norm at candidate's rho to ensure near-stationarity
-                    let rho_cand = candidate.final_point.mapv(|v| 15.0 * v.tanh());
-                    let grad_norm = match reml_state.compute_gradient(&rho_cand) {
-                        Ok(g) => g.dot(&g).sqrt(),
-                        Err(_) => f64::INFINITY,
-                    };
+                    // Compute z-space gradient norm for acceptance (consistent with optimizer)
+                    let (grad_norm_z, grad_norm_rho) =
+                        grad_norms_in_z_and_rho(&reml_state, &candidate.final_point);
 
                     eprintln!(
-                        "    -> cand value = {:.6}, grad_norm = {:.3e}",
-                        candidate.final_value, grad_norm
+                        "    -> cand value = {:.6}, ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
+                        candidate.final_value, grad_norm_z, grad_norm_rho
                     );
 
-                    // Track best candidate by value, with gradient-norm tie-breaker
+                    // Track best candidate by value, with z-gradient-norm tie-breaker
                     if candidate.final_value < best_alt_value
                         || (candidate.final_value - best_alt_value).abs() <= 1e-9
-                            && grad_norm < best_alt_grad_norm
+                            && grad_norm_z < best_alt_grad_norm_z
                     {
                         best_alt_value = candidate.final_value;
-                        best_alt_grad_norm = grad_norm;
+                        best_alt_grad_norm_z = grad_norm_z;
                         best_alt = Some(candidate);
                     }
                 }
 
-                // Acceptance rule: require not only lower cost but also reasonably small gradient
-                // Use a scale-aware threshold based on the convergence tolerance and current cost magnitude
-                // This prevents accepting solutions with large gradients that can lock in over-smoothed estimates
+                // Acceptance rule: require reasonable near-stationarity
+                // Build scale-aware thresholds and use Jacobian-aware scaling for z-space
                 let cost_scale = 0.1 + last_solution.final_value.abs();
                 let grad_tol = config.reml_convergence_tolerance * cost_scale;
-                // Use a moderate multiple of the tolerance - not as strict as final convergence
-                // but still require reasonable near-stationarity
-                let grad_norm_accept = 10.0 * grad_tol;
+                let grad_norm_accept_rho = 10.0 * grad_tol;
+                // Compute last solution's gradient norms and Jacobian scale
+                let (last_grad_norm_z, last_grad_norm_rho) =
+                    grad_norms_in_z_and_rho(&reml_state, &last_solution.final_point);
+                let jac_max_last = last_solution
+                    .final_point
+                    .iter()
+                    .map(|v| 15.0 * (1.0 - v.tanh().powi(2)))
+                    .fold(0.0f64, |a, b| a.max(b.abs()));
+                let grad_norm_accept_z = jac_max_last * grad_norm_accept_rho;
+                eprintln!(
+                    "[Restart Baseline] last value = {:.6}, ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
+                    last_solution.final_value, last_grad_norm_z, last_grad_norm_rho
+                );
                 
                 if let Some(alt) = best_alt {
                     let fv0 = last_solution.final_value;
@@ -450,13 +471,16 @@ pub fn train_model(
                     
                     // Meaningful improvement OR close values with better gradient
                     let cost_improved = fv1 < fv0 - 1e-6 * cost_scale;
-                    let similar_cost_better_grad = rel_diff < 1e-6 && best_alt_grad_norm < best_alt_grad_norm * 0.9;
+                    let similar_cost_better_grad = rel_diff < 1e-6 && best_alt_grad_norm_z < 0.9 * last_grad_norm_z;
                     
-                    if (cost_improved || similar_cost_better_grad) && best_alt_grad_norm <= grad_norm_accept {
+                    if (cost_improved || similar_cost_better_grad)
+                        && (best_alt_grad_norm_z <= grad_norm_accept_z
+                            || best_alt_grad_norm_z <= grad_norm_accept_rho)
+                    {
                         eprintln!(
-                            "[INFO] Accepting asymmetric restart (Δcost={:.3e}, grad_norm={:.2e}).",
+                            "[INFO] Accepting asymmetric restart (Δcost={:.3e}, ||grad_z||={:.2e}).",
                             fv0 - fv1,
-                            best_alt_grad_norm
+                            best_alt_grad_norm_z
                         );
                         alt
                     } else {
@@ -474,33 +498,47 @@ pub fn train_model(
                     "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
                 );
 
-                // Get the gradient at last_solution to ensure we're near a stationary point
-                // Apply same clamping as used in cost_and_grad to ensure consistency
-                // Map last z to rho and check gradient norm at that bounded point
+                // Compute both rho- and z-space gradient norms at last_solution
                 let z_last = &last_solution.final_point;
                 let rho_last = z_last.mapv(|v| 15.0 * v.tanh());
-                let gradient_norm = match reml_state.compute_gradient(&rho_last) {
-                    Ok(grad) => grad.dot(&grad).sqrt(),
-                    Err(_) => f64::INFINITY,
+                let (gradient_norm_z, gradient_norm_rho) = {
+                    let g_rho = match reml_state.compute_gradient(&rho_last) {
+                        Ok(g) => g,
+                        Err(_) => Array1::from_elem(rho_last.len(), f64::INFINITY),
+                    };
+                    let jac = z_last.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                    let g_z = &g_rho * &jac;
+                    (g_z.dot(&g_z).sqrt(), g_rho.dot(&g_rho).sqrt())
                 };
 
                 // Only accept the solution if gradient norm is small enough
-                // Use a scale-aware threshold based on the convergence tolerance and current cost magnitude
+                // Use a scale-aware threshold and Jacobian-aware scaling between spaces
                 let cost_scale = 0.1 + last_solution.final_value.abs();
                 let grad_tol = config.reml_convergence_tolerance * cost_scale;
-                // More generous threshold than restart acceptance but still require some stationarity
-                let max_grad_norm = 50.0 * grad_tol;
-                
-                if gradient_norm > max_grad_norm {
+                let max_grad_norm_rho = 50.0 * grad_tol;
+                let jac_max = z_last
+                    .iter()
+                    .map(|v| 15.0 * (1.0 - v.tanh().powi(2)))
+                    .fold(0.0f64, |a, b| a.max(b.abs()));
+                let max_grad_norm_z = jac_max * max_grad_norm_rho;
+
+                // Log both gradient norms for diagnostics
+                eprintln!(
+                    "[Diag] Line-search stop gradients: ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
+                    gradient_norm_z, gradient_norm_rho
+                );
+
+                if gradient_norm_z > max_grad_norm_z && gradient_norm_rho > max_grad_norm_rho {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
-                        "Line-search failed far from a stationary point. Gradient norm: {:.2e}",
-                        gradient_norm
+                        "Line-search failed far from a stationary point in z-space. ||grad_z||: {:.2e}",
+                        gradient_norm_z
                     )));
                 }
 
                 eprintln!(
-                    "[INFO] Accepting the best parameters found as the final result (gradient norm: {:.2e}).",
-                    gradient_norm
+                    "[INFO] Accepting the best parameters found as the final result (||grad_z||: {:.2e}, ||grad_rho||: {:.2e}).",
+                    gradient_norm_z,
+                    gradient_norm_rho
                 );
                 *last_solution
             }
@@ -625,21 +663,22 @@ fn compute_fd_gradient(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let epsilon = 1e-7;
     let mut fd_grad = Array1::zeros(rho.len());
 
     for i in 0..rho.len() {
+        // Relative, scale-aware step per coordinate (central difference)
+        let h = 1e-4 * (1.0 + rho[i].abs());
+
         let mut rho_plus = rho.clone();
-        rho_plus[i] += epsilon / 2.0;
+        rho_plus[i] += 0.5 * h;
 
         let mut rho_minus = rho.clone();
-        rho_minus[i] -= epsilon / 2.0;
+        rho_minus[i] -= 0.5 * h;
 
-        // compute_cost returns the value to be *minimized* (-LAML), which is what we need.
-        let cost_plus = reml_state.compute_cost(&rho_plus)?;
+        let cost_plus = reml_state.compute_cost(&rho_plus)?; // cost is -LAML (minimization)
         let cost_minus = reml_state.compute_cost(&rho_minus)?;
 
-        fd_grad[i] = (cost_plus - cost_minus) / epsilon;
+        fd_grad[i] = (cost_plus - cost_minus) / h;
     }
 
     Ok(fd_grad)
@@ -1701,8 +1740,6 @@ pub mod internal {
                     };
 
                     // --- Loop through penalties to compute each gradient component ---
-                    // Pre-fetch S_λ in the transformed basis to compute the penalty derivative
-                    let s_lambda = &pirls_result.reparam_result.s_transformed;
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
                         let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
@@ -1712,31 +1749,10 @@ pub mod internal {
                         let dbeta_drho_k_transformed =
                             -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
-                        // ---
-                        // Component 1: Derivative of the Penalized Deviance (complete)
-                        // This corresponds to `oo$D1/2` in mgcv; for LAML we must include
-                        // both the unpenalized deviance derivative and the penalty derivative.
-                        // ---
-
-                        // Calculate d(Deviance)/dρ_k using the chain rule
+                        // Component 1: Data deviance derivative ONLY (mgcv/gdi1)
                         let d_deviance_d_rho_k =
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
-
-                        // Add the missing penalty derivative: d(β' S β)/dρ_k
-                        // = 2 (dβ/dρ_k)' S_λ β + β' (∂S_λ/∂ρ_k) β, with ∂S_λ/∂ρ_k = λ_k S_k
-                        let s_lambda_beta = s_lambda.dot(beta_transformed);
-                        let dbl_term = 2.0 * dbeta_drho_k_transformed.dot(&s_lambda_beta);
-                        let beta_t_sk_beta = beta_transformed.dot(&s_k_beta_transformed);
-                        let d_s_term = lambdas[k] * beta_t_sk_beta;
-                        let d_penalty_d_rho_k = dbl_term + d_s_term;
-
-                        // Final penalized deviance derivative contribution
-                        let deviance_grad_term = 0.5 * (d_deviance_d_rho_k + d_penalty_d_rho_k);
-
-                        // ---
-                        // Component 2: Derivative of log|H| (existing code)
-                        // This corresponds to `oo$trA1/2` in mgcv
-                        // ---
+                        let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
                         let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
@@ -1758,21 +1774,15 @@ pub mod internal {
                         let log_det_h_grad_term =
                             0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
 
-                        // ---
                         // Component 3: Derivative of log|S|
-                        // This corresponds to `-rp$det1/2` in mgcv
-                        // ---
                         let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
 
-                        // ---
-                        // Final Gradient Assembly - Now Complete!
-                        // This exactly matches mgcv's formula: `REML1 <- oo$D1/2 + oo$trA1/2 - rp$det1/2`
-                        // ---
-                        cost_gradient[k] = deviance_grad_term  // Term 1: 0.5 * d(D)/dρ (unpenalized)
-                                         + log_det_h_grad_term           // Term 2: 0.5 * d(log|H|)/dρ  
-                                         - log_det_s_grad_term; // Term 3: -0.5 * d(log|S|)/dρ
+                        // Final Gradient Assembly - mgcv/gdi1 form for LAML
+                        cost_gradient[k] = deviance_grad_term
+                                         + log_det_h_grad_term
+                                         - log_det_s_grad_term;
                     }
-                    log::debug!("LAML gradient computation finished.");
+                    log::debug!("LAML gradient computation finished (mgcv-style assembly).");
                 }
             }
 
