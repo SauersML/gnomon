@@ -1739,6 +1739,14 @@ pub mod internal {
                         LinkFunction::Identity => Array1::zeros(self.y.len()),
                     };
 
+                    // Pre-compute S_λ β in the transformed basis for the penalty indirect term
+                    let mut s_lambda_beta_transformed = Array1::zeros(beta_transformed.len());
+                    for j in 0..lambdas.len() {
+                        let s_j_t = rs_transformed[j].t().dot(&rs_transformed[j]);
+                        let s_j_beta = s_j_t.dot(beta_transformed);
+                        s_lambda_beta_transformed = s_lambda_beta_transformed + s_j_beta.mapv(|v| v * lambdas[j]);
+                    }
+
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
@@ -1749,10 +1757,22 @@ pub mod internal {
                         let dbeta_drho_k_transformed =
                             -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
 
-                        // Component 1: Data deviance derivative ONLY (mgcv/gdi1)
+                        // Component 1a: Data deviance derivative ONLY (mgcv/gdi1)
                         let d_deviance_d_rho_k =
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
                         let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
+
+                        // Component 1b: Direct derivative of the explicit penalty term β'S_λβ
+                        // Our compute_cost includes the explicit penalty in the objective, so the
+                        // total derivative must include its direct ρ-derivative. In the non-Gaussian
+                        // case the indirect parts are handled via other terms; here we add the direct
+                        // piece so that the analytic gradient matches the finite-difference of cost.
+                        let penalty_direct_term = 0.5 * lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
+
+                        // Component 1c: Indirect derivative of β'S_λβ through β(ρ)
+                        // 0.5 * d/dρ_k (β'S_λβ) contributes (S_λ β)ᵀ (∂β/∂ρ_k) + 0.5 λ_k βᵀ S_k β.
+                        // We precomputed S_λ β as s_lambda_beta_transformed.
+                        let penalty_indirect_term = s_lambda_beta_transformed.dot(&dbeta_drho_k_transformed);
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
                         let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
@@ -1777,8 +1797,10 @@ pub mod internal {
                         // Component 3: Derivative of log|S|
                         let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
 
-                        // Final Gradient Assembly - mgcv/gdi1 form for LAML
+                        // Final Gradient Assembly - mgcv/gdi1 form for LAML, with explicit penalty direct + indirect terms
                         cost_gradient[k] = deviance_grad_term
+                                         + penalty_indirect_term
+                                         + penalty_direct_term
                                          + log_det_h_grad_term
                                          - log_det_s_grad_term;
                     }
