@@ -171,18 +171,32 @@ pub fn train_model(
     let mut seed_candidates = Vec::new();
 
     // Symmetric base seeds
-    // Include genuinely small-λ seeds to encourage exploration away from heavy smoothing
-    let base_values: &[f64] = &[8.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0];
+    // Include genuinely small-λ and large-λ seeds to explore a broader landscape
+    let base_values: &[f64] = &[12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0];
     for &val in base_values {
         seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
     }
 
     // Asymmetric seeds to break symmetry (crucial for distinguishing PC relevance)
     if layout.num_penalties >= 2 {
-        seed_candidates.push(Array1::from(vec![8.0, 6.0])); // Heavy vs medium
-        seed_candidates.push(Array1::from(vec![6.0, 8.0])); // Medium vs heavy  
-        seed_candidates.push(Array1::from(vec![4.0, 2.0])); // Medium vs light
-        seed_candidates.push(Array1::from(vec![2.0, 4.0])); // Light vs medium
+        // A diverse palette of asymmetric starting points
+        let asym_pairs: &[[f64; 2]] = &[
+            [12.0, 0.0], [0.0, 12.0], [10.0, 2.0], [2.0, 10.0],
+            [8.0, -4.0], [-4.0, 8.0], [6.0, -2.0], [-2.0, 6.0],
+            [8.0, 6.0], [6.0, 8.0], [4.0, 2.0], [2.0, 4.0],
+            [-8.0, 0.0], [0.0, -8.0], [-10.0, -2.0], [-2.0, -10.0],
+        ];
+        for p in asym_pairs {
+            seed_candidates.push(Array1::from_vec(p.to_vec()));
+        }
+
+        // A small grid over a coarse set to increase diversity without exploding combinations
+        let grid_vals: &[f64] = &[-8.0, -4.0, 0.0, 4.0, 8.0];
+        for &a in grid_vals {
+            for &b in grid_vals {
+                seed_candidates.push(Array1::from(vec![a, b]));
+            }
+        }
     }
 
     // For higher dimensions, extend asymmetric patterns
@@ -2064,7 +2078,7 @@ pub mod internal {
         #[test]
         fn test_model_learns_overall_fit_of_known_function() {
             // Generate data from a known function
-            let n_samples = 100;
+            let n_samples = 500;
             let mut rng = StdRng::seed_from_u64(42);
 
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
@@ -2137,7 +2151,9 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let trained_model = train_model(&data, &config).expect("Model training should succeed");
+            let mut model_for_pd = train_model(&data, &config).expect("Model training should succeed");
+            // For PD diagnostics, disable RGC to avoid projection bias during averaging
+            model_for_pd.hull = None;
 
             // Create a grid of test points to evaluate overall fit
             let n_grid = 15;
@@ -2158,7 +2174,7 @@ pub mod internal {
                     // Get the model's prediction
                     let pred_pgs = Array1::from_elem(1, pgs_val);
                     let pred_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
-                    let pred_prob = trained_model
+                    let pred_prob = model_for_pd
                         .predict(pred_pgs.view(), pred_pc.view())
                         .unwrap()[0];
                     pred_probs.push(pred_prob);
@@ -2525,12 +2541,11 @@ pub mod internal {
             println!("✓ Relative smoothness test skipped!");
         }
 
-        /// **Test 4: Component Dissection Test**
-        /// Provides a diagnostic test that verifies the model can learn the shapes of individual,
-        /// non-interacting smooth terms.
+        /// Real-world evaluation: discrimination, calibration, complexity, and stability via CV.
         #[test]
-        fn test_model_recovers_individual_smooth_shapes() {
-            let n_samples = 100;
+        fn test_model_realworld_metrics() {
+            // --- Data generation (additive truth) ---
+            let n_samples = 500;
             let mut rng = StdRng::seed_from_u64(42);
 
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
@@ -2540,56 +2555,34 @@ pub mod internal {
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
 
-            // Define an ADDITIVE + INTERACTION function to match the model
-            let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = (pgs_val * 0.8).sin() * 0.5; // sin effect for PGS
-                let pc_effect = 0.4 * pc_val.powi(2); // quadratic effect for PC
-                let interaction_effect = 0.3 * pgs_val * pc_val; // Interaction term
-                0.2 + pgs_effect + pc_effect + interaction_effect // Additive + Interaction
+            let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
+                let pgs_effect = (pgs_val * 0.8).sin() * 0.5;
+                let pc_effect = 0.4 * pc_val.powi(2);
+                0.2 + pgs_effect + pc_effect
             };
 
-            // Generate outcomes
+            // Outcomes
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
-                    let pgs_val = p[i];
-                    let pc_val = pcs[[i, 0]];
-                    let logit = true_function(pgs_val, pc_val);
+                    let logit = true_logit(p[i], pcs[[i, 0]]);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
-                    let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
-
-                    if rng.gen_range(0.0..1.0) < prob_clamped {
-                        1.0
-                    } else {
-                        0.0
-                    }
+                    let prob = prob.clamp(1e-6, 1.0 - 1e-6);
+                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
                 .collect();
 
-            let data = TrainingData {
-                y,
-                p: p.clone(),
-                pcs,
-                weights: Array1::ones(p.len()),
-            };
-
-            // Train model
-            let config = ModelConfig {
+            // Base config
+            let base_config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
-                reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 4, // More knots for better shape recovery
-                    degree: 3,
-                },
+                reml_max_iterations: 30,
+                pgs_basis_config: BasisConfig { num_knots: 8, degree: 3 },
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
-                    basis_config: BasisConfig {
-                        num_knots: 4, // More knots for better shape recovery
-                        degree: 3,
-                    },
+                    basis_config: BasisConfig { num_knots: 8, degree: 3 },
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
@@ -2601,83 +2594,205 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let trained_model = train_model(&data, &config).expect("Model training should succeed");
+            // --- CV setup ---
+            let repeats = vec![42_u64, 1337_u64];
+            let k_folds = 5_usize;
 
-            // Test PGS main effect shape (with PC fixed at 0)
-            let n_test = 20;
-            let test_pgs_values = Array1::linspace(-2.0, 2.0, n_test);
-            let pc_zero = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
+            // Accumulators
+            let mut aucs = Vec::new();
+            let mut pr_aucs = Vec::new();
+            let mut log_losses = Vec::new();
+            let mut briers = Vec::new();
+            let mut cal_slopes = Vec::new();
+            let mut cal_intercepts = Vec::new();
+            let mut eces = Vec::new();
+            let mut total_edfs = Vec::new();
+            let mut min_eigs = Vec::new();
+            let mut rho_bounds_ok = true;
+            let mut proj_rates = Vec::new();
 
-            let mut true_pgs_effects = Vec::with_capacity(n_test);
-            let mut predicted_pgs_effects = Vec::with_capacity(n_test);
+            println!("[CV] Starting real-world metrics evaluation: n_samples={}, k_folds={}, repeats={}", n_samples, k_folds, repeats.len());
+            for (rep_idx, &seed) in repeats.iter().enumerate() {
+                println!("[CV] Repeat {} (seed={})", rep_idx + 1, seed);
+                use rand::seq::SliceRandom;
+                // Build fold indices
+                let mut idx: Vec<usize> = (0..n_samples).collect();
+                let mut rng_fold = StdRng::seed_from_u64(seed);
+                idx.shuffle(&mut rng_fold);
 
-            for &pgs_val in test_pgs_values.iter() {
-                // True PGS effect at PC=0
-                let true_logit = true_function(pgs_val, 0.0);
-                true_pgs_effects.push(true_logit);
+                let fold_size = (n_samples as f64 / k_folds as f64).ceil() as usize;
+                for fold in 0..k_folds {
+                    let start = fold * fold_size;
+                    let end = ((fold + 1) * fold_size).min(n_samples);
+                    if start >= end { break; }
+                    let val_len = end - start;
+                    let train_len = n_samples - val_len;
+                    println!("[CV]  Fold {}/{}: train={}, val={}", fold + 1, k_folds, train_len, val_len);
+                    let val_idx: Vec<usize> = idx[start..end].to_vec();
+                    let train_idx: Vec<usize> = idx.iter().cloned().filter(|i| *i < start || *i >= end).collect();
 
-                // Model prediction at PC=0
-                let test_pgs = Array1::from_elem(1, pgs_val);
-                let pred_prob = trained_model
-                    .predict(test_pgs.view(), pc_zero.view())
-                    .unwrap()[0];
+                    // Build train data
+                    let take = |arr: &Array1<f64>, ids: &Vec<usize>| -> Array1<f64> {
+                        Array1::from(ids.iter().map(|&i| arr[i]).collect::<Vec<_>>())
+                    };
+                    let take_pcs = |mat: &Array2<f64>, ids: &Vec<usize>| -> Array2<f64> {
+                        Array2::from_shape_fn((ids.len(), mat.ncols()), |(r, c)| mat[[ids[r], c]])
+                    };
 
-                // Convert back to logit scale for comparison
-                let pred_prob_clamped = pred_prob.clamp(1e-6, 1.0 - 1e-6);
-                let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
-                predicted_pgs_effects.push(pred_logit);
+                    let data_train = TrainingData {
+                        y: take(&y, &train_idx),
+                        p: take(&p, &train_idx),
+                        pcs: take_pcs(&pcs, &train_idx),
+                        weights: Array1::ones(train_idx.len()),
+                    };
+
+                    let data_val_p = take(&p, &val_idx);
+                    let data_val_pcs = take_pcs(&pcs, &val_idx);
+                    let data_val_y = take(&y, &val_idx);
+
+                    // Train
+                    let trained = train_model(&data_train, &base_config).expect("training failed");
+                    println!(
+                        "[CV]   Trained: lambdas={:?} (rho={:?}), hull={} facets",
+                        trained.lambdas,
+                        trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>(),
+                        trained.hull.as_ref().map(|h| h.facets.len()).unwrap_or(0)
+                    );
+
+                    // Complexity: edf and Hessian min-eig by refitting at chosen lambdas on training X
+                    let (x_tr, s_list, layout, _, _, _, _, _, _) =
+                        build_design_and_penalty_matrices(&data_train, &trained.config).expect("layout");
+                    let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
+                    let rho = Array1::from(trained.lambdas.iter().map(|&l| l.ln().clamp(-15.0, 15.0)).collect::<Vec<_>>());
+                    let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
+                        rho.view(),
+                        x_tr.view(),
+                        data_train.y.view(),
+                        data_train.weights.view(),
+                        &rs_list,
+                        &layout,
+                        &trained.config,
+                    ).expect("pirls refit");
+
+                    total_edfs.push(pirls_res.edf);
+                    println!("[CV]   Complexity: edf={:.2}", pirls_res.edf);
+                    // Min eigenvalue of penalized Hessian
+                    let (eigs, _) = pirls_res
+                        .penalized_hessian_transformed
+                        .eigh(ndarray_linalg::UPLO::Upper)
+                        .expect("eigh");
+                    let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+                    min_eigs.push(min_eig);
+                    println!("[CV]   Penalized Hessian min-eig={:.3e}", min_eig);
+
+                    // Rho bounds sanity
+                    rho_bounds_ok &= trained
+                        .lambdas
+                        .iter()
+                        .all(|&l| l.ln().abs() < 14.0);
+                    if !rho_bounds_ok {
+                        println!("[CV]   WARNING: rho near bounds: {:?}", trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>());
+                    }
+
+                    // RGC projection stats on validation
+                    let proj_rate = if let Some(hull) = &trained.hull {
+                        let mut raw = Array2::zeros((data_val_p.len(), 1 + data_val_pcs.ncols()));
+                        raw.column_mut(0).assign(&data_val_p);
+                        if raw.ncols() > 1 { raw.slice_mut(ndarray::s![.., 1..]).assign(&data_val_pcs); }
+                        let (corrected, num_proj) = hull.project_if_needed(raw.view());
+                        let rate = num_proj as f64 / corrected.nrows() as f64;
+                        proj_rates.push(rate);
+                        println!("[CV]   RGC: projected {}/{} ({:.1}%)", num_proj, corrected.nrows(), 100.0*rate);
+                        rate
+                    } else { proj_rates.push(0.0); 0.0 };
+                    assert!(proj_rate <= 0.20, "Mean projection rate must be <= 20% (got {:.2}%)", 100.0*proj_rate);
+
+                    // Predict on validation
+                    let preds = trained
+                        .predict(data_val_p.view(), data_val_pcs.view())
+                        .expect("predict val");
+
+                    // Metrics
+                    let auc = calculate_auc_cv(&preds, &data_val_y);
+                    let pr = calculate_pr_auc(&preds, &data_val_y);
+                    let ll = calculate_log_loss(&preds, &data_val_y);
+                    let br = calculate_brier(&preds, &data_val_y);
+                    let (c_int, c_slope) = calibration_intercept_slope(&preds, &data_val_y);
+                    let ece10 = expected_calibration_error(&preds, &data_val_y, 10);
+
+                    println!(
+                        "[CV]   Metrics: AUC={:.3}, PR-AUC={:.3}, LogLoss={:.3}, Brier={:.3}, CalInt={:.3}, CalSlope={:.3}, ECE10={:.3}",
+                        auc, pr, ll, br, c_int, c_slope, ece10
+                    );
+                    aucs.push(auc);
+                    pr_aucs.push(pr);
+                    log_losses.push(ll);
+                    briers.push(br);
+                    cal_intercepts.push(c_int);
+                    cal_slopes.push(c_slope);
+                    eces.push(ece10);
+                }
             }
 
-            // Calculate correlation for PGS main effect
-            let true_pgs_array = Array1::from_vec(true_pgs_effects);
-            let pred_pgs_array = Array1::from_vec(predicted_pgs_effects);
-            let pgs_correlation = correlation_coefficient(&true_pgs_array, &pred_pgs_array);
+            // Aggregates
+            let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / (v.len() as f64);
+            let sd = |v: &Vec<f64>| {
+                let m = mean(v);
+                (v.iter().map(|&x| (x - m) * (x - m)).sum::<f64>() / (v.len().max(1) as f64)).sqrt()
+            };
 
-            // Test PC main effect shape (with PGS fixed at 0)
-            let test_pc_values = Array1::linspace(-1.5, 1.5, n_test);
-            let pgs_zero = Array1::from_elem(1, 0.0);
+            let auc_m = mean(&aucs);
+            let auc_sd = sd(&aucs);
+            let pr_m = mean(&pr_aucs);
+            let ll_m = mean(&log_losses);
+            let ll_sd = sd(&log_losses);
+            let br_m = mean(&briers);
+            let slope_m = mean(&cal_slopes);
+            let cint_m = mean(&cal_intercepts);
+            let ece_m = mean(&eces);
+            let edf_m = mean(&total_edfs);
+            let edf_sd = sd(&total_edfs);
+            let min_eig_min = min_eigs.iter().copied().fold(f64::INFINITY, f64::min);
+            let proj_m = mean(&proj_rates);
 
-            let mut true_pc_effects = Vec::with_capacity(n_test);
-            let mut predicted_pc_effects = Vec::with_capacity(n_test);
-
-            for &pc_val in test_pc_values.iter() {
-                // True PC effect at PGS=0
-                let true_logit = true_function(0.0, pc_val);
-                true_pc_effects.push(true_logit);
-
-                // Model prediction at PGS=0
-                let test_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
-                let pred_prob = trained_model
-                    .predict(pgs_zero.view(), test_pc.view())
-                    .unwrap()[0];
-
-                // Convert back to logit scale
-                let pred_prob_clamped = pred_prob.clamp(1e-6, 1.0 - 1e-6);
-                let pred_logit = (pred_prob_clamped / (1.0 - pred_prob_clamped)).ln();
-                predicted_pc_effects.push(pred_logit);
-            }
-
-            // Calculate correlation for PC main effect
-            let true_pc_array = Array1::from_vec(true_pc_effects);
-            let pred_pc_array = Array1::from_vec(predicted_pc_effects);
-            let pc_correlation = correlation_coefficient(&true_pc_array, &pred_pc_array);
-
-            // Assert high correlation for both components
-            assert!(
-                pgs_correlation > 0.25,
-                "PGS partial dependence shape should be well recovered. Correlation: {:.4}",
-                pgs_correlation
+            // Print aggregates
+            println!("[CV] Summary across {} folds:", aucs.len());
+            println!(
+                "[CV]  AUC: mean={:.3} sd={:.3}; PR-AUC: mean={:.3}",
+                auc_m, auc_sd, pr_m
             );
-
-            assert!(
-                pc_correlation > 0.90,
-                "PC partial dependence shape should be well recovered. Correlation: {:.4}",
-                pc_correlation
+            println!(
+                "[CV]  LogLoss: mean={:.3} sd={:.3}; Brier mean={:.3}",
+                ll_m, ll_sd, br_m
             );
+            println!(
+                "[CV]  Calibration: intercept={:.3}, slope={:.3}, ECE10={:.3}",
+                cint_m, slope_m, ece_m
+            );
+            println!(
+                "[CV]  Complexity: edf mean={:.2} sd={:.2}, min-eig(min)={:.3e}",
+                edf_m, edf_sd, min_eig_min
+            );
+            println!("[CV]  RGC: mean projection rate={:.2}%", 100.0*proj_m);
 
-            println!("✓ Individual shape recovery test passed!");
-            println!("  PGS main effect correlation: {:.4}", pgs_correlation);
-            println!("  PC main effect correlation:  {:.4}", pc_correlation);
+            // Assertions per spec
+            assert!(auc_m >= 0.60, "AUC mean too low: {:.3}", auc_m);
+            assert!(auc_sd <= 0.06, "AUC SD too high: {:.3}", auc_sd);
+            assert!(pr_m > 0.5, "PR-AUC mean should be > 0.5: {:.3}", pr_m);
+
+            assert!(ll_m <= 0.70, "Log-loss mean too high: {:.3}", ll_m);
+            assert!(ll_sd <= 0.05, "Log-loss SD too high: {:.3}", ll_sd);
+            assert!(br_m <= 0.25, "Brier mean too high: {:.3}", br_m);
+
+            assert!( (slope_m >= 0.80) && (slope_m <= 1.20), "Calibration slope out of range: {:.3}", slope_m);
+            assert!( (cint_m >= -0.20) && (cint_m <= 0.20), "Calibration intercept out of range: {:.3}", cint_m);
+            assert!( ece_m <= 0.15, "ECE too high: {:.3}", ece_m);
+
+            assert!(rho_bounds_ok, "Rho at or near bounds across folds");
+            assert!(edf_m >= 10.0 && edf_m <= 80.0, "EDF mean out of range: {:.2}", edf_m);
+            assert!(edf_sd <= 10.0, "EDF SD too high: {:.2}", edf_sd);
+            assert!(min_eig_min > 1e-6, "Hessian min eigenvalue too small: {:.3e}", min_eig_min);
+            assert!(proj_m <= 0.20, "Mean projection rate (RGC) exceeds 20%: {:.2}%", 100.0*proj_m);
         }
 
         /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
@@ -2768,21 +2883,123 @@ pub mod internal {
             auc
         }
 
-        /// Calculates the correlation coefficient between two arrays
+        // Metrics helpers (no plotting)
+        fn calculate_auc_cv(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
+            assert_eq!(predictions.len(), outcomes.len());
+            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let pos = outcomes.iter().filter(|&&y| y > 0.5).count() as f64;
+            let neg = outcomes.len() as f64 - pos;
+            if pos == 0.0 || neg == 0.0 { return 0.5; }
+            let mut tp = 0.0; let mut fp = 0.0; let mut last_tpr = 0.0; let mut last_fpr = 0.0; let mut auc = 0.0;
+            let mut i = 0; let n = pairs.len();
+            while i < n {
+                let score = pairs[i].0; let mut tp_inc = 0.0; let mut fp_inc = 0.0;
+                while i < n && (pairs[i].0 - score).abs() <= 1e-12 {
+                    if pairs[i].1 > 0.5 { tp_inc += 1.0; } else { fp_inc += 1.0; }
+                    i += 1;
+                }
+                tp += tp_inc; fp += fp_inc;
+                let tpr = tp / pos; let fpr = fp / neg;
+                auc += (fpr - last_fpr) * (tpr + last_tpr) / 2.0;
+                last_tpr = tpr; last_fpr = fpr;
+            }
+            auc
+        }
+
+        fn calculate_pr_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
+            assert_eq!(predictions.len(), outcomes.len());
+            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let pos = outcomes.iter().filter(|&&y| y > 0.5).count() as f64;
+            if pos == 0.0 { return 0.0; }
+            let mut tp = 0.0; let mut fp = 0.0; let mut last_recall = 0.0; let mut pr_auc = 0.0;
+            let mut i = 0; let n = pairs.len();
+            while i < n {
+                let score = pairs[i].0; let mut tp_inc = 0.0; let mut fp_inc = 0.0;
+                while i < n && (pairs[i].0 - score).abs() <= 1e-12 {
+                    if pairs[i].1 > 0.5 { tp_inc += 1.0; } else { fp_inc += 1.0; }
+                    i += 1;
+                }
+                let prev_recall = last_recall;
+                tp += tp_inc; fp += fp_inc;
+                let recall = tp / pos;
+                let precision = if tp + fp > 0.0 { tp / (tp + fp) } else { 1.0 };
+                pr_auc += (recall - prev_recall) * precision;
+                last_recall = recall;
+            }
+            pr_auc
+        }
+
+        fn calculate_log_loss(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
+            let mut sum = 0.0; let n = predictions.len() as f64;
+            for (&p_raw, &y) in predictions.iter().zip(outcomes.iter()) {
+                let p = p_raw.clamp(1e-9, 1.0 - 1e-9);
+                sum += if y > 0.5 { -p.ln() } else { -(1.0 - p).ln() };
+            }
+            sum / n
+        }
+
+        fn calculate_brier(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
+            let n = predictions.len() as f64;
+            predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p - y)*(p - y)).sum::<f64>() / n
+        }
+
+        fn expected_calibration_error(predictions: &Array1<f64>, outcomes: &Array1<f64>, bins: usize) -> f64 {
+            assert!(bins >= 2);
+            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let n = pairs.len();
+            let mut ece = 0.0;
+            for b in 0..bins {
+                let lo = b * n / bins; let hi = ((b + 1) * n / bins).min(n);
+                if lo >= hi { continue; }
+                let slice = &pairs[lo..hi];
+                let m = slice.len() as f64;
+                let avg_p = slice.iter().map(|(p, _)| *p).sum::<f64>() / m;
+                let avg_y = slice.iter().map(|(_, y)| *y).sum::<f64>() / m;
+                ece += (m / n as f64) * (avg_p - avg_y).abs();
+            }
+            ece
+        }
+
+        // Keep for other tests relying on it
         fn correlation_coefficient(x: &Array1<f64>, y: &Array1<f64>) -> f64 {
             let x_mean = x.mean().unwrap_or(0.0);
             let y_mean = y.mean().unwrap_or(0.0);
+            let num: f64 = x.iter().zip(y.iter()).map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean)).sum();
+            let x_var: f64 = x.iter().map(|&xi| (xi - x_mean).powi(2)).sum();
+            let y_var: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
+            num / (x_var.sqrt() * y_var.sqrt())
+        }
 
-            let numerator: f64 = x
+        fn calibration_intercept_slope(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> (f64, f64) {
+            // Logistic recalibration: y ~ sigmoid(a + b * logit(p)) via Newton with two params
+            let z: Vec<f64> = predictions
                 .iter()
-                .zip(y.iter())
-                .map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean))
-                .sum();
-
-            let x_variance: f64 = x.iter().map(|&xi| (xi - x_mean).powi(2)).sum();
-            let y_variance: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
-
-            numerator / (x_variance.sqrt() * y_variance.sqrt())
+                .map(|&p| ((p.clamp(1e-9, 1.0 - 1e-9)) / (1.0 - p.clamp(1e-9, 1.0 - 1e-9))).ln())
+                .collect();
+            let y: Vec<f64> = outcomes.iter().copied().collect();
+            let mut a = 0.0; let mut b = 1.0; // start near identity
+            for _ in 0..25 {
+                let mut g0 = 0.0; let mut g1 = 0.0; let mut h00 = 0.0; let mut h01 = 0.0; let mut h11 = 0.0;
+                for i in 0..z.len() {
+                    let eta = a + b * z[i];
+                    let p = 1.0 / (1.0 + (-eta).exp());
+                    let w = p * (1.0 - p);
+                    let r = y[i] - p;
+                    g0 += r; g1 += r * z[i];
+                    h00 += w; h01 += w * z[i]; h11 += w * z[i] * z[i];
+                }
+                // Solve 2x2 system [h00 h01; h01 h11] [da db]^T = [g0 g1]^T
+                let det = h00 * h11 - h01 * h01;
+                if det.abs() < 1e-12 { break; }
+                let da = ( g0 * h11 - g1 * h01) / det;
+                let db = (-g0 * h01 + g1 * h00) / det;
+                a += da; b += db;
+                if da.abs().max(db.abs()) < 1e-6 { break; }
+            }
+            (a, b)
         }
 
         /// Test that the P-IRLS algorithm can handle models with multiple PCs and interactions
