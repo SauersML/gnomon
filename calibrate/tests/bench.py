@@ -23,6 +23,11 @@ from html import escape
 
 import pandas as pd
 
+# Use a headless backend for matplotlib and provide our own saved plots
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # Import data-generation utilities from the sibling mgcv.py module
 import mgcv  # same directory import
 
@@ -112,11 +117,11 @@ def train_with_perf(train_tsv: Path, tag: str):
 
     # Collect perf reports (flat and call-graph) for HTML embedding
     flat_cmd = [
-        "perf", "report", "--stdio", "--no-children", "--percent-limit", "0.5",
+        "perf", "report", "--stdio", "--no-children", "--percent-limit", "5",
         "-i", str(perf_data)
     ]
     graph_cmd = [
-        "perf", "report", "--stdio", "--call-graph=graph", "--percent-limit", "2",
+        "perf", "report", "--stdio", "--call-graph=graph", "--percent-limit", "5",
         "-i", str(perf_data)
     ]
     rc_flat, flat_lines = run_capture(flat_cmd, cwd=WORKSPACE_ROOT)
@@ -132,6 +137,51 @@ def train_with_perf(train_tsv: Path, tag: str):
     }
 
 
+def save_plot_png(df: pd.DataFrame, tag: str, alpha: float, linear_mode: bool, noise_mode: bool) -> Path:
+    """Generate the binned probability plots and save as PNG, similar to mgcv.create_binned_plots."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+    if noise_mode:
+        suptitle = f'Binned Probability (Pure Noise, alpha={alpha})'
+    elif linear_mode:
+        suptitle = f'Binned Probability (Linear, alpha={alpha})'
+    else:
+        suptitle = f'Binned Probability (Non-Linear, alpha={alpha})'
+    fig.suptitle(suptitle)
+
+    # variable_one
+    df = df.copy()
+    v1bin = pd.cut(df['variable_one'], bins=mgcv.N_BINS)
+    v1_emp = df.groupby(v1bin, observed=True)['outcome'].mean()
+    v1_true = df.groupby(v1bin, observed=True)['final_probability'].mean()
+    v1_centers = [b.mid for b in v1_emp.index]
+    axes[0].plot(v1_centers, v1_emp.values, 'o-', label='Empirical P(1)')
+    axes[0].plot(v1_centers, v1_true.values, 'r--', label='True Prob')
+    axes[0].set_title('variable 1 vs. P(1)')
+    axes[0].set_xlabel('variable 1' if not linear_mode else 'variable 1 (angle)')
+    axes[0].set_ylim(0, 1)
+    axes[0].grid(True, linestyle='--', alpha=0.5)
+    axes[0].legend()
+
+    # variable_two
+    v2bin = pd.cut(df['variable_two'], bins=mgcv.N_BINS)
+    v2_emp = df.groupby(v2bin, observed=True)['outcome'].mean()
+    v2_true = df.groupby(v2bin, observed=True)['final_probability'].mean()
+    v2_centers = [b.mid for b in v2_emp.index]
+    axes[1].plot(v2_centers, v2_emp.values, 'o-', label='Empirical P(1)')
+    axes[1].plot(v2_centers, v2_true.values, 'r--', label='True Prob')
+    axes[1].set_title('variable 2 vs. P(1)')
+    axes[1].set_xlabel('variable 2')
+    axes[1].set_ylim(0, 1)
+    axes[1].grid(True, linestyle='--', alpha=0.5)
+    axes[1].legend()
+
+    out_png = WORKDIR / f"plot_{tag}.png"
+    fig.savefig(out_png, dpi=120)
+    plt.close(fig)
+    return out_png
+
+
 def main():
     # 1) Build profiling binary
     build_profiling_binary()
@@ -139,17 +189,20 @@ def main():
     # 2) Generate three datasets using mgcv's generator:
     #    default (non-linear), linear mode, and pure noise.
     datasets = [
-        ("nonlinear", mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=False, noise_mode=False)),
-        ("linear",    mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=True,  noise_mode=False)),
-        ("noise",     mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=False, noise_mode=True)),
+        ("nonlinear", False, False, mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=False, noise_mode=False)),
+        ("linear",    True,  False, mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=True,  noise_mode=False)),
+        ("noise",     False, True,  mgcv.generate_data(mgcv.N_SAMPLES_TRAIN, mgcv.NOISE_BLEND_FACTOR, linear_mode=False, noise_mode=True)),
     ]
 
     # 3) Convert each to the Rust training TSV schema and run training under perf
     report_sections = []
-    for tag, df in datasets:
+    for tag, linear_mode, noise_mode, df in datasets:
         train_tsv = SCRIPT_DIR / f"rust_train_{tag}.tsv"
         prepare_training_tsv_from_df(df, train_tsv)
         section = train_with_perf(train_tsv, tag)
+        # Save a PNG plot for the dataset
+        plot_path = save_plot_png(df, tag, mgcv.NOISE_BLEND_FACTOR, linear_mode, noise_mode)
+        section["plot_png"] = plot_path
         report_sections.append(section)
 
     # 4) Build a simple HTML report and open it automatically
@@ -163,6 +216,11 @@ def main():
         for sec in report_sections:
             f.write(f"<h2>Workload: {escape(sec['tag'])}</h2>\n")
             f.write(f"<p>perf.data: {escape(str(sec['perf_data']))}</p>\n")
+            # Embed PNG plot
+            if sec.get('plot_png'):
+                rel = os.path.relpath(sec['plot_png'], start=html_path.parent)
+                f.write("<h3>Data plot</h3>\n")
+                f.write(f"<img src='{escape(rel)}' alt='plot {escape(sec['tag'])}' style='max-width:100%;height:auto;border:1px solid #ddd'/>\n")
             f.write("<h3>Flat profile (no children)</h3>\n")
             flat = escape(sec.get("flat", ""))
             f.write(f"<pre>{flat}</pre>\n")
