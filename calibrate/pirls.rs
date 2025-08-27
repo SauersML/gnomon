@@ -791,6 +791,24 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     pivoted_matrix
 }
 
+/// Symmetrically unpivot a matrix using the forward permutation `pivot`.
+/// If `(sqrt(W)X) * P = Q * R`, then `XtWX = P * (R^T R) * P^T`.
+/// Given `m_pivoted = R^T R` in pivoted order, this returns `P * m_pivoted * P^T`.
+fn unpivot_sym_by_perm(m_pivoted: &Array2<f64>, pivot: &[usize]) -> Array2<f64> {
+    let n = m_pivoted.nrows();
+    assert_eq!(n, m_pivoted.ncols());
+    assert_eq!(pivot.len(), n);
+    let mut out = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let oi = pivot[i];
+            let oj = pivot[j];
+            out[[oi, oj]] = m_pivoted[[i, j]];
+        }
+    }
+    out
+}
+
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
 ///
@@ -1425,16 +1443,13 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
     // STAGE 7: Construct the penalized Hessian
     //-----------------------------------------------------------------------
-    // We compute the Hessian directly in the stable basis using its definition:
-    // H_transformed = (X_transformed)' * W * (X_transformed) + S_transformed
-    // This avoids the complex and error-prone un-pivoting of the R factor.
+    // Build XtWX without re-touching n using Stage 1 QR result.
+    // From (sqrt(W)X) * P = Q * R  =>  Xᵀ W X = P (Rᵀ R) Pᵀ
+    let xtwx_pivoted = r1_pivoted.t().dot(&r1_pivoted);
+    let xtwx = unpivot_sym_by_perm(&xtwx_pivoted, &initial_pivot);
 
-    let sqrt_w = weights.mapv(f64::sqrt);
-    let wx_transformed = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-    let xtwx_transformed = wx_transformed.t().dot(&wx_transformed);
-
-    // Use precomputed S = EᵀE from caller
-    let penalized_hessian = &xtwx_transformed + s_transformed;
+    // Use precomputed S = EᵀE from caller (original order)
+    let penalized_hessian = &xtwx + s_transformed;
 
     // Debug-time guards to verify numerical properties
     #[cfg(debug_assertions)]
@@ -1477,7 +1492,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     // Calculate effective degrees of freedom using H and XtWX directly (stable)
-    let edf = calculate_edf(&penalized_hessian, &xtwx_transformed)?;
+    let edf = calculate_edf(&penalized_hessian, &xtwx)?;
 
     // Calculate scale parameter
     let scale = calculate_scale(
