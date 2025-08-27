@@ -136,6 +136,60 @@ def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
     df2[["phenotype", "score", "PC1"]].to_csv(out_path, sep="\t", index=False)
 
 
+def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
+    """Run perf record with sensible defaults and automatic fallback for mmap limit.
+    Returns wall time in seconds. Exits on non-recoverable errors.
+    """
+    import time as _time
+    # Build candidate mmap sizes: env override first, then fallbacks, finally no -m
+    mm_env = os.environ.get("BENCH_MMAP_PAGES")
+    candidates: list[int | None] = []
+    if mm_env and mm_env.isdigit():
+        candidates.append(int(mm_env))
+    # Preferred default smaller to avoid mlock errors
+    for v in (256, 128, 64):
+        if mm_env is None or str(v) != mm_env:
+            candidates.append(v)
+    candidates.append(None)  # last resort: let perf choose
+
+    freq = os.environ.get("BENCH_FREQ", "2000")
+    t0 = None
+    last_err = None
+    for mmap_pages in candidates:
+        record = [
+            "perf", "record",
+            "-e", "cycles:u",
+            "--call-graph", "dwarf,16384",
+            "-F", freq,
+            "-o", str(perf_data),
+        ]
+        if mmap_pages is not None:
+            record += ["-m", str(mmap_pages)]
+        record += ["--"] + app_cmd
+
+        print(f"$ {' '.join(map(str, record))}")
+        t0 = _time.perf_counter()
+        rc, lines = run_capture(record, cwd=WORKSPACE_ROOT, env=env)
+        dt = _time.perf_counter() - t0
+        # Echo output for transparency
+        if lines:
+            sys.stdout.write("\n".join(lines) + ("\n" if lines and not lines[-1].endswith("\n") else ""))
+        if rc == 0:
+            return dt
+        text = "\n".join(lines) if lines else ""
+        last_err = (rc, text)
+        if "Permission error mapping pages" in text or "mmap" in text.lower():
+            print("perf record failed due to mmap/lock limits; retrying with smaller -m…")
+            continue
+        # Non-recoverable error
+        sys.exit(rc)
+    # Exhausted candidates
+    if last_err is not None:
+        rc, _ = last_err
+        sys.exit(rc)
+    return 0.0
+
+
 def train_with_perf(train_tsv: Path, tag: str):
     # Compose the train command with realistic defaults
     cmd = [
@@ -147,16 +201,6 @@ def train_with_perf(train_tsv: Path, tag: str):
     ]
 
     perf_data = WORKDIR / f"perf_{tag}.data"
-    # Better unwind and deeper stacks; sample user-space cycles only.
-    record = [
-        "perf", "record",
-        "-e", "cycles:u",
-        "--call-graph", "dwarf,16384",
-        "-F", os.environ.get("BENCH_FREQ", "2000"),
-        "-m", os.environ.get("BENCH_MMAP_PAGES", "1024"),
-        "-o", str(perf_data), "--",
-    ]
-    cmd = record + cmd
 
     # Use fixed threads for stability if user hasn't set it
     env = os.environ.copy()
@@ -169,11 +213,8 @@ def train_with_perf(train_tsv: Path, tag: str):
     env.setdefault("OPENBLAS_WAIT_POLICY", os.environ.get("BENCH_OBLAS_WAIT", "PASSIVE"))
 
     print(f"\n=== Training [{tag}] with perf ===")
-    # Time the perf-wrapped run
-    import time as _time
-    t0 = _time.perf_counter()
-    run_or_die(cmd, cwd=WORKSPACE_ROOT, env=env)
-    dt = _time.perf_counter() - t0
+    # Run perf record with automatic fallback for mmap limits
+    dt = _run_perf_record(cmd, perf_data, env)
 
     # Collect perf reports (call-graph) for HTML embedding
     graph_cmd = [
