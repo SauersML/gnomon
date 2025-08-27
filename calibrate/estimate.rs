@@ -30,8 +30,8 @@ use crate::calibrate::construction::{
     compute_penalty_square_roots,
 };
 use crate::calibrate::data::TrainingData;
-use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::hull::build_peeled_hull;
+use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
@@ -39,13 +39,10 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
 // faer: high-performance dense solvers
 use faer::Mat as FaerMat;
-use faer::linalg::solvers::{
-    Llt as FaerLlt,
-    Ldlt as FaerLdlt,
-    Lblt as FaerLblt,
-    Solve as FaerSolve,
-};
 use faer::Side;
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
 
 // Helper: Frobenius inner product for faer matrices
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
@@ -60,8 +57,8 @@ fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
 }
 use std::cell::RefCell;
 use std::collections::HashMap;
-use thiserror::Error;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// A comprehensive error type for the model estimation process.
 #[derive(Error, Debug)]
@@ -194,7 +191,9 @@ pub fn train_model(
 
     // Symmetric base seeds
     // Include genuinely small-λ and large-λ seeds to explore a broader landscape
-    let base_values: &[f64] = &[12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0];
+    let base_values: &[f64] = &[
+        12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0,
+    ];
     for &val in base_values {
         seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
     }
@@ -203,10 +202,22 @@ pub fn train_model(
     if layout.num_penalties >= 2 {
         // A diverse palette of asymmetric starting points
         let asym_pairs: &[[f64; 2]] = &[
-            [12.0, 0.0], [0.0, 12.0], [10.0, 2.0], [2.0, 10.0],
-            [8.0, -4.0], [-4.0, 8.0], [6.0, -2.0], [-2.0, 6.0],
-            [8.0, 6.0], [6.0, 8.0], [4.0, 2.0], [2.0, 4.0],
-            [-8.0, 0.0], [0.0, -8.0], [-10.0, -2.0], [-2.0, -10.0],
+            [12.0, 0.0],
+            [0.0, 12.0],
+            [10.0, 2.0],
+            [2.0, 10.0],
+            [8.0, -4.0],
+            [-4.0, 8.0],
+            [6.0, -2.0],
+            [-2.0, 6.0],
+            [8.0, 6.0],
+            [6.0, 8.0],
+            [4.0, 2.0],
+            [2.0, 4.0],
+            [-8.0, 0.0],
+            [0.0, -8.0],
+            [-10.0, -2.0],
+            [-2.0, -10.0],
         ];
         for p in asym_pairs {
             seed_candidates.push(Array1::from_vec(p.to_vec()));
@@ -455,9 +466,9 @@ pub fn train_model(
 
                     let candidate = match run {
                         Ok(sol) => sol,
-                        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution: ls, .. }) => {
-                            *ls
-                        }
+                        Err(wolfe_bfgs::BfgsError::LineSearchFailed {
+                            last_solution: ls, ..
+                        }) => *ls,
                         Err(_) => continue,
                     };
 
@@ -499,16 +510,17 @@ pub fn train_model(
                     "[Restart Baseline] last value = {:.6}, ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
                     last_solution.final_value, last_grad_norm_z, last_grad_norm_rho
                 );
-                
+
                 if let Some(alt) = best_alt {
                     let fv0 = last_solution.final_value;
                     let fv1 = alt.final_value;
                     let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
-                    
+
                     // Meaningful improvement OR close values with better gradient
                     let cost_improved = fv1 < fv0 - 1e-6 * cost_scale;
-                    let similar_cost_better_grad = rel_diff < 1e-6 && best_alt_grad_norm_z < 0.9 * last_grad_norm_z;
-                    
+                    let similar_cost_better_grad =
+                        rel_diff < 1e-6 && best_alt_grad_norm_z < 0.9 * last_grad_norm_z;
+
                     if (cost_improved || similar_cost_better_grad)
                         && (best_alt_grad_norm_z <= grad_norm_accept_z
                             || best_alt_grad_norm_z <= grad_norm_accept_rho)
@@ -583,8 +595,7 @@ pub fn train_model(
 
                     eprintln!(
                         "[INFO] Accepting the best parameters found as the final result (||grad_z||: {:.2e}, ||grad_rho||: {:.2e}).",
-                        gradient_norm_z,
-                        gradient_norm_rho
+                        gradient_norm_z, gradient_norm_rho
                     );
                     *last_solution
                 }
@@ -732,11 +743,7 @@ fn compute_fd_gradient(
 }
 
 /// Computes and prints the cosine similarity between the analytical and finite-difference gradients.
-fn check_gradient_for_seed(
-    reml_state: &internal::RemlState,
-    rho: &Array1<f64>,
-    seed_index: usize,
-) {
+fn check_gradient_for_seed(reml_state: &internal::RemlState, rho: &Array1<f64>, seed_index: usize) {
     println!("\n--- Gradient Check for Seed #{} ---", seed_index);
     println!("  ρ = {:?}", rho.to_vec());
 
@@ -753,7 +760,10 @@ fn check_gradient_for_seed(
     let g_fd = match compute_fd_gradient(reml_state, rho) {
         Ok(grad) => grad,
         Err(e) => {
-            println!("  ERROR: Failed to compute finite-difference gradient: {:?}", e);
+            println!(
+                "  ERROR: Failed to compute finite-difference gradient: {:?}",
+                e
+            );
             return;
         }
     };
@@ -826,7 +836,6 @@ pub mod internal {
                 FaerFactor::Llt(f) => f.solve(rhs),
                 FaerFactor::Lblt(f) => f.solve(rhs),
                 FaerFactor::Ldlt(f) => f.solve(rhs),
-                
             }
         }
     }
@@ -983,7 +992,9 @@ pub mod internal {
             let fact = Arc::new(self.factorize_faer(h));
             {
                 let mut cache = self.faer_factor_cache.borrow_mut();
-                if cache.len() > 64 { cache.clear(); }
+                if cache.len() > 64 {
+                    cache.clear();
+                }
                 cache.insert(key, Arc::clone(&fact));
             }
             fact
@@ -1195,9 +1206,10 @@ pub mod internal {
                         // Solve X = H^{-1} Rt using the cached factor
                         let x = factor.solve(rt.as_ref());
                         // tr(H^{-1} λ_k RᵀR) = λ_k ⟨X, Rt⟩_F
-                        trace_h_inv_s_lambda += lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
+                        trace_h_inv_s_lambda +=
+                            lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
                     }
-                    
+
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
@@ -1337,7 +1349,8 @@ pub mod internal {
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-                        if let Ok(h_inv_col) = internal::robust_solve(hessian_t, &s_col.to_owned()) {
+                        if let Ok(h_inv_col) = internal::robust_solve(hessian_t, &s_col.to_owned())
+                        {
                             trace_h_inv_s_lambda += h_inv_col[j];
                         }
                     }
@@ -1665,7 +1678,8 @@ pub mod internal {
                         let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
                         let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
                         let x = factor_g.solve(rt.as_ref());
-                        trace_h_inv_s_lambda += lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
+                        trace_h_inv_s_lambda +=
+                            lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
                     }
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
                     let scale = dp / (n - edf).max(1e-8);
@@ -1795,7 +1809,8 @@ pub mod internal {
                     for j in 0..lambdas.len() {
                         let s_j_t = rs_transformed[j].t().dot(&rs_transformed[j]);
                         let s_j_beta = s_j_t.dot(beta_transformed);
-                        s_lambda_beta_transformed = s_lambda_beta_transformed + s_j_beta.mapv(|v| v * lambdas[j]);
+                        s_lambda_beta_transformed =
+                            s_lambda_beta_transformed + s_j_beta.mapv(|v| v * lambdas[j]);
                     }
 
                     // --- Loop through penalties to compute each gradient component ---
@@ -1818,12 +1833,14 @@ pub mod internal {
                         // total derivative must include its direct ρ-derivative. In the non-Gaussian
                         // case the indirect parts are handled via other terms; here we add the direct
                         // piece so that the analytic gradient matches the finite-difference of cost.
-                        let penalty_direct_term = 0.5 * lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
+                        let penalty_direct_term =
+                            0.5 * lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
 
                         // Component 1c: Indirect derivative of β'S_λβ through β(ρ)
                         // 0.5 * d/dρ_k (β'S_λβ) contributes (S_λ β)ᵀ (∂β/∂ρ_k) + 0.5 λ_k βᵀ S_k β.
                         // We precomputed S_λ β as s_lambda_beta_transformed.
-                        let penalty_indirect_term = s_lambda_beta_transformed.dot(&dbeta_drho_k_transformed);
+                        let penalty_indirect_term =
+                            s_lambda_beta_transformed.dot(&dbeta_drho_k_transformed);
 
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
                         let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
@@ -1850,10 +1867,10 @@ pub mod internal {
 
                         // Final Gradient Assembly - mgcv/gdi1 form for LAML, with explicit penalty direct + indirect terms
                         cost_gradient[k] = deviance_grad_term
-                                         + penalty_indirect_term
-                                         + penalty_direct_term
-                                         + log_det_h_grad_term
-                                         - log_det_s_grad_term;
+                            + penalty_indirect_term
+                            + penalty_direct_term
+                            + log_det_h_grad_term
+                            - log_det_s_grad_term;
                     }
                     // mgcv-style assembly
                     log::debug!("LAML gradient computation finished.");
@@ -2158,16 +2175,14 @@ pub mod internal {
                     num_knots: 6,
                     degree: 3,
                 },
-                pc_configs: vec![
-                    PrincipalComponentConfig {
-                        name: "PC1".to_string(),
-                        basis_config: BasisConfig {
-                            num_knots: 6,
-                            degree: 3,
-                        },
-                        range: (-1.5, 1.5),
-                    }
-                ],
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 6,
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
@@ -2177,7 +2192,8 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let mut model_for_pd = train_model(&data, &config).expect("Model training should succeed");
+            let mut model_for_pd =
+                train_model(&data, &config).expect("Model training should succeed");
             // For PD diagnostics, disable RGC to avoid projection bias during averaging
             model_for_pd.hull = None;
 
@@ -2325,16 +2341,14 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_configs: vec![
-                    PrincipalComponentConfig {
-                        name: "PC1".to_string(),
-                        basis_config: BasisConfig {
-                            num_knots: 3,
-                            degree: 3,
-                        },
-                        range: (-1.5, 1.5),
-                    }
-                ],
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
@@ -2536,16 +2550,25 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
                 pc_configs: vec![
                     PrincipalComponentConfig {
                         name: "PC1".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 3,
+                        },
                         range: (-1.5, 1.5),
                     },
                     PrincipalComponentConfig {
                         name: "PC2".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 3,
+                        },
                         range: (-1.5, 1.5),
                     },
                 ],
@@ -2637,10 +2660,16 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 30,
-                pgs_basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 8,
+                    degree: 3,
+                },
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
-                    basis_config: BasisConfig { num_knots: 8, degree: 3 },
+                    basis_config: BasisConfig {
+                        num_knots: 8,
+                        degree: 3,
+                    },
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
@@ -2669,7 +2698,12 @@ pub mod internal {
             let mut rho_bounds_ok = true;
             let mut proj_rates = Vec::new();
 
-            println!("[CV] Starting real-world metrics evaluation: n_samples={}, k_folds={}, repeats={}", n_samples, k_folds, repeats.len());
+            println!(
+                "[CV] Starting real-world metrics evaluation: n_samples={}, k_folds={}, repeats={}",
+                n_samples,
+                k_folds,
+                repeats.len()
+            );
             for (rep_idx, &seed) in repeats.iter().enumerate() {
                 println!("[CV] Repeat {} (seed={})", rep_idx + 1, seed);
                 use rand::seq::SliceRandom;
@@ -2682,12 +2716,24 @@ pub mod internal {
                 for fold in 0..k_folds {
                     let start = fold * fold_size;
                     let end = ((fold + 1) * fold_size).min(n_samples);
-                    if start >= end { break; }
+                    if start >= end {
+                        break;
+                    }
                     let val_len = end - start;
                     let train_len = n_samples - val_len;
-                    println!("[CV]  Fold {}/{}: train={}, val={}", fold + 1, k_folds, train_len, val_len);
+                    println!(
+                        "[CV]  Fold {}/{}: train={}, val={}",
+                        fold + 1,
+                        k_folds,
+                        train_len,
+                        val_len
+                    );
                     let val_idx: Vec<usize> = idx[start..end].to_vec();
-                    let train_idx: Vec<usize> = idx.iter().cloned().filter(|i| *i < start || *i >= end).collect();
+                    let train_idx: Vec<usize> = idx
+                        .iter()
+                        .cloned()
+                        .filter(|i| *i < start || *i >= end)
+                        .collect();
 
                     // Build train data
                     let take = |arr: &Array1<f64>, ids: &Vec<usize>| -> Array1<f64> {
@@ -2719,9 +2765,16 @@ pub mod internal {
 
                     // Complexity: edf and Hessian min-eig by refitting at chosen lambdas on training X
                     let (x_tr, s_list, layout, _, _, _, _, _, _) =
-                        build_design_and_penalty_matrices(&data_train, &trained.config).expect("layout");
+                        build_design_and_penalty_matrices(&data_train, &trained.config)
+                            .expect("layout");
                     let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
-                    let rho = Array1::from(trained.lambdas.iter().map(|&l| l.ln().clamp(-15.0, 15.0)).collect::<Vec<_>>());
+                    let rho = Array1::from(
+                        trained
+                            .lambdas
+                            .iter()
+                            .map(|&l| l.ln().clamp(-15.0, 15.0))
+                            .collect::<Vec<_>>(),
+                    );
                     let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
                         rho.view(),
                         x_tr.view(),
@@ -2730,7 +2783,8 @@ pub mod internal {
                         &rs_list,
                         &layout,
                         &trained.config,
-                    ).expect("pirls refit");
+                    )
+                    .expect("pirls refit");
 
                     total_edfs.push(pirls_res.edf);
                     println!("[CV]   Complexity: edf={:.2}", pirls_res.edf);
@@ -2744,26 +2798,40 @@ pub mod internal {
                     println!("[CV]   Penalized Hessian min-eig={:.3e}", min_eig);
 
                     // Rho bounds sanity
-                    rho_bounds_ok &= trained
-                        .lambdas
-                        .iter()
-                        .all(|&l| l.ln().abs() < 14.0);
+                    rho_bounds_ok &= trained.lambdas.iter().all(|&l| l.ln().abs() < 14.0);
                     if !rho_bounds_ok {
-                        println!("[CV]   WARNING: rho near bounds: {:?}", trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>());
+                        println!(
+                            "[CV]   WARNING: rho near bounds: {:?}",
+                            trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>()
+                        );
                     }
 
                     // RGC projection stats on validation
                     let proj_rate = if let Some(hull) = &trained.hull {
                         let mut raw = Array2::zeros((data_val_p.len(), 1 + data_val_pcs.ncols()));
                         raw.column_mut(0).assign(&data_val_p);
-                        if raw.ncols() > 1 { raw.slice_mut(ndarray::s![.., 1..]).assign(&data_val_pcs); }
+                        if raw.ncols() > 1 {
+                            raw.slice_mut(ndarray::s![.., 1..]).assign(&data_val_pcs);
+                        }
                         let (corrected, num_proj) = hull.project_if_needed(raw.view());
                         let rate = num_proj as f64 / corrected.nrows() as f64;
                         proj_rates.push(rate);
-                        println!("[CV]   RGC: projected {}/{} ({:.1}%)", num_proj, corrected.nrows(), 100.0*rate);
+                        println!(
+                            "[CV]   RGC: projected {}/{} ({:.1}%)",
+                            num_proj,
+                            corrected.nrows(),
+                            100.0 * rate
+                        );
                         rate
-                    } else { proj_rates.push(0.0); 0.0 };
-                    assert!(proj_rate <= 0.20, "Mean projection rate must be <= 20% (got {:.2}%)", 100.0*proj_rate);
+                    } else {
+                        proj_rates.push(0.0);
+                        0.0
+                    };
+                    assert!(
+                        proj_rate <= 0.20,
+                        "Mean projection rate must be <= 20% (got {:.2}%)",
+                        100.0 * proj_rate
+                    );
 
                     // Predict on validation
                     let preds = trained
@@ -2831,7 +2899,7 @@ pub mod internal {
                 "[CV]  Complexity: edf mean={:.2} sd={:.2}, min-eig(min)={:.3e}",
                 edf_m, edf_sd, min_eig_min
             );
-            println!("[CV]  RGC: mean projection rate={:.2}%", 100.0*proj_m);
+            println!("[CV]  RGC: mean projection rate={:.2}%", 100.0 * proj_m);
 
             // Assertions per spec
             assert!(auc_m >= 0.60, "AUC mean too low: {:.3}", auc_m);
@@ -2842,15 +2910,35 @@ pub mod internal {
             assert!(ll_sd <= 0.05, "Log-loss SD too high: {:.3}", ll_sd);
             assert!(br_m <= 0.25, "Brier mean too high: {:.3}", br_m);
 
-            assert!( (slope_m >= 0.80) && (slope_m <= 1.20), "Calibration slope out of range: {:.3}", slope_m);
-            assert!( (cint_m >= -0.20) && (cint_m <= 0.20), "Calibration intercept out of range: {:.3}", cint_m);
-            assert!( ece_m <= 0.15, "ECE too high: {:.3}", ece_m);
+            assert!(
+                (slope_m >= 0.80) && (slope_m <= 1.20),
+                "Calibration slope out of range: {:.3}",
+                slope_m
+            );
+            assert!(
+                (cint_m >= -0.20) && (cint_m <= 0.20),
+                "Calibration intercept out of range: {:.3}",
+                cint_m
+            );
+            assert!(ece_m <= 0.15, "ECE too high: {:.3}", ece_m);
 
             assert!(rho_bounds_ok, "Rho at or near bounds across folds");
-            assert!(edf_m >= 10.0 && edf_m <= 80.0, "EDF mean out of range: {:.2}", edf_m);
+            assert!(
+                edf_m >= 10.0 && edf_m <= 80.0,
+                "EDF mean out of range: {:.2}",
+                edf_m
+            );
             assert!(edf_sd <= 10.0, "EDF SD too high: {:.2}", edf_sd);
-            assert!(min_eig_min > 1e-6, "Hessian min eigenvalue too small: {:.3e}", min_eig_min);
-            assert!(proj_m <= 0.20, "Mean projection rate (RGC) exceeds 20%: {:.2}%", 100.0*proj_m);
+            assert!(
+                min_eig_min > 1e-6,
+                "Hessian min eigenvalue too small: {:.3e}",
+                min_eig_min
+            );
+            assert!(
+                proj_m <= 0.20,
+                "Mean projection rate (RGC) exceeds 20%: {:.2}%",
+                100.0 * proj_m
+            );
         }
 
         /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
@@ -2908,9 +2996,7 @@ pub mod internal {
                 let mut tp_in_tie_group = 0.0;
                 let mut fp_in_tie_group = 0.0;
 
-                while i < pairs.len()
-                    && (pairs[i].0 - current_score).abs() <= tie_eps
-                {
+                while i < pairs.len() && (pairs[i].0 - current_score).abs() <= tie_eps {
                     if *pairs[i].1 > 0.5 {
                         // It's a positive outcome
                         tp_in_tie_group += 1.0;
@@ -2944,43 +3030,80 @@ pub mod internal {
         // Metrics helpers (no plotting)
         fn calculate_auc_cv(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
             assert_eq!(predictions.len(), outcomes.len());
-            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            let mut pairs: Vec<(f64, f64)> = predictions
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(&p, &y)| (p, y))
+                .collect();
             pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             let pos = outcomes.iter().filter(|&&y| y > 0.5).count() as f64;
             let neg = outcomes.len() as f64 - pos;
-            if pos == 0.0 || neg == 0.0 { return 0.5; }
-            let mut tp = 0.0; let mut fp = 0.0; let mut last_tpr = 0.0; let mut last_fpr = 0.0; let mut auc = 0.0;
-            let mut i = 0; let n = pairs.len();
+            if pos == 0.0 || neg == 0.0 {
+                return 0.5;
+            }
+            let mut tp = 0.0;
+            let mut fp = 0.0;
+            let mut last_tpr = 0.0;
+            let mut last_fpr = 0.0;
+            let mut auc = 0.0;
+            let mut i = 0;
+            let n = pairs.len();
             while i < n {
-                let score = pairs[i].0; let mut tp_inc = 0.0; let mut fp_inc = 0.0;
+                let score = pairs[i].0;
+                let mut tp_inc = 0.0;
+                let mut fp_inc = 0.0;
                 while i < n && (pairs[i].0 - score).abs() <= 1e-12 {
-                    if pairs[i].1 > 0.5 { tp_inc += 1.0; } else { fp_inc += 1.0; }
+                    if pairs[i].1 > 0.5 {
+                        tp_inc += 1.0;
+                    } else {
+                        fp_inc += 1.0;
+                    }
                     i += 1;
                 }
-                tp += tp_inc; fp += fp_inc;
-                let tpr = tp / pos; let fpr = fp / neg;
+                tp += tp_inc;
+                fp += fp_inc;
+                let tpr = tp / pos;
+                let fpr = fp / neg;
                 auc += (fpr - last_fpr) * (tpr + last_tpr) / 2.0;
-                last_tpr = tpr; last_fpr = fpr;
+                last_tpr = tpr;
+                last_fpr = fpr;
             }
             auc
         }
 
         fn calculate_pr_auc(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
             assert_eq!(predictions.len(), outcomes.len());
-            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            let mut pairs: Vec<(f64, f64)> = predictions
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(&p, &y)| (p, y))
+                .collect();
             pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             let pos = outcomes.iter().filter(|&&y| y > 0.5).count() as f64;
-            if pos == 0.0 { return 0.0; }
-            let mut tp = 0.0; let mut fp = 0.0; let mut last_recall = 0.0; let mut pr_auc = 0.0;
-            let mut i = 0; let n = pairs.len();
+            if pos == 0.0 {
+                return 0.0;
+            }
+            let mut tp = 0.0;
+            let mut fp = 0.0;
+            let mut last_recall = 0.0;
+            let mut pr_auc = 0.0;
+            let mut i = 0;
+            let n = pairs.len();
             while i < n {
-                let score = pairs[i].0; let mut tp_inc = 0.0; let mut fp_inc = 0.0;
+                let score = pairs[i].0;
+                let mut tp_inc = 0.0;
+                let mut fp_inc = 0.0;
                 while i < n && (pairs[i].0 - score).abs() <= 1e-12 {
-                    if pairs[i].1 > 0.5 { tp_inc += 1.0; } else { fp_inc += 1.0; }
+                    if pairs[i].1 > 0.5 {
+                        tp_inc += 1.0;
+                    } else {
+                        fp_inc += 1.0;
+                    }
                     i += 1;
                 }
                 let prev_recall = last_recall;
-                tp += tp_inc; fp += fp_inc;
+                tp += tp_inc;
+                fp += fp_inc;
                 let recall = tp / pos;
                 let precision = if tp + fp > 0.0 { tp / (tp + fp) } else { 1.0 };
                 pr_auc += (recall - prev_recall) * precision;
@@ -2990,7 +3113,8 @@ pub mod internal {
         }
 
         fn calculate_log_loss(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
-            let mut sum = 0.0; let n = predictions.len() as f64;
+            let mut sum = 0.0;
+            let n = predictions.len() as f64;
             for (&p_raw, &y) in predictions.iter().zip(outcomes.iter()) {
                 let p = p_raw.clamp(1e-9, 1.0 - 1e-9);
                 sum += if y > 0.5 { -p.ln() } else { -(1.0 - p).ln() };
@@ -3000,18 +3124,34 @@ pub mod internal {
 
         fn calculate_brier(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> f64 {
             let n = predictions.len() as f64;
-            predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p - y)*(p - y)).sum::<f64>() / n
+            predictions
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(&p, &y)| (p - y) * (p - y))
+                .sum::<f64>()
+                / n
         }
 
-        fn expected_calibration_error(predictions: &Array1<f64>, outcomes: &Array1<f64>, bins: usize) -> f64 {
+        fn expected_calibration_error(
+            predictions: &Array1<f64>,
+            outcomes: &Array1<f64>,
+            bins: usize,
+        ) -> f64 {
             assert!(bins >= 2);
-            let mut pairs: Vec<(f64, f64)> = predictions.iter().zip(outcomes.iter()).map(|(&p, &y)| (p, y)).collect();
+            let mut pairs: Vec<(f64, f64)> = predictions
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(&p, &y)| (p, y))
+                .collect();
             pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
             let n = pairs.len();
             let mut ece = 0.0;
             for b in 0..bins {
-                let lo = b * n / bins; let hi = ((b + 1) * n / bins).min(n);
-                if lo >= hi { continue; }
+                let lo = b * n / bins;
+                let hi = ((b + 1) * n / bins).min(n);
+                if lo >= hi {
+                    continue;
+                }
                 let slice = &pairs[lo..hi];
                 let m = slice.len() as f64;
                 let avg_p = slice.iter().map(|(p, _)| *p).sum::<f64>() / m;
@@ -3025,37 +3165,57 @@ pub mod internal {
         fn correlation_coefficient(x: &Array1<f64>, y: &Array1<f64>) -> f64 {
             let x_mean = x.mean().unwrap_or(0.0);
             let y_mean = y.mean().unwrap_or(0.0);
-            let num: f64 = x.iter().zip(y.iter()).map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean)).sum();
+            let num: f64 = x
+                .iter()
+                .zip(y.iter())
+                .map(|(&xi, &yi)| (xi - x_mean) * (yi - y_mean))
+                .sum();
             let x_var: f64 = x.iter().map(|&xi| (xi - x_mean).powi(2)).sum();
             let y_var: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
             num / (x_var.sqrt() * y_var.sqrt())
         }
 
-        fn calibration_intercept_slope(predictions: &Array1<f64>, outcomes: &Array1<f64>) -> (f64, f64) {
+        fn calibration_intercept_slope(
+            predictions: &Array1<f64>,
+            outcomes: &Array1<f64>,
+        ) -> (f64, f64) {
             // Logistic recalibration: y ~ sigmoid(a + b * logit(p)) via Newton with two params
             let z: Vec<f64> = predictions
                 .iter()
                 .map(|&p| ((p.clamp(1e-9, 1.0 - 1e-9)) / (1.0 - p.clamp(1e-9, 1.0 - 1e-9))).ln())
                 .collect();
             let y: Vec<f64> = outcomes.iter().copied().collect();
-            let mut a = 0.0; let mut b = 1.0; // start near identity
+            let mut a = 0.0;
+            let mut b = 1.0; // start near identity
             for _ in 0..25 {
-                let mut g0 = 0.0; let mut g1 = 0.0; let mut h00 = 0.0; let mut h01 = 0.0; let mut h11 = 0.0;
+                let mut g0 = 0.0;
+                let mut g1 = 0.0;
+                let mut h00 = 0.0;
+                let mut h01 = 0.0;
+                let mut h11 = 0.0;
                 for i in 0..z.len() {
                     let eta = a + b * z[i];
                     let p = 1.0 / (1.0 + (-eta).exp());
                     let w = p * (1.0 - p);
                     let r = y[i] - p;
-                    g0 += r; g1 += r * z[i];
-                    h00 += w; h01 += w * z[i]; h11 += w * z[i] * z[i];
+                    g0 += r;
+                    g1 += r * z[i];
+                    h00 += w;
+                    h01 += w * z[i];
+                    h11 += w * z[i] * z[i];
                 }
                 // Solve 2x2 system [h00 h01; h01 h11] [da db]^T = [g0 g1]^T
                 let det = h00 * h11 - h01 * h01;
-                if det.abs() < 1e-12 { break; }
-                let da = ( g0 * h11 - g1 * h01) / det;
+                if det.abs() < 1e-12 {
+                    break;
+                }
+                let da = (g0 * h11 - g1 * h01) / det;
                 let db = (-g0 * h01 + g1 * h00) / det;
-                a += da; b += db;
-                if da.abs().max(db.abs()) < 1e-6 { break; }
+                a += da;
+                b += db;
+                if da.abs().max(db.abs()) < 1e-6 {
+                    break;
+                }
             }
             (a, b)
         }
@@ -3834,42 +3994,66 @@ pub mod internal {
                 pc_configs: vec![
                     PrincipalComponentConfig {
                         name: "PC1".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC2".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC3".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC4".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC5".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC6".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC7".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                     PrincipalComponentConfig {
                         name: "PC8".to_string(),
-                        basis_config: BasisConfig { num_knots: 8, degree: 2 },
+                        basis_config: BasisConfig {
+                            num_knots: 8,
+                            degree: 2,
+                        },
                         range: (0.0, 1.0),
                     },
                 ],
@@ -3982,16 +4166,14 @@ pub mod internal {
                     num_knots: 6, // Reduced to avoid ModelOverparameterized
                     degree: 3,
                 },
-                pc_configs: vec![
-                    PrincipalComponentConfig {
-                        name: "PC1".to_string(),
-                        basis_config: BasisConfig {
-                            num_knots: 5, // Reduced to avoid ModelOverparameterized
-                            degree: 3,
-                        },
-                        range: (-1.5, 1.5),
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 5, // Reduced to avoid ModelOverparameterized
+                        degree: 3,
                     },
-                ],
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (0.0, 1.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
@@ -4096,13 +4278,14 @@ pub mod internal {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_configs: vec![
-                    PrincipalComponentConfig {
-                        name: "PC1".to_string(),
-                        basis_config: BasisConfig { num_knots: 3, degree: 3 },
-                        range: (-1.5, 1.5),
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
                     },
-                ],
+                    range: (-1.5, 1.5),
+                }],
                 pgs_range: (0.0, 1.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
@@ -4240,7 +4423,10 @@ pub mod internal {
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
-                    pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    pgs_basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
                     pc_configs: vec![],
                     pgs_range: (-2.0, 2.0),
                     sum_to_zero_constraints: std::collections::HashMap::new(),
@@ -4254,7 +4440,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // 3. Build GUARANTEED CONSISTENT structures for this simple model.
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -4375,7 +4561,10 @@ pub mod internal {
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
-                    pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    pgs_basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
                     pc_configs: vec![],
                     pgs_range: (-1.0, 1.0),
                     sum_to_zero_constraints: std::collections::HashMap::new(),
@@ -4390,10 +4579,10 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // 2. Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
-                build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
-                    panic!("Matrix build failed for {:?}: {:?}", link_function, e)
-                });
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                    build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
+                        panic!("Matrix build failed for {:?}: {:?}", link_function, e)
+                    });
 
                 // 3. Create RemlState with the consistent objects
                 let reml_state = internal::RemlState::new(
@@ -4540,10 +4729,16 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig { num_knots: 2, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 2,
+                    degree: 3,
+                },
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
-                    basis_config: BasisConfig { num_knots: 2, degree: 3 },
+                    basis_config: BasisConfig {
+                        num_knots: 2,
+                        degree: 3,
+                    },
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
@@ -4727,16 +4922,19 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
                 pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-    };
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
+            };
 
             // 2. Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
@@ -4842,7 +5040,10 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
                 pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
                 sum_to_zero_constraints: std::collections::HashMap::new(),
@@ -5040,7 +5241,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
     };
 
     // Try to build the matrices - if this fails, the test is still valid
-            let matrices_result = build_design_and_penalty_matrices(&data, &config);
+    let matrices_result = build_design_and_penalty_matrices(&data, &config);
     if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
@@ -5228,13 +5429,14 @@ mod optimizer_progress_tests {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_configs: vec![
-                PrincipalComponentConfig {
-                    name: "PC1".to_string(),
-                    basis_config: BasisConfig { num_knots: 6, degree: 3 },
-                    range: (-3.0, 3.0),
+            pc_configs: vec![PrincipalComponentConfig {
+                name: "PC1".to_string(),
+                basis_config: BasisConfig {
+                    num_knots: 6,
+                    degree: 3,
                 },
-            ],
+                range: (-3.0, 3.0),
+            }],
             pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
@@ -5299,8 +5501,8 @@ mod optimizer_progress_tests {
 // === Numerical gradient validation for LAML ===
 #[cfg(test)]
 mod gradient_validation_tests {
-    use super::*;
     use super::test_helpers;
+    use super::*;
     use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -5319,7 +5521,12 @@ mod gradient_validation_tests {
             t.max(-6.0).min(6.0)
         });
         let y = test_helpers::generate_y_from_logit(&logits, &mut rng);
-        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n) };
+        let data = TrainingData {
+            y,
+            p: p.clone(),
+            pcs,
+            weights: Array1::ones(n),
+        };
 
         let config = ModelConfig {
             link_function: LinkFunction::Logit,
@@ -5328,14 +5535,18 @@ mod gradient_validation_tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
-            pc_configs: vec![
-                PrincipalComponentConfig {
-                    name: "PC1".to_string(),
-                    basis_config: BasisConfig { num_knots: 3, degree: 3 },
-                    range: (-1.5, 1.5),
-                }
-            ],
+            pgs_basis_config: BasisConfig {
+                num_knots: 4,
+                degree: 3,
+            },
+            pc_configs: vec![PrincipalComponentConfig {
+                name: "PC1".to_string(),
+                basis_config: BasisConfig {
+                    num_knots: 3,
+                    degree: 3,
+                },
+                range: (-1.5, 1.5),
+            }],
             pgs_range: (-2.0, 2.0),
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
@@ -5347,7 +5558,10 @@ mod gradient_validation_tests {
 
         let (x, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).expect("matrix build");
-        assert!(layout.num_penalties > 0, "Model must have at least one penalty");
+        assert!(
+            layout.num_penalties > 0,
+            "Model must have at least one penalty"
+        );
 
         let reml_state = internal::RemlState::new(
             data.y.view(),
@@ -5356,10 +5570,11 @@ mod gradient_validation_tests {
             s_list,
             &layout,
             &config,
-        ).expect("state");
-        
+        )
+        .expect("state");
+
         // Step 2: use a larger step size for the numerical gradient
-        
+
         // Evaluate at rho = 0 (λ = 1)
         let rho0 = Array1::zeros(layout.num_penalties);
         let analytic = reml_state.compute_gradient(&rho0).expect("analytic grad");
@@ -5373,7 +5588,7 @@ mod gradient_validation_tests {
             rp[k] += h;
             let mut rm = rho0.clone();
             rm[k] -= h;
-            
+
             // Use the public API as intended. The larger `h` makes this a valid approximation.
             let fp = reml_state.compute_cost(&rp).expect("cost+");
             let fm = reml_state.compute_cost(&rm).expect("cost-");
@@ -5387,7 +5602,10 @@ mod gradient_validation_tests {
             assert!(
                 rel_err < 0.25, // A more reasonable tolerance for this specific test
                 "Total derivative mismatch at k={}: analytic={:.6e}, numeric={:.6e}, rel_err={:.3e}",
-                k, analytic[k], numeric[k], rel_err
+                k,
+                analytic[k],
+                numeric[k],
+                rel_err
             );
         }
     }

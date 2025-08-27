@@ -45,12 +45,10 @@ def build_profiling_binary():
     rf = env.get("RUSTFLAGS", "").strip()
     flags = "-C force-frame-pointers=yes -C debuginfo=2 -C link-dead-code=yes"
     env["RUSTFLAGS"] = (rf + " " + flags).strip() if rf else flags
-    if not EXECUTABLE_PATH.exists():
-        print("--- Building profiling binary (symbols kept) ---")
-        # Build from workspace root so cargo.toml resolves correctly
-        run_or_die(["cargo", "build", "--profile", "profiling"], cwd=WORKSPACE_ROOT, env=env)
-    else:
-        print("--- Found existing profiling binary. ---")
+    # Always rebuild to ensure latest changes are profiled
+    print("--- Building profiling binary (symbols kept) ---")
+    # Build from workspace root so cargo.toml resolves correctly
+    run_or_die(["cargo", "build", "--profile", "profiling"], cwd=WORKSPACE_ROOT, env=env)
 
 
 def run_or_die(cmd, cwd=None, env=None, stream=True):

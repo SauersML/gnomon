@@ -13,8 +13,8 @@ pub struct PirlsWorkspace {
     pub wx: Array2<f64>,
     pub wz: Array1<f64>,
     // Stage 2/4 assembly (use max needed sizes)
-    pub scaled_matrix: Array2<f64>,     // (<= p + eb_rows) x p
-    pub final_aug_matrix: Array2<f64>,  // (<= p + e_rows) x p
+    pub scaled_matrix: Array2<f64>,    // (<= p + eb_rows) x p
+    pub final_aug_matrix: Array2<f64>, // (<= p + e_rows) x p
     // Stage 5 RHS buffers
     pub rhs_full: Array1<f64>, // length <= p + e_rows
     // Gradient check helpers
@@ -455,7 +455,9 @@ pub fn fit_model_for_fixed_rho(
                 deviance: last_deviance,
                 edf: if let Some((ref result, _)) = last_stable_result {
                     result.edf
-                } else { 0.0 },
+                } else {
+                    0.0
+                },
                 stable_penalty_term,
                 final_weights: weights,
                 status: PirlsStatus::Unstable,
@@ -633,7 +635,11 @@ pub fn fit_model_for_fixed_rho(
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
         deviance: last_deviance,
-        edf: if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 },
+        edf: if let Some((ref result, _)) = last_stable_result {
+            result.edf
+        } else {
+            0.0
+        },
         stable_penalty_term,
         final_weights: weights,
         status: PirlsStatus::MaxIterationsReached,
@@ -1746,10 +1752,14 @@ pub fn compute_final_penalized_hessian(
 
     // Find the maximum eigenvalue to create a relative tolerance
     let max_eigenval = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-    
+
     // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eigenval > 0.0 { max_eigenval * 1e-12 } else { 1e-12 };
-    
+    let tolerance = if max_eigenval > 0.0 {
+        max_eigenval * 1e-12
+    } else {
+        1e-12
+    };
+
     let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
     let mut e = Array2::zeros((p, rank_s));
@@ -2335,8 +2345,8 @@ mod tests {
                 num_knots: 5,
                 degree: 3,
             }, // Stable basis
-            pc_configs: vec![], // PGS-only model
-            pgs_range: (-2.0, 2.0),   // Match the data
+            pc_configs: vec![],     // PGS-only model
+            pgs_range: (-2.0, 2.0), // Match the data
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),

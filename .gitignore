@@ -5,3 +5,5 @@ model.toml
 *.csv
 *.tsv
 t.py
+calibrate/tests/__pycache__/
+calibrate/tests/bench_workdir/

@@ -2,8 +2,8 @@ use crate::calibrate::basis::{self, create_bspline_basis, create_difference_pena
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::ModelConfig;
-use ndarray::{Array1, Array2, Axis, s};
 use ndarray::parallel::prelude::*;
+use ndarray::{Array1, Array2, Axis, s};
 use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -100,7 +100,7 @@ pub struct ModelLayout {
     pub intercept_col: usize,
     pub pgs_main_cols: Range<usize>,
     /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
-    pub pc_null_cols: Vec<Range<usize>>,  
+    pub pc_null_cols: Vec<Range<usize>>,
     pub penalty_map: Vec<PenalizedBlock>,
     /// Direct indices to avoid string lookups in hot paths
     pub pc_main_block_idx: Vec<usize>,
@@ -169,7 +169,11 @@ impl ModelLayout {
         // Reserve capacities to avoid reallocations
         // Estimated number of penalized blocks: one per PC main effect, plus one per interaction (if enabled)
         let estimated_penalized_blocks = config.pc_configs.len()
-            + if num_pgs_interaction_bases > 0 { config.pc_configs.len() } else { 0 };
+            + if num_pgs_interaction_bases > 0 {
+                config.pc_configs.len()
+            } else {
+                0
+            };
         penalty_map.reserve_exact(estimated_penalized_blocks);
         pc_null_cols.reserve_exact(config.pc_configs.len());
 
@@ -268,12 +272,12 @@ pub fn build_design_and_penalty_matrices(
 > {
     // PRE-EMPTIVE CHECK: Calculate the potential number of coefficients BEFORE building any matrices
     let n_samples = data.y.len();
-    
+
     // Calculate coefficients for each term based on the config
     let pgs_basis_coeffs = config.pgs_basis_config.num_knots + config.pgs_basis_config.degree + 1;
     let intercept_coeffs = 1;
     let pgs_main_coeffs = pgs_basis_coeffs - 1;
-    
+
     let mut pc_main_coeffs = 0;
     let mut interaction_coeffs = 0;
     for pc_config in &config.pc_configs {
@@ -281,12 +285,16 @@ pub fn build_design_and_penalty_matrices(
         pc_main_coeffs += pc_basis_coeffs - 1;
         interaction_coeffs += (pgs_basis_coeffs - 1) * (pc_basis_coeffs - 1);
     }
-    
+
     let num_coeffs = intercept_coeffs + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
-    
+
     if num_coeffs > n_samples {
         // FAIL FAST before any expensive calculations
-        log::error!("Model is severely over-parameterized: {} coefficients for {} samples", num_coeffs, n_samples);
+        log::error!(
+            "Model is severely over-parameterized: {} coefficients for {} samples",
+            num_coeffs,
+            n_samples
+        );
         return Err(EstimationError::ModelOverparameterized {
             num_coeffs,
             num_samples: n_samples,
@@ -296,7 +304,7 @@ pub fn build_design_and_penalty_matrices(
             interaction_coeffs,
         });
     }
-    
+
     // Validate PC configuration against available data
     if config.pc_configs.len() > data.pcs.ncols() {
         let pc_names: Vec<String> = config.pc_configs.iter().map(|pc| pc.name.clone()).collect();
@@ -447,7 +455,9 @@ pub fn build_design_and_penalty_matrices(
             TermType::PcMainEffect => {
                 // Main effects have single penalty index
                 let penalty_idx = block.penalty_indices[0];
-                for j in col_range.clone() { s_list[penalty_idx][[j, j]] = 1.0; }
+                for j in col_range.clone() {
+                    s_list[penalty_idx][[j, j]] = 1.0;
+                }
             }
             TermType::Interaction => {
                 // Interactions now have single penalty index since both marginals are whitened
@@ -463,7 +473,9 @@ pub fn build_design_and_penalty_matrices(
 
                 // Since we use WHITENED marginals for interactions, penalty is identity matrix
                 // This creates proper scale consistency between main effects and interactions
-                for j in col_range.clone() { s_list[penalty_idx][[j, j]] = 1.0; }
+                for j in col_range.clone() {
+                    s_list[penalty_idx][[j, j]] = 1.0;
+                }
             }
         }
     }
@@ -601,8 +613,12 @@ pub fn build_design_and_penalty_matrices(
 
             // Build main-effect matrix M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
             // Extract intercept and PGS main
-            let intercept = x_matrix.slice(s![.., layout.intercept_col..layout.intercept_col + 1]).to_owned();
-            let pgs_main = x_matrix.slice(s![.., layout.pgs_main_cols.clone()]).to_owned();
+            let intercept = x_matrix
+                .slice(s![.., layout.intercept_col..layout.intercept_col + 1])
+                .to_owned();
+            let pgs_main = x_matrix
+                .slice(s![.., layout.pgs_main_cols.clone()])
+                .to_owned();
             // Extract this PC's main effect columns: null then range
             let pc_block = &layout.penalty_map[layout.pc_main_block_idx[pc_idx]];
             let pc_null_cols = &layout.pc_null_cols[pc_idx];
@@ -611,25 +627,36 @@ pub fn build_design_and_penalty_matrices(
             } else {
                 None
             };
-            let pc_range = x_matrix.slice(s![.., pc_block.col_range.clone()]).to_owned();
+            let pc_range = x_matrix
+                .slice(s![.., pc_block.col_range.clone()])
+                .to_owned();
 
             // Preallocate M = [Intercept | PGS_main | PC_null (opt) | PC_range]
-            let m_cols = 1 + pgs_main.ncols() + pc_null.as_ref().map_or(0, |z| z.ncols()) + pc_range.ncols();
+            let m_cols =
+                1 + pgs_main.ncols() + pc_null.as_ref().map_or(0, |z| z.ncols()) + pc_range.ncols();
             let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
             let mut offset = 0;
             // Intercept
-            m_matrix.slice_mut(s![.., offset..offset + 1]).assign(&intercept);
+            m_matrix
+                .slice_mut(s![.., offset..offset + 1])
+                .assign(&intercept);
             offset += 1;
             // PGS_main
-            m_matrix.slice_mut(s![.., offset..offset + pgs_main.ncols()]).assign(&pgs_main);
+            m_matrix
+                .slice_mut(s![.., offset..offset + pgs_main.ncols()])
+                .assign(&pgs_main);
             offset += pgs_main.ncols();
             // PC_null
             if let Some(pc_n) = pc_null.as_ref() {
-                m_matrix.slice_mut(s![.., offset..offset + pc_n.ncols()]).assign(pc_n);
+                m_matrix
+                    .slice_mut(s![.., offset..offset + pc_n.ncols()])
+                    .assign(pc_n);
                 offset += pc_n.ncols();
             }
             // PC_range
-            m_matrix.slice_mut(s![.., offset..offset + pc_range.ncols()]).assign(&pc_range);
+            m_matrix
+                .slice_mut(s![.., offset..offset + pc_range.ncols()])
+                .assign(&pc_range);
 
             // Weighted projection: Alpha = (M^T W M)^+ (M^T W T)
             // Reuse precomputed weight column once
@@ -657,7 +684,9 @@ pub fn build_design_and_penalty_matrices(
             // Construct Σ^+ as diagonal with thresholding
             let mut s_inv = Array2::zeros((s.len(), s.len()));
             for i in 0..s.len() {
-                if s[i] > tol { s_inv[[i, i]] = 1.0 / s[i]; }
+                if s[i] > tol {
+                    s_inv[[i, i]] = 1.0 / s[i];
+                }
             }
             let gram_pinv = vt.t().dot(&s_inv).dot(&u.t());
             let alpha = gram_pinv.dot(&rhs); // shape: m_cols x t_cols
@@ -668,15 +697,13 @@ pub fn build_design_and_penalty_matrices(
             // Save Alpha for use at prediction time
             let interaction_key = format!("f(PGS,{})", pc_name);
             interaction_orth_alpha.insert(interaction_key.clone(), alpha);
-            
+
             // Store zero means for backward compatibility
             let zeros = Array1::zeros(tensor_orth.ncols());
             interaction_centering_means.insert(interaction_key, zeros);
 
             // Assign the orthogonalized tensor block to design matrix (no extra centering)
-            x_matrix
-                .slice_mut(s![.., col_range])
-                .assign(&tensor_orth);
+            x_matrix.slice_mut(s![.., col_range]).assign(&tensor_orth);
         }
     }
 
@@ -694,13 +721,19 @@ pub fn build_design_and_penalty_matrices(
         // This should rarely be reached due to the pre-emptive check
         match calculate_condition_number(&x_matrix) {
             Ok(cond) if cond > 1e9 => {
-                log::error!("Design matrix is severely ill-conditioned (condition number > 1e9). Aborting.");
-                return Err(EstimationError::ModelIsIllConditioned { condition_number: cond });
+                log::error!(
+                    "Design matrix is severely ill-conditioned (condition number > 1e9). Aborting."
+                );
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: cond,
+                });
             }
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 log::error!("SVD failed during condition number check. Aborting.");
-                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
             }
         }
     }
@@ -776,10 +809,14 @@ pub fn create_balanced_penalty_root(
 
     // Find the maximum eigenvalue to create a relative tolerance
     let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-    
+
     // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-    
+    let tolerance = if max_eig > 0.0 {
+        max_eig * 1e-12
+    } else {
+        1e-12
+    };
+
     let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
     if penalty_rank == 0 {
@@ -821,10 +858,14 @@ pub fn compute_penalty_square_roots(
         // Count positive eigenvalues to determine rank
         // Find the maximum eigenvalue to create a relative tolerance
         let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        
+
         // Define a relative tolerance. Use an absolute fallback for zero matrices.
-        let tolerance = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-        
+        let tolerance = if max_eig > 0.0 {
+            max_eig * 1e-12
+        } else {
+            1e-12
+        };
+
         let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
         if rank_k == 0 {
@@ -1616,7 +1657,6 @@ mod tests {
         (data, config)
     }
 
-
     #[test]
     fn test_interaction_design_matrix_is_full_rank() {
         let (data, config) = create_test_data_for_construction(100, 1);
@@ -1744,8 +1784,17 @@ mod tests {
         // Build training matrices and transforms
         let (data, config) = create_test_data_for_construction(100, 1);
         // Capture interaction_orth_alpha from the return tuple
-        let (x_training, _, _, sum_to_zero_constraints, knot_vectors, range_transforms, pc_null_transforms, interaction_centering_means, interaction_orth_alpha) = 
-            build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (
+            x_training,
+            _,
+            _,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            pc_null_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+        ) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms
         let mut cfg = config.clone();
@@ -1793,8 +1842,12 @@ mod tests {
                 pcs: {
                     let mut pcs = HashMap::new();
                     let mut v: Vec<f64> = Vec::new();
-                    for i in 1..=n_pc { v.push(10.0 + i as f64); }
-                    for i in 1..=r_pc { v.push(20.0 + i as f64); }
+                    for i in 1..=n_pc {
+                        v.push(10.0 + i as f64);
+                    }
+                    for i in 1..=r_pc {
+                        v.push(20.0 + i as f64);
+                    }
                     pcs.insert(pc_name.clone(), v);
                     pcs
                 },

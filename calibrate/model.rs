@@ -1,7 +1,7 @@
 use crate::calibrate::basis::{self};
-use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::hull::PeeledHull;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -196,7 +196,12 @@ impl TrainedModel {
         let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
 
         // --- 3. Reconstruct Mathematical Objects ---
-        let x_new = internal::construct_design_matrix(p_corr.view(), pcs_corr.view(), &self.config, &self.coefficients)?;
+        let x_new = internal::construct_design_matrix(
+            p_corr.view(),
+            pcs_corr.view(),
+            &self.config,
+            &self.coefficients,
+        )?;
         let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         // This is a critical safety check. It ensures that the number of columns in the
@@ -263,7 +268,12 @@ impl TrainedModel {
         }
         let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
 
-        let x_new = internal::construct_design_matrix(p_corr.view(), pcs_corr.view(), &self.config, &self.coefficients)?;
+        let x_new = internal::construct_design_matrix(
+            p_corr.view(),
+            pcs_corr.view(),
+            &self.config,
+            &self.coefficients,
+        )?;
         let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
 
         if x_new.ncols() != flattened_coeffs.len() {
@@ -393,12 +403,12 @@ mod internal {
             .sum_to_zero_constraints
             .get("pgs_main")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs_main".to_string()))?;
-            
+
         // Note: z_range_pgs is still required for interactions later, but not needed for main effects
 
         // Target width must match trained coefficient count
         let pgs_coef_len = coeffs.main_effects.pgs.len();
-        
+
         // CRITICAL: For PGS main effect, we use ONLY the sum-to-zero constraint transform.
         // The range transform (z_range_pgs) is used ONLY for interaction terms.
 
@@ -410,8 +420,10 @@ mod internal {
         if m != pgs_z.nrows() || c != pgs_coef_len {
             return Err(ModelError::DimensionMismatch(format!(
                 "PGS basis transform dimensions mismatch: B_unc {}×{}, Z {}×{}, coefs {}",
-                pgs_main_basis_unc.nrows(), m,
-                pgs_z.nrows(), c,
+                pgs_main_basis_unc.nrows(),
+                m,
+                pgs_z.nrows(),
+                c,
                 pgs_coef_len
             )));
         }
@@ -463,24 +475,34 @@ mod internal {
                 let pc_range_basis = pc_main_basis_unc.dot(range_transform);
                 pc_range_bases.push(pc_range_basis);
                 // Get the required null-space transform
-                let z_null = config.pc_null_transforms.get(pc_name)
-                    .ok_or_else(|| ModelError::ConstraintMissing(format!("pc_null_transform for {}", pc_name)))?;
-                
+                let z_null = config.pc_null_transforms.get(pc_name).ok_or_else(|| {
+                    ModelError::ConstraintMissing(format!("pc_null_transform for {}", pc_name))
+                })?;
+
                 if pc_main_basis_unc.ncols() != z_null.nrows() {
                     return Err(ModelError::DimensionMismatch(format!(
                         "PC null transform dimensions mismatch for {}: basis {}×{}, transform {}×{}",
                         pc_name,
-                        pc_main_basis_unc.nrows(), pc_main_basis_unc.ncols(),
-                        z_null.nrows(), z_null.ncols()
+                        pc_main_basis_unc.nrows(),
+                        pc_main_basis_unc.ncols(),
+                        z_null.nrows(),
+                        z_null.ncols()
                     )));
                 }
-                
+
                 // Build null-space basis (may have 0 columns if PC has no null space)
                 let pc_null_basis = pc_main_basis_unc.dot(z_null);
-                pc_null_bases.push(if z_null.ncols() > 0 { Some(pc_null_basis) } else { None });
+                pc_null_bases.push(if z_null.ncols() > 0 {
+                    Some(pc_null_basis)
+                } else {
+                    None
+                });
             } else {
                 // No range transform found for this PC
-                return Err(ModelError::ConstraintMissing(format!("range transform for {}", pc_name)));
+                return Err(ModelError::ConstraintMissing(format!(
+                    "range transform for {}",
+                    pc_name
+                )));
             }
         }
 
@@ -511,7 +533,8 @@ mod internal {
         // 4. Tensor product interaction effects - only if PCs are present
         if !config.pc_configs.is_empty() {
             // Use WHITENED basis for consistency with training
-            let z_range_pgs_pred = config.range_transforms
+            let z_range_pgs_pred = config
+                .range_transforms
                 .get("pgs")
                 .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?;
 
@@ -544,18 +567,31 @@ mod internal {
                         row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
 
                     // Apply stored orthogonalization to remove main-effect components (pure interaction)
-                    let alpha = config.interaction_orth_alpha.get(&tensor_key)
-                        .ok_or_else(|| ModelError::ConstraintMissing(format!("interaction_orth_alpha for {}", tensor_key)))?;
-                    
+                    let alpha =
+                        config
+                            .interaction_orth_alpha
+                            .get(&tensor_key)
+                            .ok_or_else(|| {
+                                ModelError::ConstraintMissing(format!(
+                                    "interaction_orth_alpha for {}",
+                                    tensor_key
+                                ))
+                            })?;
+
                     // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
                     let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
                     // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
-                    let mut m_cols: Vec<Array1<f64>> = intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
+                    let mut m_cols: Vec<Array1<f64>> =
+                        intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
                     m_cols.extend(pgs_main_basis.axis_iter(Axis(1)).map(|c| c.to_owned()));
                     if let Some(ref pc_null) = pc_null_bases[pc_idx] {
                         m_cols.extend(pc_null.axis_iter(Axis(1)).map(|c| c.to_owned()));
                     }
-                    m_cols.extend(pc_range_bases[pc_idx].axis_iter(Axis(1)).map(|c| c.to_owned()));
+                    m_cols.extend(
+                        pc_range_bases[pc_idx]
+                            .axis_iter(Axis(1))
+                            .map(|c| c.to_owned()),
+                    );
                     let m_matrix = ndarray::stack(
                         Axis(1),
                         &m_cols.iter().map(|c| c.view()).collect::<Vec<_>>(),
@@ -750,16 +786,14 @@ mod tests {
                     num_knots: 2,
                     degree: 1,
                 },
-                pc_configs: vec![
-                    PrincipalComponentConfig {
-                        name: "PC1".to_string(),
-                        basis_config: BasisConfig {
-                            num_knots: 2,
-                            degree: 1,
-                        },
-                        range: (-1.0, 1.0),
-                    }
-                ],
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 2,
+                        degree: 1,
+                    },
+                    range: (-1.0, 1.0),
+                }],
                 pgs_range: (-2.0, 2.0),
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
@@ -935,13 +969,11 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             pgs_basis_config: pgs_basis_config.clone(),
-            pc_configs: vec![
-                PrincipalComponentConfig {
-                    name: "PC1".to_string(),
-                    basis_config: pc1_basis_config.clone(),
-                    range: (-0.5, 0.5),
-                }
-            ],
+            pc_configs: vec![PrincipalComponentConfig {
+                name: "PC1".to_string(),
+                basis_config: pc1_basis_config.clone(),
+                range: (-0.5, 0.5),
+            }],
             pgs_range: (-1.0, 1.0),
             sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
@@ -1017,13 +1049,18 @@ mod tests {
                     },
                     pcs: {
                         // Use null + range dimension for PC1
-                        let pc1_dim_null = pc_null_transforms.get("PC1").map(|z| z.ncols()).unwrap_or(0);
+                        let pc1_dim_null = pc_null_transforms
+                            .get("PC1")
+                            .map(|z| z.ncols())
+                            .unwrap_or(0);
                         let pc1_dim_range = range_transforms.get("PC1").unwrap().ncols();
 
                         let mut pc_map = HashMap::new();
                         pc_map.insert(
                             "PC1".to_string(),
-                            (1..=(pc1_dim_null + pc1_dim_range)).map(|i| i as f64).collect(),
+                            (1..=(pc1_dim_null + pc1_dim_range))
+                                .map(|i| i as f64)
+                                .collect(),
                         );
                         pc_map
                     },
@@ -1084,15 +1121,28 @@ mod tests {
             loaded_model.config.pgs_basis_config.degree,
             original_model.config.pgs_basis_config.degree
         );
-        assert_eq!(loaded_model.config.pc_configs.len(), original_model.config.pc_configs.len());
+        assert_eq!(
+            loaded_model.config.pc_configs.len(),
+            original_model.config.pc_configs.len()
+        );
         // Check that each PC config matches
         for i in 0..loaded_model.config.pc_configs.len() {
-            assert_eq!(loaded_model.config.pc_configs[i].name, original_model.config.pc_configs[i].name);
-            assert_eq!(loaded_model.config.pc_configs[i].range, original_model.config.pc_configs[i].range);
-            assert_eq!(loaded_model.config.pc_configs[i].basis_config.num_knots, 
-                      original_model.config.pc_configs[i].basis_config.num_knots);
-            assert_eq!(loaded_model.config.pc_configs[i].basis_config.degree, 
-                      original_model.config.pc_configs[i].basis_config.degree);
+            assert_eq!(
+                loaded_model.config.pc_configs[i].name,
+                original_model.config.pc_configs[i].name
+            );
+            assert_eq!(
+                loaded_model.config.pc_configs[i].range,
+                original_model.config.pc_configs[i].range
+            );
+            assert_eq!(
+                loaded_model.config.pc_configs[i].basis_config.num_knots,
+                original_model.config.pc_configs[i].basis_config.num_knots
+            );
+            assert_eq!(
+                loaded_model.config.pc_configs[i].basis_config.degree,
+                original_model.config.pc_configs[i].basis_config.degree
+            );
         }
         assert_eq!(
             loaded_model.config.pgs_range,
@@ -1100,7 +1150,12 @@ mod tests {
         );
 
         // 2. Check sum_to_zero_constraints transformations exist for PGS main effect only
-        assert!(loaded_model.config.sum_to_zero_constraints.contains_key("pgs_main"));
+        assert!(
+            loaded_model
+                .config
+                .sum_to_zero_constraints
+                .contains_key("pgs_main")
+        );
 
         // 3. Check coefficient values
         assert_eq!(

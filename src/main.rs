@@ -112,16 +112,16 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create PC configs with names, ranges, and basis configs
-    let pc_configs = (0..args.num_pcs).map(|i| {
-        gnomon::calibrate::model::PrincipalComponentConfig {
-            name: format!("PC{}", i+1),
+    let pc_configs = (0..args.num_pcs)
+        .map(|i| gnomon::calibrate::model::PrincipalComponentConfig {
+            name: format!("PC{}", i + 1),
             basis_config: BasisConfig {
                 num_knots: args.pc_knots,
                 degree: args.pc_degree,
             },
             range: pc_ranges[i],
-        }
-    }).collect();
+        })
+        .collect();
 
     // Lambda values are now estimated automatically via REML
     println!("Training model with REML estimation of smoothing parameters");

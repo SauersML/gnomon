@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Error type for hull building and projection.
 #[derive(thiserror::Error, Debug)]
 pub enum HullError {
-    #[error("Input data must have at least d+1 points to define a hull. Got {0} points for dimension {1}.")]
+    #[error(
+        "Input data must have at least d+1 points to define a hull. Got {0} points for dimension {1}."
+    )]
     InsufficientPoints(usize, usize),
 }
 
@@ -24,7 +26,10 @@ impl PeeledHull {
     pub fn project_if_needed(&self, points: ArrayView2<f64>) -> (Array2<f64>, usize) {
         let n = points.nrows();
         let d = points.ncols();
-        assert_eq!(d, self.dim, "Dimension mismatch in PeeledHull::project_if_needed");
+        assert_eq!(
+            d, self.dim,
+            "Dimension mismatch in PeeledHull::project_if_needed"
+        );
 
         let mut out = Array2::zeros((n, d));
         let mut num_projected = 0usize;
@@ -102,16 +107,16 @@ impl PeeledHull {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array};
+    use ndarray::array;
 
     fn unit_square_hull() -> PeeledHull {
         // 0 <= x <= 1, 0 <= y <= 1
         PeeledHull {
             facets: vec![
-                (array![1.0, 0.0], 1.0),   // x <= 1
-                (array![-1.0, 0.0], 0.0),  // -x <= 0 -> x >= 0
-                (array![0.0, 1.0], 1.0),   // y <= 1
-                (array![0.0, -1.0], 0.0),  // -y <= 0 -> y >= 0
+                (array![1.0, 0.0], 1.0),  // x <= 1
+                (array![-1.0, 0.0], 0.0), // -x <= 0 -> x >= 0
+                (array![0.0, 1.0], 1.0),  // y <= 1
+                (array![0.0, -1.0], 0.0), // -y <= 0 -> y >= 0
             ],
             dim: 2,
         }
@@ -120,13 +125,13 @@ mod tests {
     #[test]
     fn test_is_inside_unit_square() {
         let h = unit_square_hull();
-        assert!(h.is_inside(array![0.5, 0.5].view()));    // inside
-        assert!(h.is_inside(array![1.0, 0.5].view()));    // on edge
-        assert!(h.is_inside(array![0.0, 0.0].view()));    // corner
-        assert!(!h.is_inside(array![1.1, 0.5].view()));   // outside +x
-        assert!(!h.is_inside(array![-0.1, 0.5].view()));  // outside -x
-        assert!(!h.is_inside(array![0.5, 1.1].view()));   // outside +y
-        assert!(!h.is_inside(array![0.5, -0.1].view()));  // outside -y
+        assert!(h.is_inside(array![0.5, 0.5].view())); // inside
+        assert!(h.is_inside(array![1.0, 0.5].view())); // on edge
+        assert!(h.is_inside(array![0.0, 0.0].view())); // corner
+        assert!(!h.is_inside(array![1.1, 0.5].view())); // outside +x
+        assert!(!h.is_inside(array![-0.1, 0.5].view())); // outside -x
+        assert!(!h.is_inside(array![0.5, 1.1].view())); // outside +y
+        assert!(!h.is_inside(array![0.5, -0.1].view())); // outside -y
     }
 
     #[test]
@@ -165,7 +170,12 @@ mod tests {
         let (corrected, num_proj) = hull.project_if_needed(test.view());
         assert_eq!(num_proj, 2);
         // First point unchanged
-        assert!((corrected.row(0).to_owned() - test.row(0).to_owned()).mapv(|v| v.abs()).sum() < 1e-12);
+        assert!(
+            (corrected.row(0).to_owned() - test.row(0).to_owned())
+                .mapv(|v| v.abs())
+                .sum()
+                < 1e-12
+        );
         // All corrected points must be inside
         for i in 0..corrected.nrows() {
             assert!(hull.is_inside(corrected.row(i)));
@@ -205,9 +215,7 @@ pub fn build_peeled_hull(data: &Array2<f64>, peels: usize) -> Result<PeeledHull,
             break;
         }
         // Remove rows at `verts` from current
-        let keep_mask: Vec<bool> = (0..current.nrows())
-            .map(|i| !verts.contains(&i))
-            .collect();
+        let keep_mask: Vec<bool> = (0..current.nrows()).map(|i| !verts.contains(&i)).collect();
         let mut next = Array2::zeros((keep_mask.iter().filter(|&&k| k).count(), d));
         let mut r = 0;
         for (i, &keep) in keep_mask.iter().enumerate() {
