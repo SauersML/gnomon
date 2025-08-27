@@ -37,9 +37,31 @@ use crate::calibrate::pirls::{self, PirlsResult};
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
+// faer: high-performance dense solvers
+use faer::Mat as FaerMat;
+use faer::linalg::solvers::{
+    Llt as FaerLlt,
+    Ldlt as FaerLdlt,
+    Lblt as FaerLblt,
+    Solve as FaerSolve,
+};
+use faer::Side;
+
+// Helper: Frobenius inner product for faer matrices
+fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
+    let (m, n) = (a.nrows(), a.ncols());
+    let mut acc = 0.0;
+    for j in 0..n {
+        for i in 0..m {
+            acc += a[(i, j)] * b[(i, j)];
+        }
+    }
+    acc
+}
 use std::cell::RefCell;
 use std::collections::HashMap;
 use thiserror::Error;
+use std::sync::Arc;
 
 /// A comprehensive error type for the model estimation process.
 #[derive(Error, Debug)]
@@ -792,23 +814,39 @@ pub mod internal {
     use ndarray_linalg::SVD;
     use ndarray_linalg::error::LinalgError;
 
+    enum FaerFactor {
+        Llt(FaerLlt<f64>),
+        Lblt(FaerLblt<f64>),
+        Ldlt(FaerLdlt<f64>),
+    }
+
+    impl FaerFactor {
+        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+            match self {
+                FaerFactor::Llt(f) => f.solve(rhs),
+                FaerFactor::Lblt(f) => f.solve(rhs),
+                FaerFactor::Ldlt(f) => f.solve(rhs),
+                
+            }
+        }
+    }
+
     /// Robust solver that provides fallback mechanisms for maximum numerical stability
     enum RobustSolver {
-        Cholesky(Array2<f64>), // Store matrix, will use Cholesky decomposition
-        Fallback(Array2<f64>), // Store matrix, will use existing robust_solve
+        Cholesky(Array2<f64>), // Store matrix, factor per use (safe baseline)
+        Fallback(Array2<f64>),
     }
 
     impl RobustSolver {
         /// Create a solver with automatic fallback: Cholesky → robust_solve
         fn new(matrix: &Array2<f64>) -> Result<Self, EstimationError> {
-            // First, try Cholesky decomposition to test if matrix is positive-definite
+            // Probe Cholesky once to choose fast path; store matrix to avoid type gymnastics
             match matrix.cholesky(UPLO::Lower) {
                 Ok(_) => {
                     log::debug!("Using Cholesky decomposition for matrix solving");
                     Ok(RobustSolver::Cholesky(matrix.clone()))
                 }
                 Err(_) => {
-                    // Fallback to existing robust_solve method
                     log::warn!(
                         "Cholesky failed, will fall back to robust_solve for individual operations"
                     );
@@ -821,7 +859,6 @@ pub mod internal {
         fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             match self {
                 RobustSolver::Cholesky(stored_matrix) => {
-                    // Use Cholesky decomposition for solving
                     let chol = stored_matrix
                         .cholesky(UPLO::Lower)
                         .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -835,11 +872,10 @@ pub mod internal {
         fn solve_matrix(&self, rhs_matrix: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
             match self {
                 RobustSolver::Cholesky(stored_matrix) => {
-                    // Efficient batch solve using single Cholesky factorization
+                    // Factor once per call and reuse across columns
                     let chol = stored_matrix
                         .cholesky(UPLO::Lower)
                         .map_err(EstimationError::LinearSystemSolveFailed)?;
-
                     let mut solution = Array2::zeros(rhs_matrix.raw_dim());
                     for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
                         let sol_col = chol
@@ -880,6 +916,7 @@ pub mod internal {
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
         cache: RefCell<HashMap<Vec<u64>, PirlsResult>>,
+        faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
         eval_count: RefCell<u64>,
         last_cost: RefCell<f64>,
         last_grad_norm: RefCell<f64>,
@@ -907,12 +944,49 @@ pub mod internal {
                 layout,
                 config,
                 cache: RefCell::new(HashMap::new()),
+                faer_factor_cache: RefCell::new(HashMap::new()),
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
             })
+        }
+
+        fn rho_key(&self, rho: &Array1<f64>) -> Vec<u64> {
+            rho.iter().map(|&v| v.to_bits()).collect()
+        }
+
+        fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
+            let p = h.nrows();
+            let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| h[[i, j]]);
+            if let Ok(f) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+                log::debug!("Using faer LLᵀ for Hessian solves");
+                return FaerFactor::Llt(f);
+            }
+            // Next, try semidefinite LDLᵀ (can fail)
+            if let Ok(f) = FaerLdlt::new(h_faer.as_ref(), Side::Lower) {
+                log::warn!("LLᵀ failed; using faer LDLᵀ for (semi-definite) Hessian solves");
+                return FaerFactor::Ldlt(f);
+            }
+            // Finally, use symmetric indefinite LBLᵀ (Bunch–Kaufman). This does not return Result.
+            log::warn!("LLᵀ/LDLᵀ failed; using faer LBLᵀ (Bunch–Kaufman) for Hessian solves");
+            let f = FaerLblt::new(h_faer.as_ref(), Side::Lower);
+            FaerFactor::Lblt(f)
+        }
+
+        fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
+            let key = self.rho_key(rho);
+            if let Some(f) = self.faer_factor_cache.borrow().get(&key) {
+                return Arc::clone(f);
+            }
+            let fact = Arc::new(self.factorize_faer(h));
+            {
+                let mut cache = self.faer_factor_cache.borrow_mut();
+                if cache.len() > 64 { cache.clear(); }
+                cache.insert(key, Arc::clone(&fact));
+            }
+            fact
         }
 
         // Accessor methods for private fields
@@ -1105,54 +1179,23 @@ pub mod internal {
                     // This avoids transforming matrices back to the original basis unnecessarily
                     let hessian_t = &pirls_result.stabilized_hessian_transformed;
                     let rs_transformed = &pirls_result.reparam_result.rs_transformed;
-                    
+
                     // Initialize trace accumulator
                     let mut trace_h_inv_s_lambda = 0.0;
-                    
-                    // Directly use the transformed penalty matrices (already whitened)
+
+                    // Factor H once using faer and cache across cost+grad
+                    let factor = self.get_faer_factor(p, hessian_t);
+
+                    // Use Rᵀ RHS to avoid forming S_k = RᵀR and keep RHS thin
                     for k in 0..lambdas.len() {
-                        // Form the kth penalty matrix in the transformed basis: S_k^t = rs_transformed[k]ᵀ * rs_transformed[k]
-                        let s_k_t = rs_transformed[k].t().dot(&rs_transformed[k]);
-                        
-                        // Scale by lambda before computing trace
-                        let s_k_scaled = s_k_t.mapv(|x| x * lambdas[k]);
-                        
-                        // Solve H_t X = S_k_scaled for each column and accumulate trace
-                        for j in 0..s_k_scaled.ncols() {
-                            let s_col = s_k_scaled.column(j);
-                            
-                            // Skip zero columns for efficiency
-                            if s_col.iter().all(|&x| x == 0.0) {
-                                continue;
-                            }
-                            
-                            match hessian_t.solve(&s_col.to_owned()) {
-                                Ok(h_inv_s_col) => {
-                                    // Add diagonal element to trace
-                                    trace_h_inv_s_lambda += h_inv_s_col[j];
-                                }
-                                Err(e_direct) => {
-                                    log::warn!(
-                                        "Linear system solve failed for EDF column {}, attempting robust fallback: {:?}",
-                                        j,
-                                        e_direct
-                                    );
-                                    // Fallback to robust SVD-based solve
-                                    match robust_solve(hessian_t, &s_col.to_owned()) {
-                                        Ok(h_inv_s_col) => {
-                                            trace_h_inv_s_lambda += h_inv_s_col[j];
-                                        }
-                                        Err(e_fallback) => {
-                                            log::warn!(
-                                                "Robust solve also failed during EDF trace calculation: {:?}",
-                                                e_fallback
-                                            );
-                                            return Err(e_fallback);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let r_k = &rs_transformed[k]; // (r_k × p)
+                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
+                        // Rt is (p × r_k)
+                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
+                        // Solve X = H^{-1} Rt using the cached factor
+                        let x = factor.solve(rt.as_ref());
+                        // tr(H^{-1} λ_k RᵀR) = λ_k ⟨X, Rt⟩_F
+                        trace_h_inv_s_lambda += lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
                     }
                     
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
@@ -1614,28 +1657,15 @@ pub mod internal {
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance
 
-                    // EDF calculation - need to rebuild penalty matrix for this calculation
-                    let mut s_lambda_original =
-                        Array2::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
-                    for k in 0..lambdas.len() {
-                        let s_k_original = self.rs_list[k].t().dot(&self.rs_list[k]);
-                        s_lambda_original.scaled_add(lambdas[k], &s_k_original);
-                    }
-
-                    // Transform Hessian back to original basis for this calculation
-                    let hessian_original = qs
-                        .dot(&pirls_result.stabilized_hessian_transformed)
-                        .dot(&qs.t());
-
+                    // EDF calculation in transformed basis using FAER and Rt RHS
+                    let factor_g = self.get_faer_factor(p, hessian);
                     let mut trace_h_inv_s_lambda = 0.0;
-                    for j in 0..s_lambda_original.ncols() {
-                        let s_col = s_lambda_original.column(j);
-                        if let Ok(h_inv_col) = internal::robust_solve(
-                            &hessian_original, // Use original basis Hessian
-                            &s_col.to_owned(),
-                        ) {
-                            trace_h_inv_s_lambda += h_inv_col[j];
-                        }
+                    for k in 0..lambdas.len() {
+                        let r_k = &rs_transformed[k];
+                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
+                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
+                        let x = factor_g.solve(rt.as_ref());
+                        trace_h_inv_s_lambda += lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
                     }
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
                     let scale = dp / (n - edf).max(1e-8);
@@ -1654,11 +1684,14 @@ pub mod internal {
                     // the direct penalty term derivative. This simplification is not available for
                     // non-Gaussian models where the weight matrix depends on β.
 
+                    // factor_g already computed above; reuse it for trace terms
+
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
-                        // Use transformed penalty matrix (consistent with other calculations)
-                        let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
-                        let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
+                        let r_k = &rs_transformed[k];
+                        // Avoid forming S_k: compute S_k β = Rᵀ (R β)
+                        let r_beta = r_k.dot(beta_transformed);
+                        let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
                         // ---
                         // Component 1: Derivative of the Penalized Deviance
@@ -1673,19 +1706,12 @@ pub mod internal {
                         // Component 2: Derivative of the Penalized Hessian Determinant
                         // R/C Counterpart: `oo$trA1/2`
                         // ---
-                        // Calculate tr(H⁻¹ * S_k) using transformed penalty matrix
-                        let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_transformed.ncols() {
-                            let s_col = s_k_transformed.column(j);
-                            if s_col.iter().all(|&x| x == 0.0) {
-                                continue;
-                            }
-                            if let Ok(h_inv_col) =
-                                internal::robust_solve(&hessian, &s_col.to_owned())
-                            {
-                                trace_h_inv_s_k += h_inv_col[j];
-                            }
-                        }
+                        // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
+                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
+                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
+                        let x = factor_g.solve(rt.as_ref());
+                        // Frobenius inner product ⟨X, Rt⟩
+                        let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt.as_ref());
                         let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                         let log_det_h_grad_term = tra1 / 2.0;
 
