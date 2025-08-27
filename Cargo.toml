@@ -52,7 +52,6 @@ ndarray-linalg = { version = "0.17.0", default-features = false, features = ["op
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.16"
 toml = "0.8.23"
-# Bump Polars to a version compatible with Nightly/edition 2024 to fix polars-arrow const-eval panic
 polars = { version = "0.50.0", features = ["csv", "ndarray", "fmt", "lazy"] }
 stable-intrinsics = "0.1.1"
 wolfe_bfgs = { git = "https://github.com/SauersML/wolfe_bfgs" }

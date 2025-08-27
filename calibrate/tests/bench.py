@@ -41,10 +41,6 @@ PERF_PERCENT_LIMIT = 5
 
 def build_profiling_binary():
     env = os.environ.copy()
-    # Ensure good debug/unwind quality in profiling builds
-    rf = env.get("RUSTFLAGS", "").strip()
-    flags = "-C force-frame-pointers=yes -C debuginfo=2 -C link-dead-code=yes"
-    env["RUSTFLAGS"] = (rf + " " + flags).strip() if rf else flags
     # Always rebuild to ensure latest changes are profiled
     print("--- Building profiling binary (symbols kept) ---")
     # Build from workspace root so cargo.toml resolves correctly
