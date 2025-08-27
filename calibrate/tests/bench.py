@@ -287,7 +287,7 @@ def main():
     with html_path.open("w", encoding="utf-8") as f:
         f.write("<!doctype html><meta charset='utf-8'>\n")
         f.write("<title>Calibrate Flamegraph</title>\n")
-        f.write("<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:18px} h1{margin:0 0 8px} .meta{color:#444;margin:4px 0 16px} .frame{border:1px solid #ddd}</style>\n")
+        f.write("<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:18px} h1{margin:0 0 8px} .meta{color:#444;margin:4px 0 16px} .frame{border:1px solid #ddd} .flame svg{width:100%;height:auto;display:block}</style>\n")
         f.write("<h1>Calibrate Flamegraph</h1>\n")
         # only one section
         sec = report_sections[0]
@@ -305,7 +305,9 @@ def main():
             # Inline the SVG content so it always renders
             try:
                 svg_text = Path(sec['flame_svg']).read_text(encoding='utf-8')
+                f.write("<div class='flame'>")
                 f.write(svg_text)
+                f.write("</div>")
             except Exception as e:
                 f.write(f"<p>Could not inline flamegraph SVG: {escape(str(e))}</p>")
         else:
