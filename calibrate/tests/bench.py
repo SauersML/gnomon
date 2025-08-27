@@ -35,20 +35,8 @@ WORKDIR = SCRIPT_DIR / "bench_workdir"
 WORKDIR.mkdir(exist_ok=True)
 
 EXECUTABLE_PATH = WORKSPACE_ROOT / "target" / "profiling" / "gnomon"
-# Minimum percent to include in perf text reports. Override with BENCH_PERF_PERCENT=1 for more detail.
-PERF_PERCENT_LIMIT = int(os.environ.get("BENCH_PERF_PERCENT", "5"))
-
-def _maybe_set_affinity():
-    cores = os.environ.get("BENCH_PIN_CORES", "").strip()
-    if not cores:
-        return
-    try:
-        cpus = {int(x) for x in cores.split(",") if x.strip()}
-        if cpus:
-            os.sched_setaffinity(0, cpus)
-            print(f"Affinity pinned to CPUs: {sorted(cpus)}")
-    except Exception as e:
-        print(f"Could not set affinity: {e}")
+# Minimum percent to include in perf text reports.
+PERF_PERCENT_LIMIT = 5
 
 
 def build_profiling_binary():
@@ -95,31 +83,119 @@ def run_capture(cmd, cwd=None, env=None):
     return ret, lines
 
 
-def _cache_dsos_for_perf():
-    exe = str(EXECUTABLE_PATH)
-    rc, out = run_capture(["bash", "-lc", f"ldd {exe} || otool -L {exe}"], cwd=WORKSPACE_ROOT)
-    if rc != 0:
-        return
+# (Removed OpenBLAS annotate helpers and DSO priming)
+
+
+def _filter_tree(lines: list[str]) -> list[str]:
+    """Filter perf tree output by stanza and drop 0-children stanzas.
+
+    A stanza is a header line with two percentage columns (Overhead, Children)
+    followed by its label-only block until the next header. We drop the header
+    and its block when Children == 0.00. We also remove address-only and
+    '(inlined)' label lines. No name-specific filtering.
+    """
     import re as _re
-    paths: list[str] = []
-    for line in out:
-        m = _re.search(r"(/[^ )]+?\.(?:so(?:\.[0-9]+)?|dylib))", line)
-        if m:
-            paths.append(m.group(1))
-    for p in set(paths):
-        run_capture(["perf", "buildid-cache", "-r", p], cwd=WORKSPACE_ROOT)
+    header_re = _re.compile(r"^\s*(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%\s+")
+    addr_line_pat = _re.compile(r"0x[0-9A-Fa-f]{6,}(\s+0x[0-9A-Fa-f]{6,})*$")
+    addr_token_pat = _re.compile(r"^0x[0-9A-Fa-f]{6,}$")
+
+    def is_addr_only(text: str) -> bool:
+        content = text.replace('|', ' ').replace('-', ' ').replace('`', ' ')
+        content = ' '.join(content.split())
+        if addr_line_pat.match(content):
+            return True
+        toks = content.split()
+        return bool(toks and addr_token_pat.match(toks[-1]))
+
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        s = ln.strip()
+        # Pass through boilerplate lines
+        if not s or s.startswith('#') or 'Percent' in ln or 'Overhead' in ln:
+            out.append(ln)
+            i += 1
+            continue
+        m = header_re.match(ln)
+        if not m:
+            # Not a stanza header: keep unless it's address-only or inlined
+            if '(inlined)' not in ln and not is_addr_only(ln):
+                out.append(ln)
+            i += 1
+            continue
+        # Header line with Overhead and Children
+        try:
+            children_pct = float(m.group(2))
+        except Exception:
+            children_pct = 0.0
+        keep = (children_pct != 0.0)
+        if keep:
+            out.append(ln)
+        # Consume label block for this stanza
+        i += 1
+        while i < n:
+            ln2 = lines[i]
+            s2 = ln2.strip()
+            if not s2 or s2.startswith('#') or 'Percent' in ln2 or 'Overhead' in ln2:
+                if keep:
+                    out.append(ln2)
+                i += 1
+                break
+            if header_re.match(ln2):
+                # Next stanza begins
+                break
+            if keep and '(inlined)' not in ln2 and not is_addr_only(ln2):
+                out.append(ln2)
+            i += 1
+        # loop continues; do not increment i here as we either broke to next header or already advanced
+    return out
 
 
-def annotate_blas_server(perf_data: Path) -> str:
-    # Try a few common OpenBLAS/BLAS soname variants
-    dsos = "libopenblas.so,libopenblas.so.0,libblas.so.3,libopenblas.dylib"
-    cmd = [
-        "perf", "annotate", "--stdio", "-i", str(perf_data),
-        "--dsos", dsos,
-        "--symbol", "blas_thread_server",
-    ]
-    rc, lines = run_capture(cmd, cwd=WORKSPACE_ROOT)
-    return "\n".join(lines) if rc == 0 and lines else ""
+def _dedup_label_blocks(lines: list[str]) -> list[str]:
+    """Collapse repeated non-percent label blocks that perf prints multiple times.
+
+    A "label block" is a run of lines without the two leading percentage columns.
+    We keep the first occurrence and drop subsequent identical blocks until it changes.
+    """
+    import re as _re
+    pct_pat = _re.compile(r"^\s*(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%\b")
+    out: list[str] = []
+    buf: list[str] = []
+    last_norm: str | None = None
+
+    def normalize(block_lines: list[str]) -> str:
+        # Remove empty lines and collapse consecutive duplicates
+        normed: list[str] = []
+        for ln in block_lines:
+            s = ln.rstrip()
+            if not s:
+                continue
+            if not normed or normed[-1] != s:
+                normed.append(s)
+        return "\n".join(normed)
+
+    def flush():
+        nonlocal buf, last_norm
+        if not buf:
+            return
+        norm = normalize(buf)
+        if norm and norm != last_norm:
+            out.extend(buf)
+            last_norm = norm
+        buf = []
+
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith('#') or 'Percent' in ln or 'Overhead' in ln or ln.startswith('---') or pct_pat.match(ln):
+            flush()
+            out.append(ln)
+            continue
+        # Non-percent label line -> part of current block
+        buf.append(ln)
+    flush()
+    return out
 
 
 def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
@@ -141,18 +217,10 @@ def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
     Returns wall time in seconds. Exits on non-recoverable errors.
     """
     import time as _time
-    # Build candidate mmap sizes: env override first, then fallbacks, finally no -m
-    mm_env = os.environ.get("BENCH_MMAP_PAGES")
-    candidates: list[int | None] = []
-    if mm_env and mm_env.isdigit():
-        candidates.append(int(mm_env))
-    # Preferred default smaller to avoid mlock errors
-    for v in (256, 128, 64):
-        if mm_env is None or str(v) != mm_env:
-            candidates.append(v)
-    candidates.append(None)  # last resort: let perf choose
-
-    freq = os.environ.get("BENCH_FREQ", "2000")
+    # Candidate mmap sizes: fixed attempts, then let perf choose
+    candidates: list[int | None] = [256, 128, 64, None]
+    # Lower frequency to reduce overflow and file size (fixed)
+    freq = "700"
     t0 = None
     last_err = None
     for mmap_pages in candidates:
@@ -202,28 +270,30 @@ def train_with_perf(train_tsv: Path, tag: str):
 
     perf_data = WORKDIR / f"perf_{tag}.data"
 
-    # Use fixed threads for stability if user hasn't set it
+    # Use fixed threads for stability
     env = os.environ.copy()
-    env.setdefault("RAYON_NUM_THREADS", "1")
-    # BLAS threading defaults; overridable
-    oblas_threads = os.environ.get("BENCH_OBLAS_THREADS", "1")
-    env.setdefault("OPENBLAS_NUM_THREADS", oblas_threads)
-    env.setdefault("OMP_NUM_THREADS", oblas_threads)
-    env.setdefault("MKL_NUM_THREADS", oblas_threads)
-    env.setdefault("OPENBLAS_WAIT_POLICY", os.environ.get("BENCH_OBLAS_WAIT", "PASSIVE"))
+    env["RAYON_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["OPENBLAS_WAIT_POLICY"] = "PASSIVE"
 
     print(f"\n=== Training [{tag}] with perf ===")
     # Run perf record with automatic fallback for mmap limits
     dt = _run_perf_record(cmd, perf_data, env)
 
-    # Collect perf reports (call-graph) for HTML embedding
+    # Collect perf report as a call-graph tree (default, always on)
     graph_cmd = [
         "perf", "report", "--stdio", "--call-graph=graph", "--percent-limit", str(PERF_PERCENT_LIMIT),
-        "--max-stack", os.environ.get("BENCH_MAX_STACK", "1024"),
+        "--max-stack", "1024",
         "-i", str(perf_data)
     ]
     rc_graph, graph_lines = run_capture(graph_cmd, cwd=WORKSPACE_ROOT)
-    annotate_text = annotate_blas_server(perf_data)
+    if rc_graph == 0 and graph_lines:
+        graph_lines = _filter_tree(graph_lines)
+        graph_lines = _dedup_label_blocks(graph_lines)
+    merge_ok, merge_text = merged_hot_subpaths(perf_data)
+    condensed_ok, condensed_text = condensed_hot_paths(perf_data)
 
     return {
         "tag": tag,
@@ -231,15 +301,11 @@ def train_with_perf(train_tsv: Path, tag: str):
         "runtime_sec": dt,
         "graph_ok": (rc_graph == 0),
         "graph": "\n".join(graph_lines),
-        "annotate": annotate_text,
-        "env_snapshot": {
-            "RAYON_NUM_THREADS": env.get("RAYON_NUM_THREADS", ""),
-            "OPENBLAS_NUM_THREADS": env.get("OPENBLAS_NUM_THREADS", ""),
-            "OPENBLAS_WAIT_POLICY": env.get("OPENBLAS_WAIT_POLICY", ""),
-            "OMP_NUM_THREADS": env.get("OMP_NUM_THREADS", ""),
-            "BENCH_FREQ": os.environ.get("BENCH_FREQ", "2000"),
-            "BENCH_MAX_STACK": os.environ.get("BENCH_MAX_STACK", "1024"),
-        },
+        "merge_ok": merge_ok,
+        "merge": merge_text,
+        "condensed_ok": condensed_ok,
+        "condensed": condensed_text,
+        # No env snapshot in report (no env flags)
     }
 
 
@@ -259,13 +325,177 @@ def generate_flamegraph(perf_data_path: Path, tag: str) -> Path | None:
     return None
 
 
+def merged_hot_subpaths(perf_data_path: Path) -> tuple[bool, str]:
+    """Compute merged hot leaf-suffix subpaths from collapsed stacks.
+
+    Uses `perf script | inferno-collapse-perf` to obtain folded stacks of the form
+    "frame1;frame2;...;leaf count". We then aggregate counts by the last K frames
+    (leafward suffix), merging identical subpaths that occur under different callers.
+
+    No environment flags: uses fixed depth and top limits.
+    """
+    has_collapse = _sh.which("inferno-collapse-perf") is not None
+    if not has_collapse:
+        return False, ""
+    rc, lines = run_capture([
+        "bash", "-lc",
+        f"perf script -i {perf_data_path} | inferno-collapse-perf"
+    ], cwd=WORKSPACE_ROOT)
+    if rc != 0 or not lines:
+        return False, ""
+    total = 0
+    from collections import defaultdict
+    agg: dict[str, int] = defaultdict(int)
+    depth = 6
+    # Parse folded format: frame1;frame2;...;leaf count
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            stack, cnt_str = ln.rsplit(" ", 1)
+            cnt = int(cnt_str)
+        except Exception:
+            continue
+        total += cnt
+        frames = stack.split(";")
+        # Remove raw address-only frames from the suffix
+        frames = [f for f in frames if not f.startswith("0x") or not all(c in "0123456789abcdefABCDEFx" for c in f)]
+        # Use leafward suffix of length K
+        suffix = frames[-depth:]
+        key = ";".join(suffix)
+        agg[key] += cnt
+
+    if not agg or total <= 0:
+        return False, ""
+    # Prepare top-N merged suffixes
+    top_n = 20
+    items = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    # Build a compact text block
+    out_lines = []
+    out_lines.append(f"Merged by leaf-suffix (depth={depth}), top {len(items)} of {len(agg)} unique suffixes")
+    out_lines.append("")
+    for key, cnt in items:
+        pct = 100.0 * cnt / total
+        out_lines.append(f"{pct:6.2f}%  {cnt:>8}  {key}")
+    return True, "\n".join(out_lines)
+
+
+def condensed_hot_paths(perf_data_path: Path) -> tuple[bool, str]:
+    """Condense hot paths to a human-meaningful spine per stack.
+
+    Rule per stack (frames are root->leaf):
+      1) Origin (first frame)
+      2) First frame containing 'gnomon::' (if any)
+      3) Last frame containing 'gnomon::' (if any, not duplicating first)
+      4) First non-gnomon frame immediately after the last gnomon (if any)
+      5) A few useful extras after that whose global aggregate counts are high
+
+    Aggregates identical condensed paths and ranks by sample count.
+    Avoids raw address-only frames and removes " (inlined)" markers.
+    """
+    has_collapse = _sh.which("inferno-collapse-perf") is not None
+    if not has_collapse:
+        return False, ""
+    rc, lines = run_capture([
+        "bash", "-lc",
+        f"perf script -i {perf_data_path} | inferno-collapse-perf"
+    ], cwd=WORKSPACE_ROOT)
+    if rc != 0 or not lines:
+        return False, ""
+
+    from collections import defaultdict
+    total = 0
+    parsed: list[tuple[list[str], int]] = []
+    frame_count: dict[str, int] = defaultdict(int)
+
+    def is_addr(s: str) -> bool:
+        s = s.strip()
+        return s.startswith("0x") and all(c in "0123456789abcdefABCDEFx" for c in s)
+
+    def norm(s: str) -> str:
+        s = s.replace(" (inlined)", "").strip()
+        return s
+
+    # Parse and collect global frame counts
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            stack, cnt_str = ln.rsplit(" ", 1)
+            cnt = int(cnt_str)
+        except Exception:
+            continue
+        frames = [norm(f) for f in stack.split(";") if not is_addr(f)]
+        if not frames:
+            continue
+        parsed.append((frames, cnt))
+        total += cnt
+        # Aggregate simple inclusive count per frame name
+        for f in set(frames):
+            frame_count[f] += cnt
+
+    if not parsed or total <= 0:
+        return False, ""
+
+    # Build condensed path per stack
+    agg_paths: dict[tuple[str, ...], int] = defaultdict(int)
+    EXTRA_LIMIT = 3
+    # Set a fixed usefulness threshold at ~2% of total samples
+    EXTRA_MIN = max(1, int(0.02 * total))
+
+    for frames, cnt in parsed:
+        origin = frames[0]
+        g_idx_first = next((i for i, f in enumerate(frames) if "gnomon::" in f), None)
+        g_idx_last = None
+        if g_idx_first is not None:
+            for i, f in enumerate(frames):
+                if "gnomon::" in f:
+                    g_idx_last = i
+        path: list[str] = [origin]
+        if g_idx_first is not None:
+            if frames[g_idx_first] not in path:
+                path.append(frames[g_idx_first])
+        if g_idx_last is not None and frames[g_idx_last] not in path:
+            path.append(frames[g_idx_last])
+        # First non-gnomon after last gnomon
+        start_extra = (g_idx_last + 1) if g_idx_last is not None else 1
+        first_non_g_after = None
+        for j in range(start_extra, len(frames)):
+            if "gnomon::" not in frames[j]:
+                first_non_g_after = frames[j]
+                break
+        if first_non_g_after is not None and first_non_g_after not in path:
+            path.append(first_non_g_after)
+
+        # Useful extras: subsequent non-duplicate frames with high global weight
+        extras_added = 0
+        for j in range((start_extra if first_non_g_after is None else frames.index(first_non_g_after) + 1), len(frames)):
+            f = frames[j]
+            if f in path:
+                continue
+            if frame_count.get(f, 0) >= EXTRA_MIN:
+                path.append(f)
+                extras_added += 1
+                if extras_added >= EXTRA_LIMIT:
+                    break
+
+        agg_paths[tuple(path)] += cnt
+
+    # Format top-N condensed paths
+    items = sorted(agg_paths.items(), key=lambda kv: kv[1], reverse=True)[:25]
+    lines_out = ["Condensed hot paths (origin → first gnomon → last gnomon → next non-gnomon → extras)", ""]
+    for path, cnt in items:
+        pct = 100.0 * cnt / total
+        lines_out.append(f"{pct:6.2f}%  {cnt:>8}  {' → '.join(path)}")
+    return True, "\n".join(lines_out)
+
+
 def main():
-    # Optional CPU affinity for reproducibility
-    _maybe_set_affinity()
     # 1) Build profiling binary
     build_profiling_binary()
-    # Prime perf with DSO build-ids to improve annotation
-    _cache_dsos_for_perf()
+    # No DSO priming needed (no annotate section)
 
     # 2) Generate a single dataset (default non-linear) to keep report minimal
     datasets = [
@@ -292,15 +522,7 @@ def main():
         # only one section
         sec = report_sections[0]
         f.write(f"<div class='meta'>Runtime: {sec['runtime_sec']:.3f} s</div>\n")
-        # Environment snapshot for reproducibility
-        es = sec.get('env_snapshot') or {}
-        f.write("<div class='meta'>Env: "
-                f"OPENBLAS_NUM_THREADS={escape(es.get('OPENBLAS_NUM_THREADS',''))}, "
-                f"OPENBLAS_WAIT_POLICY={escape(es.get('OPENBLAS_WAIT_POLICY',''))}, "
-                f"RAYON_NUM_THREADS={escape(es.get('RAYON_NUM_THREADS',''))}, "
-                f"FREQ={escape(es.get('BENCH_FREQ',''))} Hz, "
-                f"MAX_STACK={escape(es.get('BENCH_MAX_STACK',''))}"
-                "</div>\n")
+        # No environment snapshot (no env flags)
         if sec.get('flame_svg') and sec['flame_svg']:
             # Inline the SVG content so it always renders
             try:
@@ -313,7 +535,7 @@ def main():
         else:
             f.write("<p>Flamegraph not available (missing tooling). Install inferno-collapse-perf and inferno-flamegraph.</p>")
 
-        # Raw text perf report (call graph) under the plot, filtered by percent threshold
+        # Text perf report (call graph tree)
         f.write("<h2 style='margin-top:18px'>Perf Text Report</h2>\n")
         f.write(f"<div class='meta'>Showing entries with ≥{PERF_PERCENT_LIMIT}%</div>\n")
         f.write("<h3>Call Graph</h3>\n")
@@ -324,14 +546,25 @@ def main():
         else:
             f.write("<p>Call-graph report unavailable.</p>")
 
-        # Annotate the OpenBLAS thread server if available
-        f.write("<h3>OpenBLAS blas_thread_server annotate</h3>\n")
-        if sec.get('annotate'):
-            f.write("<pre style='white-space:pre-wrap;max-height:400px;overflow:auto;border:1px solid #eee;padding:8px;background:#fafafa'>")
-            f.write(escape(sec['annotate']))
+        # Condensed and merged views to reduce duplication
+        f.write("<h3>Condensed Hot Paths</h3>\n")
+        if sec.get('condensed_ok') and sec.get('condensed'):
+            f.write("<pre style='white-space:pre-wrap;max-height:360px;overflow:auto;border:1px solid #eee;padding:8px;background:#fafafa'>")
+            f.write(escape(sec['condensed']))
             f.write("</pre>")
         else:
-            f.write("<p>No annotate output (symbols or data missing).</p>")
+            f.write("<p>Condensed paths unavailable (install inferno-collapse-perf).</p>")
+
+        # Merged identical leaf-suffix subpaths
+        f.write("<h3>Merged Hot Subpaths</h3>\n")
+        if sec.get('merge_ok') and sec.get('merge'):
+            f.write("<pre style='white-space:pre-wrap;max-height:360px;overflow:auto;border:1px solid #eee;padding:8px;background:#fafafa'>")
+            f.write(escape(sec['merge']))
+            f.write("</pre>")
+        else:
+            f.write("<p>Subpath merge unavailable (install inferno-collapse-perf).</p>")
+
+        # (Removed OpenBLAS annotate section)
 
     print(f"\nHTML report -> {html_path}")
     try:
