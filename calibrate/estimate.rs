@@ -36,7 +36,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Cholesky, Eigh, Solve, UPLO};
+use ndarray_linalg::{Eigh, Solve};
 // faer: high-performance dense solvers
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -689,7 +689,7 @@ pub fn train_model(
     config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
     config_with_constraints.pc_null_transforms = pc_null_transforms;
 
-    // Build Robust Geometric Clamping hull from training predictors
+    // Build Peeled Hull Clamping (PHC) hull from training predictors
     let hull_opt = {
         let n = data.p.len();
         let d = 1 + config.pc_configs.len();
@@ -702,7 +702,7 @@ pub fn train_model(
         match build_peeled_hull(&x_raw, 3) {
             Ok(h) => Some(h),
             Err(e) => {
-                println!("RGC hull construction skipped: {}", e);
+                println!("PHC hull construction skipped: {}", e);
                 None
             }
         }
@@ -821,7 +821,7 @@ fn log_layout_info(layout: &ModelLayout) {
 // Make internal module public for tests
 pub mod internal {
     use super::*;
-    use ndarray_linalg::SVD;
+    use ndarray_linalg::{Cholesky, SVD, UPLO};
     use ndarray_linalg::error::LinalgError;
 
     enum FaerFactor {
@@ -1892,14 +1892,11 @@ pub mod internal {
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        //eprintln!(
-        //    "    [Debug] ENTERING robust_solve - matrix shape: {:?}, rhs len: {}",
-        //    matrix.shape(),
-        //    rhs.len()
-        //);
-        // Try standard solve first for well-conditioned matrices
-        if let Ok(solution) = matrix.solve(rhs) {
-            return Ok(solution);
+        // Fast path: attempt Cholesky (SPD). Avoids generic LU.
+        if let Ok(chol) = matrix.cholesky(UPLO::Lower) {
+            return chol
+                .solve(rhs)
+                .map_err(EstimationError::LinearSystemSolveFailed);
         }
 
         // If standard solve fails, use SVD-based pseudo-inverse approach
@@ -1930,16 +1927,38 @@ pub mod internal {
                 Ok(pinv.dot(rhs))
             }
             _ => {
-                // Final fallback: regularized solve
+                // Final fallback: small ridge + try Cholesky again, else SVD
                 let mut regularized = matrix.clone();
                 let ridge = 1e-6;
                 for i in 0..regularized.nrows() {
                     regularized[[i, i]] += ridge;
                 }
-
-                regularized
-                    .solve(rhs)
-                    .map_err(EstimationError::LinearSystemSolveFailed)
+                if let Ok(chol) = regularized.cholesky(UPLO::Lower) {
+                    return chol
+                        .solve(rhs)
+                        .map_err(EstimationError::LinearSystemSolveFailed);
+                }
+                // Last resort: SVD pinv
+                match regularized.svd(true, true) {
+                    Ok((Some(u), s, Some(vt))) => {
+                        let tolerance = s.iter().fold(0.0f64, |a, &b| a.max(b)) * 1e-12;
+                        let mut pinv = Array2::zeros((regularized.ncols(), regularized.nrows()));
+                        for (i, &sigma) in s.iter().enumerate() {
+                            if sigma > tolerance {
+                                let u_col = u.column(i);
+                                let v_col = vt.row(i);
+                                let scale = 1.0 / sigma;
+                                for j in 0..pinv.nrows() {
+                                    for k in 0..pinv.ncols() {
+                                        pinv[[j, k]] += v_col[j] * scale * u_col[k];
+                                    }
+                                }
+                            }
+                        }
+                        Ok(pinv.dot(rhs))
+                    }
+                    _ => Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }),
+                }
             }
         }
     }
@@ -2194,7 +2213,7 @@ pub mod internal {
 
             let mut model_for_pd =
                 train_model(&data, &config).expect("Model training should succeed");
-            // For PD diagnostics, disable RGC to avoid projection bias during averaging
+            // For PD diagnostics, disable PHC to avoid projection bias during averaging
             model_for_pd.hull = None;
 
             // Create a minimal grid of test points to evaluate overall fit
@@ -2806,7 +2825,7 @@ pub mod internal {
                         );
                     }
 
-                    // RGC projection stats on validation
+                    // PHC projection stats on validation
                     let proj_rate = if let Some(hull) = &trained.hull {
                         let mut raw = Array2::zeros((data_val_p.len(), 1 + data_val_pcs.ncols()));
                         raw.column_mut(0).assign(&data_val_p);
@@ -2817,7 +2836,7 @@ pub mod internal {
                         let rate = num_proj as f64 / corrected.nrows() as f64;
                         proj_rates.push(rate);
                         println!(
-                            "[CV]   RGC: projected {}/{} ({:.1}%)",
+                            "[CV]   PHC: projected {}/{} ({:.1}%)",
                             num_proj,
                             corrected.nrows(),
                             100.0 * rate
@@ -2899,7 +2918,7 @@ pub mod internal {
                 "[CV]  Complexity: edf mean={:.2} sd={:.2}, min-eig(min)={:.3e}",
                 edf_m, edf_sd, min_eig_min
             );
-            println!("[CV]  RGC: mean projection rate={:.2}%", 100.0 * proj_m);
+            println!("[CV]  PHC: mean projection rate={:.2}%", 100.0 * proj_m);
 
             // Assertions per spec
             assert!(auc_m >= 0.60, "AUC mean too low: {:.3}", auc_m);
@@ -2936,7 +2955,7 @@ pub mod internal {
             );
             assert!(
                 proj_m <= 0.20,
-                "Mean projection rate (RGC) exceeds 20%: {:.2}%",
+                "Mean projection rate (PHC) exceeds 20%: {:.2}%",
                 100.0 * proj_m
             );
         }

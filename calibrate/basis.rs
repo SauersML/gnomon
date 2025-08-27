@@ -396,8 +396,8 @@ mod internal {
     /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
     /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
     ///
-    /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Robust Geometric
-    /// Clamping (RGC) provides geometric projection. This function must honor the
+    /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Peeled Hull
+    /// Clamping (PHC) provides geometric projection. This function must honor the
     /// provided `x` value. For out-of-domain `x`, we select the boundary span so the
     /// basis evaluates consistently (yielding zeros except at boundaries), without
     /// altering `x` itself.

@@ -176,7 +176,7 @@ impl TrainedModel {
             });
         }
 
-        // --- 2. Robust Geometric Clamping (if hull available) ---
+        // --- 2. Peeled Hull Clamping (PHC) if hull available ---
         // Assemble raw predictors, optionally project, and split back
         let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
         let (x_corr, num_projected) = if let Some(hull) = &self.hull {
@@ -187,7 +187,7 @@ impl TrainedModel {
         if x_corr.nrows() > 0 && num_projected > 0 {
             let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
             println!(
-                "[RGC] Projected {} of {} points ({:.1}%).",
+                "[PHC] Projected {} of {} points ({:.1}%).",
                 num_projected,
                 x_corr.nrows(),
                 rate
@@ -250,7 +250,7 @@ impl TrainedModel {
             });
         }
 
-        // Assemble raw predictors, optionally project, and split back
+        // Assemble raw predictors, optionally project via PHC, and split back
         let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
         let (x_corr, num_projected) = if let Some(hull) = &self.hull {
             hull.project_if_needed(raw.view())
@@ -260,7 +260,7 @@ impl TrainedModel {
         if x_corr.nrows() > 0 && num_projected > 0 {
             let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
             println!(
-                "[RGC] Projected {} of {} points ({:.1}%).",
+                "[PHC] Projected {} of {} points ({:.1}%).",
                 num_projected,
                 x_corr.nrows(),
                 rate
