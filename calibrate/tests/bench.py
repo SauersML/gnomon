@@ -38,12 +38,29 @@ EXECUTABLE_PATH = WORKSPACE_ROOT / "target" / "profiling" / "gnomon"
 # Minimum percent to include in perf text reports. Override with BENCH_PERF_PERCENT=1 for more detail.
 PERF_PERCENT_LIMIT = int(os.environ.get("BENCH_PERF_PERCENT", "5"))
 
+def _maybe_set_affinity():
+    cores = os.environ.get("BENCH_PIN_CORES", "").strip()
+    if not cores:
+        return
+    try:
+        cpus = {int(x) for x in cores.split(",") if x.strip()}
+        if cpus:
+            os.sched_setaffinity(0, cpus)
+            print(f"Affinity pinned to CPUs: {sorted(cpus)}")
+    except Exception as e:
+        print(f"Could not set affinity: {e}")
+
 
 def build_profiling_binary():
+    env = os.environ.copy()
+    # Ensure good debug/unwind quality in profiling builds
+    rf = env.get("RUSTFLAGS", "").strip()
+    flags = "-C force-frame-pointers=yes -C debuginfo=2 -C link-dead-code=yes"
+    env["RUSTFLAGS"] = (rf + " " + flags).strip() if rf else flags
     if not EXECUTABLE_PATH.exists():
         print("--- Building profiling binary (symbols kept) ---")
         # Build from workspace root so cargo.toml resolves correctly
-        run_or_die(["cargo", "build", "--profile", "profiling"], cwd=WORKSPACE_ROOT)
+        run_or_die(["cargo", "build", "--profile", "profiling"], cwd=WORKSPACE_ROOT, env=env)
     else:
         print("--- Found existing profiling binary. ---")
 
@@ -78,6 +95,33 @@ def run_capture(cmd, cwd=None, env=None):
     return ret, lines
 
 
+def _cache_dsos_for_perf():
+    exe = str(EXECUTABLE_PATH)
+    rc, out = run_capture(["bash", "-lc", f"ldd {exe} || otool -L {exe}"], cwd=WORKSPACE_ROOT)
+    if rc != 0:
+        return
+    import re as _re
+    paths: list[str] = []
+    for line in out:
+        m = _re.search(r"(/[^ )]+?\.(?:so(?:\.[0-9]+)?|dylib))", line)
+        if m:
+            paths.append(m.group(1))
+    for p in set(paths):
+        run_capture(["perf", "buildid-cache", "-r", p], cwd=WORKSPACE_ROOT)
+
+
+def annotate_blas_server(perf_data: Path) -> str:
+    # Try a few common OpenBLAS/BLAS soname variants
+    dsos = "libopenblas.so,libopenblas.so.0,libblas.so.3,libopenblas.dylib"
+    cmd = [
+        "perf", "annotate", "--stdio", "-i", str(perf_data),
+        "--dsos", dsos,
+        "--symbol", "blas_thread_server",
+    ]
+    rc, lines = run_capture(cmd, cwd=WORKSPACE_ROOT)
+    return "\n".join(lines) if rc == 0 and lines else ""
+
+
 def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
     # Map mgcv columns -> calibrate training schema
     mapping = {
@@ -103,11 +147,26 @@ def train_with_perf(train_tsv: Path, tag: str):
     ]
 
     perf_data = WORKDIR / f"perf_{tag}.data"
-    cmd = ["perf", "record", "-g", "-o", str(perf_data), "--"] + cmd
+    # Better unwind and deeper stacks; sample user-space cycles only.
+    record = [
+        "perf", "record",
+        "-e", "cycles:u",
+        "--call-graph", "dwarf,16384",
+        "-F", os.environ.get("BENCH_FREQ", "2000"),
+        "-m", os.environ.get("BENCH_MMAP_PAGES", "1024"),
+        "-o", str(perf_data), "--",
+    ]
+    cmd = record + cmd
 
     # Use fixed threads for stability if user hasn't set it
     env = os.environ.copy()
     env.setdefault("RAYON_NUM_THREADS", "1")
+    # BLAS threading defaults; overridable
+    oblas_threads = os.environ.get("BENCH_OBLAS_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", oblas_threads)
+    env.setdefault("OMP_NUM_THREADS", oblas_threads)
+    env.setdefault("MKL_NUM_THREADS", oblas_threads)
+    env.setdefault("OPENBLAS_WAIT_POLICY", os.environ.get("BENCH_OBLAS_WAIT", "PASSIVE"))
 
     print(f"\n=== Training [{tag}] with perf ===")
     # Time the perf-wrapped run
@@ -116,12 +175,14 @@ def train_with_perf(train_tsv: Path, tag: str):
     run_or_die(cmd, cwd=WORKSPACE_ROOT, env=env)
     dt = _time.perf_counter() - t0
 
-    # Collect perf reports (flat and call-graph) for HTML embedding
+    # Collect perf reports (call-graph) for HTML embedding
     graph_cmd = [
         "perf", "report", "--stdio", "--call-graph=graph", "--percent-limit", str(PERF_PERCENT_LIMIT),
+        "--max-stack", os.environ.get("BENCH_MAX_STACK", "1024"),
         "-i", str(perf_data)
     ]
     rc_graph, graph_lines = run_capture(graph_cmd, cwd=WORKSPACE_ROOT)
+    annotate_text = annotate_blas_server(perf_data)
 
     return {
         "tag": tag,
@@ -129,6 +190,15 @@ def train_with_perf(train_tsv: Path, tag: str):
         "runtime_sec": dt,
         "graph_ok": (rc_graph == 0),
         "graph": "\n".join(graph_lines),
+        "annotate": annotate_text,
+        "env_snapshot": {
+            "RAYON_NUM_THREADS": env.get("RAYON_NUM_THREADS", ""),
+            "OPENBLAS_NUM_THREADS": env.get("OPENBLAS_NUM_THREADS", ""),
+            "OPENBLAS_WAIT_POLICY": env.get("OPENBLAS_WAIT_POLICY", ""),
+            "OMP_NUM_THREADS": env.get("OMP_NUM_THREADS", ""),
+            "BENCH_FREQ": os.environ.get("BENCH_FREQ", "2000"),
+            "BENCH_MAX_STACK": os.environ.get("BENCH_MAX_STACK", "1024"),
+        },
     }
 
 
@@ -149,8 +219,12 @@ def generate_flamegraph(perf_data_path: Path, tag: str) -> Path | None:
 
 
 def main():
+    # Optional CPU affinity for reproducibility
+    _maybe_set_affinity()
     # 1) Build profiling binary
     build_profiling_binary()
+    # Prime perf with DSO build-ids to improve annotation
+    _cache_dsos_for_perf()
 
     # 2) Generate a single dataset (default non-linear) to keep report minimal
     datasets = [
@@ -177,6 +251,15 @@ def main():
         # only one section
         sec = report_sections[0]
         f.write(f"<div class='meta'>Runtime: {sec['runtime_sec']:.3f} s</div>\n")
+        # Environment snapshot for reproducibility
+        es = sec.get('env_snapshot') or {}
+        f.write("<div class='meta'>Env: "
+                f"OPENBLAS_NUM_THREADS={escape(es.get('OPENBLAS_NUM_THREADS',''))}, "
+                f"OPENBLAS_WAIT_POLICY={escape(es.get('OPENBLAS_WAIT_POLICY',''))}, "
+                f"RAYON_NUM_THREADS={escape(es.get('RAYON_NUM_THREADS',''))}, "
+                f"FREQ={escape(es.get('BENCH_FREQ',''))} Hz, "
+                f"MAX_STACK={escape(es.get('BENCH_MAX_STACK',''))}"
+                "</div>\n")
         if sec.get('flame_svg') and sec['flame_svg']:
             # Inline the SVG content so it always renders
             try:
@@ -197,6 +280,15 @@ def main():
             f.write("</pre>")
         else:
             f.write("<p>Call-graph report unavailable.</p>")
+
+        # Annotate the OpenBLAS thread server if available
+        f.write("<h3>OpenBLAS blas_thread_server annotate</h3>\n")
+        if sec.get('annotate'):
+            f.write("<pre style='white-space:pre-wrap;max-height:400px;overflow:auto;border:1px solid #eee;padding:8px;background:#fafafa'>")
+            f.write(escape(sec['annotate']))
+            f.write("</pre>")
+        else:
+            f.write("<p>No annotate output (symbols or data missing).</p>")
 
     print(f"\nHTML report -> {html_path}")
     try:
