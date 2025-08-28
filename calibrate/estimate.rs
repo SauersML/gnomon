@@ -1871,12 +1871,8 @@ pub mod internal {
                     // Use the exact PIRLS solve-state to preserve cancellations
                     let mu_solve = &pirls_result.solve_mu;
                     
-                    // Calculate the gradient of the unpenalized deviance w.r.t. beta
-                    // For weighted logit: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X' (w ∘ (y - μ))
-                    let residuals = self.y().to_owned() - mu_solve;
-                    // Deviance gradient uses prior weights with residuals
-                    let weighted_residuals = &self.weights * &residuals;
-                    let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&weighted_residuals);
+                    // We don't need to compute the unpenalized deviance gradient for LAML
+                    // as we're using the direct derivative of the penalized deviance
 
                     // Efficient batched computation of hat matrix diagonal
                     // Instead of N individual solves, use single factorization + batched solve
@@ -1904,6 +1900,27 @@ pub mod internal {
                         }
                     };
                     let hat_diag = Array1::from_vec(hat_diag);
+                    
+                    // Calculate edf for the hat-diag sanity check
+                    let p_eff = pirls_result.beta_transformed.len() as f64;
+                    let mut trace_h_inv_s_lambda = 0.0;
+                    
+                    // Compute trace of H⁻¹S_λ using existing penalty matrices
+                    // reparam_result.s_transformed already contains the full S_λ
+                    let s_lambda = &reparam_result.s_transformed;
+                    for j in 0..s_lambda.ncols() {
+                        let col = s_lambda.column(j).to_owned();
+                        if col.iter().all(|&x| x.abs() < 1e-12) {
+                            continue;
+                        }
+                        if let Ok(h_inv_col) = solver.solve(&col) {
+                            trace_h_inv_s_lambda += h_inv_col[j];
+                        }
+                    }
+                    let edf = p_eff - trace_h_inv_s_lambda;
+                    let hat_sum = hat_diag.sum();
+                    eprintln!("[hat] sum(diag(Hat))={:.3}  edf≈{:.3}  Δ={:.3e}", 
+                             hat_sum, edf, (hat_sum-edf));
 
                     // 2. Compute dW/dη, which depends on the link function.
                     let dw_deta: Array1<f64> = match self.config.link_function {
@@ -1941,11 +1958,23 @@ pub mod internal {
                             + 1e-12;
                         let rel = r_norm / ref_norm;
                         if rel > 1e-3 {
+                            eprintln!(
+                                "[WARN] weak stationarity: rel={:.2e}  ||data||={:.3e}  ||pen||={:.3e}",
+                                rel,
+                                data_part.mapv(|v| v.abs()).sum(),
+                                penalty_part.mapv(|v| v.abs()).sum()
+                            );
                             return Err(EstimationError::RemlOptimizationFailed(format!(
                                 "Inner solve stationarity check failed: rel_residual={:.3e}",
                                 rel
                             )));
                         } else if rel > 1e-6 {
+                            eprintln!(
+                                "[WARN] weak stationarity: rel={:.2e}  ||data||={:.3e}  ||pen||={:.3e}",
+                                rel,
+                                data_part.mapv(|v| v.abs()).sum(),
+                                penalty_part.mapv(|v| v.abs()).sum()
+                            );
                             log::warn!(
                                 "Inner solve stationarity is weak (rel_residual={:.3e}); gradient may be noisy.",
                                 rel
@@ -1955,44 +1984,49 @@ pub mod internal {
 
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
-                        // Use transformed penalty matrix (consistent with other calculations)
-                        let s_k_transformed = rs_transformed[k].t().dot(&rs_transformed[k]);
-                        let s_k_beta_transformed = s_k_transformed.dot(beta_transformed);
+                        // S_k and S_k β̂ in the transformed (stable) basis
+                        let s_k = rs_transformed[k].t().dot(&rs_transformed[k]);
+                        let s_k_beta = s_k.dot(beta_transformed);
 
-                        // a. Calculate dβ/dρ_k = -λ_k * H⁻¹ * S_k * β
-                        let dbeta_drho_k_transformed =
-                            -lambdas[k] * solver.solve(&s_k_beta_transformed)?;
+                        // (1) Dp term: ½ d/dρ_k Dp = ½ λ_k βᵀ S_k β
+                        let d1_k = lambdas[k] * beta_transformed.dot(&s_k_beta);
+                        let deviance_grad_term = 0.5 * d1_k;
 
-                        // Component 1a: Data deviance derivative ONLY (mgcv/gdi1)
-                        let d_deviance_d_rho_k =
-                            deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
-                        let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
+                        // Keep dbeta/drho for the weight-derivative (log|H|) term
+                        let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
 
-                        // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
-                        let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
+                        // (2a) weight-derivative part of ½ d log|H| / dρ_k = ½ tr(H⁻¹ Xᵀ (∂W/∂ρ_k) X)
+                        let eta1_k = x_transformed.dot(&dbeta_drho_k);
+                        let dwdrho_k_diag = &dw_deta * &eta1_k;             // ∂W/∂ρ_k = (∂W/∂η) ∘ (∂η/∂ρ_k)
+                        let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag); // tr(H⁻¹ Xᵀ diag(⋯) X)
 
-                        // c. Calculate the weight derivative term: tr(H⁻¹ Xᵀ (∂W/∂ρₖ) X)
-                        let dwdrho_k_diag = &dw_deta * &eta1_k;
-                        let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag);
-
-                        // d. Calculate tr(H⁻¹ * S_k)
+                        // (2b) S part of ½ d log|H| / dρ_k = ½ λ_k tr(H⁻¹ S_k)
                         let mut trace_h_inv_s_k = 0.0;
-                        for j in 0..s_k_transformed.ncols() {
-                            let s_col = s_k_transformed.column(j);
-                            if s_col.iter().all(|&x| x == 0.0) {
+                        for j in 0..s_k.ncols() {
+                            let col = s_k.column(j).to_owned();
+                            if col.iter().all(|&x| x == 0.0) {
                                 continue;
                             }
-                            let h_inv_col = solver.solve(&s_col.to_owned())?;
-                            trace_h_inv_s_k += h_inv_col[j];
+                            trace_h_inv_s_k += solver.solve(&col)?[j];
                         }
-                        let det1_k = pirls_result.reparam_result.det1[k];
+                        let log_det_h_grad_term = 0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
 
-                        // Final Gradient Assembly - mgcv/gdi1 form for LAML
-                        let log_det_h_grad_term =
-                            0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
-                        let log_det_s_grad_term = 0.5 * det1_k;
-                        cost_gradient[k] =
-                            deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
+                        // (3) −½ d log|S_λ|_+ / dρ_k
+                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
+
+                        // Final assembly (C = −LAML is minimized)
+                        cost_gradient[k] = deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
+                            
+                        // Per-component gradient breakdown for observability
+                        eprintln!(
+                          "[LAML g] k={k} +½λ β'S_kβ={:+.3e}  +½λ tr(H⁻¹S_k)={:+.3e}  +½ weight={:+.3e} \
+                           -½ dlog|S|={:+.3e}  => g={:+.3e}",
+                          deviance_grad_term,
+                          0.5 * (lambdas[k] * trace_h_inv_s_k),
+                          0.5 * weight_deriv_term,
+                          -0.5 * pirls_result.reparam_result.det1[k],
+                          cost_gradient[k],
+                        );
                     }
                     // mgcv-style assembly
                     log::debug!("LAML gradient computation finished.");
@@ -2003,6 +2037,25 @@ pub mod internal {
             // The cost_gradient variable as computed above is already -∇V(ρ),
             // which is exactly what the optimizer needs.
             // No final negation is needed.
+            
+            // One-direction secant test (cheap FD validation)
+            if !p.is_empty() {
+                let h = 1e-4;
+                let mut dir = Array1::zeros(p.len()); dir[0] = 1.0; // pick k=0 or max|grad|
+                let gdot = cost_gradient.dot(&dir);
+                let fp = self.compute_cost(&(p.clone() + &(h * &dir))).unwrap_or(f64::INFINITY);
+                let fm = self.compute_cost(&(p.clone() - &(h * &dir))).unwrap_or(f64::INFINITY);
+                let secant = (fp - fm) / (2.0 * h);
+                let denom = gdot.abs().max(secant.abs()).max(1e-8);
+                eprintln!("[DD] dir-k={} g·d={:+.3e}  FD={:+.3e}  rel={:.2e}",
+                        0, gdot, secant, ((gdot-secant).abs()/denom));
+                
+                // Check for exploding gradients
+                let big = cost_gradient.iter().map(|x| x.abs()).fold(0./0., f64::max);
+                if !big.is_finite() || big > 1e6 {
+                    eprintln!("[WARN] gradient exploded: max|g|={:.3e} (ρ={:?})", big, p.to_vec());
+                }
+            }
 
             Ok(cost_gradient)
         }
