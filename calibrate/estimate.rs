@@ -1822,6 +1822,35 @@ pub mod internal {
                             s_lambda_beta_transformed + s_j_beta.mapv(|v| v * lambdas[j]);
                     }
 
+                    // --- Release-level stationarity check against the accepted PIRLS system ---
+                    // Verify: X^T W_solve (X beta - z_solve) + S_lambda beta ≈ 0
+                    // Use the already computed s_lambda_beta_transformed to avoid forming S_lambda.
+                    {
+                        let z_solve = &pirls_result.solve_working_response;
+                        let w_solve = &pirls_result.solve_weights;
+                        let tmp_eta = x_transformed.dot(beta_transformed);
+                        let work_resid = &tmp_eta - z_solve; // Xβ - z_solve
+                        let data_part = x_transformed.t().dot(&(w_solve * &work_resid));
+                        let penalty_part = &s_lambda_beta_transformed;
+                        let stationarity_vec = &data_part + penalty_part;
+                        let r_norm = stationarity_vec.mapv(|v| v.abs()).sum();
+                        let ref_norm = data_part.mapv(|v| v.abs()).sum()
+                            + penalty_part.mapv(|v| v.abs()).sum()
+                            + 1e-12;
+                        let rel = r_norm / ref_norm;
+                        if rel > 1e-3 {
+                            return Err(EstimationError::RemlOptimizationFailed(format!(
+                                "Inner solve stationarity check failed: rel_residual={:.3e}",
+                                rel
+                            )));
+                        } else if rel > 1e-6 {
+                            log::warn!(
+                                "Inner solve stationarity is weak (rel_residual={:.3e}); gradient may be noisy.",
+                                rel
+                            );
+                        }
+                    }
+
                     // --- Loop through penalties to compute each gradient component ---
                     for k in 0..lambdas.len() {
                         // Use transformed penalty matrix (consistent with other calculations)
