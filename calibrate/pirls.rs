@@ -540,7 +540,7 @@ pub fn fit_model_for_fixed_rho(
                     result.penalized_hessian.clone()
                 } else {
                     log::warn!("No stable result saved, computing Hessian as fallback");
-                    let (result, _rank) = solve_penalized_least_squares(
+                    let (result, rank) = solve_penalized_least_squares(
                         x_transformed.view(),
                         z.view(),
                         weights.view(),
@@ -551,6 +551,7 @@ pub fn fit_model_for_fixed_rho(
                         y.view(),
                         config.link_function,
                     )?;
+                    log::trace!("Fallback solve rank: {}", rank);
                     result.penalized_hessian
                 };
                 let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
@@ -3268,14 +3269,15 @@ fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationErro
     // Add a small constant ridge and retry, escalating a few times if necessary
     let n = hess.nrows();
     let mut delta = 1e-8_f64;
-    for _try_num in 0..5 {
+    for attempt in 0..5 {
         for i in 0..n {
             hess[[i, i]] += delta;
         }
         if hess.cholesky(UPLO::Lower).is_ok() {
             log::warn!(
-                "Penalized Hessian not PD; added ridge {:.1e} to ensure stability.",
-                delta
+                "Penalized Hessian not PD; added ridge {:.1e} on attempt {} to ensure stability.",
+                delta,
+                attempt + 1
             );
             return Ok(());
         }
