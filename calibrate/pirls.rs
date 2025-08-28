@@ -3,7 +3,7 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Eigh, UPLO};
+use ndarray_linalg::{Cholesky, Eigh, UPLO};
 use std::time::Instant;
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -98,6 +98,12 @@ pub struct PirlsResult {
 
     // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
+    // Additional PIRLS state captured at the accepted step to support
+    // cost/gradient consistency in the outer optimization
+    pub final_mu: Array1<f64>,
+    pub solve_weights: Array1<f64>,
+    pub solve_working_response: Array1<f64>,
+    pub solve_mu: Array1<f64>,
 
     // Keep all other fields as they are
     pub status: PirlsStatus,
@@ -234,6 +240,7 @@ pub fn fit_model_for_fixed_rho(
 
     // Save the most recent stable result to avoid redundant computation
     let mut last_stable_result: Option<(StablePLSResult, usize)> = None;
+    let mut last_mu_solve = mu.clone();
 
     // Validate dimensions
     assert_eq!(
@@ -250,6 +257,10 @@ pub fn fit_model_for_fixed_rho(
 
     log::info!("Reparameterization complete. Starting P-IRLS loop in transformed basis...");
 
+    // Track the last linear system weights/working response used in the solve
+    let mut last_weights_solve = weights.clone();
+    let mut last_z_solve = z.clone();
+
     for iter in 1..=config.max_iterations {
         last_iter = iter; // Update on every iteration
 
@@ -261,6 +272,10 @@ pub fn fit_model_for_fixed_rho(
         // These are needed later for the gradient check
         let weights_solve = weights.clone();
         let z_solve = z.clone();
+        // Persist for use in returns irrespective of exit status
+        last_weights_solve = weights_solve.clone();
+        last_z_solve = z_solve.clone();
+        last_mu_solve = mu.clone();
 
         // Calculate the penalty for the current beta using the transformed total penalty matrix
         let penalty_current = beta_current.dot(&s_transformed.dot(&beta_current));
@@ -459,7 +474,11 @@ pub fn fit_model_for_fixed_rho(
                     0.0
                 },
                 stable_penalty_term,
-                final_weights: weights,
+                final_weights: weights.clone(),
+                final_mu: mu.clone(),
+                solve_weights: last_weights_solve.clone(),
+                solve_working_response: last_z_solve.clone(),
+                solve_mu: last_mu_solve.clone(),
                 status: PirlsStatus::Unstable,
                 iteration: iter,
                 max_abs_eta,
@@ -579,7 +598,11 @@ pub fn fit_model_for_fixed_rho(
                     deviance: last_deviance,
                     edf: edf_from_solver,
                     stable_penalty_term,
-                    final_weights: weights,
+                    final_weights: weights.clone(),
+                    final_mu: mu.clone(),
+                    solve_weights: last_weights_solve.clone(),
+                    solve_working_response: last_z_solve.clone(),
+                    solve_mu: last_mu_solve.clone(),
                     status: PirlsStatus::Converged,
                     iteration: iter,
                     max_abs_eta,
@@ -641,7 +664,11 @@ pub fn fit_model_for_fixed_rho(
             0.0
         },
         stable_penalty_term,
-        final_weights: weights,
+        final_weights: weights.clone(),
+        final_mu: mu.clone(),
+        solve_weights: last_weights_solve.clone(),
+        solve_working_response: last_z_solve.clone(),
+        solve_mu: last_mu_solve.clone(),
         status: PirlsStatus::MaxIterationsReached,
         iteration: last_iter,
         max_abs_eta,
@@ -3137,44 +3164,40 @@ mod tests {
     }
 }
 
-/// Ensures a matrix is positive definite by adjusting negative eigenvalues
-/// CRITICAL: This function must be used consistently for both cost and gradient
+/// Ensure positive definiteness by adding a small constant ridge to the diagonal if needed.
+/// This mirrors the outer objective/gradient stabilization (H_eff = H or H + c I),
+/// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
 fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
-    if let Ok((evals, evecs)) = hess.eigh(UPLO::Lower) {
-        // Check if ALL eigenvalues are negative - CRITICAL numerical issue
-        if evals.iter().all(|&x| x < 0.0) {
-            let min_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            // Critical error - program termination
-            return Err(EstimationError::HessianNotPositiveDefinite { min_eigenvalue });
-        }
-
-        // Original behavior for other cases
-        let thresh = evals.iter().cloned().fold(0.0, f64::max) * 1e-6;
-        let mut adjusted = false;
-        let mut evals_mut = evals.clone();
-
-        for eval in evals_mut.iter_mut() {
-            if *eval < thresh {
-                *eval = thresh;
-                adjusted = true;
-            }
-        }
-
-        if adjusted {
-            let min_original_eigenvalue = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            log::warn!(
-                "Penalized Hessian was not positive definite (min eigenvalue: {:.3e}). Adjusting for stability. This may indicate an ill-posed model.",
-                min_original_eigenvalue
-            );
-            *hess = evecs.dot(&Array2::from_diag(&evals_mut)).dot(&evecs.t());
-        }
-
-        Ok(())
-    } else {
-        // Fallback: add small ridge to diagonal
-        for i in 0..hess.nrows() {
-            hess[[i, i]] += 1e-6;
-        }
-        Ok(())
+    // If already PD, do nothing
+    if hess.cholesky(UPLO::Lower).is_ok() {
+        return Ok(());
     }
+
+    // Add a small constant ridge and retry, escalating a few times if necessary
+    let n = hess.nrows();
+    let mut delta = 1e-8_f64;
+    for _try in 0..5 {
+        for i in 0..n {
+            hess[[i, i]] += delta;
+        }
+        if hess.cholesky(UPLO::Lower).is_ok() {
+            log::warn!(
+                "Penalized Hessian not PD; added ridge {:.1e} to ensure stability.",
+                delta
+            );
+            return Ok(());
+        }
+        delta *= 10.0;
+    }
+
+    // As a last resort, report indefiniteness with min eigenvalue for diagnostics
+    if let Ok((evals, _)) = hess.eigh(UPLO::Lower) {
+        let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        return Err(EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: min_eig,
+        });
+    }
+    Err(EstimationError::HessianNotPositiveDefinite {
+        min_eigenvalue: f64::NEG_INFINITY,
+    })
 }

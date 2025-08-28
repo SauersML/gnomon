@@ -1177,17 +1177,16 @@ pub fn stable_reparameterization(
                     1.0
                 };
 
-                // If the top r eigenvalues don't capture enough energy, reduce r conservatively
-                if captured_energy_ratio < 0.8 {
-                    let conservative_r = r.saturating_sub(1);
-                    log::warn!(
-                        "Top {} eigenvalues capture only {:.1}% of total energy. Reducing r from {} to {}",
-                        r,
-                        captured_energy_ratio * 100.0,
-                        r,
-                        conservative_r
+                // Expectation: because r was computed as the count of eigenvalues
+                // above 'rank_tolerance', and 'top_r_eigenvalues' selects the largest
+                // r of those same positive eigenvalues, 'captured_energy_ratio' should
+                // be exactly 1.0 up to numerical noise. We keep this check as a guardrail:
+                // if it ever falls below 0.99, something is internally inconsistent.
+                if captured_energy_ratio < 0.99 {
+                    panic!(
+                        "Energy capture ratio too low: {:.6}. With r={} defined by positive eigenvalues, this ratio should be ≈1.0.",
+                        captured_energy_ratio, r
                     );
-                    r = conservative_r;
                 }
             }
         }

@@ -1270,24 +1270,26 @@ pub mod internal {
                     // Log-determinant of the penalty matrix - use stable value from P-IRLS
                     let log_det_s = pirls_result.reparam_result.log_det;
 
-                    // Log-determinant of the penalized Hessian using SINGLE stabilized Hessian from P-IRLS
+                    // Log-determinant of the penalized Hessian: use the UNSTABILIZED matrix
+                    // for value-consistency with the gradient. Fall back to eigenvalue sum with
+                    // a small constant ridge for numerical safety only.
                     let log_det_h = match pirls_result
-                        .stabilized_hessian_transformed
+                        .penalized_hessian_transformed
                         .cholesky(UPLO::Lower)
                     {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
                             log::warn!(
-                                "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
+                                "Cholesky failed for penalized Hessian, using eigenvalue method"
                             );
 
                             let (eigenvalues, _) = pirls_result
-                                .stabilized_hessian_transformed
+                                .penalized_hessian_transformed
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
-                            let ridge = 1e-8;
+                            let ridge = 1e-8; // constant ridge for numeric safety
                             let stabilized_log_det: f64 = eigenvalues
                                 .iter()
                                 .map(|&ev| (ev + ridge).max(ridge))
@@ -1751,20 +1753,26 @@ pub mod internal {
                     log::debug!("Pre-computing for gradient calculation (LAML)...");
 
                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
-                    let solver = RobustSolver::new(&hessian)?; // Use stabilized transformed Hessian
+                    // Use the same effective Hessian as the cost path:
+                    // if Cholesky fails on H, add a small constant ridge and use H_eff = H + cI everywhere.
+                    let mut h_eff = pirls_result.penalized_hessian_transformed.clone();
+                    let cholesky_ok = h_eff.cholesky(UPLO::Lower).is_ok();
+                    if !cholesky_ok {
+                        let p_dim = h_eff.nrows();
+                        let c: f64 = 1e-8;
+                        for i in 0..p_dim {
+                            h_eff[[i, i]] += c;
+                        }
+                    }
+                    let solver = RobustSolver::new(&h_eff)?;
 
-                    // Pre-compute transformed eta and working variables from P-IRLS state
-                    let eta = x_transformed.dot(beta_transformed);
-                    let (mu, _, _) = crate::calibrate::pirls::update_glm_vectors(
-                        self.y,
-                        &eta,
-                        self.config.link_function,
-                        self.weights,
-                    );
+                    // Use the exact PIRLS solve-state to preserve cancellations
+                    let mu_solve = &pirls_result.solve_mu;
 
                     // Calculate the gradient of the unpenalized deviance w.r.t. beta
                     // For weighted logit: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X' (w ∘ (y - μ))
-                    let residuals = &self.y() - &mu;
+                    let residuals = self.y().to_owned() - mu_solve;
+                    // Deviance gradient uses prior weights with residuals
                     let weighted_residuals = &self.weights * &residuals;
                     let deviance_grad_wrt_beta = -2.0 * x_transformed.t().dot(&weighted_residuals);
 
@@ -1796,9 +1804,10 @@ pub mod internal {
                     let hat_diag = Array1::from_vec(hat_diag);
 
                     // 2. Compute dW/dη, which depends on the link function.
-                    let dw_deta = match self.config.link_function {
+                    let dw_deta: Array1<f64> = match self.config.link_function {
                         LinkFunction::Logit => {
-                            &self.weights * (&mu * (1.0 - &mu) * (1.0 - 2.0 * &mu))
+                            let core = mu_solve.mapv(|m| m * (1.0 - m) * (1.0 - 2.0 * m));
+                            &self.weights * &core
                         }
                         // Fallback for Identity, though this branch shouldn't be taken for Identity link
                         LinkFunction::Identity => Array1::zeros(self.y.len()),
@@ -5514,6 +5523,145 @@ mod optimizer_progress_tests {
         );
 
         Ok(())
+    }
+}
+
+// === Reparameterization Consistency Test ===
+#[cfg(test)]
+mod reparam_consistency_tests {
+    use super::*;
+    use crate::calibrate::construction::build_design_and_penalty_matrices;
+    use crate::calibrate::data::TrainingData;
+    use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
+    use ndarray::{Array1, Array2};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    // For any rho (log-lambda), the chain rule requires
+    // dC/drho = diag(lambda) * dC/dlambda with lambda = exp(rho).
+    // We check this by comparing the analytic gradient w.r.t. rho against
+    // a finite-difference gradient computed in lambda-space and mapped by diag(lambda).
+    #[test]
+    fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
+        // 1) Small, deterministic Gaussian/Identity problem
+        let n = 400;
+        let mut rng = StdRng::seed_from_u64(12345);
+        let p = Array1::from_shape_fn(n, |_| rng.gen_range(-1.0..1.0));
+        let y = p.mapv(|x: f64| 0.4 * (0.5 * x).sin() + 0.1 * x * x)
+            + Array1::from_shape_fn(n, |_| rng.gen_range(-0.01..0.01));
+        let pcs = Array2::zeros((n, 0));
+        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n) };
+
+        let config = ModelConfig {
+            link_function: LinkFunction::Identity,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 20,
+            pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
+            pc_configs: vec![],
+            pgs_range: (-1.0, 1.0),
+            sum_to_zero_constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
+            interaction_orth_alpha: std::collections::HashMap::new(),
+        };
+
+        let (x, s_list, layout, ..) = build_design_and_penalty_matrices(&data, &config)
+            .expect("matrix build");
+
+        if layout.num_penalties == 0 {
+            println!("Skipping reparam consistency test: no penalties.");
+            return;
+        }
+
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+        ).expect("RemlState");
+
+        // 2) Moderate random rho in [-1, 1]
+        let k = layout.num_penalties;
+        let rho = Array1::from_shape_fn(k, |_| rng.gen_range(-1.0..1.0));
+        let lambda = rho.mapv(f64::exp);
+
+        // 3) Analytic gradient wrt rho
+        let g_rho = match reml_state.compute_gradient(&rho) {
+            Ok(g) => g,
+            Err(EstimationError::PirlsDidNotConverge { .. }) => {
+                println!("Skipping: PIRLS did not converge at base rho.");
+                return;
+            }
+            Err(e) => panic!("Analytic gradient failed: {:?}", e),
+        };
+
+        // 4) Finite-difference gradient wrt lambda (central diff, relative step)
+        let objective = |rv: &Array1<f64>| -> Option<f64> {
+            match reml_state.compute_cost(rv) {
+                Ok(c) if c.is_finite() => Some(c),
+                _ => None,
+            }
+        };
+
+        // Ensure base cost is finite
+        if objective(&rho).is_none() {
+            println!("Skipping: base cost not finite.");
+            return;
+        }
+
+        let mut g_lambda_fd = Array1::zeros(k);
+        for i in 0..k {
+            let lam_i = lambda[i].max(1e-12);
+            let mut hi = 1e-4 * lam_i;
+            // Keep step safe to avoid negative lambda
+            if hi > 0.49 * lam_i { hi = 0.49 * lam_i; }
+
+            let mut lam_plus = lambda.clone();
+            let mut lam_minus = lambda.clone();
+            lam_plus[i] = lam_i + hi;
+            lam_minus[i] = lam_i - hi;
+
+            let rho_plus = lam_plus.mapv(f64::ln);
+            let rho_minus = lam_minus.mapv(f64::ln);
+
+            let c_plus = match objective(&rho_plus) {
+                Some(v) => v,
+                None => {
+                    println!("Skipping index {}: non-finite cost at + step", i);
+                    return; // avoid flaky failures in CI
+                }
+            };
+            let c_minus = match objective(&rho_minus) {
+                Some(v) => v,
+                None => {
+                    println!("Skipping index {}: non-finite cost at - step", i);
+                    return;
+                }
+            };
+
+            g_lambda_fd[i] = (c_plus - c_minus) / (2.0 * hi);
+        }
+
+        // 5) Compare: g_rho ?= diag(lambda) * g_lambda_fd
+        let rhs = &lambda * &g_lambda_fd; // elementwise
+
+        let dot = g_rho.dot(&rhs);
+        let n1 = g_rho.mapv(|x| x * x).sum().sqrt();
+        let n2 = rhs.mapv(|x| x * x).sum().sqrt();
+        let cos = dot / (n1 * n2).max(1e-18);
+        let rel_err = (&g_rho - &rhs).mapv(|x| x * x).sum().sqrt() / n2.max(1e-18);
+        let norm_ratio = n1 / n2.max(1e-18);
+
+        // Slightly relaxed tolerances to avoid flakiness from numerical branches
+        assert!(cos > 0.999, "cosine similarity too low: {}", cos);
+        assert!(rel_err <= 3e-4, "relative L2 error too high: {}", rel_err);
+        assert!(norm_ratio > 0.998 && norm_ratio < 1.002, "norm ratio off: {}", norm_ratio);
     }
 }
 

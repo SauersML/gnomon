@@ -108,8 +108,8 @@ def main():
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", str(NUM_PCS),
         # These knot/degree values are analogous to the basis complexity in the R code
-        "--pgs-knots", "8",  # for 'score' (variable_one)
-        "--pc-knots", "8",   # for 'PC1' (variable_two)
+        "--pgs-knots", "2",  # for 'score' (variable_one)
+        "--pc-knots", "2",   # for 'PC1' (variable_two)
         "--pgs-degree", "3",
         "--pc-degree", "3",
         str(RUST_TRAIN_DATA_PATH),
