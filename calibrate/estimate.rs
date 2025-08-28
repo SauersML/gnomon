@@ -1833,9 +1833,9 @@ pub mod internal {
                         let data_part = x_transformed.t().dot(&(w_solve * &work_resid));
                         let penalty_part = &s_lambda_beta_transformed;
                         let stationarity_vec = &data_part + penalty_part;
-                        let r_norm = stationarity_vec.mapv(|v: f64| v.abs()).sum::<f64>();
-                        let ref_norm = data_part.mapv(|v: f64| v.abs()).sum::<f64>()
-                            + penalty_part.mapv(|v: f64| v.abs()).sum::<f64>()
+                        let r_norm = stationarity_vec.mapv(|v: f64| v.abs()).sum();
+                        let ref_norm = data_part.mapv(|v: f64| v.abs()).sum()
+                            + penalty_part.mapv(|v: f64| v.abs()).sum()
                             + 1e-12;
                         let rel = r_norm / ref_norm;
                         if rel > 1e-3 {
