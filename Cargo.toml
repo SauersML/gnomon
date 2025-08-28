@@ -59,6 +59,8 @@ log = "0.4.27"
 env_logger = "0.10.2"
 faer = "0.22.6"
 
+planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
+
 [profile.release]
 opt-level = 3
 lto = "fat"
