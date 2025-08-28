@@ -98,5 +98,3 @@ grep = "0.3.2"
 name = "path_benchmark"
 harness = false
 
-[patch.crates-io]
-polars = { git = "https://github.com/skewballfox/polars" }
