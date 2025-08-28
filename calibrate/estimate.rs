@@ -909,7 +909,7 @@ fn log_layout_info(layout: &ModelLayout) {
 // Make internal module public for tests
 pub mod internal {
     use super::*;
-    use ndarray_linalg::{Cholesky, SVD, UPLO};
+    use ndarray_linalg::{Cholesky, Eigh, SVD, UPLO};
     use ndarray_linalg::error::LinalgError;
 
     enum FaerFactor {
@@ -1866,7 +1866,7 @@ pub mod internal {
 
                     // Use the exact PIRLS solve-state to preserve cancellations
                     let mu_solve = &pirls_result.solve_mu;
-
+                    
                     // Calculate the gradient of the unpenalized deviance w.r.t. beta
                     // For weighted logit: Deviance = -2 * log-likelihood, so ∂D/∂β = -2 * X' (w ∘ (y - μ))
                     let residuals = self.y().to_owned() - mu_solve;
@@ -1964,20 +1964,6 @@ pub mod internal {
                             deviance_grad_wrt_beta.dot(&dbeta_drho_k_transformed);
                         let deviance_grad_term = 0.5 * d_deviance_d_rho_k;
 
-                        // Component 1b: Direct derivative of the explicit penalty term β'S_λβ
-                        // Our compute_cost includes the explicit penalty in the objective, so the
-                        // total derivative must include its direct ρ-derivative. In the non-Gaussian
-                        // case the indirect parts are handled via other terms; here we add the direct
-                        // piece so that the analytic gradient matches the finite-difference of cost.
-                        let penalty_direct_term =
-                            0.5 * lambdas[k] * beta_transformed.dot(&s_k_beta_transformed);
-
-                        // Component 1c: Indirect derivative of β'S_λβ through β(ρ)
-                        // 0.5 * d/dρ_k (β'S_λβ) contributes (S_λ β)ᵀ (∂β/∂ρ_k) + 0.5 λ_k βᵀ S_k β.
-                        // We precomputed S_λ β as s_lambda_beta_transformed.
-                        let penalty_indirect_term =
-                            s_lambda_beta_transformed.dot(&dbeta_drho_k_transformed);
-
                         // b. Calculate ∂η/∂ρ_k = X * (∂β/∂ρ_k)
                         let eta1_k = x_transformed.dot(&dbeta_drho_k_transformed);
 
@@ -1995,18 +1981,14 @@ pub mod internal {
                             let h_inv_col = solver.solve(&s_col.to_owned())?;
                             trace_h_inv_s_k += h_inv_col[j];
                         }
+                        let det1_k = pirls_result.reparam_result.det1[k];
+
+                        // Final Gradient Assembly - mgcv/gdi1 form for LAML
                         let log_det_h_grad_term =
                             0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
-
-                        // Component 3: Derivative of log|S|
-                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
-
-                        // Final Gradient Assembly - mgcv/gdi1 form for LAML, with explicit penalty direct + indirect terms
-                        cost_gradient[k] = deviance_grad_term
-                            + penalty_indirect_term
-                            + penalty_direct_term
-                            + log_det_h_grad_term
-                            - log_det_s_grad_term;
+                        let log_det_s_grad_term = 0.5 * det1_k;
+                        cost_gradient[k] =
+                            deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
                     }
                     // mgcv-style assembly
                     log::debug!("LAML gradient computation finished.");
