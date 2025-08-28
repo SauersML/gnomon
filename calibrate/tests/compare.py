@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, brier_score_loss
+import joblib
+from pygam import LogisticGAM, s, te
 
 # --- 1. Define Paths and Parameters ---
 
@@ -15,11 +17,13 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 # --- Model and Data Paths ---
 GNOMON_EXECUTABLE = WORKSPACE_ROOT / "target" / "release" / "gnomon"
 R_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.rds'
+PYGAM_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.joblib'
 RUST_MODEL_CONFIG_PATH = PROJECT_ROOT / 'model.toml'
 TEST_DATA_CSV = SCRIPT_DIR / 'test_data.csv' # Use test data for all evaluation
 
 # --- Temporary File Paths for Inference ---
 R_PREDICTIONS_CSV = SCRIPT_DIR / 'r_model_predictions.csv'
+PYGAM_PREDICTIONS_CSV = SCRIPT_DIR / 'pygam_model_predictions.csv'
 RUST_PREDICTIONS_CSV = SCRIPT_DIR / 'rust_model_predictions.csv'
 RUST_FORMATTED_INFERENCE_DATA_TSV = SCRIPT_DIR / 'rust_formatted_inference_data.tsv'
 
@@ -75,10 +79,29 @@ def run_rust_inference(input_csv, temp_tsv, output_csv):
         rust_output_path.unlink()
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}"); sys.exit(1)
+        
+def run_python_inference(input_csv, output_csv):
+    """Generic function to get predictions from the Python/PyGAM model."""
+    print(f"--- Running Python/PyGAM inference on '{input_csv.name}'")
+    try:
+        # Load the model and make predictions
+        model = joblib.load(PYGAM_MODEL_PATH)
+        data = pd.read_csv(input_csv)
+        X = data[['variable_one', 'variable_two']].values
+        predictions = model.predict_proba(X)
+        
+        # Save predictions to CSV
+        pd.DataFrame({'pygam_prediction': predictions}).to_csv(output_csv, index=False)
+    except Exception as e:
+        print(f"\nERROR: PyGAM inference failed. Error:\n{e}"); sys.exit(1)
 
 def print_performance_report(df):
     """Calculates and prints all performance metrics based on test data."""
-    y_true, models = df['outcome'], {"R / mgcv": df['r_prediction'], "Rust / gnomon": df['rust_prediction']}
+    y_true, models = df['outcome'], {
+        "R / mgcv": df['r_prediction'], 
+        "Python / PyGAM": df['pygam_prediction'],
+        "Rust / gnomon": df['rust_prediction']
+    }
     print("\n" + "="*60); print("      Model Performance on TEST Data"); print("="*60)
     print("\n[Discrimination: AUC]"); print("Higher is better.")
     for n, p in models.items(): print(f"  - {n:<20}: {roc_auc_score(y_true, p):.4f}")
@@ -92,51 +115,262 @@ def print_performance_report(df):
 
 def plot_prediction_comparisons(df):
     """
-    Generates a 1x3 plot comparing model predictions against each other and
-    against the true underlying probability.
+    Generates plots centered around Rust comparisons with other models and ground truth.
     """
-    print("\n--- Generating 1x3 Prediction Comparison Scatter Plot ---")
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6.5))
-    fig.suptitle("Prediction Accuracy on Test Data", fontsize=20)
-
-    # --- Plot 1: R vs. Rust (Inter-Model Agreement) ---
-    mae_models = np.mean(np.abs(df['r_prediction'] - df['rust_prediction']))
-    axes[0].scatter(df['r_prediction'], df['rust_prediction'], alpha=0.2, s=10, rasterized=True)
-    axes[0].plot([0, 1], [0, 1], 'r--', label='Perfect Agreement')
-    axes[0].set(
-        xlabel="R / mgcv Prediction",
-        ylabel="Rust / gnomon Prediction",
-        title=f"Model vs. Model (MAE = {mae_models:.4f})"
-    )
-    axes[0].grid(True, linestyle='--'); axes[0].set_aspect('equal', 'box'); axes[0].legend()
-
-    # --- Plot 2: R vs. Ground Truth Probability (Model Accuracy) ---
-    mae_r = np.mean(np.abs(df['final_probability'] - df['r_prediction']))
-    axes[1].scatter(df['final_probability'], df['r_prediction'], alpha=0.2, s=10, rasterized=True)
-    axes[1].plot([0, 1], [0, 1], 'r--', label='Perfect Prediction')
-    axes[1].set(
-        xlabel="True Final Probability",
-        ylabel="R / mgcv Prediction",
-        title=f"R vs. Ground Truth (MAE = {mae_r:.4f})"
-    )
-    axes[1].grid(True, linestyle='--'); axes[1].set_aspect('equal', 'box'); axes[1].legend()
-
-    # --- Plot 3: Rust vs. Ground Truth Probability (Model Accuracy) ---
-    mae_rust = np.mean(np.abs(df['final_probability'] - df['rust_prediction']))
-    axes[2].scatter(df['final_probability'], df['rust_prediction'], alpha=0.2, s=10, rasterized=True)
-    axes[2].plot([0, 1], [0, 1], 'r--', label='Perfect Prediction')
-    axes[2].set(
-        xlabel="True Final Probability",
-        ylabel="Rust / gnomon Prediction",
-        title=f"Rust vs. Ground Truth (MAE = {mae_rust:.4f})"
-    )
-    axes[2].grid(True, linestyle='--'); axes[2].set_aspect('equal', 'box'); axes[2].legend()
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.show()
+    print("\n--- Generating Model Comparison Plots ---")
+    
+    # Define consistent colors across all visualizations
+    COLORS = {
+        'rust': '#2ca02c',      # Green for Rust
+        'r': '#1f77b4',         # Blue for R
+        'pygam': '#ff7f0e',     # Orange for PyGAM
+        'perfect': '#d62728',   # Red for perfect prediction lines
+        'grid': '#cccccc'       # Light gray for grids
+    }
+    
+    # Create custom colormaps with model-specific colors for density plots
+    from matplotlib.colors import LinearSegmentedColormap
+    
+    # Define separate colormaps for each model
+    # Each colormap transitions from white to the model's color
+    r_cmap = LinearSegmentedColormap.from_list('r_cmap', ['#ffffff', COLORS['r']], N=100)
+    pygam_cmap = LinearSegmentedColormap.from_list('pygam_cmap', ['#ffffff', COLORS['pygam']], N=100)
+    rust_cmap = LinearSegmentedColormap.from_list('rust_cmap', ['#ffffff', COLORS['rust']], N=100)
+    
+    # Define models and their visual attributes
+    models = {
+        'R / mgcv': {
+            'predictions': 'r_prediction',
+            'color': COLORS['r'],
+            'marker': 'o',       # Circle
+            'label': 'R / mgcv',
+            'zorder': 2
+        },
+        'Python / PyGAM': {
+            'predictions': 'pygam_prediction',
+            'color': COLORS['pygam'],
+            'marker': 'o',       # Circle
+            'label': 'Python / PyGAM',
+            'zorder': 2
+        },
+        'Rust / gnomon': {
+            'predictions': 'rust_prediction',
+            'color': COLORS['rust'],
+            'marker': 'o',       # Circle
+            'label': 'Rust / gnomon',
+            'zorder': 3  # Higher zorder to ensure Rust is on top
+        }
+    }
+    
+    # Function to add density-based coloring to a scatter plot
+    def density_scatter(ax, x, y, color, marker, label, zorder=1):
+        from scipy.stats import gaussian_kde
+        xy = np.vstack([x, y])
+        try:
+            density = gaussian_kde(xy)(xy)
+            idx = np.argsort(density)
+            x, y, density = x[idx], y[idx], density[idx]
+            # Use a custom colormap based on the model's main color
+            from matplotlib.colors import LinearSegmentedColormap
+            light_color = '#ffffff'  # White for low density
+            cmap_name = f"density_{color.replace('#', '')}"
+            custom_cmap = LinearSegmentedColormap.from_list(cmap_name, [light_color, color], N=100)
+            
+            scatter = ax.scatter(x, y, c=density, cmap=custom_cmap, 
+                      s=30, marker=marker, edgecolor='none',
+                      alpha=0.8, zorder=zorder)
+            return scatter
+        except Exception:
+            # Fallback if KDE fails
+            return ax.scatter(x, y, c=color, s=30, marker=marker, alpha=0.5, 
+                           label=label, zorder=zorder)
+    
+    # Create a 2x2 figure with increased spacing between rows and much wider plots
+    fig = plt.figure(figsize=(28, 13))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], width_ratios=[1.8, 1.8], hspace=0.4, wspace=0.1)
+    
+    # Plot 1: Rust vs Ground Truth (Top Left)
+    ax1 = fig.add_subplot(gs[0, 0])
+    
+    # Calculate MAE for Rust vs ground truth
+    rust_mae = np.mean(np.abs(df['final_probability'] - df['rust_prediction']))
+    
+    # Create Rust vs Truth scatter plot with model-specific colormap
+    rust_x = df['final_probability'].values
+    rust_y = df['rust_prediction'].values
+    
+    # Use direct colormap approach for better color consistency
+    from scipy.stats import gaussian_kde
+    xy = np.vstack([rust_x, rust_y])
+    try:
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x, y, density = rust_x[idx], rust_y[idx], density[idx]
+        rust_scatter = ax1.scatter(x, y, c=density, cmap=rust_cmap,
+                               s=30, marker='o', edgecolor='none',
+                               alpha=0.8, zorder=3, label='Rust vs Ground Truth')
+    except Exception:
+        # Fallback if KDE fails
+        rust_scatter = ax1.scatter(rust_x, rust_y, c=COLORS['rust'],
+                               s=30, marker='o', alpha=0.5, 
+                               label='Rust vs Ground Truth', zorder=3)
+    
+    # Add reference line and styling
+    ax1.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
+    ax1.set_title(f"Rust / gnomon vs. Ground Truth\nMAE = {rust_mae:.4f}", fontsize=16)
+    ax1.set_xlabel("True Probability", fontsize=14)
+    ax1.set_ylabel("Rust / gnomon Prediction", fontsize=14)
+    ax1.set_xlim(-0.05, 1.05)
+    ax1.set_ylim(-0.05, 1.05)
+    # Use a rectangular aspect ratio instead of square
+    ax1.set_box_aspect(0.6)  # Makes the plot wider than tall
+    ax1.grid(True, linestyle='--', alpha=0.3)
+    ax1.legend(loc='upper left')
+    
+    # Add colorbar
+    if hasattr(rust_scatter, 'get_cmap'):
+        cbar = fig.colorbar(rust_scatter, ax=ax1, shrink=0.8)
+        cbar.set_label('Density', rotation=270, labelpad=20)
+    
+    # Plot 2: Rust vs R (Top Right)
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    # Calculate metrics for Rust vs R
+    mae_rust_r = np.mean(np.abs(df['rust_prediction'] - df['r_prediction']))
+    
+    # Create scatter plot for Rust vs R using R's color
+    ax2.scatter(df['r_prediction'], df['rust_prediction'], 
+               c=COLORS['r'], s=30, marker='o', 
+               alpha=0.5, label='Rust vs R')
+    
+    # Add reference line and styling
+    ax2.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Agreement', zorder=4)
+    ax2.set_title(f"Rust / gnomon vs. R / mgcv\nMAE = {mae_rust_r:.4f}", fontsize=16)
+    ax2.set_xlabel("R / mgcv Prediction", fontsize=14)
+    ax2.set_ylabel("Rust / gnomon Prediction", fontsize=14)
+    ax2.set_xlim(-0.05, 1.05)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_box_aspect(0.6)  # Makes the plot wider than tall
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    ax2.legend(loc='upper left')
+    
+    # Plot 3: Rust vs PyGAM (Bottom Left)
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    # Calculate metrics for Rust vs PyGAM
+    mae_rust_pygam = np.mean(np.abs(df['rust_prediction'] - df['pygam_prediction']))
+    
+    # Create scatter plot for Rust vs PyGAM using PyGAM's color
+    ax3.scatter(df['pygam_prediction'], df['rust_prediction'], 
+               c=COLORS['pygam'], s=30, marker='o', 
+               alpha=0.5, label='Rust vs PyGAM')
+    
+    # Add reference line and styling
+    ax3.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Agreement', zorder=4)
+    ax3.set_title(f"Rust / gnomon vs. Python / PyGAM\nMAE = {mae_rust_pygam:.4f}", fontsize=16)
+    ax3.set_xlabel("Python / PyGAM Prediction", fontsize=14)
+    ax3.set_ylabel("Rust / gnomon Prediction", fontsize=14)
+    ax3.set_xlim(-0.05, 1.05)
+    ax3.set_ylim(-0.05, 1.05)
+    ax3.set_box_aspect(0.6)  # Makes the plot wider than tall
+    ax3.grid(True, linestyle='--', alpha=0.3)
+    ax3.legend(loc='upper left')
+    
+    # Plot 4: All Models vs Ground Truth (Bottom Right)
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Calculate model MAEs for legend
+    mae_values = {name: np.mean(np.abs(df['final_probability'] - df[model['predictions']]))
+                 for name, model in models.items()}
+    
+    # Add density-colored scatter plots for each model with consistent colormaps
+    from scipy.stats import gaussian_kde
+    
+    # R model
+    r_x = df['final_probability'].values
+    r_y = df['r_prediction'].values
+    try:
+        xy = np.vstack([r_x, r_y])
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x, y, density = r_x[idx], r_y[idx], density[idx]
+        ax4.scatter(x, y, c=density, cmap=r_cmap,
+                  s=25, marker='o', edgecolor='none', alpha=0.5, 
+                  label=f"R / mgcv (MAE={mae_values['R / mgcv']:.4f})")
+    except Exception:
+        ax4.scatter(r_x, r_y, c=COLORS['r'], s=25, marker='o', alpha=0.3,
+                  label=f"R / mgcv (MAE={mae_values['R / mgcv']:.4f})")
+    
+    # PyGAM model
+    pygam_x = df['final_probability'].values
+    pygam_y = df['pygam_prediction'].values
+    try:
+        xy = np.vstack([pygam_x, pygam_y])
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x, y, density = pygam_x[idx], pygam_y[idx], density[idx]
+        ax4.scatter(x, y, c=density, cmap=pygam_cmap,
+                  s=25, marker='o', edgecolor='none', alpha=0.5,
+                  label=f"PyGAM (MAE={mae_values['Python / PyGAM']:.4f})")
+    except Exception:
+        ax4.scatter(pygam_x, pygam_y, c=COLORS['pygam'], s=25, marker='o', alpha=0.3,
+                  label=f"PyGAM (MAE={mae_values['Python / PyGAM']:.4f})")
+    
+    # Make Rust more prominent
+    rust_x = df['final_probability'].values
+    rust_y = df['rust_prediction'].values
+    try:
+        xy = np.vstack([rust_x, rust_y])
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x, y, density = rust_x[idx], rust_y[idx], density[idx]
+        ax4.scatter(x, y, c=density, cmap=rust_cmap,
+                  s=30, marker='o', edgecolor='none', alpha=0.7, zorder=3,
+                  label=f"Rust / gnomon (MAE={mae_values['Rust / gnomon']:.4f})")
+    except Exception:
+        ax4.scatter(rust_x, rust_y, c=COLORS['rust'], s=30, marker='o', alpha=0.7, zorder=3,
+                  label=f"Rust / gnomon (MAE={mae_values['Rust / gnomon']:.4f})")
+    
+    # Add reference line and styling
+    ax4.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
+    ax4.set_title("All Models vs. Ground Truth\n(Rust highlighted)", fontsize=16)
+    ax4.set_xlabel("True Probability", fontsize=14)
+    ax4.set_ylabel("Model Predictions", fontsize=14)
+    ax4.set_xlim(-0.05, 1.05)
+    ax4.set_ylim(-0.05, 1.05)
+    ax4.set_box_aspect(0.6)  # Makes the plot wider than tall
+    ax4.grid(True, linestyle='--', alpha=0.3)
+    ax4.legend(loc='upper left')
+    
+    # Add overall title
+    fig.suptitle("Rust-Centered Model Comparisons", fontsize=22, y=0.98)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
 def plot_model_surfaces(test_df):
-    """Generates a 1x3 plot of model surfaces and the empirical test data surface."""
-    print("\n" + "#"*70); print("### PLOTTING LEARNED SURFACE COMPARISON ###"); print("#"*70)
+    """Generates model surface plots for all three models and empirical data."""
+    print("\n" + "#"*70); print("### PLOTTING MODEL SURFACES COMPARISON ###"); print("#"*70)
+    
+    # Define consistent colors across all visualizations
+    COLORS = {
+        'rust': '#2ca02c',      # Green for Rust
+        'r': '#1f77b4',         # Blue for R
+        'pygam': '#ff7f0e',     # Orange for PyGAM
+        'perfect': '#d62728',   # Red for decision boundaries
+        'grid': '#cccccc'       # Light gray for grids
+    }
+    
+    # Define custom colormaps for each model to ensure color consistency
+    from matplotlib.colors import LinearSegmentedColormap
+    
+    # Create custom colormaps with model-specific colors
+    r_cmap = LinearSegmentedColormap.from_list('r_cmap', ['#ffffff', COLORS['r']], N=100)
+    pygam_cmap = LinearSegmentedColormap.from_list('pygam_cmap', ['#ffffff', COLORS['pygam']], N=100)
+    rust_cmap = LinearSegmentedColormap.from_list('rust_cmap', ['#ffffff', COLORS['rust']], N=100)
+    
+    # For empirical data, use a neutral colormap
+    emp_cmap = 'viridis'
 
     # A. Dynamically calculate plot boundaries based on the test data range
     print(f"\n--- Dynamically calculating plot ranges from '{TEST_DATA_CSV.name}' ---")
@@ -159,37 +393,117 @@ def plot_model_surfaces(test_df):
     grid_csv_path = SCRIPT_DIR / 'temp_grid_data.csv'; grid_df.to_csv(grid_csv_path, index=False)
     grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
     r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
+    pygam_preds_path = SCRIPT_DIR / 'temp_pygam_surface_preds.csv'
     rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
 
     run_r_inference(grid_csv_path, r_preds_path)
+    run_python_inference(grid_csv_path, pygam_preds_path)
     run_rust_inference(grid_csv_path, grid_tsv_path, rust_preds_path)
 
     r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
+    pygam_preds = pd.read_csv(pygam_preds_path)['pygam_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
     rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-
-    # D. Create the 1x3 plot
-    print("\n--- Generating 1x3 Surface Plot ---")
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6), constrained_layout=True, sharex=True, sharey=True)
-    fig.suptitle("Comparison of Learned Surfaces vs. Empirical Test Data", fontsize=20)
-    levels = np.linspace(0, 1, 21)
-
-    axes[0].contourf(v1_grid, v2_grid, r_preds, levels=levels, cmap='viridis'); axes[0].set_title("R / mgcv Model", fontsize=14); axes[0].set_ylabel("variable_two")
-    axes[1].contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap='viridis'); axes[1].set_title("Rust / gnomon Model", fontsize=14)
-    cf = axes[2].hexbin(x=test_df['variable_one'], y=test_df['variable_two'], C=test_df['outcome'], gridsize=40, cmap='viridis', reduce_C_function=np.mean, vmin=0, vmax=1)
-    axes[2].set_title(f"Empirical Surface (Test Data)", fontsize=14)
-
-    for ax in axes: ax.set_xlabel("variable_one")
-    fig.colorbar(cf, ax=axes, orientation='vertical', shrink=0.8, label='P(outcome=1)')
+    
+    # Calculate differences between models, with Rust as the reference
+    rust_r_diff = np.abs(rust_preds - r_preds)
+    rust_pygam_diff = np.abs(rust_preds - pygam_preds)
+    max_diff = max(rust_r_diff.max(), rust_pygam_diff.max())
+    
+    # D. Create a 2x2 plot layout with all models and empirical data
+    print("\n--- Generating Model Surface Plots ---")
+    fig = plt.figure(figsize=(20, 18))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], hspace=0.4, wspace=0.2)
+    
+    # Model predictions in a clear layout
+    ax1 = fig.add_subplot(gs[0, 0])  # R model (top left)
+    ax2 = fig.add_subplot(gs[0, 1])  # PyGAM model (top right)
+    ax3 = fig.add_subplot(gs[1, 0])  # Rust model (bottom left)
+    ax4 = fig.add_subplot(gs[1, 1])  # Empirical data (bottom right)
+    
+    fig.suptitle("Model Surfaces Comparison", fontsize=24, y=0.98)
+    
+    # Define consistent colormaps for each model
+    from matplotlib.colors import LinearSegmentedColormap
+    
+    levels = np.linspace(0, 1, 31)  # Increase levels for smoother contours
+    
+    # Top left: R model
+    cf_r = ax1.contourf(v1_grid, v2_grid, r_preds, levels=levels, cmap=r_cmap, alpha=0.9)
+    ax1.contour(v1_grid, v2_grid, r_preds, levels=[0.25, 0.5, 0.75], colors='white', linewidths=1.0)
+    ax1.contour(v1_grid, v2_grid, r_preds, levels=[0.5], colors=COLORS['r'], linewidths=2.5)
+    ax1.set_title("R / mgcv Model Surface", fontsize=18, pad=10)
+    ax1.set_xlabel("variable_one", fontsize=14)
+    ax1.set_ylabel("variable_two", fontsize=14)
+    ax1.grid(color='white', linestyle=':', alpha=0.5)
+    fig.colorbar(cf_r, ax=ax1, orientation='vertical', shrink=0.8, 
+                label='Probability (R / mgcv)')
+    
+    # Top right: PyGAM model
+    cf_pygam = ax2.contourf(v1_grid, v2_grid, pygam_preds, levels=levels, cmap=pygam_cmap, alpha=0.9)
+    ax2.contour(v1_grid, v2_grid, pygam_preds, levels=[0.25, 0.5, 0.75], colors='white', linewidths=1.0)
+    ax2.contour(v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=COLORS['pygam'], linewidths=2.5)
+    ax2.set_title("Python / PyGAM Model Surface", fontsize=18, pad=10)
+    ax2.set_xlabel("variable_one", fontsize=14)
+    ax2.grid(color='white', linestyle=':', alpha=0.5)
+    fig.colorbar(cf_pygam, ax=ax2, orientation='vertical', shrink=0.8, 
+                label='Probability (Python / PyGAM)')
+    
+    # Bottom left: Rust model
+    cf_rust = ax3.contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap=rust_cmap, alpha=0.9)
+    ax3.contour(v1_grid, v2_grid, rust_preds, levels=[0.25, 0.5, 0.75], colors='white', linewidths=1.0)
+    ax3.contour(v1_grid, v2_grid, rust_preds, levels=[0.5], colors=COLORS['rust'], linewidths=2.5)
+    ax3.set_title("Rust / gnomon Model Surface", fontsize=18, pad=10)
+    ax3.set_xlabel("variable_one", fontsize=14)
+    ax3.set_ylabel("variable_two", fontsize=14)
+    ax3.grid(color='white', linestyle=':', alpha=0.5)
+    fig.colorbar(cf_rust, ax=ax3, orientation='vertical', shrink=0.8, 
+                label='Probability (Rust / gnomon)')
+    
+    # Bottom right: Empirical data with all decision boundaries
+    hb = ax4.hexbin(x=test_df['variable_one'], y=test_df['variable_two'], 
+                  C=test_df['outcome'], gridsize=40, cmap=emp_cmap,
+                  reduce_C_function=np.mean, mincnt=1, vmin=0, vmax=1,
+                  edgecolors='gray', linewidths=0.1)
+    
+    # Add all three decision boundaries with consistent colors and styles
+    r_line = ax4.contour(v1_grid, v2_grid, r_preds, levels=[0.5], colors=COLORS['r'], 
+                        linewidths=2.0, linestyles='-', alpha=0.9)
+    pygam_line = ax4.contour(v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=COLORS['pygam'], 
+                           linewidths=2.0, linestyles='-', alpha=0.9)
+    rust_line = ax4.contour(v1_grid, v2_grid, rust_preds, levels=[0.5], colors=COLORS['rust'], 
+                          linewidths=2.0, linestyles='-', alpha=0.9)
+    
+    # Create proxy artists for the legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color=COLORS['r'], lw=2, label='R / mgcv Decision Boundary'),
+        Line2D([0], [0], color=COLORS['pygam'], lw=2, label='Python / PyGAM Decision Boundary'),
+        Line2D([0], [0], color=COLORS['rust'], lw=2, label='Rust / gnomon Decision Boundary')
+    ]
+    
+    ax4.set_title("Empirical Data with All Decision Boundaries", fontsize=18, pad=10)
+    ax4.set_xlabel("variable_one", fontsize=14)
+    ax4.legend(handles=legend_elements, loc='upper right', fontsize=10)
+    
+    fig.colorbar(hb, ax=ax4, orientation='vertical', shrink=0.8, 
+                label='Probability (Mean outcome)')
+    
+    # Ensure all subplots share the same axes limits
+    for ax in [ax1, ax2, ax3, ax4]:
+        ax.set_xlim(v1_min, v1_max)
+        ax.set_ylim(v2_min, v2_max)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
     # E. Cleanup temporary files
-    grid_csv_path.unlink(); grid_tsv_path.unlink(); r_preds_path.unlink(); rust_preds_path.unlink();
+    grid_csv_path.unlink(); grid_tsv_path.unlink(); r_preds_path.unlink(); pygam_preds_path.unlink(); rust_preds_path.unlink();
 
 # --- 4. Main Execution Block ---
 
 def main():
     # --- 1. Check for required files ---
-    required_files = [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TEST_DATA_CSV]
+    required_files = [R_MODEL_PATH, PYGAM_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TEST_DATA_CSV]
     for f in required_files:
         if not f.is_file():
             print(f"FATAL ERROR: Required file not found: {f}")
@@ -202,12 +516,14 @@ def main():
 
     # --- 3. Run inference on the test data to get predictions ---
     run_r_inference(TEST_DATA_CSV, R_PREDICTIONS_CSV)
+    run_python_inference(TEST_DATA_CSV, PYGAM_PREDICTIONS_CSV)
     run_rust_inference(TEST_DATA_CSV, RUST_FORMATTED_INFERENCE_DATA_TSV, RUST_PREDICTIONS_CSV)
 
     # --- 4. Combine data and predictions ---
     r_preds_df = pd.read_csv(R_PREDICTIONS_CSV)
+    pygam_preds_df = pd.read_csv(PYGAM_PREDICTIONS_CSV)
     rust_preds_df = pd.read_csv(RUST_PREDICTIONS_CSV)
-    combined_df = pd.concat([test_df, r_preds_df, rust_preds_df], axis=1)
+    combined_df = pd.concat([test_df, r_preds_df, pygam_preds_df, rust_preds_df], axis=1)
 
     # --- 5. Report metrics and plot comparisons on test data ---
     print_performance_report(combined_df)
@@ -216,6 +532,7 @@ def main():
 
     # --- 6. Final cleanup ---
     R_PREDICTIONS_CSV.unlink()
+    PYGAM_PREDICTIONS_CSV.unlink()
     RUST_PREDICTIONS_CSV.unlink()
     RUST_FORMATTED_INFERENCE_DATA_TSV.unlink()
     print("\n--- Analysis script finished successfully. ---")
