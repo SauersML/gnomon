@@ -260,6 +260,8 @@ pub fn fit_model_for_fixed_rho(
     // Track the last linear system weights/working response used in the solve
     let mut last_weights_solve = weights.clone();
     let mut last_z_solve = z.clone();
+    // Track coefficient norm growth to detect divergence in unpenalized logistic fits
+    let mut prev_beta_norm: f64 = 0.0;
 
     for iter in 1..=config.max_iterations {
         last_iter = iter; // Update on every iteration
@@ -484,6 +486,96 @@ pub fn fit_model_for_fixed_rho(
                 max_abs_eta,
                 reparam_result: reparam_result.clone(),
             });
+        }
+
+        // Additional robust separation checks for unpenalized logistic models
+        let no_penalty = eb_transformed.nrows() == 0 && e_transformed.nrows() == 0;
+        if config.link_function == LinkFunction::Logit && no_penalty {
+            let eta_soft_threshold = 30.0; // softer threshold than 100 for unpenalized cases
+            let eps_sat = 1e-3;
+            let sat_frac = {
+                let n = mu.len() as f64;
+                let k = mu
+                    .iter()
+                    .filter(|&&m| m <= eps_sat || m >= 1.0 - eps_sat)
+                    .count() as f64;
+                if n > 0.0 { k / n } else { 0.0 }
+            };
+            // Beta divergence: large absolute norm or rapid growth
+            let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
+            let beta_grew_fast = prev_beta_norm > 0.0 && beta_norm > prev_beta_norm * 2.5;
+            let beta_too_large = beta_norm > 1e3;
+            let eta_too_large = max_abs_eta > eta_soft_threshold;
+            let probs_saturated = sat_frac > 0.95;
+            // Extremely low deviance per sample indicates near-perfect separation
+            let n_samples = y.len() as f64;
+            let dev_per_sample = if n_samples > 0.0 { last_deviance / n_samples } else { last_deviance };
+            let dev_tiny = dev_per_sample < 1e-2; // e.g., < 0.01 per sample
+
+            // Direct separation-by-order check: all positives have higher η than all negatives
+            let mut min_eta_pos = f64::INFINITY;
+            let mut max_eta_neg = f64::NEG_INFINITY;
+            let mut has_pos = false;
+            let mut has_neg = false;
+            for (i, &yi) in y.iter().enumerate() {
+                if yi > 0.5 {
+                    has_pos = true;
+                    let v = eta[i];
+                    if v < min_eta_pos { min_eta_pos = v; }
+                } else {
+                    has_neg = true;
+                    let v = eta[i];
+                    if v > max_eta_neg { max_eta_neg = v; }
+                }
+            }
+            let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
+
+            if eta_too_large || probs_saturated || dev_tiny || order_separated || (iter >= 3 && (beta_grew_fast || beta_too_large)) {
+                log::warn!(
+                    "P-IRLS instability (unpenalized Logit) at iter {}: max|eta|={:.2e}, sat_frac={:.3}, dev/n={:.3e}, order_sep={}, ||beta||={:.2e} (prev {:.2e})",
+                    iter, max_abs_eta, sat_frac, dev_per_sample, order_separated, beta_norm, prev_beta_norm
+                );
+
+                let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
+                    result.penalized_hessian.clone()
+                } else {
+                    log::warn!("No stable result saved, computing Hessian as fallback");
+                    let (result, _rank) = solve_penalized_least_squares(
+                        x_transformed.view(),
+                        z.view(),
+                        weights.view(),
+                        &eb_transformed,
+                        e_transformed,
+                        &s_from_e_precomputed,
+                        &mut workspace,
+                        y.view(),
+                        config.link_function,
+                    )?;
+                    result.penalized_hessian
+                };
+                let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+                let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+                ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+                return Ok(PirlsResult {
+                    beta_transformed: beta_transformed.clone(),
+                    penalized_hessian_transformed,
+                    stabilized_hessian_transformed,
+                    deviance: last_deviance,
+                    edf: if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 },
+                    stable_penalty_term,
+                    final_weights: weights.clone(),
+                    final_mu: mu.clone(),
+                    solve_weights: last_weights_solve.clone(),
+                    solve_working_response: last_z_solve.clone(),
+                    solve_mu: last_mu_solve.clone(),
+                    status: PirlsStatus::Unstable,
+                    iteration: iter,
+                    max_abs_eta,
+                    reparam_result: reparam_result.clone(),
+                });
+            }
+            // Update previous beta norm for next iteration
+            prev_beta_norm = beta_norm;
         }
 
         // Calculate the penalized deviance using the transformed penalty matrix
