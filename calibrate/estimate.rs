@@ -60,6 +60,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+const LAML_RIDGE: f64 = 1e-8;
+const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
+const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
+
 /// A comprehensive error type for the model estimation process.
 #[derive(Error, Debug)]
 pub enum EstimationError {
@@ -409,7 +413,7 @@ pub fn train_model(
     let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
         (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
             // Prefer asymmetric unless symmetric is significantly better (> 0.1% + small absolute margin)
-            *asym_cost <= *sym_cost * 1.001 + 1e-6
+            *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
         }
         (Some(_), None) => true,
         (None, Some(_)) => false,
@@ -713,7 +717,7 @@ pub fn train_model(
     };
 
     // Abort if the inner loop encountered repeated numerical failures
-    const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
+    // Use module-level constant
     if reml_state.consecutive_cost_error_count() >= MAX_CONSECUTIVE_INNER_ERRORS {
         let last_msg = reml_state
             .last_cost_error_string()
@@ -813,7 +817,7 @@ fn compute_fd_gradient(
 
     for i in 0..rho.len() {
         // Relative, scale-aware step per coordinate (central difference)
-        let h = 1e-4 * (1.0 + rho[i].abs());
+        let h = f64::cbrt(std::f64::EPSILON) * (1.0 + rho[i].abs()); // ~1e-5.3 scaled
 
         let mut rho_plus = rho.clone();
         rho_plus[i] += 0.5 * h;
@@ -1301,7 +1305,7 @@ pub mod internal {
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
-                    let phi = dp / (n - edf).max(1e-8);
+                    let phi = dp / (n - edf).max(LAML_RIDGE);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
@@ -1322,7 +1326,7 @@ pub mod internal {
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
-                            let ridge = 1e-8;
+                            let ridge = LAML_RIDGE;
                             eigenvalues
                                 .iter()
                                 .map(|&ev| (ev + ridge).max(ridge))
@@ -1377,7 +1381,7 @@ pub mod internal {
                                 .eigh(UPLO::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
-                            let ridge = 1e-8; // constant ridge for numeric safety
+                            let ridge = LAML_RIDGE; // constant ridge for numeric safety
                             let stabilized_log_det: f64 = eigenvalues
                                 .iter()
                                 .map(|&ev| (ev + ridge).max(ridge))
@@ -1435,7 +1439,7 @@ pub mod internal {
                     let mut h_eff = pirls_result.penalized_hessian_transformed.clone();
                     if h_eff.cholesky(UPLO::Lower).is_err() {
                         let p_dim = h_eff.nrows();
-                        let c: f64 = 1e-8;
+                        let c: f64 = LAML_RIDGE;
                         for i in 0..p_dim {
                             h_eff[[i, i]] += c;
                         }
@@ -1466,17 +1470,17 @@ pub mod internal {
         }
 
         /// The state-aware closure method for the BFGS optimizer.
-        /// Accepts unconstrained parameters `z`, maps to bounded `rho = 15*tanh(z)`.
-        pub fn cost_and_grad(&self, rho_bfgs: &Array1<f64>) -> (f64, Array1<f64>) {
+        /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND*tanh(z)`.
+        pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+            const RHO_BOUND: f64 = 15.0;
             let eval_num = {
                 let mut count = self.eval_count.borrow_mut();
                 *count += 1;
                 *count
             };
 
-            // Interpret input as unconstrained z; map to bounded rho via tanh
-            let z = rho_bfgs;
-            let rho = z.mapv(|v| if v.is_finite() { 15.0 * v.tanh() } else { 0.0 });
+            // Map from unbounded z to bounded rho via tanh
+            let rho = z.mapv(|v| if v.is_finite() { RHO_BOUND * v.tanh() } else { 0.0 });
 
             // Attempt to compute the cost and gradient.
             let cost_result = self.compute_cost(&rho);
@@ -1487,8 +1491,8 @@ pub mod internal {
                     *self.consecutive_cost_errors.borrow_mut() = 0;
                     match self.compute_gradient(&rho) {
                         Ok(grad) => {
-                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = 15*(1 - tanh(z)^2)
-                            let jac = z.mapv(|v| 15.0 * (1.0 - v.tanh().powi(2)));
+                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = RHO_BOUND*(1 - tanh(z)^2)
+                            let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
                             let grad_z = &grad * &jac;
                             let grad_norm = grad_z.dot(&grad_z).sqrt();
 
@@ -1782,7 +1786,7 @@ pub mod internal {
                             lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
                     }
                     let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
-                    let scale = dp / (n - edf).max(1e-8);
+                    let scale = dp / (n - edf).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
@@ -1857,7 +1861,7 @@ pub mod internal {
                     let cholesky_ok = h_eff.cholesky(UPLO::Lower).is_ok();
                     if !cholesky_ok {
                         let p_dim = h_eff.nrows();
-                        let c: f64 = 1e-8;
+                        let c: f64 = LAML_RIDGE;
                         for i in 0..p_dim {
                             h_eff[[i, i]] += c;
                         }
@@ -4789,7 +4793,7 @@ pub mod internal {
                 };
 
                 // Make sure gradient is significant enough to test
-                if grad_start[0].abs() < 1e-8 {
+                if grad_start[0].abs() < LAML_RIDGE {
                     println!(
                         "Warning: Gradient too small to test descent property at starting point"
                     );
@@ -4864,7 +4868,7 @@ pub mod internal {
                     println!("Numerical gradient:  {:.8}", numerical_grad);
 
                     // For a high-level correctness check, just verify sign consistency
-                    if numerical_grad.abs() > 1e-8 && grad_start[0].abs() > 1e-8 {
+                    if numerical_grad.abs() > LAML_RIDGE && grad_start[0].abs() > LAML_RIDGE {
                         let signs_match = numerical_grad.signum() == grad_start[0].signum();
                         println!("Gradient signs match: {}", signs_match);
                     }
@@ -5026,7 +5030,7 @@ pub mod internal {
             let grad_norm = grad_mid.dot(&grad_mid).sqrt();
 
             // Use a very conservative step size for numerical stability
-            let step_size = 1e-8 / grad_norm.max(1.0);
+            let step_size = LAML_RIDGE / grad_norm.max(1.0);
             let rho_step = &rho_mid - step_size * &grad_mid;
             let cost_step = compute_cost_safe(&rho_step);
 
@@ -5894,7 +5898,7 @@ mod gradient_validation_tests {
 
         // Compare with a tight relative tolerance, as the test is now valid.
         for k in 0..layout.num_penalties {
-            let denom = numeric[k].abs().max(analytic[k].abs()).max(1e-8);
+            let denom = numeric[k].abs().max(analytic[k].abs()).max(LAML_RIDGE);
             let rel_err = (analytic[k] - numeric[k]).abs() / denom;
             assert!(
                 rel_err < 0.25, // A more reasonable tolerance for this specific test
