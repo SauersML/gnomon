@@ -28,25 +28,19 @@ ahash = "0.8.12"
 clap = { version = "4.5.46", features = ["derive"] }
 memmap2 = "0.9.8"
 rayon = "1.11.0"
-thread_local = "1.1.9"
 crossbeam-queue = "0.3.12"
-sysinfo = "0.35.2"
 tokio = { version = "1.47.1", features = ["sync", "rt-multi-thread", "macros"] }
 num_cpus = "1.17.0"
-cache-size = "0.7.0"
 ryu = "1.0.20"
-nonmax = "0.5.5"
 futures = "0.3.31"
 itertools = "0.14.0"
 crossbeam-channel = "0.5.15"
-lexical-core = "1.0.5"
 memchr = "2.7.5"
 natord = "1.0.9"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 dwldutil = "2.0.4"
 indicatif = "0.17"
 flate2 = "1.1.2"
-dashmap = "6.1.0"
 ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
 ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-static"] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -55,7 +49,6 @@ toml = "0.8.23"
 polars = { version = "0.50.0", features = ["csv", "ndarray", "fmt", "lazy"] }
 wolfe_bfgs = { git = "https://github.com/SauersML/wolfe_bfgs" }
 log = "0.4.27"
-env_logger = "0.10.2"
 faer = "0.22.6"
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
