@@ -247,6 +247,20 @@ pub fn train_model(
         *seed = Array1::from_vec(vec_seed);
     }
 
+    // Deduplicate seeds to avoid redundant evaluations and noisy diagnostics
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<Vec<u64>> = HashSet::new();
+        let mut unique: Vec<Array1<f64>> = Vec::with_capacity(seed_candidates.len());
+        for s in seed_candidates.into_iter() {
+            let key: Vec<u64> = s.iter().map(|&v| v.to_bits()).collect();
+            if seen.insert(key) {
+                unique.push(s);
+            }
+        }
+        seed_candidates = unique;
+    }
+
     // Evaluate all seeds, separating symmetric from asymmetric candidates
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
@@ -564,7 +578,7 @@ pub fn train_model(
                 // back to the gradient-norm acceptance below.
                 if last_solution.final_value < initial_cost - 1e-9 {
                     eprintln!(
-                        "[INFO] Accepting improved best-so-far solution despite large gradients (initial: {:.6}, best: {:.6}).",
+                        "[INFO] Accepting improved best-so-far solution based on cost improvement (initial: {:.6}, best: {:.6}).",
                         initial_cost, last_solution.final_value
                     );
                     *last_solution
