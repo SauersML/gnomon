@@ -53,7 +53,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.16"
 toml = "0.8.23"
 polars = { version = "0.50.0", features = ["csv", "ndarray", "fmt", "lazy"] }
-stable-intrinsics = "0.1.1"
 wolfe_bfgs = { git = "https://github.com/SauersML/wolfe_bfgs" }
 log = "0.4.27"
 env_logger = "0.10.2"
