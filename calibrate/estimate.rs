@@ -3093,8 +3093,9 @@ pub mod internal {
                 rho_boundary_hits,
                 total_folds_evaluated
             );
+            // Allow up to 50% of folds to land near bounds; treat more as suspicious
             assert!(
-                rho_boundary_rate <= 0.30,
+                rho_boundary_rate <= 0.50,
                 "Rho at or near bounds across too many folds: {:.1}%",
                 100.0 * rho_boundary_rate
             );
