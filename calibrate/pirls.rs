@@ -540,7 +540,7 @@ pub fn fit_model_for_fixed_rho(
                     result.penalized_hessian.clone()
                 } else {
                     log::warn!("No stable result saved, computing Hessian as fallback");
-                    let (result, rank) = solve_penalized_least_squares(
+                    let (result, _rank) = solve_penalized_least_squares(
                         x_transformed.view(),
                         z.view(),
                         weights.view(),
@@ -3268,7 +3268,7 @@ fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationErro
     // Add a small constant ridge and retry, escalating a few times if necessary
     let n = hess.nrows();
     let mut delta = 1e-8_f64;
-    for try_num in 0..5 {
+    for _try_num in 0..5 {
         for i in 0..n {
             hess[[i, i]] += delta;
         }
