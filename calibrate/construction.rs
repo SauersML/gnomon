@@ -1436,7 +1436,8 @@ pub fn stable_reparameterization(
         .eigh(UPLO::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
     // Use a small constant ridge epsilon for smoothed logdet/inverse; keep it lambda-independent
-    let ridge_eps: f64 = 1e-8;
+    // keep for possible future smoothing: not used when using pseudo-determinant
+    // let _ridge_eps: f64 = 1e-8;
 
     // Determine effective rank (for e_transformed shape) using raw spectrum and relative tolerance
     let max_eigenval = s_eigenvalues_raw.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -1466,28 +1467,30 @@ pub fn stable_reparameterization(
     // This represents the true penalty strength and changes with lambda values
     let e_transformed = e_matrix.t().to_owned();
 
-    // Step 4: Calculate log-determinant from the eigenvalues we already computed
-    // Smooth log-determinant using constant ridge on the spectrum
+    // Step 4: Calculate log-pseudo-determinant from the positive eigenvalues
     let log_det: f64 = s_eigenvalues_raw
         .iter()
-        .map(|&ev| (ev + ridge_eps).ln())
+        .filter(|&&ev| ev > tolerance)
+        .map(|&ev| ev.ln())
         .sum();
 
     // Step 5: Calculate derivatives using the correct transformed matrices
     let mut det1 = Array1::zeros(lambdas.len());
 
-    // Compute smoothed inverse (S_lambda + ridge_eps I)^{-1}
+    // Compute pseudo-inverse S_lambda^+ using only eigenvalues above tolerance
     let mut s_plus = Array2::zeros((p, p));
     for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
-        let v_i = s_eigenvectors.column(i);
-        let outer_product = v_i
-            .to_owned()
-            .insert_axis(Axis(1))
-            .dot(&v_i.to_owned().insert_axis(Axis(0)));
-        s_plus.scaled_add(1.0 / (eigenval + ridge_eps), &outer_product);
+        if eigenval > tolerance {
+            let v_i = s_eigenvectors.column(i);
+            let outer_product = v_i
+                .to_owned()
+                .insert_axis(Axis(1))
+                .dot(&v_i.to_owned().insert_axis(Axis(0)));
+            s_plus.scaled_add(1.0 / eigenval, &outer_product);
+        }
     }
 
-    // Calculate derivatives: det1[k] = λ_k * tr((S_λ+ridge I)^{-1} S_k_transformed)
+    // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
     for k in 0..lambdas.len() {
         let s_k_transformed = final_rs_transformed[k].t().dot(&final_rs_transformed[k]);
         let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
