@@ -36,7 +36,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and Linalg
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Eigh, Solve};
+use ndarray_linalg::Solve;
 // faer: high-performance dense solvers
 use faer::Mat as FaerMat;
 use faer::Side;
