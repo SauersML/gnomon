@@ -166,6 +166,62 @@ pub fn train_model(
         config,
     )?;
 
+    // Fast-path: if there are no penalties, skip outer REML/BFGS optimization entirely.
+    // Fit a single unpenalized model via P-IRLS and finalize.
+    if layout.num_penalties == 0 {
+        eprintln!("\n[STAGE 2/3] Skipping smoothing parameter optimization (no penalties)...");
+        eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
+
+        let zero_rho = Array1::<f64>::zeros(0);
+        let final_fit = pirls::fit_model_for_fixed_rho(
+            zero_rho.view(),
+            reml_state.x(),
+            reml_state.y(),
+            reml_state.weights(),
+            reml_state.rs_list_ref(),
+            &layout,
+            config,
+        )?;
+
+        let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
+        let mapped_coefficients =
+            crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+
+        let mut config_with_constraints = config.clone();
+        config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
+        config_with_constraints.knot_vectors = knot_vectors;
+        config_with_constraints.range_transforms = range_transforms;
+        config_with_constraints.interaction_centering_means = interaction_centering_means;
+        config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+        config_with_constraints.pc_null_transforms = pc_null_transforms;
+
+        // Build PHC hull as in the standard path
+        let hull_opt = {
+            let n = data.p.len();
+            let d = 1 + config.pc_configs.len();
+            let mut x_raw = ndarray::Array2::zeros((n, d));
+            x_raw.column_mut(0).assign(&data.p);
+            if d > 1 {
+                let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+                x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+            }
+            match build_peeled_hull(&x_raw, 3) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    println!("PHC hull construction skipped: {}", e);
+                    None
+                }
+            }
+        };
+
+        return Ok(TrainedModel {
+            config: config_with_constraints,
+            coefficients: mapped_coefficients,
+            lambdas: vec![],
+            hull: hull_opt,
+        });
+    }
+
     // Helper: map bounded rho -> unconstrained z
     fn atanh_clamped(x: f64) -> f64 {
         0.5 * ((1.0 + x) / (1.0 - x)).ln()
@@ -1355,18 +1411,24 @@ pub mod internal {
                         laml, -laml
                     );
 
-                    // Diagnostics: effective degrees of freedom via tr(H^{-1} S_λ)
-                    // Compute in the transformed basis for consistency (H and S_λ are available)
+                    // Diagnostics: effective degrees of freedom via tr(H_eff^{-1} S_λ)
+                    // Use the SAME effective Hessian as in log|H| (H or H + cI)
                     let s_lambda_transformed = &pirls_result.reparam_result.s_transformed;
-                    let hessian_t = &pirls_result.stabilized_hessian_transformed;
+                    let mut h_eff = pirls_result.penalized_hessian_transformed.clone();
+                    if h_eff.cholesky(UPLO::Lower).is_err() {
+                        let p_dim = h_eff.nrows();
+                        let c: f64 = 1e-8;
+                        for i in 0..p_dim {
+                            h_eff[[i, i]] += c;
+                        }
+                    }
                     let mut trace_h_inv_s_lambda = 0.0;
                     for j in 0..s_lambda_transformed.ncols() {
                         let s_col = s_lambda_transformed.column(j);
                         if s_col.iter().all(|&x| x == 0.0) {
                             continue;
                         }
-                        if let Ok(h_inv_col) = internal::robust_solve(hessian_t, &s_col.to_owned())
-                        {
+                        if let Ok(h_inv_col) = internal::robust_solve(&h_eff, &s_col.to_owned()) {
                             trace_h_inv_s_lambda += h_inv_col[j];
                         }
                     }
@@ -1628,6 +1690,10 @@ pub mod internal {
             p: &Array1<f64>,
             pirls_result: &PirlsResult,
         ) -> Result<Array1<f64>, EstimationError> {
+            // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
+            if p.len() == 0 {
+                return Ok(Array1::zeros(0));
+            }
             // --- Extract stable transformed quantities ---
             let beta_transformed = &pirls_result.beta_transformed;
             let hessian_transformed = &pirls_result.penalized_hessian_transformed;
@@ -1839,7 +1905,7 @@ pub mod internal {
                     // --- Release-level stationarity check against the accepted PIRLS system ---
                     // Verify: X^T W_solve (X beta - z_solve) + S_lambda beta ≈ 0
                     // Use the already computed s_lambda_beta_transformed to avoid forming S_lambda.
-                    {
+                    if p.len() > 0 {
                         let z_solve = &pirls_result.solve_working_response;
                         let w_solve = &pirls_result.solve_weights;
                         let tmp_eta = x_transformed.dot(beta_transformed);
