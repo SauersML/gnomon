@@ -8,14 +8,14 @@ a comprehensive set of analysis plots.
 import subprocess
 import pandas as pd
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 import os
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, confusion_matrix
-from sklearn.calibration import calibration_curve
+from sklearn.metrics import roc_auc_score, brier_score_loss, confusion_matrix, log_loss, average_precision_score
 
 # --- Path Configuration ---
 # Get the absolute path of the directory containing this script
@@ -287,7 +287,7 @@ def bin_stats(y, p, edges):
             continue
         conf = p[idx].mean()
         acc  = y[idx].mean()
-        k = int(round(acc*n_b))  # Number of positive examples in bin
+        k = int(y[idx].sum())  # Exact count of positives in bin
         lo, hi = wilson_ci(k, n_b)
         rows.append({
             'bin': b, 'left': edges[b], 'right': edges[b+1], 'n': n_b,
@@ -312,6 +312,151 @@ def ici_isotonic(y_true, y_prob):
     return float(np.mean(np.abs(m - p)))
 
 
+def ece_rq_shared_edges(preds_dict, y_true, bin_counts=(10,20,40), repeats=50, min_per_bin=20, rng=None):
+    """Calculate randomized quantile ECE using shared bin edges across all models.
+    
+    This ensures that all models are evaluated on the exact same bin edges,
+    making the ECE values strictly comparable across models.
+    
+    Args:
+        preds_dict: Dictionary of model_name -> predicted_probabilities
+        y_true: True binary labels
+        bin_counts: Tuple of bin counts to try for multi-resolution averaging
+        repeats: Number of random offsets per bin count
+        min_per_bin: Minimum examples per bin (auto-reduces bin count if needed)
+        rng: Random number generator or seed
+        
+    Returns:
+        Dictionary of model_name -> {'ece_mean': float, 'ece_std': float}
+    """
+    rng = np.random.default_rng(rng)
+    y, _ = _prep_vec(y_true, next(iter(preds_dict.values())))
+    
+    # Pool predictions for edges
+    pooled = np.concatenate([_prep_vec(y_true, p)[1] for p in preds_dict.values()])
+    results = {}
+    
+    # Pre-generate all edge sets from pooled predictions
+    edge_sets = []
+    for M in bin_counts:
+        M_eff = min(M, max(1, len(y)//max(1, min_per_bin)))
+        if M_eff < 2:
+            edge_sets.append([(None, M_eff)])  # marker for degenerate case
+            continue
+        sets_M = []
+        for _ in range(repeats):
+            delta = rng.uniform(0, 1.0/M_eff)
+            qs = (delta + np.arange(M_eff+1)/M_eff).clip(0,1)
+            edges = np.quantile(pooled, qs)
+            edges[0], edges[-1] = 0.0, 1.0
+            edges = np.unique(edges)
+            sets_M.append((edges, M_eff))
+        edge_sets.append(sets_M)
+
+    # Evaluate each model on the same edge sets
+    for name, p_raw in preds_dict.items():
+        y_m, p_m = _prep_vec(y_true, p_raw)
+        eces = []
+        for sets_M in edge_sets:
+            for edges, M_eff in sets_M:
+                if edges is None:  # degenerate case
+                    eces.append(abs(y_m.mean() - p_m.mean()))
+                else:
+                    eces.append(_ece_from_edges(y_m, p_m, edges))
+        eces = np.array(eces, dtype=float)
+        results[name] = {
+            'ece_mean': float(np.mean(eces)),
+            'ece_std': float(np.std(eces, ddof=1)) if len(eces) > 1 else 0.0
+        }
+    return results
+
+
+def ece_rq_bootstrap_ci(y_true, y_prob, n_boot=500, alpha=0.05, rng=None):
+    """Calculate bootstrap confidence intervals for randomized quantile ECE.
+    
+    This measures sampling uncertainty in the ECE estimate by bootstrapping
+    the data and averaging randomized-quantile ECE for each bootstrap sample.
+    
+    Args:
+        y_true: True binary labels
+        y_prob: Predicted probabilities
+        n_boot: Number of bootstrap samples
+        alpha: Alpha level for confidence interval (e.g., 0.05 for 95% CI)
+        rng: Random number generator or seed
+        
+    Returns:
+        Tuple of (mean_ece, lower_ci, upper_ci)
+    """
+    rng = np.random.default_rng(rng)
+    y, p = _prep_vec(y_true, y_prob)
+    n = len(y)
+    stats = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)  # Bootstrap sampling with replacement
+        e = ece_randomized_quantile(
+            y[idx], p[idx], 
+            bin_counts=(10,20,40), repeats=30, min_per_bin=20, 
+            rng=rng.integers(1<<32)
+        )['ece_mean']
+        stats.append(e)
+    stats = np.array(stats, dtype=float)
+    stats = stats[~np.isnan(stats)]  # Remove NaNs
+    if len(stats) == 0:
+        return (np.nan, np.nan, np.nan)
+    lo, hi = np.quantile(stats, [alpha/2, 1-alpha/2])
+    return (float(np.mean(stats)), float(lo), float(hi))
+
+
+def brier_decomposition(y_true, y_prob, n_bins=20):
+    """Decompose Brier score into reliability, resolution, and uncertainty components.
+    
+    Args:
+        y_true: True binary labels
+        y_prob: Predicted probabilities
+        n_bins: Number of bins for grouping predictions
+        
+    Returns:
+        Tuple of (reliability, resolution, uncertainty)
+    """
+    y, p = _prep_vec(y_true, y_prob)
+    
+    # Use quantile binning for more balanced bins
+    qs = np.linspace(0, 1, n_bins+1)
+    edges = np.quantile(p, qs)
+    edges[0], edges[-1] = 0.0, 1.0
+    edges = np.unique(edges)
+    
+    ids = np.digitize(p, edges, right=True) - 1
+    ids = np.clip(ids, 0, len(edges)-2)
+    
+    # Overall mean outcome (prevalence)
+    p_bar = y.mean()
+    reliability = 0.0
+    resolution = 0.0
+    
+    for b in range(len(edges)-1):
+        idx = (ids == b)
+        n_b = idx.sum()
+        if n_b == 0:
+            continue
+        
+        # Mean prediction and outcome in this bin
+        conf = p[idx].mean()
+        acc = y[idx].mean()
+        
+        # Bin weight
+        w = n_b/len(y)
+        
+        # Accumulate components
+        reliability += w * (conf - acc)**2     # Squared calibration error in bin
+        resolution += w * (acc - p_bar)**2     # How far bin's outcomes deviate from overall mean
+    
+    # Inherent uncertainty in the data
+    uncertainty = p_bar * (1 - p_bar)
+    
+    return reliability, resolution, uncertainty
+
+
 def generate_performance_report(df_results):
     """Calculates and prints a side-by-side comparison of model metrics."""
     y_true = df_results['phenotype']
@@ -327,17 +472,19 @@ def generate_performance_report(df_results):
     print("      Model Performance Comparison on Test Set")
     print("="*60)
 
-    print("\n[Discrimination: AUC (Area Under ROC Curve)]")
-    print("Higher is better. Measures ability to distinguish classes.")
+    print("\n[Discrimination: AUC (Area Under ROC Curve) & PR-AUC]")
+    print("Higher is better. ROC-AUC for overall discrimination, PR-AUC for imbalanced data.")
     for name, y_prob in models.items():
         auc = roc_auc_score(y_true, y_prob)
-        print(f"  - {name:<28}: {auc:.4f}")
+        pr_auc_val = average_precision_score(y_true, y_prob)
+        print(f"  - {name:<28}: AUC={auc:.4f} | PR-AUC={pr_auc_val:.4f}")
 
-    print("\n[Probabilistic Accuracy: Brier Score]")
-    print("Lower is better. Measures accuracy of the predicted probabilities.")
+    print("\n[Probabilistic Accuracy: Brier Score & Log Loss]")
+    print("Lower is better. Brier for squared error, Log Loss for likelihood-based assessment.")
     for name, y_prob in models.items():
         brier = brier_score_loss(y_true, y_prob)
-        print(f"  - {name:<28}: {brier:.4f}")
+        logloss = log_loss(y_true, np.clip(y_prob, _EPS, 1-_EPS))
+        print(f"  - {name:<28}: Brier={brier:.4f} | LogLoss={logloss:.4f}")
 
     print("\n[Fit: Nagelkerke's R-squared]")
     print("Higher is better (0-1). Likelihood-based, common in PGS literature.")
@@ -352,22 +499,39 @@ def generate_performance_report(df_results):
         print(f"  - {name:<28}: {r2_t:.4f}")
 
     print("\n[Calibration: Expected Calibration Error (ECE)]")
-    print("Lower is better. Mass-weighted; randomized-quantile for stability.")
+    print("Lower is better. Mass-weighted; shared-edges for fair comparison.")
+    
+    # Calculate shared-edges ECE across all models (strictly comparable)
+    shared_ece = ece_rq_shared_edges(models, y_true, 
+                                   bin_counts=(10, 20, 40),
+                                   repeats=50, min_per_bin=20, rng=123)
+    
+    # Add bootstrap CI for GAM model
+    gam_name = "GAM (gnomon)"
+    mean_e, lo_e, hi_e = ece_rq_bootstrap_ci(y_true, models[gam_name], 
+                                          n_boot=200, alpha=0.05, rng=123)
+    
     for name, y_prob in models.items():
-        # Calculate improved ECE metrics
+        # Calculate individual metrics
         ece_q = ece_quantile(y_true, y_prob, n_bins=20)
-        ece_rq = ece_randomized_quantile(
-            y_true, y_prob, 
-            bin_counts=(10, 20, 40), 
-            repeats=50, 
-            min_per_bin=20, 
-            rng=123
-        )
-        # Calculate bin-free ICI
         ici = ici_isotonic(y_true, y_prob)
+        shared_result = shared_ece[name]
         
-        # Print both standard quantile ECE and randomized version with SD
-        print(f"  - {name:<28}: ECE_q20={ece_q:.4f} | ECE_rq={ece_rq['ece_mean']:.4f} ±{ece_rq['ece_std']:.4f} | ICI={ici:.4f}")
+        # Print metrics
+        print(f"  - {name:<28}: ECE_q20={ece_q:.4f} | ECE_shared={shared_result['ece_mean']:.4f} ±{shared_result['ece_std']:.4f} | ICI={ici:.4f}")
+        
+        # Add bootstrap CI for GAM
+        if name == gam_name:
+            print(f"      Bootstrap 95% CI for {name}: [{lo_e:.4f}, {hi_e:.4f}]")
+            
+    # Add Brier decomposition
+    print("\n[Brier Score Decomposition]")
+    print("reliability ↓, resolution ↑, uncertainty (data)")
+    for name, y_prob in models.items():
+        rel, res, unc = brier_decomposition(y_true, y_prob, n_bins=20)
+        brier = brier_score_loss(y_true, y_prob)
+        # Verify: brier ≈ rel - res + unc
+        print(f"  - {name:<28}: rel={rel:.4f}, res={res:.4f}, unc={unc:.4f} (brier={brier:.4f})")
 
     print("\n[Confusion Matrices (at threshold=0.5)]")
     for name, y_prob in models.items():
@@ -438,15 +602,16 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
         # Calculate bin statistics with Wilson CIs
         dfb = bin_stats(y_true, p, edges)
         
-        # Calculate randomized quantile ECE for label
+        # Calculate metrics for label
         ece_rq = ece_randomized_quantile(y_true, p, bin_counts=(10,20,40), repeats=50, rng=123)
+        ici = ici_isotonic(y_true, p)
         
         # Plot with error bars
         ax3.errorbar(
             dfb['conf'], dfb['acc'], 
             yerr=[dfb['acc']-dfb['lo'], dfb['hi']-dfb['acc']],
             fmt='o-', capsize=3, lw=1.5, 
-            label=f"{name} (ECE = {ece_rq['ece_mean']:.3f})", 
+            label=f"{name} (ECE={ece_rq['ece_mean']:.3f}, ICI={ici:.3f})", 
             color=colors[name], 
             zorder=zord[name]
         )
@@ -485,12 +650,33 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     ax4.grid(True, linestyle='--', alpha=0.6)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    print("\nPlot generated. Close the plot window to finish the script.")
-    plt.show()
+    
+    # Save or show plot based on environment settings
+    if save_plots:
+        output_file = output_dir / "gam_analysis.png"
+        plt.savefig(output_file, dpi=150)
+        print(f"\nPlot saved to {output_file}")
+    else:
+        print("\nPlot generated. Close the plot window to finish the script.")
+        plt.show()
 
 
 def main():
     """Main function to run the end-to-end simulation and plotting."""
+    # Check if running in a headless environment and set appropriate backend
+    # This allows the script to run on servers without a display
+    try:
+        if 'DISPLAY' not in os.environ or not os.environ['DISPLAY']:
+            print("Running in headless mode. Setting non-interactive backend.")
+            matplotlib.use('Agg')
+    except Exception as e:
+        print(f"Note: {e}. Will attempt to use default backend.")
+        
+    # Set default figure format and output path for saved plots
+    output_dir = Path(os.environ.get('PLOT_OUTPUT_DIR', './'))
+    output_dir.mkdir(exist_ok=True)
+    save_plots = os.environ.get('SAVE_PLOTS', 'false').lower() in ('true', '1', 't')
+        
     try:
         print(f"Project Root Detected: {PROJECT_ROOT}")
         build_rust_project()
