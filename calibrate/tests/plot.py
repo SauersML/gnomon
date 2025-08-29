@@ -8,14 +8,22 @@ a comprehensive set of analysis plots.
 import subprocess
 import pandas as pd
 import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-from pathlib import Path
-import sys
 import os
+import sys
+from pathlib import Path
+import platform
+
+# Configure matplotlib backend BEFORE importing pyplot
+import matplotlib
+if 'DISPLAY' not in os.environ or not os.environ['DISPLAY']:
+    print("Running in headless mode. Setting non-interactive backend.")
+    matplotlib.use('Agg')  # Must happen before importing pyplot
+
+import matplotlib.pyplot as plt
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, confusion_matrix, log_loss, average_precision_score
+from sklearn.metrics import brier_score_loss, confusion_matrix
+from sklearn.isotonic import IsotonicRegression
 
 # --- Path Configuration ---
 # Get the absolute path of the directory containing this script
@@ -26,7 +34,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 
 # Define all paths relative to the project root
-EXECUTABLE_NAME = "gnomon"
+EXECUTABLE_NAME = "gnomon.exe" if platform.system().lower().startswith("win") else "gnomon"
 EXECUTABLE_PATH = WORKSPACE_ROOT / "target" / "release" / EXECUTABLE_NAME
 MODEL_PATH = PROJECT_ROOT / "model.toml"
 PREDICTIONS_PATH = PROJECT_ROOT / "predictions.tsv"  # The fixed output file for the tool
@@ -138,23 +146,24 @@ def tjurs_r2(y_true, y_prob):
 
 def nagelkerkes_r2(y_true, y_prob):
     """Calculates Nagelkerke's Pseudo R-squared."""
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    epsilon = 1e-15
-    y_prob = np.clip(y_prob, epsilon, 1 - epsilon)
-
+    y_true = np.asarray(y_true, float)
+    y_prob = np.clip(np.asarray(y_prob, float), 1e-15, 1 - 1e-15)
+    
     # Log-likelihood of the model with only an intercept (null model)
     p_mean = np.mean(y_true)
+    if p_mean == 0.0 or p_mean == 1.0:
+        return np.nan  # NaN is more honest than 0.0 for this edge case
+    
     log_likelihood_null = np.sum(y_true * np.log(p_mean) + (1 - y_true) * np.log(1 - p_mean))
-
+    
     # Log-likelihood of the full model
     log_likelihood_model = np.sum(y_true * np.log(y_prob) + (1 - y_true) * np.log(1 - y_prob))
-
+    
     n = len(y_true)
     r2_cs = 1 - np.exp((2/n) * (log_likelihood_null - log_likelihood_model))
     max_r2_cs = 1 - np.exp((2/n) * log_likelihood_null)
     
-    return r2_cs / max_r2_cs if max_r2_cs > 0 else 0.0
+    return r2_cs / max_r2_cs if max_r2_cs > 0 else np.nan
 
 
 # --- Robust Calibration Metrics ---
@@ -168,6 +177,50 @@ def _prep_vec(y, p):
     p = pd.Series(p).astype(float).clip(_EPS, 1-_EPS)
     m = (~y.isna()) & (~p.isna())
     return y[m].values, p[m].values
+
+def safe_auc(y_true, y_prob):
+    """Safely calculate AUC with proper edge case handling."""
+    y, p = _prep_vec(y_true, y_prob)
+    if len(np.unique(y)) < 2:  # Need both classes for ROC
+        return np.nan
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(y, p)
+
+def safe_pr_auc(y_true, y_prob):
+    """Safely calculate PR-AUC with proper edge case handling."""
+    y, p = _prep_vec(y_true, y_prob)
+    if (y==1).sum() == 0 or (y==0).sum() == 0:  # Need both classes
+        return np.nan
+    from sklearn.metrics import average_precision_score
+    return average_precision_score(y, p)
+
+def safe_logloss(y_true, y_prob):
+    """Safely calculate log loss with proper edge case handling."""
+    y, p = _prep_vec(y_true, y_prob)
+    if len(y) == 0:
+        return np.nan
+    from sklearn.metrics import log_loss
+    return log_loss(y, p)
+
+def best_threshold_youden(y_true, y_prob):
+    """Find the optimal threshold that maximizes Youden's J statistic (sensitivity + specificity - 1).
+    
+    Args:
+        y_true: True binary labels
+        y_prob: Predicted probabilities
+        
+    Returns:
+        float: The threshold that maximizes Youden's J
+    """
+    y, p = _prep_vec(y_true, y_prob)
+    if len(np.unique(y)) < 2:  # Need both classes
+        return 0.5  # Default threshold
+    
+    from sklearn.metrics import roc_curve
+    fpr, tpr, thresholds = roc_curve(y, p)
+    j_scores = tpr - fpr  # Youden's J = sensitivity + specificity - 1 = tpr + (1-fpr) - 1 = tpr - fpr
+    best_idx = np.argmax(j_scores)
+    return float(thresholds[best_idx])
 
 def _ece_from_edges(y, p, edges):
     """Calculate ECE given bin edges, using bin-mass weighting."""
@@ -295,8 +348,6 @@ def bin_stats(y, p, edges):
         })
     return pd.DataFrame(rows)
 
-from sklearn.isotonic import IsotonicRegression
-
 def ici_isotonic(y_true, y_prob):
     """Calculate Integrated Calibration Index using isotonic regression.
     
@@ -330,16 +381,20 @@ def ece_rq_shared_edges(preds_dict, y_true, bin_counts=(10,20,40), repeats=50, m
         Dictionary of model_name -> {'ece_mean': float, 'ece_std': float}
     """
     rng = np.random.default_rng(rng)
-    y, _ = _prep_vec(y_true, next(iter(preds_dict.values())))
     
-    # Pool predictions for edges
-    pooled = np.concatenate([_prep_vec(y_true, p)[1] for p in preds_dict.values()])
-    results = {}
+    # Prep per-model and find the min N across models
+    prepared = {name: _prep_vec(y_true, p) for name, p in preds_dict.items()}
+    Ns = [len(y) for (y, p) in prepared.values()]
+    N_min = min(Ns)
+    
+    # Pool predictions (use clipped/cleaned predictions)
+    pooled = np.concatenate([p for (_, p) in prepared.values()])
+    
+    results, edge_sets = {}, []
     
     # Pre-generate all edge sets from pooled predictions
-    edge_sets = []
     for M in bin_counts:
-        M_eff = min(M, max(1, len(y)//max(1, min_per_bin)))
+        M_eff = min(M, max(1, N_min//max(1, min_per_bin)))
         if M_eff < 2:
             edge_sets.append([(None, M_eff)])  # marker for degenerate case
             continue
@@ -354,8 +409,7 @@ def ece_rq_shared_edges(preds_dict, y_true, bin_counts=(10,20,40), repeats=50, m
         edge_sets.append(sets_M)
 
     # Evaluate each model on the same edge sets
-    for name, p_raw in preds_dict.items():
-        y_m, p_m = _prep_vec(y_true, p_raw)
+    for name, (y_m, p_m) in prepared.items():
         eces = []
         for sets_M in edge_sets:
             for edges, M_eff in sets_M:
@@ -405,6 +459,54 @@ def ece_rq_bootstrap_ci(y_true, y_prob, n_boot=500, alpha=0.05, rng=None):
         return (np.nan, np.nan, np.nan)
     lo, hi = np.quantile(stats, [alpha/2, 1-alpha/2])
     return (float(np.mean(stats)), float(lo), float(hi))
+
+
+def ece_rq_shared_edges_bootstrap_ci(models, y_true, n_boot=500, alpha=0.05, rng=None):
+    """Calculate bootstrap confidence intervals for shared-edges randomized quantile ECE.
+    
+    This measures sampling uncertainty in the shared-edges ECE estimate by bootstrapping
+    the data and recalculating shared-edges ECE for each bootstrap sample. It ensures
+    that the same bootstrap indices are used for all models for consistency.
+    
+    Args:
+        models: Dictionary of model_name -> predicted_probabilities
+        y_true: True binary labels
+        n_boot: Number of bootstrap samples
+        alpha: Alpha level for confidence interval (e.g., 0.05 for 95% CI)
+        rng: Random number generator or seed
+        
+    Returns:
+        Dictionary of model_name -> {'mean': float, 'lo': float, 'hi': float}
+    """
+    rng = np.random.default_rng(rng)
+    # Prepare once
+    y = pd.Series(y_true).values
+    preds = {k: pd.Series(v).values for k, v in models.items()}
+    n = len(y)
+    stats = {k: [] for k in models}
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)  # Bootstrap sampling with replacement
+        # Slice all arrays with the same bootstrap indices
+        y_b = y[idx]
+        preds_b = {k: v[idx] for k, v in preds.items()}
+        # Recompute shared-edges randomized ECE on the bootstrap sample
+        shared = ece_rq_shared_edges(preds_b, y_b, bin_counts=(10,20,40), 
+                                    repeats=30, min_per_bin=20, 
+                                    rng=rng.integers(1<<32))
+        for k in models:
+            stats[k].append(shared[k]['ece_mean'])
+
+    out = {}
+    for k, vals in stats.items():
+        arr = np.array(vals, dtype=float)
+        arr = arr[~np.isnan(arr)]  # Remove NaNs
+        if len(arr) == 0:
+            out[k] = {'mean': np.nan, 'lo': np.nan, 'hi': np.nan}
+            continue
+        lo, hi = np.quantile(arr, [alpha/2, 1-alpha/2])
+        out[k] = {'mean': float(np.mean(arr)), 'lo': float(lo), 'hi': float(hi)}
+    return out
 
 
 def brier_decomposition(y_true, y_prob, n_bins=20):
@@ -475,15 +577,16 @@ def generate_performance_report(df_results):
     print("\n[Discrimination: AUC (Area Under ROC Curve) & PR-AUC]")
     print("Higher is better. ROC-AUC for overall discrimination, PR-AUC for imbalanced data.")
     for name, y_prob in models.items():
-        auc = roc_auc_score(y_true, y_prob)
-        pr_auc_val = average_precision_score(y_true, y_prob)
+        auc = safe_auc(y_true, y_prob)
+        pr_auc_val = safe_pr_auc(y_true, y_prob)
         print(f"  - {name:<28}: AUC={auc:.4f} | PR-AUC={pr_auc_val:.4f}")
 
     print("\n[Probabilistic Accuracy: Brier Score & Log Loss]")
     print("Lower is better. Brier for squared error, Log Loss for likelihood-based assessment.")
     for name, y_prob in models.items():
-        brier = brier_score_loss(y_true, y_prob)
-        logloss = log_loss(y_true, np.clip(y_prob, _EPS, 1-_EPS))
+        y, p = _prep_vec(y_true, y_prob)  # Handle NaNs and invalid values
+        brier = brier_score_loss(y, p) if len(y) > 0 else np.nan
+        logloss = safe_logloss(y_true, y_prob)
         print(f"  - {name:<28}: Brier={brier:.4f} | LogLoss={logloss:.4f}")
 
     print("\n[Fit: Nagelkerke's R-squared]")
@@ -506,10 +609,9 @@ def generate_performance_report(df_results):
                                    bin_counts=(10, 20, 40),
                                    repeats=50, min_per_bin=20, rng=123)
     
-    # Add bootstrap CI for GAM model
-    gam_name = "GAM (gnomon)"
-    mean_e, lo_e, hi_e = ece_rq_bootstrap_ci(y_true, models[gam_name], 
-                                          n_boot=200, alpha=0.05, rng=123)
+    # Calculate bootstrap CIs for shared-edges ECE
+    shared_boot = ece_rq_shared_edges_bootstrap_ci(models, y_true, 
+                                              n_boot=200, alpha=0.05, rng=123)
     
     for name, y_prob in models.items():
         # Calculate individual metrics
@@ -517,29 +619,48 @@ def generate_performance_report(df_results):
         ici = ici_isotonic(y_true, y_prob)
         shared_result = shared_ece[name]
         
-        # Print metrics
+        # Print metrics with bootstrap CI for consistency
+        ci = shared_boot[name] if name in shared_boot else {'lo': np.nan, 'hi': np.nan}
         print(f"  - {name:<28}: ECE_q20={ece_q:.4f} | ECE_shared={shared_result['ece_mean']:.4f} ±{shared_result['ece_std']:.4f} | ICI={ici:.4f}")
-        
-        # Add bootstrap CI for GAM
-        if name == gam_name:
-            print(f"      Bootstrap 95% CI for {name}: [{lo_e:.4f}, {hi_e:.4f}]")
+        print(f"      Bootstrap 95% CI for shared-edges ECE: [{ci['lo']:.4f}, {ci['hi']:.4f}]")
             
     # Add Brier decomposition
     print("\n[Brier Score Decomposition]")
     print("reliability ↓, resolution ↑, uncertainty (data)")
     for name, y_prob in models.items():
-        rel, res, unc = brier_decomposition(y_true, y_prob, n_bins=20)
-        brier = brier_score_loss(y_true, y_prob)
-        # Verify: brier ≈ rel - res + unc
+        y_clean, p_clean = _prep_vec(y_true, y_prob)  # Handle NaNs and invalid values
+        rel, res, unc = brier_decomposition(y_clean, p_clean, n_bins=20)
+        brier = brier_score_loss(y_clean, p_clean) if len(y_clean) > 0 else np.nan
+        # Verify Brier score decomposition identity: brier ≈ rel - res + unc
+        err = abs(brier - (rel - res + unc))
         print(f"  - {name:<28}: rel={rel:.4f}, res={res:.4f}, unc={unc:.4f} (brier={brier:.4f})")
+        if err > 1e-4:  # Check if identity doesn't hold within tolerance
+            print(f"    (Warning: Brier decomposition mismatch Δ={err:.2e})")
 
-    print("\n[Confusion Matrices (at threshold=0.5)]")
+    print("\n[Confusion Matrices (with tuned thresholds)]")
     for name, y_prob in models.items():
-        y_pred_class = (y_prob > 0.5).astype(int)
-        cm = confusion_matrix(y_true, y_pred_class)
+        # Clean data and handle NaNs
+        y_clean, p_clean = _prep_vec(y_true, y_prob)
+        
+        # Find optimal threshold using Youden's J statistic
+        threshold = best_threshold_youden(y_clean, p_clean)
+        
+        # Apply the tuned threshold for classification
+        y_pred_class = (p_clean > threshold).astype(int)
+        cm = confusion_matrix(y_clean, y_pred_class)
         cm_proportions = cm / cm.sum()
+        
+        # Calculate sensitivity and specificity
+        if len(np.unique(y_clean)) < 2:  # Edge case: only one class
+            sensitivity = np.nan
+            specificity = np.nan
+        else:
+            tn, fp, fn, tp = cm.ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        
         print(f"\n  --- {name} ---")
-        print("  (Proportions of total data)")
+        print(f"  (Optimal threshold = {threshold:.4f}, Sensitivity = {sensitivity:.3f}, Specificity = {specificity:.3f})")
         print(f"             Predicted 0   Predicted 1")
         print(f"    True 0     {cm_proportions[0,0]:<12.3f}  {cm_proportions[0,1]:<12.3f}")
         print(f"    True 1     {cm_proportions[1,0]:<12.3f}  {cm_proportions[1,1]:<12.3f}")
@@ -597,13 +718,16 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     colors = {"Oracle":"gold", "Signal":"darkorange", "GAM":"blue", "Baseline":"red"}
     zord = {"Oracle":5, "Signal":4, "GAM":3, "Baseline":2}
     
+    # Calculate shared-edges ECE for plot labels
+    shared_for_plot = ece_rq_shared_edges(preds, y_true, bin_counts=(10,20,40), repeats=50, min_per_bin=20, rng=123)
+    
     # Plot each model's calibration curve with error bars
     for name, p in preds.items():
         # Calculate bin statistics with Wilson CIs
         dfb = bin_stats(y_true, p, edges)
         
-        # Calculate metrics for label
-        ece_rq = ece_randomized_quantile(y_true, p, bin_counts=(10,20,40), repeats=50, rng=123)
+        # Get metrics for label using shared-edges ECE for consistency
+        ece_mean = shared_for_plot[name]['ece_mean']
         ici = ici_isotonic(y_true, p)
         
         # Plot with error bars
@@ -611,7 +735,7 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
             dfb['conf'], dfb['acc'], 
             yerr=[dfb['acc']-dfb['lo'], dfb['hi']-dfb['acc']],
             fmt='o-', capsize=3, lw=1.5, 
-            label=f"{name} (ECE={ece_rq['ece_mean']:.3f}, ICI={ici:.3f})", 
+            label=f"{name} (ECE={ece_mean:.3f}, ICI={ici:.3f})", 
             color=colors[name], 
             zorder=zord[name]
         )
@@ -654,7 +778,8 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     # Save or show plot based on environment settings
     if save_plots:
         output_file = output_dir / "gam_analysis.png"
-        plt.savefig(output_file, dpi=150)
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        plt.close(fig)  # Close figure to free memory in headless mode
         print(f"\nPlot saved to {output_file}")
     else:
         print("\nPlot generated. Close the plot window to finish the script.")
@@ -663,15 +788,6 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
 
 def main():
     """Main function to run the end-to-end simulation and plotting."""
-    # Check if running in a headless environment and set appropriate backend
-    # This allows the script to run on servers without a display
-    try:
-        if 'DISPLAY' not in os.environ or not os.environ['DISPLAY']:
-            print("Running in headless mode. Setting non-interactive backend.")
-            matplotlib.use('Agg')
-    except Exception as e:
-        print(f"Note: {e}. Will attempt to use default backend.")
-        
     # Set default figure format and output path for saved plots
     output_dir = Path(os.environ.get('PLOT_OUTPUT_DIR', './'))
     output_dir.mkdir(exist_ok=True)
