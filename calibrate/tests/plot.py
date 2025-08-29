@@ -547,7 +547,7 @@ def generate_performance_report(df_results):
     print("\n" + "="*60)
 
 
-def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid):
+def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid, save_plots=False, output_dir=None):
     """Generates a 2x2 grid of plots for model analysis."""
     fig, axes = plt.subplots(2, 2, figsize=(18, 16))
     fig.suptitle("Comprehensive GAM Model Analysis vs. Baseline and Oracle", fontsize=22, y=0.98)
@@ -752,7 +752,7 @@ def main():
         signal_surface = 1 / (1 + np.exp(-true_logit_surface))
 
         # 10. Generate and display the final analysis plots
-        create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid)
+        create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid, save_plots, output_dir)
 
     finally:
         # Clean up temporary files created during the run
