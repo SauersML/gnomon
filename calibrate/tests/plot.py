@@ -157,6 +157,161 @@ def nagelkerkes_r2(y_true, y_prob):
     return r2_cs / max_r2_cs if max_r2_cs > 0 else 0.0
 
 
+# --- Robust Calibration Metrics ---
+
+# Small constant to prevent numerical issues
+_EPS = 1e-15
+
+def _prep_vec(y, p):
+    """Prepare data vectors by converting to proper types and handling NaNs."""
+    y = pd.Series(y).astype(float)
+    p = pd.Series(p).astype(float).clip(_EPS, 1-_EPS)
+    m = (~y.isna()) & (~p.isna())
+    return y[m].values, p[m].values
+
+def _ece_from_edges(y, p, edges):
+    """Calculate ECE given bin edges, using bin-mass weighting."""
+    # Assign points to bins formed by 'edges' in probability space
+    ids = np.digitize(p, edges, right=True) - 1
+    ids = np.clip(ids, 0, len(edges)-2)
+    N = len(p)
+    ece = 0.0
+    for b in range(len(edges)-1):
+        idx = (ids == b)
+        n_b = int(idx.sum())
+        if n_b == 0:
+            continue
+        conf = p[idx].mean()
+        acc  = y[idx].mean()
+        ece += (n_b / N) * abs(acc - conf)
+    return ece
+
+def ece_quantile(y_true, y_prob, n_bins=20):
+    """Mass-weighted ECE using equal-frequency (quantile) bins.
+    
+    Args:
+        y_true: True binary labels
+        y_prob: Predicted probabilities
+        n_bins: Number of bins to use
+        
+    Returns:
+        Bin-mass-weighted ECE value
+    """
+    y, p = _prep_vec(y_true, y_prob)
+    if len(y) == 0:
+        return np.nan
+    qs = np.linspace(0, 1, n_bins+1)
+    edges = np.quantile(p, qs)
+    edges[0], edges[-1] = 0.0, 1.0
+    edges = np.unique(edges)
+    if len(edges) < 2:
+        return abs(y.mean() - p.mean())  # degenerate case
+    return _ece_from_edges(y, p, edges)
+
+def ece_randomized_quantile(y_true, y_prob, bin_counts=(10,20,40), repeats=50, min_per_bin=20, rng=None):
+    """Averaged, bin-insensitive ECE: quantile bins with random offsets, multi-resolution.
+    
+    This method creates multiple random binnings in rank space and
+    averages the ECE across them, making the metric more stable and
+    less sensitive to bin boundaries.
+    
+    Args:
+        y_true: True binary labels
+        y_prob: Predicted probabilities
+        bin_counts: Tuple of bin counts to try for multi-resolution averaging
+        repeats: Number of random offsets per bin count
+        min_per_bin: Minimum examples per bin (auto-reduces bin count if needed)
+        rng: Random number generator or seed
+        
+    Returns:
+        Dict with 'ece_mean', 'ece_std', and other details
+    """
+    rng = np.random.default_rng(rng)
+    y, p = _prep_vec(y_true, y_prob)
+    if len(y) == 0:
+        return {'ece_mean': np.nan, 'ece_std': np.nan, 'details': {}}
+    eces = []
+    for M in bin_counts:
+        # Ensure enough examples per bin
+        M_eff = min(M, max(1, len(y)//max(1, min_per_bin)))
+        if M_eff < 2:
+            eces.append(abs(y.mean() - p.mean()))
+            continue
+        for _ in range(repeats):
+            delta = rng.uniform(0, 1.0/M_eff)
+            qs = (delta + np.arange(M_eff+1)/M_eff).clip(0, 1)
+            edges = np.quantile(p, qs)
+            edges[0], edges[-1] = 0.0, 1.0
+            edges = np.unique(edges)
+            if len(edges) < 2:
+                eces.append(abs(y.mean() - p.mean()))
+                continue
+            eces.append(_ece_from_edges(y, p, edges))
+    eces = np.array(eces, dtype=float)
+    return {
+        'ece_mean': float(np.mean(eces)),
+        'ece_std':  float(np.std(eces, ddof=1)) if len(eces) > 1 else 0.0,
+        'details':  {'bin_counts': list(bin_counts), 'repeats': repeats}
+    }
+
+def wilson_ci(k, n, z=1.959963984540054):  # 95% CI
+    """Calculate Wilson score confidence interval for a binomial proportion."""
+    if n == 0: 
+        return (np.nan, np.nan)
+    p = k/n
+    denom = 1 + z**2/n
+    center = (p + z**2/(2*n)) / denom
+    half = z*np.sqrt((p*(1-p) + z**2/(4*n))/n) / denom
+    return center - half, center + half
+
+def shared_quantile_edges(pred_dict, n_bins=20, rng=123):
+    """Build shared bin edges across all models using quantiles."""
+    rng = np.random.default_rng(rng)
+    all_p = np.concatenate([v for v in pred_dict.values()])
+    delta = rng.uniform(0, 1.0/n_bins)
+    qs = (delta + np.arange(n_bins+1)/n_bins).clip(0,1)
+    edges = np.quantile(all_p, qs)
+    edges[0], edges[-1] = 0.0, 1.0
+    return np.unique(edges)
+
+def bin_stats(y, p, edges):
+    """Calculate per-bin statistics given bin edges."""
+    ids = np.digitize(p, edges, right=True) - 1
+    ids = np.clip(ids, 0, len(edges)-2)
+    rows = []
+    N = len(p)
+    for b in range(len(edges)-1):
+        idx = (ids == b)
+        n_b = int(idx.sum())
+        if n_b == 0: 
+            continue
+        conf = p[idx].mean()
+        acc  = y[idx].mean()
+        k = int(round(acc*n_b))  # Number of positive examples in bin
+        lo, hi = wilson_ci(k, n_b)
+        rows.append({
+            'bin': b, 'left': edges[b], 'right': edges[b+1], 'n': n_b,
+            'mass': n_b/N, 'conf': conf, 'acc': acc, 'lo': lo, 'hi': hi
+        })
+    return pd.DataFrame(rows)
+
+from sklearn.isotonic import IsotonicRegression
+
+def ici_isotonic(y_true, y_prob):
+    """Calculate Integrated Calibration Index using isotonic regression.
+    
+    This is a bin-free calibration metric measuring the mean absolute
+    difference between predictions and an isotonic fit of outcomes.
+    """
+    y, p = _prep_vec(y_true, y_prob)
+    if len(y) < 2:
+        return np.nan
+    iso = IsotonicRegression(out_of_bounds='clip')
+    # Fit expected outcome as function of predicted probability
+    m = iso.fit_transform(p, y)
+    return float(np.mean(np.abs(m - p)))
+
+
 def generate_performance_report(df_results):
     """Calculates and prints a side-by-side comparison of model metrics."""
     y_true = df_results['phenotype']
@@ -197,11 +352,22 @@ def generate_performance_report(df_results):
         print(f"  - {name:<28}: {r2_t:.4f}")
 
     print("\n[Calibration: Expected Calibration Error (ECE)]")
-    print("Lower is better. Measures how trustworthy the probabilities are.")
+    print("Lower is better. Mass-weighted; randomized-quantile for stability.")
     for name, y_prob in models.items():
-        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='uniform')
-        ece = np.mean(np.abs(prob_true - prob_pred))
-        print(f"  - {name:<28}: {ece:.4f}")
+        # Calculate improved ECE metrics
+        ece_q = ece_quantile(y_true, y_prob, n_bins=20)
+        ece_rq = ece_randomized_quantile(
+            y_true, y_prob, 
+            bin_counts=(10, 20, 40), 
+            repeats=50, 
+            min_per_bin=20, 
+            rng=123
+        )
+        # Calculate bin-free ICI
+        ici = ici_isotonic(y_true, y_prob)
+        
+        # Print both standard quantile ECE and randomized version with SD
+        print(f"  - {name:<28}: ECE_q20={ece_q:.4f} | ECE_rq={ece_rq['ece_mean']:.4f} ±{ece_rq['ece_std']:.4f} | ICI={ici:.4f}")
 
     print("\n[Confusion Matrices (at threshold=0.5)]")
     for name, y_prob in models.items():
@@ -248,25 +414,63 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
     ax2.set_ylabel("Principal Component 1 (PC1)")
     ax2.grid(True, linestyle='--', alpha=0.5)
 
-    # --- 3. Bottom-Left: Calibration Curve Comparison ---
+    # --- 3. Bottom-Left: Improved Calibration Curve Comparison ---
     ax3 = axes[1, 0]
-    y_true = results_df['phenotype']
-    models_for_calib = {
-        "Oracle": (results_df['oracle_prob'], 'gold', 'D-', 5),
-        "Signal Model": (results_df['signal_prob'], 'darkorange', 'x--', 4),
-        "GAM": (results_df['prediction'], 'blue', 's-', 3),
-        "Baseline": (results_df['baseline_prediction'], 'red', 'o--', 2)
+    y_true = results_df['phenotype'].values
+    
+    # Prepare predictions dictionary for all models
+    preds = {
+        "Oracle":   results_df['oracle_prob'].values,
+        "Signal":   results_df['signal_prob'].values,
+        "GAM":      results_df['prediction'].values,
+        "Baseline": results_df['baseline_prediction'].values,
     }
-    for name, (y_prob, color, style, z) in models_for_calib.items():
-        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='uniform')
-        ece = np.mean(np.abs(prob_true - prob_pred))
-        ax3.plot(prob_pred, prob_true, style, label=f"{name} (ECE = {ece:.3f})", color=color, zorder=z)
+    
+    # Calculate shared quantile bin edges across all models
+    edges = shared_quantile_edges(preds, n_bins=20, rng=123)
+    
+    # Define colors and z-order for consistent appearance
+    colors = {"Oracle":"gold", "Signal":"darkorange", "GAM":"blue", "Baseline":"red"}
+    zord = {"Oracle":5, "Signal":4, "GAM":3, "Baseline":2}
+    
+    # Plot each model's calibration curve with error bars
+    for name, p in preds.items():
+        # Calculate bin statistics with Wilson CIs
+        dfb = bin_stats(y_true, p, edges)
+        
+        # Calculate randomized quantile ECE for label
+        ece_rq = ece_randomized_quantile(y_true, p, bin_counts=(10,20,40), repeats=50, rng=123)
+        
+        # Plot with error bars
+        ax3.errorbar(
+            dfb['conf'], dfb['acc'], 
+            yerr=[dfb['acc']-dfb['lo'], dfb['hi']-dfb['acc']],
+            fmt='o-', capsize=3, lw=1.5, 
+            label=f"{name} (ECE = {ece_rq['ece_mean']:.3f})", 
+            color=colors[name], 
+            zorder=zord[name]
+        )
+    
+    # Add perfect calibration line
     ax3.plot([0, 1], [0, 1], "k:", label="Perfect Calibration", zorder=1)
-    ax3.set_title("3. Calibration Curve (Lower ECE is Better)", fontsize=16)
-    ax3.set_xlabel("Mean Predicted Probability (per bin)")
-    ax3.set_ylabel("Observed Frequency of Positives (per bin)")
-    ax3.legend()
+    
+    # Set title and labels
+    ax3.set_title("3. Reliability Diagram (shared quantile bins, 95% CI)", fontsize=16)
+    ax3.set_xlabel("Mean predicted probability (per bin)")
+    ax3.set_ylabel("Empirical frequency (per bin)")
+    ax3.set_xlim(0, 1)
+    ax3.set_ylim(0, 1)
     ax3.grid(True, linestyle='--', alpha=0.6)
+    ax3.legend(loc='upper left')
+    
+    # Add bin-mass bars using twin axis (using GAM as reference model)
+    df_mass = bin_stats(y_true, preds['GAM'], edges)
+    ax3b = ax3.twinx()
+    centers = (df_mass['left'] + df_mass['right'])/2
+    widths = df_mass['right'] - df_mass['left']
+    ax3b.bar(centers, df_mass['mass'], width=widths, alpha=0.15, color='gray', edgecolor='none')
+    ax3b.set_ylabel("Bin mass (GAM)")
+    ax3b.set_ylim(0, max(df_mass['mass'])*1.6 if len(df_mass)>0 else 1.0)
 
     # --- 4. Bottom-Right: Prediction Distribution by Class (GAM Model) ---
     ax4 = axes[1, 1]
