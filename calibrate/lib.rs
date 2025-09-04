@@ -1,5 +1,6 @@
 #![deny(dead_code)]
 #![deny(unused_imports)]
+#![allow(non_snake_case)]
 
 pub mod basis;
 pub mod construction;

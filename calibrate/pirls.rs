@@ -22,6 +22,10 @@ pub struct PirlsWorkspace {
     pub weighted_residual: Array1<f64>,
     // Step-halving direction (XΔβ)
     pub delta_eta: Array1<f64>,
+    // Preallocated buffers for GEMM (e.g., XtWX)
+    pub xtwx_buf: Array2<f64>,
+    // Preallocated buffer for GEMV results (length p)
+    pub vec_buf_p: Array1<f64>,
 }
 
 impl PirlsWorkspace {
@@ -40,6 +44,8 @@ impl PirlsWorkspace {
             working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
+            xtwx_buf: Array2::zeros((p, p)),
+            vec_buf_p: Array1::zeros(p),
         }
     }
 }
@@ -112,6 +118,8 @@ pub struct PirlsResult {
 
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
+    // Cached X·Qs for this PIRLS result (transformed design matrix)
+    pub x_transformed: Array2<f64>,
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -348,19 +356,22 @@ pub fn fit_model_for_fixed_rho(
         const MAX_STEP_HALVING: usize = 30;
 
         // Use a robust loop for step-halving that prioritizes numerical stability.
-        // Suggestion #2: Reuse Xβ step direction in step-halving
+        // Reuse XΔβ step direction in step-halving
         let beta_update = &beta_trial_initial - &beta_current; // Δβ
         // Reuse workspace for XΔβ
         workspace.delta_eta = x_transformed.dot(&beta_update);
+        // Quadratic form reuse for penalty(β + αΔ)
+        let s_beta_current = s_transformed.dot(&beta_current);
+        let penalty_current_cached = beta_current.dot(&s_beta_current);
+        let s_delta = s_transformed.dot(&beta_update);
+        let cross = s_beta_current.dot(&beta_update);
+        let quad = beta_update.dot(&s_delta);
         let mut alpha = 1.0;
         loop {
-            // Candidate beta and eta for current α
-            let beta_candidate = &beta_current + &(alpha * &beta_update);
+            // Candidate eta for current α (avoid forming beta_candidate until accept)
             let eta_trial = &eta + &(alpha * &workspace.delta_eta);
-            let (mu_trial, _, _) =
-                update_glm_vectors(y, &eta_trial, config.link_function, prior_weights);
-            let deviance_trial =
-                calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
+            let mu_trial = mu_only(&eta_trial, config.link_function);
+            let deviance_trial = calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
 
             // First, check if the trial step resulted in a numerically valid state.
             // This is the most important check.
@@ -369,7 +380,8 @@ pub fn fit_model_for_fixed_rho(
                 && deviance_trial.is_finite();
 
             if is_numerically_valid {
-                let penalty_trial = beta_candidate.dot(&s_transformed.dot(&beta_candidate));
+                // penalty(β + αΔ) = penalty(β) + 2α (Sβ·Δ) + α² (Δ·SΔ)
+                let penalty_trial = penalty_current_cached + 2.0 * alpha * cross + alpha * alpha * quad;
                 let penalized_deviance_trial = deviance_trial + penalty_trial;
                 // Track the last attempted change for diagnostics
                 last_halving_change = (penalized_deviance_trial - penalized_deviance_current).abs();
@@ -383,7 +395,7 @@ pub fn fit_model_for_fixed_rho(
                 if accept_step {
                     // SUCCESS: The step is valid and improves the fit.
                     // Update the main state variables and exit the step-halving loop.
-                    beta_transformed = beta_candidate;
+                    beta_transformed = &beta_current + &(alpha * &beta_update);
                     eta = eta_trial;
                     last_deviance = deviance_trial;
                     (mu, weights, z) =
@@ -485,6 +497,7 @@ pub fn fit_model_for_fixed_rho(
                 iteration: iter,
                 max_abs_eta,
                 reparam_result: reparam_result.clone(),
+                x_transformed: x_transformed.clone(),
             });
         }
 
@@ -573,6 +586,7 @@ pub fn fit_model_for_fixed_rho(
                     iteration: iter,
                     max_abs_eta,
                     reparam_result: reparam_result.clone(),
+                    x_transformed: x_transformed.clone(),
                 });
             }
             // Update previous beta norm for next iteration
@@ -700,6 +714,7 @@ pub fn fit_model_for_fixed_rho(
                     iteration: iter,
                     max_abs_eta,
                     reparam_result: reparam_result.clone(),
+                    x_transformed: x_transformed.clone(),
                 });
             }
         }
@@ -708,8 +723,8 @@ pub fn fit_model_for_fixed_rho(
     // If we reach here, we've hit max iterations without converging
     log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
 
-    // In mgcv's implementation, there is no additional check for whether we're at a valid minimum
-    // It just reports failure to converge
+    // Before returning, perform a final stationarity check using the SAME (W, z) as the last solve.
+    // If the gradient is small, we can report a valid stalled minimum for the outer loop to accept.
 
     // Use the saved stable result to avoid redundant computation
     let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
@@ -736,16 +751,51 @@ pub fn fit_model_for_fixed_rho(
     // Calculate the stable penalty term using the transformed quantities
     let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
-    log::warn!(
-        "P-IRLS reached max iterations ({}) without convergence",
-        last_iter
-    );
+    // Compute a final gradient check w.r.t the last W_solve and z_solve
+    let x_transformed_t = x_transformed.t().to_owned();
+    let tmp_eta = x_transformed.dot(&beta_transformed);
+    workspace.working_residual = &tmp_eta - &last_z_solve; // Xβ - z_solve
+    workspace.weighted_residual = &last_weights_solve * &workspace.working_residual; // W_solve (Xβ - z_solve)
+    let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
+    let grad_penalty_part = s_transformed.dot(&beta_transformed);
+    let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
+    let gradient_norm = gradient_wrt_solve
+        .iter()
+        .map(|&v| v.abs())
+        .fold(0.0, f64::max);
+
+    // Build a scale-consistent tolerance similar to the inner loop
+    let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+    let penalized_deviance_new = last_deviance + penalty_new;
+    let scale_term = match config.link_function {
+        LinkFunction::Logit => 1.0,
+        LinkFunction::Identity => {
+            let residuals = &y.view() - &mu;
+            let weighted_rss: f64 = prior_weights
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            // EDF from last stable result if available
+            let edf_here = if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 };
+            let df = (x_transformed.nrows() as f64 - edf_here).max(1.0);
+            weighted_rss / df
+        }
+    };
+    let convergence_scale = scale_term.abs() + penalized_deviance_new.abs();
+    let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
 
     // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
     ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
-    // Return with MaxIterationsReached status
+    // If stationarity is met, return a stalled-but-valid minimum for acceptance
+    let final_status = if gradient_norm < gradient_tol {
+        PirlsStatus::StalledAtValidMinimum
+    } else {
+        PirlsStatus::MaxIterationsReached
+    };
+
     Ok(PirlsResult {
         beta_transformed,
         penalized_hessian_transformed,
@@ -762,10 +812,11 @@ pub fn fit_model_for_fixed_rho(
         solve_weights: last_weights_solve.clone(),
         solve_working_response: last_z_solve.clone(),
         solve_mu: last_mu_solve.clone(),
-        status: PirlsStatus::MaxIterationsReached,
+        status: final_status,
         iteration: last_iter,
         max_abs_eta,
         reparam_result,
+        x_transformed,
     })
 }
 
@@ -914,7 +965,7 @@ fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
 /// Symmetrically unpivot a matrix using the forward permutation `pivot`.
 /// If `(sqrt(W)X) * P = Q * R`, then `XtWX = P * (R^T R) * P^T`.
 /// Given `m_pivoted = R^T R` in pivoted order, this returns `P * m_pivoted * P^T`.
-fn unpivot_sym_by_perm(m_pivoted: &Array2<f64>, pivot: &[usize]) -> Array2<f64> {
+fn unpivot_sym_by_perm(m_pivoted: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
     let n = m_pivoted.nrows();
     assert_eq!(n, m_pivoted.ncols());
     assert_eq!(pivot.len(), n);
@@ -1079,6 +1130,20 @@ pub fn update_glm_vectors(
     }
 }
 
+#[inline]
+fn mu_only(eta: &Array1<f64>, link: LinkFunction) -> Array1<f64> {
+    match link {
+        LinkFunction::Logit => {
+            // Clamp eta to prevent overflow and clamp probabilities away from 0/1
+            let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+            let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+            mu.mapv_inplace(|v| v.clamp(1e-8, 1.0 - 1e-8));
+            mu
+        }
+        LinkFunction::Identity => eta.clone(),
+    }
+}
+
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -1222,9 +1287,22 @@ pub fn solve_penalized_least_squares(
             beta_transformed[j_orig] = beta_kept[j_new];
         }
 
-        // 5) Build Hessian H = Xᵀ W X (since S=0) and verify KKT
-        let xtwx = wx.t().dot(&wx);
-        let grad = xtwx.dot(&beta_transformed) - wx.t().dot(&wz);
+        // 5) Build Hessian H = Xᵀ W X (since S=0) using preallocated buffer
+        use ndarray::linalg::{general_mat_mul, general_mat_vec_mul};
+        let p_wx = wx.ncols();
+        if workspace.xtwx_buf.dim() != (p_wx, p_wx) {
+            // resize if needed (shouldn't happen in steady state)
+            workspace.xtwx_buf = Array2::zeros((p_wx, p_wx));
+        }
+        workspace.xtwx_buf.fill(0.0);
+        general_mat_mul(1.0, &wx.t(), &wx, 0.0, &mut workspace.xtwx_buf);
+        // Compute wx.t() * wz into a preallocated buffer via GEMV
+        if workspace.vec_buf_p.len() != p_wx {
+            workspace.vec_buf_p = Array1::zeros(p_wx);
+        }
+        workspace.vec_buf_p.fill(0.0);
+        general_mat_vec_mul(1.0, &wx.t(), &wz, 0.0, &mut workspace.vec_buf_p);
+        let grad = workspace.xtwx_buf.view().dot(&beta_transformed) - &workspace.vec_buf_p;
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         if inf_norm > 1e-10 {
             return Err(EstimationError::ModelIsIllConditioned {
@@ -1235,7 +1313,7 @@ pub fn solve_penalized_least_squares(
         return Ok((
             StablePLSResult {
                 beta: beta_transformed,
-                penalized_hessian: xtwx,
+                penalized_hessian: workspace.xtwx_buf.clone(),
                 edf: rank as f64, // EDF = rank in unpenalized LS
                 scale: 1.0,
             },
@@ -1289,9 +1367,24 @@ pub fn solve_penalized_least_squares(
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
     workspace.sqrt_w.assign(&weights.mapv(|w| w.sqrt())); // Weights are guaranteed non-negative
     let sqrt_w = &workspace.sqrt_w;
-    workspace.wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
+    // wx <- X .* sqrt_w (column-wise scale, no temporaries)
+    let (n_dim, p_dim) = x_transformed.dim();
+    if workspace.wx.dim() != (n_dim, p_dim) {
+        workspace.wx = Array2::zeros((n_dim, p_dim));
+    }
+    for j in 0..p_dim {
+        let mut dst_col = workspace.wx.column_mut(j);
+        dst_col.assign(&x_transformed.column(j));
+        ndarray::Zip::from(&mut dst_col)
+            .and(sqrt_w)
+            .for_each(|d, &sw| *d *= sw);
+    }
     let wx = &workspace.wx;
-    workspace.wz = sqrt_w * &z;
+    // wz <- sqrt_w .* z
+    workspace.wz.assign(&z);
+    ndarray::Zip::from(&mut workspace.wz)
+        .and(sqrt_w)
+        .for_each(|dz, &sw| *dz *= sw);
     let wz = &workspace.wz;
 
     // Perform initial pivoted QR on the weighted design matrix
@@ -1343,15 +1436,19 @@ pub fn solve_penalized_least_squares(
     assert!(workspace.scaled_matrix.ncols() >= p);
     let mut scaled_matrix = workspace.scaled_matrix.slice_mut(s![..scaled_rows, ..p]);
 
-    // Fill in with slice assignments (Suggestion #9)
+    // Fill in with slice assignments and scale in place
     use ndarray::s as ns;
-    scaled_matrix
-        .slice_mut(ns![..r_rows, ..])
-        .assign(&(&r1_pivoted.to_owned() * (1.0 / r_norm)));
+    {
+        let mut top = scaled_matrix.slice_mut(ns![..r_rows, ..]);
+        top.assign(&r1_pivoted);
+        let inv = 1.0 / r_norm;
+        top.mapv_inplace(|v| v * inv);
+    }
     if eb_rows > 0 {
-        scaled_matrix
-            .slice_mut(ns![r_rows.., ..])
-            .assign(&(&eb_pivoted.to_owned() * (1.0 / eb_norm)));
+        let mut bot = scaled_matrix.slice_mut(ns![r_rows.., ..]);
+        bot.assign(&eb_pivoted);
+        let inv = 1.0 / eb_norm;
+        bot.mapv_inplace(|v| v * inv);
     }
 
     // Perform pivoted QR on the scaled matrix for rank determination
@@ -1488,6 +1585,13 @@ pub fn solve_penalized_least_squares(
     // Back-substitution to solve the triangular system
     let mut beta_dropped = Array1::zeros(rank);
 
+    // Hoist diagonal tolerance invariants outside inner loop
+    let max_diag = r_square
+        .diag()
+        .iter()
+        .fold(0.0f64, |acc, &val| acc.max(val.abs()));
+    let tol = (max_diag + 1.0) * 1e-14;
+
     for i in (0..rank).rev() {
         // Initialize with right-hand side value
         let mut sum = rhs_square[i];
@@ -1497,12 +1601,6 @@ pub fn solve_penalized_least_squares(
             sum -= r_square[[i, j]] * beta_dropped[j];
         }
 
-        // Use relative tolerance for diagonal check, or trust Stage 2 rank detection
-        let max_diag = r_square
-            .diag()
-            .iter()
-            .fold(0.0f64, |acc, &val| acc.max(val.abs()));
-        let tol = (max_diag + 1.0) * 1e-14;
         if r_square[[i, i]].abs() < tol {
             // This should not happen with proper rank detection in Stage 2
             log::warn!(
@@ -1565,8 +1663,16 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
     // Build XtWX without re-touching n using Stage 1 QR result.
     // From (sqrt(W)X) * P = Q * R  =>  Xᵀ W X = P (Rᵀ R) Pᵀ
-    let xtwx_pivoted = r1_pivoted.t().dot(&r1_pivoted);
-    let xtwx = unpivot_sym_by_perm(&xtwx_pivoted, &initial_pivot);
+    // Compute RᵀR into a preallocated buffer
+    {
+        use ndarray::linalg::general_mat_mul;
+        let mut buf = workspace.xtwx_buf.slice_mut(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
+        buf.fill(0.0);
+        // buf <- Rᵀ R
+        general_mat_mul(1.0, &r1_pivoted.t(), &r1_pivoted, 0.0, &mut buf);
+    }
+    let xtwx_pivoted_view = workspace.xtwx_buf.slice(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
+    let xtwx = unpivot_sym_by_perm(xtwx_pivoted_view, &initial_pivot);
 
     // Use precomputed S = EᵀE from caller (original order)
     let penalized_hessian = &xtwx + s_transformed;
@@ -1612,7 +1718,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     // Calculate effective degrees of freedom using H and XtWX directly (stable)
-    let edf = calculate_edf(&penalized_hessian, &xtwx)?;
+    let edf = calculate_edf(&penalized_hessian, &xtwx, e_transformed.nrows())?;
 
     // Calculate scale parameter
     let scale = calculate_scale(
@@ -1760,15 +1866,12 @@ fn pivoted_qr_faer(
 fn calculate_edf(
     penalized_hessian: &Array2<f64>,
     xtwx: &Array2<f64>,
+    penalty_rank: usize,
 ) -> Result<f64, EstimationError> {
     use ndarray_linalg::{Cholesky, SVD, Solve, UPLO};
     let p = penalized_hessian.ncols();
-    // For unpenalized detection only, compare H and XtWX (small, single subtraction)
-    let diff = penalized_hessian - xtwx;
-    let s_norm = diff.iter().map(|&v| v * v).sum::<f64>().sqrt();
-    let xtwx_norm = xtwx.iter().map(|&v| v * v).sum::<f64>().sqrt();
 
-    if s_norm < 1e-8 * (1.0 + xtwx_norm) {
+    if penalty_rank == 0 {
         // Unpenalized: EDF is rank(X). Estimate rank from XtWX via SVD.
         let (_, svals, _) = xtwx
             .svd(false, false)
@@ -2229,6 +2332,7 @@ mod tests {
             intercept_col: 0,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
+            pc_null_block_idx: vec![],
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
@@ -2339,6 +2443,7 @@ mod tests {
             intercept_col: 0,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
+            pc_null_block_idx: vec![],
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
@@ -3186,6 +3291,7 @@ mod tests {
             intercept_col: 0,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
+            pc_null_block_idx: vec![],
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],

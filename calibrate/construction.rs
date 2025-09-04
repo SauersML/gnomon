@@ -101,6 +101,8 @@ pub struct ModelLayout {
     pub pgs_main_cols: Range<usize>,
     /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
     pub pc_null_cols: Vec<Range<usize>>,
+    /// Penalty-map indices for each PC's explicit null-space block, if present (aligned with config.pc_configs)
+    pub pc_null_block_idx: Vec<Option<usize>>,
     pub penalty_map: Vec<PenalizedBlock>,
     /// Direct indices to avoid string lookups in hot paths
     pub pc_main_block_idx: Vec<usize>,
@@ -146,6 +148,7 @@ impl ModelLayout {
         let mut penalty_idx_counter = 0;
         let mut pc_null_cols: Vec<Range<usize>> = Vec::with_capacity(config.pc_configs.len());
         let mut pc_main_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
+        let mut pc_null_block_idx: Vec<Option<usize>> = Vec::with_capacity(config.pc_configs.len());
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
@@ -177,7 +180,7 @@ impl ModelLayout {
         penalty_map.reserve_exact(estimated_penalized_blocks);
         pc_null_cols.reserve_exact(config.pc_configs.len());
 
-        // Main effect for each PC (first reserve null/unpenalized, then range/penalized)
+        // Main effect for each PC (null-space and range-space treated as separate penalized blocks)
         for (i, (&n_null, &n_range)) in pc_null_basis_ncols
             .iter()
             .zip(pc_range_basis_ncols.iter())
@@ -187,6 +190,21 @@ impl ModelLayout {
             let null_range = current_col..current_col + n_null;
             pc_null_cols.push(null_range.clone());
             current_col += n_null;
+
+            // Add a dedicated penalty for the null-space columns (mgcv select=TRUE style)
+            // This ensures the likelihood is bounded in all directions under the Logit link.
+            if n_null > 0 {
+                penalty_map.push(PenalizedBlock {
+                    term_name: format!("f({})_null", config.pc_configs[i].name),
+                    col_range: null_range.clone(),
+                    penalty_indices: vec![penalty_idx_counter],
+                    term_type: TermType::PcMainEffect,
+                });
+                pc_null_block_idx.push(Some(penalty_map.len() - 1));
+                penalty_idx_counter += 1;
+            } else {
+                pc_null_block_idx.push(None);
+            }
 
             // Range-space (penalized)
             let range = current_col..current_col + n_range;
@@ -236,10 +254,27 @@ impl ModelLayout {
             )));
         }
 
+        // Layout invariants: PC index-aligned vectors must match lengths
+        if pc_main_block_idx.len() != pc_null_cols.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "PC layout vectors misaligned: pc_main_block_idx.len()={} vs pc_null_cols.len()={}",
+                pc_main_block_idx.len(),
+                pc_null_cols.len()
+            )));
+        }
+        if pc_null_block_idx.len() != pc_null_cols.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "PC layout vectors misaligned: pc_null_block_idx.len()={} vs pc_null_cols.len()={}",
+                pc_null_block_idx.len(),
+                pc_null_cols.len()
+            )));
+        }
+
         Ok(ModelLayout {
             intercept_col,
             pgs_main_cols,
             pc_null_cols,
+            pc_null_block_idx,
             penalty_map,
             pc_main_block_idx,
             interaction_block_idx,
@@ -453,10 +488,13 @@ pub fn build_design_and_penalty_matrices(
 
         match block.term_type {
             TermType::PcMainEffect => {
-                // Main effects have single penalty index
+                // Main effects have single penalty index. Normalize identity penalty
+                // so each block has unit Frobenius norm regardless of size.
                 let penalty_idx = block.penalty_indices[0];
+                let m = col_range.len() as f64;
+                let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
                 for j in col_range.clone() {
-                    s_list[penalty_idx][[j, j]] = 1.0;
+                    s_list[penalty_idx][[j, j]] = alpha;
                 }
             }
             TermType::Interaction => {
@@ -471,10 +509,11 @@ pub fn build_design_and_penalty_matrices(
 
                 let penalty_idx = block.penalty_indices[0]; // Single penalty for whitened interaction
 
-                // Since we use WHITENED marginals for interactions, penalty is identity matrix
-                // This creates proper scale consistency between main effects and interactions
+                // Normalize identity penalty to unit Frobenius norm for this block
+                let m = col_range.len() as f64;
+                let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
                 for j in col_range.clone() {
-                    s_list[penalty_idx][[j, j]] = 1.0;
+                    s_list[penalty_idx][[j, j]] = alpha;
                 }
             }
         }
@@ -764,6 +803,8 @@ pub struct ReparamResult {
     pub qs: Array2<f64>,
     /// Transformed penalty square roots rS (each is rank_k x p)
     pub rs_transformed: Vec<Array2<f64>>,
+    /// Cached transposes of rS (each is p x rank_k) to avoid repeated transposes in hot paths
+    pub rs_transposed: Vec<Array2<f64>>,
     /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
     /// This is used for applying the actual penalty in the least squares solve
     pub e_transformed: Array2<f64>,
@@ -974,6 +1015,7 @@ pub fn stable_reparameterization(
             det1: Array1::zeros(0),
             qs: Array2::eye(p),
             rs_transformed: vec![],
+            rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p)), // rank x p matrix
         });
     }
@@ -1503,7 +1545,11 @@ pub fn stable_reparameterization(
         log_det,
         det1,
         qs: qf,
-        rs_transformed: final_rs_transformed,
+        rs_transformed: final_rs_transformed.clone(),
+        rs_transposed: final_rs_transformed
+            .iter()
+            .map(|m| m.t().to_owned())
+            .collect(),
         e_transformed,
     })
 }
@@ -1687,11 +1733,11 @@ mod tests {
         let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // Expect one-penalty-per-interaction structure: 1 PC main + 1 interaction penalty = 2 total
+        // With null-space penalization: 2 PC main penalties (null + range) + 1 interaction penalty = 3 total
         assert_eq!(
             s_list.len(),
-            2,
-            "Should have exactly 2 penalty matrices: 1 PC main + 1 interaction (whitened)"
+            3,
+            "Should have exactly 3 penalty matrices: 1 PC null + 1 PC range + 1 interaction (whitened)"
         );
 
         let interaction_block = layout
@@ -1711,7 +1757,21 @@ mod tests {
 
         // Verify penalty matrix structure - single identity penalty for whitened interaction
         let s_interaction = &s_list[interaction_penalty_idx]; // Single interaction penalty
-        let s_pc_main = &s_list[0]; // PC main effects penalty matrix
+
+        // Locate explicit PC range and PC null penalty blocks
+        let pc_range_block = layout
+            .penalty_map
+            .iter()
+            .find(|b| b.term_type == TermType::PcMainEffect && b.term_name == "f(PC1)")
+            .expect("PC range main-effect block not found in layout");
+        let pc_null_block = layout
+            .penalty_map
+            .iter()
+            .find(|b| b.term_type == TermType::PcMainEffect && b.term_name == "f(PC1)_null")
+            .expect("PC null-space block not found in layout");
+
+        let s_pc_range = &s_list[pc_range_block.penalty_indices[0]];
+        let s_pc_null = &s_list[pc_null_block.penalty_indices[0]];
 
         // Check that the interaction penalty is identity on the interaction block
         for r in 0..layout.total_coeffs {
@@ -1732,24 +1792,32 @@ mod tests {
         }
 
         // Check that PC main penalty matrix has identity on PC main blocks and zeros elsewhere
-        let pc_main_block = layout
-            .penalty_map
-            .iter()
-            .find(|b| b.term_type == TermType::PcMainEffect)
-            .expect("PC main effect block not found in layout");
-
+        // Check range block identity structure
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
-                if pc_main_block.col_range.contains(&r) && pc_main_block.col_range.contains(&c) {
-                    // Within PC main block: should be identity
+                if pc_range_block.col_range.contains(&r) && pc_range_block.col_range.contains(&c) {
                     if r == c {
-                        assert_abs_diff_eq!(s_pc_main[[r, c]], 1.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_range[[r, c]], 1.0, epsilon = 1e-12);
                     } else {
-                        assert_abs_diff_eq!(s_pc_main[[r, c]], 0.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_range[[r, c]], 0.0, epsilon = 1e-12);
                     }
                 } else {
-                    // Outside PC main block: should be zero
-                    assert_abs_diff_eq!(s_pc_main[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_pc_range[[r, c]], 0.0, epsilon = 1e-12);
+                }
+            }
+        }
+
+        // Check null block identity structure
+        for r in 0..layout.total_coeffs {
+            for c in 0..layout.total_coeffs {
+                if pc_null_block.col_range.contains(&r) && pc_null_block.col_range.contains(&c) {
+                    if r == c {
+                        assert_abs_diff_eq!(s_pc_null[[r, c]], 1.0, epsilon = 1e-12);
+                    } else {
+                        assert_abs_diff_eq!(s_pc_null[[r, c]], 0.0, epsilon = 1e-12);
+                    }
+                } else {
+                    assert_abs_diff_eq!(s_pc_null[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }

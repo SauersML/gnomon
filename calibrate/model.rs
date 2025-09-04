@@ -1085,7 +1085,8 @@ mod tests {
                     interactions
                 },
             },
-            lambdas: vec![0.1, 0.2], // Match layout.num_penalties: 1 PC main + 1 interaction penalty
+            // Match layout.num_penalties dynamically (PC null + PC range + interaction)
+            lambdas: vec![0.1; layout.num_penalties],
             hull: None,
         };
 
@@ -1252,35 +1253,45 @@ pub fn map_coefficients(
         pgs = beta.slice(s![layout.pgs_main_cols.clone()]).to_vec();
     }
 
-    // Iterate penalized blocks; for each PC main effect, prepend associated null-space coeffs
-    let mut pc_main_idx = 0usize;
-    for block in &layout.penalty_map {
-        let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
-
-        use crate::calibrate::construction::TermType;
-        match block.term_type {
-            TermType::PcMainEffect => {
-                let pc_name = block
-                    .term_name
-                    .trim_start_matches("f(")
-                    .trim_end_matches(')')
-                    .to_string();
-
-                // Fetch corresponding null-space coefficients (if any) by index
-                let null_range = &layout.pc_null_cols[pc_main_idx];
-                let mut full = Vec::new();
-                if null_range.len() > 0 {
-                    full.extend_from_slice(&beta.slice(s![null_range.clone()]).to_vec());
-                }
-                full.extend_from_slice(&coeffs);
-                pcs.insert(pc_name, full);
-
-                pc_main_idx += 1;
-            }
-            TermType::Interaction => {
-                interaction_effects.insert(block.term_name.to_string(), coeffs);
-            }
+    // Build PC main-effect coefficients deterministically by layout indices
+    // For each PCj: concatenate [null-space coeffs for PCj (if any), range-space coeffs for PCj].
+    // Infer PC count from layout vectors; layout invariants guarantee alignment.
+    let num_pcs = layout.pc_main_block_idx.len();
+    for i in 0..num_pcs {
+        let range_block_idx = layout.pc_main_block_idx[i];
+        let range_block = &layout.penalty_map[range_block_idx];
+        let mut full = Vec::new();
+        let null_range = &layout.pc_null_cols[i];
+        if null_range.len() > 0 {
+            full.extend_from_slice(&beta.slice(s![null_range.clone()]).to_vec());
         }
+        full.extend_from_slice(&beta.slice(s![range_block.col_range.clone()]).to_vec());
+
+        // Derive PC name robustly from the range block term name, which is guaranteed to be f(PCname)
+        let name_str = &range_block.term_name;
+        let pc_name = if let Some(start) = name_str.find("f(") {
+            let rest = &name_str[start + 2..];
+            let end = rest.find(')').ok_or_else(|| {
+                EstimationError::LayoutError(format!(
+                    "Malformed PC term name: {}",
+                    name_str
+                ))
+            })?;
+            rest[..end].to_string()
+        } else {
+            return Err(EstimationError::LayoutError(format!(
+                "Unexpected PC term name (missing prefix): {}",
+                name_str
+            )));
+        };
+        pcs.insert(pc_name, full);
+    }
+
+    // Build interaction effects deterministically by layout.interaction_block_idx order.
+    for &blk_idx in &layout.interaction_block_idx {
+        let block = &layout.penalty_map[blk_idx];
+        let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
+        interaction_effects.insert(block.term_name.to_string(), coeffs);
     }
 
     Ok(MappedCoefficients {

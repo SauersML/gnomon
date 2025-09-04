@@ -60,6 +60,10 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+[profile.dev]
+# Turn off debug info for regular 'cargo build/test'
+debug = 0
+
 [profile.profiling]
 inherits = "release"
 debug = 1
