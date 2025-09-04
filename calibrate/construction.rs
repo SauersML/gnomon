@@ -1755,8 +1755,12 @@ mod tests {
 
         let interaction_penalty_idx = interaction_block.penalty_indices[0];
 
-        // Verify penalty matrix structure - single identity penalty for whitened interaction
+        // Verify penalty matrix structure - single identity (Frobenius-normalized) penalty for whitened interaction
         let s_interaction = &s_list[interaction_penalty_idx]; // Single interaction penalty
+        let alpha_interaction = {
+            let m = interaction_block.col_range.len() as f64;
+            if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 }
+        };
 
         // Locate explicit PC range and PC null penalty blocks
         let pc_range_block = layout
@@ -1780,7 +1784,7 @@ mod tests {
                     && interaction_block.col_range.contains(&c)
                 {
                     if r == c {
-                        assert_abs_diff_eq!(s_interaction[[r, c]], 1.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_interaction[[r, c]], alpha_interaction, epsilon = 1e-12);
                     } else {
                         assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
                     }
@@ -1793,11 +1797,15 @@ mod tests {
 
         // Check that PC main penalty matrix has identity on PC main blocks and zeros elsewhere
         // Check range block identity structure
+        let alpha_pc_range = {
+            let m = pc_range_block.col_range.len() as f64;
+            if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 }
+        };
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
                 if pc_range_block.col_range.contains(&r) && pc_range_block.col_range.contains(&c) {
                     if r == c {
-                        assert_abs_diff_eq!(s_pc_range[[r, c]], 1.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_range[[r, c]], alpha_pc_range, epsilon = 1e-12);
                     } else {
                         assert_abs_diff_eq!(s_pc_range[[r, c]], 0.0, epsilon = 1e-12);
                     }
@@ -1808,11 +1816,15 @@ mod tests {
         }
 
         // Check null block identity structure
+        let alpha_pc_null = {
+            let m = pc_null_block.col_range.len() as f64;
+            if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 }
+        };
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
                 if pc_null_block.col_range.contains(&r) && pc_null_block.col_range.contains(&c) {
                     if r == c {
-                        assert_abs_diff_eq!(s_pc_null[[r, c]], 1.0, epsilon = 1e-12);
+                        assert_abs_diff_eq!(s_pc_null[[r, c]], alpha_pc_null, epsilon = 1e-12);
                     } else {
                         assert_abs_diff_eq!(s_pc_null[[r, c]], 0.0, epsilon = 1e-12);
                     }
