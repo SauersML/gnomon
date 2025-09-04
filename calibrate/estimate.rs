@@ -1042,18 +1042,20 @@ pub mod internal {
     }
 
     /// Robust solver that provides fallback mechanisms for maximum numerical stability
+    #[allow(dead_code)]
     enum RobustSolver {
         Cholesky(Array2<f64>), // Store matrix, factor per use (factor once per matrix-RHS)
         Fallback(Array2<f64>),
     }
 
+    #[allow(dead_code)]
     impl RobustSolver {
         /// Create a solver with automatic fallback: Cholesky → robust_solve
         fn new(matrix: &Array2<f64>) -> Result<Self, EstimationError> {
             // Probe Cholesky once to choose fast path; store matrix
             match matrix.cholesky(UPLO::Lower) {
                 Ok(_) => {
-                    log::debug!("Using Cholesky decomposition for matrix solving");
+                    println!("Using Cholesky decomposition for matrix solving");
                     Ok(RobustSolver::Cholesky(matrix.clone()))
                 }
                 Err(_) => {
@@ -1124,6 +1126,7 @@ pub(super) struct RemlState<'a> {
 
     impl<'a> RemlState<'a> {
         // Default memory budget for hat matrix computation (MB)
+        #[allow(dead_code)]
         const HAT_MB_BUDGET_DEFAULT: usize = 64;
         
         /// Computes the hat diagonal efficiently using chunking to bound memory usage.
@@ -1148,6 +1151,7 @@ pub(super) struct RemlState<'a> {
         /// 
         /// # Returns
         /// * Array of hat diagonal values (length n)
+        #[allow(dead_code)]
         fn hat_diag_chunked(
             &self,
             solver: &RobustSolver,
@@ -1422,7 +1426,7 @@ pub(super) struct RemlState<'a> {
             let p = h.nrows();
             let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| h[[i, j]]);
             if let Ok(f) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
-                log::debug!("Using faer LLᵀ for Hessian solves");
+                println!("Using faer LLᵀ for Hessian solves");
                 return FaerFactor::Llt(f);
             }
             // Next, try semidefinite LDLᵀ (can fail)
@@ -1574,7 +1578,7 @@ pub(super) struct RemlState<'a> {
 
             // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
             let lambdas_for_logging = rho.mapv(f64::exp);
-            log::debug!(
+            println!(
                 "Smoothing parameters for this evaluation: [{:.2e}, {:.2e}, ...]",
                 lambdas_for_logging.get(0).unwrap_or(&0.0),
                 lambdas_for_logging.get(1).unwrap_or(&0.0)
@@ -1727,7 +1731,7 @@ pub(super) struct RemlState<'a> {
                             }
                         }
                         Err(e) => {
-                            log::debug!("Failed to compute condition number (non-critical): {e:?}");
+                            println!("Failed to compute condition number (non-critical): {e:?}");
                         }
                     }
 
@@ -1892,20 +1896,15 @@ pub(super) struct RemlState<'a> {
                         laml, -laml
                     );
 
-                    // Diagnostics: effective degrees of freedom via hat trace tr(W^{1/2} X H^{-1} Xᵀ W^{1/2})
-                    // Use the SAME effective Hessian as in log|H|
+                    // Diagnostics: effective degrees of freedom via trace identity
+                    // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
                     let (h_eff_diag, _) = self.effective_hessian(pirls_result.as_ref());
-                    let solver = RobustSolver::new(&h_eff_diag)?;
-                    // Use X transformed cached in PIRLS result
-                    let x_transformed = pirls_result.x_transformed.view().to_owned();
-                    let w_solve = &pirls_result.solve_weights;
-                    let hat_diag = self.hat_diag_chunked(&solver, x_transformed.view(), w_solve.view())?;
-                    let mut edf = hat_diag.sum();
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    edf = edf.clamp(0.0, p_eff);
+                    let lambdas = p.mapv(f64::exp);
+                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, &h_eff_diag)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
                     println!(
-                        "[GNOMON COST] EDF diag: p = {:.3}, tr(H^-1 Sλ) = {:.6}, edf = {:.6}",
+                        "[GNOMON COST] EDF trace: p = {:.3}, tr(H^-1 Sλ) = {:.6}, edf = {:.6}",
                         p_eff, trace_h_inv_s_lambda, edf
                     );
 
@@ -2334,7 +2333,7 @@ pub(super) struct RemlState<'a> {
                 }
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
-                    log::debug!("Pre-computing for gradient calculation (LAML)...");
+                    println!("Pre-computing for gradient calculation (LAML)...");
 
                     // Include the missing derivative of the penalized log-likelihood part via FD.
                     // This ensures exact consistency with the COST used in compute_cost.
@@ -2414,7 +2413,7 @@ pub(super) struct RemlState<'a> {
                           cost_gradient[k]);
                     }
                     // mgcv-style assembly
-                    log::debug!("LAML gradient computation finished.");
+                    println!("LAML gradient computation finished.");
                 }
             }
 
@@ -2448,7 +2447,8 @@ pub(super) struct RemlState<'a> {
 
     /// Robust solve using QR/SVD approach similar to mgcv's implementation
     /// This avoids the singularity issues that plague direct matrix inversion
-    fn robust_solve(
+#[allow(dead_code)]
+fn robust_solve(
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -2460,7 +2460,7 @@ pub(super) struct RemlState<'a> {
         }
 
         // If standard solve fails, use SVD-based least-squares without forming pinv
-        log::debug!("Standard solve failed, using direct SVD solve");
+        println!("Standard solve failed, using direct SVD solve");
 
         match matrix.svd(true, true) {
             Ok((Some(u), s, Some(vt))) => {
@@ -2606,7 +2606,7 @@ pub(super) struct RemlState<'a> {
 
         // Log partitioning info for debugging
         if large_indices.len() + small_indices.len() < s.nrows() {
-            log::debug!(
+            println!(
                 "Similarity transform: {} large, {} small, {} null eigenvalues",
                 large_indices.len(),
                 small_indices.len(),

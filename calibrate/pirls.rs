@@ -4,6 +4,10 @@ use crate::calibrate::model::{LinkFunction, ModelConfig};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::{Cholesky, Eigh, UPLO};
+// faer symmetric solvers for SPD/indefinite systems
+use faer::Mat as FaerMat;
+use faer::Side;
+use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use std::time::Instant;
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -320,7 +324,7 @@ pub fn fit_model_for_fixed_rho(
 
         // The logger outputs detailed matrix dimensions and timings for each sub-stage
         // of the solver, which helps identify potential numerical issues.
-        log::debug!(
+        println!(
             "[P-IRLS Loop Iter #{}] Logger configuration check: debug-level logs enabled",
             iter
         );
@@ -346,7 +350,7 @@ pub fn fit_model_for_fixed_rho(
         let edf_from_solver = stable_result.0.edf;
 
         // The solver now returns beta in the transformed basis which is what we need for the P-IRLS loop
-        log::debug!(
+        println!(
             "P-IRLS Iteration #{}: Getting solver result in transformed basis",
             iter
         );
@@ -402,7 +406,7 @@ pub fn fit_model_for_fixed_rho(
                         update_glm_vectors(y, &eta, config.link_function, prior_weights);
 
                     if step_halving_count > 0 {
-                        log::debug!(
+                        println!(
                             "Step halving successful after {} attempts",
                             step_halving_count
                         );
@@ -620,7 +624,7 @@ pub fn fit_model_for_fixed_rho(
         let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
 
         // Log iteration info
-        log::debug!(
+        println!(
             "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
             iter,
             penalized_deviance_new,
@@ -1215,21 +1219,8 @@ pub fn solve_penalized_least_squares(
     y: ArrayView1<f64>, // Original response (not the working response z)
     link_function: LinkFunction, // Link function to determine appropriate scale calculation
 ) -> Result<(StablePLSResult, usize), EstimationError> {
-    // The penalized least squares solver implements a 5-stage algorithm:
-    // 1. Pre-scaling to improve numerical conditioning
-    // 2. Initial QR decomposition of the weighted design matrix
-    // 3. Rank detection and removal of numerically unidentifiable coefficients
-    // 4. Second QR decomposition on the reduced system
-    // 5. Back-substitution and reconstruction of coefficients
-    println!(
-        "[PLS Solver] Starting QR decomposition of {}×{} design matrix + {}×{} eb (rank detect) + {}×{} e_transformed (penalty apply)",
-        x_transformed.nrows(),
-        x_transformed.ncols(),
-        eb.nrows(),
-        eb.ncols(),
-        e_transformed.nrows(),
-        e_transformed.ncols()
-    );
+    // The penalized least squares solver implements a 5-stage algorithm (QR path) or
+    // a fast symmetric solve (SPD path) when H is SPD.
 
     // FAST PATH: Pure unpenalized WLS case (no penalty rows)
     if eb.nrows() == 0 && e_transformed.nrows() == 0 {
@@ -1321,9 +1312,100 @@ pub fn solve_penalized_least_squares(
         ));
     }
 
+    // FAST PATH (penalized case): Use symmetric solve on H = Xᵀ W X + S_λ
+    if e_transformed.nrows() > 0 {
+        // Weighted design and RHS via broadcasting
+        workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+        let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
+        if workspace.wx.dim() != x_transformed.dim() {
+            workspace.wx = Array2::zeros(x_transformed.dim());
+        }
+        workspace.wx.assign(&x_transformed);
+        workspace.wx *= &sqrt_w_col; // wx = X .* sqrt_w
+        workspace.wz.assign(&z);
+        workspace.wz *= &workspace.sqrt_w; // wz = z .* sqrt_w
+
+        let xtwx = {
+            let r = &workspace.wx; // sqrt(W) X
+            r.t().dot(r)
+        };
+        let xtwz = workspace.wx.t().dot(&workspace.wz);
+
+        // H = XtWX + S_lambda (symmetrize to avoid false SPD failures)
+        let mut penalized_hessian = xtwx + s_transformed;
+        let p_dim = x_transformed.ncols();
+        for i in 0..p_dim {
+            for j in 0..i {
+                let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+                penalized_hessian[[i, j]] = v;
+                penalized_hessian[[j, i]] = v;
+            }
+        }
+        // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
+        let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
+        if let Ok(chol) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+            // Single multi-RHS solve: [ XtWz | Eᵀ ]
+            let rk_rows = e_transformed.nrows();
+            let nrhs = 1 + rk_rows;
+            let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
+                if j == 0 { xtwz[i] } else { e_transformed[(j - 1, i)] }
+            });
+            let sol = chol.solve(rhs.as_ref());
+
+            // β̂ from first column
+            let mut beta_transformed = Array1::zeros(p_dim);
+            for i in 0..p_dim { beta_transformed[i] = sol[(i, 0)]; }
+            if !beta_transformed.iter().all(|v| v.is_finite()) {
+                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+            }
+
+            // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
+            let mut frob = 0.0f64;
+            for j in 0..rk_rows {
+                for i in 0..p_dim {
+                    frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                }
+            }
+            let edf = (p_dim as f64 - frob).clamp(0.0, p_dim as f64);
+            if !edf.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+            }
+
+            // Scale parameter
+            let scale = calculate_scale(
+                &beta_transformed,
+                x_transformed,
+                y,
+                weights,
+                edf,
+                link_function,
+            );
+            if !scale.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+            }
+
+            println!(
+                "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
+                edf,
+                scale
+            );
+
+            return Ok((
+                StablePLSResult {
+                    beta: beta_transformed,
+                    penalized_hessian,
+                    edf,
+                    scale,
+                },
+                p_dim,
+            ));
+        }
+        // If LLᵀ fails, continue into the robust QR path below.
+    }
+
     let function_timer = Instant::now();
-    log::debug!(
-        "[PLS Solver] Entering. Matrix dimensions: x_transformed=({}x{}), eb=({}x{}), e_transformed=({}x{})",
+        println!(
+        "[PLS Solver] Entering QR path. Matrix dimensions: x=({}x{}), eb=({}x{}), e=({}x{})",
         x_transformed.nrows(),
         x_transformed.ncols(),
         eb.nrows(),
@@ -1338,7 +1420,7 @@ pub fn solve_penalized_least_squares(
     const RANK_TOL: f64 = 1e-7;
 
     // let n = x_transformed.nrows();
-    let p = x_transformed.ncols();
+    let p_dim = x_transformed.ncols();
 
     // --- Negative Weight Handling ---
     // The reference mgcv implementation includes extensive logic for handling negative weights,
@@ -1362,47 +1444,39 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     let stage1_timer = Instant::now();
-    log::debug!("[PLS Solver] Stage 1/5: Starting initial QR on weighted design matrix...");
+    println!("[PLS Solver] Stage 1/5: Starting initial QR on weighted design matrix...");
 
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
-    workspace.sqrt_w.assign(&weights.mapv(|w| w.sqrt())); // Weights are guaranteed non-negative
-    let sqrt_w = &workspace.sqrt_w;
-    // wx <- X .* sqrt_w (column-wise scale, no temporaries)
-    let (n_dim, p_dim) = x_transformed.dim();
-    if workspace.wx.dim() != (n_dim, p_dim) {
-        workspace.wx = Array2::zeros((n_dim, p_dim));
+    workspace.sqrt_w.assign(&weights.mapv(f64::sqrt)); // Weights are guaranteed non-negative
+    let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
+    // wx <- X .* sqrt_w (broadcast)
+    if workspace.wx.dim() != x_transformed.dim() {
+        workspace.wx = Array2::zeros(x_transformed.dim());
     }
-    for j in 0..p_dim {
-        let mut dst_col = workspace.wx.column_mut(j);
-        dst_col.assign(&x_transformed.column(j));
-        ndarray::Zip::from(&mut dst_col)
-            .and(sqrt_w)
-            .for_each(|d, &sw| *d *= sw);
-    }
+    workspace.wx.assign(&x_transformed);
+    workspace.wx *= &sqrt_w_col;
     let wx = &workspace.wx;
     // wz <- sqrt_w .* z
     workspace.wz.assign(&z);
-    ndarray::Zip::from(&mut workspace.wz)
-        .and(sqrt_w)
-        .for_each(|dz, &sw| *dz *= sw);
+    workspace.wz *= &workspace.sqrt_w;
     let wz = &workspace.wz;
 
     // Perform initial pivoted QR on the weighted design matrix
     let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
 
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
-    let r_rows = r1_full.nrows().min(p);
+    let r_rows = r1_full.nrows().min(p_dim);
     let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
 
     // DO NOT UN-PIVOT r1_pivoted. Keep it in its stable, pivoted form.
     // The columns of R1 are currently permuted according to `initial_pivot`.
     // This permutation is crucial for numerical stability in rank detection.
-    log::debug!("Keeping R1 matrix in pivoted order for maximum numerical stability");
+    println!("Keeping R1 matrix in pivoted order for maximum numerical stability");
 
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(wz);
 
-    log::debug!(
+    println!(
         "[PLS Solver] Stage 1/5: Initial QR complete. [{:.2?}]",
         stage1_timer.elapsed()
     );
@@ -1412,7 +1486,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     let stage2_timer = Instant::now();
-    log::debug!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
+    println!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
 
     // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
     // This ensures the columns of both matrices are aligned correctly
@@ -1426,15 +1500,15 @@ pub fn solve_penalized_least_squares(
         1.0
     };
 
-    log::debug!("Frobenius norms: R_norm={}, Eb_norm={}", r_norm, eb_norm);
+    println!("Frobenius norms: R_norm={}, Eb_norm={}", r_norm, eb_norm);
 
     // Create the scaled augmented matrix for numerical stability using pivoted matrices
     // [R1_pivoted/Rnorm; Eb_pivoted/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
     let eb_rows = eb_pivoted.nrows();
     let scaled_rows = r_rows + eb_rows;
     assert!(workspace.scaled_matrix.nrows() >= scaled_rows);
-    assert!(workspace.scaled_matrix.ncols() >= p);
-    let mut scaled_matrix = workspace.scaled_matrix.slice_mut(s![..scaled_rows, ..p]);
+    assert!(workspace.scaled_matrix.ncols() >= p_dim);
+    let mut scaled_matrix = workspace.scaled_matrix.slice_mut(s![..scaled_rows, ..p_dim]);
 
     // Fill in with slice assignments and scale in place
     use ndarray::s as ns;
@@ -1456,7 +1530,7 @@ pub fn solve_penalized_least_squares(
     let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_owned)?;
 
     // Determine rank using condition number on the scaled matrix
-    let mut rank = p.min(scaled_rows);
+    let mut rank = p_dim.min(scaled_rows);
     while rank > 0 {
         let r_sub = r_scaled.slice(s![..rank, ..rank]);
         let condition = estimate_r_condition(r_sub.view());
@@ -1478,11 +1552,11 @@ pub fn solve_penalized_least_squares(
         });
     }
 
-    log::debug!("Solver determined rank {}/{} using scaled matrix", rank, p);
-    log::debug!(
+    println!("Solver determined rank {}/{} using scaled matrix", rank, p_dim);
+    println!(
         "[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]",
         rank,
-        p,
+        p_dim,
         stage2_timer.elapsed()
     );
 
@@ -1491,7 +1565,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     let stage3_timer = Instant::now();
-    log::debug!(
+    println!(
         "[PLS Solver] Stage 3/5: Reducing system to rank {}...",
         rank
     );
@@ -1516,7 +1590,7 @@ pub fn solve_penalized_least_squares(
     // Record kept positions in the initial pivoted order for later reconstruction
     let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
 
-    log::debug!(
+    println!(
         "[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]",
         stage3_timer.elapsed()
     );
@@ -1526,7 +1600,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     let stage4_timer = Instant::now();
-    log::debug!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
+    println!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
 
     // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
     // This uses the lambda-DEPENDENT penalty for actual penalty application
@@ -1551,7 +1625,7 @@ pub fn solve_penalized_least_squares(
     let final_aug_owned = final_aug_matrix.to_owned();
     let (q_final, r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
 
-    log::debug!(
+    println!(
         "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
         stage4_timer.elapsed()
     );
@@ -1561,7 +1635,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     let stage5_timer = Instant::now();
-    log::debug!("[PLS Solver] Stage 5/5: Solving system and reconstructing results...");
+    println!("[PLS Solver] Stage 5/5: Solving system and reconstructing results...");
 
     // Prepare the full RHS for the final system
     assert!(workspace.rhs_full.len() >= final_aug_rows);
@@ -1623,7 +1697,7 @@ pub fn solve_penalized_least_squares(
     // Direct composition approach: orig_j = initial_pivot[ kept_positions[ final_pivot[j] ] ]
     // This maps each solved coefficient directly to its original column index
 
-    let mut beta_transformed = Array1::zeros(p);
+    let mut beta_transformed = Array1::zeros(p_dim);
 
     // For each solved coefficient j, find its original column index through the permutation chain
     for j in 0..rank {
@@ -1730,11 +1804,11 @@ pub fn solve_penalized_least_squares(
         link_function,
     );
 
-    log::debug!(
+    println!(
         "[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]",
         stage5_timer.elapsed()
     );
-    log::debug!(
+    println!(
         "[PLS Solver] Exiting. Total time: [{:.2?}]",
         function_timer.elapsed()
     );
