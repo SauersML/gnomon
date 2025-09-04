@@ -682,7 +682,7 @@ index 3c9dbdf..3f8acf7 100644
                          let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag); // tr(H⁻¹ Xᵀ diag(⋯) X)
  
                          // (2b) S part of ½ d log|H| / dρ_k = ½ λ_k tr(H⁻¹ S_k)
-+                        // Use Rt RHS + single factorization (ndarray): tr(H^{-1} S_k) = Σ_j ⟨(H^{-1} R_k^T)_·j, (R_k^T)_·j⟩
++                        // Use Rt RHS + single factorization (ndarray): tr(H^{-1} S_k) = Σ_j ⟨(H^{-1} R_k^T)_·j, (R_k^T)_·j⟩
 +                        let rt_nd: Array2<f64> = r_k.t().to_owned(); // (p × r_k)
 +                        let x_nd = solver.solve_matrix(&rt_nd)?;     // H^{-1} R_k^T
                          let mut trace_h_inv_s_k = 0.0;
