@@ -2758,36 +2758,60 @@ pub(super) struct RemlState<'a> {
             // For PD diagnostics, disable PHC to avoid projection bias during averaging
             model_for_pd.hull = None;
 
-            // Create a minimal grid of test points to evaluate overall fit
-            // Smallest non-degenerate grid (2 x 2)
-            let n_grid = 2;
-            let test_pgs = Array1::linspace(-2.0, 2.0, n_grid);
-            let test_pc = Array1::linspace(-1.5, 1.5, n_grid);
+            // Evaluate fit by averaging over four quadrant "squares" of the 2D input domain
+            // Define splits for PGS and PC1 to form quadrants
+            let pgs_splits = (-2.0, 0.0, 2.0); // left: [-2,0], right: [0,2]
+            let pc_splits = (-1.5, 0.0, 1.5); // bottom: [-1.5,0], top: [0,1.5]
 
-            let mut true_probs = Vec::with_capacity(n_grid * n_grid);
-            let mut pred_probs = Vec::with_capacity(n_grid * n_grid);
+            // Subgrid resolution within each square to compute averages deterministically
+            let sub_n: usize = 10; // 10x10 samples per square (100 per square)
 
-            // For every combination of PGS and PC values in our test grid
-            for &pgs_val in test_pgs.iter() {
-                for &pc_val in test_pc.iter() {
-                    // Calculate the true probability from our generating function
-                    let true_logit = true_function(pgs_val, pc_val);
-                    let true_prob = 1.0 / (1.0 + f64::exp(-true_logit));
-                    true_probs.push(true_prob);
+            let mut square_true_means = Vec::with_capacity(4);
+            let mut square_pred_means = Vec::with_capacity(4);
 
-                    // Get the model's prediction
-                    let pred_pgs = Array1::from_elem(1, pgs_val);
-                    let pred_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
-                    let pred_prob = model_for_pd
-                        .predict(pred_pgs.view(), pred_pc.view())
-                        .unwrap()[0];
-                    pred_probs.push(pred_prob);
+            // Quadrants in order: TL, TR, BL, BR
+            let quadrants = vec![
+                // (pgs_min, pgs_max, pc_min, pc_max)
+                (pgs_splits.0, pgs_splits.1, pc_splits.1, pc_splits.2), // Top-Left
+                (pgs_splits.1, pgs_splits.2, pc_splits.1, pc_splits.2), // Top-Right
+                (pgs_splits.0, pgs_splits.1, pc_splits.0, pc_splits.1), // Bottom-Left
+                (pgs_splits.1, pgs_splits.2, pc_splits.0, pc_splits.1), // Bottom-Right
+            ];
+
+            for (pgs_min, pgs_max, pc_min, pc_max) in quadrants {
+                let pgs_ticks = Array1::linspace(pgs_min, pgs_max, sub_n);
+                let pc_ticks = Array1::linspace(pc_min, pc_max, sub_n);
+
+                let mut true_sum = 0.0;
+                let mut pred_sum = 0.0;
+                let mut count = 0.0;
+
+                for &pgs_val in pgs_ticks.iter() {
+                    for &pc_val in pc_ticks.iter() {
+                        // True probability at (pgs_val, pc_val)
+                        let true_logit = true_function(pgs_val, pc_val);
+                        let true_prob = 1.0 / (1.0 + f64::exp(-true_logit));
+                        true_sum += true_prob;
+
+                        // Model's prediction at (pgs_val, pc_val)
+                        let pred_pgs = Array1::from_elem(1, pgs_val);
+                        let pred_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
+                        let pred_prob = model_for_pd
+                            .predict(pred_pgs.view(), pred_pc.view())
+                            .unwrap()[0];
+                        pred_sum += pred_prob;
+
+                        count += 1.0;
+                    }
                 }
+
+                square_true_means.push(true_sum / count);
+                square_pred_means.push(pred_sum / count);
             }
 
-            // Calculate correlation between true and predicted values (grid-based PD diagnostics)
-            let true_prob_array = Array1::from_vec(true_probs);
-            let pred_prob_array = Array1::from_vec(pred_probs);
+            // Calculate correlation between square-averaged true and predicted values
+            let true_prob_array = Array1::from_vec(square_true_means);
+            let pred_prob_array = Array1::from_vec(square_pred_means);
             let correlation = correlation_coefficient(&true_prob_array, &pred_prob_array);
 
             // Also compute training-set metrics vs. labels for additional context
@@ -2803,7 +2827,7 @@ pub(super) struct RemlState<'a> {
             let brier = calculate_brier(&train_preds, &data.y);
 
             // Always print labeled diagnostics (shown on failure; visible with --nocapture on success)
-            println!("[TEST] Grid Corr(true,pred) = {:.4}", correlation);
+            println!("[TEST] Square-Avg Corr(true,pred) = {:.4}", correlation);
             println!("[TEST] Train Corr(pred,labels) = {:.4}", train_corr);
             println!(
                 "[TEST] Train Metrics: AUC={:.3}, PR-AUC={:.3}, LogLoss={:.3}, Brier={:.3}",

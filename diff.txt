@@ -1,0 +1,728 @@
+diff --git a/calibrate/estimate.rs b/calibrate/estimate.rs
+index 3c9dbdf..3f8acf7 100644
+--- a/calibrate/estimate.rs
++++ b/calibrate/estimate.rs
+@@ -343,16 +343,10 @@ pub fn train_model(
+     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+ 
+-    // Decide a single seed index for a one-off gradient check (if available)
+-    let grad_check_idx = [1usize, 4, 7]
+-        .into_iter()
+-        .find(|&k| k < seed_candidates.len());
++    // We'll do a single mandatory gradient check after we select the initial point
+ 
+     for (i, seed) in seed_candidates.iter().enumerate() {
+-        // Perform the gradient check once for the chosen seed index, if present.
+-        if Some(i) == grad_check_idx {
+-            check_gradient_for_seed(&reml_state, seed, i);
+-        }
++        // We'll do the gradient check after selecting the initial point, not here
+         let cost = match reml_state.compute_cost(seed) {
+             Ok(c) if c.is_finite() => {
+                 eprintln!(
+@@ -450,6 +444,55 @@ pub fn train_model(
+         );
+         to_z_from_rho(&Array1::from_elem(layout.num_penalties, 1.0))
+     });
++    
++    // Map to rho space for gradient check
++    let initial_rho = initial_z.mapv(|v| 15.0 * v.tanh());
++    
++    // MANDATORY GRADIENT CHECK - Run once at the initial point before starting optimization
++    eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy at initial point");
++    if !initial_rho.is_empty() {
++        match check_gradient(&reml_state, &initial_rho) {
++            Ok((cosine_sim, rel_error)) => {
++                eprintln!("  Cosine similarity = {:.6}", cosine_sim);
++                eprintln!("  Relative L2 error = {:.6e}", rel_error);
++                
++                // Check both criteria for acceptance
++                let cosine_ok = cosine_sim >= 0.999;
++                let relerr_ok = rel_error <= 1e-2;
++                
++                if !cosine_ok || !relerr_ok {
++                    // Find the worst component for diagnostics
++                    let g_analytic = reml_state.compute_gradient(&initial_rho)?;
++                    let g_fd = compute_fd_gradient(&reml_state, &initial_rho)?;
++                    let mut max_diff_idx = 0;
++                    let mut max_rel_diff = 0.0;
++                    
++                    for i in 0..g_analytic.len() {
++                        let diff = (g_analytic[i] - g_fd[i]).abs();
++                        let denom = 1.0 + g_analytic[i].abs().max(g_fd[i].abs());
++                        let rel_diff = diff / denom;
++                        if rel_diff > max_rel_diff {
++                            max_rel_diff = rel_diff;
++                            max_diff_idx = i;
++                        }
++                    }
++                    
++                    return Err(EstimationError::RemlOptimizationFailed(format!(
++                        "Initial gradient check failed: cosine={:.6}, relerr={:.6e}; worst component idx={}. Investigate H/trace alignment or PIRLS state.",
++                        cosine_sim, rel_error, max_diff_idx
++                    )));
++                }
++                
++                eprintln!("  ✓ Gradient check passed!");
++            },
++            Err(e) => {
++                return Err(EstimationError::RemlOptimizationFailed(format!(
++                    "Gradient check failed with error: {:?}",
++                    e
++                )));
++            }
++        }
++    }
+ 
+     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
+ 
+@@ -835,30 +878,15 @@ fn compute_fd_gradient(
+ }
+ 
+ /// Computes and prints the cosine similarity between the analytical and finite-difference gradients.
+-fn check_gradient_for_seed(reml_state: &internal::RemlState, rho: &Array1<f64>, seed_index: usize) {
+-    println!("\n--- Gradient Check for Seed #{} ---", seed_index);
+-    println!("  ρ = {:?}", rho.to_vec());
+-
++/// This function is used by the gradient check in train_model.
++/// It computes analytical and finite-difference gradients and returns their
++/// cosine similarity and relative L2 error.
++fn check_gradient(reml_state: &internal::RemlState, rho: &Array1<f64>) -> Result<(f64, f64), EstimationError> {
+     // 1. Get the analytical gradient
+-    let g_analytic = match reml_state.compute_gradient(rho) {
+-        Ok(grad) => grad,
+-        Err(e) => {
+-            println!("  ERROR: Failed to compute analytical gradient: {:?}", e);
+-            return;
+-        }
+-    };
++    let g_analytic = reml_state.compute_gradient(rho)?;
+ 
+     // 2. Get the finite-difference gradient
+-    let g_fd = match compute_fd_gradient(reml_state, rho) {
+-        Ok(grad) => grad,
+-        Err(e) => {
+-            println!(
+-                "  ERROR: Failed to compute finite-difference gradient: {:?}",
+-                e
+-            );
+-            return;
+-        }
+-    };
++    let g_fd = compute_fd_gradient(reml_state, rho)?;
+ 
+     // 3. Compute cosine similarity
+     let dot_product = g_analytic.dot(&g_fd);
+@@ -875,12 +903,15 @@ fn check_gradient_for_seed(reml_state: &internal::RemlState, rho: &Array1<f64>,
+             0.0 // One is zero, the other isn't; orthogonal
+         }
+     };
+-
+-    // 4. Print the results
+-    println!("  Analytical Gradient : {:?}", g_analytic.to_vec());
+-    println!("  Finite Diff Gradient: {:?}", g_fd.to_vec());
+-    println!("  Cosine Similarity   : {:.8}", cosine_similarity);
+-    println!("-------------------------------------\n");
++    
++    // Compute relative L2 error
++    let diff = &g_fd - &g_analytic;
++    let diff_norm = diff.dot(&diff).sqrt();
++    let denom = 1.0 + norm_analytic.max(norm_fd);
++    let rel_error = diff_norm / denom;
++    
++    // Return both metrics
++    Ok((cosine_similarity, rel_error))
+ }
+ 
+ /// Helper to log the final model structure.
+@@ -1026,6 +1057,136 @@ pub mod internal {
+     }
+ 
+     impl<'a> RemlState<'a> {
++        // Default memory budget for hat matrix computation (MB)
++        const HAT_MB_BUDGET_DEFAULT: usize = 64;
++        
++        /// Computes the hat diagonal efficiently using chunking to bound memory usage.
++        /// 
++        /// Instead of solving H C = Xᵀ for the whole matrix C (p × n), which can be very large
++        /// for large n, this method processes the data in blocks of rows to limit memory usage.
++        /// 
++        /// Memory usage is automatically managed using an internal budget.
++        /// 
++        // Method hat_diag_chunked removed
++        
++        /// Computes the hat diagonal efficiently using chunking to bound memory usage.
++        /// 
++        /// Instead of solving H C = Xᵀ for the whole matrix C (p × n), which can be very large
++        /// for large n, this method processes the data in blocks of rows to limit memory usage.
++        /// 
++        /// Memory usage is automatically managed using an internal budget.
++        /// 
++        /// # Arguments
++        /// * `solver` - The robust solver containing the Hessian
++        /// * `xt` - The design matrix X in transformed basis (n × p)
++        /// 
++        /// # Returns
++        /// * Array of hat diagonal values (length n)
++        fn hat_diag_chunked(
++            &self,
++            solver: &RobustSolver,
++            xt: ArrayView2<f64>,
++        ) -> Result<Array1<f64>, EstimationError> {
++            let n = xt.nrows();
++            let p = xt.ncols();
++            
++            // Get memory budget from environment or use default
++            let budget_mb = match std::env::var("GAM_HAT_BLOCK_MB") {
++                Ok(val) => {
++                    match val.parse::<usize>() {
++                        Ok(mb) => mb.clamp(8, 4096),
++                        Err(_) => Self::HAT_MB_BUDGET_DEFAULT,
++                    }
++                },
++                Err(_) => Self::HAT_MB_BUDGET_DEFAULT,
++            };
++            
++            // Calculate block size based on memory budget and matrix dimensions
++            // Each f64 is 8 bytes, we'll be allocating a matrix of size (p × block_rows)
++            let bytes_per_element = 8;
++            let budget_bytes = budget_mb * 1024 * 1024;
++            let block_rows = std::cmp::max(1, budget_bytes / (bytes_per_element * p));
++            
++            // Clamp block_rows to at most n (the number of observations)
++            let block_rows = std::cmp::min(block_rows, n);
++            
++            // Log memory usage information
++            let peak_mb = (bytes_per_element * p * block_rows) / (1024 * 1024);
++            log::info!("Hat diagonal computation: p={}, n={}, block_rows={}, peak memory ~{}MB", 
++                     p, n, block_rows, peak_mb);
++            
++            if block_rows == 1 {
++                log::warn!("Hat diagonal using very small blocks (1 row); performance may be degraded");
++            }
++            
++            let mut hat = Array1::zeros(n);
++            
++            // Optimization: if block size >= n, do a single computation for the whole matrix
++            if block_rows >= n {
++                // Fast path: process all rows at once
++                let xt_full = xt.t().to_owned();  // shape (p × n)
++                let c_full = solver.solve_matrix(&xt_full)?; // H⁻¹ X^T
++                
++                // Compute diagonal elements: hat[i] = X[i,:] · C[:,i]
++                for i in 0..n {
++                    hat[i] = xt.row(i).dot(&c_full.column(i));
++                }
++                
++                return Ok(hat);
++            }
++            
++            // Otherwise, process data in blocks to limit memory usage
++            let mut i = 0;
++            while i < n {
++                // Determine block size (handle last block potentially being smaller)
++                let b = usize::min(block_rows, n - i);
++                
++                // Extract block of rows from X
++                let x_block = xt.slice(ndarray::s![i..i+b, ..]);
++                
++                // Form RHS = X_block.t() (shape p × b)
++                let rhs = x_block.t().to_owned();
++                
++                // Solve H C_block = X_block.t() (reusing same factorization)
++                let c_block = solver.solve_matrix(&rhs)?;
++                
++                // Compute diagonal elements: hat[i+r] = X[i+r,:] · C[:,r]
++                for r in 0..b {
++                    hat[i + r] = x_block.row(r).dot(&c_block.column(r));
++                }
++                
++                // Move to next block
++                i += b;
++            }
++            
++            Ok(hat)
++        }
++        
++        /// Returns the effective Hessian and the ridge value used (if any).
++        /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
++        /// 
++        /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
++        /// If not, a small ridge is added to ensure positive definiteness, and that
++        /// ridged matrix is returned along with the ridge value used.
++        fn effective_hessian<'p>(&self, pr: &'p PirlsResult) -> (Array2<f64>, f64) {
++            let h = pr.penalized_hessian_transformed.clone();
++            
++            // Try Cholesky - if it succeeds, matrix is already PD
++            if h.cholesky(UPLO::Lower).is_ok() {
++                return (h, 0.0); // No ridge needed
++            }
++            
++            // Add ridge for stabilization
++            let mut h_eff = h.clone();
++            let c = LAML_RIDGE;
++            let p_dim = h_eff.nrows();
++            for i in 0..p_dim {
++                h_eff[[i, i]] += c;
++            }
++            
++            (h_eff, c)
++        }
++        
+         pub(super) fn new(
+             y: ArrayView1<'a, f64>,
+             x: ArrayView2<'a, f64>,
+@@ -1054,9 +1215,77 @@ pub mod internal {
+             })
+         }
+ 
+-        fn rho_key(&self, rho: &Array1<f64>) -> Vec<u64> {
+-            rho.iter().map(|&v| v.to_bits()).collect()
++        /// Creates a sanitized cache key from rho values.
++        /// Returns None if any component is NaN, which indicates that caching should be skipped.
++        /// Maps -0.0 to 0.0 to ensure consistency in caching.
++        fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
++            let mut key = Vec::with_capacity(rho.len());
++            for &v in rho.iter() {
++                if v.is_nan() {
++                    return None; // Don't cache NaN values
++                }
++                if v == 0.0 {
++                    // This handles both +0.0 and -0.0
++                    key.push(0.0f64.to_bits());
++                } else {
++                    key.push(v.to_bits());
++                }
++            }
++            Some(key)
+         }
++        
++        /// Calculate effective degrees of freedom (EDF) using a consistent approach
++        /// for both cost and gradient calculations, ensuring identical values.
++        /// 
++        /// # Arguments
++        /// * `pr` - PIRLS result containing the penalty matrices
++        /// * `lambdas` - Smoothing parameters (lambda values)
++        /// * `h_eff` - Effective Hessian matrix
++        /// 
++        /// # Returns
++        /// * Effective degrees of freedom value
++        fn edf_from_h_and_rk(
++            &self,
++            pr: &PirlsResult,
++            lambdas: &Array1<f64>, 
++            h_eff: &Array2<f64>
++        ) -> Result<f64, EstimationError> {
++            // Factor the effective Hessian once
++            let factor = self.get_faer_factor(lambdas, h_eff);
++            
++            // Initialize trace accumulator
++            let mut trace_h_inv_s_lambda = 0.0;
++            
++            // Use PIRLS-transformed (basis-aligned) R_k; apply λ_k exactly once.
++            let rs_transformed = &pr.reparam_result.rs_transformed;
++            for k in 0..lambdas.len() {
++                let r_k = &rs_transformed[k];
++                let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
++                // Rt is (p × r_k)
++                let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
++                // Solve X = H^{-1} Rt using the cached factor
++                let x = factor.solve(rt.as_ref());
++                // tr(H^{-1} λ_k RᵀR) = λ_k ⟨X, Rt⟩_F
++                trace_h_inv_s_lambda += lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
++            }
++            
++            // Calculate EDF as p - trace, with a minimum of 1.0
++            let p = pr.beta_transformed.len() as f64;
++            let edf = (p - trace_h_inv_s_lambda).max(1.0);
++            
++            Ok(edf)
++        }
++        
++        // rho_key has been replaced by the more robust rho_key_sanitized method
++        
++        /// Returns the per-penalty square-root matrices in the transformed coefficient basis
++        /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
++        /// Using these avoids accidental double counting of λ when forming derivatives.
++        /// 
++        /// # Arguments
++        /// * `pr` - The PIRLS result with the transformation matrix Qs
++        /// 
++        /// # Returns
+ 
+         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
+             let p = h.nrows();
+@@ -1077,12 +1306,15 @@ pub mod internal {
+         }
+ 
+         fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
+-            let key = self.rho_key(rho);
+-            if let Some(f) = self.faer_factor_cache.borrow().get(&key) {
+-                return Arc::clone(f);
++            let key_opt = self.rho_key_sanitized(rho);
++            if let Some(key) = &key_opt {
++                if let Some(f) = self.faer_factor_cache.borrow().get(key) {
++                    return Arc::clone(f);
++                }
+             }
+             let fact = Arc::new(self.factorize_faer(h));
+-            {
++            
++            if let Some(key) = key_opt {
+                 let mut cache = self.faer_factor_cache.borrow_mut();
+                 if cache.len() > 64 {
+                     cache.clear();
+@@ -1123,9 +1355,12 @@ pub mod internal {
+             &self,
+             rho: &Array1<f64>,
+         ) -> Result<PirlsResult, EstimationError> {
+-            let key: Vec<u64> = rho.iter().map(|&v| v.to_bits()).collect();
+-            if let Some(cached_result) = self.cache.borrow().get(&key) {
+-                return Ok(cached_result.clone());
++            // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
++            let key_opt = self.rho_key_sanitized(rho);
++            if let Some(key) = &key_opt {
++                if let Some(cached_result) = self.cache.borrow().get(key) {
++                    return Ok(cached_result.clone());
++                }
+             }
+ 
+             println!("  -> Solving inner P-IRLS loop for this evaluation...");
+@@ -1159,8 +1394,10 @@ pub mod internal {
+             // Check the status returned by the P-IRLS routine.
+             match pirls_result.status {
+                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+-                    // This is a successful fit. Cache and return it.
+-                    self.cache.borrow_mut().insert(key, pirls_result.clone());
++                    // This is a successful fit. Cache only if key is valid (not NaN).
++                    if let Some(key) = key_opt {
++                        self.cache.borrow_mut().insert(key, pirls_result.clone());
++                    }
+                     Ok(pirls_result)
+                 }
+                 pirls::PirlsStatus::Unstable => {
+@@ -1210,13 +1447,25 @@ pub mod internal {
+                     return Err(e);
+                 }
+             };
++            
++            // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
++            if !p.is_empty() {
++                let kλ = p.len();
++                let kR = pirls_result.reparam_result.rs_transformed.len();
++                let kD = pirls_result.reparam_result.det1.len();
++                if !(kλ == kR && kR == kD) {
++                    return Err(EstimationError::LayoutError(
++                        format!("Penalty dimension mismatch: lambdas={}, R={}, det1={}", kλ, kR, kD)
++                    ));
++                }
++            }
+ 
+             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
+-            if pirls_result
+-                .penalized_hessian_transformed
+-                .cholesky(UPLO::Lower)
+-                .is_err()
+-            {
++            // Use our effective_hessian helper to check if the Hessian needs stabilization
++            let (_, ridge_used) = self.effective_hessian(&pirls_result);
++            
++            // Only check eigenvalues if we needed to add a ridge
++            if ridge_used > 0.0 {
+                 if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower)
+                 {
+                     let all_nonpos = eigs.iter().all(|&x| x <= 0.0);
+@@ -1269,7 +1518,8 @@ pub mod internal {
+                     // However, mgcv deliberately uses the unweighted count 'n.true' in gam.fit3.
+                     // We maintain this behavior for strict mgcv compatibility.
+                     let n = self.y.len() as f64;
+-                    let num_coeffs = pirls_result.beta_transformed.len() as f64;
++                    // Unused after refactoring to use edf_from_h_and_rk
++                    let _num_coeffs = pirls_result.beta_transformed.len() as f64;
+ 
+                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
+                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
+@@ -1281,28 +1531,12 @@ pub mod internal {
+                     // Work directly in the transformed basis for efficiency and numerical stability
+                     // This avoids transforming matrices back to the original basis unnecessarily
+                     let hessian_t = &pirls_result.stabilized_hessian_transformed;
+-                    let rs_transformed = &pirls_result.reparam_result.rs_transformed;
++                    // Unused after refactoring to use edf_from_h_and_rk
++                    let _rs_transformed = &pirls_result.reparam_result.rs_transformed;
+ 
+-                    // Initialize trace accumulator
+-                    let mut trace_h_inv_s_lambda = 0.0;
+-
+-                    // Factor H once using faer and cache across cost+grad
+-                    let factor = self.get_faer_factor(p, hessian_t);
+-
+-                    // Use Rᵀ RHS to avoid forming S_k = RᵀR and keep RHS thin
+-                    for k in 0..lambdas.len() {
+-                        let r_k = &rs_transformed[k]; // (r_k × p)
+-                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
+-                        // Rt is (p × r_k)
+-                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
+-                        // Solve X = H^{-1} Rt using the cached factor
+-                        let x = factor.solve(rt.as_ref());
+-                        // tr(H^{-1} λ_k RᵀR) = λ_k ⟨X, Rt⟩_F
+-                        trace_h_inv_s_lambda +=
+-                            lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
+-                    }
+-
+-                    let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
++                    // Use the edf_from_h_and_rk helper for consistent EDF calculation
++                    // between cost and gradient functions
++                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, hessian_t)?;
+ 
+                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
+                     let phi = dp / (n - edf).max(LAML_RIDGE);
+@@ -1362,22 +1596,20 @@ pub mod internal {
+                     // Log-determinant of the penalty matrix - use stable value from P-IRLS
+                     let log_det_s = pirls_result.reparam_result.log_det;
+ 
+-                    // Log-determinant of the penalized Hessian: use the UNSTABILIZED matrix
+-                    // for value-consistency with the gradient. Fall back to eigenvalue sum with
+-                    // a small constant ridge for numerical safety only.
+-                    let log_det_h = match pirls_result
+-                        .penalized_hessian_transformed
+-                        .cholesky(UPLO::Lower)
+-                    {
++                    // Get effective Hessian (stabilized if needed) and ridge used
++                    let (h_eff, _) = self.effective_hessian(&pirls_result);
++                    
++                    // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
++                    // that will also be used in the gradient calculation
++                    let log_det_h = match h_eff.cholesky(UPLO::Lower) {
+                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
+                         Err(_) => {
+                             // Eigenvalue fallback if Cholesky fails
+                             log::warn!(
+-                                "Cholesky failed for penalized Hessian, using eigenvalue method"
++                                "Cholesky failed for effective penalized Hessian, using eigenvalue method"
+                             );
+ 
+-                            let (eigenvalues, _) = pirls_result
+-                                .penalized_hessian_transformed
++                            let (eigenvalues, _) = h_eff
+                                 .eigh(UPLO::Lower)
+                                 .map_err(EstimationError::EigendecompositionFailed)?;
+ 
+@@ -1435,7 +1667,6 @@ pub mod internal {
+ 
+                     // Diagnostics: effective degrees of freedom via tr(H_eff^{-1} S_λ)
+                     // Use the SAME effective Hessian as in log|H| (H or H + cI)
+-                    let s_lambda_transformed = &pirls_result.reparam_result.s_transformed;
+                     let mut h_eff = pirls_result.penalized_hessian_transformed.clone();
+                     if h_eff.cholesky(UPLO::Lower).is_err() {
+                         let p_dim = h_eff.nrows();
+@@ -1444,15 +1675,19 @@ pub mod internal {
+                             h_eff[[i, i]] += c;
+                         }
+                     }
++                    let solver = RobustSolver::new(&h_eff)?;
++                    let rs_transformed = &pirls_result.reparam_result.rs_transformed;
++                    let lambdas = p.mapv(f64::exp);
+                     let mut trace_h_inv_s_lambda = 0.0;
+-                    for j in 0..s_lambda_transformed.ncols() {
+-                        let s_col = s_lambda_transformed.column(j);
+-                        if s_col.iter().all(|&x| x == 0.0) {
+-                            continue;
+-                        }
+-                        if let Ok(h_inv_col) = internal::robust_solve(&h_eff, &s_col.to_owned()) {
+-                            trace_h_inv_s_lambda += h_inv_col[j];
++                    for k in 0..lambdas.len() {
++                        let r_k = &rs_transformed[k];
++                        let x_rt = solver.solve_matrix(&r_k.t().to_owned())?;
++                        // Calculate trace by summing column dot products
++                        let mut col_trace = 0.0;
++                        for j in 0..r_k.t().ncols() {
++                            col_trace += x_rt.column(j).dot(&r_k.t().column(j));
+                         }
++                        trace_h_inv_s_lambda += lambdas[k] * col_trace;
+                     }
+                     let p_eff = pirls_result.beta_transformed.len() as f64;
+                     let edf = p_eff - trace_h_inv_s_lambda;
+@@ -1716,6 +1951,17 @@ pub mod internal {
+             if p.len() == 0 {
+                 return Ok(Array1::zeros(0));
+             }
++            
++            // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
++            let kλ = p.len();
++            let kR = pirls_result.reparam_result.rs_transformed.len();
++            let kD = pirls_result.reparam_result.det1.len();
++            if !(kλ == kR && kR == kD) {
++                return Err(EstimationError::LayoutError(
++                    format!("Penalty dimension mismatch: lambdas={}, R={}, det1={}", kλ, kR, kD)
++                ));
++            }
++            
+             // --- Extract stable transformed quantities ---
+             let beta_transformed = &pirls_result.beta_transformed;
+             let hessian_transformed = &pirls_result.penalized_hessian_transformed;
+@@ -1855,17 +2101,9 @@ pub mod internal {
+                     log::debug!("Pre-computing for gradient calculation (LAML)...");
+ 
+                     // --- Pre-computation: Do this ONCE per gradient evaluation ---
+-                    // Use the same effective Hessian as the cost path:
+-                    // if Cholesky fails on H, add a small constant ridge and use H_eff = H + cI everywhere.
+-                    let mut h_eff = pirls_result.penalized_hessian_transformed.clone();
+-                    let cholesky_ok = h_eff.cholesky(UPLO::Lower).is_ok();
+-                    if !cholesky_ok {
+-                        let p_dim = h_eff.nrows();
+-                        let c: f64 = LAML_RIDGE;
+-                        for i in 0..p_dim {
+-                            h_eff[[i, i]] += c;
+-                        }
+-                    }
++                    // Use the same effective Hessian as the cost path via our helper
++                    // This ensures we use the exact same H_eff in both cost and gradient
++                    let (h_eff, _) = self.effective_hessian(&pirls_result);
+                     let solver = RobustSolver::new(&h_eff)?;
+ 
+                     // Use the exact PIRLS solve-state to preserve cancellations
+@@ -1874,53 +2112,12 @@ pub mod internal {
+                     // We don't need to compute the unpenalized deviance gradient for LAML
+                     // as we're using the direct derivative of the penalized deviance
+ 
+-                    // Efficient batched computation of hat matrix diagonal
+-                    // Instead of N individual solves, use single factorization + batched solve
+-                    // Compute H C = X^T, then diag(hat) = diag(X C) = sum over i of X[i,:] * C[:,i]
+-                    let hat_diag = match &solver {
+-                        RobustSolver::Cholesky(_) => {
+-                            // Single factorization, then solve H C = X^T for C (p x N)
+-                            let xt = x_transformed.t().to_owned(); // (p x N)
+-                            let c = solver.solve_matrix(&xt)?; // H^{-1} X^T, shape (p x N)
+-
+-                            // Compute diagonal: hat[i] = X[i,:] · C[:,i] for each observation i
+-                            (0..x_transformed.nrows())
+-                                .map(|i| x_transformed.row(i).dot(&c.column(i)))
+-                                .collect::<Vec<_>>()
+-                        }
+-                        RobustSolver::Fallback(_) => {
+-                            // Fallback: per-row solves (avoid ArrayView threading issues)
+-                            (0..x_transformed.nrows())
+-                                .map(|i| {
+-                                    let xi = x_transformed.row(i).to_owned(); // owned
+-                                    let ci = solver.solve(&xi)?; // H^{-1} x_i^T
+-                                    Ok(xi.dot(&ci))
+-                                })
+-                                .collect::<Result<Vec<_>, EstimationError>>()?
+-                        }
+-                    };
+-                    let hat_diag = Array1::from_vec(hat_diag);
+-                    
+-                    // Calculate edf for the hat-diag sanity check
+-                    let p_eff = pirls_result.beta_transformed.len() as f64;
+-                    let mut trace_h_inv_s_lambda = 0.0;
++                    // Use the chunked hat diagonal computation to bound memory usage
++                    let hat_diag = self.hat_diag_chunked(&solver, x_transformed.view())?;
+                     
+-                    // Compute trace of H⁻¹S_λ using existing penalty matrices
+-                    // reparam_result.s_transformed already contains the full S_λ
+-                    let s_lambda = &reparam_result.s_transformed;
+-                    for j in 0..s_lambda.ncols() {
+-                        let col = s_lambda.column(j).to_owned();
+-                        if col.iter().all(|&x| x.abs() < 1e-12) {
+-                            continue;
+-                        }
+-                        if let Ok(h_inv_col) = solver.solve(&col) {
+-                            trace_h_inv_s_lambda += h_inv_col[j];
+-                        }
+-                    }
+-                    let edf = p_eff - trace_h_inv_s_lambda;
+-                    let hat_sum = hat_diag.sum();
+-                    eprintln!("[hat] sum(diag(Hat))={:.3}  edf≈{:.3}  Δ={:.3e}", 
+-                             hat_sum, edf, (hat_sum-edf));
++                    // We could calculate EDF here, but it's not directly needed for the gradient
++                    // calculation and can lead to confusion due to different formulas.
++                    // The hat diagonal is already computed correctly above.
+ 
+                     // 2. Compute dW/dη, which depends on the link function.
+                     let dw_deta: Array1<f64> = match self.config.link_function {
+@@ -1933,10 +2130,12 @@ pub mod internal {
+                     };
+ 
+                     // Pre-compute S_λ β in the transformed basis for the penalty indirect term
++                    // Use the PIRLS-provided transformed penalty roots to stay aligned with H
++                    let rs_transformed = &reparam_result.rs_transformed;
+                     let mut s_lambda_beta_transformed = Array1::zeros(beta_transformed.len());
+                     for j in 0..lambdas.len() {
+-                        let s_j_t = rs_transformed[j].t().dot(&rs_transformed[j]);
+-                        let s_j_beta = s_j_t.dot(beta_transformed);
++                        let r_j = &rs_transformed[j];
++                        let s_j_beta = r_j.t().dot(&r_j.dot(beta_transformed));
+                         s_lambda_beta_transformed =
+                             s_lambda_beta_transformed + s_j_beta.mapv(|v| v * lambdas[j]);
+                     }
+@@ -1985,14 +2184,15 @@ pub mod internal {
+                     // --- Loop through penalties to compute each gradient component ---
+                     for k in 0..lambdas.len() {
+                         // S_k and S_k β̂ in the transformed (stable) basis
+-                        let s_k = rs_transformed[k].t().dot(&rs_transformed[k]);
+-                        let s_k_beta = s_k.dot(beta_transformed);
++                        // Use PIRLS-provided R_k in the same basis as H
++                        let r_k = &rs_transformed[k];
++                        let r_beta = r_k.dot(beta_transformed);
++                        let s_k_beta = r_k.t().dot(&r_beta);
+ 
+-                        // (1) Dp term: ½ d/dρ_k Dp = ½ λ_k βᵀ S_k β
+-                        let d1_k = lambdas[k] * beta_transformed.dot(&s_k_beta);
+-                        let deviance_grad_term = 0.5 * d1_k;
++                        // (1) Deviance/penalty channel: +½ λ_k βᵀ S_k β
++                        let deviance_grad_term = 0.5 * (lambdas[k] * beta_transformed.dot(&s_k_beta));
+ 
+-                        // Keep dbeta/drho for the weight-derivative (log|H|) term
++                        // Keep dβ/dρ for the weight-derivative (log|H|) term
+                         let dbeta_drho_k = -lambdas[k] * solver.solve(&s_k_beta)?;
+ 
+                         // (2a) weight-derivative part of ½ d log|H| / dρ_k = ½ tr(H⁻¹ Xᵀ (∂W/∂ρ_k) X)
+@@ -2001,14 +2201,15 @@ pub mod internal {
+                         let weight_deriv_term = hat_diag.dot(&dwdrho_k_diag); // tr(H⁻¹ Xᵀ diag(⋯) X)
+ 
+                         // (2b) S part of ½ d log|H| / dρ_k = ½ λ_k tr(H⁻¹ S_k)
++                        // Use Rt RHS + single factorization (ndarray): tr(H^{-1} S_k) = Σ_j ⟨(H^{-1} R_k^T)_·j, (R_k^T)_·j⟩
++                        let rt_nd: Array2<f64> = r_k.t().to_owned(); // (p × r_k)
++                        let x_nd = solver.solve_matrix(&rt_nd)?;     // H^{-1} R_k^T
+                         let mut trace_h_inv_s_k = 0.0;
+-                        for j in 0..s_k.ncols() {
+-                            let col = s_k.column(j).to_owned();
+-                            if col.iter().all(|&x| x == 0.0) {
+-                                continue;
+-                            }
+-                            trace_h_inv_s_k += solver.solve(&col)?[j];
++                        for j in 0..rt_nd.ncols() {
++                            trace_h_inv_s_k += x_nd.column(j).dot(&rt_nd.column(j));
+                         }
++                        
++                        // Add the weight term (non-Gaussian) with a plus sign
+                         let log_det_h_grad_term = 0.5 * (lambdas[k] * trace_h_inv_s_k + weight_deriv_term);
+ 
+                         // (3) −½ d log|S_λ|_+ / dρ_k
+@@ -2016,12 +2217,12 @@ pub mod internal {
+ 
+                         // Final assembly (C = −LAML is minimized)
+                         cost_gradient[k] = deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
+-                            
++
+                         // Per-component gradient breakdown for observability
+                         eprintln!(
+                           "[LAML g] k={k} +½λ β'S_kβ={:+.3e}  +½λ tr(H⁻¹S_k)={:+.3e}  +½ weight={:+.3e} \
+                            -½ dlog|S|={:+.3e}  => g={:+.3e}",
+-                          deviance_grad_term,
++                          0.5 * (lambdas[k] * beta_transformed.dot(&s_k_beta)),
+                           0.5 * (lambdas[k] * trace_h_inv_s_k),
+                           0.5 * weight_deriv_term,
+                           -0.5 * pirls_result.reparam_result.det1[k],
+diff --git a/calibrate/lib.rs b/calibrate/lib.rs
+index 678daaf..835e8b1 100644
+--- a/calibrate/lib.rs
++++ b/calibrate/lib.rs
+@@ -1,5 +1,6 @@
+ #![deny(dead_code)]
+ #![deny(unused_imports)]
++#![allow(non_snake_case)]
+ 
+ pub mod basis;
+ pub mod construction;
