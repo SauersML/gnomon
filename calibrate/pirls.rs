@@ -948,7 +948,6 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 /// For a matrix A and pivot p, the result B is such that `B_j = A_{p[j]}`.
 ///
 /// # Parameters
-
 /// * `matrix`: The matrix whose columns will be permuted.
 /// * `pivot`: The forward permutation vector.
 fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {

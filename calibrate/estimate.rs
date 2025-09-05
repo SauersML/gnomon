@@ -1117,17 +1117,6 @@ pub(super) struct RemlState<'a> {
     }
 
     impl<'a> RemlState<'a> {
-
-        
-        /// Computes the hat diagonal efficiently using chunking to bound memory usage.
-        /// 
-        /// Instead of solving H C = Xᵀ for the whole matrix C (p × n), which can be very large
-        /// for large n, this method processes the data in blocks of rows to limit memory usage.
-        /// 
-        /// Memory usage is automatically managed using an internal budget.
-        /// 
-
-        
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
         /// 
@@ -1308,7 +1297,6 @@ pub(super) struct RemlState<'a> {
         /// * `pr` - The PIRLS result with the transformation matrix Qs
         /// 
         /// # Returns
-
         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
             let p = h.nrows();
             let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| h[[i, j]]);
@@ -1518,10 +1506,6 @@ pub(super) struct RemlState<'a> {
     }
 
     impl RemlState<'_> {
-        /// A wrapper around compute_cost that catches exceptions and returns a Result
-        /// This is useful for unit tests where we want to catch errors instead of panicking
-        // Function no longer needed
-
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
@@ -2012,7 +1996,6 @@ pub(super) struct RemlState<'a> {
         ///   deviance component. The derivative of the penalized deviance must include both
         ///   d(D)/dρ_k and d(βᵀSβ)/dρ_k. Our implementation follows mgcv’s gdi1: we add the penalty
         ///   derivative to the deviance derivative before applying the 1/2 factor.
-
         // 1.  Start with the chain rule.  For any λₖ,
         //     dV/dλₖ = ∂V/∂λₖ  (holding β̂ fixed)  +  (∂V/∂β̂)ᵀ · (∂β̂/∂λₖ).
         //     The first summand is called the direct part, the second the indirect part.
@@ -2048,7 +2031,6 @@ pub(super) struct RemlState<'a> {
         // 3.  The sign of ∂β̂/∂λₖ matters.  From the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
-
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let pirls_result = match self.execute_pirls_if_needed(p) {
@@ -2336,7 +2318,7 @@ pub(super) struct RemlState<'a> {
     /// Implements the stable re-parameterization algorithm from Wood (2011) Appendix B
     /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
     /// to avoid "dominant machine zero leakage" between penalty components
-
+    ///
     /// Helper to calculate log |S|+ robustly using similarity transforms to handle disparate eigenvalues
     pub fn calculate_log_det_pseudo(s: &Array2<f64>) -> Result<f64, LinalgError> {
         if s.nrows() == 0 {

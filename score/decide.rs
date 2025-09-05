@@ -69,7 +69,7 @@ pub struct DecisionContext {
 pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
     if ctx.subset_frac <= 0.2750_f32 {
         RunStrategy::UseSimpleTree
-    } else if ctx.n_cohort <= 2_236.0677_f32 {
+    } else if ctx.n_cohort <= 2_236.067_7_f32 {
         RunStrategy::UseSimpleTree
     } else if ctx.n_cohort <= 7_071.067_f32 {
         if ctx.subset_frac <= 0.7500_f32 {
@@ -150,7 +150,7 @@ pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
                     } else {
                         ComputePath::NoPivot
                     }
-                } else if ctx.n_cohort <= 2_236.0677_f32 {
+                } else if ctx.n_cohort <= 2_236.067_7_f32 {
                     ComputePath::NoPivot
                 } else {
                     ComputePath::Pivot
@@ -216,7 +216,7 @@ pub fn decide_path_without_freq(ctx: &DecisionContext) -> ComputePath {
                     } else {
                         ComputePath::NoPivot
                     }
-                } else if ctx.n_cohort <= 2_236.0677_f32 {
+                } else if ctx.n_cohort <= 2_236.067_7_f32 {
                     ComputePath::NoPivot
                 } else if ctx.k_scores <= 2.2361_f32 {
                     // Impure node, No-Pivot is majority class [0.839 > 0.160]
