@@ -155,16 +155,16 @@ pub enum ModelError {
 }
 
 impl TrainedModel {
-    /// Detailed predictions including linear predictor, mean response, clamping flags,
-    /// and optional standard errors on the linear predictor.
+    /// Detailed predictions including linear predictor, mean response, signed distance
+    /// to the peeled hull boundary (negative inside), and optional SEs for eta.
     pub fn predict_detailed(
         &self,
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<(
-        Array1<f64>, // eta (linear predictor)
-        Array1<f64>, // mean (after inverse link)
-        Vec<u8>,     // clamped_by_hull flags (0/1)
+        Array1<f64>,         // eta (linear predictor)
+        Array1<f64>,         // mean (after inverse link)
+        Array1<f64>,         // signed distance to peeled hull (negative inside)
         Option<Array1<f64>>, // se_eta if available
     ), ModelError> {
         // --- 1. Validate Inputs ---
@@ -172,25 +172,13 @@ impl TrainedModel {
             return Err(ModelError::MismatchedPcCount { found: pcs_new.ncols(), expected: self.config.pc_configs.len() });
         }
 
-        // --- 2. Peeled Hull Clamping (PHC) if hull available ---
+        // --- 2. Geometry: compute signed distance and projection in one pass ---
         let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-        let (x_corr, _) = if let Some(hull) = &self.hull {
-            hull.project_if_needed(raw.view())
+        let (signed_dist, x_corr) = if let Some(hull) = &self.hull {
+            hull.signed_distance_and_project_many(raw.view())
         } else {
-            (raw.clone(), 0)
+            (Array1::zeros(raw.nrows()), raw.clone())
         };
-        // Per-row clamping flags by comparing raw vs corrected
-        let mut clamped = Vec::with_capacity(raw.nrows());
-        for i in 0..raw.nrows() {
-            let mut changed = 0u8;
-            for j in 0..raw.ncols() {
-                if (raw[[i, j]] - x_corr[[i, j]]).abs() > 1e-12 {
-                    changed = 1;
-                    break;
-                }
-            }
-            clamped.push(changed);
-        }
         let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
 
         // --- 3. Build design and coefficients ---
@@ -226,7 +214,7 @@ impl TrainedModel {
                 use ndarray_linalg::{Cholesky, UPLO, Solve};
                 let chol = match h.clone().cholesky(UPLO::Lower) {
                     Ok(c) => c,
-                    Err(_) => return Ok((eta, mean, clamped, None)),
+                    Err(_) => return Ok((eta, mean, signed_dist, None)),
                 };
                 let mut vars = Array1::zeros(x_new.nrows());
                 for i in 0..x_new.nrows() {
@@ -234,7 +222,7 @@ impl TrainedModel {
                     // Solve H v = x^T for v (1D)
                     let v = match chol.solve(&x_row) {
                         Ok(sol) => sol,
-                        Err(_) => { return Ok((eta, mean, clamped, None)); }
+                        Err(_) => { return Ok((eta, mean, signed_dist, None)); }
                     };
                     let var_i = x_row.dot(&v);
                     vars[i] = if self.config.link_function == LinkFunction::Identity {
@@ -250,7 +238,7 @@ impl TrainedModel {
             None
         };
 
-        Ok((eta, mean, clamped, se_eta_opt))
+        Ok((eta, mean, signed_dist, se_eta_opt))
     }
     /// Predicts outcomes for new individuals using the trained model.
     ///

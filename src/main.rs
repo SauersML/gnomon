@@ -173,13 +173,13 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Make detailed predictions
     println!("Generating predictions with diagnostics...");
-    let (eta, mean, clamped, se_eta_opt) = model.predict_detailed(data.p.view(), data.pcs.view())?;
+    let (eta, mean, signed_dist, se_eta_opt) = model.predict_detailed(data.p.view(), data.pcs.view())?;
 
     // Save predictions with required columns to hardcoded output path
     let output_path = "predictions.tsv";
     save_predictions_detailed(
         &data.sample_ids,
-        &clamped,
+        &signed_dist,
         &eta,
         &mean,
         se_eta_opt.as_ref(),
@@ -211,7 +211,7 @@ fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
 
 fn save_predictions_detailed(
     sample_ids: &Vec<String>,
-    clamped: &Vec<u8>,
+    signed_distance: &Array1<f64>,
     eta: &Array1<f64>,
     mean: &Array1<f64>,
     se_eta_opt: Option<&Array1<f64>>,
@@ -226,11 +226,11 @@ fn save_predictions_detailed(
             // Header for binary target
             writeln!(
                 file,
-                "sample_id\tclamped_by_hull\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
+                "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
             )?;
             for i in 0..eta.len() {
                 let id = &sample_ids[i];
-                let clamp = clamped[i];
+                let sd = signed_distance[i];
                 let log_odds = eta[i];
                 let p = mean[i];
                 let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
@@ -240,18 +240,18 @@ fn save_predictions_detailed(
                     let lo_p = 1.0 / (1.0 + (-lo_eta).exp());
                     let hi_p = 1.0 / (1.0 + (-hi_eta).exp());
                     (
-                        format!("{:.6}", se),
-                        format!("{:.6}", lo_p.max(0.0).min(1.0)),
-                        format!("{:.6}", hi_p.max(0.0).min(1.0)),
+                        se.to_string(),
+                        lo_p.max(0.0).min(1.0).to_string(),
+                        hi_p.max(0.0).min(1.0).to_string(),
                     )
                 } else {
                     ("NA".to_string(), "NA".to_string(), "NA".to_string())
                 };
                 writeln!(
                     file,
-                    "{}\t{}\t{:.6}\t{}\t{:.6}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     id,
-                    clamp,
+                    sd,
                     log_odds,
                     se_str,
                     p,
@@ -264,29 +264,29 @@ fn save_predictions_detailed(
             // Header for continuous target
             writeln!(
                 file,
-                "sample_id\tclamped_by_hull\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
+                "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
             )?;
             for i in 0..eta.len() {
                 let id = &sample_ids[i];
-                let clamp = clamped[i];
+                let sd = signed_distance[i];
                 let pred = mean[i];
                 let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
                     let se = se_eta[i];
                     let lo = pred - 1.959964 * se;
                     let hi = pred + 1.959964 * se;
                     (
-                        format!("{:.6}", se),
-                        format!("{:.6}", lo),
-                        format!("{:.6}", hi),
+                        se.to_string(),
+                        lo.to_string(),
+                        hi.to_string(),
                     )
                 } else {
                     ("NA".to_string(), "NA".to_string(), "NA".to_string())
                 };
                 writeln!(
                     file,
-                    "{}\t{}\t{:.6}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     id,
-                    clamp,
+                    sd,
                     pred,
                     se_str,
                     lo_str,

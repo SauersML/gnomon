@@ -57,6 +57,78 @@ impl PeeledHull {
         true
     }
 
+    /// Compute the signed distance from a point to the peeled hull boundary.
+    ///
+    /// Convention:
+    /// - Negative inside: exact distance to the nearest boundary facet.
+    /// - Positive outside: exact Euclidean distance to the polytope (via projection).
+    /// - Zero on the boundary.
+    pub fn signed_distance(&self, x: ArrayView1<f64>) -> f64 {
+        if self.is_inside(x) {
+            // Inside: distance to boundary is the minimum slack over facets.
+            // Facet normals are constructed unit-length, so slack equals Euclidean distance.
+            let mut min_slack = f64::INFINITY;
+            for (a, b) in &self.facets {
+                let slack = *b - a.dot(&x);
+                if slack < min_slack {
+                    min_slack = slack;
+                }
+            }
+            // Numerical safety: never return a negative slack for inside points
+            -min_slack.max(0.0)
+        } else {
+            // Outside: use Dykstra projection onto the feasible polytope
+            let z = self.project_point(x);
+            let diff = &x.to_owned() - &z;
+            let dist = diff.mapv(|v| v * v).sum().sqrt();
+            dist
+        }
+    }
+
+    /// Vectorized signed distance for a batch of points (row-wise).
+    pub fn signed_distance_many(&self, points: ArrayView2<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(points.nrows());
+        for i in 0..points.nrows() {
+            out[i] = self.signed_distance(points.row(i));
+        }
+        out
+    }
+
+    /// Compute signed distances and corresponding projections in a single pass.
+    /// Returns (signed_distances, projected_points).
+    pub fn signed_distance_and_project_many(
+        &self,
+        points: ArrayView2<f64>,
+    ) -> (Array1<f64>, Array2<f64>) {
+        let n = points.nrows();
+        let d = points.ncols();
+        let mut dist = Array1::zeros(n);
+        let mut proj = Array2::zeros((n, d));
+
+        for i in 0..n {
+            let xi = points.row(i);
+            if self.is_inside(xi) {
+                // Inside: negative min slack; projection is itself
+                let mut min_slack = f64::INFINITY;
+                for (a, b) in &self.facets {
+                    let slack = *b - a.dot(&xi);
+                    if slack < min_slack {
+                        min_slack = slack;
+                    }
+                }
+                dist[i] = -min_slack.max(0.0);
+                proj.row_mut(i).assign(&xi);
+            } else {
+                // Outside: project once; distance is Euclidean norm to projection
+                let zi = self.project_point(xi);
+                let di = (&xi.to_owned() - &zi).mapv(|v| v * v).sum().sqrt();
+                dist[i] = di;
+                proj.row_mut(i).assign(&zi.view());
+            }
+        }
+        (dist, proj)
+    }
+
     /// Project a single point onto the polytope using Dykstra's algorithm for halfspaces.
     fn project_point(&self, y: ArrayView1<f64>) -> Array1<f64> {
         let d = self.dim;
@@ -180,6 +252,30 @@ mod tests {
         for i in 0..corrected.nrows() {
             assert!(hull.is_inside(corrected.row(i)));
         }
+    }
+
+    #[test]
+    fn test_signed_distance_unit_square() {
+        let h = unit_square_hull();
+        // Inside center: nearest boundary at distance 0.5 (negative inside)
+        let d_center = h.signed_distance(array![0.5, 0.5].view());
+        assert!((d_center + 0.5).abs() < 1e-12);
+
+        // Inside near left edge: distance ~0.2 (negative)
+        let d_inside = h.signed_distance(array![0.2, 0.8].view());
+        assert!((d_inside + 0.2).abs() < 1e-12);
+
+        // On edge: exactly zero (treat as on/inside)
+        let d_edge = h.signed_distance(array![1.0, 0.3].view());
+        assert!(d_edge.abs() < 1e-12);
+
+        // Outside along +x: distance 0.5
+        let d_out_x = h.signed_distance(array![1.5, 0.5].view());
+        assert!((d_out_x - 0.5).abs() < 1e-8);
+
+        // Outside towards corner: distance sqrt(0.5^2 + 0.5^2)
+        let d_out_corner = h.signed_distance(array![1.5, -0.5].view());
+        assert!((d_out_corner - (0.5f64.hypot(0.5))).abs() < 1e-6);
     }
 }
 
