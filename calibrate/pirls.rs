@@ -1344,6 +1344,32 @@ pub fn solve_penalized_least_squares(
         // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
         let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
         if let Ok(chol) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+            // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
+            let cond_bad = match penalized_hessian.eigh(UPLO::Lower) {
+                Ok((eigs, _)) => {
+                    let mut min_ev = f64::INFINITY;
+                    let mut max_ev = 0.0f64;
+                    for &ev in eigs.iter() {
+                        if ev.is_finite() {
+                            if ev > max_ev { max_ev = ev; }
+                            if ev < min_ev { min_ev = ev; }
+                        }
+                    }
+                    // Treat non-positive or extremely small min eigenvalues as bad conditioning
+                    if !(min_ev.is_finite()) || min_ev <= 0.0 { true }
+                    else {
+                        let cond = max_ev / min_ev.max(std::f64::MIN_POSITIVE);
+                        cond > 1e8
+                    }
+                }
+                Err(_) => {
+                    // If we can't estimate, be conservative and proceed with SPD path
+                    false
+                }
+            };
+            if cond_bad {
+                println!("[PLS Solver] SPD/LLᵀ: condition poor; falling back to QR path");
+            } else {
             // Single multi-RHS solve: [ XtWz | Eᵀ ]
             let rk_rows = e_transformed.nrows();
             let nrhs = 1 + rk_rows;
@@ -1399,6 +1425,7 @@ pub fn solve_penalized_least_squares(
                 },
                 p_dim,
             ));
+            }
         }
         // If LLᵀ fails, continue into the robust QR path below.
     }
@@ -1559,6 +1586,8 @@ pub fn solve_penalized_least_squares(
         p_dim,
         stage2_timer.elapsed()
     );
+
+    
 
     //-----------------------------------------------------------------------
     // STAGE 3: Create rank-reduced system using the rank pivot
@@ -1792,7 +1821,7 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     // Calculate effective degrees of freedom using H and XtWX directly (stable)
-    let edf = calculate_edf(&penalized_hessian, &xtwx, e_transformed.nrows())?;
+    let edf = calculate_edf(&penalized_hessian, e_transformed)?;
 
     // Calculate scale parameter
     let scale = calculate_scale(
@@ -1939,66 +1968,25 @@ fn pivoted_qr_faer(
 /// This avoids pivot mismatches by using the correctly aligned final matrices
 fn calculate_edf(
     penalized_hessian: &Array2<f64>,
-    xtwx: &Array2<f64>,
-    penalty_rank: usize,
+    e_transformed: &Array2<f64>,
 ) -> Result<f64, EstimationError> {
-    use ndarray_linalg::{Cholesky, SVD, Solve, UPLO};
     let p = penalized_hessian.ncols();
-
-    if penalty_rank == 0 {
-        // Unpenalized: EDF is rank(X). Estimate rank from XtWX via SVD.
-        let (_, svals, _) = xtwx
-            .svd(false, false)
-            .map_err(EstimationError::LinearSystemSolveFailed)?;
-        let smax: f64 = svals.iter().cloned().fold(0.0_f64, f64::max);
-        let rank = svals.iter().filter(|&&v| v > smax * 1e-12).count();
-        return Ok(rank as f64);
+    let r = e_transformed.nrows();
+    if r == 0 {
+        return Ok(p as f64);
     }
-
-    // Penalized: use edf = tr(H^{-1} XtWX)
-    if let Ok(chol) = penalized_hessian.cholesky(UPLO::Lower) {
-        let mut trace: f64 = 0.0;
-        for j in 0..p {
-            let rhs_col = xtwx.column(j).to_owned();
-            let sol_col = chol
-                .solve(&rhs_col)
-                .map_err(EstimationError::LinearSystemSolveFailed)?;
-            trace += sol_col[j];
-        }
-        let edf = trace.max(0.0).min(p as f64);
-        return Ok(edf);
-    }
-
-    // Fallback: SVD-based pseudo-inverse for H, then tr(H⁺ XtWX)
-    let (maybe_u, svals, maybe_vt) = penalized_hessian
-        .svd(true, true)
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
-    let (u, vt) = match (maybe_u, maybe_vt) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-    };
-    let smax: f64 = svals.iter().cloned().fold(0.0_f64, |a, b| a.max(b.abs()));
-    let tol = smax * 1e-12;
-    let mut s_inv = Array2::zeros((svals.len(), svals.len()));
-    for i in 0..svals.len() {
-        if svals[i] > tol {
-            s_inv[[i, i]] = 1.0 / svals[i];
+    let h_f = FaerMat::<f64>::from_fn(p, p, |i, j| penalized_hessian[[i, j]]);
+    let rhs = FaerMat::<f64>::from_fn(p, r, |i, j| e_transformed[(j, i)]);
+    let chol = FaerLlt::new(h_f.as_ref(), Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?;
+    let sol = chol.solve(rhs.as_ref());
+    let mut tr_hinv_s = 0.0f64;
+    for j in 0..r {
+        for i in 0..p {
+            tr_hinv_s += sol[(i, j)] * e_transformed[(j, i)];
         }
     }
-    let pinv_h = vt.t().dot(&s_inv).dot(&u.t());
-    let inv_h_xtwx = pinv_h.dot(xtwx);
-    let trace: f64 = (0..p).map(|i| inv_h_xtwx[[i, i]]).sum();
-    let edf = trace.clamp(0.0, p as f64);
-    if !edf.is_finite() {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-    Ok(edf)
+    Ok((p as f64 - tr_hinv_s).clamp(0.0, p as f64))
 }
 
 /// Calculate scale parameter correctly for different link functions

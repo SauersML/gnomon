@@ -1408,6 +1408,34 @@ pub(super) struct RemlState<'a> {
             let p = pr.beta_transformed.len() as f64;
             let edf = (p - trace_h_inv_s_lambda).max(1.0);
 
+            // H-only consistency check that does not depend on X/W and is valid with stabilized H
+            // edf_alt = tr(H^{-1} (H - S_λ)) = p - tr(H^{-1} S_λ)
+            // Reuse penalty matrix S_λ computed in the same transformed basis as H
+            let s_from_e = pr.reparam_result.s_transformed.clone();
+            let h_minus_s = {
+                let mut m = h_eff.clone();
+                m -= &s_from_e;
+                m
+            };
+            let x_h_inv_h_minus_s = {
+                let (nr, nc) = (h_minus_s.nrows(), h_minus_s.ncols());
+                let rhs = FaerMat::<f64>::from_fn(nr, nc, |i, j| h_minus_s[[i, j]]);
+                factor.solve(rhs.as_ref())
+            };
+            let mut edf_alt = 0.0f64;
+            let diag_len = x_h_inv_h_minus_s.nrows().min(x_h_inv_h_minus_s.ncols());
+            for i in 0..diag_len {
+                edf_alt += x_h_inv_h_minus_s[(i, i)];
+            }
+            let rel_h_only = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
+            assert!(
+                rel_h_only < 1e-8,
+                "EDF H-only check failed: edf={:.6}, edf_alt(tr(H^-1(H-S)))={:.6} (rel={:.3e})",
+                edf,
+                edf_alt,
+                rel_h_only
+            );
+
             Ok(edf)
         }
         
