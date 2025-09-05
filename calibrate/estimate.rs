@@ -219,6 +219,27 @@ pub fn train_model(
         }
 
         let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
+        // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
+        let h_trans = final_fit.penalized_hessian_transformed.clone();
+        let qs = &final_fit.reparam_result.qs;
+        let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+        // Compute scale for Identity; 1.0 for Logit
+        let scale_val = match config.link_function {
+            LinkFunction::Logit => 1.0,
+            LinkFunction::Identity => {
+                // Weighted RSS over residuals divided by (n - edf)
+                let fitted = x_matrix.dot(&final_beta_original);
+                let residuals = data.y.clone() - &fitted;
+                let weighted_rss: f64 = data
+                    .weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum();
+                let effective_n = data.y.len() as f64;
+                weighted_rss / (effective_n - final_fit.edf).max(1.0)
+            }
+        };
         let mapped_coefficients =
             crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
 
@@ -254,6 +275,8 @@ pub fn train_model(
             coefficients: mapped_coefficients,
             lambdas: vec![],
             hull: hull_opt,
+            penalized_hessian: Some(penalized_hessian_orig),
+            scale: Some(scale_val),
         });
     }
 
@@ -919,6 +942,26 @@ pub fn train_model(
     // Transform the final, optimal coefficients from the stable basis
     // back to the original, interpretable basis.
     let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
+    // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
+    let h_trans = final_fit.penalized_hessian_transformed.clone();
+    let qs = &final_fit.reparam_result.qs;
+    let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+    // Compute scale for Identity; 1.0 for Logit
+    let scale_val = match config.link_function {
+        LinkFunction::Logit => 1.0,
+        LinkFunction::Identity => {
+            let fitted = reml_state.x().dot(&final_beta_original);
+            let residuals = reml_state.y().to_owned() - &fitted;
+            let weighted_rss: f64 = reml_state
+                .weights()
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            let effective_n = reml_state.y().len() as f64;
+            weighted_rss / (effective_n - final_fit.edf).max(1.0)
+        }
+    };
 
     // Now, map the coefficients from the original basis for user output.
     let mapped_coefficients =
@@ -955,6 +998,8 @@ pub fn train_model(
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
         hull: hull_opt,
+        penalized_hessian: Some(penalized_hessian_orig),
+        scale: Some(scale_val),
     })
 }
 

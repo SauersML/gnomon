@@ -118,6 +118,13 @@ pub struct TrainedModel {
     /// Robust geometric clamping hull (optional for backwards compatibility)
     #[serde(default)]
     pub hull: Option<PeeledHull>,
+    /// Optional penalized Hessian (X'WX + S) at convergence in the model's coefficient order.
+    /// When present, enables standard error estimates at prediction time via var = x^T H^{-1} x.
+    #[serde(default)]
+    pub penalized_hessian: Option<Array2<f64>>,
+    /// Optional scale parameter (Gaussian identity link). Used for mean SE scaling when applicable.
+    #[serde(default)]
+    pub scale: Option<f64>,
 }
 
 /// Custom error type for model loading, saving, and prediction.
@@ -148,6 +155,103 @@ pub enum ModelError {
 }
 
 impl TrainedModel {
+    /// Detailed predictions including linear predictor, mean response, clamping flags,
+    /// and optional standard errors on the linear predictor.
+    pub fn predict_detailed(
+        &self,
+        p_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<(
+        Array1<f64>, // eta (linear predictor)
+        Array1<f64>, // mean (after inverse link)
+        Vec<u8>,     // clamped_by_hull flags (0/1)
+        Option<Array1<f64>>, // se_eta if available
+    ), ModelError> {
+        // --- 1. Validate Inputs ---
+        if pcs_new.ncols() != self.config.pc_configs.len() {
+            return Err(ModelError::MismatchedPcCount { found: pcs_new.ncols(), expected: self.config.pc_configs.len() });
+        }
+
+        // --- 2. Peeled Hull Clamping (PHC) if hull available ---
+        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+        let (x_corr, _num_projected) = if let Some(hull) = &self.hull {
+            hull.project_if_needed(raw.view())
+        } else {
+            (raw.clone(), 0)
+        };
+        // Per-row clamping flags by comparing raw vs corrected
+        let mut clamped = Vec::with_capacity(raw.nrows());
+        for i in 0..raw.nrows() {
+            let mut changed = 0u8;
+            for j in 0..raw.ncols() {
+                if (raw[[i, j]] - x_corr[[i, j]]).abs() > 1e-12 {
+                    changed = 1;
+                    break;
+                }
+            }
+            clamped.push(changed);
+        }
+        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+
+        // --- 3. Build design and coefficients ---
+        let x_new = internal::construct_design_matrix(
+            p_corr.view(),
+            pcs_corr.view(),
+            &self.config,
+            &self.coefficients,
+        )?;
+        let beta = internal::flatten_coefficients(&self.coefficients, &self.config)?;
+        if x_new.ncols() != beta.len() {
+            return Err(ModelError::InternalStackingError);
+        }
+
+        // --- 4. Linear predictor and mean ---
+        let eta = x_new.dot(&beta);
+        let mean = match self.config.link_function {
+            LinkFunction::Logit => {
+                let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+                let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
+                probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+                probs
+            }
+            LinkFunction::Identity => eta.clone(),
+        };
+
+        // --- 5. Optional SE for eta using penalized Hessian ---
+        let se_eta_opt = if let Some(h) = &self.penalized_hessian {
+            if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
+                None
+            } else {
+                // Solve H v = x^T for each row x, var = x^T v
+                use ndarray_linalg::{Cholesky, UPLO, Solve};
+                let chol = match h.clone().cholesky(UPLO::Lower) {
+                    Ok(c) => c,
+                    Err(_) => return Ok((eta, mean, clamped, None)),
+                };
+                let mut vars = Array1::zeros(x_new.nrows());
+                for i in 0..x_new.nrows() {
+                    let x_row = x_new.row(i).to_owned();
+                    // Solve H v = x^T for v (1D)
+                    let v = match chol.solve(&x_row) {
+                        Ok(sol) => sol,
+                        Err(_) => { return Ok((eta, mean, clamped, None)); }
+                    };
+                    let var_i = x_row.dot(&v);
+                    vars[i] = if self.config.link_function == LinkFunction::Identity {
+                        // For Gaussian identity, scale variance if scale present
+                        if let Some(scale) = self.scale { var_i * scale } else { var_i }
+                    } else {
+                        var_i
+                    };
+                }
+                Some(vars.mapv(|v| v.max(0.0).sqrt()))
+            }
+        } else {
+            None
+        };
+
+        Ok((eta, mean, clamped, se_eta_opt))
+    }
     /// Predicts outcomes for new individuals using the trained model.
     ///
     /// This is the core inference engine. It is a fast, non-iterative process that:
@@ -738,6 +842,8 @@ mod tests {
             },
             lambdas: vec![],
             hull: None,
+            penalized_hessian: None,
+            scale: None,
         };
 
         // --- Define Test Points ---
@@ -812,6 +918,8 @@ mod tests {
             },
             lambdas: vec![],
             hull: None,
+            penalized_hessian: None,
+            scale: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -1088,6 +1196,8 @@ mod tests {
             // Match layout.num_penalties dynamically (PC null + PC range + interaction)
             lambdas: vec![0.1; layout.num_penalties],
             hull: None,
+            penalized_hessian: None,
+            scale: None,
         };
 
         // Create a temporary file for testing

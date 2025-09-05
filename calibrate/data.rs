@@ -48,6 +48,9 @@ pub struct PredictionData {
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
+    /// Optional sample identifiers. If an input column `sample_id` exists, it is used;
+    /// otherwise sequential IDs (1-based) are generated as strings.
+    pub sample_ids: Vec<String>,
 }
 
 /// A comprehensive error type for all data loading and validation failures.
@@ -100,8 +103,8 @@ pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, Da
 
 /// Loads and validates data specifically for prediction.
 pub fn load_prediction_data(path: &str, num_pcs: usize) -> Result<PredictionData, DataError> {
-    let (p, pcs, _, _) = internal::load_data(path, num_pcs, false, false)?;
-    Ok(PredictionData { p, pcs })
+    let (p, pcs, _, _, sample_ids) = internal::load_data_with_ids(path, num_pcs, false, false)?;
+    Ok(PredictionData { p, pcs, sample_ids })
 }
 
 /// Internal module for shared data loading logic.
@@ -391,6 +394,67 @@ mod internal {
             "Data validation successful: all required columns have numeric data with no missing values."
         );
         Ok((pgs, pcs, phenotype_opt, weights))
+    }
+
+    /// Variant of `load_data` that also extracts or synthesizes sample IDs.
+    pub(super) fn load_data_with_ids(
+        path: &str,
+        num_pcs: usize,
+        include_phenotype: bool,
+        require_weights: bool,
+    ) -> Result<
+        (
+            Array1<f64>,
+            Array2<f64>,
+            Option<Array1<f64>>,
+            Array1<f64>,
+            Vec<String>,
+        ),
+        DataError,
+    > {
+        // Load using the existing path
+        let (p, pcs, y_opt, w) = load_data(path, num_pcs, include_phenotype, require_weights)?;
+
+        // Reload a lightweight frame to try to get sample_id without duplicating conversions
+        let df = CsvReader::new(File::open(Path::new(path))?)
+            .with_options(
+                CsvReadOptions::default()
+                    .with_has_header(true)
+                    .with_parse_options(
+                        CsvParseOptions::default().with_separator(b'\t'),
+                    ),
+            )
+            .finish()?;
+
+        let n = p.len();
+        let sample_ids: Vec<String> = if df.get_column_names().iter().any(|c| c == &"sample_id") {
+            let s = df.column("sample_id")?;
+            if s.null_count() > 0 {
+                // If nulls exist, synthesize IDs
+                (1..=n).map(|i| i.to_string()).collect()
+            } else {
+                // Collect via per-row AnyValue -> String for robustness across dtypes
+                let len = s.len().min(n);
+                let mut out = Vec::with_capacity(n);
+                for i in 0..len {
+                    let v = s.get(i).unwrap_or(polars::prelude::AnyValue::Null);
+                    out.push(match v {
+                        polars::prelude::AnyValue::Null => (i + 1).to_string(),
+                        _ => v.to_string(),
+                    });
+                }
+                // If fewer than n due to any mismatch, pad sequentially
+                for i in len..n {
+                    out.push((i + 1).to_string());
+                }
+                out
+            }
+        } else {
+            // No sample_id column; synthesize sequential numeric IDs as strings
+            (1..=n).map(|i| i.to_string()).collect()
+        };
+
+        Ok((p, pcs, y_opt, w, sample_ids))
     }
 }
 

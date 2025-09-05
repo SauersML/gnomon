@@ -1972,6 +1972,8 @@ mod tests {
             coefficients: coeffs.clone(),
             lambdas: vec![], // not used at prediction
             hull: None,
+            penalized_hessian: None,
+            scale: None,
         };
 
         // Compute predictions via predict_linear() (which rebuilds X_new internally)

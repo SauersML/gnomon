@@ -171,13 +171,21 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     let data = load_prediction_data(&args.test_data, num_pcs)?;
     println!("Loaded {} samples for prediction", data.p.len());
 
-    // Make predictions
-    println!("Generating predictions...");
-    let predictions = model.predict(data.p.view(), data.pcs.view())?;
+    // Make detailed predictions
+    println!("Generating predictions with diagnostics...");
+    let (eta, mean, clamped, se_eta_opt) = model.predict_detailed(data.p.view(), data.pcs.view())?;
 
-    // Save predictions to hardcoded output path
+    // Save predictions with required columns to hardcoded output path
     let output_path = "predictions.tsv";
-    save_predictions(&predictions, output_path)?;
+    save_predictions_detailed(
+        &data.sample_ids,
+        &clamped,
+        &eta,
+        &mean,
+        se_eta_opt.as_ref(),
+        model.config.link_function,
+        output_path,
+    )?;
     println!("Predictions saved to: {output_path}");
 
     Ok(())
@@ -201,16 +209,92 @@ fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
     (min_val, max_val)
 }
 
-fn save_predictions(predictions: &Array1<f64>, output_path: &str) -> Result<(), std::io::Error> {
+fn save_predictions_detailed(
+    sample_ids: &Vec<String>,
+    clamped: &Vec<u8>,
+    eta: &Array1<f64>,
+    mean: &Array1<f64>,
+    se_eta_opt: Option<&Array1<f64>>,
+    link: LinkFunction,
+    output_path: &str,
+) -> Result<(), std::io::Error> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
-    writeln!(file, "prediction")?;
-
-    for &pred in predictions.iter() {
-        writeln!(file, "{pred:.6}")?;
+    match link {
+        LinkFunction::Logit => {
+            // Header for binary target
+            writeln!(
+                file,
+                "sample_id\tclamped_by_hull\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
+            )?;
+            for i in 0..eta.len() {
+                let id = &sample_ids[i];
+                let clamp = clamped[i];
+                let log_odds = eta[i];
+                let p = mean[i];
+                let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
+                    let se = se_eta[i];
+                    let lo_eta = log_odds - 1.959964 * se;
+                    let hi_eta = log_odds + 1.959964 * se;
+                    let lo_p = 1.0 / (1.0 + (-lo_eta).exp());
+                    let hi_p = 1.0 / (1.0 + (-hi_eta).exp());
+                    (
+                        format!("{:.6}", se),
+                        format!("{:.6}", lo_p.max(0.0).min(1.0)),
+                        format!("{:.6}", hi_p.max(0.0).min(1.0)),
+                    )
+                } else {
+                    ("NA".to_string(), "NA".to_string(), "NA".to_string())
+                };
+                writeln!(
+                    file,
+                    "{}\t{}\t{:.6}\t{}\t{:.6}\t{}\t{}",
+                    id,
+                    clamp,
+                    log_odds,
+                    se_str,
+                    p,
+                    lo_str,
+                    hi_str
+                )?;
+            }
+        }
+        LinkFunction::Identity => {
+            // Header for continuous target
+            writeln!(
+                file,
+                "sample_id\tclamped_by_hull\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
+            )?;
+            for i in 0..eta.len() {
+                let id = &sample_ids[i];
+                let clamp = clamped[i];
+                let pred = mean[i];
+                let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
+                    let se = se_eta[i];
+                    let lo = pred - 1.959964 * se;
+                    let hi = pred + 1.959964 * se;
+                    (
+                        format!("{:.6}", se),
+                        format!("{:.6}", lo),
+                        format!("{:.6}", hi),
+                    )
+                } else {
+                    ("NA".to_string(), "NA".to_string(), "NA".to_string())
+                };
+                writeln!(
+                    file,
+                    "{}\t{}\t{:.6}\t{}\t{}\t{}",
+                    id,
+                    clamp,
+                    pred,
+                    se_str,
+                    lo_str,
+                    hi_str
+                )?;
+            }
+        }
     }
-
     Ok(())
 }
 
