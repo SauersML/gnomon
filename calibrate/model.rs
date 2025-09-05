@@ -174,7 +174,7 @@ impl TrainedModel {
 
         // --- 2. Peeled Hull Clamping (PHC) if hull available ---
         let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-        let (x_corr, _num_projected) = if let Some(hull) = &self.hull {
+        let (x_corr, _) = if let Some(hull) = &self.hull {
             hull.project_if_needed(raw.view())
         } else {
             (raw.clone(), 0)

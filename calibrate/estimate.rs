@@ -1067,7 +1067,7 @@ fn log_layout_info(layout: &ModelLayout) {
 // Make internal module public for tests
 pub mod internal {
     use super::*;
-    use ndarray_linalg::{Cholesky, Eigh, SVD, UPLO, Solve};
+    use ndarray_linalg::{Cholesky, Eigh, UPLO};
     use ndarray_linalg::error::LinalgError;
 
     enum FaerFactor {
@@ -1086,60 +1086,7 @@ pub mod internal {
         }
     }
 
-    /// Robust solver that provides fallback mechanisms for maximum numerical stability
-    #[allow(dead_code)]
-    enum RobustSolver {
-        Cholesky(Array2<f64>), // Store matrix, factor per use (factor once per matrix-RHS)
-        Fallback(Array2<f64>),
-    }
 
-    #[allow(dead_code)]
-    impl RobustSolver {
-        /// Create a solver with automatic fallback: Cholesky → robust_solve
-        fn new(matrix: &Array2<f64>) -> Result<Self, EstimationError> {
-            // Probe Cholesky once to choose fast path; store matrix
-            match matrix.cholesky(UPLO::Lower) {
-                Ok(_) => {
-                    println!("Using Cholesky decomposition for matrix solving");
-                    Ok(RobustSolver::Cholesky(matrix.clone()))
-                }
-                Err(_) => {
-                    log::warn!(
-                        "Cholesky failed, will fall back to robust_solve for individual operations"
-                    );
-                    Ok(RobustSolver::Fallback(matrix.clone()))
-                }
-            }
-        }
-
-        fn solve_matrix(&self, rhs_matrix: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-            match self {
-                RobustSolver::Cholesky(stored_matrix) => {
-                    // Factor once per matrix-RHS and reuse across columns
-                    let chol = stored_matrix
-                        .cholesky(UPLO::Lower)
-                        .map_err(EstimationError::LinearSystemSolveFailed)?;
-                    let mut solution = Array2::zeros(rhs_matrix.raw_dim());
-                    for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
-                        let sol_col = chol
-                            .solve(&rhs_col.to_owned())
-                            .map_err(EstimationError::LinearSystemSolveFailed)?;
-                        solution.column_mut(j).assign(&sol_col);
-                    }
-                    Ok(solution)
-                }
-                RobustSolver::Fallback(stored_matrix) => {
-                    // Fallback: solve each column individually
-                    let mut solution = Array2::zeros(rhs_matrix.raw_dim());
-                    for (j, rhs_col) in rhs_matrix.axis_iter(Axis(1)).enumerate() {
-                        let sol_col = robust_solve(stored_matrix, &rhs_col.to_owned())?;
-                        solution.column_mut(j).assign(&sol_col);
-                    }
-                    Ok(solution)
-                }
-            }
-        }
-    }
 
     /// Holds the state for the outer REML optimization. Implements `CostFunction`
     /// and `Gradient` for the `argmin` library.
@@ -1170,9 +1117,7 @@ pub(super) struct RemlState<'a> {
     }
 
     impl<'a> RemlState<'a> {
-        // Default memory budget for hat matrix computation (MB)
-        #[allow(dead_code)]
-        const HAT_MB_BUDGET_DEFAULT: usize = 64;
+
         
         /// Computes the hat diagonal efficiently using chunking to bound memory usage.
         /// 
@@ -1181,138 +1126,7 @@ pub(super) struct RemlState<'a> {
         /// 
         /// Memory usage is automatically managed using an internal budget.
         /// 
-        // Method hat_diag_chunked removed
-        
-        /// Computes the hat diagonal efficiently using chunking to bound memory usage.
-        /// 
-        /// Instead of solving H C = Xᵀ for the whole matrix C (p × n), which can be very large
-        /// for large n, this method processes the data in blocks of rows to limit memory usage.
-        /// 
-        /// Memory usage is automatically managed using an internal budget.
-        /// 
-        /// # Arguments
-        /// * `solver` - The robust solver containing the Hessian
-        /// * `xt` - The design matrix X in transformed basis (n × p)
-        /// 
-        /// # Returns
-        /// * Array of hat diagonal values (length n)
-        #[allow(dead_code)]
-        fn hat_diag_chunked(
-            &self,
-            solver: &RobustSolver,
-            xt: ArrayView2<f64>,
-            w_diag: ArrayView1<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
-            let n = xt.nrows();
-            let p = xt.ncols();
-            
-            // Get memory budget from environment or use default
-            let budget_mb = match std::env::var("GAM_HAT_BLOCK_MB") {
-                Ok(val) => {
-                    match val.parse::<usize>() {
-                        Ok(mb) => mb.clamp(8, 4096),
-                        Err(_) => Self::HAT_MB_BUDGET_DEFAULT,
-                    }
-                },
-                Err(_) => Self::HAT_MB_BUDGET_DEFAULT,
-            };
-            
-            // Calculate block size based on memory budget and matrix dimensions
-            // Each f64 is 8 bytes, we'll be allocating a matrix of size (p × block_rows)
-            let bytes_per_element = 8;
-            let budget_bytes = budget_mb * 1024 * 1024;
-            let block_rows = std::cmp::max(1, budget_bytes / (bytes_per_element * p));
-            
-            // Clamp block_rows to at most n (the number of observations)
-            let block_rows = std::cmp::min(block_rows, n);
-            
-            // Log memory usage information
-            let peak_mb = (bytes_per_element * p * block_rows) / (1024 * 1024);
-            log::info!("Hat diagonal computation: p={}, n={}, block_rows={}, peak memory ~{}MB", 
-                     p, n, block_rows, peak_mb);
-            
-            if block_rows == 1 {
-                log::warn!("Hat diagonal using very small blocks (1 row); performance may be degraded");
-            }
-            
-            let mut hat = Array1::zeros(n);
-            
-            // Optimization: if block size >= n, do a single computation for the whole matrix
-            if block_rows >= n {
-                // Fast path: process all rows at once
-                // Build weighted design: Xw = diag(sqrt(W)) X
-                let sqrt_w = w_diag.mapv(f64::sqrt);
-                let xw = &xt * &sqrt_w.view().insert_axis(Axis(1));
-                let rhs = xw.t().to_owned(); // (p × n)
-                // Reuse factorization across all columns when available
-                match solver {
-                    RobustSolver::Cholesky(stored_matrix) => {
-                        let chol = stored_matrix
-                            .cholesky(UPLO::Lower)
-                            .map_err(EstimationError::LinearSystemSolveFailed)?;
-                        let mut c_full = Array2::zeros(rhs.raw_dim());
-                        for (j, rhs_col) in rhs.axis_iter(Axis(1)).enumerate() {
-                            let sol_col = chol
-                                .solve(&rhs_col.to_owned())
-                                .map_err(EstimationError::LinearSystemSolveFailed)?;
-                            c_full.column_mut(j).assign(&sol_col);
-                        }
-                        for i in 0..n {
-                            hat[i] = xw.row(i).dot(&c_full.column(i));
-                        }
-                    }
-                    RobustSolver::Fallback(_) => {
-                        let c_full = solver.solve_matrix(&rhs)?; // H⁻¹ (Xw)^T
-                        for i in 0..n {
-                            hat[i] = xw.row(i).dot(&c_full.column(i));
-                        }
-                    }
-                }
-                return Ok(hat);
-            }
-            
-            // Otherwise, process data in blocks to limit memory usage
-            let mut i = 0;
-            while i < n {
-                // Determine block size (handle last block potentially being smaller)
-                let b = usize::min(block_rows, n - i);
-                
-                // Extract block of rows from X and weights
-                let x_block = xt.slice(ndarray::s![i..i+b, ..]);
-                let w_block = w_diag.slice(ndarray::s![i..i+b]);
-                // Weighted block: Xw_block = diag(sqrt(W_block)) X_block
-                let sqrt_w_block = w_block.mapv(f64::sqrt);
-                let xw_block = &x_block * &sqrt_w_block.view().insert_axis(Axis(1));
-                // Form RHS = (Xw_block).t() (shape p × b)
-                let rhs = xw_block.t().to_owned();
-                // Solve H C_block = (Xw_block).t(), reusing factorization when available
-                let c_block = match solver {
-                    RobustSolver::Cholesky(stored_matrix) => {
-                        let chol = stored_matrix
-                            .cholesky(UPLO::Lower)
-                            .map_err(EstimationError::LinearSystemSolveFailed)?;
-                        let mut out = Array2::zeros(rhs.raw_dim());
-                        for (j, rhs_col) in rhs.axis_iter(Axis(1)).enumerate() {
-                            let sol_col = chol
-                                .solve(&rhs_col.to_owned())
-                                .map_err(EstimationError::LinearSystemSolveFailed)?;
-                            out.column_mut(j).assign(&sol_col);
-                        }
-                        out
-                    }
-                    RobustSolver::Fallback(_) => solver.solve_matrix(&rhs)?,
-                };
-                // Compute diagonal elements: hat[i+r] = (Xw_block)[r,:] · C_block[:,r]
-                for r in 0..b {
-                    hat[i + r] = xw_block.row(r).dot(&c_block.column(r));
-                }
-                
-                // Move to next block
-                i += b;
-            }
-            
-            Ok(hat)
-        }
+
         
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
@@ -2277,7 +2091,6 @@ pub(super) struct RemlState<'a> {
             let hessian_transformed = &pirls_result.penalized_hessian_transformed;
             let reparam_result = &pirls_result.reparam_result;
             // Use cached X·Qs from PIRLS (currently unused in this path)
-            let _x_transformed = pirls_result.x_transformed.view().to_owned();
             let rs_transformed = &reparam_result.rs_transformed;
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
@@ -2518,65 +2331,7 @@ pub(super) struct RemlState<'a> {
         }
     }
 
-    /// Robust solve using QR/SVD approach similar to mgcv's implementation
-    /// This avoids the singularity issues that plague direct matrix inversion
-#[allow(dead_code)]
-fn robust_solve(
-        matrix: &Array2<f64>,
-        rhs: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        // Fast path: attempt Cholesky (SPD). Avoids generic LU.
-        if let Ok(chol) = matrix.cholesky(UPLO::Lower) {
-            return chol
-                .solve(rhs)
-                .map_err(EstimationError::LinearSystemSolveFailed);
-        }
 
-        // If standard solve fails, use SVD-based least-squares without forming pinv
-        println!("Standard solve failed, using direct SVD solve");
-
-        match matrix.svd(true, true) {
-            Ok((Some(u), s, Some(vt))) => {
-                let smax = s.iter().fold(0.0f64, |a, &b| a.max(b));
-                let tolerance = smax * 1e-12;
-                // Compute x = V Σ^+ Uᵀ b without constructing Σ^+
-                let utb = u.t().dot(rhs);
-                let mut y = utb.clone();
-                for (yi, &si) in y.iter_mut().zip(s.iter()) {
-                    if si > tolerance { *yi /= si; } else { *yi = 0.0; }
-                }
-                let x = vt.t().dot(&y);
-                Ok(x)
-            }
-            _ => {
-                // Final fallback: small ridge + try Cholesky again, else SVD
-                let mut regularized = matrix.clone();
-                let ridge = 1e-6;
-                for i in 0..regularized.nrows() {
-                    regularized[[i, i]] += ridge;
-                }
-                if let Ok(chol) = regularized.cholesky(UPLO::Lower) {
-                    return chol
-                        .solve(rhs)
-                        .map_err(EstimationError::LinearSystemSolveFailed);
-                }
-                // Last resort: direct SVD solve on regularized matrix
-                match regularized.svd(true, true) {
-                    Ok((Some(u), s, Some(vt))) => {
-                        let smax = s.iter().fold(0.0f64, |a, &b| a.max(b));
-                        let tolerance = smax * 1e-12;
-                        let utb = u.t().dot(rhs);
-                        let mut y = utb.clone();
-                        for (yi, &si) in y.iter_mut().zip(s.iter()) {
-                            if si > tolerance { *yi /= si; } else { *yi = 0.0; }
-                        }
-                        Ok(vt.t().dot(&y))
-                    }
-                    _ => Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }),
-                }
-            }
-        }
-    }
 
     /// Implements the stable re-parameterization algorithm from Wood (2011) Appendix B
     /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
