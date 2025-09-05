@@ -1256,33 +1256,60 @@ pub(super) struct RemlState<'a> {
             let p = pr.beta_transformed.len() as f64;
             let edf = (p - trace_h_inv_s_lambda).max(1.0);
 
-            // H-only consistency check that does not depend on X/W and is valid with stabilized H
-            // edf_alt = tr(H^{-1} (H - S_λ)) = p - tr(H^{-1} S_λ)
-            // Reuse penalty matrix S_λ computed in the same transformed basis as H
-            let s_from_e = pr.reparam_result.s_transformed.clone();
-            let h_minus_s = {
-                let mut m = h_eff.clone();
-                m -= &s_from_e;
-                m
-            };
-            let x_h_inv_h_minus_s = {
-                let (nr, nc) = (h_minus_s.nrows(), h_minus_s.ncols());
-                let rhs = FaerMat::<f64>::from_fn(nr, nc, |i, j| h_minus_s[[i, j]]);
-                factor.solve(rhs.as_ref())
-            };
-            let mut edf_alt = 0.0f64;
-            let diag_len = x_h_inv_h_minus_s.nrows().min(x_h_inv_h_minus_s.ncols());
-            for i in 0..diag_len {
-                edf_alt += x_h_inv_h_minus_s[(i, i)];
+            // Cross-check EDF using algebraically equivalent form: tr(H^{-1}(H - S_λ)).
+            // Keep as a runtime invariant with a tolerance derived from floating-point error
+            // and the conditioning of H to avoid false positives in ill-conditioned cases.
+            {
+                // Reuse penalty matrix S_λ computed in the same transformed basis as H
+                let s_from_e = pr.reparam_result.s_transformed.clone();
+                let h_minus_s = {
+                    let mut m = h_eff.clone();
+                    m -= &s_from_e;
+                    m
+                };
+                let x_h_inv_h_minus_s = {
+                    let (nr, nc) = (h_minus_s.nrows(), h_minus_s.ncols());
+                    let rhs = FaerMat::<f64>::from_fn(nr, nc, |i, j| h_minus_s[[i, j]]);
+                    factor.solve(rhs.as_ref())
+                };
+                let mut edf_alt = 0.0f64;
+                let diag_len = x_h_inv_h_minus_s.nrows().min(x_h_inv_h_minus_s.ncols());
+                for i in 0..diag_len {
+                    edf_alt += x_h_inv_h_minus_s[(i, i)];
+                }
+
+                // Principled tolerance: scale by machine epsilon and κ₂(H)
+                let cond2 = match h_eff.eigh(UPLO::Lower) {
+                    Ok((evals, _)) => {
+                        let mut min_ev = f64::INFINITY;
+                        let mut max_ev = f64::NEG_INFINITY;
+                        for &ev in evals.iter() {
+                            if ev < min_ev { min_ev = ev; }
+                            if ev > max_ev { max_ev = ev; }
+                        }
+                        if min_ev > 0.0 { max_ev / min_ev } else { f64::INFINITY }
+                    }
+                    Err(_) => f64::INFINITY,
+                };
+                let eps = f64::EPSILON;
+                // Constant 10 moderates accumulation/solve effects without being overly loose
+                let tol = if cond2.is_finite() {
+                    10.0 * eps * (1.0 + cond2)
+                } else {
+                    // If condition estimation failed, fall back to a conservative bound
+                    1e-6
+                };
+                let rel_h_only = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
+                assert!(
+                    rel_h_only <= tol,
+                    "EDF H-only check failed: edf={:.6}, edf_alt(tr(H^-1(H-S)))={:.6} (rel={:.3e} > tol={:.3e}, κ2≈{:.3e})",
+                    edf,
+                    edf_alt,
+                    rel_h_only,
+                    tol,
+                    cond2
+                );
             }
-            let rel_h_only = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
-            assert!(
-                rel_h_only < 1e-8,
-                "EDF H-only check failed: edf={:.6}, edf_alt(tr(H^-1(H-S)))={:.6} (rel={:.3e})",
-                edf,
-                edf_alt,
-                rel_h_only
-            );
 
             Ok(edf)
         }
