@@ -199,6 +199,9 @@ pub enum ModelError {
         "Calibrated prediction requested but no calibrator is present (disabled or missing from model)."
     )]
     CalibratorMissing,
+    
+    #[error("Estimation error: {0}")]
+    EstimationError(#[from] crate::calibrate::estimate::EstimationError),
 }
 
 impl TrainedModel {
@@ -320,7 +323,7 @@ impl TrainedModel {
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         // Restore original behavior via detailed path: PHC -> design rebuild -> inverse link
-        let (_eta, mean, _signed_dist, _se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
+        let (_, mean, _, _) = self.predict_detailed(p_new, pcs_new)?;
         Ok(mean)
     }
 
@@ -339,7 +342,7 @@ impl TrainedModel {
         }
 
         // 3) Get eta, signed distance, and se(eta) via detailed path
-        let (eta, _mean_unused, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
+        let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
         let pred_in = match self.config.link_function {
             LinkFunction::Logit => eta.clone(),
@@ -352,7 +355,7 @@ impl TrainedModel {
             pred_in.view(),
             se_in.view(),
             signed_dist.view(),
-        );
+        )?;
         Ok(preds)
     }
 

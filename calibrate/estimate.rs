@@ -138,6 +138,12 @@ pub enum EstimationError {
 
     #[error("Calibrator training failed: {0}")]
     CalibratorTrainingFailed(String),
+
+    #[error("Invalid specification: {0}")]
+    InvalidSpecification(String),
+
+    #[error("Prediction error")]
+    PredictionError,
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -1099,6 +1105,8 @@ pub fn train_model(
             penalty_order_dist: base_penalty_order,
             double_penalty_ridge: 1e-6, // Keep the tiny ridge on the nullspace
             distance_hinge: true,       // Keep the distance hinge behavior
+            nullspace_shrinkage_kappa: Some(1.0), // Default equal shrinkage
+            prior_weights: None         // No custom weights
         };
 
         // Build design and penalties for calibrator
@@ -1147,6 +1155,8 @@ pub fn train_model(
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            se_linear_fallback: schema.se_linear_fallback,
+            dist_linear_fallback: schema.dist_linear_fallback,
             lambda_pred: lambdas_cal[0],
             lambda_se: lambdas_cal[1],
             lambda_dist: lambdas_cal[2],
