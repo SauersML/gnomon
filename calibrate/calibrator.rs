@@ -4369,7 +4369,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), w.view(), x.view(), None, link).unwrap();
+            compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
 
         // Create calibrator spec with enough knots to get ~p_cal parameters
         let spec = CalibratorSpec {
