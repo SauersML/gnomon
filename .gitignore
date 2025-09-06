@@ -9,3 +9,4 @@ calibrate/tests/__pycache__/
 calibrate/tests/bench_workdir/
 report.md
 diff.txt
+.devcontainer/
