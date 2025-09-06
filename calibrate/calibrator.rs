@@ -115,6 +115,8 @@ pub fn compute_alo_features(
     hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
 ) -> Result<CalibratorFeatures, EstimationError> {
+    // Touch prior_weights to satisfy unused-variable lint (we no longer use it for φ)
+    let _ = prior_weights.len();
     let n = base.x_transformed.nrows();
     let p = base.x_transformed.ncols();
 
@@ -127,7 +129,7 @@ pub fn compute_alo_features(
 
     // Factor K = X' W X + S_λ (use actual penalized Hessian from PIRLS, not the stabilized version).
     // The penalized_hessian_transformed is the correct matrix (X'WX + S_λ) for LOO leverage computation
-    let mut k = base.penalized_hessian_transformed.clone();
+    let k = base.penalized_hessian_transformed.clone();
     // Adaptive ridge for safety based on matrix scale
     // Use relative scaling (trace/p) for numerical stability
     // This means the ridge is proportional to the average diagonal element
@@ -766,34 +768,8 @@ pub fn build_calibrator_design(
         spec.se_basis.degree,
     )?;
     
-    // Apply sum-to-zero constraints using training weights
-    // We need to enforce ∑ᵢ wᵢ f(xᵢ) = 0 to prevent the intercept from shifting
-    // This is crucial for identifiability and correct estimation
-    
-    // Use training weights for STZ constraint if available (preferred)
-    // This ensures the constraint is orthogonal to the likelihood inner product
-    // and properly aligns the nullspace with the fitting weights
-    let train_weights = if let Some(ref weights) = spec.prior_weights {
-        weights.clone()
-    } else {
-        // Fall back to uniform weights if prior_weights not provided
-        // This is not ideal but maintains backwards compatibility
-        Array1::ones(n)
-    };
-    
-    // Normalize weights to have mean 1.0 for numerical stability
-    // This keeps the sum-to-zero constraint at a reasonable scale
-    let weight_mean = train_weights.sum() / n.max(1) as f64;
-    let w_normalized = if weight_mean > 0.0 {
-        &train_weights / weight_mean
-    } else {
-        // Fallback to uniform weights if sum is zero
-        eprintln!("[CAL] Warning: weights sum to zero, using uniform weights for STZ constraint");
-        Array1::ones(n)
-    };
-    
-    // Apply weighted constraint for predictor:
-    // ∑ᵢ wᵢ f(xᵢ) = 0 ensuring no intercept shift
+    // Apply sum-to-zero constraints (unweighted) to prevent intercept confounding.
+    // This keeps identifiability without tying constraints to any specific weights.
     let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), None)?;
     
     // For SE, check if we need to use linear fallback first (detected before standardization)
@@ -1253,58 +1229,43 @@ mod tests {
     fn logdet_penalty_pseudodet(s_lambda: &Array2<f64>) -> f64 {
         // Use existing eigendecomposition functionality from basis.rs
         // This avoids direct dependency on ndarray_linalg
-        let (evals, evecs_unused) = match crate::calibrate::basis::null_range_whiten(s_lambda) {
+        let evals = match crate::calibrate::basis::null_range_whiten(s_lambda) {
             Ok((null, range)) => {
-                // Count nullspace dim as zero eigenvalues, use range space for positives
                 let null_dim = null.ncols();
                 let range_dim = range.ncols();
                 let mut all_evals = Vec::with_capacity(null_dim + range_dim);
-                
-                // Estimate positive eigenvalues using the range space
-                // This is a simplification - we'd normally compute them directly
                 if range_dim > 0 {
-                    // Approximate positive eigenvalues using column norms of range space
                     for j in 0..range_dim {
                         let col = range.column(j);
                         let norm_squared: f64 = col.iter().map(|&x| x * x).sum();
                         all_evals.push(norm_squared);
                     }
                 }
-                
-                // Sort eigenvalues (zeros are implicit)
                 all_evals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                (all_evals, None::<Array2<f64>>)
+                all_evals
             },
             Err(_) => {
-                // Fallback: use manual power iteration to estimate eigenvalues
                 let n = s_lambda.nrows();
                 let mut evals = Vec::new();
-                
-                // Simple power iteration to find largest few eigenvalues
                 let mut remaining = s_lambda.clone();
-                for _ in 0..std::cmp::min(n, 10) { // Find at most 10 largest eigenvalues
+                for _ in 0..std::cmp::min(n, 10) {
                     let mut v = Array1::from_elem(n, 1.0 / (n as f64).sqrt());
-                    // Power iteration
                     for _ in 0..20 {
                         let v_new = remaining.dot(&v);
                         let norm = (v_new.iter().map(|x| x*x).sum::<f64>()).sqrt();
                         if norm < 1e-12_f64 { break; }
                         v = &v_new / norm;
                     }
-                    
-                    // Rayleigh quotient
                     let rayleigh = v.dot(&remaining.dot(&v));
                     if rayleigh > 1e-12_f64 {
                         evals.push(rayleigh);
-                        // Deflation
                         let vvt = v.to_shape((n, 1)).unwrap().dot(&v.to_shape((1, n)).unwrap());
                         remaining = &remaining - &(&vvt * rayleigh);
                     } else {
                         break;
                     }
                 }
-                
-                (evals, None)
+                evals
             }
         };
         
