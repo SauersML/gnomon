@@ -1023,15 +1023,26 @@ pub fn train_model(
             config.link_function,
         ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e)))?;
 
-        // Calibrator spec defaults
+        // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
+        // This ensures the calibrator lives in the same function class as the base smooth
+        let base_num_knots = config.pgs_basis_config.num_knots;
+        let base_degree = config.pgs_basis_config.degree;
+        let base_penalty_order = config.penalty_order;
+        
+        eprintln!("[CAL] Using base PGS smooth parameters: num_knots={}, degree={}, penalty_order={}", 
+                   base_num_knots, base_degree, base_penalty_order);
+        
         let spec = cal::CalibratorSpec {
             link: config.link_function,
-            pred_basis: crate::calibrate::model::BasisConfig { num_knots: 25, degree: 3 },
-            se_basis: crate::calibrate::model::BasisConfig { num_knots: 7, degree: 3 },
-            penalty_order_pred: 2,
-            penalty_order_se: 2,
-            double_penalty_ridge: 1e-6,
-            distance_hinge: true,
+            // Use identical parameters for all three calibrator smooths
+            pred_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
+            se_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
+            dist_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
+            penalty_order_pred: base_penalty_order,
+            penalty_order_se: base_penalty_order,
+            penalty_order_dist: base_penalty_order,
+            double_penalty_ridge: 1e-6,  // Keep the tiny ridge on the nullspace
+            distance_hinge: true,       // Keep the distance hinge behavior
         };
 
         // Build design and penalties for calibrator
@@ -1050,8 +1061,8 @@ pub fn train_model(
         ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e)))?;
 
         eprintln!(
-            "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}; edf: pred={:.2}, se={:.2}{}",
-            lambdas_cal[0], lambdas_cal[1], edf_pair.0, edf_pair.1,
+            "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, se={:.2}, dist={:.2}{}",
+            lambdas_cal[0], lambdas_cal[1], lambdas_cal[2], edf_pair.0, edf_pair.1, edf_pair.2,
             if config.link_function == LinkFunction::Identity {
                 format!("; scale={:.3e}", scale_cal)
             } else { String::new() }
@@ -1061,13 +1072,16 @@ pub fn train_model(
             spec: spec.clone(),
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
+            knots_dist: schema.knots_dist,
             stz_pred: schema.stz_pred,
             stz_se: schema.stz_se,
+            stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             lambda_pred: lambdas_cal[0],
             lambda_se: lambdas_cal[1],
+            lambda_dist: lambdas_cal[2],
             coefficients: beta_cal,
             column_spans: schema.column_spans,
             scale: if config.link_function == LinkFunction::Identity { Some(scale_cal) } else { None },
@@ -1076,25 +1090,28 @@ pub fn train_model(
         // Detailed one-time summary after calibration ends
         let deg_pred = spec.pred_basis.degree;
         let deg_se = spec.se_basis.degree;
+        let deg_dist = spec.dist_basis.degree;
         let m_pred_int = (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
         let m_se_int = (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
+        let m_dist_int = (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
         let rho_pred = model.lambda_pred.ln();
         let rho_se = model.lambda_se.ln();
+        let rho_dist = model.lambda_dist.ln();
         println!(
             concat!(
                 "[CAL][train] summary:\n",
-                "  design: n={}, p={}, pred_cols={}, se_cols={}, has_dist={}\n",
-                "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={}\n",
-                "  penalty: order_pred={}, order_se={}, nullspace_ridge={}\n",
-                "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3})\n",
-                "  edf:     pred={:.2}, se={:.2}, total={:.2}\n",
+                "  design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}\n",
+                "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
+                "  penalty: order_pred={}, order_se={}, order_dist={}, nullspace_ridge={}\n",
+                "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
+                "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
                 "  opt:     iterations={}, final_grad_norm={:.3e}"
             ),
-            x_cal.nrows(), x_cal.ncols(), model.column_spans.0, model.column_spans.1, model.column_spans.2,
-            deg_pred, m_pred_int, deg_se, m_se_int,
-            spec.penalty_order_pred, spec.penalty_order_se, spec.double_penalty_ridge,
-            model.lambda_pred, rho_pred, model.lambda_se, rho_se,
-            edf_pair.0, edf_pair.1, (edf_pair.0 + edf_pair.1),
+            x_cal.nrows(), x_cal.ncols(), model.column_spans.0.len(), model.column_spans.1.len(), model.column_spans.2.len(),
+            deg_pred, m_pred_int, deg_se, m_se_int, deg_dist, m_dist_int,
+            spec.penalty_order_pred, spec.penalty_order_se, spec.penalty_order_dist, spec.double_penalty_ridge,
+            model.lambda_pred, rho_pred, model.lambda_se, rho_se, model.lambda_dist, rho_dist,
+            edf_pair.0, edf_pair.1, edf_pair.2, (edf_pair.0 + edf_pair.1 + edf_pair.2),
             fit_meta.0, fit_meta.1
         );
 

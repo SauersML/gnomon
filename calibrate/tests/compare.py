@@ -565,6 +565,10 @@ def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
     # Add PyGAM if available
     if 'pygam_prediction' in df.columns:
         models["Python / PyGAM"] = df['pygam_prediction'].values
+        
+    # Add uncalibrated if available
+    if 'uncalibrated_prediction' in df.columns:
+        models["Uncalibrated Rust"] = df['uncalibrated_prediction'].values
     print("\n" + "="*60)
     print("      Model Performance on TEST Data")
     print("="*60)
@@ -653,12 +657,14 @@ def plot_prediction_comparisons(df):
         'rust': '#2ca02c',      # Green for Rust
         'r': '#1f77b4',         # Blue for R
         'pygam': '#ff7f0e',     # Orange for PyGAM
+        'uncalibrated': '#9467bd', # Purple for uncalibrated predictions
         'perfect': '#d62728',   # Red for perfect prediction lines
         'grid': '#cccccc'       # Light gray for grids
     }
     
     # Check which models we have
     has_pygam = 'pygam_prediction' in df.columns
+    has_uncalibrated = 'uncalibrated_prediction' in df.columns
     
     # Create custom colormaps with model-specific colors for density plots
     from matplotlib.colors import LinearSegmentedColormap
@@ -696,6 +702,16 @@ def plot_prediction_comparisons(df):
             'color': COLORS['pygam'],
             'marker': 'o',       # Circle
             'label': 'Python / PyGAM',
+            'zorder': 2
+        }
+        
+    # Add uncalibrated model if available
+    if has_uncalibrated:
+        models['Uncalibrated Rust'] = {
+            'predictions': 'uncalibrated_prediction',
+            'color': COLORS['uncalibrated'],
+            'marker': 'o',       # Circle
+            'label': 'Uncalibrated Rust',
             'zorder': 2
         }
     
@@ -837,6 +853,110 @@ def plot_prediction_comparisons(df):
     
     # Use more compatible padding approach instead of tight_layout
     fig.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.4, wspace=0.3)
+    plt.show()
+
+def plot_calibrated_vs_uncalibrated(df):
+    """
+    Create a plot comparing calibrated vs uncalibrated predictions for the Rust/gnomon model.
+    Only runs if uncalibrated_prediction column exists in the dataframe.
+    """
+    print("\n--- Generating Calibrated vs Uncalibrated Comparison Plot ---")
+    
+    # Check if uncalibrated predictions are available
+    if 'uncalibrated_prediction' not in df.columns:
+        print("Skipping calibrated vs uncalibrated comparison - uncalibrated_prediction column not found")
+        return
+    
+    # Define consistent colors for plot
+    COLORS = {
+        'rust': '#2ca02c',      # Green for Rust (calibrated)
+        'uncalibrated': '#9467bd', # Purple for uncalibrated
+        'perfect': '#d62728',   # Red for perfect prediction lines
+    }
+    
+    # Create figure with two subplots side by side
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+    fig.suptitle("Calibrated vs Uncalibrated Predictions (Rust/gnomon)", fontsize=20, y=0.98)
+    
+    # Define colormaps for density plots
+    from matplotlib.colors import LinearSegmentedColormap
+    calibrated_cmap = LinearSegmentedColormap.from_list('calibrated_cmap', ['#ffffff', COLORS['rust']], N=100)
+    uncalibrated_cmap = LinearSegmentedColormap.from_list('uncalibrated_cmap', ['#ffffff', COLORS['uncalibrated']], N=100)
+    
+    # Calculate MAE for both models for legend
+    calibrated_mae = np.mean(np.abs(df['final_probability'] - df['rust_prediction']))
+    uncalibrated_mae = np.mean(np.abs(df['final_probability'] - df['uncalibrated_prediction']))
+    
+    # --- Left subplot: Calibrated vs ground truth ---
+    ax1 = axes[0]
+    x = df['final_probability'].values
+    y = df['rust_prediction'].values
+    
+    # Use density coloring for scatter plot
+    from scipy.stats import gaussian_kde
+    try:
+        xy = np.vstack([x, y])
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x_sorted, y_sorted, density_sorted = x[idx], y[idx], density[idx]
+        scatter1 = ax1.scatter(x_sorted, y_sorted, c=density_sorted, cmap=calibrated_cmap,
+                           s=30, marker='o', edgecolor='none', alpha=0.8, zorder=2,
+                           label=f'Calibrated Predictions')
+    except Exception:
+        # Fallback if KDE fails
+        scatter1 = ax1.scatter(x, y, c=COLORS['rust'], s=30, marker='o', alpha=0.6,
+                           label=f'Calibrated Predictions')
+    
+    # Add reference line and styling
+    ax1.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
+    ax1.set_title(f"Calibrated Predictions vs. Ground Truth\nMAE = {calibrated_mae:.4f}", fontsize=16)
+    ax1.set_xlabel("True Probability", fontsize=14)
+    ax1.set_ylabel("Calibrated Prediction", fontsize=14)
+    ax1.set_xlim(-0.05, 1.05)
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.grid(True, linestyle='--', alpha=0.3)
+    ax1.legend(loc='upper left')
+    
+    # Add colorbar if available
+    if hasattr(scatter1, 'get_cmap'):
+        cbar1 = fig.colorbar(scatter1, ax=ax1, shrink=0.8)
+        cbar1.set_label('Density', rotation=270, labelpad=20)
+    
+    # --- Right subplot: Uncalibrated vs ground truth ---
+    ax2 = axes[1]
+    x = df['final_probability'].values
+    y = df['uncalibrated_prediction'].values
+    
+    # Use density coloring for scatter plot
+    try:
+        xy = np.vstack([x, y])
+        density = gaussian_kde(xy)(xy)
+        idx = np.argsort(density)
+        x_sorted, y_sorted, density_sorted = x[idx], y[idx], density[idx]
+        scatter2 = ax2.scatter(x_sorted, y_sorted, c=density_sorted, cmap=uncalibrated_cmap,
+                           s=30, marker='o', edgecolor='none', alpha=0.8, zorder=2,
+                           label=f'Uncalibrated Predictions')
+    except Exception:
+        # Fallback if KDE fails
+        scatter2 = ax2.scatter(x, y, c=COLORS['uncalibrated'], s=30, marker='o', alpha=0.6,
+                           label=f'Uncalibrated Predictions')
+    
+    # Add reference line and styling
+    ax2.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
+    ax2.set_title(f"Uncalibrated Predictions vs. Ground Truth\nMAE = {uncalibrated_mae:.4f}", fontsize=16)
+    ax2.set_xlabel("True Probability", fontsize=14)
+    ax2.set_ylabel("Uncalibrated Prediction", fontsize=14)
+    ax2.set_xlim(-0.05, 1.05)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    ax2.legend(loc='upper left')
+    
+    # Add colorbar if available
+    if hasattr(scatter2, 'get_cmap'):
+        cbar2 = fig.colorbar(scatter2, ax=ax2, shrink=0.8)
+        cbar2.set_label('Density', rotation=270, labelpad=20)
+    
+    fig.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust for the suptitle
     plt.show()
 
 def plot_model_surfaces(test_df):
@@ -1062,14 +1182,31 @@ def plot_model_calibration_comparison(df):
         'rust': '#2ca02c',      # Green for Rust
         'r': '#1f77b4',         # Blue for R
         'pygam': '#ff7f0e',     # Orange for PyGAM
+        'uncalibrated': '#9467bd', # Purple for uncalibrated predictions
         'perfect': '#d62728',   # Red for perfect prediction lines
     }
     
     # Check which models we have
     has_pygam = 'pygam_prediction' in df.columns
+    has_uncalibrated = 'uncalibrated_prediction' in df.columns
     
     # Set up the figure - adjust grid based on available models
-    if has_pygam:
+    if has_pygam and has_uncalibrated:
+        # 2x3 grid with all 4 models
+        fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+        fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
+        # Extract data for all models
+        y_true = df['outcome'].values
+        models = {
+            "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
+            "Python / PyGAM": {'preds': df['pygam_prediction'].values, 'color': COLORS['pygam'], 'ax': axes[0, 1]},
+            "Rust / gnomon": {'preds': df['rust_prediction'].values, 'color': COLORS['rust'], 'ax': axes[1, 0]},
+            "Uncalibrated Rust": {'preds': df['uncalibrated_prediction'].values, 'color': COLORS['uncalibrated'], 'ax': axes[1, 1]},
+        }
+        # Create a new figure for the comparison plot
+        comp_fig, comp_ax = plt.subplots(1, 1, figsize=(10, 8))
+        comparison_ax = comp_ax
+    elif has_pygam:
         # 2x2 grid with all 3 models
         fig, axes = plt.subplots(2, 2, figsize=(18, 16))
         fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
@@ -1079,6 +1216,18 @@ def plot_model_calibration_comparison(df):
             "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
             "Python / PyGAM": {'preds': df['pygam_prediction'].values, 'color': COLORS['pygam'], 'ax': axes[0, 1]},
             "Rust / gnomon": {'preds': df['rust_prediction'].values, 'color': COLORS['rust'], 'ax': axes[1, 0]},
+        }
+        comparison_ax = axes[1, 1]  # Last plot is for comparison
+    elif has_uncalibrated:
+        # 2x2 grid with R, Rust, and Uncalibrated
+        fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+        fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
+        # Extract data for all models
+        y_true = df['outcome'].values
+        models = {
+            "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
+            "Rust / gnomon": {'preds': df['rust_prediction'].values, 'color': COLORS['rust'], 'ax': axes[0, 1]},
+            "Uncalibrated Rust": {'preds': df['uncalibrated_prediction'].values, 'color': COLORS['uncalibrated'], 'ax': axes[1, 0]},
         }
         comparison_ax = axes[1, 1]  # Last plot is for comparison
     else:
@@ -1216,6 +1365,7 @@ def main():
     print_performance_report(combined_df, bootstrap_ci=True, n_boot=200, seed=42)
     plot_prediction_comparisons(combined_df)
     plot_model_calibration_comparison(combined_df)  # New calibration plots
+    plot_calibrated_vs_uncalibrated(combined_df)    # Compare calibrated vs uncalibrated predictions
     plot_model_surfaces(test_df)
 
     # --- 6. Final cleanup ---
