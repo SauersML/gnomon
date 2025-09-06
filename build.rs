@@ -1,6 +1,5 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
-use std::error::Error;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -26,6 +25,12 @@ struct CustomUppercaseCollector {
 
 // A custom collector for #[allow(dead_code)] attribute violations
 struct DeadCodeCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+// A custom collector for #[ignore] test attribute violations
+struct IgnoredTestCollector {
     violations: Vec<String>,
     file_path: PathBuf,
 }
@@ -163,6 +168,38 @@ impl DeadCodeCollector {
         );
         error_msg
             .push_str("   Either use the code (removing the attribute) or remove it completely.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl IgnoredTestCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} #[ignore] test attributes in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str("\n⚠️ #[ignore] TEST ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
+        error_msg.push_str("   IGNORING TESTS IS NEVER ALLOWED FOR ANY REASON.\n");
+        error_msg.push_str("   Fix the test so it can run properly without being ignored.\n");
 
         Some(error_msg)
     }
@@ -311,6 +348,22 @@ impl Sink for DeadCodeCollector {
     }
 }
 
+impl Sink for IgnoredTestCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        // Get the line number and the content of the matched line.
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // Format the violation string
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        // Return `Ok(true)` to continue searching for more matches in the same file.
+        Ok(true)
+    }
+}
+
 fn main() {
     // Always rerun this script if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
@@ -318,23 +371,38 @@ fn main() {
     // Manually check for unused variables in the build script
     manually_check_for_unused_variables();
 
-    // Scan Rust source files for underscore prefixed variables and fail if found.
-    if let Err(e) = scan_for_underscore_prefixes() {
-        // Print the formatted error and fail the build.
-        // The `eprintln!` here is crucial for showing the error in `cargo`'s output.
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
+    // Collect all violations from all checks
+    let mut all_violations = Vec::new();
 
-    // Scan Rust source files for forbidden comment patterns and fail if found.
-    if let Err(e) = scan_for_forbidden_comment_patterns() {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
+    // Scan Rust source files for underscore prefixed variables
+    let underscore_violations = scan_for_underscore_prefixes();
+    all_violations.extend(underscore_violations);
 
-    // Scan Rust source files for #[allow(dead_code)] attributes and fail if found.
-    if let Err(e) = scan_for_allow_dead_code() {
-        eprintln!("{e}");
+    // Scan Rust source files for forbidden comment patterns
+    let comment_violations = scan_for_forbidden_comment_patterns();
+    all_violations.extend(comment_violations);
+
+    // Scan Rust source files for #[allow(dead_code)] attributes
+    let dead_code_violations = scan_for_allow_dead_code();
+    all_violations.extend(dead_code_violations);
+    
+    // Scan Rust source files for #[ignore] test attributes
+    let ignored_test_violations = scan_for_ignored_tests();
+    all_violations.extend(ignored_test_violations);
+
+    // If any violations were found, print them all and exit with error
+    if !all_violations.is_empty() {
+        eprintln!("\n❌ VALIDATION ERRORS");
+        eprintln!("====================");
+        
+        let violation_count = all_violations.len();
+        
+        for violation in all_violations {
+            eprintln!("{violation}");
+            eprintln!("--------------------");
+        }
+        
+        eprintln!("\n⚠️ Found {} total code quality violations. Fix all issues before committing.", violation_count);
         std::process::exit(1);
     }
 }
@@ -398,64 +466,77 @@ fn manually_check_for_unused_variables() {
     }
 }
 
-fn scan_for_underscore_prefixes() -> Result<(), Box<dyn Error>> {
+fn scan_for_underscore_prefixes() -> Vec<String> {
     // Regex pattern to find underscore prefixed variable names.
     // This pattern needs to be more generalized to catch all underscore-prefixed variables,
     // especially in match statements and destructuring patterns
     let pattern = r"\b(_[a-zA-Z0-9_]+)\b";
-    let matcher = RegexMatcher::new_line_matcher(pattern)?;
-    let mut searcher = Searcher::new();
+    let mut all_violations = Vec::new();
+    
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
 
-    // Use `walkdir` to find all Rust files, replacing the `find` command.
-    // This is more portable and robust.
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok()) // Ignore any errors during directory traversal.
-        .filter(|e| !e.path().starts_with("./target")) // Exclude the target directory.
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-    // Keep only .rs files.
-    {
-        let path = entry.path();
+            // Use `walkdir` to find all Rust files, replacing the `find` command.
+            // This is more portable and robust.
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok()) // Ignore any errors during directory traversal.
+                .filter(|e| !e.path().starts_with("./target")) // Exclude the target directory.
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            // Keep only .rs files.
+            {
+                let path = entry.path();
 
-        // Check if we can read the file
-        match std::fs::read_to_string(path) {
-            Ok(_) => {}         // File exists and can be read
-            Err(_) => continue, // Skip files we can't read
-        };
+                // Check if we can read the file
+                match std::fs::read_to_string(path) {
+                    Ok(_) => {}         // File exists and can be read
+                    Err(_) => continue, // Skip files we can't read
+                };
 
-        // Add debug info for estimate.rs to help diagnose the underscore variable detection
-        let is_estimate_rs = path
-            .to_str()
-            .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
-        if is_estimate_rs {
-            println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
-        }
+                // Add debug info for estimate.rs to help diagnose the underscore variable detection
+                let is_estimate_rs = path
+                    .to_str()
+                    .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
+                if is_estimate_rs {
+                    println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
+                }
 
-        // Create a new collector for each file.
-        let mut collector = ViolationCollector::new(path);
+                // Create a new collector for each file.
+                let mut collector = ViolationCollector::new(path);
 
-        // Search the file using our regex matcher and collector sink.
-        searcher.search_path(&matcher, path, &mut collector)?;
-
-        // Process results
-        if let Some(error_message) = collector.check_and_get_error_message() {
-            // If violations were found, return the error
-            return Err(error_message.into());
+                // Search the file using our regex matcher and collector sink.
+                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                    // Handle search errors gracefully
+                    continue;
+                }
+                
+                // Process results
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    // Add this error to our collection instead of returning immediately
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // If there's an error creating the matcher, report it but don't return early
+            all_violations.push(format!("Error creating regex matcher for underscore prefixes: {}", e));
         }
     }
 
-    // If the loop completes without finding any violations, the check passes.
-    Ok(())
+    // Return all violations found
+    all_violations
 }
 
 fn is_doc_comment(line: &str) -> bool {
     line.trim_start().starts_with("///")
 }
 
-fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
+fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     // Regex patterns to find forbidden comment patterns
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
+    let mut all_violations = Vec::new();
 
     // Split into separate patterns for clarity and reliability
     // 1. Pattern to catch forbidden words in comments
@@ -465,107 +546,198 @@ fn scan_for_forbidden_comment_patterns() -> Result<(), Box<dyn Error>> {
     // 3. Pattern to catch comments where all alphabetic characters are uppercase
     let all_caps_pattern = r"(//|/\*|///).*";
 
-    // First check for forbidden words
-    let forbidden_matcher = RegexMatcher::new_line_matcher(forbidden_words_pattern)?;
-    let mut searcher = Searcher::new();
+    // Check for forbidden words
+    match RegexMatcher::new_line_matcher(forbidden_words_pattern) {
+        Ok(forbidden_matcher) => {
+            let mut searcher = Searcher::new();
 
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
-        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-    {
-        let path = entry.path();
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
 
-        // Use a collector that doesn't filter out doc comments for forbidden words
-        let mut collector = ForbiddenCommentCollector::new(path, true);
-        searcher.search_path(&forbidden_matcher, path, &mut collector)?;
-
-        if let Some(error_message) = collector.check_and_get_error_message() {
-            return Err(error_message.into());
+                // Use a collector that doesn't filter out doc comments for forbidden words
+                let mut collector = ForbiddenCommentCollector::new(path, true);
+                if searcher.search_path(&forbidden_matcher, path, &mut collector).is_err() {
+                    continue;
+                }
+                
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // Record the error but continue checking other patterns
+            all_violations.push(format!("Error creating forbidden words regex: {}", e));
         }
     }
 
-    // Then check for stars in non-doc comments
-    let stars_matcher = RegexMatcher::new_line_matcher(stars_pattern)?;
+    // Check for stars in non-doc comments
+    match RegexMatcher::new_line_matcher(stars_pattern) {
+        Ok(stars_matcher) => {
+            let mut searcher = Searcher::new();
 
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
-        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-    {
-        let path = entry.path();
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
 
-        // Use a single collector with custom filtering logic
-        // false means don't check for ** in doc comments
-        let mut collector = ForbiddenCommentCollector::new(path, false);
-        searcher.search_path(&stars_matcher, path, &mut collector)?;
-
-        if let Some(error_message) = collector.check_and_get_error_message() {
-            return Err(error_message.into());
+                // Use a single collector with custom filtering logic
+                // false means don't check for ** in doc comments
+                let mut collector = ForbiddenCommentCollector::new(path, false);
+                if searcher.search_path(&stars_matcher, path, &mut collector).is_err() {
+                    continue;
+                }
+                
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // Record the error but continue checking other patterns
+            all_violations.push(format!("Error creating stars pattern regex: {}", e));
         }
     }
 
     // Check for comments where all alphabetic characters are uppercase
-    let all_caps_matcher = RegexMatcher::new_line_matcher(all_caps_pattern)?;
+    match RegexMatcher::new_line_matcher(all_caps_pattern) {
+        Ok(all_caps_matcher) => {
+            let mut searcher = Searcher::new();
 
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| !e.path().starts_with("./target"))
-        .filter(|e| e.file_name() != "build.rs")
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-    {
-        let path = entry.path();
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target"))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
 
-        let mut custom_collector = CustomUppercaseCollector::new(path);
-        searcher.search_path(&all_caps_matcher, path, &mut custom_collector)?;
-
-        if let Some(error_message) = custom_collector.check_and_get_error_message() {
-            return Err(error_message.into());
+                let mut custom_collector = CustomUppercaseCollector::new(path);
+                if searcher.search_path(&all_caps_matcher, path, &mut custom_collector).is_err() {
+                    continue;
+                }
+                
+                if let Some(error_message) = custom_collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // Record the error but don't return early
+            all_violations.push(format!("Error creating uppercase pattern regex: {}", e));
         }
     }
 
-    Ok(())
+    all_violations
 }
 
-fn scan_for_allow_dead_code() -> Result<(), Box<dyn Error>> {
+fn scan_for_allow_dead_code() -> Vec<String> {
     // Regex pattern to find #[allow(dead_code)] attributes
     let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
-    let matcher = RegexMatcher::new_line_matcher(pattern)?;
-    let mut searcher = Searcher::new();
+    let mut all_violations = Vec::new();
+    
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
 
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
-        .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-    {
-        let path = entry.path();
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
 
-        // Check if we can read the file
-        match std::fs::read_to_string(path) {
-            Ok(_) => {}         // File exists and can be read
-            Err(_) => continue, // Skip files we can't read
-        };
+                // Check if we can read the file
+                match std::fs::read_to_string(path) {
+                    Ok(_) => {}         // File exists and can be read
+                    Err(_) => continue, // Skip files we can't read
+                };
 
-        // Create a collector for each file
-        let mut collector = DeadCodeCollector::new(path);
+                // Create a collector for each file
+                let mut collector = DeadCodeCollector::new(path);
 
-        // Search the file using our regex matcher and collector sink
-        searcher.search_path(&matcher, path, &mut collector)?;
-
-        // Process results
-        if let Some(error_message) = collector.check_and_get_error_message() {
-            // If violations were found, return the error
-            return Err(error_message.into());
+                // Search the file using our regex matcher and collector sink
+                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                    // Handle search errors gracefully
+                    continue;
+                }
+                
+                // Process results
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    // Add this error to our collection instead of returning immediately
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // If there's an error creating the matcher, report it but don't return early
+            all_violations.push(format!("Error creating dead code regex matcher: {}", e));
         }
     }
+    
+    // Return all violations found
+    all_violations
+}
 
-    // If the loop completes without finding any violations, the check passes
-    Ok(())
+fn scan_for_ignored_tests() -> Vec<String> {
+    // Regex pattern to find #[ignore] test attributes
+    let pattern = r"#\s*\[\s*ignore\s*\]";
+    let mut all_violations = Vec::new();
+    
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                // Check if we can read the file
+                match std::fs::read_to_string(path) {
+                    Ok(_) => {}         // File exists and can be read
+                    Err(_) => continue, // Skip files we can't read
+                };
+
+                // Create a collector for each file
+                let mut collector = IgnoredTestCollector::new(path);
+
+                // Search the file using our regex matcher and collector sink
+                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                    // Handle search errors gracefully
+                    continue;
+                }
+                
+                // Process results
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    // Add this error to our collection instead of returning immediately
+                    all_violations.push(error_message);
+                }
+            }
+        },
+        Err(e) => {
+            // If there's an error creating the matcher, report it but don't return early
+            all_violations.push(format!("Error creating ignored tests regex matcher: {}", e));
+        }
+    }
+    
+    // Return all violations found
+    all_violations
 }
