@@ -133,6 +133,21 @@ pub struct PenalizedBlock {
 }
 
 impl ModelLayout {
+    /// Minimal external layout for arbitrary design matrices used by the calibrator or adapters.
+    /// Sets only the fields required by PIRLS and reparameterization.
+    pub fn external(total_coeffs: usize, num_penalties: usize) -> Self {
+        ModelLayout {
+            intercept_col: 0,
+            pgs_main_cols: 0..0,
+            pc_null_cols: vec![],
+            pc_null_block_idx: vec![],
+            penalty_map: vec![],
+            pc_main_block_idx: vec![],
+            interaction_block_idx: vec![],
+            total_coeffs,
+            num_penalties,
+        }
+    }
     /// Creates a new layout based on the model configuration and basis dimensions.
     /// Enforces strict dimensional consistency across the entire GAM system.
     pub fn new(
@@ -1974,6 +1989,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
+            calibrator: None,
         };
 
         // Compute predictions via predict_linear() (which rebuilds X_new internally)

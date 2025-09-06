@@ -135,6 +135,9 @@ pub enum EstimationError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Calibrator training failed: {0}")]
+    CalibratorTrainingFailed(String),
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -277,6 +280,7 @@ pub fn train_model(
             hull: hull_opt,
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
+            calibrator: None,
         });
     }
 
@@ -992,6 +996,110 @@ pub fn train_model(
             }
         }
     };
+    // ===== Calibrator training (post-fit layer; loud behavior) =====
+    let calibrator_opt = if !crate::calibrate::model::calibrator_enabled() {
+        eprintln!("[CAL] Calibrator disabled by flag; skipping post-process calibration.");
+        None
+    } else {
+        eprintln!("[CAL] Calibrator enabled; starting post-process calibration...");
+        use crate::calibrate::calibrator as cal;
+        // Build raw predictor matrix used for hull and distance
+        let n = data.p.len();
+        let d = 1 + config.pc_configs.len();
+        let mut x_raw = ndarray::Array2::zeros((n, d));
+        x_raw.column_mut(0).assign(&data.p);
+        if d > 1 {
+            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+        }
+
+        // Compute ALO features from the base fit (fail loud if any error)
+        let features = cal::compute_alo_features(
+            &final_fit,
+            reml_state.y(),
+            reml_state.weights(),
+            x_raw.view(),
+            hull_opt.as_ref(),
+            config.link_function,
+        ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e)))?;
+
+        // Calibrator spec defaults
+        let spec = cal::CalibratorSpec {
+            link: config.link_function,
+            pred_basis: crate::calibrate::model::BasisConfig { num_knots: 25, degree: 3 },
+            se_basis: crate::calibrate::model::BasisConfig { num_knots: 7, degree: 3 },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            double_penalty_ridge: 1e-6,
+            distance_hinge: true,
+        };
+
+        // Build design and penalties for calibrator
+        eprintln!("[CAL] Building calibrator design and penalties...");
+        let (x_cal, penalties_cal, schema) = cal::build_calibrator_design(&features, &spec)
+            .map_err(|e| EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e)))?;
+
+        eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
+        let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
+            reml_state.y(),
+            reml_state.weights(),
+            x_cal.view(),
+            &penalties_cal,
+            config.link_function,
+            &spec,
+        ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e)))?;
+
+        eprintln!(
+            "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}; edf: pred={:.2}, se={:.2}{}",
+            lambdas_cal[0], lambdas_cal[1], edf_pair.0, edf_pair.1,
+            if config.link_function == LinkFunction::Identity {
+                format!("; scale={:.3e}", scale_cal)
+            } else { String::new() }
+        );
+
+        let model = cal::CalibratorModel {
+            spec: spec.clone(),
+            knots_pred: schema.knots_pred,
+            knots_se: schema.knots_se,
+            stz_pred: schema.stz_pred,
+            stz_se: schema.stz_se,
+            standardize_pred: schema.standardize_pred,
+            standardize_se: schema.standardize_se,
+            standardize_dist: schema.standardize_dist,
+            lambda_pred: lambdas_cal[0],
+            lambda_se: lambdas_cal[1],
+            coefficients: beta_cal,
+            column_spans: schema.column_spans,
+            scale: if config.link_function == LinkFunction::Identity { Some(scale_cal) } else { None },
+        };
+
+        // Detailed one-time summary after calibration ends
+        let deg_pred = spec.pred_basis.degree;
+        let deg_se = spec.se_basis.degree;
+        let m_pred_int = (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
+        let m_se_int = (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
+        let rho_pred = model.lambda_pred.ln();
+        let rho_se = model.lambda_se.ln();
+        println!(
+            concat!(
+                "[CAL][train] summary:\n",
+                "  design: n={}, p={}, pred_cols={}, se_cols={}, has_dist={}\n",
+                "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={}\n",
+                "  penalty: order_pred={}, order_se={}, nullspace_ridge={}\n",
+                "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3})\n",
+                "  edf:     pred={:.2}, se={:.2}, total={:.2}\n",
+                "  opt:     iterations={}, final_grad_norm={:.3e}"
+            ),
+            x_cal.nrows(), x_cal.ncols(), model.column_spans.0, model.column_spans.1, model.column_spans.2,
+            deg_pred, m_pred_int, deg_se, m_se_int,
+            spec.penalty_order_pred, spec.penalty_order_se, spec.double_penalty_ridge,
+            model.lambda_pred, rho_pred, model.lambda_se, rho_se,
+            edf_pair.0, edf_pair.1, (edf_pair.0 + edf_pair.1),
+            fit_meta.0, fit_meta.1
+        );
+
+        Some(model)
+    };
 
     Ok(TrainedModel {
         config: config_with_constraints,
@@ -1000,6 +1108,130 @@ pub fn train_model(
         hull: hull_opt,
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
+        calibrator: calibrator_opt,
+    })
+}
+
+// ===== External optimizer facade for arbitrary designs (e.g., calibrator) =====
+
+#[derive(Clone)]
+pub struct ExternalOptimOptions {
+    pub link: LinkFunction,
+    pub max_iter: usize,
+    pub tol: f64,
+}
+
+pub struct ExternalOptimResult {
+    pub beta: Array1<f64>,
+    pub lambdas: Array1<f64>,
+    pub scale: f64,
+    pub edf_by_block: Vec<f64>,
+    pub edf_total: f64,
+    pub iterations: usize,
+    pub final_grad_norm: f64,
+}
+
+/// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
+pub fn optimize_external_design(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: ArrayView2<'_, f64>,
+    s_list: &[Array2<f64>],
+    opts: &ExternalOptimOptions,
+) -> Result<ExternalOptimResult, EstimationError> {
+    use crate::calibrate::construction::compute_penalty_square_roots;
+    use crate::calibrate::model::ModelConfig;
+
+    let p = x.ncols();
+    let k = s_list.len();
+    let layout = ModelLayout::external(p, k);
+    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter);
+
+    let s_vec: Vec<Array2<f64>> = s_list.to_vec();
+    let rs_list = compute_penalty_square_roots(&s_vec)?;
+
+    // Clone inputs to own their storage and unify lifetimes inside this function
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.to_owned();
+    let reml_state = internal::RemlState::new(y_o.view(), x_o.view(), w_o.view(), s_vec, &layout, &cfg)?;
+    let initial_rho = Array1::<f64>::zeros(k);
+    // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
+    let initial_z = initial_rho.mapv(|r| {
+        let ratio = r / RHO_BOUND;
+        let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
+        0.5 * ((1.0 + xr) / (1.0 - xr)).ln()
+    });
+    let result = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+        .with_tolerance(opts.tol)
+        .with_max_iterations(opts.max_iter)
+        .run();
+    let (final_point, iters, grad_norm_reported) = match result {
+        Ok(BfgsSolution { final_point, iterations, final_gradient_norm, .. }) => (final_point, iterations, final_gradient_norm),
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => (last_solution.final_point.clone(), last_solution.iterations, last_solution.final_gradient_norm),
+        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => (last_solution.final_point.clone(), last_solution.iterations, last_solution.final_gradient_norm),
+        Err(e) => return Err(EstimationError::RemlOptimizationFailed(format!("{e:?}"))),
+    };
+    let final_rho = final_point.mapv(|v| RHO_BOUND * v.tanh());
+    let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
+    let pirls_res = pirls::fit_model_for_fixed_rho(
+        final_rho.view(), x_o.view(), y_o.view(), w_o.view(), &rs_list_ref, &layout, &cfg,
+    )?;
+
+    // Map beta back to original basis
+    let beta_orig = pirls_res.reparam_result.qs.dot(&pirls_res.beta_transformed);
+
+    // Scale (Gaussian) or 1.0 (Logit)
+    let scale = match opts.link {
+        LinkFunction::Identity => {
+            let fitted = x_o.dot(&beta_orig);
+            let resid = y_o.to_owned() - &fitted;
+            let rss: f64 = w_o.iter().zip(resid.iter()).map(|(&wi, &ri)| wi * ri * ri).sum();
+            let n = y_o.len() as f64;
+            rss / (n - pirls_res.edf).max(1.0)
+        }
+        LinkFunction::Logit => 1.0,
+    };
+
+    // EDF by block using stabilized H and penalty roots in transformed basis
+    let lambdas = final_rho.mapv(f64::exp);
+    let h = &pirls_res.stabilized_hessian_transformed;
+    let p_dim = h.nrows();
+    let h_f = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
+    let llt = FaerLlt::new(h_f.as_ref(), Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?;
+    let mut traces = vec![0.0f64; k];
+    for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+        let rank_k = rs.nrows();
+        let ekt = FaerMat::<f64>::from_fn(p_dim, rank_k, |i, j| rs[[j, i]]);
+        let x_sol = llt.solve(ekt.as_ref());
+        let mut frob = 0.0;
+        for j in 0..rank_k { for i in 0..p_dim { frob += x_sol[(i, j)] * ekt[(i, j)]; } }
+        traces[kk] = lambdas[kk] * frob;
+    }
+    let edf_total = (pirls_res.beta_transformed.len() as f64 - traces.iter().sum::<f64>())
+        .clamp(0.0, pirls_res.beta_transformed.len() as f64);
+    // Per-block EDF: use block range dimension (rank of R_k) minus λ tr(H^{-1} S_k)
+    // This better reflects penalized coefficients in the transformed basis
+    let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
+    for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+        let p_k = rs_k.nrows() as f64;
+        let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
+        edf_by_block.push(edf_k);
+    }
+
+    // Compute gradient norm at final rho for reporting
+    let final_grad = reml_state.compute_gradient(&final_rho).unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
+    let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+
+    Ok(ExternalOptimResult {
+        beta: beta_orig,
+        lambdas: lambdas.to_owned(),
+        scale,
+        edf_by_block,
+        edf_total,
+        iterations: iters,
+        final_grad_norm: if grad_norm_reported.is_finite() { grad_norm_reported } else { final_grad_norm },
     })
 }
 
@@ -1107,6 +1339,7 @@ pub(super) struct RemlState<'a> {
     pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
     layout: &'a ModelLayout,
     config: &'a ModelConfig,
+    
         cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
         faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
         eval_count: RefCell<u64>,
@@ -1161,7 +1394,7 @@ pub(super) struct RemlState<'a> {
                 rs_list,
                 layout,
                 config,
-                cache: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
                 faer_factor_cache: RefCell::new(HashMap::new()),
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
@@ -4551,15 +4784,15 @@ pub(super) struct RemlState<'a> {
             let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
-            let reml_state = internal::RemlState::new(
-                data.y.view(),
-                x_matrix.view(),
-                data.weights.view(),
-                s_list,
-                &layout,
-                &config,
-            )
-            .unwrap();
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x_matrix.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+        )
+        .unwrap();
 
             // Try the initial rho = [0, 0] that causes the problem
             let initial_rho = Array1::zeros(layout.num_penalties);

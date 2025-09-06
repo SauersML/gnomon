@@ -9,6 +9,14 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use thiserror::Error;
 
+// Global toggle for the optional post-process calibrator layer.
+// Enabled by default. Wire this to a CLI flag like `--no-calibrate` by
+// calling `model::set_calibrator_enabled(false)` before training/prediction.
+use std::sync::atomic::{AtomicBool, Ordering};
+static CALIBRATOR_ENABLED: AtomicBool = AtomicBool::new(true);
+pub fn set_calibrator_enabled(enabled: bool) { CALIBRATOR_ENABLED.store(enabled, Ordering::SeqCst); }
+pub fn calibrator_enabled() -> bool { CALIBRATOR_ENABLED.load(Ordering::SeqCst) }
+
 // --- Public Data Structures ---
 // These structs define the public, human-readable format of the trained model
 // when serialized to a TOML file.
@@ -87,6 +95,30 @@ pub struct ModelConfig {
     pub pc_null_transforms: HashMap<String, Array2<f64>>,
 }
 
+impl ModelConfig {
+    /// Minimal configuration for external designs (calibrator adapter).
+    /// Only the fields used by PIRLS/REML are populated; others are left empty.
+    pub fn external(link: LinkFunction, reml_tol: f64, reml_max_iter: usize) -> Self {
+        ModelConfig {
+            link_function: link,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 50,
+            reml_convergence_tolerance: reml_tol,
+            reml_max_iterations: reml_max_iter as u64,
+            pgs_basis_config: BasisConfig { num_knots: 0, degree: 0 },
+            pc_configs: Vec::new(),
+            pgs_range: (0.0, 1.0),
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+        }
+    }
+}
+
 /// A structured representation of the fitted model coefficients, designed for
 /// human interpretation and sharing. This structure is used in the TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +157,9 @@ pub struct TrainedModel {
     /// Optional scale parameter (Gaussian identity link). Used for mean SE scaling when applicable.
     #[serde(default)]
     pub scale: Option<f64>,
+    /// Optional post-fit calibrator model
+    #[serde(default)]
+    pub calibrator: Option<crate::calibrate::calibrator::CalibratorModel>,
 }
 
 /// Custom error type for model loading, saving, and prediction.
@@ -152,6 +187,9 @@ pub enum ModelError {
     ConstraintMissing(String),
     #[error("Coefficient vector for term '{0}' is missing from the model file.")]
     CoefficientMissing(String),
+
+    #[error("Calibrated prediction requested but no calibrator is present (disabled or missing from model).")]
+    CalibratorMissing,
 }
 
 impl TrainedModel {
@@ -260,69 +298,36 @@ impl TrainedModel {
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
-        // --- 1. Validate Inputs ---
-        if pcs_new.ncols() != self.config.pc_configs.len() {
-            return Err(ModelError::MismatchedPcCount {
-                found: pcs_new.ncols(),
-                expected: self.config.pc_configs.len(),
-            });
-        }
+        // Restore original behavior via detailed path: PHC -> design rebuild -> inverse link
+        let (_eta, mean, _signed_dist, _se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
+        Ok(mean)
+    }
 
-        // --- 2. Peeled Hull Clamping (PHC) if hull available ---
-        // Assemble raw predictors, optionally project, and split back
-        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-        let (x_corr, num_projected) = if let Some(hull) = &self.hull {
-            hull.project_if_needed(raw.view())
-        } else {
-            (raw, 0)
+    /// Predicts outcomes applying the optional post-process calibrator.
+    /// Baseline predictions are computed first, then the calibrator adjusts them.
+    pub fn predict_calibrated(
+        &self,
+        p_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<Array1<f64>, ModelError> {
+        // 1) Baseline predictions
+        let baseline = self.predict(p_new, pcs_new)?;
+        // 2) If no calibrator present, error loudly (no silent fallback)
+        if self.calibrator.is_none() { return Err(ModelError::CalibratorMissing); }
+
+        // 3) Get eta, signed distance, and se(eta) via detailed path
+        let (eta, _mean_unused, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
+        let cal = self.calibrator.as_ref().unwrap();
+        let pred_in = match self.config.link_function {
+            LinkFunction::Logit => eta.clone(),
+            LinkFunction::Identity => baseline.clone(),
         };
-        if x_corr.nrows() > 0 && num_projected > 0 {
-            let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
-            println!(
-                "[PHC] Projected {} of {} points ({:.1}%).",
-                num_projected,
-                x_corr.nrows(),
-                rate
-            );
-        }
-        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+        let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
 
-        // --- 3. Reconstruct Mathematical Objects ---
-        let x_new = internal::construct_design_matrix(
-            p_corr.view(),
-            pcs_corr.view(),
-            &self.config,
-            &self.coefficients,
-        )?;
-        let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
-
-        // This is a critical safety check. It ensures that the number of columns in the
-        // design matrix constructed for prediction exactly matches the number of coefficients
-        // in the flattened model vector. A mismatch here would lead to silently incorrect
-        // predictions and indicates a severe bug in the model's layout logic.
-        if x_new.ncols() != flattened_coeffs.len() {
-            return Err(ModelError::InternalStackingError);
-        }
-
-        // --- 4. Compute Linear Predictor ---
-        let eta = x_new.dot(&flattened_coeffs);
-
-        // --- 5. Apply Inverse Link Function ---
-        let predictions = match self.config.link_function {
-            LinkFunction::Logit => {
-                // Clamp eta to prevent numerical overflow in exp(), just like in pirls.rs
-                let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-                // Apply the inverse link function (sigmoid) to the clamped eta
-                let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e))); // Sigmoid
-                // Clamp probabilities away from 0 and 1 to prevent numerical instability
-                // This matches the behavior in the training code (pirls.rs::update_glm_vectors)
-                probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
-                probs
-            }
-            LinkFunction::Identity => eta,
-        };
-
-        Ok(predictions)
+        let preds = crate::calibrate::calibrator::predict_calibrator(
+            cal, pred_in.view(), se_in.view(), signed_dist.view(),
+        );
+        Ok(preds)
     }
 
     /// Returns the linear predictor (η = Xβ) for new data without applying the inverse link.
@@ -832,6 +837,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
+            calibrator: None,
         };
 
         // --- Define Test Points ---
@@ -908,6 +914,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
+            calibrator: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -1186,6 +1193,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
+            calibrator: None,
         };
 
         // Create a temporary file for testing
