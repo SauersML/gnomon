@@ -420,9 +420,7 @@ mod internal {
             .with_options(
                 CsvReadOptions::default()
                     .with_has_header(true)
-                    .with_parse_options(
-                        CsvParseOptions::default().with_separator(b'\t'),
-                    ),
+                    .with_parse_options(CsvParseOptions::default().with_separator(b'\t')),
             )
             .finish()?;
 

@@ -1110,7 +1110,7 @@ pub fn stable_reparameterization(
             let frob_norm = s_active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
             // Weight by lambda so the transform reflects current smoothing regime
             let omega_i = frob_norm * lambdas[i];
-        
+
             // No artificial perturbation - mgcv handles zero penalties exactly
             frob_norms.push((i, omega_i));
             max_omega = max_omega.max(omega_i);
@@ -1497,7 +1497,9 @@ pub fn stable_reparameterization(
     // let _ridge_eps: f64 = 1e-8;
 
     // Determine effective rank (for e_transformed shape) using raw spectrum and relative tolerance
-    let max_eigenval = s_eigenvalues_raw.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let max_eigenval = s_eigenvalues_raw
+        .iter()
+        .fold(0.0_f64, |a, &b| a.max(b.abs()));
     let tolerance = max_eigenval * 1e-12;
     let penalty_rank = s_eigenvalues_raw
         .iter()
@@ -1799,7 +1801,11 @@ mod tests {
                     && interaction_block.col_range.contains(&c)
                 {
                     if r == c {
-                        assert_abs_diff_eq!(s_interaction[[r, c]], alpha_interaction, epsilon = 1e-12);
+                        assert_abs_diff_eq!(
+                            s_interaction[[r, c]],
+                            alpha_interaction,
+                            epsilon = 1e-12
+                        );
                     } else {
                         assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
                     }

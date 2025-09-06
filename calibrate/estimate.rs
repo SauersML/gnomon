@@ -484,10 +484,10 @@ pub fn train_model(
         );
         to_z_from_rho(&Array1::from_elem(layout.num_penalties, 1.0))
     });
-    
+
     // Map to rho space for gradient check (always-on)
     let initial_rho = initial_z.mapv(|v| RHO_BOUND * v.tanh());
-    
+
     // Always-on gradient check - run once at the initial point (release builds included)
     eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy at initial point");
     if !initial_rho.is_empty() {
@@ -499,7 +499,13 @@ pub fn train_model(
         let dot = g_analytic.dot(&g_fd);
         let n_a = g_analytic.dot(&g_analytic).sqrt();
         let n_f = g_fd.dot(&g_fd).sqrt();
-        let cosine_sim = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else if n_a < 1e-12 && n_f < 1e-12 { 1.0 } else { 0.0 };
+        let cosine_sim = if n_a * n_f > 1e-12 {
+            dot / (n_a * n_f)
+        } else if n_a < 1e-12 && n_f < 1e-12 {
+            1.0
+        } else {
+            0.0
+        };
         let rel_l2 = {
             let diff = &g_fd - &g_analytic;
             let dnorm = diff.dot(&diff).sqrt();
@@ -518,7 +524,10 @@ pub fn train_model(
         let g_inf = g_ref.iter().fold(0.0_f64, |m, &v| m.max(v));
         let tau_abs = 1e-6_f64;
         let tau_rel = 1e-3_f64 * g_inf;
-        let mask: Vec<bool> = g_ref.iter().map(|&r| r >= tau_abs || r >= tau_rel).collect();
+        let mask: Vec<bool> = g_ref
+            .iter()
+            .map(|&r| r >= tau_abs || r >= tau_rel)
+            .collect();
 
         let mut kept = 0usize;
         let mut ok = 0usize;
@@ -528,19 +537,40 @@ pub fn train_model(
                 let r = g_ref[i];
                 // Scale-aware per-component tolerance: looser for very small components
                 let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
-                let rel_fac = if scale >= 0.10 { 0.15 } else if scale >= 0.03 { 0.35 } else { 0.70 };
+                let rel_fac = if scale >= 0.10 {
+                    0.15
+                } else if scale >= 0.03 {
+                    0.35
+                } else {
+                    0.70
+                };
                 let tol_i = 1e-8_f64 + rel_fac * r;
-                if (g_analytic[i] - g_fd[i]).abs() <= tol_i { ok += 1; }
+                if (g_analytic[i] - g_fd[i]).abs() <= tol_i {
+                    ok += 1;
+                }
             }
         }
-        let comp_rate = if kept > 0 { (ok as f64) / (kept as f64) } else { 1.0 };
-        eprintln!("  Component pass rate (masked) = {:.1}% (kept {} of {})", 100.0*comp_rate, kept, g_analytic.len());
+        let comp_rate = if kept > 0 {
+            (ok as f64) / (kept as f64)
+        } else {
+            1.0
+        };
+        eprintln!(
+            "  Component pass rate (masked) = {:.1}% (kept {} of {})",
+            100.0 * comp_rate,
+            kept,
+            g_analytic.len()
+        );
 
         // Acceptance: global metrics plus masked component rate
         let cosine_ok = cosine_sim >= 0.999;
         let rel_ok = (rel_l2 <= 5e-2) || (n_a < 1e-6);
         // For tiny kept sets (<=3), accept 50% to avoid false negatives in low-dim noisy cases
-        let comp_ok = if kept <= 3 { comp_rate >= 0.50 } else { comp_rate >= 0.70 };
+        let comp_ok = if kept <= 3 {
+            comp_rate >= 0.50
+        } else {
+            comp_rate >= 0.70
+        };
 
         if !(cosine_ok && rel_ok && comp_ok) {
             // Build clear failure diagnostics: which gates failed and why
@@ -558,7 +588,11 @@ pub fn train_model(
                 rel_l2,
                 rel_max,
                 if rel_ok { "OK" } else { "FAIL" },
-                if n_a < 1e-6 { " (analytic grad ~0, relaxed)" } else { "" }
+                if n_a < 1e-6 {
+                    " (analytic grad ~0, relaxed)"
+                } else {
+                    ""
+                }
             ));
             gates.push(format!(
                 "compRate(masked)={:.1}% (kept {}/{}; min {:.0}%) [{}]",
@@ -573,13 +607,21 @@ pub fn train_model(
             #[allow(clippy::type_complexity)]
             let mut offenders: Vec<(usize, f64, f64, f64, f64, f64)> = Vec::new();
             for i in 0..g_analytic.len() {
-                if !mask[i] { continue; }
+                if !mask[i] {
+                    continue;
+                }
                 let a = g_analytic[i];
                 let f = g_fd[i];
                 let r = g_ref[i];
                 let denom = 1e-8_f64.max(r);
                 let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
-                let rel_fac = if scale >= 0.10 { 0.15 } else if scale >= 0.03 { 0.35 } else { 0.70 };
+                let rel_fac = if scale >= 0.10 {
+                    0.15
+                } else if scale >= 0.03 {
+                    0.35
+                } else {
+                    0.70
+                };
                 let tol_i = 1e-8_f64 + rel_fac * r;
                 let rel = (a - f).abs() / denom;
                 if (a - f).abs() > tol_i {
@@ -845,7 +887,7 @@ pub fn train_model(
                     let max_grad_norm_rho = 50.0 * grad_tol;
                     let jac_max = z_last
                         .iter()
-                    .map(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)))
+                        .map(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)))
                         .fold(0.0f64, |a, b| a.max(b.abs()));
                     let max_grad_norm_z = jac_max * max_grad_norm_rho;
 
@@ -1021,34 +1063,50 @@ pub fn train_model(
             x_raw.view(),
             hull_opt.as_ref(),
             config.link_function,
-        ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e)))?;
+        )
+        .map_err(|e| {
+            EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
+        })?;
 
         // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
         // This ensures the calibrator lives in the same function class as the base smooth
         let base_num_knots = config.pgs_basis_config.num_knots;
         let base_degree = config.pgs_basis_config.degree;
         let base_penalty_order = config.penalty_order;
-        
-        eprintln!("[CAL] Using base PGS smooth parameters: num_knots={}, degree={}, penalty_order={}", 
-                   base_num_knots, base_degree, base_penalty_order);
-        
+
+        eprintln!(
+            "[CAL] Using base PGS smooth parameters: num_knots={}, degree={}, penalty_order={}",
+            base_num_knots, base_degree, base_penalty_order
+        );
+
         let spec = cal::CalibratorSpec {
             link: config.link_function,
             // Use identical parameters for all three calibrator smooths
-            pred_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
-            se_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
-            dist_basis: crate::calibrate::model::BasisConfig { num_knots: base_num_knots, degree: base_degree },
+            pred_basis: crate::calibrate::model::BasisConfig {
+                num_knots: base_num_knots,
+                degree: base_degree,
+            },
+            se_basis: crate::calibrate::model::BasisConfig {
+                num_knots: base_num_knots,
+                degree: base_degree,
+            },
+            dist_basis: crate::calibrate::model::BasisConfig {
+                num_knots: base_num_knots,
+                degree: base_degree,
+            },
             penalty_order_pred: base_penalty_order,
             penalty_order_se: base_penalty_order,
             penalty_order_dist: base_penalty_order,
-            double_penalty_ridge: 1e-6,  // Keep the tiny ridge on the nullspace
+            double_penalty_ridge: 1e-6, // Keep the tiny ridge on the nullspace
             distance_hinge: true,       // Keep the distance hinge behavior
         };
 
         // Build design and penalties for calibrator
         eprintln!("[CAL] Building calibrator design and penalties...");
         let (x_cal, penalties_cal, schema) = cal::build_calibrator_design(&features, &spec)
-            .map_err(|e| EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e)))?;
+            .map_err(|e| {
+                EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e))
+            })?;
 
         eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
         let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
@@ -1058,14 +1116,24 @@ pub fn train_model(
             &penalties_cal,
             config.link_function,
             &spec,
-        ).map_err(|e| EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e)))?;
+        )
+        .map_err(|e| {
+            EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
+        })?;
 
         eprintln!(
             "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, se={:.2}, dist={:.2}{}",
-            lambdas_cal[0], lambdas_cal[1], lambdas_cal[2], edf_pair.0, edf_pair.1, edf_pair.2,
+            lambdas_cal[0],
+            lambdas_cal[1],
+            lambdas_cal[2],
+            edf_pair.0,
+            edf_pair.1,
+            edf_pair.2,
             if config.link_function == LinkFunction::Identity {
                 format!("; scale={:.3e}", scale_cal)
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         );
 
         let model = cal::CalibratorModel {
@@ -1084,16 +1152,22 @@ pub fn train_model(
             lambda_dist: lambdas_cal[2],
             coefficients: beta_cal,
             column_spans: schema.column_spans,
-            scale: if config.link_function == LinkFunction::Identity { Some(scale_cal) } else { None },
+            scale: if config.link_function == LinkFunction::Identity {
+                Some(scale_cal)
+            } else {
+                None
+            },
         };
 
         // Detailed one-time summary after calibration ends
         let deg_pred = spec.pred_basis.degree;
         let deg_se = spec.se_basis.degree;
         let deg_dist = spec.dist_basis.degree;
-        let m_pred_int = (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
+        let m_pred_int =
+            (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
         let m_se_int = (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
-        let m_dist_int = (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
+        let m_dist_int =
+            (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
         let rho_pred = model.lambda_pred.ln();
         let rho_se = model.lambda_se.ln();
         let rho_dist = model.lambda_dist.ln();
@@ -1107,12 +1181,33 @@ pub fn train_model(
                 "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
                 "  opt:     iterations={}, final_grad_norm={:.3e}"
             ),
-            x_cal.nrows(), x_cal.ncols(), model.column_spans.0.len(), model.column_spans.1.len(), model.column_spans.2.len(),
-            deg_pred, m_pred_int, deg_se, m_se_int, deg_dist, m_dist_int,
-            spec.penalty_order_pred, spec.penalty_order_se, spec.penalty_order_dist, spec.double_penalty_ridge,
-            model.lambda_pred, rho_pred, model.lambda_se, rho_se, model.lambda_dist, rho_dist,
-            edf_pair.0, edf_pair.1, edf_pair.2, (edf_pair.0 + edf_pair.1 + edf_pair.2),
-            fit_meta.0, fit_meta.1
+            x_cal.nrows(),
+            x_cal.ncols(),
+            model.column_spans.0.len(),
+            model.column_spans.1.len(),
+            model.column_spans.2.len(),
+            deg_pred,
+            m_pred_int,
+            deg_se,
+            m_se_int,
+            deg_dist,
+            m_dist_int,
+            spec.penalty_order_pred,
+            spec.penalty_order_se,
+            spec.penalty_order_dist,
+            spec.double_penalty_ridge,
+            model.lambda_pred,
+            rho_pred,
+            model.lambda_se,
+            rho_se,
+            model.lambda_dist,
+            rho_dist,
+            edf_pair.0,
+            edf_pair.1,
+            edf_pair.2,
+            (edf_pair.0 + edf_pair.1 + edf_pair.2),
+            fit_meta.0,
+            fit_meta.1
         );
 
         Some(model)
@@ -1171,12 +1266,19 @@ pub fn optimize_external_design(
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.to_owned();
-    let reml_state = internal::RemlState::new(y_o.view(), x_o.view(), w_o.view(), s_vec, &layout, &cfg)?;
+    let reml_state =
+        internal::RemlState::new(y_o.view(), x_o.view(), w_o.view(), s_vec, &layout, &cfg)?;
     let initial_rho = Array1::<f64>::zeros(k);
     // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
     let initial_z = initial_rho.mapv(|r| {
         let ratio = r / RHO_BOUND;
-        let xr = if ratio < -0.999_999 { -0.999_999 } else if ratio > 0.999_999 { 0.999_999 } else { ratio };
+        let xr = if ratio < -0.999_999 {
+            -0.999_999
+        } else if ratio > 0.999_999 {
+            0.999_999
+        } else {
+            ratio
+        };
         0.5 * ((1.0 + xr) / (1.0 - xr)).ln()
     });
     let result = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
@@ -1184,15 +1286,34 @@ pub fn optimize_external_design(
         .with_max_iterations(opts.max_iter)
         .run();
     let (final_point, iters, grad_norm_reported) = match result {
-        Ok(BfgsSolution { final_point, iterations, final_gradient_norm, .. }) => (final_point, iterations, final_gradient_norm),
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => (last_solution.final_point.clone(), last_solution.iterations, last_solution.final_gradient_norm),
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => (last_solution.final_point.clone(), last_solution.iterations, last_solution.final_gradient_norm),
+        Ok(BfgsSolution {
+            final_point,
+            iterations,
+            final_gradient_norm,
+            ..
+        }) => (final_point, iterations, final_gradient_norm),
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => (
+            last_solution.final_point.clone(),
+            last_solution.iterations,
+            last_solution.final_gradient_norm,
+        ),
+        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => (
+            last_solution.final_point.clone(),
+            last_solution.iterations,
+            last_solution.final_gradient_norm,
+        ),
         Err(e) => return Err(EstimationError::RemlOptimizationFailed(format!("{e:?}"))),
     };
     let final_rho = final_point.mapv(|v| RHO_BOUND * v.tanh());
     let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
-        final_rho.view(), x_o.view(), y_o.view(), w_o.view(), &rs_list_ref, &layout, &cfg,
+        final_rho.view(),
+        x_o.view(),
+        y_o.view(),
+        w_o.view(),
+        &rs_list_ref,
+        &layout,
+        &cfg,
     )?;
 
     // Map beta back to original basis
@@ -1203,7 +1324,11 @@ pub fn optimize_external_design(
         LinkFunction::Identity => {
             let fitted = x_o.dot(&beta_orig);
             let resid = y_o.to_owned() - &fitted;
-            let rss: f64 = w_o.iter().zip(resid.iter()).map(|(&wi, &ri)| wi * ri * ri).sum();
+            let rss: f64 = w_o
+                .iter()
+                .zip(resid.iter())
+                .map(|(&wi, &ri)| wi * ri * ri)
+                .sum();
             let n = y_o.len() as f64;
             rss / (n - pirls_res.edf).max(1.0)
         }
@@ -1215,15 +1340,22 @@ pub fn optimize_external_design(
     let h = &pirls_res.stabilized_hessian_transformed;
     let p_dim = h.nrows();
     let h_f = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
-    let llt = FaerLlt::new(h_f.as_ref(), Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?;
+    let llt = FaerLlt::new(h_f.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
     let mut traces = vec![0.0f64; k];
     for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
         let rank_k = rs.nrows();
         let ekt = FaerMat::<f64>::from_fn(p_dim, rank_k, |i, j| rs[[j, i]]);
         let x_sol = llt.solve(ekt.as_ref());
         let mut frob = 0.0;
-        for j in 0..rank_k { for i in 0..p_dim { frob += x_sol[(i, j)] * ekt[(i, j)]; } }
+        for j in 0..rank_k {
+            for i in 0..p_dim {
+                frob += x_sol[(i, j)] * ekt[(i, j)];
+            }
+        }
         traces[kk] = lambdas[kk] * frob;
     }
     let edf_total = (pirls_res.beta_transformed.len() as f64 - traces.iter().sum::<f64>())
@@ -1238,7 +1370,9 @@ pub fn optimize_external_design(
     }
 
     // Compute gradient norm at final rho for reporting
-    let final_grad = reml_state.compute_gradient(&final_rho).unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
+    let final_grad = reml_state
+        .compute_gradient(&final_rho)
+        .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
     let final_grad_norm = final_grad.dot(&final_grad).sqrt();
 
     Ok(ExternalOptimResult {
@@ -1248,7 +1382,11 @@ pub fn optimize_external_design(
         edf_by_block,
         edf_total,
         iterations: iters,
-        final_grad_norm: if grad_norm_reported.is_finite() { grad_norm_reported } else { final_grad_norm },
+        final_grad_norm: if grad_norm_reported.is_finite() {
+            grad_norm_reported
+        } else {
+            final_grad_norm
+        },
     })
 }
 
@@ -1286,7 +1424,11 @@ fn compute_fd_gradient(
 
         // Prefer the larger-step derivative if the two disagree substantially
         let denom = d1.abs().max(d2.abs()).max(1e-12);
-        fd_grad[i] = if (d1 - d2).abs() > 0.2 * denom { d2 } else { d1 };
+        fd_grad[i] = if (d1 - d2).abs() > 0.2 * denom {
+            d2
+        } else {
+            d1
+        };
     }
 
     Ok(fd_grad)
@@ -1316,8 +1458,8 @@ fn log_layout_info(layout: &ModelLayout) {
 // Make internal module public for tests
 pub mod internal {
     use super::*;
-    use ndarray_linalg::{Cholesky, Eigh, UPLO};
     use ndarray_linalg::error::LinalgError;
+    use ndarray_linalg::{Cholesky, Eigh, UPLO};
 
     enum FaerFactor {
         Llt(FaerLlt<f64>),
@@ -1335,8 +1477,6 @@ pub mod internal {
         }
     }
 
-
-
     /// Holds the state for the outer REML optimization. Implements `CostFunction`
     /// and `Gradient` for the `argmin` library.
     ///
@@ -1347,16 +1487,16 @@ pub mod internal {
     /// for the same `rho` vector, which can happen during the line search.
     /// `RefCell` allows us to mutate the cache through a `&self` reference,
     /// making this optimization possible while adhering to the optimizer's API.
-pub(super) struct RemlState<'a> {
-    y: ArrayView1<'a, f64>,
-    x: ArrayView2<'a, f64>,
-    weights: ArrayView1<'a, f64>,
-    // Original penalty matrices S_k (p × p), ρ-independent basis
-    s_full_list: Vec<Array2<f64>>, 
-    pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
-    layout: &'a ModelLayout,
-    config: &'a ModelConfig,
-    
+    pub(super) struct RemlState<'a> {
+        y: ArrayView1<'a, f64>,
+        x: ArrayView2<'a, f64>,
+        weights: ArrayView1<'a, f64>,
+        // Original penalty matrices S_k (p × p), ρ-independent basis
+        s_full_list: Vec<Array2<f64>>,
+        pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
+        layout: &'a ModelLayout,
+        config: &'a ModelConfig,
+
         cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
         faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
         eval_count: RefCell<u64>,
@@ -1369,18 +1509,18 @@ pub(super) struct RemlState<'a> {
     impl<'a> RemlState<'a> {
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
-        /// 
+        ///
         /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
         /// If not, a small ridge is added to ensure positive definiteness, and that
         /// ridged matrix is returned along with the ridge value used.
         fn effective_hessian<'p>(&self, pr: &'p PirlsResult) -> (Array2<f64>, f64) {
             let h = pr.penalized_hessian_transformed.clone();
-            
+
             // Try Cholesky - if it succeeds, matrix is already PD
             if h.cholesky(UPLO::Lower).is_ok() {
                 return (h, 0.0); // No ridge needed
             }
-            
+
             // Add ridge for stabilization
             let mut h_eff = h.clone();
             let c = LAML_RIDGE;
@@ -1388,10 +1528,10 @@ pub(super) struct RemlState<'a> {
             for i in 0..p_dim {
                 h_eff[[i, i]] += c;
             }
-            
+
             (h_eff, c)
         }
-        
+
         pub(super) fn new(
             y: ArrayView1<'a, f64>,
             x: ArrayView2<'a, f64>,
@@ -1411,7 +1551,7 @@ pub(super) struct RemlState<'a> {
                 rs_list,
                 layout,
                 config,
-            cache: RefCell::new(HashMap::new()),
+                cache: RefCell::new(HashMap::new()),
                 faer_factor_cache: RefCell::new(HashMap::new()),
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
@@ -1466,22 +1606,22 @@ pub(super) struct RemlState<'a> {
             }
             Some(key)
         }
-        
+
         /// Calculate effective degrees of freedom (EDF) using a consistent approach
         /// for both cost and gradient calculations, ensuring identical values.
-        /// 
+        ///
         /// # Arguments
         /// * `pr` - PIRLS result containing the penalty matrices
         /// * `lambdas` - Smoothing parameters (lambda values)
         /// * `h_eff` - Effective Hessian matrix
-        /// 
+        ///
         /// # Returns
         /// * Effective degrees of freedom value
         fn edf_from_h_and_rk(
             &self,
             pr: &PirlsResult,
-            lambdas: &Array1<f64>, 
-            h_eff: &Array2<f64>
+            lambdas: &Array1<f64>,
+            h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
             // Factor the effective Hessian once
             let factor = self.get_faer_factor(lambdas, h_eff);
@@ -1489,7 +1629,9 @@ pub(super) struct RemlState<'a> {
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
             let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
-            let x = factor.solve(FaerMat::<f64>::from_fn(e_t.nrows(), e_t.ncols(), |i, j| e_t[[i, j]]).as_ref());
+            let x = factor.solve(
+                FaerMat::<f64>::from_fn(e_t.nrows(), e_t.ncols(), |i, j| e_t[[i, j]]).as_ref(),
+            );
             let trace_h_inv_s_lambda = {
                 // Frobenius inner product between H⁻¹ Eᵀ and Eᵀ
                 let mut acc = 0.0;
@@ -1534,10 +1676,18 @@ pub(super) struct RemlState<'a> {
                         let mut min_ev = f64::INFINITY;
                         let mut max_ev = f64::NEG_INFINITY;
                         for &ev in evals.iter() {
-                            if ev < min_ev { min_ev = ev; }
-                            if ev > max_ev { max_ev = ev; }
+                            if ev < min_ev {
+                                min_ev = ev;
+                            }
+                            if ev > max_ev {
+                                max_ev = ev;
+                            }
                         }
-                        if min_ev > 0.0 { max_ev / min_ev } else { f64::INFINITY }
+                        if min_ev > 0.0 {
+                            max_ev / min_ev
+                        } else {
+                            f64::INFINITY
+                        }
                     }
                     Err(_) => f64::INFINITY,
                 };
@@ -1563,16 +1713,16 @@ pub(super) struct RemlState<'a> {
 
             Ok(edf)
         }
-        
+
         // rho_key has been replaced by the more robust rho_key_sanitized method
-        
+
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
         /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
         /// Using these avoids accidental double counting of λ when forming derivatives.
-        /// 
+        ///
         /// # Arguments
         /// * `pr` - The PIRLS result with the transformation matrix Qs
-        /// 
+        ///
         /// # Returns
         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
             let p = h.nrows();
@@ -1600,7 +1750,7 @@ pub(super) struct RemlState<'a> {
                 }
             }
             let fact = Arc::new(self.factorize_faer(h));
-            
+
             if let Some(key) = key_opt {
                 let mut cache = self.faer_factor_cache.borrow_mut();
                 if cache.len() > 64 {
@@ -1643,7 +1793,7 @@ pub(super) struct RemlState<'a> {
                 let fp = self.penalised_ll_at(&rp)?;
                 let fm = self.penalised_ll_at(&rm)?;
                 // Minus sign: COST gradient uses - d penalised_ll / d rho
-                g[k] = - (fp - fm) / h;
+                g[k] = -(fp - fm) / h;
             }
             Ok(g)
         }
@@ -1672,14 +1822,18 @@ pub(super) struct RemlState<'a> {
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 { return Ok(Array1::zeros(0)); }
+            if rho.len() == 0 {
+                return Ok(Array1::zeros(0));
+            }
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
-                let mut rp = rho.clone(); rp[k] += 0.5 * h;
-                let mut rm = rho.clone(); rm[k] -= 0.5 * h;
+                let mut rp = rho.clone();
+                rp[k] += 0.5 * h;
+                let mut rm = rho.clone();
+                rm[k] -= 0.5 * h;
                 let fp = self.half_logh_at(&rp)?;
                 let fm = self.half_logh_at(&rm)?;
                 g[k] = (fp - fm) / h;
@@ -1759,7 +1913,9 @@ pub(super) struct RemlState<'a> {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
-                        self.cache.borrow_mut().insert(key, Arc::clone(&pirls_result));
+                        self.cache
+                            .borrow_mut()
+                            .insert(key, Arc::clone(&pirls_result));
                     }
                     Ok(pirls_result)
                 }
@@ -1800,37 +1956,72 @@ pub(super) struct RemlState<'a> {
                         "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                     );
                     // Diagnostics: which rho are at bounds
-                    let at_lower: Vec<usize> = p.iter().enumerate().filter_map(|(i,&v)| if v <= -RHO_BOUND + 1e-8 { Some(i) } else { None }).collect();
-                    let at_upper: Vec<usize> = p.iter().enumerate().filter_map(|(i,&v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None }).collect();
-                    eprintln!("[Diag] rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
+                    let at_lower: Vec<usize> = p
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &v)| {
+                            if v <= -RHO_BOUND + 1e-8 {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let at_upper: Vec<usize> = p
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
+                        .collect();
+                    eprintln!(
+                        "[Diag] rho bounds: lower={:?} upper={:?}",
+                        at_lower, at_upper
+                    );
                     return Ok(f64::INFINITY);
                 }
                 Err(e) => {
                     // Other errors still bubble up
                     // Provide bounds diagnostics here too
-                    let at_lower: Vec<usize> = p.iter().enumerate().filter_map(|(i,&v)| if v <= -RHO_BOUND + 1e-8 { Some(i) } else { None }).collect();
-                    let at_upper: Vec<usize> = p.iter().enumerate().filter_map(|(i,&v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None }).collect();
-                    eprintln!("[Diag] rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
+                    let at_lower: Vec<usize> = p
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &v)| {
+                            if v <= -RHO_BOUND + 1e-8 {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let at_upper: Vec<usize> = p
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
+                        .collect();
+                    eprintln!(
+                        "[Diag] rho bounds: lower={:?} upper={:?}",
+                        at_lower, at_upper
+                    );
                     return Err(e);
                 }
             };
-            
+
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
                 let kλ = p.len();
                 let kR = pirls_result.reparam_result.rs_transformed.len();
                 let kD = pirls_result.reparam_result.det1.len();
                 if !(kλ == kR && kR == kD) {
-                    return Err(EstimationError::LayoutError(
-                        format!("Penalty dimension mismatch: lambdas={}, R={}, det1={}", kλ, kR, kD)
-                    ));
+                    return Err(EstimationError::LayoutError(format!(
+                        "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
+                        kλ, kR, kD
+                    )));
                 }
             }
 
             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
             // Use our effective_hessian helper to check if the Hessian needs stabilization
             let (_, ridge_used) = self.effective_hessian(pirls_result.as_ref());
-            
+
             // Only check eigenvalues if we needed to add a ridge
             if ridge_used > 0.0 {
                 if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower)
@@ -1977,7 +2168,7 @@ pub(super) struct RemlState<'a> {
                             eprintln!("[Diag] H_eff min_eig={:.3e}", min_eig);
                         }
                     }
-                    
+
                     // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
                     // that will also be used in the gradient calculation
                     let log_det_h = match h_eff.cholesky(UPLO::Lower) {
@@ -2074,7 +2265,13 @@ pub(super) struct RemlState<'a> {
             };
 
             // Map from unbounded z to bounded rho via tanh
-            let rho = z.mapv(|v| if v.is_finite() { RHO_BOUND * v.tanh() } else { 0.0 });
+            let rho = z.mapv(|v| {
+                if v.is_finite() {
+                    RHO_BOUND * v.tanh()
+                } else {
+                    0.0
+                }
+            });
 
             // Attempt to compute the cost and gradient.
             let cost_result = self.compute_cost(&rho);
@@ -2149,17 +2346,22 @@ pub(super) struct RemlState<'a> {
                         let at_lower: Vec<usize> = rho
                             .iter()
                             .enumerate()
-                            .filter_map(|(i, &v)| if v <= -RHO_BOUND + 1e-8 { Some(i) } else { None })
+                            .filter_map(|(i, &v)| {
+                                if v <= -RHO_BOUND + 1e-8 {
+                                    Some(i)
+                                } else {
+                                    None
+                                }
+                            })
                             .collect();
                         let at_upper: Vec<usize> = rho
                             .iter()
                             .enumerate()
-                            .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
+                            .filter_map(
+                                |(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None },
+                            )
                             .collect();
-                        eprintln!(
-                            "  -> Rho bounds: lower={:?} upper={:?}",
-                            at_lower, at_upper
-                        );
+                        eprintln!("  -> Rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
                     }
                     // Try to get a useful gradient direction to move away from problematic region
                     let gradient = match self.compute_gradient(&rho) {
@@ -2334,17 +2536,18 @@ pub(super) struct RemlState<'a> {
             if p.len() == 0 {
                 return Ok(Array1::zeros(0));
             }
-            
+
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             let kλ = p.len();
             let kR = pirls_result.reparam_result.rs_transformed.len();
             let kD = pirls_result.reparam_result.det1.len();
             if !(kλ == kR && kR == kD) {
-                return Err(EstimationError::LayoutError(
-                    format!("Penalty dimension mismatch: lambdas={}, R={}, det1={}", kλ, kR, kD)
-                ));
+                return Err(EstimationError::LayoutError(format!(
+                    "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
+                    kλ, kR, kD
+                )));
             }
-            
+
             // --- Extract stable transformed quantities ---
             let beta_transformed = &pirls_result.beta_transformed;
             let hessian_transformed = &pirls_result.penalized_hessian_transformed;
@@ -2490,7 +2693,8 @@ pub(super) struct RemlState<'a> {
                     // No explicit deviance-by-beta channel here; we rely on numeric components for consistency.
 
                     // Precompute S_λ eigenstructure in ORIGINAL basis for det1
-                    let (log_det_s_full, s_eigs, s_vecs, s_tol) = self.s_lambda_logdet_and_eigs(&lambdas)?;
+                    let (log_det_s_full, s_eigs, s_vecs, s_tol) =
+                        self.s_lambda_logdet_and_eigs(&lambdas)?;
                     // Compute det1_full[k] = λ_k tr(S_λ^+ S_k) via eigenpairs
                     let mut det1_full = vec![0.0_f64; lambdas.len()];
                     for (i_ev, &ev) in s_eigs.iter().enumerate() {
@@ -2510,21 +2714,28 @@ pub(super) struct RemlState<'a> {
                     let (h_eff_m, _) = self.effective_hessian(&pirls_result);
                     let half_logh_val = match h_eff_m.cholesky(UPLO::Lower) {
                         Ok(l) => l.diag().mapv(f64::ln).sum(),
-                        Err(_) => {
-                            match h_eff_m.eigh(UPLO::Lower) {
-                                Ok((eigs, _)) => eigs
-                                    .iter()
-                                    .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
-                                    .map(|ev| 0.5 * ev.ln())
-                                    .sum(),
-                                Err(_) => f64::NAN,
-                            }
-                        }
+                        Err(_) => match h_eff_m.eigh(UPLO::Lower) {
+                            Ok((eigs, _)) => eigs
+                                .iter()
+                                .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
+                                .map(|ev| 0.5 * ev.ln())
+                                .sum(),
+                            Err(_) => f64::NAN,
+                        },
                     };
                     // Try to get min eigen for quick conditioning diagnostics
-                    let min_eig_opt = h_eff_m.eigh(UPLO::Lower).ok().and_then(|(e, _)| e.iter().cloned().reduce(f64::min));
-                    if let Some(min_eig) = min_eig_opt { eprintln!("[H_eff] ½·log|H|={:.6e}  min_eig={:.3e}", half_logh_val, min_eig); }
-                    else { eprintln!("[H_eff] ½·log|H|={:.6e}", half_logh_val); }
+                    let min_eig_opt = h_eff_m
+                        .eigh(UPLO::Lower)
+                        .ok()
+                        .and_then(|(e, _)| e.iter().cloned().reduce(f64::min));
+                    if let Some(min_eig) = min_eig_opt {
+                        eprintln!(
+                            "[H_eff] ½·log|H|={:.6e}  min_eig={:.3e}",
+                            half_logh_val, min_eig
+                        );
+                    } else {
+                        eprintln!("[H_eff] ½·log|H|={:.6e}", half_logh_val);
+                    }
 
                     // Summaries of numeric components (helpful in release logs)
                     let sum_pll = g_pll.sum();
@@ -2532,30 +2743,33 @@ pub(super) struct RemlState<'a> {
                     let sum_neg_half_logs = -0.5 * det1_full.iter().copied().sum::<f64>();
                     eprintln!(
                         "[LAML sum] Σ d(-ℓ_p)={:+.6e}  Σ ½ dlog|H|={:+.6e}  Σ (-½ dlog|S|)={:+.6e}",
-                        sum_pll, sum_half_logh, sum_neg_half_logs);
+                        sum_pll, sum_half_logh, sum_neg_half_logs
+                    );
 
                     // --- Loop through penalties to assemble gradient components ---
                     for k in 0..lambdas.len() {
                         // (1) ½ d log|H| / dρ_k using FULL numeric derivative (consistent with cost)
                         let log_det_h_grad_term = g_half_logh[k];
 
-                    // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
-                    let log_det_s_grad_term = 0.5 * det1_full[k];
+                        // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
+                        let log_det_s_grad_term = 0.5 * det1_full[k];
 
                         // (3) Numerical derivative of penalized log-likelihood part
                         let pll_grad_term = g_pll[k];
 
                         // Final assembly for COST gradient:
                         // dC/dρ_k = (- d penalised_ll / dρ_k) + ½ d log|H|/dρ_k − ½ d log|S_λ|_+/dρ_k
-                        cost_gradient[k] = pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
+                        cost_gradient[k] =
+                            pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
 
                         // Per-component gradient breakdown for observability
                         eprintln!(
-                          "[LAML g] k={k} d(-ℓ_p)={:+.6e}  +½ dlog|H|(full)={:+.6e}  -½ dlog|S|={:+.6e}  => g={:+.6e}",
-                          pll_grad_term,
-                          log_det_h_grad_term,
-                          -0.5 * det1_full[k],
-                          cost_gradient[k]);
+                            "[LAML g] k={k} d(-ℓ_p)={:+.6e}  +½ dlog|H|(full)={:+.6e}  -½ dlog|S|={:+.6e}  => g={:+.6e}",
+                            pll_grad_term,
+                            log_det_h_grad_term,
+                            -0.5 * det1_full[k],
+                            cost_gradient[k]
+                        );
                     }
                     // mgcv-style assembly
                     println!("LAML gradient computation finished.");
@@ -2566,31 +2780,46 @@ pub(super) struct RemlState<'a> {
             // The cost_gradient variable as computed above is already -∇V(ρ),
             // which is exactly what the optimizer needs.
             // No final negation is needed.
-            
+
             // One-direction secant test (cheap FD validation)
             if !p.is_empty() {
                 let h = 1e-4;
-                let mut dir = Array1::zeros(p.len()); dir[0] = 1.0; // pick k=0 or max|grad|
+                let mut dir = Array1::zeros(p.len());
+                dir[0] = 1.0; // pick k=0 or max|grad|
                 let gdot = cost_gradient.dot(&dir);
-                let fp = self.compute_cost(&(p.clone() + &(h * &dir))).unwrap_or(f64::INFINITY);
-                let fm = self.compute_cost(&(p.clone() - &(h * &dir))).unwrap_or(f64::INFINITY);
+                let fp = self
+                    .compute_cost(&(p.clone() + &(h * &dir)))
+                    .unwrap_or(f64::INFINITY);
+                let fm = self
+                    .compute_cost(&(p.clone() - &(h * &dir)))
+                    .unwrap_or(f64::INFINITY);
                 let secant = (fp - fm) / (2.0 * h);
                 let denom = gdot.abs().max(secant.abs()).max(1e-8);
-                eprintln!("[DD] dir-k={} g·d={:+.3e}  FD={:+.3e}  rel={:.2e}",
-                        0, gdot, secant, ((gdot-secant).abs()/denom));
-                
+                eprintln!(
+                    "[DD] dir-k={} g·d={:+.3e}  FD={:+.3e}  rel={:.2e}",
+                    0,
+                    gdot,
+                    secant,
+                    ((gdot - secant).abs() / denom)
+                );
+
                 // Check for exploding gradients
-                let big = cost_gradient.iter().map(|x| x.abs()).fold(0./0., f64::max);
+                let big = cost_gradient
+                    .iter()
+                    .map(|x| x.abs())
+                    .fold(0. / 0., f64::max);
                 if !big.is_finite() || big > 1e6 {
-                    eprintln!("[WARN] gradient exploded: max|g|={:.3e} (ρ={:?})", big, p.to_vec());
+                    eprintln!(
+                        "[WARN] gradient exploded: max|g|={:.3e} (ρ={:?})",
+                        big,
+                        p.to_vec()
+                    );
                 }
             }
 
             Ok(cost_gradient)
         }
     }
-
-
 
     /// Implements the stable re-parameterization algorithm from Wood (2011) Appendix B
     /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
@@ -3064,10 +3293,15 @@ pub(super) struct RemlState<'a> {
         // These tests are intentionally challenging and print detailed diagnostics.
         // They currently FAIL if the W-term is omitted from the LAML gradient.
 
-        fn build_logit_small_lambda_state(n: usize, seed: u64) -> (internal::RemlState<'static>, Array1<f64>) {
+        fn build_logit_small_lambda_state(
+            n: usize,
+            seed: u64,
+        ) -> (internal::RemlState<'static>, Array1<f64>) {
             use crate::calibrate::construction::build_design_and_penalty_matrices;
             use crate::calibrate::data::TrainingData;
-            use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig, PrincipalComponentConfig};
+            use crate::calibrate::model::{
+                BasisConfig, LinkFunction, ModelConfig, PrincipalComponentConfig,
+            };
 
             let mut rng = StdRng::seed_from_u64(seed);
             let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
@@ -3076,7 +3310,12 @@ pub(super) struct RemlState<'a> {
             pcs.column_mut(0).assign(&pc1);
             let logits = p.mapv(|v: f64| (0.9_f64 * v).max(-6.0_f64).min(6.0_f64));
             let y = super::test_helpers::generate_y_from_logit(&logits, &mut rng);
-            let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n) };
+            let data = TrainingData {
+                y,
+                p: p.clone(),
+                pcs,
+                weights: Array1::ones(n),
+            };
 
             let config = ModelConfig {
                 link_function: LinkFunction::Logit,
@@ -3085,10 +3324,16 @@ pub(super) struct RemlState<'a> {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
+                pgs_basis_config: BasisConfig {
+                    num_knots: 4,
+                    degree: 3,
+                },
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
-                    basis_config: BasisConfig { num_knots: 3, degree: 3 },
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
@@ -3100,11 +3345,16 @@ pub(super) struct RemlState<'a> {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, ..) = build_design_and_penalty_matrices(&data, &config)
-                .expect("matrix build");
+            let (x, s_list, layout, ..) =
+                build_design_and_penalty_matrices(&data, &config).expect("matrix build");
 
             // Leak owned arrays to obtain 'static views for the RemlState under test
-            let TrainingData { y, p: _, pcs: _, weights } = data;
+            let TrainingData {
+                y,
+                p: _,
+                pcs: _,
+                weights,
+            } = data;
             let y_static: &'static mut Array1<f64> = Box::leak(Box::new(y));
             let w_static: &'static mut Array1<f64> = Box::leak(Box::new(weights));
             let x_static: &'static mut Array2<f64> = Box::leak(Box::new(x));
@@ -3116,7 +3366,8 @@ pub(super) struct RemlState<'a> {
                 s_list,
                 Box::leak(Box::new(layout)),
                 Box::leak(Box::new(config)),
-            ).expect("RemlState");
+            )
+            .expect("RemlState");
 
             // Small lambdas: rho = -2 for each penalty
             let k = state.layout.num_penalties;
@@ -3130,8 +3381,10 @@ pub(super) struct RemlState<'a> {
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let h = (1e-4 * (1.0 + rho[k].abs())).max(1e-5);
-                let mut rp = rho.clone(); rp[k] += 0.5 * h;
-                let mut rm = rho.clone(); rm[k] -= 0.5 * h;
+                let mut rp = rho.clone();
+                rp[k] += 0.5 * h;
+                let mut rm = rho.clone();
+                rm[k] -= 0.5 * h;
                 let fp = state.compute_cost(&rp).expect("cost+");
                 let fm = state.compute_cost(&rm).expect("cost-");
                 g[k] = (fp - fm) / h;
@@ -3148,8 +3401,7 @@ pub(super) struct RemlState<'a> {
             let log_det_h = match h_eff.cholesky(UPLO::Lower) {
                 Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                 Err(_) => {
-                    let (eigs, _) = h_eff.eigh(UPLO::Lower)
-                        .expect("eigh for H_eff");
+                    let (eigs, _) = h_eff.eigh(UPLO::Lower).expect("eigh for H_eff");
                     eigs.iter()
                         .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
                         .map(|ev| ev.ln())
@@ -3163,8 +3415,10 @@ pub(super) struct RemlState<'a> {
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let h = (1e-4 * (1.0 + rho[k].abs())).max(1e-5);
-                let mut rp = rho.clone(); rp[k] += 0.5 * h;
-                let mut rm = rho.clone(); rm[k] -= 0.5 * h;
+                let mut rp = rho.clone();
+                rp[k] += 0.5 * h;
+                let mut rm = rho.clone();
+                rm[k] -= 0.5 * h;
                 let hp = half_logh(state, &rp);
                 let hm = half_logh(state, &rm);
                 g[k] = (hp - hm) / h;
@@ -3181,7 +3435,8 @@ pub(super) struct RemlState<'a> {
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let rt_arr = &pr.reparam_result.rs_transposed[k];
-                let rt = FaerMat::<f64>::from_fn(rt_arr.nrows(), rt_arr.ncols(), |i, j| rt_arr[[i, j]]);
+                let rt =
+                    FaerMat::<f64>::from_fn(rt_arr.nrows(), rt_arr.ncols(), |i, j| rt_arr[[i, j]]);
                 let x = factor.solve(rt.as_ref());
                 let trace = faer_frob_inner(x.as_ref(), rt.as_ref());
                 g[k] = 0.5 * (lambdas[k] * trace);
@@ -3220,14 +3475,22 @@ pub(super) struct RemlState<'a> {
             eprintln!("  d(-ℓp)      = {}", fmt_vec(&g_pll));
             eprintln!("  ½logH(S)    = {}", fmt_vec(&g_half_logh_s));
             eprintln!("  ½logH(full) = {}", fmt_vec(&g_half_logh_full));
-            eprintln!("  -½logS      = {}", fmt_vec(&( -0.5 * &g_log_s )));
+            eprintln!("  -½logS      = {}", fmt_vec(&(-0.5 * &g_log_s)));
 
             // Gates: code gradient should match both FD(cost) and the numeric assembly (g_true)
             let n_true = g_true.mapv(|x| x * x).sum().sqrt().max(1e-12);
             let rel_an_true = (&g_an - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
             let rel_fd_true = (&g_fd - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
-            assert!(rel_an_true <= 1e-2, "g_an vs g_true rel L2: {:.3e}", rel_an_true);
-            assert!(rel_fd_true <= 1e-2, "g_fd vs g_true rel L2: {:.3e}", rel_fd_true);
+            assert!(
+                rel_an_true <= 1e-2,
+                "g_an vs g_true rel L2: {:.3e}",
+                rel_an_true
+            );
+            assert!(
+                rel_fd_true <= 1e-2,
+                "g_fd vs g_true rel L2: {:.3e}",
+                rel_fd_true
+            );
         }
 
         #[test]
@@ -3238,7 +3501,10 @@ pub(super) struct RemlState<'a> {
             for &r in &grid {
                 let rho = Array1::from_elem(ks, r);
                 let g_fd = fd_cost_grad(&state, &rho);
-                let g_an = match state.compute_gradient(&rho) { Ok(g) => g, Err(_) => continue };
+                let g_an = match state.compute_gradient(&rho) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
                 let rel = (&g_an - &g_fd).mapv(|x| x * x).sum().sqrt()
                     / g_fd.mapv(|x| x * x).sum().sqrt().max(1e-12);
                 eprintln!("[lam sweep] rho={:>5.2}  relL2(g_an,g_fd)={:.3e}", r, rel);
@@ -3252,23 +3518,35 @@ pub(super) struct RemlState<'a> {
             let g_fd = fd_cost_grad(&state, &rho0);
             let g_an = state.compute_gradient(&rho0).expect("grad");
             // Direction j of largest discrepancy between code gradient and FD
-            let mut j = 0usize; let mut best = -1.0;
+            let mut j = 0usize;
+            let mut best = -1.0;
             for i in 0..rho0.len() {
                 let d = (g_fd[i] - g_an[i]).abs();
-                if d > best { best = d; j = i; }
+                if d > best {
+                    best = d;
+                    j = i;
+                }
             }
             let h = (1e-4 * (1.0 + rho0[j].abs())).max(1e-5);
-            let mut rp = rho0.clone(); rp[j] += 0.5 * h;
-            let mut rm = rho0.clone(); rm[j] -= 0.5 * h;
+            let mut rp = rho0.clone();
+            rp[j] += 0.5 * h;
+            let mut rm = rho0.clone();
+            rm[j] -= 0.5 * h;
             // Directional secant of the full COST (more robust and direct check)
             let fp = state.compute_cost(&rp).expect("cost+");
             let fm = state.compute_cost(&rm).expect("cost-");
             let fd_dir = (fp - fm) / h; // directional derivative of cost along e_j
             eprintln!(
                 "\n[dir cost] j={}  g_an[j]={:+.6e}  FD_dir(cost)={:+.6e}  diff={:+.6e}",
-                j, g_an[j], fd_dir, g_an[j] - fd_dir
+                j,
+                g_an[j],
+                fd_dir,
+                g_an[j] - fd_dir
             );
-            assert!((g_an[j] - fd_dir).abs() <= 1e-2, "Directional cost mismatch at small λ");
+            assert!(
+                (g_an[j] - fd_dir).abs() <= 1e-2,
+                "Directional cost mismatch at small λ"
+            );
         }
 
         /// Helper struct for per-term smoothness metrics
@@ -4219,8 +4497,7 @@ pub(super) struct RemlState<'a> {
 
             // --- 4. Verify model performance ---
             // Print the exact failure reason instead of a generic message
-            let model = model_result
-                .unwrap_or_else(|e| panic!("Model training failed: {:?}", e));
+            let model = model_result.unwrap_or_else(|e| panic!("Model training failed: {:?}", e));
 
             // Get predictions on training data
             let predictions = model.predict(data.p.view(), data.pcs.view())?;
@@ -4541,10 +4818,7 @@ pub(super) struct RemlState<'a> {
 
             // --- 3. TRAIN THE MODEL (using the existing `train_model` function) ---
             let trained_model = train_model(&data, &config).unwrap_or_else(|e| {
-                panic!(
-                    "Model training failed on this well-posed data: {:?}",
-                    e
-                )
+                panic!("Model training failed on this well-posed data: {:?}", e)
             });
 
             // --- 4. Evaluate the Model ---
@@ -4801,15 +5075,15 @@ pub(super) struct RemlState<'a> {
             let (x_matrix, s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        let reml_state = internal::RemlState::new(
-            data.y.view(),
-            x_matrix.view(),
-            data.weights.view(),
-            s_list,
-            &layout,
-            &config,
-        )
-        .unwrap();
+            let reml_state = internal::RemlState::new(
+                data.y.view(),
+                x_matrix.view(),
+                data.weights.view(),
+                s_list,
+                &layout,
+                &config,
+            )
+            .unwrap();
 
             // Try the initial rho = [0, 0] that causes the problem
             let initial_rho = Array1::zeros(layout.num_penalties);
@@ -6418,7 +6692,7 @@ mod reparam_consistency_tests {
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
     use ndarray::{Array1, Array2};
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     // For any rho (log-lambda), the chain rule requires
     // dC/drho = diag(lambda) * dC/dlambda with lambda = exp(rho).
@@ -6433,7 +6707,12 @@ mod reparam_consistency_tests {
         let y = p.mapv(|x: f64| 0.4 * (0.5 * x).sin() + 0.1 * x * x)
             + Array1::from_shape_fn(n, |_| rng.gen_range(-0.01..0.01));
         let pcs = Array2::zeros((n, 0));
-        let data = TrainingData { y, p: p.clone(), pcs, weights: Array1::ones(n) };
+        let data = TrainingData {
+            y,
+            p: p.clone(),
+            pcs,
+            weights: Array1::ones(n),
+        };
 
         let config = ModelConfig {
             link_function: LinkFunction::Identity,
@@ -6442,7 +6721,10 @@ mod reparam_consistency_tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            pgs_basis_config: BasisConfig { num_knots: 4, degree: 3 },
+            pgs_basis_config: BasisConfig {
+                num_knots: 4,
+                degree: 3,
+            },
             pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
             sum_to_zero_constraints: std::collections::HashMap::new(),
@@ -6453,8 +6735,8 @@ mod reparam_consistency_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
-        let (x, s_list, layout, ..) = build_design_and_penalty_matrices(&data, &config)
-            .expect("matrix build");
+        let (x, s_list, layout, ..) =
+            build_design_and_penalty_matrices(&data, &config).expect("matrix build");
 
         if layout.num_penalties == 0 {
             println!("Skipping reparam consistency test: no penalties.");
@@ -6468,7 +6750,8 @@ mod reparam_consistency_tests {
             s_list,
             &layout,
             &config,
-        ).expect("RemlState");
+        )
+        .expect("RemlState");
 
         // 2) Moderate random rho in [-1, 1]
         let k = layout.num_penalties;
@@ -6504,7 +6787,9 @@ mod reparam_consistency_tests {
             let lam_i = lambda[i].max(1e-12);
             let mut hi = 1e-4 * lam_i;
             // Keep step safe to avoid negative lambda
-            if hi > 0.49 * lam_i { hi = 0.49 * lam_i; }
+            if hi > 0.49 * lam_i {
+                hi = 0.49 * lam_i;
+            }
 
             let mut lam_plus = lambda.clone();
             let mut lam_minus = lambda.clone();
@@ -6545,7 +6830,11 @@ mod reparam_consistency_tests {
         // Slightly relaxed tolerances to avoid flakiness from numerical branches
         assert!(cos > 0.999, "cosine similarity too low: {}", cos);
         assert!(rel_err <= 3e-4, "relative L2 error too high: {}", rel_err);
-        assert!(norm_ratio > 0.998 && norm_ratio < 1.002, "norm ratio off: {}", norm_ratio);
+        assert!(
+            norm_ratio > 0.998 && norm_ratio < 1.002,
+            "norm ratio off: {}",
+            norm_ratio
+        );
     }
 }
 

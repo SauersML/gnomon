@@ -14,8 +14,12 @@ use thiserror::Error;
 // calling `model::set_calibrator_enabled(false)` before training/prediction.
 use std::sync::atomic::{AtomicBool, Ordering};
 static CALIBRATOR_ENABLED: AtomicBool = AtomicBool::new(true);
-pub fn set_calibrator_enabled(enabled: bool) { CALIBRATOR_ENABLED.store(enabled, Ordering::SeqCst); }
-pub fn calibrator_enabled() -> bool { CALIBRATOR_ENABLED.load(Ordering::SeqCst) }
+pub fn set_calibrator_enabled(enabled: bool) {
+    CALIBRATOR_ENABLED.store(enabled, Ordering::SeqCst);
+}
+pub fn calibrator_enabled() -> bool {
+    CALIBRATOR_ENABLED.load(Ordering::SeqCst)
+}
 
 // --- Public Data Structures ---
 // These structs define the public, human-readable format of the trained model
@@ -106,7 +110,10 @@ impl ModelConfig {
             max_iterations: 50,
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
-            pgs_basis_config: BasisConfig { num_knots: 0, degree: 0 },
+            pgs_basis_config: BasisConfig {
+                num_knots: 0,
+                degree: 0,
+            },
             pc_configs: Vec::new(),
             pgs_range: (0.0, 1.0),
             sum_to_zero_constraints: HashMap::new(),
@@ -188,7 +195,9 @@ pub enum ModelError {
     #[error("Coefficient vector for term '{0}' is missing from the model file.")]
     CoefficientMissing(String),
 
-    #[error("Calibrated prediction requested but no calibrator is present (disabled or missing from model).")]
+    #[error(
+        "Calibrated prediction requested but no calibrator is present (disabled or missing from model)."
+    )]
     CalibratorMissing,
 }
 
@@ -199,15 +208,21 @@ impl TrainedModel {
         &self,
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
-    ) -> Result<(
-        Array1<f64>,         // eta (linear predictor)
-        Array1<f64>,         // mean (after inverse link)
-        Array1<f64>,         // signed distance to peeled hull (negative inside)
-        Option<Array1<f64>>, // se_eta if available
-    ), ModelError> {
+    ) -> Result<
+        (
+            Array1<f64>,         // eta (linear predictor)
+            Array1<f64>,         // mean (after inverse link)
+            Array1<f64>,         // signed distance to peeled hull (negative inside)
+            Option<Array1<f64>>, // se_eta if available
+        ),
+        ModelError,
+    > {
         // --- 1. Validate Inputs ---
         if pcs_new.ncols() != self.config.pc_configs.len() {
-            return Err(ModelError::MismatchedPcCount { found: pcs_new.ncols(), expected: self.config.pc_configs.len() });
+            return Err(ModelError::MismatchedPcCount {
+                found: pcs_new.ncols(),
+                expected: self.config.pc_configs.len(),
+            });
         }
 
         // --- 2. Geometry: compute signed distance and projection in one pass ---
@@ -249,7 +264,7 @@ impl TrainedModel {
                 None
             } else {
                 // Solve H v = x^T for each row x, var = x^T v
-                use ndarray_linalg::{Cholesky, UPLO, Solve};
+                use ndarray_linalg::{Cholesky, Solve, UPLO};
                 let chol = match h.clone().cholesky(UPLO::Lower) {
                     Ok(c) => c,
                     Err(_) => return Ok((eta, mean, signed_dist, None)),
@@ -260,12 +275,18 @@ impl TrainedModel {
                     // Solve H v = x^T for v (1D)
                     let v = match chol.solve(&x_row) {
                         Ok(sol) => sol,
-                        Err(_) => { return Ok((eta, mean, signed_dist, None)); }
+                        Err(_) => {
+                            return Ok((eta, mean, signed_dist, None));
+                        }
                     };
                     let var_i = x_row.dot(&v);
                     vars[i] = if self.config.link_function == LinkFunction::Identity {
                         // For Gaussian identity, scale variance if scale present
-                        if let Some(scale) = self.scale { var_i * scale } else { var_i }
+                        if let Some(scale) = self.scale {
+                            var_i * scale
+                        } else {
+                            var_i
+                        }
                     } else {
                         var_i
                     };
@@ -313,7 +334,9 @@ impl TrainedModel {
         // 1) Baseline predictions
         let baseline = self.predict(p_new, pcs_new)?;
         // 2) If no calibrator present, error loudly (no silent fallback)
-        if self.calibrator.is_none() { return Err(ModelError::CalibratorMissing); }
+        if self.calibrator.is_none() {
+            return Err(ModelError::CalibratorMissing);
+        }
 
         // 3) Get eta, signed distance, and se(eta) via detailed path
         let (eta, _mean_unused, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
@@ -325,7 +348,10 @@ impl TrainedModel {
         let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
 
         let preds = crate::calibrate::calibrator::predict_calibrator(
-            cal, pred_in.view(), se_in.view(), signed_dist.view(),
+            cal,
+            pred_in.view(),
+            se_in.view(),
+            signed_dist.view(),
         );
         Ok(preds)
     }
@@ -1378,10 +1404,7 @@ pub fn map_coefficients(
         let pc_name = if let Some(start) = name_str.find("f(") {
             let rest = &name_str[start + 2..];
             let end = rest.find(')').ok_or_else(|| {
-                EstimationError::LayoutError(format!(
-                    "Malformed PC term name: {}",
-                    name_str
-                ))
+                EstimationError::LayoutError(format!("Malformed PC term name: {}", name_str))
             })?;
             rest[..end].to_string()
         } else {

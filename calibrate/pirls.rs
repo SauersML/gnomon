@@ -375,7 +375,8 @@ pub fn fit_model_for_fixed_rho(
             // Candidate eta for current α (avoid forming beta_candidate until accept)
             let eta_trial = &eta + &(alpha * &workspace.delta_eta);
             let mu_trial = mu_only(&eta_trial, config.link_function);
-            let deviance_trial = calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
+            let deviance_trial =
+                calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
 
             // First, check if the trial step resulted in a numerically valid state.
             // This is the most important check.
@@ -385,7 +386,8 @@ pub fn fit_model_for_fixed_rho(
 
             if is_numerically_valid {
                 // penalty(β + αΔ) = penalty(β) + 2α (Sβ·Δ) + α² (Δ·SΔ)
-                let penalty_trial = penalty_current_cached + 2.0 * alpha * cross + alpha * alpha * quad;
+                let penalty_trial =
+                    penalty_current_cached + 2.0 * alpha * cross + alpha * alpha * quad;
                 let penalized_deviance_trial = deviance_trial + penalty_trial;
                 // Track the last attempted change for diagnostics
                 last_halving_change = (penalized_deviance_trial - penalized_deviance_current).abs();
@@ -526,7 +528,11 @@ pub fn fit_model_for_fixed_rho(
             let probs_saturated = sat_frac > 0.95;
             // Extremely low deviance per sample indicates near-perfect separation
             let n_samples = y.len() as f64;
-            let dev_per_sample = if n_samples > 0.0 { last_deviance / n_samples } else { last_deviance };
+            let dev_per_sample = if n_samples > 0.0 {
+                last_deviance / n_samples
+            } else {
+                last_deviance
+            };
             let dev_tiny = dev_per_sample < 1e-2; // e.g., < 0.01 per sample
 
             // Direct separation-by-order check: all positives have higher η than all negatives
@@ -538,40 +544,57 @@ pub fn fit_model_for_fixed_rho(
                 if yi > 0.5 {
                     has_pos = true;
                     let v = eta[i];
-                    if v < min_eta_pos { min_eta_pos = v; }
+                    if v < min_eta_pos {
+                        min_eta_pos = v;
+                    }
                 } else {
                     has_neg = true;
                     let v = eta[i];
-                    if v > max_eta_neg { max_eta_neg = v; }
+                    if v > max_eta_neg {
+                        max_eta_neg = v;
+                    }
                 }
             }
             let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
 
-            if eta_too_large || probs_saturated || dev_tiny || order_separated || (iter >= 3 && (beta_grew_fast || beta_too_large)) {
+            if eta_too_large
+                || probs_saturated
+                || dev_tiny
+                || order_separated
+                || (iter >= 3 && (beta_grew_fast || beta_too_large))
+            {
                 log::warn!(
                     "P-IRLS instability (unpenalized Logit) at iter {}: max|eta|={:.2e}, sat_frac={:.3}, dev/n={:.3e}, order_sep={}, ||beta||={:.2e} (prev {:.2e})",
-                    iter, max_abs_eta, sat_frac, dev_per_sample, order_separated, beta_norm, prev_beta_norm
+                    iter,
+                    max_abs_eta,
+                    sat_frac,
+                    dev_per_sample,
+                    order_separated,
+                    beta_norm,
+                    prev_beta_norm
                 );
 
-                let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
-                    result.penalized_hessian.clone()
-                } else {
-                    log::warn!("No stable result saved, computing Hessian as fallback");
-                    let (result, rank) = solve_penalized_least_squares(
-                        x_transformed.view(),
-                        z.view(),
-                        weights.view(),
-                        &eb_transformed,
-                        e_transformed,
-                        &s_from_e_precomputed,
-                        &mut workspace,
-                        y.view(),
-                        config.link_function,
-                    )?;
-                    log::trace!("Fallback solve rank: {}", rank);
-                    result.penalized_hessian
-                };
-                let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+                let penalized_hessian_transformed =
+                    if let Some((ref result, _)) = last_stable_result {
+                        result.penalized_hessian.clone()
+                    } else {
+                        log::warn!("No stable result saved, computing Hessian as fallback");
+                        let (result, rank) = solve_penalized_least_squares(
+                            x_transformed.view(),
+                            z.view(),
+                            weights.view(),
+                            &eb_transformed,
+                            e_transformed,
+                            &s_from_e_precomputed,
+                            &mut workspace,
+                            y.view(),
+                            config.link_function,
+                        )?;
+                        log::trace!("Fallback solve rank: {}", rank);
+                        result.penalized_hessian
+                    };
+                let stable_penalty_term =
+                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
                 let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
                 return Ok(PirlsResult {
@@ -579,7 +602,11 @@ pub fn fit_model_for_fixed_rho(
                     penalized_hessian_transformed,
                     stabilized_hessian_transformed,
                     deviance: last_deviance,
-                    edf: if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 },
+                    edf: if let Some((ref result, _)) = last_stable_result {
+                        result.edf
+                    } else {
+                        0.0
+                    },
                     stable_penalty_term,
                     final_weights: weights.clone(),
                     final_mu: mu.clone(),
@@ -781,7 +808,11 @@ pub fn fit_model_for_fixed_rho(
                 .map(|(&w, &r)| w * r * r)
                 .sum();
             // EDF from last stable result if available
-            let edf_here = if let Some((ref result, _)) = last_stable_result { result.edf } else { 0.0 };
+            let edf_here = if let Some((ref result, _)) = last_stable_result {
+                result.edf
+            } else {
+                0.0
+            };
             let df = (x_transformed.nrows() as f64 - edf_here).max(1.0);
             weighted_rss / df
         }
@@ -1350,13 +1381,18 @@ pub fn solve_penalized_least_squares(
                     let mut max_ev = 0.0f64;
                     for &ev in eigs.iter() {
                         if ev.is_finite() {
-                            if ev > max_ev { max_ev = ev; }
-                            if ev < min_ev { min_ev = ev; }
+                            if ev > max_ev {
+                                max_ev = ev;
+                            }
+                            if ev < min_ev {
+                                min_ev = ev;
+                            }
                         }
                     }
                     // Treat non-positive or extremely small min eigenvalues as bad conditioning
-                    if !(min_ev.is_finite()) || min_ev <= 0.0 { true }
-                    else {
+                    if !(min_ev.is_finite()) || min_ev <= 0.0 {
+                        true
+                    } else {
                         let cond = max_ev / min_ev.max(std::f64::MIN_POSITIVE);
                         cond > 1e8
                     }
@@ -1369,68 +1405,79 @@ pub fn solve_penalized_least_squares(
             if cond_bad {
                 println!("[PLS Solver] SPD/LLᵀ: condition poor; falling back to QR path");
             } else {
-            // Single multi-RHS solve: [ XtWz | Eᵀ ]
-            let rk_rows = e_transformed.nrows();
-            let nrhs = 1 + rk_rows;
-            let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
-                if j == 0 { xtwz[i] } else { e_transformed[(j - 1, i)] }
-            });
-            let sol = chol.solve(rhs.as_ref());
+                // Single multi-RHS solve: [ XtWz | Eᵀ ]
+                let rk_rows = e_transformed.nrows();
+                let nrhs = 1 + rk_rows;
+                let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
+                    if j == 0 {
+                        xtwz[i]
+                    } else {
+                        e_transformed[(j - 1, i)]
+                    }
+                });
+                let sol = chol.solve(rhs.as_ref());
 
-            // β̂ from first column
-            let mut beta_transformed = Array1::zeros(p_dim);
-            for i in 0..p_dim { beta_transformed[i] = sol[(i, 0)]; }
-            if !beta_transformed.iter().all(|v| v.is_finite()) {
-                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
-            }
-
-            // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
-            let mut frob = 0.0f64;
-            for j in 0..rk_rows {
+                // β̂ from first column
+                let mut beta_transformed = Array1::zeros(p_dim);
                 for i in 0..p_dim {
-                    frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                    beta_transformed[i] = sol[(i, 0)];
                 }
-            }
-            let edf = (p_dim as f64 - frob).clamp(0.0, p_dim as f64);
-            if !edf.is_finite() {
-                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
-            }
+                if !beta_transformed.iter().all(|v| v.is_finite()) {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
 
-            // Scale parameter
-            let scale = calculate_scale(
-                &beta_transformed,
-                x_transformed,
-                y,
-                weights,
-                edf,
-                link_function,
-            );
-            if !scale.is_finite() {
-                return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
-            }
+                // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
+                let mut frob = 0.0f64;
+                for j in 0..rk_rows {
+                    for i in 0..p_dim {
+                        frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                    }
+                }
+                let edf = (p_dim as f64 - frob).clamp(0.0, p_dim as f64);
+                if !edf.is_finite() {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
 
-            println!(
-                "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
-                edf,
-                scale
-            );
-
-            return Ok((
-                StablePLSResult {
-                    beta: beta_transformed,
-                    penalized_hessian,
+                // Scale parameter
+                let scale = calculate_scale(
+                    &beta_transformed,
+                    x_transformed,
+                    y,
+                    weights,
                     edf,
-                    scale,
-                },
-                p_dim,
-            ));
+                    link_function,
+                );
+                if !scale.is_finite() {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
+
+                println!(
+                    "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
+                    edf, scale
+                );
+
+                return Ok((
+                    StablePLSResult {
+                        beta: beta_transformed,
+                        penalized_hessian,
+                        edf,
+                        scale,
+                    },
+                    p_dim,
+                ));
             }
         }
         // If LLᵀ fails, continue into the robust QR path below.
     }
 
     let function_timer = Instant::now();
-        println!(
+    println!(
         "[PLS Solver] Entering QR path. Matrix dimensions: x=({}x{}), eb=({}x{}), e=({}x{})",
         x_transformed.nrows(),
         x_transformed.ncols(),
@@ -1534,7 +1581,9 @@ pub fn solve_penalized_least_squares(
     let scaled_rows = r_rows + eb_rows;
     assert!(workspace.scaled_matrix.nrows() >= scaled_rows);
     assert!(workspace.scaled_matrix.ncols() >= p_dim);
-    let mut scaled_matrix = workspace.scaled_matrix.slice_mut(s![..scaled_rows, ..p_dim]);
+    let mut scaled_matrix = workspace
+        .scaled_matrix
+        .slice_mut(s![..scaled_rows, ..p_dim]);
 
     // Fill in with slice assignments and scale in place
     use ndarray::s as ns;
@@ -1578,15 +1627,16 @@ pub fn solve_penalized_least_squares(
         });
     }
 
-    println!("Solver determined rank {}/{} using scaled matrix", rank, p_dim);
+    println!(
+        "Solver determined rank {}/{} using scaled matrix",
+        rank, p_dim
+    );
     println!(
         "[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]",
         rank,
         p_dim,
         stage2_timer.elapsed()
     );
-
-    
 
     //-----------------------------------------------------------------------
     // STAGE 3: Create rank-reduced system using the rank pivot
@@ -1768,12 +1818,16 @@ pub fn solve_penalized_least_squares(
     // Compute RᵀR into a preallocated buffer
     {
         use ndarray::linalg::general_mat_mul;
-        let mut buf = workspace.xtwx_buf.slice_mut(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
+        let mut buf = workspace
+            .xtwx_buf
+            .slice_mut(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
         buf.fill(0.0);
         // buf <- Rᵀ R
         general_mat_mul(1.0, &r1_pivoted.t(), &r1_pivoted, 0.0, &mut buf);
     }
-    let xtwx_pivoted_view = workspace.xtwx_buf.slice(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
+    let xtwx_pivoted_view = workspace
+        .xtwx_buf
+        .slice(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
     let xtwx = unpivot_sym_by_perm(xtwx_pivoted_view, &initial_pivot);
 
     // Use precomputed S = EᵀE from caller (original order)
@@ -1976,8 +2030,11 @@ fn calculate_edf(
     }
     let h_f = FaerMat::<f64>::from_fn(p, p, |i, j| penalized_hessian[[i, j]]);
     let rhs = FaerMat::<f64>::from_fn(p, r, |i, j| e_transformed[(j, i)]);
-    let chol = FaerLlt::new(h_f.as_ref(), Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?;
+    let chol = FaerLlt::new(h_f.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
     let sol = chol.solve(rhs.as_ref());
     let mut tr_hinv_s = 0.0f64;
     for j in 0..r {

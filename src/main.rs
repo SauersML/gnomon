@@ -173,8 +173,9 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Make detailed predictions
     println!("Generating predictions with diagnostics...");
-    let (eta, mean, signed_dist, se_eta_opt) = model.predict_detailed(data.p.view(), data.pcs.view())?;
-    
+    let (eta, mean, signed_dist, se_eta_opt) =
+        model.predict_detailed(data.p.view(), data.pcs.view())?;
+
     // Check if calibrator is available
     let calibrated_mean_opt = if model.calibrator.is_some() {
         println!("Calibrator detected. Generating calibrated predictions.");
@@ -249,7 +250,7 @@ fn save_predictions_detailed(
                     "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
                 )?
             };
-            
+
             for i in 0..eta.len() {
                 let id = &sample_ids[i];
                 let sd = signed_distance[i];
@@ -257,7 +258,7 @@ fn save_predictions_detailed(
                 let uncalibrated_p = mean[i];
                 // If calibrated predictions are available, use them, otherwise use uncalibrated
                 let p = calibrated_mean_opt.map_or(uncalibrated_p, |cal| cal[i]);
-                
+
                 let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
                     let se = se_eta[i];
                     let lo_eta = log_odds - 1.959964 * se;
@@ -272,32 +273,19 @@ fn save_predictions_detailed(
                 } else {
                     ("NA".to_string(), "NA".to_string(), "NA".to_string())
                 };
-                
+
                 // Include uncalibrated prediction column when calibration is enabled
                 if calibrated_mean_opt.is_some() {
                     writeln!(
                         file,
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id,
-                        sd,
-                        log_odds,
-                        se_str,
-                        uncalibrated_p,
-                        p,
-                        lo_str,
-                        hi_str
+                        id, sd, log_odds, se_str, uncalibrated_p, p, lo_str, hi_str
                     )?
                 } else {
                     writeln!(
                         file,
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id,
-                        sd,
-                        log_odds,
-                        se_str,
-                        p,
-                        lo_str,
-                        hi_str
+                        id, sd, log_odds, se_str, p, lo_str, hi_str
                     )?
                 };
             }
@@ -315,50 +303,35 @@ fn save_predictions_detailed(
                     "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
                 )?
             };
-            
+
             for i in 0..eta.len() {
                 let id = &sample_ids[i];
                 let sd = signed_distance[i];
                 let uncalibrated_pred = mean[i];
                 // If calibrated predictions are available, use them, otherwise use uncalibrated
                 let pred = calibrated_mean_opt.map_or(uncalibrated_pred, |cal| cal[i]);
-                
+
                 let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
                     let se = se_eta[i];
                     let lo = pred - 1.959964 * se;
                     let hi = pred + 1.959964 * se;
-                    (
-                        se.to_string(),
-                        lo.to_string(),
-                        hi.to_string(),
-                    )
+                    (se.to_string(), lo.to_string(), hi.to_string())
                 } else {
                     ("NA".to_string(), "NA".to_string(), "NA".to_string())
                 };
-                
+
                 // Include uncalibrated prediction column when calibration is enabled
                 if calibrated_mean_opt.is_some() {
                     writeln!(
                         file,
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id,
-                        sd,
-                        uncalibrated_pred,
-                        pred,
-                        se_str,
-                        lo_str,
-                        hi_str
+                        id, sd, uncalibrated_pred, pred, se_str, lo_str, hi_str
                     )?
                 } else {
                     writeln!(
                         file,
                         "{}\t{}\t{}\t{}\t{}\t{}",
-                        id,
-                        sd,
-                        pred,
-                        se_str,
-                        lo_str,
-                        hi_str
+                        id, sd, pred, se_str, lo_str, hi_str
                     )?
                 };
             }
