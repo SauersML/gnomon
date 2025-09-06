@@ -12,7 +12,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Lblt as FaerLblt, Solve as FaerSolve};
+use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Solve as FaerSolve};
 use serde::{Deserialize, Serialize};
 // Use the shared optimizer facade from estimate.rs
 use crate::calibrate::estimate::{ExternalOptimOptions, optimize_external_design};
@@ -159,14 +159,12 @@ pub fn compute_alo_features(
     enum Factor {
         Llt(FaerLlt<f64>),
         Ldlt(FaerLdlt<f64>),
-        Lblt(FaerLblt<f64>),
     }
     impl Factor {
         fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
             match self {
                 Factor::Llt(f) => f.solve(rhs),
                 Factor::Ldlt(f) => f.solve(rhs),
-                Factor::Lblt(f) => f.solve(rhs),
             }
         }
     }
@@ -186,19 +184,14 @@ pub fn compute_alo_features(
         if let Ok(f) = FaerLlt::new(kf1.as_ref(), Side::Lower) {
             Factor::Llt(f)
         } else {
-            eprintln!("[CAL] LLT with moderate ridge failed; trying pivoted LDLᵀ/BLT without mutating K");
+            eprintln!("[CAL] LLT with moderate ridge failed; trying pivoted LDLᵀ without mutating K");
             let kf0 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
             if let Ok(f) = FaerLdlt::new(kf0.as_ref(), Side::Lower) {
                 Factor::Ldlt(f)
             } else {
-                let kf0b = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-                if let Ok(f) = FaerLblt::new(kf0b.as_ref(), Side::Lower) {
-                    Factor::Lblt(f)
-                } else {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
             }
         }
     };
@@ -1260,7 +1253,7 @@ mod tests {
     fn logdet_penalty_pseudodet(s_lambda: &Array2<f64>) -> f64 {
         // Use existing eigendecomposition functionality from basis.rs
         // This avoids direct dependency on ndarray_linalg
-        let (evals, _evecs) = match crate::calibrate::basis::null_range_whiten(s_lambda) {
+        let (evals, evecs_unused) = match crate::calibrate::basis::null_range_whiten(s_lambda) {
             Ok((null, range)) => {
                 // Count nullspace dim as zero eigenvalues, use range space for positives
                 let null_dim = null.ncols();
