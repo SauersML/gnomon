@@ -110,13 +110,10 @@ pub struct InternalSchema {
 pub fn compute_alo_features(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    prior_weights: ArrayView1<f64>,
     raw_train: ArrayView2<f64>,
     hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
 ) -> Result<CalibratorFeatures, EstimationError> {
-    // Touch prior_weights to satisfy unused-variable lint (we no longer use it for φ)
-    let _ = prior_weights.len();
     let n = base.x_transformed.nrows();
     let p = base.x_transformed.ncols();
 
@@ -1955,7 +1952,7 @@ mod tests {
         let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
 
         // Compute ALO features
-        compute_alo_features(&fit_res, y.view(), w.view(), x.view(), None, link).unwrap();
+        compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Extract hat diagonal elements using the LLT approach (matches compute_alo_features implementation)
         let mut aii = Array1::<f64>::zeros(n);
@@ -2053,7 +2050,6 @@ mod tests {
         compute_alo_features(
             &fit_with_zero,
             y.view(),
-            w_zero.view(),
             x.view(),
             None,
             link,
@@ -2113,7 +2109,7 @@ mod tests {
 
         // Compute ALO features
         let alo_features =
-            compute_alo_features(&full_fit, y.view(), w.view(), x.view(), None, link).unwrap();
+            compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         // Perform true leave-one-out by refitting n times
         let mut loo_pred = Array1::zeros(n);
@@ -3001,7 +2997,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             fake_x.view(),
             None,
             LinkFunction::Logit,
@@ -3295,7 +3290,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Identity,
@@ -3456,7 +3450,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x_raw.view(),
             Some(&hull),
             LinkFunction::Identity,
@@ -4319,7 +4312,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         compute_alo_features(
             &small_fit,
             y_small.view(),
-            w_small.view(),
             x_small.view(),
             None,
             link,
@@ -4338,7 +4330,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         compute_alo_features(
             &large_fit,
             y_large.view(),
-            w_large.view(),
             x_large.view(),
             None,
             link,
