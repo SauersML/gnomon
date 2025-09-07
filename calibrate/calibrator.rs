@@ -2675,7 +2675,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         };
 
         // Build design
-        let (mut x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
 
         // The test now directly uses the design matrix and penalties from build_calibrator_design
         // This ensures that X and penalties always have matching dimensions
