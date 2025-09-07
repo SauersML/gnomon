@@ -3159,7 +3159,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Logit,
@@ -3652,7 +3651,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Logit,
@@ -3715,7 +3713,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Logit,
@@ -4244,7 +4241,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let features1 = compute_alo_features(
             &base_fit1,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Logit,
@@ -4257,7 +4253,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let features2 = compute_alo_features(
             &base_fit2,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Logit,
