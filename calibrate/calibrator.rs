@@ -1066,6 +1066,25 @@ pub fn build_calibrator_design(
         penalties.iter().map(|s| (s.nrows(), s.ncols())).collect::<Vec<_>>()
     );
 
+    // --- Normalize penalty scales so REML sees comparable magnitudes ---
+    // Use the prediction smooth (k=0) as the scale reference.
+    let p = x.ncols();
+    let trace = |a: &Array2<f64>| -> f64 {
+        let n = p.min(a.ncols());
+        (0..n).map(|i| a[[i, i]]).sum()
+    };
+
+    let ref_tr = trace(&penalties[0]).max(1e-12); // guard against zero
+    // make the vec mutable for in-place scaling
+    let mut penalties = penalties;
+    for k in 1..penalties.len() {
+        let tr_k = trace(&penalties[k]).max(1e-12);
+        let scale = ref_tr / tr_k;
+        // scale S_k <- scale * S_k so lambdas are comparable across blocks
+        penalties[k] *= scale;
+    }
+    // -----------------------------------------------------------------------
+
     Ok((x, penalties, schema))
 }
 
@@ -1235,8 +1254,20 @@ pub fn fit_calibrator(
     // -----------------------------------------------
     
     let res = optimize_external_design(y, prior_weights, x, penalties, &opts)?;
+    
     // Extract all three lambdas (res.lambdas should now have 3 elements)
-    let lambdas = [res.lambdas[0], res.lambdas[1], res.lambdas[2]];
+    // Clamp to a sane range to prevent complete shutdown of any block
+    let mut lambdas = [res.lambdas[0], res.lambdas[1], res.lambdas[2]];
+    for l in lambdas.iter_mut() {
+        *l = l.clamp(1e-6, 1.0e4); // 1e4 upper cap is enough to avoid EDF≈0 in SE
+    }
+    
+    // Log if any lambdas were clamped
+    for (i, (&orig, &clamped)) in res.lambdas.iter().zip(lambdas.iter()).enumerate().take(3) {
+        if orig != clamped {
+            eprintln!("[CAL] Lambda[{}] clamped from {:.3e} to {:.3e}", i, orig, clamped);
+        }
+    }
     let edf_pred = *res.edf_by_block.get(0).unwrap_or(&0.0);
     let edf_se = *res.edf_by_block.get(1).unwrap_or(&0.0);
     let edf_dist = *res.edf_by_block.get(2).unwrap_or(&0.0);

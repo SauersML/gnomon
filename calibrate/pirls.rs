@@ -1701,12 +1701,30 @@ pub fn solve_penalized_least_squares(
 
     // Perform final pivoted QR on the unscaled, reduced system
     let final_aug_owned = final_aug_matrix.to_owned();
-    let (q_final, r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
-
+    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
+    
     println!(
         "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
         stage4_timer.elapsed()
     );
+    
+    // Add tiny ridge jitter to avoid singular/infinite condition number
+    let r_final_sq = r_final.slice(s![..rank, ..rank]);
+    let eps = 1e-10_f64;
+    let diag_floor = eps.max(r_final_sq[[0, 0]].abs() * 1e-10);
+    let m = rank;
+    let mut any_modified = false;
+    for i in 0..m {
+        // ensure strictly positive diagonal to avoid singular/inf cond
+        if r_final[[i, i]].abs() < diag_floor {
+            let old_val = r_final[[i, i]];
+            r_final[[i, i]] = if r_final[[i, i]] >= 0.0 { diag_floor } else { -diag_floor };
+            any_modified = true;
+        }
+    }
+    if any_modified {
+        println!("[PLS Solver] Applied tiny ridge jitter ({:.3e}) to R diagonal for stability", diag_floor);
+    }
 
     //-----------------------------------------------------------------------
     // STAGE 5: Apply second transformation to the RHS and solve system
