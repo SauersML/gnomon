@@ -1065,7 +1065,6 @@ pub fn train_model(
         let features = cal::compute_alo_features(
             &final_fit,
             reml_state.y(),
-            reml_state.weights(),
             x_raw.view(),
             hull_opt.as_ref(),
             config.link_function,

@@ -12,7 +12,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
+use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Solve as FaerSolve};
 use serde::{Deserialize, Serialize};
 // Use the shared optimizer facade from estimate.rs
 use crate::calibrate::estimate::{ExternalOptimOptions, optimize_external_design};
@@ -110,7 +110,6 @@ pub struct InternalSchema {
 pub fn compute_alo_features(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    prior_weights: ArrayView1<f64>,
     raw_train: ArrayView2<f64>,
     hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
@@ -127,7 +126,7 @@ pub fn compute_alo_features(
 
     // Factor K = X' W X + S_λ (use actual penalized Hessian from PIRLS, not the stabilized version).
     // The penalized_hessian_transformed is the correct matrix (X'WX + S_λ) for LOO leverage computation
-    let mut k = base.penalized_hessian_transformed.clone();
+    let k = base.penalized_hessian_transformed.clone();
     // Adaptive ridge for safety based on matrix scale
     // Use relative scaling (trace/p) for numerical stability
     // This means the ridge is proportional to the average diagonal element
@@ -154,85 +153,123 @@ pub fn compute_alo_features(
     
     // Use the ridge-augmented matrix for factorization
     let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k_with_ridge[[i, j]]);
-    let llt_result = FaerLlt::new(k_f.as_ref(), Side::Lower);
-    
-    // Multi-level factorization fallbacks with progressive stabilization
-    let llt = match llt_result {
-        Ok(llt) => llt,
-        Err(_) => {
-            // First fallback: apply moderate ridge based on matrix trace
-            eprintln!("[CAL] LLT factorization failed, applying stronger ridge (1e-8 * trace/p)");
-            let ridge_moderate = 1e-8_f64 * k_trace / p as f64;
-            for i in 0..p {
-                k[[i, i]] += ridge_moderate;
+
+    // Local generic factor wrapper to allow LLᵀ/LDLᵀ fallbacks without mutating K
+    enum Factor {
+        Llt(FaerLlt<f64>),
+        Ldlt(FaerLdlt<f64>),
+    }
+    impl Factor {
+        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+            match self {
+                Factor::Llt(f) => f.solve(rhs),
+                Factor::Ldlt(f) => f.solve(rhs),
             }
-            
-            let k_f_ridge1 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-            match FaerLlt::new(k_f_ridge1.as_ref(), Side::Lower) {
-                Ok(llt) => llt,
-                Err(_) => {
-                    // Second fallback: apply strong ridge based on matrix trace
-                    eprintln!("[CAL] Moderate ridge failed, applying strong ridge (1e-6 * trace/p)");
-                    let ridge_strong = 1e-6_f64 * k_trace / p as f64;
-                    for i in 0..p {
-                        k[[i, i]] += ridge_strong;
-                    }
-                    
-                    let k_f_ridge2 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-                    match FaerLlt::new(k_f_ridge2.as_ref(), Side::Lower) {
-                        Ok(llt) => llt,
-                        Err(_) => {
-                            // Third fallback: apply absolute ridge not relative to matrix scale
-                            eprintln!("[CAL] Strong ridge failed, applying absolute ridge (0.01)");
-                            for i in 0..p {
-                                k[[i, i]] += 0.01;
-                            }
-                            
-                            let k_f_ridge3 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-                            FaerLlt::new(k_f_ridge3.as_ref(), Side::Lower).map_err(|_| {
-                                // If it still fails after all fallbacks, we have to give up
-                                EstimationError::ModelIsIllConditioned {
-                                    condition_number: f64::INFINITY,
-                                }
-                            })?
-                        }
-                    }
-                }
+        }
+    }
+
+    // Try LLᵀ on lightly ridged copy; then moderate ridge on a fresh copy;
+    // finally pivoted LDLᵀ/BLT on the original K (no giant absolute ridge)
+    let factor = if let Ok(f) = FaerLlt::new(k_f.as_ref(), Side::Lower) {
+        Factor::Llt(f)
+    } else {
+        eprintln!("[CAL] LLT factorization failed on light ridge; trying moderate ridge");
+        let mut k_r1 = k.clone();
+        let ridge_moderate = 1e-8_f64 * k_trace / p as f64;
+        for i in 0..p {
+            k_r1[[i, i]] += ridge_moderate;
+        }
+        let kf1 = FaerMat::<f64>::from_fn(p, p, |i, j| k_r1[[i, j]]);
+        if let Ok(f) = FaerLlt::new(kf1.as_ref(), Side::Lower) {
+            Factor::Llt(f)
+        } else {
+            eprintln!("[CAL] LLT with moderate ridge failed; trying pivoted LDLᵀ without mutating K");
+            let kf0 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
+            if let Ok(f) = FaerLdlt::new(kf0.as_ref(), Side::Lower) {
+                Factor::Ldlt(f)
+            } else {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
             }
         }
     };
 
-    // Compute a_ii via block solves: solve K S = U^T, then a_i = u_i · s_i
+    // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
+    let xtwx = {
+        let ut_loc = u.t().to_owned();
+        ut_loc.dot(&u)
+    };
+
+    // Gaussian dispersion φ (use PIRLS final weights)
+    let phi = match link {
+        LinkFunction::Logit => 1.0,
+        LinkFunction::Identity => {
+            let mut rss = 0.0;
+            let mut wsum = 0.0;
+            for i in 0..n {
+                let r = y[i] - base.final_mu[i];
+                let wi = base.final_weights[i];
+                rss += wi * r * r;
+                wsum += wi;
+            }
+            let denom = (wsum - base.edf).max(1.0);
+            rss / denom
+        }
+    };
+
+    // Blocked solves: K S = Uᵀ; compute a_ii and var_full within the same block
     let block = 8192usize.min(n.max(1));
     let mut aii = Array1::<f64>::zeros(n);
+    let mut eta_tilde = Array1::<f64>::zeros(n);
+    let mut se_tilde = Array1::<f64>::zeros(n);
     let ut = u.t(); // p x n
+    let eta_hat = base.x_transformed.dot(&base.beta_transformed);
+    let z = base.solve_working_response.clone();
+
     let mut col_start = 0usize;
-    // For tracking current s_block and number of columns across loop iterations
-    let current_s_block: Option<FaerMat<f64>> = None;
-    let current_cols = 0usize;
     while col_start < n {
         let col_end = (col_start + block).min(n);
         let cols = col_end - col_start;
-        // RHS block: p x cols (slice of U^T)
+        // RHS block: p x cols
         let rhs_block = ut.slice(s![.., col_start..col_end]).to_owned();
-        // Solve K S = RHS for S (multi-RHS) using faer LLᵀ
         let rhs_f = FaerMat::<f64>::from_fn(p, cols, |i, j| rhs_block[[i, j]]);
-        let s_block = llt.solve(rhs_f.as_ref()); // p x cols
-        // Accumulate a_ii = u_i · s_i
+        let s_block = factor.solve(rhs_f.as_ref()); // p x cols
+
+        // ndarray views for multiplications
+        let s_block_nd = Array2::from_shape_fn((p, cols), |(i, j)| s_block[(i, j)]);
+        let t_block = xtwx.dot(&s_block_nd); // p x cols
+
         for j in 0..cols {
-            let row_idx = col_start + j;
+            let irow = col_start + j;
+
+            // a_ii = u_i · s_i
             let mut dot = 0.0;
-            for i in 0..p {
-                dot += u[[row_idx, i]] * s_block[(i, j)];
+            for r in 0..p {
+                dot += u[[irow, r]] * s_block[(r, j)];
             }
-            aii[row_idx] = dot;
+            aii[irow] = dot;
+
+            // var_full_i = φ * (1/wi) * s_iᵀ (XtWX) s_i
+            let wi = base.final_weights[irow].max(1e-300);
+            let mut quad = 0.0;
+            for r in 0..p {
+                quad += s_block[(r, j)] * t_block[[r, j]];
+            }
+            let var_full = phi * (quad / wi);
+
+            // Clip leverage and compute LOO inflation (variance scales by 1/(1-a)^2)
+            let a_clipped = aii[irow].clamp(0.0, 0.995);
+            let denom = 1.0 - a_clipped;
+            let var_loo = var_full / (denom * denom);
+            se_tilde[irow] = var_loo.max(0.0).sqrt();
+
+            // ALO predictor with same clipped leverage
+            eta_tilde[irow] = (eta_hat[irow] - a_clipped * z[irow]) / denom;
         }
+
         col_start = col_end;
     }
-
-    // eta_hat from base
-    let eta_hat = base.x_transformed.dot(&base.beta_transformed);
-    let z = base.solve_working_response.clone();
 
     // Validate leverage values (hat diagonals)
     // Mathematically: 0 ≤ a_ii < 1.0 (projection matrix has eigenvalues in [0,1))
@@ -297,119 +334,6 @@ pub fn compute_alo_features(
         }
     }
 
-    // LOO variance and SE
-    let mut se_tilde = Array1::<f64>::zeros(n);
-    
-    // ALO SE calculation uses X^TWX directly without needing K
-    
-    // The PirlsResult doesn't directly store the final penalty matrix
-    // We need to reconstruct it using K - X^TWX, since K = X^TWX + S
-    // For this, we'll compute X^TWX directly from the design matrix and weights
-    let mut xtw = Array2::zeros((p, n));
-    let mut xtwx = Array2::zeros((p, p));
-    
-    // First compute X^TW
-    for i in 0..n {
-        let wi = base.final_weights[i];
-        let xi = base.x_transformed.row(i);
-        for j in 0..p {
-            xtw[[j, i]] = wi * xi[j];
-        }
-    }
-    
-    // Then compute X^TWX
-    for i in 0..p {
-        for j in 0..p {
-            let mut sum = 0.0;
-            for k_idx in 0..n {
-                sum += xtw[[i, k_idx]] * base.x_transformed[[k_idx, j]];
-            }
-            xtwx[[i, j]] = sum;
-        }
-    }
-    
-    
-    // And finally compute K-S = X^TWX for the variance calculation
-    let k_minus_s = xtwx.clone();  // K-S = X^TWX
-    
-    // Dispersion parameter phi
-    let phi = match link {
-        LinkFunction::Logit => 1.0,  // Fixed at 1.0 for binomial models
-        LinkFunction::Identity => {
-            // Compute Gaussian dispersion from prior weights: φ = sum(w_prior * r^2) / (sum(w_prior) - edf)
-            let mut rss = 0.0;
-            let mut wsum = 0.0;
-            for i in 0..n {
-                let r = y[i] - base.final_mu[i];
-                rss += prior_weights[i] * r * r;
-                wsum += prior_weights[i];
-            }
-            let denom = wsum - base.edf;
-            if denom > 0.0 {
-                rss / denom
-            } else {
-                eprintln!("WARNING: Negative degrees of freedom in dispersion estimate");
-                1.0  // Fallback is standard normal scale
-            }
-        }
-    };
-    
-    for i in 0..n {
-        // Guard against nearly-singular leverages as we did for eta_tilde
-        let raw_denom = 1.0 - aii[i];
-        let denom = raw_denom.max(1e-6_f64); // Enforce strict positivity for numerical stability
-        
-        // CORRECT ALO variance formula for LOO predictor using Sherman-Morrison identity:
-        //   Var_LOO(η̂^{(-i)}) = Var_full(η̂_i) / (1 - a_ii)
-        //
-        // For penalized models with K = X^TWX + S:
-        // 1. Var_full(η̂_i) = φ * x_i^T K^{-1} (X^TWX) K^{-1} x_i
-        //                    = φ * g^T (X^TWX) g where g = K^{-1}x_i
-        // 2. We already have s = K^{-1}u_i where u_i = √(w_i)x_i
-        // 3. So g = s/√(w_i)
-        // 4. And Var_full = φ * g^T(X^TWX)g = φ * g^T(K-S)g = φ * (1/w_i) * s^T(K-S)s
-        // 5. LOO inflation is approximately 1/(1-a_ii) as in unpenalized case
-        
-        if denom <= 1e-4_f64 {
-            // Log warning but still apply the correct inflation formula
-            // (Small denominators are expected for high-leverage points)
-            eprintln!("[CAL] ALO SE 1-a_ii very small at i={}, a_ii={:.6e}", i, aii[i]);
-        }
-        
-        // For each observation, we need to compute the variance
-        // First, get K^{-1} u_i - we already have this from the a_ii calculation
-        // but need to extract the right column for the current block
-        
-        // Find the column index in the current block
-        let block_idx = i - col_start;
-        if block_idx >= current_cols {
-            // This shouldn't happen if the code is correct, but as a safeguard
-            eprintln!("[CAL] Error: block_idx out of range for block");
-            continue;
-        }
-        
-        // Extract the solution column for this observation
-        let s_i = (0..p).map(|r| current_s_block.as_ref().unwrap()[(r, block_idx)]).collect::<Vec<f64>>();
-        let wi = w[i].max(1e-300_f64);
-        
-        // Compute full-sample Var(η̂_i) = φ * (1/wi) * s^T (K - S) s
-        // Use k_minus_s which we precomputed once for efficiency
-        let s_i_array = Array1::from_vec(s_i.clone()); // Clone s_i to avoid move
-        let t = k_minus_s.dot(&s_i_array);
-        let quad = s_i.iter().zip(t.iter()).map(|(&s, &t)| s * t).sum::<f64>();
-        
-        let var_full = phi * (quad / wi);
-        
-        // LOO inflation (approx): divide by (1 - a_ii)
-        let var_loo = var_full / denom;
-        se_tilde[i] = var_loo.sqrt();
-        
-        // Optional: soft-cap extremely large SE values
-        if !se_tilde[i].is_finite() || se_tilde[i] > 1e6 {
-            eprintln!("[CAL] ALO SE extreme value at i={}: {}, capping", i, se_tilde[i]);
-            se_tilde[i] = 1e6_f64.min(se_tilde[i].abs());
-        }
-    }
 
     // Comprehensive leverage and dispersion diagnostics
     // These metrics help identify potential numerical issues or ill-conditioned fits
@@ -601,7 +525,12 @@ pub fn build_calibrator_design(
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
-    let (dist_std, dist_ms) = standardize_with(dist_mean, dist_std_raw, &dist_raw);
+    let (dist_std, dist_ms) = if use_linear_dist {
+        // Center only for linear fallback to avoid extreme scaling
+        (dist_raw.mapv(|x| x - dist_mean), (dist_mean, 1.0))
+    } else {
+        standardize_with(dist_mean, dist_std_raw, &dist_raw)
+    };
 
     // Build B-spline bases
     // Note: ranges not needed with explicit knots
@@ -815,26 +744,6 @@ pub fn build_calibrator_design(
     let se_knots   = spec.se_basis.num_knots;
     let dist_knots = spec.dist_basis.num_knots;
     
-    // Enforce penalty order <= degree for stability and reasonable nullspace dimension
-    // For P-splines with difference penalties, order > degree can lead to unexpected behavior
-    if spec.penalty_order_pred > spec.pred_basis.degree {
-        return Err(EstimationError::InvalidSpecification(
-            format!("Penalty order ({}) must not exceed spline degree ({}) for predictor smooth", 
-                    spec.penalty_order_pred, spec.pred_basis.degree)
-        ));
-    }
-    if spec.penalty_order_se > spec.se_basis.degree {
-        return Err(EstimationError::InvalidSpecification(
-            format!("Penalty order ({}) must not exceed spline degree ({}) for SE smooth", 
-                    spec.penalty_order_se, spec.se_basis.degree)
-        ));
-    }
-    if spec.penalty_order_dist > spec.dist_basis.degree {
-        return Err(EstimationError::InvalidSpecification(
-            format!("Penalty order ({}) must not exceed spline degree ({}) for distance smooth", 
-                    spec.penalty_order_dist, spec.dist_basis.degree)
-        ));
-    }
 
     // Create knots at mid-quantiles (half-step) on each calibrator axis
     // This creates a principled placement that's dependent only on the data distribution
@@ -856,35 +765,9 @@ pub fn build_calibrator_design(
         spec.se_basis.degree,
     )?;
     
-    // Apply sum-to-zero constraints using training weights
-    // We need to enforce ∑ᵢ wᵢ f(xᵢ) = 0 to prevent the intercept from shifting
-    // This is crucial for identifiability and correct estimation
-    
-    // Use training weights for STZ constraint if available (preferred)
-    // This ensures the constraint is orthogonal to the likelihood inner product
-    // and properly aligns the nullspace with the fitting weights
-    let train_weights = if let Some(ref weights) = spec.prior_weights {
-        weights.clone()
-    } else {
-        // Fall back to uniform weights if prior_weights not provided
-        // This is not ideal but maintains backwards compatibility
-        Array1::ones(n)
-    };
-    
-    // Normalize weights to have mean 1.0 for numerical stability
-    // This keeps the sum-to-zero constraint at a reasonable scale
-    let weight_mean = train_weights.sum() / n.max(1) as f64;
-    let w_normalized = if weight_mean > 0.0 {
-        &train_weights / weight_mean
-    } else {
-        // Fallback to uniform weights if sum is zero
-        eprintln!("[CAL] Warning: weights sum to zero, using uniform weights for STZ constraint");
-        Array1::ones(n)
-    };
-    
-    // Apply weighted constraint for predictor:
-    // ∑ᵢ wᵢ f(xᵢ) = 0 ensuring no intercept shift
-    let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), Some(w_normalized.view()))?;
+    // Apply sum-to-zero constraints (unweighted) to prevent intercept confounding.
+    // This keeps identifiability without tying constraints to any specific weights.
+    let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), None)?;
     
     // For SE, check if we need to use linear fallback first (detected before standardization)
     let (b_se_c, stz_se) = if se_linear_fallback {
@@ -895,7 +778,7 @@ pub fn build_calibrator_design(
     } else {
         // Apply weighted STZ constraint using the same normalized training weights
         // This ensures consistency across all smooths and maintains identifiability
-        apply_sum_to_zero_constraint(b_se_raw.view(), Some(w_normalized.view()))?
+        apply_sum_to_zero_constraint(b_se_raw.view(), None)?
     };
     
     // For distance, check if we need to use linear fallback
@@ -927,7 +810,7 @@ pub fn build_calibrator_design(
         if need_stz {
             // Apply STZ to ensure identifiability when both κ and τ are ≤ 0
             eprintln!("[CAL] Note: applying STZ to distance smooth due to absence of nullspace penalties");
-            let (b_dist_c, stz_dist_c) = apply_sum_to_zero_constraint(b_dist_raw.view(), Some(w_normalized.view()))?;
+            let (b_dist_c, stz_dist_c) = apply_sum_to_zero_constraint(b_dist_raw.view(), None)?;
             let s_dist_raw0 = create_difference_penalty_matrix(b_dist_c.ncols(), spec.penalty_order_dist)?;
             (b_dist_c, stz_dist_c, knots_dist_generated, s_dist_raw0)
         } else {
@@ -944,7 +827,11 @@ pub fn build_calibrator_design(
 
     // Build penalties in raw space, then push through STZ
     let s_pred_raw0 = create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
-    let s_se_raw0 = create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?;
+    let s_se_raw0 = if se_linear_fallback {
+        Array2::<f64>::zeros((1, 1))
+    } else {
+        create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?
+    };
     // s_dist_raw0 is already created in the if-else block above
 
     // S in constrained coordinates: S_c = T^T S_raw T
@@ -956,83 +843,26 @@ pub fn build_calibrator_design(
     // This ensures proper shrinkage behavior by penalizing both wiggly and constant/linear components
     fn add_nullspace_shrink_tied_to_lambda(
         s_raw: &Array2<f64>,
-        kappa: f64, // e.g. 1.0 - controls relative strength of nullspace vs wiggly component
+        kappa: f64,
     ) -> Result<Array2<f64>, EstimationError> {
-        // Return original if no shrinkage requested
         if kappa <= 0.0 {
             return Ok(s_raw.clone());
         }
-        
-        // Get nullspace basis
-        let (z_null, _z_range_w) =
-            null_range_whiten(s_raw).map_err(|e| EstimationError::BasisError(e))?;
-            
-        // No nullspace? Nothing to do
+        let (z_null, _) = null_range_whiten(s_raw).map_err(EstimationError::BasisError)?;
         if z_null.ncols() == 0 {
             return Ok(s_raw.clone());
         }
-        
-        // Compute a robust scale for the range part (median positive eigenvalue)
-        // Use existing functionality from basis.rs instead of direct eigendecomposition
-        let (_null, range) = crate::calibrate::basis::null_range_whiten(s_raw)
-            .map_err(|e| EstimationError::BasisError(e))?;
-        
-        // Estimate eigenvalues from the range space vectors
-        let mut evals = Vec::new();
-        let range_dim = range.ncols();
-        if range_dim > 0 {
-            // Approximate eigenvalues using column norms of range space
-            for j in 0..range_dim {
-                let col = range.column(j);
-                let norm_squared: f64 = col.iter().map(|&x| x * x).sum();
-                evals.push(norm_squared);
-            }
-        }
-        
-        // Extract positive eigenvalues for median calculation
-        // Use a robust tolerance
-        let maxabs = evals.iter().fold(0.0_f64, |m: f64, &v| m.max(v.abs()));
-        let tol_scale = 1e-12_f64.max(1e-12_f64 * maxabs);
-        let mut pos: Vec<f64> = evals.iter().copied().filter(|&e| e > tol_scale).collect();
-        
-        // Sort and find median of positive eigenvalues
-        pos.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
-        // Use median of positive eigenvalues for scale, with fallbacks:
-        // 1. If no positive eigenvalues, use 1.0 (scaled identity)
-        // 2. If median is very small, clamp to a minimum value to avoid numerical issues
-        let min_scale = 1e-10_f64;  // Minimum scale to prevent numerical issues
-        let scale = if pos.is_empty() { 
-            eprintln!("[CAL] Warning: No positive eigenvalues found for nullspace scaling, using scale=1.0");
-            1.0 
-        } else {
-            // Use median of positive eigenvalues, but clamp to reasonable minimum
-            let median = pos[pos.len()/2];
-            if median < min_scale {
-                eprintln!("[CAL] Warning: Very small eigenvalue median ({:.3e}), clamping scale to {:.3e}", 
-                          median, min_scale);
-                min_scale
-            } else {
-                median
-            }
-        };
-        
-        // Create projector P_null = Z (Z^T Z)^{-1} Z^T
+        // Projector P_null = Z (ZᵀZ)^{-1} Zᵀ
         use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
-        let (p, r) = (z_null.nrows(), z_null.ncols());
+        let (p_dim, r_dim) = (z_null.nrows(), z_null.ncols());
         let zt_z = z_null.t().dot(&z_null);
-        let zt_z_f = Mat::from_fn(r, r, |i,j| zt_z[[i,j]]);
+        let zt_z_f = Mat::from_fn(r_dim, r_dim, |i, j| zt_z[[i, j]]);
         let llt = Llt::new(zt_z_f.as_ref(), Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned{ condition_number: f64::INFINITY })?;
-        let zt_f = Mat::from_fn(r, p, |i,j| z_null.t()[[i,j]]);
+            .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?;
+        let zt_f = Mat::from_fn(r_dim, p_dim, |i, j| z_null.t()[(i, j)]);
         let inv_ztz_zt = llt.solve(zt_f.as_ref()); // r × p
-        let p_null = z_null.dot(&Array2::from_shape_fn((r, p), |(i,j)| inv_ztz_zt[(i,j)]));
-            
-        // Add nullspace penalty with weight kappa scaled by range-space scale
-        // This produces S* = S_range + kappa * scale * P_null
-        // When multiplied by lambda later, both parts scale together with comparable magnitude
-        // The scale factor ensures kappa is dimensionless and robust across different bases
-        Ok(s_raw + &p_null.mapv(|v| v * (kappa * scale)))
+        let p_null = z_null.dot(&Array2::from_shape_fn((r_dim, p_dim), |(i, j)| inv_ztz_zt[(i, j)]));
+        Ok(s_raw + &p_null.mapv(|v| v * kappa))
     }
 
     // Determine kappa - the relative strength of nullspace vs wiggly penalty
@@ -1046,9 +876,10 @@ pub fn build_calibrator_design(
     
     // Legacy parameter: double_penalty_ridge is treated as a separate fixed tau (absolute ridge)
     // This is applied as a fixed ridge on nullspace, not tied to lambda
-    let tau = spec.double_penalty_ridge.max(0.0);
-    if tau > 0.0 {
-        eprintln!("[CAL] Warning: double_penalty_ridge is deprecated, use nullspace_shrinkage_kappa instead");
+    // Ignore legacy tau to avoid tying it to λ; see discussion in issue
+    let tau = 0.0;
+    if spec.double_penalty_ridge > 0.0 {
+        eprintln!("[CAL] Ignoring double_penalty_ridge (deprecated); using nullspace_shrinkage_kappa for shrinkage");
     }
     
     
@@ -1395,58 +1226,43 @@ mod tests {
     fn logdet_penalty_pseudodet(s_lambda: &Array2<f64>) -> f64 {
         // Use existing eigendecomposition functionality from basis.rs
         // This avoids direct dependency on ndarray_linalg
-        let (evals, _evecs) = match crate::calibrate::basis::null_range_whiten(s_lambda) {
+        let evals = match crate::calibrate::basis::null_range_whiten(s_lambda) {
             Ok((null, range)) => {
-                // Count nullspace dim as zero eigenvalues, use range space for positives
                 let null_dim = null.ncols();
                 let range_dim = range.ncols();
                 let mut all_evals = Vec::with_capacity(null_dim + range_dim);
-                
-                // Estimate positive eigenvalues using the range space
-                // This is a simplification - we'd normally compute them directly
                 if range_dim > 0 {
-                    // Approximate positive eigenvalues using column norms of range space
                     for j in 0..range_dim {
                         let col = range.column(j);
                         let norm_squared: f64 = col.iter().map(|&x| x * x).sum();
                         all_evals.push(norm_squared);
                     }
                 }
-                
-                // Sort eigenvalues (zeros are implicit)
                 all_evals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                (all_evals, None::<Array2<f64>>)
+                all_evals
             },
             Err(_) => {
-                // Fallback: use manual power iteration to estimate eigenvalues
                 let n = s_lambda.nrows();
                 let mut evals = Vec::new();
-                
-                // Simple power iteration to find largest few eigenvalues
                 let mut remaining = s_lambda.clone();
-                for _ in 0..std::cmp::min(n, 10) { // Find at most 10 largest eigenvalues
+                for _ in 0..std::cmp::min(n, 10) {
                     let mut v = Array1::from_elem(n, 1.0 / (n as f64).sqrt());
-                    // Power iteration
                     for _ in 0..20 {
                         let v_new = remaining.dot(&v);
                         let norm = (v_new.iter().map(|x| x*x).sum::<f64>()).sqrt();
                         if norm < 1e-12_f64 { break; }
                         v = &v_new / norm;
                     }
-                    
-                    // Rayleigh quotient
                     let rayleigh = v.dot(&remaining.dot(&v));
                     if rayleigh > 1e-12_f64 {
                         evals.push(rayleigh);
-                        // Deflation
                         let vvt = v.to_shape((n, 1)).unwrap().dot(&v.to_shape((1, n)).unwrap());
                         remaining = &remaining - &(&vvt * rayleigh);
                     } else {
                         break;
                     }
                 }
-                
-                (evals, None)
+                evals
             }
         };
         
@@ -2136,7 +1952,7 @@ mod tests {
         let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
 
         // Compute ALO features
-        compute_alo_features(&fit_res, y.view(), w.view(), x.view(), None, link).unwrap();
+        compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Extract hat diagonal elements using the LLT approach (matches compute_alo_features implementation)
         let mut aii = Array1::<f64>::zeros(n);
@@ -2234,7 +2050,6 @@ mod tests {
         compute_alo_features(
             &fit_with_zero,
             y.view(),
-            w_zero.view(),
             x.view(),
             None,
             link,
@@ -2294,7 +2109,7 @@ mod tests {
 
         // Compute ALO features
         let alo_features =
-            compute_alo_features(&full_fit, y.view(), w.view(), x.view(), None, link).unwrap();
+            compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         // Perform true leave-one-out by refitting n times
         let mut loo_pred = Array1::zeros(n);
@@ -3182,7 +2997,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             fake_x.view(),
             None,
             LinkFunction::Logit,
@@ -3476,7 +3290,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x.view(),
             None,
             LinkFunction::Identity,
@@ -3637,7 +3450,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let alo_features = compute_alo_features(
             &base_fit,
             y.view(),
-            w.view(),
             x_raw.view(),
             Some(&hull),
             LinkFunction::Identity,
@@ -4500,7 +4312,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         compute_alo_features(
             &small_fit,
             y_small.view(),
-            w_small.view(),
             x_small.view(),
             None,
             link,
@@ -4519,7 +4330,6 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         compute_alo_features(
             &large_fit,
             y_large.view(),
-            w_large.view(),
             x_large.view(),
             None,
             link,
@@ -4559,7 +4369,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), w.view(), x.view(), None, link).unwrap();
+            compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
 
         // Create calibrator spec with enough knots to get ~p_cal parameters
         let spec = CalibratorSpec {
