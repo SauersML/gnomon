@@ -69,6 +69,10 @@ pub struct CalibratorModel {
     // Flag for distance linear fallback when distance range is negligible
     pub dist_linear_fallback: bool,
 
+    // Centering offsets for linear fallbacks
+    pub se_center_offset: f64,     // weighted mean subtracted from se_std
+    pub dist_center_offset: f64,   // weighted mean subtracted from dist_std
+    
     // Fitted lambdas
     pub lambda_pred: f64,
     pub lambda_se: f64,
@@ -99,6 +103,8 @@ pub struct InternalSchema {
     pub standardize_dist: (f64, f64),
     pub se_linear_fallback: bool,
     pub dist_linear_fallback: bool,
+    pub se_center_offset: f64,     // weighted mean subtracted from se_std
+    pub dist_center_offset: f64,   // weighted mean subtracted from dist_std
     pub column_spans: (
         std::ops::Range<usize>,
         std::ops::Range<usize>,
@@ -115,7 +121,6 @@ pub fn compute_alo_features(
     link: LinkFunction,
 ) -> Result<CalibratorFeatures, EstimationError> {
     let n = base.x_transformed.nrows();
-    let p = base.x_transformed.ncols();
 
     // Prepare U = sqrt(W) X and z
     let w = &base.final_weights;
@@ -208,13 +213,14 @@ pub fn compute_alo_features(
             }
             aii[irow] = dot;
 
-            // var_full_i = φ * (1/wi) * s_iᵀ (XtWX) s_i
-            let wi = base.final_weights[irow].max(1e-300);
+            // var_full_i = φ * s_iᵀ (XtWX) s_i
+            // We no longer need wi here since we removed the 1/wi factor
+            // let wi = base.final_weights[irow].max(1e-300);
             let mut quad = 0.0;
             for r in 0..p {
                 quad += s_block[(r, j)] * t_block[[r, j]];
             }
-            let var_full = phi * (quad / wi);
+            let var_full = phi * quad; // Removed spurious 1/wi factor
 
             // Clip leverage and compute LOO inflation (variance scales by 1/(1-a)^2)
             // Use raw a_ii with a small numerical floor on the denominator; no clipping
@@ -734,17 +740,23 @@ pub fn build_calibrator_design(
     
     // For SE, check if we need to use linear fallback first (detected before standardization)
     // but always ensure it's centered (weighted if weights provided)
+    // Calculate the centering offset once and store it for later use
+    let mu_se = if se_linear_fallback {
+        // Calculate weighted mean for centering
+        if let Some(w) = w_for_stz {
+            let ws = w.iter().copied().sum::<f64>().max(1e-12);
+            se_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws
+        } else {
+            se_std.mean().unwrap_or(0.0)
+        }
+    } else {
+        0.0  // No centering for spline basis (handled by STZ)
+    };
+    
     let (b_se_c, stz_se) = if se_linear_fallback {
         // For SE linear fallback: make the single column weighted mean zero to keep it orthogonal to the intercept
         let mut col = se_std.clone();
-        if let Some(w) = w_for_stz {
-            let ws = w.iter().copied().sum::<f64>().max(1e-12);
-            let mu = se_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws;
-            col.mapv_inplace(|v| v - mu);
-        } else {
-            let mu = col.mean().unwrap_or(0.0);
-            col.mapv_inplace(|v| v - mu);
-        }
+        col.mapv_inplace(|v| v - mu_se); // Apply centering using the pre-calculated offset
         (col.insert_axis(Axis(1)).to_owned(), Array2::<f64>::eye(1))
     } else {
         // Apply weighted STZ constraint using the provided training weights
@@ -754,9 +766,22 @@ pub fn build_calibrator_design(
     
     // For distance, check if we need to use linear fallback
     // Linear fallback when: low variance or mostly zeros (from hinging)
+    // Calculate the distance centering offset first
+    let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
+    let mu_dist = if use_linear_dist && !dist_all_zero {
+        // Calculate the weighted mean for centering
+        if let Some(w) = w_for_stz {
+            let ws = w.iter().copied().sum::<f64>().max(1e-12);
+            dist_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws
+        } else {
+            dist_std.mean().unwrap_or(0.0)
+        }
+    } else {
+        0.0  // No centering for spline basis or when all distances are zero
+    };
+    
     let (b_dist_c, stz_dist, knots_dist, s_dist_raw0) = if use_linear_dist {
         // If the "hinged+centered" distance is effectively constant/zero, drop the term entirely.
-        let dist_all_zero = dist_std.iter().all(|&v| v.abs() < 1e-12);
         if dist_all_zero {
             let b = Array2::<f64>::zeros((n, 0));
             let stz = Array2::<f64>::eye(0);
@@ -765,13 +790,10 @@ pub fn build_calibrator_design(
             (b, stz, knots, s0)
         } else {
             // keep the single centered linear column, unpenalized
-            // Make sure it's actually centered (weighted if weights provided)
+            // Make sure it's actually centered using the pre-calculated offset
             let mut b = dist_std.clone();
-            if let Some(w) = w_for_stz {
-                let ws = w.iter().copied().sum::<f64>().max(1e-12);
-                let mu = dist_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws;
-                b.mapv_inplace(|v| v - mu);
-            }
+            b.mapv_inplace(|v| v - mu_dist);
+            
             // Now insert as a column
             let b = b.insert_axis(Axis(1)).to_owned();
             let stz = Array2::<f64>::eye(1);
@@ -1015,6 +1037,8 @@ pub fn build_calibrator_design(
         standardize_dist: dist_ms,
         se_linear_fallback,
         dist_linear_fallback: use_linear_dist,
+        se_center_offset: mu_se,
+        dist_center_offset: mu_dist,
         column_spans: (pred_range, se_range, dist_range),
     };
     
@@ -1080,8 +1104,8 @@ pub fn predict_calibrator(
     
     // Handle SE basis, with special case for linear fallback
     let b_se = if model.se_linear_fallback {
-        // exact same design: one centered linear column
-        se_std.view().insert_axis(Axis(1)).to_owned()
+        // Apply the same centering that was used during training
+        (se_std.mapv(|v| v - model.se_center_offset)).insert_axis(Axis(1)).to_owned()
     } else {
         let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             se_std.view(),
@@ -1095,8 +1119,8 @@ pub fn predict_calibrator(
 
     // Handle distance basis, with special case for linear fallback
     let b_dist = if model.dist_linear_fallback || model.knots_dist.len() == 0 {
-        // exact same design: one centered linear column
-        dist_std.view().insert_axis(Axis(1)).to_owned()
+        // Apply the same centering that was used during training
+        (dist_std.mapv(|v| v - model.dist_center_offset)).insert_axis(Axis(1)).to_owned()
     } else {
         let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             dist_std.view(),
@@ -1981,6 +2005,90 @@ mod tests {
     // QR decomposition and triangular solve helpers removed as they were unused
 
     // ===== ALO Correctness Tests =====
+
+    #[test]
+    fn alo_se_calculation_correct() {
+        // This test verifies that the ALO SE calculation is correct without the 1/wi factor
+        
+        // Create a synthetic dataset with varying weights to test SE calculation
+        let n = 100;
+        let p = 5;
+        let (x, y, _) = generate_synthetic_binary_data(n, p, Some(42));
+        
+        // Create weights with significant variation
+        let mut w = Array1::ones(n);
+        for i in 0..n/4 {
+            w[i] = 5.0; // Higher weight for some observations
+        }
+        for i in n/4..(n/2) {
+            w[i] = 0.2; // Lower weight for some observations
+        }
+        
+        let link = LinkFunction::Logit;
+        
+        // Fit a simple model
+        let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        
+        // Run ALO with our fixed code
+        let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
+        
+        // Now implement the old buggy calculation manually to compare
+        let n_test = 10; // Just test a few points for comparison
+        let mut buggy_se = Vec::with_capacity(n_test);
+        
+        // Setup for ALO calculation (copied from compute_alo_features)
+        let sqrt_w = w.mapv(f64::sqrt);
+        let mut u = fit_res.x_transformed.clone();
+        let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
+        u *= &sqrt_w_col;
+        
+        // K = X' W X + S_λ
+        let k = fit_res.penalized_hessian_transformed.clone();
+        let p = k.nrows();
+        let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
+        let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+        
+        // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
+        let xtwx = u.t().dot(&u);
+        
+        // Gaussian dispersion φ (always 1.0 for logistic regression)
+        let phi = 1.0;
+        
+        // Calculate buggy SE for a few test points
+        for irow in 0..n_test {
+            // Get u_i (the scaled row of the design matrix)
+            let ui = u.row(irow).to_owned();
+            
+            // Solve K s_i = u_i
+            let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let si = factor.solve(rhs_f.as_ref());
+            
+            // Calculate quad = s_i' XtWX s_i
+            let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
+            let t_i = xtwx.dot(&si_arr);
+            let mut quad = 0.0;
+            for r in 0..p {
+                quad += si_arr[r] * t_i[r];
+            }
+            
+            // OLD BUGGY CALCULATION: divide by w_i
+            let wi = w[irow].max(1e-300);
+            let var_buggy = phi * (quad / wi);
+            let se_buggy = var_buggy.max(0.0).sqrt();
+            buggy_se.push(se_buggy);
+            
+            // Fixed calculation should be larger by a factor of sqrt(w_i)
+            let se_ratio = alo_features.se[irow] / se_buggy;
+            let expected_ratio = wi.sqrt();
+            
+            // The ratio should be approximately sqrt(w_i)
+            assert!(
+                (se_ratio - expected_ratio).abs() < 1e-10,
+                "SE ratio should be sqrt(w_i): got {:.6}, expected {:.6}, diff {:.2e}",
+                se_ratio, expected_ratio, (se_ratio - expected_ratio).abs()
+            );
+        }
+    }
 
     #[test]
     fn alo_hat_diag_sane_and_bounded() {
@@ -3099,6 +3207,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3261,6 +3371,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3396,6 +3508,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3556,6 +3670,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3742,6 +3858,159 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
     }
 
     #[test]
+    fn linear_fallback_centering_consistency() {
+        // This test verifies that centering offsets are correctly stored and applied
+        // for linear fallbacks during both training and prediction.
+        
+        // Create synthetic data where SE and distance will trigger linear fallback
+        let n = 100;
+        let mut rng = StdRng::seed_from_u64(42);
+        
+        // Create features with very small spread for SE to trigger linear fallback
+        let pred = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
+        
+        // SE with tiny range to trigger linear fallback
+        let se_base_value = 0.5;
+        let se_tiny_range = 1e-9;
+        let se = Array1::from_vec((0..n).map(|_| {
+            se_base_value + rng.r#gen::<f64>() * se_tiny_range
+        }).collect());
+        
+        // Distance with uniform values to trigger linear fallback
+        let dist = Array1::from_vec((0..n).map(|_| {
+            if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 } // Mostly zeros with a few positives
+        }).collect());
+
+        // Create non-uniform weights to test weighted centering
+        let mut weights = Array1::ones(n);
+        for i in 0..n/5 {
+            weights[i] = 5.0; // Higher weight for some observations
+        }
+        
+        // Create response
+        let y = pred.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 });
+        
+        // Create calibrator features
+        let features = CalibratorFeatures { pred, se, dist };
+        
+        // Create calibrator spec
+        let spec = CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            se_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            double_penalty_ridge: 1e-4,
+            distance_hinge: true, // Enable distance hinging
+            nullspace_shrinkage_kappa: Some(1.0),
+            prior_weights: Some(weights.clone()), // Use non-uniform weights
+        };
+        
+        // Build design and fit calibrator
+        let (x_cal, penalties, schema) = build_calibrator_design(&features, &spec).unwrap();
+        
+        // Verify that linear fallback is triggered
+        assert!(schema.se_linear_fallback, "SE linear fallback should be triggered");
+        assert!(schema.dist_linear_fallback, "Distance linear fallback should be triggered");
+        
+        // Verify that center offsets are non-zero (since we're using weighted centering)
+        assert!(schema.se_center_offset.abs() > 0.0, "SE center offset should be non-zero");
+        assert!(schema.dist_center_offset.abs() > 0.0, "Distance center offset should be non-zero");
+        
+        // Fit calibrator
+        let fit_result = fit_calibrator(
+            y.view(),
+            weights.view(),
+            x_cal.view(),
+            &penalties,
+            LinkFunction::Logit,
+            &spec,
+        ).unwrap();
+        let (beta, lambdas, _, _, _) = fit_result;
+        
+        // Create a CalibratorModel
+        let cal_model = CalibratorModel {
+            spec: spec.clone(),
+            knots_pred: schema.knots_pred,
+            knots_se: schema.knots_se,
+            knots_dist: schema.knots_dist,
+            stz_pred: schema.stz_pred,
+            stz_se: schema.stz_se,
+            stz_dist: schema.stz_dist,
+            standardize_pred: schema.standardize_pred,
+            standardize_se: schema.standardize_se,
+            standardize_dist: schema.standardize_dist,
+            se_linear_fallback: schema.se_linear_fallback,
+            dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
+            lambda_pred: lambdas[0],
+            lambda_se: lambdas[1],
+            lambda_dist: lambdas[2],
+            coefficients: beta,
+            column_spans: schema.column_spans,
+            scale: None,
+        };
+        
+        // Create new test data with similar characteristics but different values
+        let n_test = 20;
+        let test_pred = Array1::from_vec((0..n_test).map(|i| i as f64 / (n_test as f64) * 2.0 - 1.0).collect());
+        let test_se = Array1::from_vec((0..n_test).map(|_| {
+            se_base_value + rng.r#gen::<f64>() * se_tiny_range
+        }).collect());
+        let test_dist = Array1::from_vec((0..n_test).map(|_| {
+            if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 }
+        }).collect());
+        
+        // Test two prediction approaches for consistency:
+        // 1. With the full centering (our fix)
+        let pred1 = predict_calibrator(
+            &cal_model,
+            test_pred.view(),
+            test_se.view(),
+            test_dist.view(),
+        ).unwrap();
+        
+        // 2. With a "manually" centered version that applies the offsets directly
+        // (This simulates the corrected behavior to check that our implementation is right)
+        let test_se_centered = test_se.mapv(|v| v - schema.se_center_offset);
+        let test_dist_centered = test_dist.mapv(|v| v - schema.dist_center_offset);
+        
+        // Create a model with zero offsets (to simulate old behavior with manual centering)
+        let mut cal_model_zero_offsets = cal_model.clone();
+        cal_model_zero_offsets.se_center_offset = 0.0;
+        cal_model_zero_offsets.dist_center_offset = 0.0;
+        
+        // Predict with pre-centered data but zero offsets in model
+        let pred2 = predict_calibrator(
+            &cal_model_zero_offsets,
+            test_pred.view(),
+            test_se_centered.view(),
+            test_dist_centered.view(),
+        ).unwrap();
+        
+        // The predictions should be identical
+        for i in 0..n_test {
+            assert!(
+                (pred1[i] - pred2[i]).abs() < 1e-10,
+                "Predictions should match exactly between proper centering and manual centering (diff at i={}: {:.2e})",
+                i, (pred1[i] - pred2[i]).abs()
+            );
+        }
+    }
+
+    #[test]
     fn calibrator_persists_and_roundtrips_exactly() {
         // Create synthetic data
         let n = 200;
@@ -3813,6 +4082,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
