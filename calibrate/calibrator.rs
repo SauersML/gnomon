@@ -124,37 +124,11 @@ pub fn compute_alo_features(
     let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
     u *= &sqrt_w_col;
 
-    // Factor K = X' W X + S_λ (use actual penalized Hessian from PIRLS, not the stabilized version).
-    // The penalized_hessian_transformed is the correct matrix (X'WX + S_λ) for LOO leverage computation
+    // K = X' W X + S_λ from PIRLS; do not modify it for ALO
     let k = base.penalized_hessian_transformed.clone();
-    // Adaptive ridge for safety based on matrix scale
-    // Use relative scaling (trace/p) for numerical stability
-    // This means the ridge is proportional to the average diagonal element
-    let k_trace = (0..p).map(|i| k[[i, i]].abs()).sum::<f64>();
-    let k_avg_diag = k_trace / p.max(1) as f64;
-    let ridge_scale = 1e-12_f64 * k_avg_diag;
-    
-    // Safety check - use absolute minimum if scale is too small
-    let ridge_final = if k_avg_diag < 1e-8_f64 {
-        eprintln!("[CAL] Matrix scale very small ({:.2e}), using absolute ridge", k_avg_diag);
-        1e-12_f64.max(1e-10_f64 * k_avg_diag)
-    } else {
-        ridge_scale
-    };
-    
-    // Create a copy of k for factorization to avoid ridge leakage
-    // This way we keep the original k unmodified and only add ridge to the copy
-    let mut k_with_ridge = k.clone(); 
-    
-    // Apply ridge to the copy only for factorization stability
-    for i in 0..p {
-        k_with_ridge[[i, i]] += ridge_final;
-    }
-    
-    // Use the ridge-augmented matrix for factorization
-    let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k_with_ridge[[i, j]]);
+    let p = k.nrows();
+    let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
 
-    // Local generic factor wrapper to allow LLᵀ/LDLᵀ fallbacks without mutating K
     enum Factor {
         Llt(FaerLlt<f64>),
         Ldlt(FaerLdlt<f64>),
@@ -168,51 +142,15 @@ pub fn compute_alo_features(
         }
     }
 
-    // Try LLᵀ on lightly ridged copy first for efficiency
     let factor = if let Ok(f) = FaerLlt::new(k_f.as_ref(), Side::Lower) {
+        // SPD fast path
         Factor::Llt(f)
     } else {
-        eprintln!("[CAL] LLT factorization failed on light ridge; trying moderate ridge");
-        // Add moderate ridge for stability
-        let mut k_r1 = k.clone();
-        let ridge_moderate = 1e-8_f64 * k_trace / p as f64;
-        for i in 0..p {
-            k_r1[[i, i]] += ridge_moderate;
-        }
-        let kf1 = FaerMat::<f64>::from_fn(p, p, |i, j| k_r1[[i, j]]);
-        
-        if let Ok(f) = FaerLlt::new(kf1.as_ref(), Side::Lower) {
-            Factor::Llt(f)
-        } else {
-            eprintln!("[CAL] LLT with moderate ridge failed; trying pivoted LDLᵀ as last resort");
-            // Use pivoted LDLᵀ (more robust to rank deficiency)
-            let kf0 = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-            
-            // Apply tiny safety ridge to ensure numerical stability
-            let eps = 1e-12_f64 * k_avg_diag;
-            let kf0_safe = FaerMat::<f64>::from_fn(p, p, |i, j| {
-                if i == j {
-                    *kf0.get(i, j) + eps
-                } else {
-                    *kf0.get(i, j)
-                }
-            });
-            
-            // If LDLᵀ still fails, return a minimal-norm solution instead of error
-            match FaerLdlt::new(kf0_safe.as_ref(), Side::Lower) {
-                Ok(f) => Factor::Ldlt(f),
-                Err(_) => {
-                    // Instead of failing, use the QR decomposition to get min-norm solution
-                    eprintln!("[CAL] LDLᵀ failed; using fallback rank-aware QR solve for min-norm solution");
-                    Factor::Ldlt(FaerLdlt::new(k_f.as_ref(), Side::Lower).unwrap_or_else(|_| {
-                        // This should never happen since we've added a ridge, but just in case
-                        // Create an identity matrix with tiny values that will give a stable solution
-                        let id = FaerMat::<f64>::from_fn(p, p, |i, j| if i == j { eps } else { 0.0 });
-                        FaerLdlt::new(id.as_ref(), Side::Lower).expect("Identity matrix should factorize")
-                    }))
-                }
-            }
-        }
+        // Robust to semi-definiteness / near-rank-deficiency without changing K
+        Factor::Ldlt(
+            FaerLdlt::new(k_f.as_ref(), Side::Lower)
+                .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?
+        )
     };
 
     // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
@@ -279,13 +217,13 @@ pub fn compute_alo_features(
             let var_full = phi * (quad / wi);
 
             // Clip leverage and compute LOO inflation (variance scales by 1/(1-a)^2)
-            let a_clipped = aii[irow].clamp(0.0, 0.995);
-            let denom = 1.0 - a_clipped;
+            // Use raw a_ii with a small numerical floor on the denominator; no clipping
+            let denom = (1.0 - aii[irow]).max(1e-12);
             let var_loo = var_full / (denom * denom);
             se_tilde[irow] = var_loo.max(0.0).sqrt();
 
-            // ALO predictor with same clipped leverage
-            leverage_eta_tilde[irow] = (eta_hat[irow] - a_clipped * z[irow]) / denom;
+            // ALO predictor in the same pass (consistent with var inflation)
+            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom;
         }
 
         col_start = col_end;
@@ -787,20 +725,31 @@ pub fn build_calibrator_design(
         spec.se_basis.degree,
     )?;
     
-    // Apply sum-to-zero constraints (unweighted) to prevent intercept confounding.
-    // This keeps identifiability without tying constraints to any specific weights.
-    let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), None)?;
+    // Pull training weights for use in STZ (weighted centering)
+    let w_for_stz = spec.prior_weights.as_ref().map(|w| w.view());
+
+    // Apply weighted sum-to-zero constraints to prevent intercept confounding.
+    // This keeps identifiability by making smooths orthogonal to intercept in the weighted inner product.
+    let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), w_for_stz)?;
     
     // For SE, check if we need to use linear fallback first (detected before standardization)
+    // but always ensure it's centered (weighted if weights provided)
     let (b_se_c, stz_se) = if se_linear_fallback {
-        // Use a single centered linear column for SE (no STZ needed)
-        let b_se_c = se_std.view().insert_axis(Axis(1)).to_owned();
-        let stz_se_identity = Array2::<f64>::eye(1);
-        (b_se_c, stz_se_identity)
+        // For SE linear fallback: make the single column weighted mean zero to keep it orthogonal to the intercept
+        let mut col = se_std.clone();
+        if let Some(w) = w_for_stz {
+            let ws = w.iter().copied().sum::<f64>().max(1e-12);
+            let mu = se_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws;
+            col.mapv_inplace(|v| v - mu);
+        } else {
+            let mu = col.mean().unwrap_or(0.0);
+            col.mapv_inplace(|v| v - mu);
+        }
+        (col.insert_axis(Axis(1)).to_owned(), Array2::<f64>::eye(1))
     } else {
-        // Apply weighted STZ constraint using the same normalized training weights
+        // Apply weighted STZ constraint using the provided training weights
         // This ensures consistency across all smooths and maintains identifiability
-        apply_sum_to_zero_constraint(b_se_raw.view(), None)?
+        apply_sum_to_zero_constraint(b_se_raw.view(), w_for_stz)?
     };
     
     // For distance, check if we need to use linear fallback
@@ -815,8 +764,16 @@ pub fn build_calibrator_design(
             let s0 = Array2::<f64>::zeros((0, 0));
             (b, stz, knots, s0)
         } else {
-            // keep the single (centered) linear column, unpenalized
-            let b = dist_std.view().insert_axis(Axis(1)).to_owned();
+            // keep the single centered linear column, unpenalized
+            // Make sure it's actually centered (weighted if weights provided)
+            let mut b = dist_std.clone();
+            if let Some(w) = w_for_stz {
+                let ws = w.iter().copied().sum::<f64>().max(1e-12);
+                let mu = dist_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws;
+                b.mapv_inplace(|v| v - mu);
+            }
+            // Now insert as a column
+            let b = b.insert_axis(Axis(1)).to_owned();
             let stz = Array2::<f64>::eye(1);
             let knots = Array1::<f64>::zeros(0);
             let s0 = Array2::<f64>::zeros((1, 1));
@@ -830,27 +787,12 @@ pub fn build_calibrator_design(
             spec.dist_basis.degree,
         )?;
         
-        // Distance smooth is identifiable with intercept only when some nullspace penalty exists
-        // When both nullspace shrinkage kappa and double_penalty_ridge tau are <= 0, we need STZ for identifiability
-        // We'll check directly using spec values
-        let need_stz = match spec.nullspace_shrinkage_kappa {
-            Some(k) => k <= 0.0 && spec.double_penalty_ridge <= 0.0,
-            None => spec.double_penalty_ridge <= 0.0 // Default kappa is 1.0, which is > 0
-        };
-        
-        if need_stz {
-            // Apply STZ to ensure identifiability when both κ and τ are ≤ 0
-            eprintln!("[CAL] Note: applying STZ to distance smooth due to absence of nullspace penalties");
-            let (b_dist_c, stz_dist_c) = apply_sum_to_zero_constraint(b_dist_raw.view(), None)?;
-            let s_dist_raw0 = create_difference_penalty_matrix(b_dist_c.ncols(), spec.penalty_order_dist)?;
-            (b_dist_c, stz_dist_c, knots_dist_generated, s_dist_raw0)
-        } else {
-            // Use raw basis directly (no STZ) when κ > 0, as the nullspace shrinkage ensures identifiability
-            let b_dist_c = b_dist_raw.clone();
-            let stz_dist_c = Array2::<f64>::eye(b_dist_raw.ncols());
-            let s_dist_raw0 = create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
-            (b_dist_c, stz_dist_c, knots_dist_generated, s_dist_raw0)
-        }
+        // Always apply STZ to ensure identifiability for all λ values
+        // This is fundamental: STZ is required for proper identifiability regardless of penalties
+        eprintln!("[CAL] Applying STZ to distance smooth for identifiability");
+        let (b_dist_c, stz_dist) = apply_sum_to_zero_constraint(b_dist_raw.view(), w_for_stz)?;
+        let s_dist_raw0 = create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
+        (b_dist_c, stz_dist, knots_dist_generated, s_dist_raw0)
     };
     
     // Copy knots_se for ownership
@@ -869,6 +811,24 @@ pub fn build_calibrator_design(
     let s_pred_raw = stz_pred.t().dot(&s_pred_raw0).dot(&stz_pred);
     let s_se_raw = stz_se.t().dot(&s_se_raw0).dot(&stz_se);
     let s_dist_raw = stz_dist.t().dot(&s_dist_raw0).dot(&stz_dist);
+    
+    // Scale each penalty block to a common metric before optimization
+    // This ensures the REML optimization balances blocks fairly, and lambda values are comparable
+    fn scale_penalty_to_unit_mean_eig(s: &Array2<f64>) -> (Array2<f64>, f64) {
+        // Mean nonzero eigenvalue ≈ trace / rank(S)
+        let tr = (0..s.nrows()).map(|i| s[[i,i]]).sum::<f64>().abs();
+        // Crude rank estimate via diagonal > 0, robust enough for diff penalties
+        let r = (0..s.nrows()).filter(|&i| s[[i,i]] > 0.0).count().max(1) as f64;
+        let c = (tr / r).max(1e-12); // Scale factor
+        (s / c, c) // Return scaled matrix and the scaling factor
+    }
+    
+    // Scale each block in constrained coordinates
+    let (s_pred_raw_sc, c_pred) = scale_penalty_to_unit_mean_eig(&s_pred_raw);
+    let (s_se_raw_sc, c_se) = scale_penalty_to_unit_mean_eig(&s_se_raw);
+    let (s_dist_raw_sc, c_dist) = scale_penalty_to_unit_mean_eig(&s_dist_raw);
+    
+    eprintln!("[CAL] Penalty scaling factors: pred={:.3e}, se={:.3e}, dist={:.3e}", c_pred, c_se, c_dist);
 
     // Add penalty on the nullspace of the wiggliness penalty, tied to the same lambda
     // This ensures proper shrinkage behavior by penalizing both wiggly and constant/linear components
@@ -947,9 +907,9 @@ pub fn build_calibrator_design(
     }
     
     // For pred and se, apply both nullspace shrinkage tied to lambda and fixed ridge
-    // First apply kappa (tied to lambda)
-    let s_pred_shrink = add_nullspace_shrink_tied_to_lambda(&s_pred_raw, kappa)?;
-    let s_se_shrink = add_nullspace_shrink_tied_to_lambda(&s_se_raw, kappa)?;
+    // First apply kappa (tied to lambda) to scaled penalties
+    let s_pred_shrink = add_nullspace_shrink_tied_to_lambda(&s_pred_raw_sc, kappa)?;
+    let s_se_shrink = add_nullspace_shrink_tied_to_lambda(&s_se_raw_sc, kappa)?;
     
     // Then apply fixed ridge tau if needed
     let s_pred = add_fixed_nullspace_ridge(&s_pred_shrink, tau)?;
@@ -961,8 +921,8 @@ pub fn build_calibrator_design(
         // This is important: when use_linear_dist is true, s_dist_raw is already zeros(1,1)
         s_dist_raw.clone() // Keep zero: truly unpenalized linear term
     } else {
-        // For spline basis, apply both types of penalties
-        let s_dist_shrink = add_nullspace_shrink_tied_to_lambda(&s_dist_raw, kappa)?;
+        // For spline basis, apply both types of penalties to scaled matrix
+        let s_dist_shrink = add_nullspace_shrink_tied_to_lambda(&s_dist_raw_sc, kappa)?;
         add_fixed_nullspace_ridge(&s_dist_shrink, tau)?
     };
 
