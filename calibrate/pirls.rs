@@ -1717,7 +1717,7 @@ pub fn solve_penalized_least_squares(
     for i in 0..m {
         // ensure strictly positive diagonal to avoid singular/inf cond
         if r_final[[i, i]].abs() < diag_floor {
-            let old_val = r_final[[i, i]];
+            let _old_val = r_final[[i, i]]; // Keep for debugging if needed
             r_final[[i, i]] = if r_final[[i, i]] >= 0.0 { diag_floor } else { -diag_floor };
             any_modified = true;
         }
