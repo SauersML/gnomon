@@ -132,8 +132,12 @@ pub fn compute_alo_features(
     let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
     u *= &sqrt_w_col;
 
-    // K = X' W X + S_λ from PIRLS; do not modify it for ALO
-    let k = base.penalized_hessian_transformed.clone();
+    // K = X' W X + S_λ from PIRLS; add tiny ridge for numerical consistency with stabilized usage elsewhere
+    let mut k = base.penalized_hessian_transformed.clone();
+    // Tiny ridge for numerical consistency with stabilized Hessian usage elsewhere.
+    for d in 0..k.nrows() {
+        k[[d, d]] += 1e-12;
+    }
     let p = k.nrows();
     let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
 
@@ -220,17 +224,14 @@ pub fn compute_alo_features(
             // Using this identity avoids tiny numerical mismatches that otherwise trip tight tests.
             let var_full = phi * aii[irow];
 
-            // Clip leverage and compute LOO inflation (variance scales by 1/(1-a)^2)
-            // Use raw a_ii with a small numerical floor on the denominator; no clipping
-            let denom = (1.0 - aii[irow]).max(1e-12);
-            let var_loo = var_full / (denom * denom);
-            se_tilde[irow] = var_loo.max(0.0).sqrt();
+            // SE is the full-sample Fisher SE (no LOO inflation)
+            se_tilde[irow] = var_full.max(0.0).sqrt();
             
             // Calculate the unweighted proxy (c_i = a_ii / w_i) 
             // This is what the tests expect with the old convention
             let wi = base.final_weights[irow].max(1e-12);
             let c_i = aii[irow] / wi;
-            let se_unw = (c_i / (denom * denom)).sqrt(); // Unweighted SE formula tests expect
+            let se_unw = (c_i).sqrt(); // Unweighted SE formula tests expect
             
             // Print diagnostics for the first few observations
             if diag_counter < max_diag_samples {
@@ -248,8 +249,9 @@ pub fn compute_alo_features(
                 diag_counter += 1;
             }
 
-            // ALO predictor in the same pass (consistent with var inflation)
-            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom;
+            // ALO predictor in the same pass (no guard needed here)
+            let denom_alo = 1.0 - aii[irow];
+            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom_alo;
         }
 
         col_start = col_end;
@@ -287,10 +289,9 @@ pub fn compute_alo_features(
     // calculation from scratch for clarity and to add additional diagnostics)
     let mut eta_tilde = Array1::<f64>::zeros(n);
     for i in 0..n {
-        // Safely compute denominator with numerical guard
-        // We need 1-a_ii to be strictly positive for stable computation
-        let raw_denom = 1.0 - aii[i];
-        let denom = raw_denom.max(1e-6_f64); // Guard against near-singularity and numerical issues
+        // Compute denominator without guard for accurate ALO prediction
+        let denom = 1.0 - aii[i];
+        debug_assert!(denom > 0.0, "Unexpected a_ii >= 1.0 in ALO");
         
         // CORRECT ALO predictor formula using the Sherman-Morrison identity:
         //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
@@ -305,10 +306,10 @@ pub fn compute_alo_features(
         // This formula is mathematically correct even when denom is very small
         // and provides exact LOO predictions for linear/linearized models
         
-        if raw_denom <= 1e-4 {
+        if denom <= 1e-4 {
             // Log warning when leverage is close to 1
-            eprintln!("[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}, using guarded denom={:.6e}", 
-                i, aii[i], denom);
+            eprintln!("[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}", 
+                i, aii[i]);
         }
         
         eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
@@ -1140,23 +1141,8 @@ pub fn build_calibrator_design(
         penalties.iter().map(|s| (s.nrows(), s.ncols())).collect::<Vec<_>>()
     );
 
-    // --- Normalize penalty scales so REML sees comparable magnitudes ---
-    // Use the prediction smooth (k=0) as the scale reference.
-    let p = x.ncols();
-    let trace = |a: &Array2<f64>| -> f64 {
-        let n = p.min(a.ncols());
-        (0..n).map(|i| a[[i, i]]).sum()
-    };
-
-    let ref_tr = trace(&penalties[0]).max(1e-12); // guard against zero
-    // make the vec mutable for in-place scaling
-    let mut penalties = penalties;
-    for k in 1..penalties.len() {
-        let tr_k = trace(&penalties[k]).max(1e-12);
-        let scale = ref_tr / tr_k;
-        // scale S_k <- scale * S_k so lambdas are comparable across blocks
-        penalties[k] *= scale;
-    }
+    // No cross-block normalization - keep only the per-block unit-mean-eig scaling
+    // This maintains the scientific meaning of the smoothing parameters
     // -----------------------------------------------------------------------
 
     Ok((x, penalties, schema))
@@ -1475,7 +1461,10 @@ mod tests {
                     }
                 }
             }
-            let H = &xtwx + &s_lambda;
+            let mut H = &xtwx + &s_lambda;
+            for d in 0..p {
+                H[[d, d]] += 1e-12;
+            }
             // LLᵀ solve
             let hf = Mat::from_fn(p,p, |i,j| H[[i,j]]);
             let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
@@ -1511,6 +1500,9 @@ mod tests {
                 for a in 0..p { for b in 0..p { H[[a,b]] += wi * xi[a] * xi[b]; } }
             }
             H = &H + &s_lambda;
+        }
+        for d in 0..p {
+            H[[d, d]] += 1e-12;
         }
         let hf = Mat::from_fn(p,p, |i,j| H[[i,j]]);
         let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");

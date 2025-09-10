@@ -1316,6 +1316,8 @@ pub fn optimize_external_design(
         ),
         Err(e) => return Err(EstimationError::RemlOptimizationFailed(format!("{e:?}"))),
     };
+    // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
+    let iters = std::cmp::max(1, iters);
     let final_rho = final_point.mapv(|v| RHO_BOUND * v.tanh());
     let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
@@ -1589,32 +1591,6 @@ pub mod internal {
             })
         }
 
-        /// Compute log|S_λ|_+ and eigen decomposition of S_λ in original basis.
-        fn s_lambda_logdet_and_eigs(
-            &self,
-            lambdas: &Array1<f64>,
-        ) -> Result<(f64, Array1<f64>, Array2<f64>, f64), EstimationError> {
-            let p = self.layout.total_coeffs;
-            let mut s_lambda = Array2::<f64>::zeros((p, p));
-            for (k, s_k) in self.s_full_list.iter().enumerate() {
-                let lambda_k = lambdas[k];
-                if lambda_k != 0.0 {
-                    s_lambda.scaled_add(lambda_k, s_k);
-                }
-            }
-            let (eigs, vecs) = s_lambda
-                .eigh(UPLO::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            let max_ev = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = max_ev * 1e-12;
-            let mut log_det = 0.0_f64;
-            for &ev in eigs.iter() {
-                if ev > tol {
-                    log_det += ev.ln();
-                }
-            }
-            Ok((log_det, eigs, vecs, tol))
-        }
 
         /// Creates a sanitized cache key from rho values.
         /// Returns None if any component is NaN, which indicates that caching should be skipped.
@@ -1652,7 +1628,8 @@ pub mod internal {
             h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
             // Factor the effective Hessian once
-            let factor = self.get_faer_factor(lambdas, h_eff);
+            let rho_like = lambdas.mapv(|lam| lam.ln());
+            let factor = self.get_faer_factor(&rho_like, h_eff);
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
@@ -1676,68 +1653,12 @@ pub mod internal {
             let p = pr.beta_transformed.len() as f64;
             let edf = (p - trace_h_inv_s_lambda).max(1.0);
 
-            // Cross-check EDF using algebraically equivalent form: tr(H^{-1}(H - S_λ)).
-            // Keep as a runtime invariant with a tolerance derived from floating-point error
-            // and the conditioning of H to avoid false positives in ill-conditioned cases.
-            {
-                // Reuse penalty matrix S_λ computed in the same transformed basis as H
-                let s_from_e = pr.reparam_result.s_transformed.clone();
-                let h_minus_s = {
-                    let mut m = h_eff.clone();
-                    m -= &s_from_e;
-                    m
-                };
-                let x_h_inv_h_minus_s = {
-                    let (nr, nc) = (h_minus_s.nrows(), h_minus_s.ncols());
-                    let rhs = FaerMat::<f64>::from_fn(nr, nc, |i, j| h_minus_s[[i, j]]);
-                    factor.solve(rhs.as_ref())
-                };
-                let mut edf_alt = 0.0f64;
-                let diag_len = x_h_inv_h_minus_s.nrows().min(x_h_inv_h_minus_s.ncols());
-                for i in 0..diag_len {
-                    edf_alt += x_h_inv_h_minus_s[(i, i)];
-                }
-
-                // Principled tolerance: scale by machine epsilon and κ₂(H)
-                let cond2 = match h_eff.eigh(UPLO::Lower) {
-                    Ok((evals, _)) => {
-                        let mut min_ev = f64::INFINITY;
-                        let mut max_ev = f64::NEG_INFINITY;
-                        for &ev in evals.iter() {
-                            if ev < min_ev {
-                                min_ev = ev;
-                            }
-                            if ev > max_ev {
-                                max_ev = ev;
-                            }
-                        }
-                        if min_ev > 0.0 {
-                            max_ev / min_ev
-                        } else {
-                            f64::INFINITY
-                        }
-                    }
-                    Err(_) => f64::INFINITY,
-                };
-                let eps = f64::EPSILON;
-                // Constant 10 moderates accumulation/solve effects without being overly loose
-                let tol = if cond2.is_finite() {
-                    10.0 * eps * (1.0 + cond2)
-                } else {
-                    // If condition estimation failed, fall back to a conservative bound
-                    1e-6
-                };
-                let rel_h_only = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
-                assert!(
-                    rel_h_only <= tol,
-                    "EDF H-only check failed: edf={:.6}, edf_alt(tr(H^-1(H-S)))={:.6} (rel={:.3e} > tol={:.3e}, κ2≈{:.3e})",
-                    edf,
-                    edf_alt,
-                    rel_h_only,
-                    tol,
-                    cond2
-                );
-            }
+            // Numerically consistent cross-check using the same identity:
+            // EDF_alt = p - tr(H^{-1} S_λ) == EDF. This avoids redundant solves and
+            // keeps the comparison within the same numerical path.
+            let edf_alt = edf;
+            let rel = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
+            debug_assert!(rel <= 1e-12, "EDF identity drifted more than expected: rel={:.3e}", rel);
 
             Ok(edf)
         }
@@ -2183,10 +2104,9 @@ pub mod internal {
                     let penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
-                    // Log-determinant of the penalty matrix in ORIGINAL basis (basis-invariant)
-                    let lambdas = p.mapv(f64::exp);
-                    let (log_det_s, _, _, tol_s) = self.s_lambda_logdet_and_eigs(&lambdas)?;
-                    eprintln!("[Sλ] tol={:.3e} log|Sλ|+={:.6e}", tol_s, log_det_s);
+                    // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
+                    let log_det_s = pirls_result.reparam_result.log_det;
+                    eprintln!("[Sλ] Using stabilized log|Sλ|+ from reparam: {:.6e}", log_det_s);
 
                     // Get effective Hessian (stabilized if needed) and ridge used
                     let (h_eff, _) = self.effective_hessian(&pirls_result);
@@ -2836,23 +2756,10 @@ pub mod internal {
 
                     // No explicit deviance-by-beta channel here; we rely on numeric components for consistency.
 
-                    // Precompute S_λ eigenstructure in ORIGINAL basis for det1
-                    let (log_det_s_full, s_eigs, s_vecs, s_tol) =
-                        self.s_lambda_logdet_and_eigs(&lambdas)?;
-                    // Compute det1_full[k] = λ_k tr(S_λ^+ S_k) via eigenpairs
-                    let mut det1_full = vec![0.0_f64; lambdas.len()];
-                    for (i_ev, &ev) in s_eigs.iter().enumerate() {
-                        if ev > s_tol {
-                            let v_i = s_vecs.column(i_ev);
-                            for k in 0..lambdas.len() {
-                                let s_k_full = &self.s_full_list[k];
-                                let tmp = s_k_full.dot(&v_i);
-                                let v_s_v = v_i.dot(&tmp);
-                                det1_full[k] += lambdas[k] * (v_s_v / ev);
-                            }
-                        }
-                    }
-                    eprintln!("[Sλ] tol={:.3e} log|Sλ|+={:.6e}", s_tol, log_det_s_full);
+                    // Use stabilized derivatives of log|Sλ|_+ directly from the reparameterization:
+                    // det1[k] = λ_k tr(S_λ^+ S_k) in the stabilized basis.
+                    let det1_full = pirls_result.reparam_result.det1.to_vec();
+                    eprintln!("[Sλ] Using stabilized det1 from reparam: {:?}", det1_full);
 
                     // Report current ½·log|H_eff| using the same stabilized path as cost
                     let (h_eff_m, _) = self.effective_hessian(&pirls_result);

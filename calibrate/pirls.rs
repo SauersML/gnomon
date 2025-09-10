@@ -7,7 +7,7 @@ use ndarray_linalg::{Cholesky, Eigh, UPLO};
 // faer symmetric solvers for SPD/indefinite systems
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
+use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Lblt as FaerLblt, Solve as FaerSolve};
 use std::time::Instant;
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -2044,19 +2044,47 @@ fn calculate_edf(
     }
     let h_f = FaerMat::<f64>::from_fn(p, p, |i, j| penalized_hessian[[i, j]]);
     let rhs = FaerMat::<f64>::from_fn(p, r, |i, j| e_transformed[(j, i)]);
-    let chol = FaerLlt::new(h_f.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+
+    // Try LLᵀ first
+    if let Ok(ch) = FaerLlt::new(h_f.as_ref(), Side::Lower) {
+        let sol = ch.solve(rhs.as_ref());
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += sol[(i, j)] * e_transformed[(j, i)];
+            }
         }
-    })?;
-    let sol = chol.solve(rhs.as_ref());
-    let mut tr_hinv_s = 0.0f64;
-    for j in 0..r {
-        for i in 0..p {
-            tr_hinv_s += sol[(i, j)] * e_transformed[(j, i)];
-        }
+        return Ok((p as f64 - tr).clamp(0.0, p as f64));
     }
-    Ok((p as f64 - tr_hinv_s).clamp(0.0, p as f64))
+
+    // Try LDLᵀ (semi-definite)
+    if let Ok(ld) = FaerLdlt::new(h_f.as_ref(), Side::Lower) {
+        let sol = ld.solve(rhs.as_ref());
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += sol[(i, j)] * e_transformed[(j, i)];
+            }
+        }
+        return Ok((p as f64 - tr).clamp(0.0, p as f64));
+    }
+
+    // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
+    let lb = FaerLblt::new(h_f.as_ref(), Side::Lower);
+    let sol = lb.solve(rhs.as_ref());
+    if sol.nrows() == p && sol.ncols() == r {
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += sol[(i, j)] * e_transformed[(j, i)];
+            }
+        }
+        return Ok((p as f64 - tr).clamp(0.0, p as f64));
+    }
+
+    Err(EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    })
 }
 
 /// Calculate scale parameter correctly for different link functions
