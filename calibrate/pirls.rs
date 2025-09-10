@@ -1888,7 +1888,11 @@ pub fn solve_penalized_least_squares(
     //-----------------------------------------------------------------------
 
     // Calculate effective degrees of freedom using H and XtWX directly (stable)
-    let edf = calculate_edf(&penalized_hessian, e_transformed)?;
+    let mut edf = calculate_edf(&penalized_hessian, e_transformed)?;
+    if !edf.is_finite() || edf.is_nan() {
+        // robust fallback for rank-deficient/near-singular cases
+        edf = e_transformed.nrows() as f64; // Use the penalty rank as fallback
+    }
 
     // Calculate scale parameter
     let scale = calculate_scale(

@@ -2008,10 +2008,9 @@ pub mod internal {
                         Ok(condition_number) => {
                             if condition_number > MAX_CONDITION_NUMBER {
                                 log::warn!(
-                                    "Penalized Hessian very ill-conditioned (cond={:.2e}); treating as barrier.",
+                                    "Penalized Hessian very ill-conditioned (cond={:.2e}); proceeding despite poor conditioning.",
                                     condition_number
                                 );
-                                return Ok(f64::INFINITY);
                             } else if condition_number > 1e8 {
                                 log::warn!(
                                     "Penalized Hessian is ill-conditioned but proceeding: condition number = {condition_number:.2e}"

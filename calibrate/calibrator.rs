@@ -251,7 +251,7 @@ pub fn compute_alo_features(
 
             // ALO predictor in the same pass (no guard needed here)
             let denom_alo = 1.0 - aii[irow];
-            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom_alo;
+            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * (z[irow] - eta_hat[irow])) / denom_alo;
         }
 
         col_start = col_end;
@@ -312,7 +312,7 @@ pub fn compute_alo_features(
                 i, aii[i]);
         }
         
-        eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
+        eta_tilde[i] = (eta_hat[i] - aii[i] * (z[i] - eta_hat[i])) / denom;
         
         // Optional: soft-clip extreme values if needed
         if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
@@ -759,14 +759,6 @@ pub fn build_calibrator_design(
     // This keeps identifiability by making smooths orthogonal to intercept in the weighted inner product.
     let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), w_for_stz)?;
 
-    // Build an explicit unpenalized linear channel for pred (centered like STZ)
-    let pred_center_offset = if let Some(w) = w_for_stz {
-        let ws = w.iter().copied().sum::<f64>().max(1e-12);
-        pred_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws
-    } else {
-        pred_std.mean().unwrap_or(0.0)
-    };
-    let pred_lin = pred_std.mapv(|x| x - pred_center_offset); // mean zero under same inner product
     
     // Add diagnostic to check STZ constraint - verify column means are zero
     // This is what the constraint guarantees: weighted column means of B·T should be zero
@@ -1038,24 +1030,19 @@ pub fn build_calibrator_design(
         knots_se = Array1::zeros(0); // Empty knots for linear fallback
     }
 
-    // Assemble pred block: [pred_lin | B_pred_c]; linear is unpenalized
-    let mut b_pred_total = Array2::<f64>::zeros((n, 1 + b_pred_c.ncols()));
-    b_pred_total.column_mut(0).assign(&pred_lin);
-    b_pred_total.slice_mut(s![.., 1..]).assign(&b_pred_c);
-
-    // Assemble X = [1 | (pred_lin|B_pred) | B_se | B_dist]
-    let p_cols = 1 + b_pred_total.ncols() + b_se_c.ncols() + b_dist_c.ncols();
+    // Assemble X = [1 | B_pred | B_se | B_dist] - no unpenalized pred linear channel
+    let p_cols = 1 + b_pred_c.ncols() + b_se_c.ncols() + b_dist_c.ncols();
     let mut x = Array2::<f64>::zeros((n, p_cols));
     // intercept
     for i in 0..n {
         x[[i, 0]] = 1.0;
     }
-    // B_pred
-    x.slice_mut(s![.., 1..1 + b_pred_total.ncols()])
-        .assign(&b_pred_total);
+    // B_pred - pred smooth fills columns 1..1+pred_cols directly
+    x.slice_mut(s![.., 1..1 + b_pred_c.ncols()])
+        .assign(&b_pred_c);
     // B_se
-    // IMPORTANT: the SE block must start after all pred columns (linear + smooth)
-    let se_off = 1 + b_pred_total.ncols();
+    // IMPORTANT: the SE block must start after all pred columns
+    let se_off = 1 + b_pred_c.ncols();
     x.slice_mut(s![.., se_off..se_off + b_se_c.ncols()])
         .assign(&b_se_c);
     // B_dist
@@ -1069,10 +1056,10 @@ pub fn build_calibrator_design(
     let mut s_se_p = Array2::<f64>::zeros((p, p));
     let mut s_dist_p = Array2::<f64>::zeros((p, p));
     // Place into the appropriate diagonal blocks
-    // pred penalties: first column (linear) is unpenalized => zero block
+    // pred penalties: place directly at pred smooth columns (1..1+pred_cols)
     for i in 0..b_pred_c.ncols() {
         for j in 0..b_pred_c.ncols() {
-            s_pred_p[[1 + i + 1, 1 + j + 1]] = s_pred[[i, j]];
+            s_pred_p[[1 + i, 1 + j]] = s_pred[[i, j]];
         }
     }
     for i in 0..b_se_c.ncols() {
@@ -1111,7 +1098,7 @@ pub fn build_calibrator_design(
         spec.pred_basis.degree, m_pred_int, m_se_int, m_dist_int, spec.penalty_order_pred, spec.double_penalty_ridge
     );
     // Create ranges for column spans
-    let pred_range = 1..(1 + b_pred_total.ncols());  // includes linear + smooth
+    let pred_range = 1..(1 + b_pred_c.ncols());  // pred smooth only
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
@@ -1130,7 +1117,7 @@ pub fn build_calibrator_design(
         se_center_offset: mu_se,
         dist_center_offset: mu_dist,
         column_spans: (pred_range, se_range, dist_range),
-        pred_center_offset,
+        pred_center_offset: 0.0,  // No longer used since we removed the linear channel
     };
     
     // Early self-check to ensure built penalties match X width
@@ -1192,12 +1179,7 @@ pub fn predict_calibrator(
     };
 
     let b_pred = b_pred_raw.dot(&model.stz_pred);
-    // Rebuild pred linear channel from standardized pred and stored center offset
-    let pred_lin = pred_std.mapv(|x| x - model.pred_center_offset);
-    let n = pred_std.len();
-    let mut b_pred_total = Array2::<f64>::zeros((n, 1 + b_pred.ncols()));
-    b_pred_total.column_mut(0).assign(&pred_lin);
-    b_pred_total.slice_mut(s![.., 1..]).assign(&b_pred);
+    // No separate linear channel - use only the pred smooth
 
     // Handle distance basis, with special case for linear fallback
     let b_dist = if model.dist_linear_fallback || model.knots_dist.len() == 0 {
@@ -1227,7 +1209,7 @@ pub fn predict_calibrator(
     }
     if n_pred_cols > 0 {
         x.slice_mut(s![.., 1..1 + n_pred_cols])
-            .assign(&b_pred_total.slice(s![.., ..n_pred_cols]));
+            .assign(&b_pred.slice(s![.., ..n_pred_cols]));
     }
     if n_se_cols > 0 {
         let off = 1 + n_pred_cols;
@@ -1364,58 +1346,6 @@ mod tests {
     /// Evaluates the LAML objective at a fixed rho for binomial/logistic regression.
     /// This test-only function is used to verify the optimizer's solution.
     // Compute log|S_lambda|_+ (pseudo-determinant: sum of logs of positive eigenvalues)
-    fn logdet_penalty_pseudodet(s_lambda: &Array2<f64>) -> f64 {
-        // Use existing eigendecomposition functionality from basis.rs
-        // This avoids direct dependency on ndarray_linalg
-        let evals = match crate::calibrate::basis::null_range_whiten(s_lambda) {
-            Ok((null, range)) => {
-                let null_dim = null.ncols();
-                let range_dim = range.ncols();
-                let mut all_evals = Vec::with_capacity(null_dim + range_dim);
-                if range_dim > 0 {
-                    for j in 0..range_dim {
-                        let col = range.column(j);
-                        let norm_squared: f64 = col.iter().map(|&x| x * x).sum();
-                        all_evals.push(norm_squared);
-                    }
-                }
-                all_evals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                all_evals
-            },
-            Err(_) => {
-                let n = s_lambda.nrows();
-                let mut evals = Vec::new();
-                let mut remaining = s_lambda.clone();
-                for _ in 0..std::cmp::min(n, 10) {
-                    let mut v = Array1::from_elem(n, 1.0 / (n as f64).sqrt());
-                    for _ in 0..20 {
-                        let v_new = remaining.dot(&v);
-                        let norm = (v_new.iter().map(|x| x*x).sum::<f64>()).sqrt();
-                        if norm < 1e-12_f64 { break; }
-                        v = &v_new / norm;
-                    }
-                    let rayleigh = v.dot(&remaining.dot(&v));
-                    if rayleigh > 1e-12_f64 {
-                        evals.push(rayleigh);
-                        let vvt = v.to_shape((n, 1)).unwrap().dot(&v.to_shape((1, n)).unwrap());
-                        remaining = &remaining - &(&vvt * rayleigh);
-                    } else {
-                        break;
-                    }
-                }
-                evals
-            }
-        };
-        
-        // Find maximum absolute eigenvalue for scaling tolerance
-        let maxabs = evals.iter().fold(0.0_f64, |m: f64, &v| m.max(v.abs()));
-        let tol = 1e-12_f64.max(1e-12_f64 * maxabs);
-        
-        // Sum logs of eigenvalues larger than tolerance
-        evals.iter()
-            .filter_map(|&e| if e <= tol { None } else { Some(e.ln()) })
-            .sum()
-    }
 
     fn eval_laml_fixed_rho_binom(
         y: ArrayView1<f64>,
@@ -1425,18 +1355,31 @@ mod tests {
         rho: &[f64],
     ) -> f64 {
         use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
-        // 1) S_lambda
+        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+        
+        // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
             let lam = rho[j].exp();
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
 
-        // 2) penalized IRLS to convergence
+        // 1b) Stabilized reparameterization
+        let rs_list = compute_penalty_square_roots(rs_blocks).expect("roots");
+        let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
+        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("reparam");
+        
+        // Transform X to stabilized basis
+        let x_trans = x.dot(&reparam.qs);
+
+        // 2) penalized IRLS to convergence (in transformed coordinates)
         let n = x.nrows();
         let p = x.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
+        let mut beta_trans = Array1::<f64>::zeros(p);
         for _ in 0..50 {
+            // Work in original coordinates for GLM computations
+            let beta = reparam.qs.dot(&beta_trans);
             let eta = x.dot(&beta);
             let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())).mapv(|p| p.clamp(1e-12, 1.0-1e-12));
             let v = mu.iter().zip(mu.iter()).map(|(m, _)| m*(1.0-*m)).collect::<Vec<_>>();
@@ -1447,38 +1390,40 @@ mod tests {
                 let vi = (mu[i] * (1.0 - mu[i])).max(1e-12);
                 z[i] = eta[i] + (y[i] - mu[i]) / vi;
             }
-            // H = X^T W X + S, rhs = X^T W z
-            let mut xtwx = Array2::<f64>::zeros((p, p));
-            let mut xtwz = Array1::<f64>::zeros(p);
+            // H_eff = X_transᵀ W X_trans + s_transformed
+            let mut xtwx_trans = Array2::<f64>::zeros((p, p));
+            let mut xtwz_trans = Array1::<f64>::zeros(p);
             for i in 0..n {
                 let wi = w[i];
                 if wi == 0.0 { continue; }
-                let xi = x.row(i);
+                let xi_trans = x_trans.row(i);
                 for a in 0..p {
-                    xtwz[a] += wi * xi[a] * z[i];
+                    xtwz_trans[a] += wi * xi_trans[a] * z[i];
                     for b in 0..p {
-                        xtwx[[a,b]] += wi * xi[a] * xi[b];
+                        xtwx_trans[[a,b]] += wi * xi_trans[a] * xi_trans[b];
                     }
                 }
             }
-            let mut H = &xtwx + &s_lambda;
+            let mut h_eff = &xtwx_trans + &reparam.s_transformed;
             for d in 0..p {
-                H[[d, d]] += 1e-12;
+                h_eff[[d, d]] += 1e-12;
             }
-            // LLᵀ solve
-            let hf = Mat::from_fn(p,p, |i,j| H[[i,j]]);
+            // LLᵀ solve in transformed coordinates
+            let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
             let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
-            let rhs = Mat::from_fn(p,1, |i,_| xtwz[i]);
+            let rhs = Mat::from_fn(p,1, |i,_| xtwz_trans[i]);
             let sol = llt.solve(rhs.as_ref());
-            let beta_new = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
+            let beta_trans_new = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
 
-            if (&beta_new - &beta).mapv(|t| t.abs()).sum() < 1e-8 { beta = beta_new; break; }
-            beta = beta_new;
+            if (&beta_trans_new - &beta_trans).mapv(|t| t.abs()).sum() < 1e-8 { beta_trans = beta_trans_new; break; }
+            beta_trans = beta_trans_new;
         }
 
-        // 3) pieces for F
+        // 3) pieces for F - compute final objective using stabilized values
+        let beta = reparam.qs.dot(&beta_trans);
         let eta = x.dot(&beta);
         let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())).mapv(|p| p.clamp(1e-12, 1.0-1e-12));
+        
         // log-lik with prior weights
         let mut ll = 0.0;
         for i in 0..n {
@@ -1486,36 +1431,40 @@ mod tests {
         }
         let pen = 0.5 * beta.dot(&s_lambda.dot(&beta));
 
-        // log|H|
-        let mut H = Array2::<f64>::zeros((p,p));
-        {
-            // recompute W at final mu
-            let mut w = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                w[i] = w_prior[i] * mu[i] * (1.0 - mu[i]);
-            }
-            for i in 0..n {
-                let wi = w[i];
-                let xi = x.row(i);
-                for a in 0..p { for b in 0..p { H[[a,b]] += wi * xi[a] * xi[b]; } }
-            }
-            H = &H + &s_lambda;
+        // log|H_eff| using stabilized H_eff in transformed basis
+        let mut w = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            w[i] = w_prior[i] * mu[i] * (1.0 - mu[i]);
         }
-        for d in 0..p {
-            H[[d, d]] += 1e-12;
+        let mut h_eff = Array2::<f64>::zeros((p, p));
+        for i in 0..n {
+            let wi = w[i];
+            let xi_trans = x_trans.row(i);
+            for a in 0..p { 
+                for b in 0..p { 
+                    h_eff[[a,b]] += wi * xi_trans[a] * xi_trans[b]; 
+                } 
+            }
         }
-        let hf = Mat::from_fn(p,p, |i,j| H[[i,j]]);
+        h_eff = &h_eff + &reparam.s_transformed;
+        // tiny ridge
+        for d in 0..p { 
+            h_eff[[d, d]] += 1e-12; 
+        }
+        // log|H_eff|
+        let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
         let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
-        let mut logdet_H = 0.0;
-        for i in 0..p { logdet_H += llt.L().get(i,i).ln(); }
-        logdet_H *= 2.0;
+        let mut logdet_h = 0.0;
+        for i in 0..p { 
+            logdet_h += llt.L().get(i,i).ln(); 
+        }
+        logdet_h *= 2.0;
 
-        // Compute log|S_lambda|_+ (pseudo-determinant: sum of logs of positive eigenvalues)
-        // S_lambda is NOT full rank due to unpenalized intercept and possibly other unpenalized columns
-        let logdet_S = logdet_penalty_pseudodet(&s_lambda);
+        // log|Sλ|_+ stabilized from reparameterization
+        let logdet_s = reparam.log_det;
         
         // F(rho) (drop constants)
-        -ll + pen + 0.5*logdet_H - 0.5*logdet_S
+        -ll + pen + 0.5*logdet_h - 0.5*logdet_s
     }
     
     /// Evaluates the LAML objective at a fixed rho for Gaussian/identity regression.
@@ -1529,40 +1478,56 @@ mod tests {
         scale: f64, // Gaussian dispersion parameter
     ) -> f64 {
         use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
-        // 1) S_lambda
+        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+        
+        // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
             let lam = rho[j].exp();
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
 
-        // 2) Direct least squares solution
+        // 1b) Stabilized reparameterization
+        let rs_list = compute_penalty_square_roots(rs_blocks).expect("roots");
+        let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
+        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("reparam");
+        
+        // Transform X to stabilized basis
+        let x_trans = x.dot(&reparam.qs);
+
+        // 2) Direct least squares solution in transformed coordinates
         let n = x.nrows();
         let p = x.ncols();
         
-        // X^T W X + S_lambda
-        let mut xtwx = Array2::<f64>::zeros((p, p));
-        let mut xtwy = Array1::<f64>::zeros(p);
+        // H_eff = X_transᵀ W X_trans + s_transformed
+        let mut xtwx_trans = Array2::<f64>::zeros((p, p));
+        let mut xtwy_trans = Array1::<f64>::zeros(p);
         for i in 0..n {
             let wi = w_prior[i];
             if wi == 0.0 { continue; }
-            let xi = x.row(i);
+            let xi_trans = x_trans.row(i);
             for a in 0..p {
-                xtwy[a] += wi * xi[a] * y[i];
+                xtwy_trans[a] += wi * xi_trans[a] * y[i];
                 for b in 0..p {
-                    xtwx[[a,b]] += wi * xi[a] * xi[b];
+                    xtwx_trans[[a,b]] += wi * xi_trans[a] * xi_trans[b];
                 }
             }
         }
-        let h = &xtwx + &s_lambda;
+        let mut h_eff = &xtwx_trans + &reparam.s_transformed;
+        // tiny ridge
+        for d in 0..p { 
+            h_eff[[d, d]] += 1e-12; 
+        }
         // LLᵀ solve
-        let hf = Mat::from_fn(p,p, |i,j| h[[i,j]]);
+        let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
         let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
-        let rhs = Mat::from_fn(p,1, |i,_| xtwy[i]);
+        let rhs = Mat::from_fn(p,1, |i,_| xtwy_trans[i]);
         let sol = llt.solve(rhs.as_ref());
-        let beta = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
+        let beta_trans = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
+        let beta = reparam.qs.dot(&beta_trans);
 
-        // 3) pieces for F
+        // 3) pieces for F - compute final objective using stabilized values
         let eta = x.dot(&beta);
         
         // -log-lik with prior weights (weighted RSS term)
@@ -1575,17 +1540,18 @@ mod tests {
         
         let pen = 0.5 * beta.dot(&s_lambda.dot(&beta));
 
-        // log|H| = log|X^T W X + S_lambda|
-        let mut logdet_H = 0.0;
-        for i in 0..p { logdet_H += llt.L().get(i,i).ln(); }
-        logdet_H *= 2.0;
+        // log|H_eff| using stabilized H_eff in transformed basis (already computed above)
+        let mut logdet_h = 0.0;
+        for i in 0..p { 
+            logdet_h += llt.L().get(i,i).ln(); 
+        }
+        logdet_h *= 2.0;
 
-        // Compute log|S_lambda|_+ (pseudo-determinant: sum of logs of positive eigenvalues)
-        // S_lambda is NOT full rank due to unpenalized intercept and possibly other unpenalized columns
-        let logdet_S = logdet_penalty_pseudodet(&s_lambda);
+        // log|Sλ|_+ stabilized from reparameterization
+        let logdet_s = reparam.log_det;
         
         // F(rho) (drop constants)
-        neg_ll + pen + 0.5*logdet_H - 0.5*logdet_S
+        neg_ll + pen + 0.5*logdet_h - 0.5*logdet_s
     }
 
     // ===== Test Helper Functions =====
