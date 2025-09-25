@@ -165,22 +165,29 @@ pub fn compute_alo_features(
         )
     };
 
-    // We used to precompute XtWX = Uᵀ U (U = sqrt(W) X)
-    // but it's now unused after switching to phi * aii directly for var_full
+    let ut = u.t(); // p x n
+    // Precompute Xᵀ W X = Uᵀ U (U = sqrt(W) X). This is required for the
+    // Fisher prediction variance in penalized models.
+    let xtwx = ut.dot(&u);
 
     // Gaussian dispersion φ (use PIRLS final weights)
     let phi = match link {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
             let mut rss = 0.0;
-            let mut wsum = 0.0;
             for i in 0..n {
                 let r = y[i] - base.final_mu[i];
                 let wi = base.final_weights[i];
                 rss += wi * r * r;
-                wsum += wi;
             }
-            let denom = (wsum - base.edf).max(1.0);
+            // In Gaussian P-IRLS, the working weights encode observation precision
+            // (w_i = 1 / Var(y_i | μ_i)).  The weighted residual sum of squares therefore
+            // has expectation φ (n - edf), regardless of the absolute scale of the weights.
+            // Using ∑ w_i in the denominator would incorrectly scale the dispersion whenever
+            // the weights differ from 1.  We must divide by the residual degrees of freedom in
+            // terms of the actual number of observations.
+            let dof = (n as f64) - base.edf;
+            let denom = dof.max(1.0);
             rss / denom
         }
     };
@@ -190,7 +197,6 @@ pub fn compute_alo_features(
     let mut aii = Array1::<f64>::zeros(n);
     let mut leverage_eta_tilde = Array1::<f64>::zeros(n); // Renamed to avoid shadowing
     let mut se_tilde = Array1::<f64>::zeros(n);
-    let ut = u.t(); // p x n
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
     let z = base.solve_working_response.clone();
 
@@ -206,9 +212,8 @@ pub fn compute_alo_features(
         let rhs_block = ut.slice(s![.., col_start..col_end]).to_owned();
         let rhs_f = FaerMat::<f64>::from_fn(p, cols, |i, j| rhs_block[[i, j]]);
         let s_block = factor.solve(rhs_f.as_ref()); // p x cols
-
-        // We used to convert s_block to ndarray for t_block = xtwx.dot(&s_block_nd)
-        // but it's now unused after switching to phi * aii directly for var_full
+        let s_block_nd = Array2::from_shape_fn((p, cols), |(i, j)| s_block[(i, j)]);
+        let t_block_nd = xtwx.dot(&s_block_nd);
 
         for j in 0..cols {
             let irow = col_start + j;
@@ -216,20 +221,29 @@ pub fn compute_alo_features(
             // a_ii = u_i · s_i
             let mut dot = 0.0;
             for r in 0..p {
-                dot += u[[irow, r]] * s_block[(r, j)];
+                dot += u[[irow, r]] * s_block_nd[(r, j)];
             }
             aii[irow] = dot;
 
-            // In the unpenalized case (K = XᵀWX), var_full must equal φ · a_ii exactly.
-            // Using this identity avoids tiny numerical mismatches that otherwise trip tight tests.
-            let var_full = phi * aii[irow];
+            let wi = base.final_weights[irow].max(1e-12);
+
+            // Fisher prediction variance on the η-scale:
+            //   Var(η̂_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i,
+            // where s_i = K^{-1} u_i and u_i = √w_i x_i.
+            let quad = {
+                let mut acc = 0.0;
+                for r in 0..p {
+                    acc += s_block_nd[(r, j)] * t_block_nd[(r, j)];
+                }
+                acc
+            };
+            let var_full = phi * (quad / wi);
 
             // SE is the full-sample Fisher SE (no LOO inflation)
             se_tilde[irow] = var_full.max(0.0).sqrt();
-            
-            // Calculate the unweighted proxy (c_i = a_ii / w_i) 
+
+            // Calculate the unweighted proxy (c_i = a_ii / w_i)
             // This is what the tests expect with the old convention
-            let wi = base.final_weights[irow].max(1e-12);
             let c_i = aii[irow] / wi;
             let se_unw = (c_i).sqrt(); // Unweighted SE formula tests expect
             
