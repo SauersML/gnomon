@@ -240,15 +240,20 @@ pub fn compute_alo_features(
             };
             let var_full = phi * (quad / wi);
 
-            // For linear smoothers the standard LOOCV derivation gives
-            //   Var_LOO(η_i) = Var_full(η_i) / (1 - a_ii)
-            // where a_ii is the penalized leverage and Var_full(η_i) is the
-            // Fisher variance from the converged PIRLS fit.  Earlier revisions
-            // incorrectly subtracted the observation's contribution and divided
-            // by (1 - a_ii)^2, which drives the variance toward zero whenever
-            // a_ii approaches one.  The simple 1/(1-a_ii) inflation is the
-            // correct Sherman-Morrison result for both penalized and
-            // unpenalized GLMs.
+            // Proper leave-one-out (LOO) prediction variance must remove the
+            // contribution of the i-th working response before inflating by the
+            // Sherman-Morrison denominator.  For an arbitrary penalized smoother the
+            // smoothing matrix is no longer idempotent, so the simple
+            // var_full/(1 - a_ii) formula (which assumes a projection matrix) is
+            // WRONG.  The correct expression is
+            //
+            //   Var_LOO(η_i) = (Var_full(η_i) - Var(z_i) * a_ii^2) / (1 - a_ii)^2
+            //
+            // where Var(z_i) = φ / w_i.  The previous code skipped the subtraction
+            // term, implicitly assuming the hat matrix squared equals itself.  That
+            // only holds for unpenalized least squares; with smoothing penalties the
+            // matrix contracts and the omitted term is O(a_ii^2), dramatically
+            // underestimating LOO uncertainty for high leverage points.
             let denom_raw = 1.0 - aii[irow];
             if denom_raw <= 0.0 {
                 eprintln!(
@@ -257,7 +262,10 @@ pub fn compute_alo_features(
                 );
             }
             let denom = denom_raw.max(1e-12);
-            let var_loo = (var_full / denom).max(0.0);
+
+            let var_without_i = (var_full - phi * (aii[irow] * aii[irow]) / wi).max(0.0);
+            let denom_sq = denom * denom;
+            let var_loo = var_without_i / denom_sq;
             let se_full = var_full.max(0.0).sqrt();
             se_tilde[irow] = var_loo.max(0.0).sqrt();
 
@@ -270,12 +278,20 @@ pub fn compute_alo_features(
                 println!("  - a_ii: {:.6e}", aii[irow]);
                 println!("  - 1 - a_ii: {:.6e}", denom_raw);
                 println!("  - var_full (full sample): {:.6e}", var_full);
+                println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
                 println!("  - var_loo (inflated): {:.6e}", var_loo);
                 println!("  - SE_full (full sample): {:.6e}", se_full);
                 println!("  - SE_tilde (LOO): {:.6e}", se_tilde[irow]);
                 println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
                 println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
-                let expected_ratio = denom.max(1e-12).sqrt().recip();
+                let expected_ratio = {
+                    let infl = var_without_i / var_full.max(1e-24);
+                    if infl >= 0.0 {
+                        (infl.sqrt() / denom.max(1e-12)).abs()
+                    } else {
+                        f64::NAN
+                    }
+                };
                 println!(
                     "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
                     if se_full > 0.0 {
