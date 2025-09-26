@@ -262,6 +262,7 @@ pub fn compute_alo_features(
                 );
             }
             let denom = denom_raw.max(1e-12);
+
             let var_without_i = (var_full - phi * (aii[irow] * aii[irow]) / wi).max(0.0);
             let denom_sq = denom * denom;
             let var_loo = var_without_i / denom_sq;
