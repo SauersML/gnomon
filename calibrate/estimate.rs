@@ -1105,7 +1105,7 @@ pub fn train_model(
             double_penalty_ridge: 1e-6, // Keep the tiny ridge on the nullspace
             distance_hinge: true,       // Keep the distance hinge behavior
             nullspace_shrinkage_kappa: Some(1.0), // Default equal shrinkage
-            prior_weights: None         // No custom weights
+            prior_weights: Some(reml_state.weights().to_owned()),
         };
 
         // Build design and penalties for calibrator
@@ -1143,8 +1143,11 @@ pub fn train_model(
             }
         );
 
+        let mut spec_for_model = spec.clone();
+        spec_for_model.prior_weights = None; // Do not persist training weights in the saved model
+
         let model = cal::CalibratorModel {
-            spec: spec.clone(),
+            spec: spec_for_model,
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
