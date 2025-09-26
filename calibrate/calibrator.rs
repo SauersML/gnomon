@@ -482,21 +482,56 @@ pub fn build_calibrator_design(
 ) -> Result<(Array2<f64>, Vec<Array2<f64>>, InternalSchema), EstimationError> {
     let n = features.pred.len();
 
+    if let Some(w) = spec.prior_weights.as_ref() {
+        if w.len() != n {
+            return Err(EstimationError::InvalidSpecification(format!(
+                "Calibrator prior weights length {} does not match number of observations {}",
+                w.len(),
+                n
+            )));
+        }
+    }
+
     // Standardize inputs and record parameters
-    fn mean_and_std_raw(v: &Array1<f64>) -> (f64, f64) {
-        if v.len() == 0 {
+    fn mean_and_std_raw(v: &Array1<f64>, weights: Option<&Array1<f64>>) -> (f64, f64) {
+        let n = v.len();
+        if n == 0 {
             // For empty arrays, return defaults that won't cause issues
             return (0.0, 0.0);
         }
 
-        let mean = v.sum() / (v.len() as f64);
-        let mut var = 0.0;
-        for &x in v.iter() {
-            let d = x - mean;
-            var += d * d;
+        if let Some(w) = weights {
+            let mut sum_w = 0.0;
+            let mut mean_num = 0.0;
+            for (&x, &wi) in v.iter().zip(w.iter()) {
+                if wi > 0.0 {
+                    sum_w += wi;
+                    mean_num += wi * x;
+                }
+            }
+            if sum_w <= 0.0 {
+                return (0.0, 0.0);
+            }
+            let mean = mean_num / sum_w;
+            let mut var = 0.0;
+            for (&x, &wi) in v.iter().zip(w.iter()) {
+                if wi > 0.0 {
+                    let d = x - mean;
+                    var += wi * d * d;
+                }
+            }
+            var /= sum_w;
+            (mean, var.sqrt())
+        } else {
+            let mean = v.sum() / (n as f64);
+            let mut var = 0.0;
+            for &x in v.iter() {
+                let d = x - mean;
+                var += d * d;
+            }
+            var /= n as f64;
+            (mean, var.sqrt())
         }
-        var /= v.len() as f64;
-        (mean, var.sqrt())
     }
     fn standardize_with(mean: f64, std: f64, v: &Array1<f64>) -> (Array1<f64>, (f64, f64)) {
         // Ensure we don't divide by zero, use a minimum std value
@@ -507,8 +542,9 @@ pub fn build_calibrator_design(
         (v.mapv(|x| (x - mean) / s_use), (mean, s_use))
     }
 
-    let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred);
-    let (se_mean, se_std_raw) = mean_and_std_raw(&features.se);
+    let weight_opt = spec.prior_weights.as_ref();
+    let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred, weight_opt);
+    let (se_mean, se_std_raw) = mean_and_std_raw(&features.se, weight_opt);
 
     // --- Check SE variability BEFORE standardization ---
     // Detect near-constant SE values that would lead to numerical issues
@@ -529,7 +565,7 @@ pub fn build_calibrator_design(
     };
 
     // Compute robust statistics for the distance component
-    let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw);
+    let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw, weight_opt);
 
     // Advanced heuristic for linear fallback with multiple criteria
 
