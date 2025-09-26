@@ -12,7 +12,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Solve as FaerSolve};
+use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 // Use the shared optimizer facade from estimate.rs
@@ -63,18 +63,18 @@ pub struct CalibratorModel {
     pub standardize_pred: (f64, f64), // mean, std
     pub standardize_se: (f64, f64),
     pub standardize_dist: (f64, f64),
-    
+
     // Flag for SE linear fallback when SE range is negligible
     pub se_linear_fallback: bool,
-    
+
     // Flag for distance linear fallback when distance range is negligible
     pub dist_linear_fallback: bool,
 
     // Centering offsets for linear fallbacks
-    pub se_center_offset: f64,     // weighted mean subtracted from se_std
-    pub dist_center_offset: f64,   // weighted mean subtracted from dist_std
-    pub pred_center_offset: f64,   // weighted mean subtracted from pred_std (for linear channel)
-    
+    pub se_center_offset: f64,   // weighted mean subtracted from se_std
+    pub dist_center_offset: f64, // weighted mean subtracted from dist_std
+    pub pred_center_offset: f64, // weighted mean subtracted from pred_std (for linear channel)
+
     // Fitted lambdas
     pub lambda_pred: f64,
     pub lambda_se: f64,
@@ -105,9 +105,9 @@ pub struct InternalSchema {
     pub standardize_dist: (f64, f64),
     pub se_linear_fallback: bool,
     pub dist_linear_fallback: bool,
-    pub se_center_offset: f64,     // weighted mean subtracted from se_std
-    pub dist_center_offset: f64,   // weighted mean subtracted from dist_std
-    pub pred_center_offset: f64,   // weighted mean subtracted from pred_std
+    pub se_center_offset: f64,   // weighted mean subtracted from se_std
+    pub dist_center_offset: f64, // weighted mean subtracted from dist_std
+    pub pred_center_offset: f64, // weighted mean subtracted from pred_std
     pub column_spans: (
         std::ops::Range<usize>,
         std::ops::Range<usize>,
@@ -159,10 +159,11 @@ pub fn compute_alo_features(
         Factor::Llt(f)
     } else {
         // Robust to semi-definiteness / near-rank-deficiency without changing K
-        Factor::Ldlt(
-            FaerLdlt::new(k_f.as_ref(), Side::Lower)
-                .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })?
-        )
+        Factor::Ldlt(FaerLdlt::new(k_f.as_ref(), Side::Lower).map_err(|_| {
+            EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            }
+        })?)
     };
 
     let ut = u.t(); // p x n
@@ -203,7 +204,7 @@ pub fn compute_alo_features(
     // Add counter for diagnostic output (to print only first few observations)
     let mut diag_counter = 0;
     let max_diag_samples = 5; // Print only the first 5 observations for readability
-    
+
     let mut col_start = 0usize;
     while col_start < n {
         let col_end = (col_start + block).min(n);
@@ -228,7 +229,7 @@ pub fn compute_alo_features(
             let wi = base.final_weights[irow].max(1e-12);
 
             // Fisher prediction variance on the η-scale:
-            //   Var(η̂_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i,
+            //   Var_full(η̂_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i,
             // where s_i = K^{-1} u_i and u_i = √w_i x_i.
             let quad = {
                 let mut acc = 0.0;
@@ -239,33 +240,57 @@ pub fn compute_alo_features(
             };
             let var_full = phi * (quad / wi);
 
-            // SE is the full-sample Fisher SE (no LOO inflation)
-            se_tilde[irow] = var_full.max(0.0).sqrt();
+            // For linear smoothers the standard LOOCV derivation gives
+            //   Var_LOO(η_i) = Var_full(η_i) / (1 - a_ii)
+            // where a_ii is the penalized leverage and Var_full(η_i) is the
+            // Fisher variance from the converged PIRLS fit.  Earlier revisions
+            // incorrectly subtracted the observation's contribution and divided
+            // by (1 - a_ii)^2, which drives the variance toward zero whenever
+            // a_ii approaches one.  The simple 1/(1-a_ii) inflation is the
+            // correct Sherman-Morrison result for both penalized and
+            // unpenalized GLMs.
+            let denom_raw = 1.0 - aii[irow];
+            if denom_raw <= 0.0 {
+                eprintln!(
+                    "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
+                    irow, aii[irow]
+                );
+            }
+            let denom = denom_raw.max(1e-12);
+            let var_loo = (var_full / denom).max(0.0);
+            let se_full = var_full.max(0.0).sqrt();
+            se_tilde[irow] = var_loo.max(0.0).sqrt();
 
-            // Calculate the unweighted proxy (c_i = a_ii / w_i)
-            // This is what the tests expect with the old convention
-            let c_i = aii[irow] / wi;
-            let se_unw = (c_i).sqrt(); // Unweighted SE formula tests expect
-            
-            // Print diagnostics for the first few observations
+            // Diagnostics: compare LOO SE against full-sample and unweighted proxies
             if diag_counter < max_diag_samples {
+                let c_i = aii[irow] / wi;
+                let se_unw = c_i.max(0.0).sqrt();
                 println!("[GNOMON DIAG] ALO SE formula (obs {}):", irow);
                 println!("  - w_i: {:.6e}", wi);
                 println!("  - a_ii: {:.6e}", aii[irow]);
-                println!("  - var_full: {:.6e}", var_full);
-                println!("  - SE_tilde (weighted): {:.6e}", se_tilde[irow]);
+                println!("  - 1 - a_ii: {:.6e}", denom_raw);
+                println!("  - var_full (full sample): {:.6e}", var_full);
+                println!("  - var_loo (inflated): {:.6e}", var_loo);
+                println!("  - SE_full (full sample): {:.6e}", se_full);
+                println!("  - SE_tilde (LOO): {:.6e}", se_tilde[irow]);
                 println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
-                println!("  - SE_unw (unweighted): {:.6e}", se_unw);
-                println!("  - Ratio SE_tilde/SE_unw: {:.6e} (expected: ~sqrt(w_i) = {:.6e})",
-                    se_tilde[irow] / se_unw,
-                    wi.sqrt()
+                println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
+                let expected_ratio = denom.max(1e-12).sqrt().recip();
+                println!(
+                    "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
+                    if se_full > 0.0 {
+                        se_tilde[irow] / se_full
+                    } else {
+                        f64::NAN
+                    },
+                    expected_ratio
                 );
                 diag_counter += 1;
             }
 
             // ALO predictor in the same pass (no guard needed here)
-            let denom_alo = 1.0 - aii[irow];
-            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * (z[irow] - eta_hat[irow])) / denom_alo;
+            let denom_alo = denom_raw;
+            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom_alo;
         }
 
         col_start = col_end;
@@ -289,7 +314,7 @@ pub fn compute_alo_features(
             }
         }
     }
-    
+
     // Report summary of problematic leverage values
     if invalid_count > 0 || high_leverage_count > 0 {
         eprintln!(
@@ -306,7 +331,7 @@ pub fn compute_alo_features(
         // Compute denominator without guard for accurate ALO prediction
         let denom = 1.0 - aii[i];
         debug_assert!(denom > 0.0, "Unexpected a_ii >= 1.0 in ALO");
-        
+
         // CORRECT ALO predictor formula using the Sherman-Morrison identity:
         //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
         //
@@ -314,50 +339,70 @@ pub fn compute_alo_features(
         // 1. Define z_i = η̂_i + (y_i - μ_i)/v_i as the working response
         // 2. The LOO predictor is β̂^{(-i)} * x_i, where β̂^{(-i)} is fit without obs i
         // 3. Using Sherman-Morrison formula for rank-1 update to the inverse:
-        //    η̂^{(-i)} = η̂_i - a_ii * z_i / (1 - a_ii)
+        //    η̂^{(-i)} = (η̂_i - a_ii z_i) / (1 - a_ii)
         //    where a_ii = x_i^T(X^TWX)^{-1}x_i is the leverage
         //
         // This formula is mathematically correct even when denom is very small
         // and provides exact LOO predictions for linear/linearized models
-        
+
         if denom <= 1e-4 {
             // Log warning when leverage is close to 1
-            eprintln!("[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}", 
-                i, aii[i]);
+            eprintln!(
+                "[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
+                i, aii[i]
+            );
         }
-        
-        eta_tilde[i] = (eta_hat[i] - aii[i] * (z[i] - eta_hat[i])) / denom;
-        
+
+        eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
+
         // Optional: soft-clip extreme values if needed
         if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
-            eprintln!("[CAL] ALO eta_tilde extreme value at i={}: {}, capping", i, eta_tilde[i]);
+            eprintln!(
+                "[CAL] ALO eta_tilde extreme value at i={}: {}, capping",
+                i, eta_tilde[i]
+            );
             eta_tilde[i] = eta_tilde[i].clamp(-1e6, 1e6);
         }
     }
-
 
     // Comprehensive leverage and dispersion diagnostics
     // These metrics help identify potential numerical issues or ill-conditioned fits
     let mut a = aii.to_vec();
     a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     // Calculate percentiles safely even with small n
-    let p50_idx = if n > 1 { ((0.50_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1) } else { 0 };
-    let p95_idx = if n > 1 { ((0.95_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1) } else { 0 };
-    let p99_idx = if n > 1 { ((0.99_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1) } else { 0 };
-    
+    let p50_idx = if n > 1 {
+        ((0.50_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
+    } else {
+        0
+    };
+    let p95_idx = if n > 1 {
+        ((0.95_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
+    } else {
+        0
+    };
+    let p99_idx = if n > 1 {
+        ((0.99_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
+    } else {
+        0
+    };
+
     // Calculate key statistics
     let a_mean: f64 = aii.iter().sum::<f64>() / (n as f64).max(1.0);
     let a_median = a[p50_idx];
     let a_p95 = a[p95_idx];
     let a_p99 = a[p99_idx];
-    let a_max = if !a.is_empty() { *a.last().unwrap() } else { 0.0 };
-    
+    let a_max = if !a.is_empty() {
+        *a.last().unwrap()
+    } else {
+        0.0
+    };
+
     // Count observations in different leverage ranges
     let a_hi_90 = aii.iter().filter(|v| **v > 0.9).count();
     let a_hi_95 = aii.iter().filter(|v| **v > 0.95).count();
     let a_hi_99 = aii.iter().filter(|v| **v > 0.99).count();
-    
+
     eprintln!(
         "[CAL] ALO leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
         n, a_mean, a_median, a_p95, a_p99, a_max
@@ -387,14 +432,23 @@ pub fn compute_alo_features(
     let has_nan_pred = pred.iter().any(|&x| x.is_nan());
     let has_nan_se = se_tilde.iter().any(|&x| x.is_nan());
     let has_nan_dist = dist.iter().any(|&x| x.is_nan());
-    
+
     if has_nan_pred || has_nan_se || has_nan_dist {
         eprintln!("[CAL] ERROR: NaN values found in ALO features:");
-        eprintln!("      - pred: {} NaN values", pred.iter().filter(|&&x| x.is_nan()).count());
-        eprintln!("      - se: {} NaN values", se_tilde.iter().filter(|&&x| x.is_nan()).count());
-        eprintln!("      - dist: {} NaN values", dist.iter().filter(|&&x| x.is_nan()).count());
-        return Err(EstimationError::ModelIsIllConditioned { 
-            condition_number: f64::INFINITY 
+        eprintln!(
+            "      - pred: {} NaN values",
+            pred.iter().filter(|&&x| x.is_nan()).count()
+        );
+        eprintln!(
+            "      - se: {} NaN values",
+            se_tilde.iter().filter(|&&x| x.is_nan()).count()
+        );
+        eprintln!(
+            "      - dist: {} NaN values",
+            dist.iter().filter(|&&x| x.is_nan()).count()
+        );
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
         });
     }
 
@@ -418,7 +472,7 @@ pub fn build_calibrator_design(
             // For empty arrays, return defaults that won't cause issues
             return (0.0, 0.0);
         }
-        
+
         let mean = v.sum() / (v.len() as f64);
         let mut var = 0.0;
         for &x in v.iter() {
@@ -432,21 +486,24 @@ pub fn build_calibrator_design(
         // Ensure we don't divide by zero, use a minimum std value
         // This is important both for numerical stability and for handling the linear fallback case
         let s_use = std.max(1e-8_f64);
-        
+
         // Return centered and scaled version along with the standardization parameters
         (v.mapv(|x| (x - mean) / s_use), (mean, s_use))
     }
 
     let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred);
     let (se_mean, se_std_raw) = mean_and_std_raw(&features.se);
-    
+
     // --- Check SE variability BEFORE standardization ---
     // Detect near-constant SE values that would lead to numerical issues
     let se_linear_fallback = se_std_raw < 1e-8_f64;
     if se_linear_fallback {
-        eprintln!("[CAL] SE component has low variability (std={:.2e}), using linear fallback", se_std_raw);
+        eprintln!(
+            "[CAL] SE component has low variability (std={:.2e}), using linear fallback",
+            se_std_raw
+        );
     }
-    
+
     // --- Apply distance hinge in raw space before standardization ---
     // This preserves the special meaning of zero (hull boundary)
     let dist_raw = if spec.distance_hinge {
@@ -454,35 +511,35 @@ pub fn build_calibrator_design(
     } else {
         features.dist.clone()
     };
-    
+
     // Compute robust statistics for the distance component
     let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw);
 
     // Advanced heuristic for linear fallback with multiple criteria
-    
+
     // 1. Count zeros and compute distribution statistics
     let mut zeros_count = 0;
     let mut pos_count = 0;
     // Using a map to handle f64 keys since BTreeSet requires Ord trait
     let mut unique_values = std::collections::BTreeMap::<u64, ()>::new();
     let epsilon = 1e-10_f64;
-    
+
     // Process all values
     for &val in dist_raw.iter() {
         // Skip non-finite values
         if !val.is_finite() {
             continue;
         }
-        
+
         // Count zeros (values very close to zero)
         if val.abs() < epsilon {
             zeros_count += 1;
         }
-        
+
         // Count positive values (important for hinge analysis)
         if val > epsilon {
             pos_count += 1;
-            
+
             // Track approximate unique values (quantized to reduce floating-point noise)
             // This helps detect when there are too few distinct values for a good spline
             let quantized = (val * 1e6_f64).round() / 1e6_f64;
@@ -490,38 +547,53 @@ pub fn build_calibrator_design(
             unique_values.insert(quantized.to_bits(), ());
         }
     }
-    
+
     // Calculate relevant fractions, avoiding division by zero
     let n_valid = dist_raw.iter().filter(|&&x| x.is_finite()).count();
     let n_valid_f64 = n_valid as f64;
-    
-    let zeros_frac = if n_valid > 0 { zeros_count as f64 / n_valid_f64 } else { 1.0 };
-    let pos_frac = if n_valid > 0 { pos_count as f64 / n_valid_f64 } else { 0.0 };
-    let unique_frac = if pos_count > 0 { 
-        unique_values.len() as f64 / pos_count as f64 
-    } else { 
-        0.0 
+
+    let zeros_frac = if n_valid > 0 {
+        zeros_count as f64 / n_valid_f64
+    } else {
+        1.0
     };
-    
+    let pos_frac = if n_valid > 0 {
+        pos_count as f64 / n_valid_f64
+    } else {
+        0.0
+    };
+    let unique_frac = if pos_count > 0 {
+        unique_values.len() as f64 / pos_count as f64
+    } else {
+        0.0
+    };
+
     // Analyze the patterns to make an informed decision
-    let use_linear_dist = 
+    let use_linear_dist =
         // Basic criteria:
-        dist_std_raw < 1e-6_f64 ||                  // Low variance 
+        dist_std_raw < 1e-6_f64 ||                  // Low variance
         dist_raw.len() == 0 ||                 // Empty data
         n_valid == 0 ||                        // No valid data
-        
+
         // Hinge-specific criteria:
         (spec.distance_hinge && (
-            zeros_frac > 0.95 ||              // Mostly zeros (common with in-hull points) 
+            zeros_frac > 0.95 ||              // Mostly zeros (common with in-hull points)
             pos_count < 5 ||                  // Too few positive values for a meaningful spline
             (pos_count > 0 && unique_values.len() < 3) || // Too few unique positive values
             unique_frac < 0.25                // Very low diversity in positive values
         ));
-    
+
     eprintln!(
         "[CAL] Distance component analysis: std={:.2e}, zeros={:.1}%, pos={:.1}%, unique={:.1}%, using {}",
-        dist_std_raw, 100.0 * zeros_frac, 100.0 * pos_frac, 100.0 * unique_frac,
-        if use_linear_dist { "linear fallback" } else { "spline" }
+        dist_std_raw,
+        100.0 * zeros_frac,
+        100.0 * pos_frac,
+        100.0 * unique_frac,
+        if use_linear_dist {
+            "linear fallback"
+        } else {
+            "spline"
+        }
     );
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred);
@@ -546,36 +618,48 @@ pub fn build_calibrator_design(
     ) -> Array1<f64> {
         use ndarray::Array1 as A1;
         let n = vals_std.len();
-        
+
         // Interpret num_knots as the basis dimension k (mgcv-style)
         // Internal knots m = k - degree - 1
         // For P-splines, this ensures we have a sufficient basis dimension for the given degree
-        let k = target_internal;  // Original num_knots parameter is interpreted as k
-        let m = k.saturating_sub(degree + 1).max(min_internal).min(max_internal);
-        
+        let k = target_internal; // Original num_knots parameter is interpreted as k
+        let m = k
+            .saturating_sub(degree + 1)
+            .max(min_internal)
+            .min(max_internal);
+
         // Check if we're reducing knots; if so, issue a warning but don't fail
         if m < k.saturating_sub(degree + 1) {
             eprintln!(
                 "[CAL] Warning: Requested {} basis functions which would require {} internal knots, but using max of {}",
-                k, k.saturating_sub(degree + 1), max_internal
+                k,
+                k.saturating_sub(degree + 1),
+                max_internal
             );
         }
-        
+
         if n == 0 {
             // Generate a minimal valid knot vector with boundaries only
             // This ensures we always have a valid spline basis even with no data
             let left = 0.0;
             let right = 1.0; // Non-zero range for stability
             let mut knots = Vec::with_capacity(2 * (degree + 1));
-            for _ in 0..(degree + 1) { knots.push(left); }
-            for _ in 0..(degree + 1) { knots.push(right); }
+            for _ in 0..(degree + 1) {
+                knots.push(left);
+            }
+            for _ in 0..(degree + 1) {
+                knots.push(right);
+            }
             eprintln!("[CAL] Warning: creating dummy knots with empty data");
             return A1::from(knots);
         }
-        
+
         if n < degree + 1 {
             // Not enough data points for this degree, but we still create valid boundary knots
-            eprintln!("[CAL] Warning: not enough data points ({}) for spline degree {}", n, degree);
+            eprintln!(
+                "[CAL] Warning: not enough data points ({}) for spline degree {}",
+                n, degree
+            );
             // Find min/max with guards against NaN/infinity
             let mut min_val = f64::INFINITY;
             let mut max_val = f64::NEG_INFINITY;
@@ -585,47 +669,55 @@ pub fn build_calibrator_design(
                     max_val = max_val.max(x);
                 }
             }
-            
+
             // If we couldn't find valid min/max, use defaults
             if !min_val.is_finite() || !max_val.is_finite() || min_val >= max_val {
                 eprintln!("[CAL] Warning: invalid data range, using defaults");
                 min_val = -1.0;
                 max_val = 1.0;
             }
-            
+
             // Add padding to ensure range is non-zero
             let range = (max_val - min_val).max(1e-3_f64);
             let left = min_val - 0.1 * range;
             let right = max_val + 0.1 * range;
-            
+
             let mut knots = Vec::with_capacity(2 * (degree + 1));
-            for _ in 0..(degree + 1) { knots.push(left); }
-            for _ in 0..(degree + 1) { knots.push(right); }
+            for _ in 0..(degree + 1) {
+                knots.push(left);
+            }
+            for _ in 0..(degree + 1) {
+                knots.push(right);
+            }
             return A1::from(knots);
         }
-        
+
         // Filter out non-finite values before sorting
         let mut v: Vec<f64> = vals_std.iter().filter(|x| x.is_finite()).copied().collect();
-        
+
         // If no valid values, fall back to defaults
         if v.is_empty() {
             eprintln!("[CAL] Warning: no finite values for knot placement");
             let left = -1.0;
             let right = 1.0;
             let mut knots = Vec::with_capacity(2 * (degree + 1));
-            for _ in 0..(degree + 1) { knots.push(left); }
-            for _ in 0..(degree + 1) { knots.push(right); }
+            for _ in 0..(degree + 1) {
+                knots.push(left);
+            }
+            for _ in 0..(degree + 1) {
+                knots.push(right);
+            }
             return A1::from(knots);
         }
-        
+
         // Sort values for quantile calculation
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         // Calculate data range for sanity checks and robustness
         let v_min = v.first().copied().unwrap_or(0.0);
         let v_max = v.last().copied().unwrap_or(1.0);
         let range = (v_max - v_min).max(1e-6_f64); // Ensure non-zero range
-        
+
         // Robust quantile function with bounds checks
         let quant_at = |u: f64| -> f64 {
             if v.is_empty() {
@@ -634,25 +726,25 @@ pub fn build_calibrator_design(
             if v.len() == 1 {
                 return v[0];
             }
-            
+
             let t = u.clamp(0.0, 1.0) * ((v.len() - 1) as f64);
             let i = t.floor() as usize;
             let frac = t - (i as f64);
-            
+
             if i + 1 < v.len() {
                 v[i] * (1.0 - frac) + v[i + 1] * frac
             } else {
                 v[v.len() - 1]
             }
         };
-        
+
         // Generate internal knots at mid-quantiles
         let mut internal = Vec::with_capacity(m);
         for j in 0..m {
             let u = (j as f64 + 0.5) / ((m + 1) as f64);
             internal.push(quant_at(u));
         }
-        
+
         // Detect and handle duplicated knot values
         let mut unique_internal = Vec::with_capacity(internal.len());
         for &x in &internal {
@@ -661,22 +753,26 @@ pub fn build_calibrator_design(
                 unique_internal.push(x);
             }
         }
-        
+
         // If we lost too many knots to deduplication, log a warning
         if unique_internal.len() < internal.len() * 3 / 4 {
-            eprintln!("[CAL] Warning: removed {} duplicate knots", internal.len() - unique_internal.len());
+            eprintln!(
+                "[CAL] Warning: removed {} duplicate knots",
+                internal.len() - unique_internal.len()
+            );
         }
-        
+
         internal = unique_internal;
-        
-        // Ghost half-step via robust median spacing 
+
+        // Ghost half-step via robust median spacing
         let mut h = if internal.len() >= 2 {
             // Calculate all spacings between adjacent knots
-            let mut diffs: Vec<f64> = internal.windows(2)
+            let mut diffs: Vec<f64> = internal
+                .windows(2)
                 .map(|w| (w[1] - w[0]).abs())
                 .filter(|&d| d > 0.0 && d.is_finite())
                 .collect();
-                
+
             // Use median spacing if available, otherwise fallback to range-based spacing
             if !diffs.is_empty() {
                 diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -691,26 +787,29 @@ pub fn build_calibrator_design(
             // No internal knots (shouldn't happen with our logic, but just in case)
             0.5 * range
         };
-        
+
         // Safety check: ensure h is a reasonable fraction of the data range
         if h < 1e-6_f64 * range || !h.is_finite() {
             h = 0.25 * range;
-            eprintln!("[CAL] Warning: knot spacing too small or invalid, using artificial spacing h={:.4e}", h);
+            eprintln!(
+                "[CAL] Warning: knot spacing too small or invalid, using artificial spacing h={:.4e}",
+                h
+            );
         }
-        
+
         // Create ghost knots outside the data range
         let left = if internal.is_empty() {
             v_min - 0.5 * h
         } else {
             internal.first().copied().unwrap() - 0.5 * h
         };
-        
+
         let right = if internal.is_empty() {
             v_max + 0.5 * h
         } else {
             internal.last().copied().unwrap() + 0.5 * h
         };
-        
+
         // Final check for the range of all knots
         if (right - left) < 1e-6_f64 * range {
             eprintln!("[CAL] Warning: knot range too small, expanding");
@@ -720,11 +819,15 @@ pub fn build_calibrator_design(
             let new_right = mid + new_half_range;
             internal.clear(); // Reset internal knots if the range is too small
             let mut knots = Vec::with_capacity(2 * (degree + 1));
-            for _ in 0..(degree + 1) { knots.push(new_left); }
-            for _ in 0..(degree + 1) { knots.push(new_right); }
+            for _ in 0..(degree + 1) {
+                knots.push(new_left);
+            }
+            for _ in 0..(degree + 1) {
+                knots.push(new_right);
+            }
             return A1::from(knots);
         }
-        
+
         // Open uniform-style: repeat boundary knots degree+1 times
         let mut knots = Vec::with_capacity(internal.len() + 2 * (degree + 1));
         for _ in 0..(degree + 1) {
@@ -734,7 +837,7 @@ pub fn build_calibrator_design(
         for _ in 0..(degree + 1) {
             knots.push(right);
         }
-        
+
         A1::from(knots)
     }
 
@@ -742,19 +845,17 @@ pub fn build_calibrator_design(
     // The num_knots parameter is interpreted as the basis dimension k (mgcv-style)
     // Internal knots are computed as m = k - degree - 1
     let pred_knots = spec.pred_basis.num_knots;
-    let se_knots   = spec.se_basis.num_knots;
+    let se_knots = spec.se_basis.num_knots;
     let dist_knots = spec.dist_basis.num_knots;
-    
 
     // Create knots at mid-quantiles (half-step) on each calibrator axis
     // This creates a principled placement that's dependent only on the data distribution
     let knots_pred =
         make_midquantile_knots(&pred_std, spec.pred_basis.degree, pred_knots, 3, usize::MAX);
-    let knots_se = 
-        make_midquantile_knots(&se_std, spec.se_basis.degree, se_knots, 3, usize::MAX);
+    let knots_se = make_midquantile_knots(&se_std, spec.se_basis.degree, se_knots, 3, usize::MAX);
     let knots_dist_generated =
         make_midquantile_knots(&dist_std, spec.dist_basis.degree, dist_knots, 3, usize::MAX);
-        
+
     let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
         pred_std.view(),
         knots_pred.view(),
@@ -765,7 +866,7 @@ pub fn build_calibrator_design(
         knots_se.view(),
         spec.se_basis.degree,
     )?;
-    
+
     // Pull training weights for use in STZ (weighted centering)
     let w_for_stz = spec.prior_weights.as_ref().map(|w| w.view());
 
@@ -773,18 +874,17 @@ pub fn build_calibrator_design(
     // This keeps identifiability by making smooths orthogonal to intercept in the weighted inner product.
     let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), w_for_stz)?;
 
-    
     // Add diagnostic to check STZ constraint - verify column means are zero
     // This is what the constraint guarantees: weighted column means of B·T should be zero
     // (not that the sum of the coefficients is zero, which is a different constraint)
     {
         let n_rows = b_pred_c.nrows();
         let n_cols = b_pred_c.ncols();
-        
+
         // Calculate weighted column means to verify STZ constraint
         let mut max_abs_col_mean: f64 = 0.0;
         let mut col_means = Vec::with_capacity(n_cols);
-        
+
         // Use the same weights as used in the STZ constraint
         match w_for_stz {
             Some(weights) => {
@@ -792,13 +892,16 @@ pub fn build_calibrator_design(
                 let w_sum = weights.iter().copied().sum::<f64>().max(1e-12);
                 for j in 0..n_cols {
                     let col = b_pred_c.column(j);
-                    let weighted_mean = col.iter().zip(weights.iter())
+                    let weighted_mean = col
+                        .iter()
+                        .zip(weights.iter())
                         .map(|(&x, &w)| x * w)
-                        .sum::<f64>() / w_sum;
+                        .sum::<f64>()
+                        / w_sum;
                     col_means.push(weighted_mean);
                     max_abs_col_mean = max_abs_col_mean.max(weighted_mean.abs());
                 }
-            },
+            }
             None => {
                 // Calculate unweighted column means
                 for j in 0..n_cols {
@@ -809,21 +912,27 @@ pub fn build_calibrator_design(
                 }
             }
         }
-        
+
         // Print diagnostic info
         println!("[GNOMON DIAG] STZ constraint verification for pred block:");
-        println!("  - Max absolute weighted column mean: {:.6e}", max_abs_col_mean);
-        println!("  - First few column means: [{:.6e}, {:.6e}, ...]",
+        println!(
+            "  - Max absolute weighted column mean: {:.6e}",
+            max_abs_col_mean
+        );
+        println!(
+            "  - First few column means: [{:.6e}, {:.6e}, ...]",
             col_means.get(0).copied().unwrap_or(f64::NAN),
             col_means.get(1).copied().unwrap_or(f64::NAN)
         );
-        
+
         // Show that sum of coefficients is generally non-zero
         // This illustrates what the test incorrectly checks vs what STZ guarantees
         println!("  - Note: STZ guarantees column means ≈ 0, NOT sum of coefficients = 0");
-        println!("    The test 'stz_removes_intercept_confounding' incorrectly checks sum of coefficients");
+        println!(
+            "    The test 'stz_removes_intercept_confounding' incorrectly checks sum of coefficients"
+        );
     }
-    
+
     // For SE, check if we need to use linear fallback first (detected before standardization)
     // but always ensure it's centered (weighted if weights provided)
     // Calculate the centering offset once and store it for later use
@@ -831,14 +940,19 @@ pub fn build_calibrator_design(
         // Calculate weighted mean for centering
         if let Some(w) = w_for_stz {
             let ws = w.iter().copied().sum::<f64>().max(1e-12);
-            se_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws
+            se_std
+                .iter()
+                .zip(w.iter())
+                .map(|(v, wi)| v * wi)
+                .sum::<f64>()
+                / ws
         } else {
             se_std.mean().unwrap_or(0.0)
         }
     } else {
-        0.0  // No centering for spline basis (handled by STZ)
+        0.0 // No centering for spline basis (handled by STZ)
     };
-    
+
     let (b_se_c, stz_se) = if se_linear_fallback {
         // For SE linear fallback: make the single column weighted mean zero to keep it orthogonal to the intercept
         let mut col = se_std.clone();
@@ -849,7 +963,7 @@ pub fn build_calibrator_design(
         // This ensures consistency across all smooths and maintains identifiability
         apply_sum_to_zero_constraint(b_se_raw.view(), w_for_stz)?
     };
-    
+
     // For distance, check if we need to use linear fallback
     // Linear fallback when: low variance or mostly zeros (from hinging)
     // Calculate the distance centering offset first
@@ -858,14 +972,19 @@ pub fn build_calibrator_design(
         // Calculate the weighted mean for centering
         if let Some(w) = w_for_stz {
             let ws = w.iter().copied().sum::<f64>().max(1e-12);
-            dist_std.iter().zip(w.iter()).map(|(v, wi)| v * wi).sum::<f64>() / ws
+            dist_std
+                .iter()
+                .zip(w.iter())
+                .map(|(v, wi)| v * wi)
+                .sum::<f64>()
+                / ws
         } else {
             dist_std.mean().unwrap_or(0.0)
         }
     } else {
-        0.0  // No centering for spline basis or when all distances are zero
+        0.0 // No centering for spline basis or when all distances are zero
     };
-    
+
     let (b_dist_c, stz_dist, knots_dist, s_dist_raw0) = if use_linear_dist {
         // If the "hinged+centered" distance is effectively constant/zero, drop the term entirely.
         if dist_all_zero {
@@ -879,7 +998,7 @@ pub fn build_calibrator_design(
             // Make sure it's actually centered using the pre-calculated offset
             let mut b = dist_std.clone();
             b.mapv_inplace(|v| v - mu_dist);
-            
+
             // Now insert as a column
             let b = b.insert_axis(Axis(1)).to_owned();
             let stz = Array2::<f64>::eye(1);
@@ -894,20 +1013,22 @@ pub fn build_calibrator_design(
             knots_dist_generated.view(),
             spec.dist_basis.degree,
         )?;
-        
+
         // Always apply STZ to ensure identifiability for all λ values
         // This is fundamental: STZ is required for proper identifiability regardless of penalties
         eprintln!("[CAL] Applying STZ to distance smooth for identifiability");
         let (b_dist_c, stz_dist) = apply_sum_to_zero_constraint(b_dist_raw.view(), w_for_stz)?;
-        let s_dist_raw0 = create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
+        let s_dist_raw0 =
+            create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
         (b_dist_c, stz_dist, knots_dist_generated, s_dist_raw0)
     };
-    
+
     // Copy knots_se for ownership
     let mut knots_se = knots_se.clone(); // Take ownership
 
     // Build penalties in raw space, then push through STZ
-    let s_pred_raw0 = create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
+    let s_pred_raw0 =
+        create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
     let s_se_raw0 = if se_linear_fallback {
         Array2::<f64>::zeros((1, 1))
     } else {
@@ -919,24 +1040,27 @@ pub fn build_calibrator_design(
     let s_pred_raw = stz_pred.t().dot(&s_pred_raw0).dot(&stz_pred);
     let s_se_raw = stz_se.t().dot(&s_se_raw0).dot(&stz_se);
     let s_dist_raw = stz_dist.t().dot(&s_dist_raw0).dot(&stz_dist);
-    
+
     // Scale each penalty block to a common metric before optimization
     // This ensures the REML optimization balances blocks fairly, and lambda values are comparable
     fn scale_penalty_to_unit_mean_eig(s: &Array2<f64>) -> (Array2<f64>, f64) {
         // Mean nonzero eigenvalue ≈ trace / rank(S)
-        let tr = (0..s.nrows()).map(|i| s[[i,i]]).sum::<f64>().abs();
+        let tr = (0..s.nrows()).map(|i| s[[i, i]]).sum::<f64>().abs();
         // Crude rank estimate via diagonal > 0, robust enough for diff penalties
-        let r = (0..s.nrows()).filter(|&i| s[[i,i]] > 0.0).count().max(1) as f64;
+        let r = (0..s.nrows()).filter(|&i| s[[i, i]] > 0.0).count().max(1) as f64;
         let c = (tr / r).max(1e-12); // Scale factor
         (s / c, c) // Return scaled matrix and the scaling factor
     }
-    
+
     // Scale each block in constrained coordinates
     let (s_pred_raw_sc, c_pred) = scale_penalty_to_unit_mean_eig(&s_pred_raw);
     let (s_se_raw_sc, c_se) = scale_penalty_to_unit_mean_eig(&s_se_raw);
     let (s_dist_raw_sc, c_dist) = scale_penalty_to_unit_mean_eig(&s_dist_raw);
-    
-    eprintln!("[CAL] Penalty scaling factors: pred={:.3e}, se={:.3e}, dist={:.3e}", c_pred, c_se, c_dist);
+
+    eprintln!(
+        "[CAL] Penalty scaling factors: pred={:.3e}, se={:.3e}, dist={:.3e}",
+        c_pred, c_se, c_dist
+    );
 
     // Add penalty on the nullspace of the wiggliness penalty, tied to the same lambda
     // This ensures proper shrinkage behavior by penalizing both wiggly and constant/linear components
@@ -952,15 +1076,24 @@ pub fn build_calibrator_design(
             return Ok(s_raw.clone());
         }
         // Projector onto col(Z): using SVD (stable): Z = U Σ Vᵀ => P = U Uᵀ (keep cols with σ > tol)
-        let (u_opt, s, _vt_opt) = z_null
+        let (u_opt, s, vt_opt) = z_null
             .svd(true, false)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let u = u_opt.ok_or_else(|| EstimationError::LayoutError(
-            "SVD did not return U for nullspace projector".to_string()))?;
+        drop(vt_opt);
+        let u = u_opt.ok_or_else(|| {
+            EstimationError::LayoutError("SVD did not return U for nullspace projector".to_string())
+        })?;
         let sig_max = s.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         let tol = sig_max * 1e-12;
-        let keep = s.iter().enumerate().filter(|&(_, &val)| val > tol).map(|(i, _)| i).collect::<Vec<_>>();
-        if keep.is_empty() { return Ok(s_raw.clone()); }
+        let keep = s
+            .iter()
+            .enumerate()
+            .filter(|&(_, &val)| val > tol)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        if keep.is_empty() {
+            return Ok(s_raw.clone());
+        }
         let u_keep = u.select(Axis(1), &keep);
         let p_null = u_keep.dot(&u_keep.t());
         Ok(s_raw + &p_null.mapv(|v| v * kappa))
@@ -972,9 +1105,9 @@ pub fn build_calibrator_design(
     // Modern approach: Use nullspace_shrinkage_kappa parameter for relative shrinkage tied to lambda
     let kappa = match spec.nullspace_shrinkage_kappa {
         Some(k) => k,
-        None => 1.0 // Default to equal shrinkage for nullspace and wiggly components
+        None => 1.0, // Default to equal shrinkage for nullspace and wiggly components
     };
-    
+
     // Legacy-but-still-used-by-tests: add fixed ridge on the penalty nullspace.
     // This makes S_λ positive definite in practice even when X has duplicate/degenerate columns.
     let tau = spec.double_penalty_ridge;
@@ -984,48 +1117,63 @@ pub fn build_calibrator_design(
             tau
         );
     }
-    
-    
+
     // Log the nullspace penalty strength being used
-    eprintln!("[CAL] Using nullspace shrinkage kappa={:.3e}, legacy tau={:.3e}", kappa, tau);
-    
+    eprintln!(
+        "[CAL] Using nullspace shrinkage kappa={:.3e}, legacy tau={:.3e}",
+        kappa, tau
+    );
+
     // Helper function to add fixed ridge if needed
-    fn add_fixed_nullspace_ridge(s: &Array2<f64>, tau: f64) -> Result<Array2<f64>, EstimationError> {
+    fn add_fixed_nullspace_ridge(
+        s: &Array2<f64>,
+        tau: f64,
+    ) -> Result<Array2<f64>, EstimationError> {
         if tau <= 0.0 {
             return Ok(s.clone());
         }
-        
+
         // Get nullspace projector
         let (z_null, _) = null_range_whiten(s).map_err(|e| EstimationError::BasisError(e))?;
         if z_null.ncols() == 0 {
             return Ok(s.clone());
         }
-        
+
         // SVD projector onto col(Z): P = U_keep U_keepᵀ
-        let (u_opt, svals, _vt_opt) =
-            z_null.svd(true, false).map_err(EstimationError::EigendecompositionFailed)?;
-        let u = u_opt.ok_or_else(|| EstimationError::LayoutError(
-            "SVD did not return U for nullspace projector".to_string()))?;
+        let (u_opt, svals, vt_opt) = z_null
+            .svd(true, false)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        drop(vt_opt);
+        let u = u_opt.ok_or_else(|| {
+            EstimationError::LayoutError("SVD did not return U for nullspace projector".to_string())
+        })?;
         let sig_max = svals.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         let tol = sig_max * 1e-12;
-        let keep = svals.iter().enumerate().filter(|&(_, &val)| val > tol).map(|(i, _)| i).collect::<Vec<_>>();
-        if keep.is_empty() { return Ok(s.clone()); }
+        let keep = svals
+            .iter()
+            .enumerate()
+            .filter(|&(_, &val)| val > tol)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        if keep.is_empty() {
+            return Ok(s.clone());
+        }
         let u_keep = u.select(Axis(1), &keep);
         let p_null = u_keep.dot(&u_keep.t());
-        
+
         // Add fixed ridge on nullspace
         Ok(s + &p_null.mapv(|v| v * tau))
     }
-    
+
     // For pred and se, apply both nullspace shrinkage tied to lambda and fixed ridge
     // First apply kappa (tied to lambda) to scaled penalties
     let s_pred_shrink = add_nullspace_shrink_tied_to_lambda(&s_pred_raw_sc, kappa)?;
     let s_se_shrink = add_nullspace_shrink_tied_to_lambda(&s_se_raw_sc, kappa)?;
-    
+
     // Then apply fixed ridge tau if needed
     let s_pred = add_fixed_nullspace_ridge(&s_pred_shrink, tau)?;
     let mut s_se = add_fixed_nullspace_ridge(&s_se_shrink, tau)?;
-    
+
     // For distance smooth: skip penalties for linear fallback to keep it truly unpenalized
     let s_dist = if use_linear_dist {
         // Ensure a truly unpenalized linear term by keeping the original zero matrix
@@ -1081,7 +1229,7 @@ pub fn build_calibrator_design(
             s_se_p[[se_off + i, se_off + j]] = s_se[[i, j]];
         }
     }
-    
+
     // Only copy distance penalties when the block actually has columns
     if !use_linear_dist && b_dist_c.ncols() > 0 {
         for i in 0..b_dist_c.ncols() {
@@ -1109,10 +1257,15 @@ pub fn build_calibrator_design(
     );
     eprintln!(
         "[CAL] spline params: pred(degree={}, knots={}), se(knots={}), dist(knots={}), penalty_order={}, nullspace_ridge={}",
-        spec.pred_basis.degree, m_pred_int, m_se_int, m_dist_int, spec.penalty_order_pred, spec.double_penalty_ridge
+        spec.pred_basis.degree,
+        m_pred_int,
+        m_se_int,
+        m_dist_int,
+        spec.penalty_order_pred,
+        spec.double_penalty_ridge
     );
     // Create ranges for column spans
-    let pred_range = 1..(1 + b_pred_c.ncols());  // pred smooth only
+    let pred_range = 1..(1 + b_pred_c.ncols()); // pred smooth only
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
@@ -1131,15 +1284,20 @@ pub fn build_calibrator_design(
         se_center_offset: mu_se,
         dist_center_offset: mu_dist,
         column_spans: (pred_range, se_range, dist_range),
-        pred_center_offset: 0.0,  // No longer used since we removed the linear channel
+        pred_center_offset: 0.0, // No longer used since we removed the linear channel
     };
-    
+
     // Early self-check to ensure built penalties match X width
     debug_assert!(
-        penalties.iter().all(|s| s.nrows() == x.ncols() && s.ncols() == x.ncols()),
+        penalties
+            .iter()
+            .all(|s| s.nrows() == x.ncols() && s.ncols() == x.ncols()),
         "Internal: built penalties must match X width (x: {}, penalties: {:?})",
         x.ncols(),
-        penalties.iter().map(|s| (s.nrows(), s.ncols())).collect::<Vec<_>>()
+        penalties
+            .iter()
+            .map(|s| (s.nrows(), s.ncols()))
+            .collect::<Vec<_>>()
     );
 
     // No cross-block normalization - keep only the per-block unit-mean-eig scaling
@@ -1162,7 +1320,7 @@ pub fn predict_calibrator(
     let (md, sd) = model.standardize_dist;
     let pred_std = pred.mapv(|x| (x - mp) / sp.max(1e-8_f64));
     let se_std = se.mapv(|x| (x - ms) / ss.max(1e-8_f64));
-    
+
     // Important: Apply hinge in raw space before standardization,
     // matching exactly the same operation order as in build_calibrator_design
     let dist_hinged = if model.spec.distance_hinge {
@@ -1178,11 +1336,13 @@ pub fn predict_calibrator(
         model.knots_pred.view(),
         model.spec.pred_basis.degree,
     )?;
-    
+
     // Handle SE basis, with special case for linear fallback
     let b_se = if model.se_linear_fallback {
         // Apply the same centering that was used during training
-        (se_std.mapv(|v| v - model.se_center_offset)).insert_axis(Axis(1)).to_owned()
+        (se_std.mapv(|v| v - model.se_center_offset))
+            .insert_axis(Axis(1))
+            .to_owned()
     } else {
         let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             se_std.view(),
@@ -1198,7 +1358,9 @@ pub fn predict_calibrator(
     // Handle distance basis, with special case for linear fallback
     let b_dist = if model.dist_linear_fallback || model.knots_dist.len() == 0 {
         // Apply the same centering that was used during training
-        (dist_std.mapv(|v| v - model.dist_center_offset)).insert_axis(Axis(1)).to_owned()
+        (dist_std.mapv(|v| v - model.dist_center_offset))
+            .insert_axis(Axis(1))
+            .to_owned()
     } else {
         let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             dist_std.view(),
@@ -1238,35 +1400,41 @@ pub fn predict_calibrator(
 
     // Linear predictor and mean (no offset)
     let eta = x.dot(&model.coefficients);
-    
+
     // Check for invalid values in the linear predictor
     if eta.iter().any(|&x| !x.is_finite()) {
         eprintln!("[CAL] ERROR: Non-finite values in prediction linear predictor");
-        eprintln!("      - NaN: {} values", eta.iter().filter(|&&x| x.is_nan()).count());
-        eprintln!("      - Inf: {} values", eta.iter().filter(|&&x| x.is_infinite()).count());
+        eprintln!(
+            "      - NaN: {} values",
+            eta.iter().filter(|&&x| x.is_nan()).count()
+        );
+        eprintln!(
+            "      - Inf: {} values",
+            eta.iter().filter(|&&x| x.is_infinite()).count()
+        );
         return Err(EstimationError::PredictionError);
     }
-    
+
     let result = match model.spec.link {
         LinkFunction::Logit => {
             // Clamp eta only for overflow safety; don't clamp probabilities
             let eta_c = eta.mapv(|e| e.clamp(-40.0, 40.0));
             let probs = eta_c.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-            
+
             // Verify all probabilities are valid
             if probs.iter().any(|&p| p < 0.0 || p > 1.0 || !p.is_finite()) {
                 eprintln!("[CAL] ERROR: Invalid probability values in prediction");
                 return Err(EstimationError::PredictionError);
             }
-            
+
             probs
         }
         LinkFunction::Identity => {
             // For identity link, eta is the result
             eta
-        },
+        }
     };
-    
+
     Ok(result)
 }
 
@@ -1290,7 +1458,11 @@ pub fn fit_calibrator(
     // Use the spec parameter to configure options based on the penalty settings
     let opts = ExternalOptimOptions {
         link,
-        max_iter: if spec.double_penalty_ridge > 0.0 { 50 } else { 75 }, // More iterations for no ridge
+        max_iter: if spec.double_penalty_ridge > 0.0 {
+            50
+        } else {
+            75
+        }, // More iterations for no ridge
         tol: 1e-3,
     };
     eprintln!(
@@ -1303,22 +1475,29 @@ pub fn fit_calibrator(
     eprintln!(
         "[CAL] Using same spline family for all three calibrator smooths as the base PGS smooth"
     );
-    
+
     // ---- SHAPE GUARD: X and all S_k must agree (return typed error, do not panic) ----
     let p = x.ncols();
     for (k, s) in penalties.iter().enumerate() {
         if s.nrows() != p || s.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
                 "Penalty matrix {} must be {}×{}, got {}×{}",
-                k, p, p, s.nrows(), s.ncols()
+                k,
+                p,
+                p,
+                s.nrows(),
+                s.ncols()
             )));
         }
     }
-    eprintln!("[CAL] Shape check passed: X p={}, all penalties are {}×{}", p, p, p);
+    eprintln!(
+        "[CAL] Shape check passed: X p={}, all penalties are {}×{}",
+        p, p, p
+    );
     // -----------------------------------------------
-    
+
     let res = optimize_external_design(y, prior_weights, x, penalties, &opts)?;
-    
+
     // Extract lambdas directly from optimizer; do not clamp them.
     // They are exp(ρ) and already nonnegative.
     let lambdas = [res.lambdas[0], res.lambdas[1], res.lambdas[2]];
@@ -1356,7 +1535,7 @@ mod tests {
     use rand::prelude::*;
     use rand_distr::{Bernoulli, Distribution, Normal, Uniform};
     use std::f64::consts::PI;
-    
+
     /// Evaluates the LAML objective at a fixed rho for binomial/logistic regression.
     /// This test-only function is used to verify the optimizer's solution.
     // Compute log|S_lambda|_+ (pseudo-determinant: sum of logs of positive eigenvalues)
@@ -1368,9 +1547,14 @@ mod tests {
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
     ) -> f64 {
-        use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
-        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
-        
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+        };
+        use faer::{
+            Mat, Side,
+            linalg::solvers::{Llt, Solve},
+        };
+
         // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
@@ -1383,7 +1567,7 @@ mod tests {
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
         let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("reparam");
-        
+
         // Transform X to stabilized basis
         let x_trans = x.dot(&reparam.qs);
 
@@ -1395,8 +1579,14 @@ mod tests {
             // Work in original coordinates for GLM computations
             let beta = reparam.qs.dot(&beta_trans);
             let eta = x.dot(&beta);
-            let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())).mapv(|p| p.clamp(1e-12, 1.0-1e-12));
-            let v = mu.iter().zip(mu.iter()).map(|(m, _)| m*(1.0-*m)).collect::<Vec<_>>();
+            let mu = eta
+                .mapv(|e| 1.0 / (1.0 + (-e).exp()))
+                .mapv(|p| p.clamp(1e-12, 1.0 - 1e-12));
+            let v = mu
+                .iter()
+                .zip(mu.iter())
+                .map(|(m, _)| m * (1.0 - *m))
+                .collect::<Vec<_>>();
             let w = Array1::from_iter(v.into_iter()).to_owned() * &w_prior;
             // z = eta + (y-mu)/V
             let mut z = Array1::<f64>::zeros(n);
@@ -1409,12 +1599,14 @@ mod tests {
             let mut xtwz_trans = Array1::<f64>::zeros(p);
             for i in 0..n {
                 let wi = w[i];
-                if wi == 0.0 { continue; }
+                if wi == 0.0 {
+                    continue;
+                }
                 let xi_trans = x_trans.row(i);
                 for a in 0..p {
                     xtwz_trans[a] += wi * xi_trans[a] * z[i];
                     for b in 0..p {
-                        xtwx_trans[[a,b]] += wi * xi_trans[a] * xi_trans[b];
+                        xtwx_trans[[a, b]] += wi * xi_trans[a] * xi_trans[b];
                     }
                 }
             }
@@ -1423,25 +1615,30 @@ mod tests {
                 h_eff[[d, d]] += 1e-12;
             }
             // LLᵀ solve in transformed coordinates
-            let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
+            let hf = Mat::from_fn(p, p, |i, j| h_eff[[i, j]]);
             let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
-            let rhs = Mat::from_fn(p,1, |i,_| xtwz_trans[i]);
+            let rhs = Mat::from_fn(p, 1, |i, _| xtwz_trans[i]);
             let sol = llt.solve(rhs.as_ref());
-            let beta_trans_new = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
+            let beta_trans_new = Array1::from_iter((0..p).map(|i| sol[(i, 0)]));
 
-            if (&beta_trans_new - &beta_trans).mapv(|t| t.abs()).sum() < 1e-8 { beta_trans = beta_trans_new; break; }
+            if (&beta_trans_new - &beta_trans).mapv(|t| t.abs()).sum() < 1e-8 {
+                beta_trans = beta_trans_new;
+                break;
+            }
             beta_trans = beta_trans_new;
         }
 
         // 3) pieces for F - compute final objective using stabilized values
         let beta = reparam.qs.dot(&beta_trans);
         let eta = x.dot(&beta);
-        let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp())).mapv(|p| p.clamp(1e-12, 1.0-1e-12));
-        
+        let mu = eta
+            .mapv(|e| 1.0 / (1.0 + (-e).exp()))
+            .mapv(|p| p.clamp(1e-12, 1.0 - 1e-12));
+
         // log-lik with prior weights
         let mut ll = 0.0;
         for i in 0..n {
-            ll += w_prior[i] * (y[i]*mu[i].ln() + (1.0-y[i])*(1.0-mu[i]).ln());
+            ll += w_prior[i] * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
         }
         let pen = 0.5 * beta.dot(&s_lambda.dot(&beta));
 
@@ -1454,33 +1651,33 @@ mod tests {
         for i in 0..n {
             let wi = w[i];
             let xi_trans = x_trans.row(i);
-            for a in 0..p { 
-                for b in 0..p { 
-                    h_eff[[a,b]] += wi * xi_trans[a] * xi_trans[b]; 
-                } 
+            for a in 0..p {
+                for b in 0..p {
+                    h_eff[[a, b]] += wi * xi_trans[a] * xi_trans[b];
+                }
             }
         }
         h_eff = &h_eff + &reparam.s_transformed;
         // tiny ridge
-        for d in 0..p { 
-            h_eff[[d, d]] += 1e-12; 
+        for d in 0..p {
+            h_eff[[d, d]] += 1e-12;
         }
         // log|H_eff|
-        let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
+        let hf = Mat::from_fn(p, p, |i, j| h_eff[[i, j]]);
         let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
         let mut logdet_h = 0.0;
-        for i in 0..p { 
-            logdet_h += llt.L().get(i,i).ln(); 
+        for i in 0..p {
+            logdet_h += llt.L().get(i, i).ln();
         }
         logdet_h *= 2.0;
 
         // log|Sλ|_+ stabilized from reparameterization
         let logdet_s = reparam.log_det;
-        
+
         // F(rho) (drop constants)
-        -ll + pen + 0.5*logdet_h - 0.5*logdet_s
+        -ll + pen + 0.5 * logdet_h - 0.5 * logdet_s
     }
-    
+
     /// Evaluates the LAML objective at a fixed rho for Gaussian/identity regression.
     /// This test-only function is used to verify the optimizer's solution.
     fn eval_laml_fixed_rho_gaussian(
@@ -1491,9 +1688,14 @@ mod tests {
         rho: &[f64],
         scale: f64, // Gaussian dispersion parameter
     ) -> f64 {
-        use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
-        use crate::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
-        
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+        };
+        use faer::{
+            Mat, Side,
+            linalg::solvers::{Llt, Solve},
+        };
+
         // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
@@ -1506,44 +1708,46 @@ mod tests {
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
         let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("reparam");
-        
+
         // Transform X to stabilized basis
         let x_trans = x.dot(&reparam.qs);
 
         // 2) Direct least squares solution in transformed coordinates
         let n = x.nrows();
         let p = x.ncols();
-        
+
         // H_eff = X_transᵀ W X_trans + s_transformed
         let mut xtwx_trans = Array2::<f64>::zeros((p, p));
         let mut xtwy_trans = Array1::<f64>::zeros(p);
         for i in 0..n {
             let wi = w_prior[i];
-            if wi == 0.0 { continue; }
+            if wi == 0.0 {
+                continue;
+            }
             let xi_trans = x_trans.row(i);
             for a in 0..p {
                 xtwy_trans[a] += wi * xi_trans[a] * y[i];
                 for b in 0..p {
-                    xtwx_trans[[a,b]] += wi * xi_trans[a] * xi_trans[b];
+                    xtwx_trans[[a, b]] += wi * xi_trans[a] * xi_trans[b];
                 }
             }
         }
         let mut h_eff = &xtwx_trans + &reparam.s_transformed;
         // tiny ridge
-        for d in 0..p { 
-            h_eff[[d, d]] += 1e-12; 
+        for d in 0..p {
+            h_eff[[d, d]] += 1e-12;
         }
         // LLᵀ solve
-        let hf = Mat::from_fn(p,p, |i,j| h_eff[[i,j]]);
+        let hf = Mat::from_fn(p, p, |i, j| h_eff[[i, j]]);
         let llt = Llt::new(hf.as_ref(), Side::Lower).expect("H SPD");
-        let rhs = Mat::from_fn(p,1, |i,_| xtwy_trans[i]);
+        let rhs = Mat::from_fn(p, 1, |i, _| xtwy_trans[i]);
         let sol = llt.solve(rhs.as_ref());
-        let beta_trans = Array1::from_iter((0..p).map(|i| sol[(i,0)]));
+        let beta_trans = Array1::from_iter((0..p).map(|i| sol[(i, 0)]));
         let beta = reparam.qs.dot(&beta_trans);
 
         // 3) pieces for F - compute final objective using stabilized values
         let eta = x.dot(&beta);
-        
+
         // -log-lik with prior weights (weighted RSS term)
         let mut neg_ll = 0.0;
         for i in 0..n {
@@ -1551,28 +1755,34 @@ mod tests {
             neg_ll += w_prior[i] * resid * resid;
         }
         neg_ll *= 1.0 / (2.0 * scale);
-        
+
         let pen = 0.5 * beta.dot(&s_lambda.dot(&beta));
 
         // log|H_eff| using stabilized H_eff in transformed basis (already computed above)
         let mut logdet_h = 0.0;
-        for i in 0..p { 
-            logdet_h += llt.L().get(i,i).ln(); 
+        for i in 0..p {
+            logdet_h += llt.L().get(i, i).ln();
         }
         logdet_h *= 2.0;
 
         // log|Sλ|_+ stabilized from reparameterization
         let logdet_s = reparam.log_det;
-        
+
         // F(rho) (drop constants)
-        neg_ll + pen + 0.5*logdet_h - 0.5*logdet_s
+        neg_ll + pen + 0.5 * logdet_h - 0.5 * logdet_s
     }
 
     // ===== Test Helper Functions =====
-    
+
     /// Solve weighted least squares using stable LLT factorization (no permutation ambiguity)
-    fn solve_wls_llt(z_design: &Array2<f64>, u_rhs: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        use faer::{linalg::solvers::{Llt, Solve}, Mat, Side};
+    fn solve_wls_llt(
+        z_design: &Array2<f64>,
+        u_rhs: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        use faer::{
+            Mat, Side,
+            linalg::solvers::{Llt, Solve},
+        };
         let (n, p) = z_design.dim();
         // H = Zᵀ Z
         let mut h = Array2::<f64>::zeros((p, p));
@@ -1581,16 +1791,24 @@ mod tests {
             let zi = z_design.row(i);
             for a in 0..p {
                 rhs[a] += zi[a] * u_rhs[i];
-                for b in 0..p { h[[a,b]] += zi[a] * zi[b]; }
+                for b in 0..p {
+                    h[[a, b]] += zi[a] * zi[b];
+                }
             }
         }
         // tiny ridge for numerical safety
-        for j in 0..p { h[[j,j]] += 1e-12; }
-        let hf = Mat::from_fn(p, p, |i,j| h[[i,j]]);
-        let llt = Llt::new(hf.as_ref(), Side::Lower).map_err(|_| EstimationError::ModelIsIllConditioned{ condition_number: f64::INFINITY })?;
-        let rf = Mat::from_fn(p, 1, |i,_| rhs[i]);
+        for j in 0..p {
+            h[[j, j]] += 1e-12;
+        }
+        let hf = Mat::from_fn(p, p, |i, j| h[[i, j]]);
+        let llt = Llt::new(hf.as_ref(), Side::Lower).map_err(|_| {
+            EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            }
+        })?;
+        let rf = Mat::from_fn(p, 1, |i, _| rhs[i]);
         let sol = llt.solve(rf.as_ref());
-        Ok(Array1::from_iter((0..p).map(|i| sol[(i,0)])))
+        Ok(Array1::from_iter((0..p).map(|i| sol[(i, 0)])))
     }
 
     /// Expected Calibration Error (ECE) - Measures calibration quality
@@ -1694,7 +1912,7 @@ mod tests {
 
         // Assign data points to bins
         for i in 0..p.len() {
-            let pi = p[i].clamp(0.0, 1.0);  // Clamp probability to [0,1]
+            let pi = p[i].clamp(0.0, 1.0); // Clamp probability to [0,1]
             let bin_idx = ((pi * (n_bins as f64)).floor() as usize).min(n_bins - 1);
             bin_counts[bin_idx] += 1;
             bin_pred_sum[bin_idx] += p[i];
@@ -2069,33 +2287,31 @@ mod tests {
     #[test]
     fn alo_se_calculation_correct() {
         // This test verifies that the ALO SE calculation is correct without the 1/wi factor
-        
+
         // Create a synthetic dataset with varying weights to test SE calculation
         let n = 100;
         let p = 5;
         let (x, y, _) = generate_synthetic_binary_data(n, p, Some(42));
-        
+
         // Create weights with significant variation
         let mut w = Array1::ones(n);
-        for i in 0..n/4 {
+        for i in 0..n / 4 {
             w[i] = 5.0; // Higher weight for some observations
         }
-        for i in n/4..(n/2) {
+        for i in n / 4..(n / 2) {
             w[i] = 0.2; // Lower weight for some observations
         }
-        
+
         let link = LinkFunction::Logit;
-        
+
         // Fit a simple model
         let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
-        
+
         // Run ALO with our fixed code
         let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
-        
+
         // Now implement the old buggy calculation manually to compare
         let n_test = 10; // Just test a few points for comparison
-        let mut buggy_se = Vec::with_capacity(n_test);
-        
         // Use FINAL Fisher weights for comparison (this is what ALO uses)
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
         let mut u = fit_res.x_transformed.clone();
@@ -2107,22 +2323,22 @@ mod tests {
         let p = k.nrows();
         let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
         let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
-        
+
         // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
         let xtwx = u.t().dot(&u);
-        
+
         // Gaussian dispersion φ (always 1.0 for logistic regression)
         let phi = 1.0;
-        
+
         // Calculate buggy SE for a few test points
         for irow in 0..n_test {
             // Get u_i (the scaled row of the design matrix)
             let ui = u.row(irow).to_owned();
-            
+
             // Solve K s_i = u_i
             let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let si = factor.solve(rhs_f.as_ref());
-            
+
             // Calculate quad = s_i' XtWX s_i
             let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
             let t_i = xtwx.dot(&si_arr);
@@ -2130,23 +2346,32 @@ mod tests {
             for r in 0..p {
                 quad += si_arr[r] * t_i[r];
             }
-            
-            // "Buggy" SE for the ratio check, but with final weights (to match ALO weighting)
+
+            // Full-sample variance
             let wi = fit_res.final_weights[irow].max(1e-300);
-            let var_buggy = phi * (quad / wi);
-            let se_buggy = var_buggy.max(0.0).sqrt();
-            buggy_se.push(se_buggy);
-            
-            // Fixed calculation should be larger by a factor of sqrt(final_weights[i])
-            let se_ratio = alo_features.se[irow] / se_buggy;
-            let final_weight = fit_res.final_weights[irow];
-            let expected_ratio = final_weight.sqrt();
-            
-            // The ratio should be approximately sqrt(final_weights[i])
+            let var_full = phi * (quad / wi);
+
+            // Hat diagonal a_ii
+            let aii = ui.dot(&si_arr);
+
+            // Expected LOO variance using the correct penalized smoother formula
+            let var_without_i = (var_full - phi * (aii * aii) / wi).max(0.0);
+            let denom = 1.0 - aii;
+            let denom_sq = if denom.abs() < 1e-12 {
+                1e-12
+            } else {
+                denom * denom
+            };
+            let expected_var_loo = var_without_i / denom_sq;
+            let expected_se = expected_var_loo.max(0.0).sqrt();
+
+            let actual_se = alo_features.se[irow];
             assert!(
-                (se_ratio - expected_ratio).abs() < 1e-10,
-                "SE ratio should be sqrt(final_weights): got {:.6}, expected {:.6}, diff {:.2e}",
-                se_ratio, expected_ratio, (se_ratio - expected_ratio).abs()
+                (actual_se - expected_se).abs() < 1e-10,
+                "ALO SE mismatch: got {:.6e}, expected {:.6e}, diff {:.2e}",
+                actual_se,
+                expected_se,
+                (actual_se - expected_se).abs()
             );
         }
     }
@@ -2185,21 +2410,29 @@ mod tests {
         for i in 0..n {
             let wi = w[i];
             let xi = fit_res.x_transformed.row(i);
-            for a in 0..p { for b in 0..p { k[[a,b]] += wi * xi[a] * xi[b]; } }
+            for a in 0..p {
+                for b in 0..p {
+                    k[[a, b]] += wi * xi[a] * xi[b];
+                }
+            }
         }
-        for d in 0..p { k[[d,d]] += 1e-12; } // tiny ridge for stability
+        for d in 0..p {
+            k[[d, d]] += 1e-12;
+        } // tiny ridge for stability
 
         // Factor K using faer LLT
-        let kf = FaerMat::from_fn(p,p, |i,j| k[[i,j]]);
+        let kf = FaerMat::from_fn(p, p, |i, j| k[[i, j]]);
         let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
 
         // Compute a_ii = u_i^\top K^{-1} u_i for each observation
         for i in 0..n {
             let ui = u.row(i).to_owned();
-            let rhs = FaerMat::from_fn(p,1, |r,_| ui[r]);
+            let rhs = FaerMat::from_fn(p, 1, |r, _| ui[r]);
             let s = llt.solve(rhs.as_ref());
             let mut dot = 0.0;
-            for r in 0..p { dot += ui[r] * s[(r,0)]; }
+            for r in 0..p {
+                dot += ui[r] * s[(r, 0)];
+            }
             aii[i] = dot;
         }
 
@@ -2259,14 +2492,7 @@ mod tests {
         w_zero[test_idx] = 0.0;
 
         let fit_with_zero = simple_pirls_fit(&x, &y, &w_zero, link).unwrap();
-        compute_alo_features(
-            &fit_with_zero,
-            y.view(),
-            x.view(),
-            None,
-            link,
-        )
-        .unwrap();
+        compute_alo_features(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
 
         // Check directly with small custom calculation
         let mut u_zero = fit_with_zero.x_transformed.clone();
@@ -2320,8 +2546,7 @@ mod tests {
         let full_fit = simple_pirls_fit(&x, &y, &w, link).unwrap();
 
         // Compute ALO features
-        let alo_features =
-            compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         // Perform true leave-one-out by refitting n times
         let mut loo_pred = Array1::zeros(n);
@@ -2354,28 +2579,38 @@ mod tests {
 
             // Standard error calculation using LLT approach
             // For weighted regression, SE of prediction at x0 is sqrt(x0' (X'WX)^(-1) x0)
-            
+
             // Build K = X^T W X at the LOO fit, add tiny ridge
             let mut k = Array2::<f64>::zeros((p, p));
-            for r in 0..(n-1) {
+            for r in 0..(n - 1) {
                 let wi = w_loo[r];
-                if wi == 0.0 { continue; }
+                if wi == 0.0 {
+                    continue;
+                }
                 let xi = x_loo.row(r);
-                for a in 0..p { for b in 0..p { k[[a,b]] += wi * xi[a] * xi[b]; } }
+                for a in 0..p {
+                    for b in 0..p {
+                        k[[a, b]] += wi * xi[a] * xi[b];
+                    }
+                }
             }
-            for d in 0..p { k[[d,d]] += 1e-12; } // tiny ridge for stability
+            for d in 0..p {
+                k[[d, d]] += 1e-12;
+            } // tiny ridge for stability
 
             // Use faer LLT to factor and solve
-            let kf = FaerMat::from_fn(p,p, |i,j| k[[i,j]]);
+            let kf = FaerMat::from_fn(p, p, |i, j| k[[i, j]]);
             let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
 
             // Solve for c_i = x_i^T K^{-1} x_i
             let x_i = x.row(i).to_owned();
-            let rhs = FaerMat::from_fn(p,1, |r,_| x_i[r]);
+            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
             let s = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
-            for r in 0..p { ci += x_i[r] * s[(r,0)]; }
-            
+            for r in 0..p {
+                ci += x_i[r] * s[(r, 0)];
+            }
+
             // Correct "true" LOO SE: uses inflation by 1/(1-aii) from the full fit
             // We have the K from the LOO fit, which already includes the 1/(1-aii) inflation effect
             // This matches our correct ALO formula: SE = sqrt(phi * ci / (1-aii))
@@ -2441,17 +2676,17 @@ mod tests {
                 // Skip assertion for these points
                 continue;
             }
-            
+
             if is_outside[i] {
                 assert!(
-                    dist > -1e-2,  // Relaxed tolerance even further for peeled hull
+                    dist > -1e-2, // Relaxed tolerance even further for peeled hull
                     "Point {} should be outside the LOO hull (dist = {:.6e})",
                     i,
                     dist
                 );
             } else {
                 assert!(
-                    dist <= 1e-2,  // Relaxed tolerance even further for peeled hull
+                    dist <= 1e-2, // Relaxed tolerance even further for peeled hull
                     "Point {} should be inside the LOO hull (dist = {:.6e})",
                     i,
                     dist
@@ -2461,7 +2696,7 @@ mod tests {
 
         // Verify projections reduce distances for outside points
         // Storage for projected points if needed
-let mut projected_points = Array2::<f64>::zeros((n, 2));
+        let mut projected_points = Array2::<f64>::zeros((n, 2));
         let mut unprojected_dists = Array1::zeros(n);
 
         for i in 0..n {
@@ -2472,7 +2707,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 let (projected, num_projected) = hull.project_if_needed(p_2d);
                 // Store projection for later use if needed
                 if num_projected > 0 {
-                    projected_points.slice_mut(s![i, ..]).assign(&projected.row(0));
+                    projected_points
+                        .slice_mut(s![i, ..])
+                        .assign(&projected.row(0));
                 }
 
                 // Calculate Euclidean distance to original point
@@ -2501,14 +2738,14 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let x = array![[1.0, 0.0], [1.0, 1.0]];
         let y = array![0.0, 1.0];
         let w = array![1.0, 4.0];
-        
+
         // Solve via LLT solve_wls_llt
         let sqrt_w = w.mapv(f64::sqrt);
         let mut z_design = x.clone();
         z_design *= &sqrt_w.view().insert_axis(Axis(1));
         let u = &sqrt_w * &y;
         let beta_llt = solve_wls_llt(&z_design, &u).unwrap();
-        
+
         // Solve via normal equations directly
         let xtwx = x.t().dot(&Array2::from_diag(&w)).dot(&x);
         let xtwy = x.t().dot(&(&w * &y));
@@ -2519,7 +2756,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             [-xtwx[[1, 0]] / det, xtwx[[0, 0]] / det]
         ];
         let beta_ne = inv.dot(&xtwy);
-        
+
         // Both methods should give the same result
         assert!((beta_llt - beta_ne).iter().all(|d| d.abs() < 1e-10));
     }
@@ -2613,28 +2850,29 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         // This is what STZ constraint actually guarantees
         let pred_range = schema.column_spans.0.clone();
         let b_pred = x.slice(s![.., pred_range.clone()]);
-        
+
         // Calculate weighted column means
         let w_sum = w.sum();
         let mut max_abs_col_mean: f64 = 0.0;
-        
+
         for j in 0..b_pred.ncols() {
             let col = b_pred.column(j);
-            let weighted_mean = col.iter().zip(w.iter())
-                .map(|(&x, &w)| x * w)
-                .sum::<f64>() / w_sum;
+            let weighted_mean = col.iter().zip(w.iter()).map(|(&x, &w)| x * w).sum::<f64>() / w_sum;
             max_abs_col_mean = max_abs_col_mean.max(weighted_mean.abs());
         }
-        
+
         assert!(
             max_abs_col_mean < 1e-8,
             "Max absolute weighted column mean should be ~0 due to STZ constraint, got {:.2e}",
             max_abs_col_mean
         );
-        
+
         // For reference, sum of coefficients is generally not zero
         let pred_coef_sum: f64 = beta.slice(s![pred_range]).sum();
-        println!("[INFO] Sum of pred coefficients: {:.2e} (not expected to be zero by STZ)", pred_coef_sum);
+        println!(
+            "[INFO] Sum of pred coefficients: {:.2e} (not expected to be zero by STZ)",
+            pred_coef_sum
+        );
     }
 
     #[test]
@@ -2710,21 +2948,24 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Use null_range_whiten to compute the nullity before and after adding ridge
         let (z_null_before, _) = null_range_whiten(&s_pred_no_ridge)
-            .map_err(|e| EstimationError::BasisError(e)).unwrap();
+            .map_err(|e| EstimationError::BasisError(e))
+            .unwrap();
         let null_dim_before = z_null_before.ncols();
 
         // After ridge
         let (z_null_after, _) = null_range_whiten(&s_pred_with_ridge)
-            .map_err(|e| EstimationError::BasisError(e)).unwrap();
+            .map_err(|e| EstimationError::BasisError(e))
+            .unwrap();
         let null_dim_after = z_null_after.ncols();
 
         // With ridge>0 the nullspace should shrink (often to 0)
         assert!(
             null_dim_after <= null_dim_before,
             "Nullspace dimension should not increase with ridge (before: {}, after: {})",
-            null_dim_before, null_dim_after
+            null_dim_before,
+            null_dim_after
         );
-        
+
         // Optionally: check that with-ridge matrix is positive definite
         // by attempting a Cholesky factorization with a tiny regularization
         let tiny_ridge = 1e-12;
@@ -2732,10 +2973,13 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         for i in 0..s_with_tiny_ridge.ncols() {
             s_with_tiny_ridge[[i, i]] += tiny_ridge;
         }
-        let s_f = FaerMat::<f64>::from_fn(s_with_tiny_ridge.nrows(), s_with_tiny_ridge.ncols(),
-            |i, j| s_with_tiny_ridge[[i, j]]);
+        let s_f = FaerMat::<f64>::from_fn(
+            s_with_tiny_ridge.nrows(),
+            s_with_tiny_ridge.ncols(),
+            |i, j| s_with_tiny_ridge[[i, j]],
+        );
         let llt_result = FaerLlt::new(s_f.as_ref(), Side::Lower);
-        
+
         assert!(
             llt_result.is_ok(),
             "Penalty with nullspace ridge should be positive definite"
@@ -2864,7 +3108,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // The test now directly uses the design matrix and penalties from build_calibrator_design
         // This ensures that X and penalties always have matching dimensions
-        // 
+        //
         // Instead of modifying the matrix structure and risking dimension mismatch,
         // we'll make our test more realistic by modifying the calibrator features to
         // create near collinearity directly in the input data
@@ -3063,28 +3307,25 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         );
 
         // Should converge successfully
-        assert!(
-            fit_result.is_ok(),
-            "Calibrator fitting should succeed"
-        );
-        
+        assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
+
         // Extract optimization details and verify reasonable convergence
         let (_, lambdas, _, _, (iterations, grad_norm)) = fit_result.unwrap();
-        
+
         // Should converge in a reasonable number of iterations
         assert!(
             iterations > 0 && iterations < 50,
             "Should converge in a reasonable number of iterations: {}",
             iterations
         );
-        
+
         // Final gradient norm should be small
         assert!(
             grad_norm < 1.0,
             "Final gradient norm should be small: {:.4e}",
             grad_norm
         );
-        
+
         // All lambdas should be positive
         for (i, &lambda) in lambdas.iter().enumerate() {
             assert!(
@@ -3168,7 +3409,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         // Create alternative approach that will cause shape mismatch
         // Create X with wrong shape on purpose to test shape guard
         let x_wrong_shape = x; // x has shape (n, p) which doesn't match penalties
-        
+
         // First verify that correct shape design works
         let fit_result_correct = fit_calibrator(
             y.view(),
@@ -3178,12 +3419,17 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             LinkFunction::Logit,
             &spec,
         );
-        
+
         // The fit with correct shape should succeed or at least not fail due to shape mismatch
-        assert!(fit_result_correct.is_ok() || 
-               !matches!(fit_result_correct.unwrap_err(), EstimationError::InvalidInput { .. }),
-               "Design from build_calibrator_design should have correct shapes");
-               
+        assert!(
+            fit_result_correct.is_ok()
+                || !matches!(
+                    fit_result_correct.unwrap_err(),
+                    EstimationError::InvalidInput { .. }
+                ),
+            "Design from build_calibrator_design should have correct shapes"
+        );
+
         // Now try with deliberately wrong shape X
         let fit_result = fit_calibrator(
             y.view(),
@@ -3202,10 +3448,13 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             Err(EstimationError::InvalidInput { .. }) => {
                 // Expected error type - shape mismatch caught
                 println!("Shape guard correctly detected mismatch between X and penalties");
-            },
+            }
             Err(err) => {
-                panic!("Expected InvalidInput error due to shape mismatch, got: {:?}", err);
-            },
+                panic!(
+                    "Expected InvalidInput error due to shape mismatch, got: {:?}",
+                    err
+                );
+            }
             Ok(_) => {
                 panic!("Expected fit to fail with shape mismatch, but it succeeded");
             }
@@ -3321,7 +3570,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             alo_features.pred.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Compute calibration metrics for base and calibrated predictions
         let base_ece = ece(&y, &base_probs, 50);
@@ -3407,14 +3657,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let base_preds = base_fit.solve_mu.clone();
 
         // Generate ALO features
-        let alo_features = compute_alo_features(
-            &base_fit,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Logit,
-        )
-        .unwrap();
+        let alo_features =
+            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -3486,7 +3730,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             alo_features.pred.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Compute calibration metrics before and after
         let base_ece = ece(&y, &base_preds, 50);
@@ -3540,14 +3785,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let base_preds = base_fit.solve_mu.clone();
 
         // Generate ALO features
-        let alo_features = compute_alo_features(
-            &base_fit,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Identity,
-        )
-        .unwrap();
+        let alo_features =
+            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Identity)
+                .unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -3624,7 +3864,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             alo_features.pred.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Calculate MSE before and after calibration
         let mut base_mse = 0.0;
@@ -3835,7 +4076,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             test_alo_features.pred.view(),
             test_alo_features.se.view(),
             test_alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Calculate errors for inside and outside points
         let mut inside_base_mse = 0.0;
@@ -3908,14 +4150,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Just test that we can fit a calibrator
         let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
-        let alo_features = compute_alo_features(
-            &base_fit,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Logit,
-        )
-        .unwrap();
+        let alo_features =
+            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let features = CalibratorFeatures {
             pred: alo_features.pred,
@@ -3962,38 +4198,44 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
     fn linear_fallback_centering_consistency() {
         // This test verifies that centering offsets are correctly stored and applied
         // for linear fallbacks during both training and prediction.
-        
+
         // Create synthetic data where SE and distance will trigger linear fallback
         let n = 100;
         let mut rng = StdRng::seed_from_u64(42);
-        
+
         // Create features with very small spread for SE to trigger linear fallback
         let pred = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
-        
+
         // SE with tiny range to trigger linear fallback
         let se_base_value = 0.5;
         let se_tiny_range = 1e-9;
-        let se = Array1::from_vec((0..n).map(|_| {
-            se_base_value + rng.r#gen::<f64>() * se_tiny_range
-        }).collect());
-        
+        let se = Array1::from_vec(
+            (0..n)
+                .map(|_| se_base_value + rng.r#gen::<f64>() * se_tiny_range)
+                .collect(),
+        );
+
         // Distance with uniform values to trigger linear fallback
-        let dist = Array1::from_vec((0..n).map(|_| {
-            if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 } // Mostly zeros with a few positives
-        }).collect());
+        let dist = Array1::from_vec(
+            (0..n)
+                .map(|_| {
+                    if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 } // Mostly zeros with a few positives
+                })
+                .collect(),
+        );
 
         // Create non-uniform weights to test weighted centering
         let mut weights = Array1::ones(n);
-        for i in 0..n/5 {
+        for i in 0..n / 5 {
             weights[i] = 5.0; // Higher weight for some observations
         }
-        
+
         // Create response
         let y = pred.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 });
-        
+
         // Create calibrator features
         let features = CalibratorFeatures { pred, se, dist };
-        
+
         // Create calibrator spec
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -4017,18 +4259,30 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: Some(weights.clone()), // Use non-uniform weights
         };
-        
+
         // Build design and fit calibrator
         let (x_cal, penalties, schema) = build_calibrator_design(&features, &spec).unwrap();
-        
+
         // Verify that linear fallback is triggered
-        assert!(schema.se_linear_fallback, "SE linear fallback should be triggered");
-        assert!(schema.dist_linear_fallback, "Distance linear fallback should be triggered");
-        
+        assert!(
+            schema.se_linear_fallback,
+            "SE linear fallback should be triggered"
+        );
+        assert!(
+            schema.dist_linear_fallback,
+            "Distance linear fallback should be triggered"
+        );
+
         // Verify that center offsets are non-zero (since we're using weighted centering)
-        assert!(schema.se_center_offset.abs() > 0.0, "SE center offset should be non-zero");
-        assert!(schema.dist_center_offset.abs() > 0.0, "Distance center offset should be non-zero");
-        
+        assert!(
+            schema.se_center_offset.abs() > 0.0,
+            "SE center offset should be non-zero"
+        );
+        assert!(
+            schema.dist_center_offset.abs() > 0.0,
+            "Distance center offset should be non-zero"
+        );
+
         // Fit calibrator
         let fit_result = fit_calibrator(
             y.view(),
@@ -4037,9 +4291,10 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             &penalties,
             LinkFunction::Logit,
             &spec,
-        ).unwrap();
+        )
+        .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
-        
+
         // Create a CalibratorModel
         let cal_model = CalibratorModel {
             spec: spec.clone(),
@@ -4064,17 +4319,25 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             column_spans: schema.column_spans,
             scale: None,
         };
-        
+
         // Create new test data with similar characteristics but different values
         let n_test = 20;
-        let test_pred = Array1::from_vec((0..n_test).map(|i| i as f64 / (n_test as f64) * 2.0 - 1.0).collect());
-        let test_se = Array1::from_vec((0..n_test).map(|_| {
-            se_base_value + rng.r#gen::<f64>() * se_tiny_range
-        }).collect());
-        let test_dist = Array1::from_vec((0..n_test).map(|_| {
-            if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 }
-        }).collect());
-        
+        let test_pred = Array1::from_vec(
+            (0..n_test)
+                .map(|i| i as f64 / (n_test as f64) * 2.0 - 1.0)
+                .collect(),
+        );
+        let test_se = Array1::from_vec(
+            (0..n_test)
+                .map(|_| se_base_value + rng.r#gen::<f64>() * se_tiny_range)
+                .collect(),
+        );
+        let test_dist = Array1::from_vec(
+            (0..n_test)
+                .map(|_| if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 })
+                .collect(),
+        );
+
         // Test two prediction approaches for consistency:
         // 1. With the full centering (our fix)
         let pred1 = predict_calibrator(
@@ -4082,8 +4345,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             test_pred.view(),
             test_se.view(),
             test_dist.view(),
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         // 2. With a "manually" centered version that accounts for standardization
         // The offset is in standardized units, so we need to convert it to raw units
         // by multiplying by the standard deviation
@@ -4091,26 +4355,28 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let (_, dist_std) = schema.standardize_dist;
         let test_se_centered = test_se.mapv(|v| v - schema.se_center_offset * se_std);
         let test_dist_centered = test_dist.mapv(|v| v - schema.dist_center_offset * dist_std);
-        
+
         // Create a model with zero offsets (to simulate old behavior with manual centering)
         let mut cal_model_zero_offsets = cal_model.clone();
         cal_model_zero_offsets.se_center_offset = 0.0;
         cal_model_zero_offsets.dist_center_offset = 0.0;
-        
+
         // Predict with pre-centered data but zero offsets in model
         let pred2 = predict_calibrator(
             &cal_model_zero_offsets,
             test_pred.view(),
             test_se_centered.view(),
             test_dist_centered.view(),
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         // The predictions should be identical
         for i in 0..n_test {
             assert!(
                 (pred1[i] - pred2[i]).abs() < 1e-9,
                 "Predictions should match closely between proper centering and manual centering (diff at i={}: {:.2e})",
-                i, (pred1[i] - pred2[i]).abs()
+                i,
+                (pred1[i] - pred2[i]).abs()
             );
         }
     }
@@ -4127,14 +4393,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
 
         // Generate ALO features
-        let alo_features = compute_alo_features(
-            &base_fit,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Logit,
-        )
-        .unwrap();
+        let alo_features =
+            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -4204,7 +4464,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             alo_features.pred.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Serialize to JSON using serde (simulating save_model -> TOML -> load_model)
         let json = serde_json::to_string(&original_cal_model).unwrap();
@@ -4218,7 +4479,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             alo_features.pred.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
-        ).unwrap(); // Safe to unwrap in tests
+        )
+        .unwrap(); // Safe to unwrap in tests
 
         // Compare predictions
         for i in 0..n {
@@ -4283,9 +4545,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             loaded_cal_model.column_spans.2.end
         );
     }
-    
+
     // ===== Optimizer Verification Tests =====
-    
+
     /// Tests that the optimizer's solution is a stationary point of the LAML objective
     /// for binomial/logistic regression.
     #[test]
@@ -4294,10 +4556,10 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let n = 300;
         let eta = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 4.0 - 2.0).collect());
         let distorted_eta = add_sinusoidal_miscalibration(&eta, 0.5, 2.0);
-        
+
         // Convert to probabilities
         let base_probs = distorted_eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-        
+
         // Generate outcomes from distorted probabilities
         let mut rng = StdRng::seed_from_u64(42);
         let mut y = Array1::zeros(n);
@@ -4305,20 +4567,20 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             let dist = Bernoulli::new(base_probs[i]).unwrap();
             y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
         }
-        
+
         // Create calibrator features directly
         let features = CalibratorFeatures {
             pred: distorted_eta,
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
         };
-        
+
         // Create calibrator spec
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
                 degree: 3,
-                num_knots: 8,  // More knots to capture wiggle
+                num_knots: 8, // More knots to capture wiggle
             },
             se_basis: BasisConfig {
                 degree: 3,
@@ -4336,49 +4598,56 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
-        
+
         // Build design and fit calibrator
         let (x_cal, rs_blocks, _) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::ones(n);
         let fit_result = fit_calibrator(
-            y.view(), 
-            w.view(), 
-            x_cal.view(), 
-            &rs_blocks, 
-            LinkFunction::Logit, 
-            &spec
-        ).unwrap();
-        
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            &rs_blocks,
+            LinkFunction::Logit,
+            &spec,
+        )
+        .unwrap();
+
         let (beta, lambdas, _, _, _) = fit_result;
         let rho_hat = [lambdas[0].ln(), lambdas[1].ln(), lambdas[2].ln()];
-        
+
         // First test: evaluate objective at the optimizer's solution and perturbed points
         let f0 = eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_hat);
         let eps = 1e-3;
-        
+
         // Check stationarity along each coordinate direction
         for j in 0..rho_hat.len() {
             let mut rp = rho_hat.clone();
             rp[j] += eps;
-            
+
             let mut rm = rho_hat.clone();
             rm[j] -= eps;
-            
+
             let fp = eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rp);
             let fm = eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rm);
-            
+
             assert!(
-                f0 <= fp + 1e-5, 
+                f0 <= fp + 1e-5,
                 "Not a min along +e{}: f0={:.6} fp={:.6} diff={:.6}",
-                j, f0, fp, fp - f0
+                j,
+                f0,
+                fp,
+                fp - f0
             );
             assert!(
-                f0 <= fm + 1e-5, 
+                f0 <= fm + 1e-5,
                 "Not a min along -e{}: f0={:.6} fm={:.6} diff={:.6}",
-                j, f0, fm, fm - f0
+                j,
+                f0,
+                fm,
+                fm - f0
             );
         }
-        
+
         // Second test: check that the inner KKT residual is small (beta-side convergence)
         // Recompute S_lambda at the optimum
         let mut s_lambda = Array2::<f64>::zeros((x_cal.ncols(), x_cal.ncols()));
@@ -4386,11 +4655,11 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             let lam = lambdas[j];
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
-        
+
         // Compute working response and weights at the fitted beta
         let eta = x_cal.dot(&beta);
         let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-        
+
         // Compute working weights and response
         let mut w_work = Array1::<f64>::zeros(n);
         let mut z = Array1::<f64>::zeros(n);
@@ -4400,27 +4669,29 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             w_work[i] = w[i] * vi;
             z[i] = eta[i] + (y[i] - p_i) / vi.max(1e-12);
         }
-        
+
         // KKT residual: r_beta = X^T W(z - X beta) - S_lambda * beta
         let mut xtwz_minus_xtwxb = Array1::<f64>::zeros(beta.len());
         for i in 0..n {
             let wi = w_work[i];
-            if wi < 1e-12 { continue; }
-            
+            if wi < 1e-12 {
+                continue;
+            }
+
             let xi = x_cal.row(i);
             let resid = z[i] - eta[i];
-            
+
             for j in 0..beta.len() {
                 xtwz_minus_xtwxb[j] += wi * xi[j] * resid;
             }
         }
-        
+
         let s_beta = s_lambda.dot(&beta);
         let residual = &xtwz_minus_xtwxb - &s_beta;
-        
+
         // Compute L2 norm of the residual
-        let res_norm: f64 = residual.iter().map(|&r| r*r).sum::<f64>().sqrt();
-        
+        let res_norm: f64 = residual.iter().map(|&r| r * r).sum::<f64>().sqrt();
+
         // The residual should be very small if PIRLS converged correctly
         assert!(
             res_norm < 1e-4,
@@ -4437,20 +4708,26 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let n = 300;
         let p = 5;
         let hetero_factor = 1.5;
-        let (x_data, y, mu_true, sigma_true) = generate_synthetic_gaussian_data(n, p, hetero_factor, Some(42));
+        let (x_data, y, mu_true, sigma_true) =
+            generate_synthetic_gaussian_data(n, p, hetero_factor, Some(42));
         // Calculate statistics about the heteroscedastic standard errors
         let mean_sigma = sigma_true.iter().sum::<f64>() / sigma_true.len() as f64;
         let max_sigma = sigma_true.iter().fold(0.0f64, |max, &x| max.max(x));
-        eprintln!("[CAL] Generated {} samples with {} features, mean sigma: {:.2}, max sigma: {:.2}", 
-                  x_data.nrows(), x_data.ncols(), mean_sigma, max_sigma);
-        
+        eprintln!(
+            "[CAL] Generated {} samples with {} features, mean sigma: {:.2}, max sigma: {:.2}",
+            x_data.nrows(),
+            x_data.ncols(),
+            mean_sigma,
+            max_sigma
+        );
+
         // Create calibrator features directly
         let features = CalibratorFeatures {
             pred: mu_true,
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
         };
-        
+
         // Create calibrator spec
         let spec = CalibratorSpec {
             link: LinkFunction::Identity,
@@ -4474,55 +4751,77 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
-        
+
         // Build design and fit calibrator
         let (x_cal, rs_blocks, _) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::ones(n);
         let fit_result = fit_calibrator(
-            y.view(), 
-            w.view(), 
-            x_cal.view(), 
-            &rs_blocks, 
-            LinkFunction::Identity, 
-            &spec
-        ).unwrap();
-        
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            &rs_blocks,
+            LinkFunction::Identity,
+            &spec,
+        )
+        .unwrap();
+
         let (beta, lambdas, scale, _, _) = fit_result;
         let rho_hat = [lambdas[0].ln(), lambdas[1].ln(), lambdas[2].ln()];
-        
+
         // First test: evaluate objective at the optimizer's solution and perturbed points
         let f0 = eval_laml_fixed_rho_gaussian(
-            y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_hat, scale
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            &rs_blocks,
+            &rho_hat,
+            scale,
         );
         let eps = 1e-3;
-        
+
         // Check stationarity along each coordinate direction
         for j in 0..rho_hat.len() {
             let mut rp = rho_hat.clone();
             rp[j] += eps;
-            
+
             let mut rm = rho_hat.clone();
             rm[j] -= eps;
-            
+
             let fp = eval_laml_fixed_rho_gaussian(
-                y.view(), w.view(), x_cal.view(), &rs_blocks, &rp, scale
+                y.view(),
+                w.view(),
+                x_cal.view(),
+                &rs_blocks,
+                &rp,
+                scale,
             );
             let fm = eval_laml_fixed_rho_gaussian(
-                y.view(), w.view(), x_cal.view(), &rs_blocks, &rm, scale
+                y.view(),
+                w.view(),
+                x_cal.view(),
+                &rs_blocks,
+                &rm,
+                scale,
             );
-            
+
             assert!(
-                f0 <= fp + 1e-5, 
+                f0 <= fp + 1e-5,
                 "Not a min along +e{}: f0={:.6} fp={:.6} diff={:.6}",
-                j, f0, fp, fp - f0
+                j,
+                f0,
+                fp,
+                fp - f0
             );
             assert!(
-                f0 <= fm + 1e-5, 
+                f0 <= fm + 1e-5,
                 "Not a min along -e{}: f0={:.6} fm={:.6} diff={:.6}",
-                j, f0, fm, fm - f0
+                j,
+                f0,
+                fm,
+                fm - f0
             );
         }
-        
+
         // Second test: check curvature along random directions
         let mut rng = StdRng::seed_from_u64(123);
         for _ in 0..2 {
@@ -4532,9 +4831,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 d[j] = rng.r#gen::<f64>() * 2.0 - 1.0;
             }
             // Normalize to unit length
-            let norm: f64 = d.iter().map(|&x| x*x).sum::<f64>().sqrt();
+            let norm: f64 = d.iter().map(|&x| x * x).sum::<f64>().sqrt();
             d.mapv_inplace(|x| x / norm);
-            
+
             // Evaluate at rho_hat + eps*d and rho_hat - eps*d
             let mut rp = rho_hat.clone();
             let mut rm = rho_hat.clone();
@@ -4542,14 +4841,24 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 rp[j] += eps * d[j];
                 rm[j] -= eps * d[j];
             }
-            
+
             let fp = eval_laml_fixed_rho_gaussian(
-                y.view(), w.view(), x_cal.view(), &rs_blocks, &rp, scale
+                y.view(),
+                w.view(),
+                x_cal.view(),
+                &rs_blocks,
+                &rp,
+                scale,
             );
             let fm = eval_laml_fixed_rho_gaussian(
-                y.view(), w.view(), x_cal.view(), &rs_blocks, &rm, scale
+                y.view(),
+                w.view(),
+                x_cal.view(),
+                &rs_blocks,
+                &rm,
+                scale,
             );
-            
+
             // Discrete second derivative should be non-negative at a minimum
             let second_deriv = fp + fm - 2.0 * f0;
             assert!(
@@ -4558,7 +4867,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 second_deriv
             );
         }
-        
+
         // Third test: check the inner KKT residual
         // Recompute S_lambda at the optimum
         let mut s_lambda = Array2::<f64>::zeros((x_cal.ncols(), x_cal.ncols()));
@@ -4566,33 +4875,35 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             let lam = lambdas[j];
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
-        
+
         // For Gaussian regression, the KKT residual is simpler:
         // r_beta = X^T W(y - X beta) - S_lambda * beta
         let eta = x_cal.dot(&beta);
         let mut xtw_resid = Array1::<f64>::zeros(beta.len());
-        
+
         for i in 0..n {
             let wi = w[i];
-            if wi < 1e-12 { continue; }
-            
+            if wi < 1e-12 {
+                continue;
+            }
+
             let xi = x_cal.row(i);
             let resid = y[i] - eta[i];
-            
+
             for j in 0..beta.len() {
                 xtw_resid[j] += wi * xi[j] * resid;
             }
         }
-        
+
         // Scale by 1/scale for Gaussian
         xtw_resid.mapv_inplace(|v| v / scale);
-        
+
         let s_beta = s_lambda.dot(&beta);
         let residual = &xtw_resid - &s_beta;
-        
+
         // Compute L2 norm of the residual
-        let res_norm: f64 = residual.iter().map(|&r| r*r).sum::<f64>().sqrt();
-        
+        let res_norm: f64 = residual.iter().map(|&r| r * r).sum::<f64>().sqrt();
+
         // The residual should be very small if the linear system was solved correctly
         assert!(
             res_norm < 1e-4,
@@ -4631,8 +4942,8 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 penalty_order_dist: 2,
                 double_penalty_ridge: 1e-4,
                 distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
-            prior_weights: None,
+                nullspace_shrinkage_kappa: Some(1.0),
+                prior_weights: None,
             };
 
             // Build design and fit calibrator
@@ -4658,26 +4969,16 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         // First run
         let w = Array1::ones(n);
         let base_fit1 = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
-        let features1 = compute_alo_features(
-            &base_fit1,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Logit,
-        )
-        .unwrap();
+        let features1 =
+            compute_alo_features(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
+                .unwrap();
         let (beta1, lambdas1) = create_calibrator(&features1);
 
         // Second run - should be identical
         let base_fit2 = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
-        let features2 = compute_alo_features(
-            &base_fit2,
-            y.view(),
-            x.view(),
-            None,
-            LinkFunction::Logit,
-        )
-        .unwrap();
+        let features2 =
+            compute_alo_features(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
+                .unwrap();
         let (beta2, lambdas2) = create_calibrator(&features2);
 
         // Compare results - they should be identical
@@ -4724,14 +5025,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         // Compare results for small dataset using both original and blocked computation
         // Note: This is checking the internal implementation of compute_alo_features
         // which uses blocking for large datasets but direct computation for small ones
-        compute_alo_features(
-            &small_fit,
-            y_small.view(),
-            x_small.view(),
-            None,
-            link,
-        )
-        .unwrap();
+        compute_alo_features(&small_fit, y_small.view(), x_small.view(), None, link).unwrap();
 
         // Now test performance on large dataset
         let start = Instant::now();
@@ -4742,14 +5036,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Time just the ALO computation
         let alo_start = Instant::now();
-        compute_alo_features(
-            &large_fit,
-            y_large.view(),
-            x_large.view(),
-            None,
-            link,
-        )
-        .unwrap();
+        compute_alo_features(&large_fit, y_large.view(), x_large.view(), None, link).unwrap();
         let alo_duration = alo_start.elapsed();
 
         eprintln!(
@@ -4783,8 +5070,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let base_fit = simple_pirls_fit(&x, &y, &w, link).unwrap();
 
         // Generate ALO features
-        let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
 
         // Create calibrator spec with enough knots to get ~p_cal parameters
         let spec = CalibratorSpec {
@@ -5015,8 +5301,11 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         let n = 100;
         let p = 5;
         let (x_data, y, true_beta) = generate_synthetic_binary_data(n, p, Some(42));
-        eprintln!("[CAL] True beta dimensions: {}, first feature value: {:.4}", 
-                 true_beta.len(), x_data[[0, 0]]);
+        eprintln!(
+            "[CAL] True beta dimensions: {}, first feature value: {:.4}",
+            true_beta.len(),
+            x_data[[0, 0]]
+        );
 
         // Create calibrator features directly
         let features = CalibratorFeatures {
@@ -5079,20 +5368,18 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             "Calibrator should fit stably with large lambdas"
         );
 
-        let (beta, lambdas, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) = result.unwrap();
+        let (beta, lambdas, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) =
+            result.unwrap();
         // Use the values to print calibration metrics
         eprintln!(
             "Large lambda test results - edf: ({:.2},{:.2},{:.2}), lambdas: ({:.2e},{:.2e},{:.2e}), iterations: {}, convergence: {:.4e}",
             edf_pred, edf_se, edf_dist, lambdas[0], lambdas[1], lambdas[2], iters, grad_norm
         );
-        
+
         // Print calibration metrics
         eprintln!(
             "[CAL] Calibration metrics: edf=({:.1},{:.1},{:.1}), lambdas=({:.4e},{:.4e},{:.4e}), scale={:.4e}, convergence={:.4e}",
-            edf_pred, edf_se, edf_dist,
-            lambdas[0], lambdas[1], lambdas[2],
-            scale,
-            grad_norm
+            edf_pred, edf_se, edf_dist, lambdas[0], lambdas[1], lambdas[2], scale, grad_norm
         );
 
         // With large penalties, EDF should be very small
@@ -5108,17 +5395,17 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             assert!(b.is_finite(), "Coefficients should be finite");
         }
     }
-    
+
     // === Diagnostic Tests ===
     // These tests are intentionally designed to show discrepancies
     // rather than making pass/fail assertions
-    
+
     #[test]
     fn test_alo_weighting_convention() {
         // Create a small hand-sized unpenalized logistic model with varying weights
         let n = 30;
         let p = 5;
-        
+
         // Create synthetic data with varying weights
         let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
         let mut x = Array2::<f64>::zeros((n, p));
@@ -5127,110 +5414,158 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
                 x[[i, j]] = rng.gen_range(-1.0..1.0);
             }
         }
-        
+
         // Generate binary response
         let true_beta = Array1::from_vec(vec![0.5, -0.5, 0.25, -0.25, 0.1]);
         let xbeta = x.dot(&true_beta);
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
             let p_i = 1.0 / (1.0 + (-xbeta[i]).exp());
-            y[i] = if rng.gen_range(0.0..1.0) < p_i { 1.0 } else { 0.0 };
+            y[i] = if rng.gen_range(0.0..1.0) < p_i {
+                1.0
+            } else {
+                0.0
+            };
         }
-        
+
         // Create weights with significant variation
         let mut w = Array1::ones(n);
-        for i in 0..n/3 {
+        for i in 0..n / 3 {
             w[i] = 5.0; // Higher weight
         }
-        for i in n/3..2*n/3 {
+        for i in n / 3..2 * n / 3 {
             w[i] = 0.2; // Lower weight
         }
         // Rest stay at 1.0
-        
+
         // Fit a simple model to get the ALO features
         let fit_res = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
-        
+
         // Compute ALO features
-        let alo_features = compute_alo_features(
-            &fit_res, 
-            y.view(), 
-            x.view(), 
-            None, 
-            LinkFunction::Logit
-        ).unwrap();
-        
+        let alo_features =
+            compute_alo_features(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+
         // Get inputs for manual SE calculation
         let sqrt_w = w.mapv(f64::sqrt);
         let mut u = fit_res.x_transformed.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
-        
+
         // Get the penalized Hessian (K = XᵀWX + Sλ)
         let k = fit_res.penalized_hessian_transformed.clone();
         let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
         let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
-        
+
         // Compute hat diagonals and both SE conventions for a few observations
         println!("\nALO weighting convention test:");
-        println!("| i | weight | a_ii | var_full | SE_tilde | c_i = a_ii/w_i | SE_unw | Ratio |");
-        println!("|---|--------|------|----------|----------|----------------|--------|-------|");
-        
-        for i in 0..std::cmp::min(10, n) {
-            // Get u_i (scaled row of design matrix)
+        println!("| i | weight | a_ii | 1-a_ii | var_full | SE_full | SE_loo | Ratio (loo/full) |");
+        println!("|---|--------|------|--------|----------|---------|--------|------------------|");
+
+        let xtwx = u.t().dot(&u);
+        let mut hat_diagonals = Vec::with_capacity(n);
+        let mut se_fulls = Vec::with_capacity(n);
+        let mut se_loos = Vec::with_capacity(n);
+
+        for i in 0..n {
             let ui = u.row(i).to_owned();
-            
-            // Solve K s_i = uᵀ_i
             let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let si = factor.solve(rhs_f.as_ref());
             let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
-            
-            // Compute a_ii = u_i · s_i
+
             let mut aii = 0.0;
             for r in 0..p {
                 aii += ui[r] * si[(r, 0)];
             }
-            
-            // Compute var_full = φ · s_iᵀ (XᵀWX) s_i
-            let xtwx = u.t().dot(&u);
+
             let ti = xtwx.dot(&si_arr);
             let mut var_full = 0.0;
             for r in 0..p {
                 var_full += si_arr[r] * ti[r];
             }
-            
-            // Compute both SE conventions
+
             let denom = (1.0 - aii).max(1e-12);
-            let var_loo = var_full / (denom * denom);
-            let se_tilde = var_loo.sqrt();
-            
-            // Compute unweighted proxy convention
-            let wi = w[i];
-            let c_i = aii / wi;
-            let se_unw = (c_i / (denom * denom)).sqrt();
-            
-            // Print both versions for comparison
-            println!("| {:2} | {:6.3} | {:5.3} | {:8.3e} | {:8.3e} | {:14.3e} | {:6.3e} | {:5.3} |", 
-                i, wi, aii, var_full, se_tilde, c_i, se_unw, se_tilde/se_unw);
+            let var_loo = var_full / denom;
+            let se_full = var_full.sqrt();
+            let se_loo = var_loo.sqrt();
+
+            hat_diagonals.push(aii);
+            se_fulls.push(se_full);
+            se_loos.push(se_loo);
         }
-        
-        // Directly show that the ratio matches sqrt(w_i)
-        println!("\nVerifying ratio SE_tilde/SE_unw ≈ sqrt(w_i):");
-        for i in [0, n/3, 2*n/3] { // Sample from each weight group
-            let weight = w[i];
-            let expected_ratio = weight.sqrt();
-            let se_ratio = alo_features.se[i] / (alo_features.se[i] / expected_ratio);
-            
-            println!("Obs {}: weight = {:.3}, expected ratio = {:.3}, actual ratio = {:.3}", 
-                i, weight, expected_ratio, se_ratio);
+
+        for i in 0..std::cmp::min(10, n) {
+            let aii = hat_diagonals[i];
+            let denom = (1.0 - aii).max(1e-12);
+            let se_full = se_fulls[i];
+            let se_loo_manual = se_loos[i];
+            let var_full = se_full * se_full;
+
+            println!(
+                "| {:2} | {:6.3} | {:5.3} | {:6.3} | {:8.3e} | {:8.3e} | {:8.3e} | {:12.3e} |",
+                i,
+                w[i],
+                aii,
+                denom,
+                var_full,
+                se_full,
+                se_loo_manual,
+                if se_full > 0.0 {
+                    se_loo_manual / se_full
+                } else {
+                    f64::NAN
+                }
+            );
+
+            let alo_se = alo_features.se[i];
+            assert!(
+                (alo_se - se_loo_manual).abs() <= 1e-9 * (1.0 + se_loo_manual.abs()),
+                "ALO SE mismatch at i={}: computed {:.6e}, manual {:.6e}",
+                i,
+                alo_se,
+                se_loo_manual
+            );
+            let expected_ratio = denom.sqrt().recip();
+            let actual_ratio = if se_full > 0.0 {
+                se_loo_manual / se_full
+            } else {
+                f64::NAN
+            };
+            assert!(
+                (actual_ratio - expected_ratio).abs() <= 1e-9 * (1.0 + expected_ratio.abs()),
+                "Inflation mismatch at i={}: got {:.6e}, expected {:.6e}",
+                i,
+                actual_ratio,
+                expected_ratio
+            );
+        }
+
+        println!("\nVerifying ratio SE_tilde/SE_full ≈ 1/sqrt(1-a_ii):");
+        for i in [0, n / 3, 2 * n / 3] {
+            // Sample from each weight group
+            let aii = hat_diagonals[i];
+            let denom = (1.0 - aii).max(1e-12);
+            let expected_ratio = denom.sqrt().recip();
+            let se_full = se_fulls[i];
+            let se_loo = alo_features.se[i];
+            let actual_ratio = if se_full > 0.0 {
+                se_loo / se_full
+            } else {
+                f64::NAN
+            };
+
+            println!(
+                "Obs {}: weight = {:.3}, a_ii = {:.3}, expected ratio = {:.3}, actual ratio = {:.3}",
+                i, w[i], aii, expected_ratio, actual_ratio
+            );
         }
     }
-    
+
     #[test]
     fn test_stz_checks_column_means_not_coef_sums() {
         // This test demonstrates the difference between:
         // 1. Column means of basis matrix being zero (STZ guarantee)
         // 2. Sum of coefficients being zero (incorrect test assertion)
-        
+
         // Create a simple dataset with just a constant predictor
         let n = 100;
         let constant_pred = Array1::ones(n);
@@ -5278,7 +5613,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None, // Uniform weights
         };
-        
+
         // Non-uniform weights version
         let mut weights = Array1::ones(n);
         for i in 0..30 {
@@ -5287,7 +5622,7 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
         for i in 70..90 {
             weights[i] = 0.5; // Lower weights for others
         }
-        
+
         let spec_nonuniform = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
@@ -5313,9 +5648,9 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
 
         // Build designs and fit models for both weight cases
         println!("\nCase 1: Uniform weights");
-        let (x_uniform, penalties_uniform, schema_uniform) = 
+        let (x_uniform, penalties_uniform, schema_uniform) =
             build_calibrator_design(&features, &spec_uniform).unwrap();
-            
+
         let fit_uniform = fit_calibrator(
             y.view(),
             Array1::ones(n).view(),
@@ -5323,12 +5658,13 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             &penalties_uniform,
             LinkFunction::Logit,
             &spec_uniform,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         println!("\nCase 2: Non-uniform weights");
-        let (x_nonuniform, penalties_nonuniform, schema_nonuniform) = 
+        let (x_nonuniform, penalties_nonuniform, schema_nonuniform) =
             build_calibrator_design(&features, &spec_nonuniform).unwrap();
-            
+
         let fit_nonuniform = fit_calibrator(
             y.view(),
             weights.view(),
@@ -5336,20 +5672,21 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             &penalties_nonuniform,
             LinkFunction::Logit,
             &spec_nonuniform,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Extract only the beta values from the results
         let (beta_uniform, ..) = fit_uniform;
         let (beta_nonuniform, ..) = fit_nonuniform;
-        
+
         // Verify column means vs coefficient sums
         // 1. Column means should be ~0 in both cases (STZ guarantee)
         println!("\nVerifying column means of the basis matrix after STZ constraint:");
-        
+
         // Get pred block span for uniform case
         let pred_range_uniform = schema_uniform.column_spans.0.clone();
         let b_pred_uniform = x_uniform.slice(s![.., pred_range_uniform.clone()]);
-        
+
         // Calculate column means for uniform case
         let mut max_abs_col_mean_uniform: f64 = 0.0;
         for j in 0..b_pred_uniform.ncols() {
@@ -5357,49 +5694,78 @@ let mut projected_points = Array2::<f64>::zeros((n, 2));
             let mean = col.sum() / (n as f64);
             max_abs_col_mean_uniform = max_abs_col_mean_uniform.max(mean.abs());
         }
-        
+
         // Get pred block span for non-uniform case
         let pred_range_nonuniform = schema_nonuniform.column_spans.0.clone();
         let b_pred_nonuniform = x_nonuniform.slice(s![.., pred_range_nonuniform.clone()]);
-        
+
         // Calculate weighted column means for non-uniform case
         let w_sum = weights.sum();
         let mut max_abs_col_mean_nonuniform: f64 = 0.0;
         for j in 0..b_pred_nonuniform.ncols() {
             let col = b_pred_nonuniform.column(j);
-            let weighted_mean = col.iter().zip(weights.iter())
+            let weighted_mean = col
+                .iter()
+                .zip(weights.iter())
                 .map(|(&x, &w)| x * w)
-                .sum::<f64>() / w_sum;
+                .sum::<f64>()
+                / w_sum;
             max_abs_col_mean_nonuniform = max_abs_col_mean_nonuniform.max(weighted_mean.abs());
         }
-        
-        println!("  Uniform weights case: max absolute column mean = {:.6e}", max_abs_col_mean_uniform);
-        println!("  Non-uniform weights case: max absolute weighted column mean = {:.6e}", max_abs_col_mean_nonuniform);
-        
+
+        println!(
+            "  Uniform weights case: max absolute column mean = {:.6e}",
+            max_abs_col_mean_uniform
+        );
+        println!(
+            "  Non-uniform weights case: max absolute weighted column mean = {:.6e}",
+            max_abs_col_mean_nonuniform
+        );
+
         // 2. But sum of coefficients is generally NOT zero (the test's incorrect assertion)
         let pred_coef_sum_uniform: f64 = beta_uniform.slice(s![pred_range_uniform]).sum();
         let pred_coef_sum_nonuniform: f64 = beta_nonuniform.slice(s![pred_range_nonuniform]).sum();
-        
+
         println!("\nTesting the test's incorrect assumption:");
-        println!("  Uniform weights case: sum of pred coefficients = {:.6e}", pred_coef_sum_uniform);
-        println!("  Non-uniform weights case: sum of pred coefficients = {:.6e}", pred_coef_sum_nonuniform);
-        
+        println!(
+            "  Uniform weights case: sum of pred coefficients = {:.6e}",
+            pred_coef_sum_uniform
+        );
+        println!(
+            "  Non-uniform weights case: sum of pred coefficients = {:.6e}",
+            pred_coef_sum_nonuniform
+        );
+
         // 3. But the intercept should be close to logit(mean_y) in both cases (the correct assertion)
         let intercept_uniform = beta_uniform[0];
         let intercept_nonuniform = beta_nonuniform[0];
-        
+
         println!("\nVerifying intercept is close to logit(mean_y):");
-        println!("  Uniform weights case: intercept = {:.3}, logit(mean_y) = {:.3}, diff = {:.3}", 
-            intercept_uniform, logit_mean_y, (intercept_uniform - logit_mean_y).abs());
-        println!("  Non-uniform weights case: intercept = {:.3}, logit(mean_y) = {:.3}, diff = {:.3}", 
-            intercept_nonuniform, logit_mean_y, (intercept_nonuniform - logit_mean_y).abs());
-            
+        println!(
+            "  Uniform weights case: intercept = {:.3}, logit(mean_y) = {:.3}, diff = {:.3}",
+            intercept_uniform,
+            logit_mean_y,
+            (intercept_uniform - logit_mean_y).abs()
+        );
+        println!(
+            "  Non-uniform weights case: intercept = {:.3}, logit(mean_y) = {:.3}, diff = {:.3}",
+            intercept_nonuniform,
+            logit_mean_y,
+            (intercept_nonuniform - logit_mean_y).abs()
+        );
+
         // Note that the test's assertion about sum of coefficients is invalid
         println!("\nConclusion:");
-        println!("  - STZ guarantees column means ≈ 0 (TRUE for both cases: {:.2e}, {:.2e})",
-            max_abs_col_mean_uniform, max_abs_col_mean_nonuniform);
-        println!("  - Sum of coefficients = 0 is NOT guaranteed by STZ. Test assertion is INVALID.");
+        println!(
+            "  - STZ guarantees column means ≈ 0 (TRUE for both cases: {:.2e}, {:.2e})",
+            max_abs_col_mean_uniform, max_abs_col_mean_nonuniform
+        );
+        println!(
+            "  - Sum of coefficients = 0 is NOT guaranteed by STZ. Test assertion is INVALID."
+        );
         println!("  - The correct test should check column means, not coefficient sums.");
-        println!("  - Also check the intercept against logit(mean_y), which IS a valid expectation.");
+        println!(
+            "  - Also check the intercept against logit(mean_y), which IS a valid expectation."
+        );
     }
 }
