@@ -538,9 +538,10 @@ mod tests {
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
         // 3 internal + 2 * (2+1) boundary = 9 knots
         assert_eq!(knots.len(), 9);
+        let expected_knots = array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0];
         assert_abs_diff_eq!(
-            knots,
-            array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0],
+            knots.as_slice().unwrap(),
+            expected_knots.as_slice().unwrap(),
             epsilon = 1e-9
         );
     }
@@ -553,9 +554,10 @@ mod tests {
         // Since quantile knots are disabled, this should generate uniform knots
         // 3 internal knots + 2 * (2+1) boundary = 9 knots
         assert_eq!(knots.len(), 9);
+        let expected_knots = array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0];
         assert_abs_diff_eq!(
-            knots,
-            array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0],
+            knots.as_slice().unwrap(),
+            expected_knots.as_slice().unwrap(),
             epsilon = 1e-9
         );
     }
@@ -573,7 +575,12 @@ mod tests {
             [0., 1., -4., 5., -2.],
             [0., 0., 1., -2., 1.]
         ];
-        assert_abs_diff_eq!(s, expected_s, epsilon = 1e-9);
+        assert_eq!(s.shape(), expected_s.shape());
+        assert_abs_diff_eq!(
+            s.as_slice().unwrap(),
+            expected_s.as_slice().unwrap(),
+            epsilon = 1e-9
+        );
     }
 
     #[test]
@@ -1151,9 +1158,10 @@ mod tests {
         .unwrap();
 
         // Uniform fallback: boundary repeated degree+1=2 times => 2 + 3 + 2 = 7 knots
+        let expected_knots = array![0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0];
         assert_abs_diff_eq!(
-            knots_uniform,
-            array![0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0],
+            knots_uniform.as_slice().unwrap(),
+            expected_knots.as_slice().unwrap(),
             epsilon = 1e-9
         );
 

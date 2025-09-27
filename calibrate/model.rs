@@ -892,7 +892,11 @@ mod tests {
 
         // Verify the results match our correctly calculated ground truth
         assert_eq!(predictions.len(), 2);
-        assert_abs_diff_eq!(predictions, expected_values, epsilon = 1e-10);
+        assert_abs_diff_eq!(
+            predictions.as_slice().unwrap(),
+            expected_values.as_slice().unwrap(),
+            epsilon = 1e-10
+        );
     }
 
     /// Tests that the prediction fails appropriately with invalid input dimensions.
