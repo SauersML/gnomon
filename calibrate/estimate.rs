@@ -34,10 +34,10 @@ use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
-// Ndarray and Linalg
+// Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-// use ndarray_linalg::Solve; // moved inside internal module
 // faer: high-performance dense solvers
+use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -77,10 +77,10 @@ pub enum EstimationError {
     BasisError(#[from] crate::calibrate::basis::BasisError),
 
     #[error("A linear system solve failed. The penalized Hessian may be singular. Error: {0}")]
-    LinearSystemSolveFailed(ndarray_linalg::error::LinalgError),
+    LinearSystemSolveFailed(FaerLinalgError),
 
     #[error("Eigendecomposition failed: {0}")]
-    EigendecompositionFailed(ndarray_linalg::error::LinalgError),
+    EigendecompositionFailed(FaerLinalgError),
 
     #[error("Parameter constraint violation: {0}")]
     ParameterConstraintViolation(String),
@@ -1365,7 +1365,7 @@ pub fn optimize_external_design(
         fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
             match self {
                 Fact::Llt(f) => f.solve(rhs),
-                Fact::Ldlt(f) => f.solve(rhs)
+                Fact::Ldlt(f) => f.solve(rhs),
             }
         }
     }
@@ -1373,7 +1373,9 @@ pub fn optimize_external_design(
         Ok(ch) => Fact::Llt(ch),
         Err(_) => {
             let ld = FaerLdlt::new(h_f.as_ref(), Side::Lower).map_err(|_| {
-                EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
             })?;
             Fact::Ldlt(ld)
         }
@@ -1491,8 +1493,7 @@ fn log_layout_info(layout: &ModelLayout) {
 // Make internal module public for tests
 pub mod internal {
     use super::*;
-    use ndarray_linalg::error::LinalgError;
-    use ndarray_linalg::{Cholesky, Eigh, UPLO};
+    use faer::Side;
 
     enum FaerFactor {
         Llt(FaerLlt<f64>),
@@ -1550,7 +1551,7 @@ pub mod internal {
             let h = pr.penalized_hessian_transformed.clone();
 
             // Try Cholesky - if it succeeds, matrix is already PD
-            if h.cholesky(UPLO::Lower).is_ok() {
+            if h.cholesky(Side::Lower).is_ok() {
                 return (h, 0.0); // No ridge needed
             }
 
@@ -1593,7 +1594,6 @@ pub mod internal {
                 last_cost_error_msg: RefCell::new(None),
             })
         }
-
 
         /// Creates a sanitized cache key from rho values.
         /// Returns None if any component is NaN, which indicates that caching should be skipped.
@@ -1661,7 +1661,11 @@ pub mod internal {
             // keeps the comparison within the same numerical path.
             let edf_alt = edf;
             let rel = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
-            debug_assert!(rel <= 1e-12, "EDF identity drifted more than expected: rel={:.3e}", rel);
+            debug_assert!(
+                rel <= 1e-12,
+                "EDF identity drifted more than expected: rel={:.3e}",
+                rel
+            );
 
             Ok(edf)
         }
@@ -1754,11 +1758,11 @@ pub mod internal {
         fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
             let (h_eff, _) = self.effective_hessian(&pr);
-            let log_det_h = match h_eff.cholesky(UPLO::Lower) {
+            let log_det_h = match h_eff.cholesky(Side::Lower) {
                 Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                 Err(_) => {
                     let (eigs, _) = h_eff
-                        .eigh(UPLO::Lower)
+                        .eigh(Side::Lower)
                         .map_err(EstimationError::EigendecompositionFailed)?;
                     eigs.iter()
                         .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
@@ -1976,7 +1980,7 @@ pub mod internal {
 
             // Only check eigenvalues if we needed to add a ridge
             if ridge_used > 0.0 {
-                if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(UPLO::Lower)
+                if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
                 {
                     let all_nonpos = eigs.iter().all(|&x| x <= 0.0);
                     if all_nonpos {
@@ -2061,7 +2065,7 @@ pub mod internal {
                     // log |H| = log |X'X + S_λ| using SINGLE stabilized Hessian from P-IRLS
                     let log_det_h = match pirls_result
                         .stabilized_hessian_transformed
-                        .cholesky(UPLO::Lower)
+                        .cholesky(Side::Lower)
                     {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
@@ -2070,7 +2074,7 @@ pub mod internal {
                             );
                             let (eigenvalues, _) = pirls_result
                                 .stabilized_hessian_transformed
-                                .eigh(UPLO::Lower)
+                                .eigh(Side::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = LAML_RIDGE;
@@ -2108,12 +2112,15 @@ pub mod internal {
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let log_det_s = pirls_result.reparam_result.log_det;
-                    eprintln!("[Sλ] Using stabilized log|Sλ|+ from reparam: {:.6e}", log_det_s);
+                    eprintln!(
+                        "[Sλ] Using stabilized log|Sλ|+ from reparam: {:.6e}",
+                        log_det_s
+                    );
 
                     // Get effective Hessian (stabilized if needed) and ridge used
                     let (h_eff, _) = self.effective_hessian(&pirls_result);
                     // Quick diag: min eig of H_eff if eigen OK
-                    if let Ok((eigs, _)) = h_eff.eigh(UPLO::Lower) {
+                    if let Ok((eigs, _)) = h_eff.eigh(Side::Lower) {
                         if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
                             eprintln!("[Diag] H_eff min_eig={:.3e}", min_eig);
                         }
@@ -2121,7 +2128,7 @@ pub mod internal {
 
                     // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
                     // that will also be used in the gradient calculation
-                    let log_det_h = match h_eff.cholesky(UPLO::Lower) {
+                    let log_det_h = match h_eff.cholesky(Side::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
                             // Eigenvalue fallback if Cholesky fails
@@ -2130,7 +2137,7 @@ pub mod internal {
                             );
 
                             let (eigenvalues, _) = h_eff
-                                .eigh(UPLO::Lower)
+                                .eigh(Side::Lower)
                                 .map_err(EstimationError::EigendecompositionFailed)?;
 
                             let ridge = LAML_RIDGE; // constant ridge for numeric safety
@@ -2154,7 +2161,7 @@ pub mod internal {
                     // to determine M_p robustly, avoiding contamination from dominant penalties.
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = (self.layout.total_coeffs - penalty_rank) as f64;
-                    
+
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
@@ -2171,7 +2178,7 @@ pub mod internal {
                     // Check if we used eigenvalues for the Hessian determinant
                     let eigenvals = pirls_result
                         .penalized_hessian_transformed
-                        .eigh(UPLO::Lower)
+                        .eigh(Side::Lower)
                         .ok();
 
                     if let Some((evals, _)) = eigenvals {
@@ -2185,9 +2192,10 @@ pub mod internal {
                     // Add diagnostic to compare stabilized vs raw Hessian-based objective
                     // This reconstructs the raw F(ρ) as would be computed by the test suite
                     // using the unstabilized Hessian in the original basis (XᵀWX + Sλ)
-                    
+
                     // First, compute XᵀWX in the original basis
-                    let mut xtwx = Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    let mut xtwx =
+                        Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     let x_orig = self.x();
                     let w_orig = self.weights();
                     for i in 0..x_orig.nrows() {
@@ -2199,22 +2207,23 @@ pub mod internal {
                             }
                         }
                     }
-                    
+
                     // Add penalty (Sλ) to get raw H = XᵀWX + Sλ in original basis
                     let mut h_raw = xtwx.clone();
                     for (k, &lambda) in lambdas.iter().enumerate() {
-                        let s_k = &self.s_full_list[k];  // Get the p×p penalty matrix
+                        let s_k = &self.s_full_list[k]; // Get the p×p penalty matrix
                         if lambda != 0.0 {
-                            h_raw.scaled_add(lambda, s_k);  // Add λ·S_k to H_raw
+                            h_raw.scaled_add(lambda, s_k); // Add λ·S_k to H_raw
                         }
                     }
-                    
+
                     // Compute log|H_raw| via Cholesky if possible, otherwise use eigh
-                    let log_det_h_raw = match h_raw.cholesky(UPLO::Lower) {
+                    let log_det_h_raw = match h_raw.cholesky(Side::Lower) {
                         Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                         Err(_) => {
-                            if let Ok((evals, _)) = h_raw.eigh(UPLO::Lower) {
-                                let min_raw_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                            if let Ok((evals, _)) = h_raw.eigh(Side::Lower) {
+                                let min_raw_eig =
+                                    evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                                 println!("    -> (Raw Hessian min eigenvalue: {min_raw_eig:.3e})");
                                 evals.iter().map(|&ev| ev.max(1e-12).ln()).sum::<f64>()
                             } else {
@@ -2223,20 +2232,21 @@ pub mod internal {
                             }
                         }
                     };
-                    
+
                     // Compute the raw objective F_raw(ρ)
                     let f_raw = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h_raw
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-                        
+
                     // Report both objectives and the delta
                     println!("[GNOMON DIAG] Objective function comparison:");
                     println!("  - F_eff(ρ) (stabilized): {:.6e}", laml);
                     println!("  - F_raw(ρ) (unstabilized): {:.6e}", f_raw);
-                    println!("  - Delta: {:.6e} (rel: {:.3e})", 
+                    println!(
+                        "  - Delta: {:.6e} (rel: {:.3e})",
                         laml - f_raw,
                         (laml - f_raw) / f_raw.abs().max(1e-12)
                     );
-                    
+
                     println!(
                         "[GNOMON COST] <== Final LAML score: {:.6e} (Cost to minimize: {:.6e})",
                         laml, -laml
@@ -2249,65 +2259,77 @@ pub mod internal {
                     let lambdas = p.mapv(f64::exp);
                     let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, &h_eff_diag)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
-                    
+
                     // Use a simpler approach to show difference in raw vs stabilized
                     // Instead of trying to compute the exact trace, we'll examine eigenvalues
                     // of both Hessians to illustrate the stabilization effect
-                    
+
                     // Try to analyze the raw Hessian via eigendecomposition
-                    let eigendecomp_result = h_raw.eigh(UPLO::Lower);
-                    
+                    let eigendecomp_result = h_raw.eigh(Side::Lower);
+
                     // Extract eigenvalues of the stabilized Hessian (this should always work)
                     let stabilized_eigs = pirls_result
                         .penalized_hessian_transformed
-                        .eigh(UPLO::Lower)
+                        .eigh(Side::Lower)
                         .ok()
                         .map(|(evals, _)| {
                             let min_stab = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                             let max_stab = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
                             (min_stab, max_stab, max_stab / min_stab.max(1e-12))
                         });
-                    
+
                     // Handle both success and failure cases for raw Hessian
                     match eigendecomp_result {
                         Ok(eigs_raw) => {
                             // Success case: we can analyze both Hessians
-                            let min_raw_eig = eigs_raw.0.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max_raw_eig = eigs_raw.0.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                            let min_raw_eig =
+                                eigs_raw.0.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                            let max_raw_eig =
+                                eigs_raw.0.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
                             let cond_raw = max_raw_eig / min_raw_eig.max(1e-12);
-                            
+
                             // Print comparison of eigenvalue ranges
                             if let Some((min_stab, max_stab, cond_stab)) = stabilized_eigs {
                                 println!("[GNOMON DIAG] Hessian condition numbers:");
-                                println!("  - Raw Hessian:        min={:.3e}, max={:.3e}, κ={:.3e}", 
-                                        min_raw_eig, max_raw_eig, cond_raw);
-                                println!("  - Stabilized Hessian: min={:.3e}, max={:.3e}, κ={:.3e}", 
-                                        min_stab, max_stab, cond_stab);
+                                println!(
+                                    "  - Raw Hessian:        min={:.3e}, max={:.3e}, κ={:.3e}",
+                                    min_raw_eig, max_raw_eig, cond_raw
+                                );
+                                println!(
+                                    "  - Stabilized Hessian: min={:.3e}, max={:.3e}, κ={:.3e}",
+                                    min_stab, max_stab, cond_stab
+                                );
                                 println!("  - Stabilization ratio: {:.3e}x", cond_raw / cond_stab);
                             }
-                        },
+                        }
                         Err(_) => {
                             // Failure case: raw Hessian has issues
-                            println!("[GNOMON DIAG] Raw Hessian is not positive definite, can't compute eigendecomposition");
-                            
+                            println!(
+                                "[GNOMON DIAG] Raw Hessian is not positive definite, can't compute eigendecomposition"
+                            );
+
                             // Still try to show stabilized Hessian info
                             if let Some((min_stab, max_stab, cond_stab)) = stabilized_eigs {
                                 println!("[GNOMON DIAG] Stabilized Hessian condition:");
-                                println!("  - min={:.3e}, max={:.3e}, κ={:.3e}", 
-                                        min_stab, max_stab, cond_stab);
+                                println!(
+                                    "  - min={:.3e}, max={:.3e}, κ={:.3e}",
+                                    min_stab, max_stab, cond_stab
+                                );
                             }
                         }
                     };
-                    
+
                     // Print information about the stabilized EDF calculations
                     // We don't try to compute raw EDF directly anymore, just show the stabilized value
                     println!("[GNOMON DIAG] Stabilized EDF information:");
                     println!("  - EDF_eff (stabilized): {:.6}", edf);
                     println!("  - Trace: tr(H^-1 Sλ) = {:.6}", trace_h_inv_s_lambda);
-                    println!("  - This value would change substantially with an ill-conditioned Hessian");
+                    println!(
+                        "  - This value would change substantially with an ill-conditioned Hessian"
+                    );
                     // Note that we can't directly compare stabilized vs raw EDF anymore,
                     // but the Hessian condition number comparison above helps explain why they differ
-                    
+
                     println!(
                         "[GNOMON COST] EDF trace: p = {:.3}, tr(H^-1 Sλ) = {:.6}, edf = {:.6}",
                         p_eff, trace_h_inv_s_lambda, edf
@@ -2627,7 +2649,7 @@ pub mod internal {
 
             // Check for severe indefiniteness in the original Hessian (before stabilization)
             // This suggests a problematic region we should retreat from
-            if let Ok((eigenvalues, _)) = hessian_transformed.eigh(UPLO::Lower) {
+            if let Ok((eigenvalues, _)) = hessian_transformed.eigh(Side::Lower) {
                 // Original behavior for severe indefiniteness
                 let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
@@ -2765,9 +2787,9 @@ pub mod internal {
 
                     // Report current ½·log|H_eff| using the same stabilized path as cost
                     let (h_eff_m, _) = self.effective_hessian(&pirls_result);
-                    let half_logh_val = match h_eff_m.cholesky(UPLO::Lower) {
+                    let half_logh_val = match h_eff_m.cholesky(Side::Lower) {
                         Ok(l) => l.diag().mapv(f64::ln).sum(),
-                        Err(_) => match h_eff_m.eigh(UPLO::Lower) {
+                        Err(_) => match h_eff_m.eigh(Side::Lower) {
                             Ok((eigs, _)) => eigs
                                 .iter()
                                 .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
@@ -2778,7 +2800,7 @@ pub mod internal {
                     };
                     // Try to get min eigen for quick conditioning diagnostics
                     let min_eig_opt = h_eff_m
-                        .eigh(UPLO::Lower)
+                        .eigh(Side::Lower)
                         .ok()
                         .and_then(|(e, _)| e.iter().cloned().reduce(f64::min));
                     if let Some(min_eig) = min_eig_opt {
@@ -2879,14 +2901,14 @@ pub mod internal {
     /// to avoid "dominant machine zero leakage" between penalty components
     ///
     /// Helper to calculate log |S|+ robustly using similarity transforms to handle disparate eigenvalues
-    pub fn calculate_log_det_pseudo(s: &Array2<f64>) -> Result<f64, LinalgError> {
+    pub fn calculate_log_det_pseudo(s: &Array2<f64>) -> Result<f64, FaerLinalgError> {
         if s.nrows() == 0 {
             return Ok(0.0);
         }
 
         // For small matrices or well-conditioned cases, use simple eigendecomposition
         if s.nrows() <= 10 {
-            let eigenvalues = s.eigh(UPLO::Lower)?.0;
+            let eigenvalues = s.eigh(Side::Lower)?.0;
             return Ok(eigenvalues
                 .iter()
                 .filter(|&&eig| eig > 1e-12)
@@ -2900,13 +2922,13 @@ pub mod internal {
 
     /// Recursive similarity transform for stable log determinant computation
     /// Implements Wood (2017) Algorithm p.286 for numerical stability with disparate eigenvalues
-    fn stable_log_det_recursive(s: &Array2<f64>) -> Result<f64, LinalgError> {
+    fn stable_log_det_recursive(s: &Array2<f64>) -> Result<f64, FaerLinalgError> {
         const TOL: f64 = 1e-12;
         const MAX_COND: f64 = 1e12; // Condition number threshold for recursion
 
         if s.nrows() <= 5 {
             // Base case: use direct eigendecomposition for small matrices
-            let eigenvalues = s.eigh(UPLO::Lower)?.0;
+            let eigenvalues = s.eigh(Side::Lower)?.0;
             return Ok(eigenvalues
                 .iter()
                 .filter(|&&eig| eig > TOL)
@@ -2922,7 +2944,7 @@ pub mod internal {
 
         // If well-conditioned, use direct eigendecomposition
         if condition_number < MAX_COND {
-            let (eigenvalues, _) = s.eigh(UPLO::Lower)?;
+            let (eigenvalues, _) = s.eigh(Side::Lower)?;
             return Ok(eigenvalues
                 .iter()
                 .filter(|&&eig| eig > TOL)
@@ -2931,7 +2953,7 @@ pub mod internal {
         }
 
         // For ill-conditioned matrices, partition eigenspace
-        let (eigenvalues, eigenvectors) = s.eigh(UPLO::Lower)?;
+        let (eigenvalues, eigenvectors) = s.eigh(Side::Lower)?;
         let max_eig = eigenvalues
             .iter()
             .fold(f64::NEG_INFINITY, |a, &b| a.max(b.abs()));
@@ -3451,10 +3473,10 @@ pub mod internal {
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
             let (h_eff, _) = state.effective_hessian(&pr);
             // Cholesky if possible, otherwise eigenvalue fallback with ridge — same as cost
-            let log_det_h = match h_eff.cholesky(UPLO::Lower) {
+            let log_det_h = match h_eff.cholesky(Side::Lower) {
                 Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
                 Err(_) => {
-                    let (eigs, _) = h_eff.eigh(UPLO::Lower).expect("eigh for H_eff");
+                    let (eigs, _) = h_eff.eigh(Side::Lower).expect("eigh for H_eff");
                     eigs.iter()
                         .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
                         .map(|ev| ev.ln())
@@ -4007,7 +4029,7 @@ pub mod internal {
                     // Min eigenvalue of penalized Hessian
                     let (eigs, _) = pirls_res
                         .penalized_hessian_transformed
-                        .eigh(ndarray_linalg::UPLO::Upper)
+                        .eigh(Side::Upper)
                         .expect("eigh");
                     let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
                     min_eigs.push(min_eig);
@@ -7002,19 +7024,19 @@ mod gradient_validation_tests {
             );
         }
     }
-    
+
     // === Diagnostic Tests ===
     // These tests are intentionally designed to "fail" to provide diagnostic output
     // They help understand the differences between stabilized and raw calculations
-    
+
     #[test]
     fn test_objective_consistency_raw_vs_stabilized() {
         // Create a small logistic regression problem with potential ill-conditioning
         let n = 100;
         let p = 10;
         let mut rng = rand::rngs::StdRng::seed_from_u64(424242);
-        
-        // Generate predictors with some collinearity 
+
+        // Generate predictors with some collinearity
         let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
@@ -7026,43 +7048,49 @@ mod gradient_validation_tests {
                 }
             }
         }
-        
+
         // Generate binary response
-        let xbeta_true = x.dot(&Array1::from_vec(vec![1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.1, -0.1, 0.05, -0.05]));
+        let xbeta_true = x.dot(&Array1::from_vec(vec![
+            1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.1, -0.1, 0.05, -0.05,
+        ]));
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
             let p_i = 1.0 / (1.0 + (-xbeta_true[i]).exp());
-            y[i] = if rng.gen_range(0.0..1.0) < p_i { 1.0 } else { 0.0 };
+            y[i] = if rng.gen_range(0.0..1.0) < p_i {
+                1.0
+            } else {
+                0.0
+            };
         }
-        
+
         // Create two identical penalty matrices (for pred and scale penalties)
         let mut s1 = Array2::<f64>::zeros((p, p));
         let mut s2 = Array2::<f64>::zeros((p, p));
-        for i in 0..p-1 {
+        for i in 0..p - 1 {
             s1[[i, i]] = 1.0;
-            s1[[i+1, i+1]] = 1.0;
-            s1[[i, i+1]] = -1.0;
-            s1[[i+1, i]] = -1.0;
-            
+            s1[[i + 1, i + 1]] = 1.0;
+            s1[[i, i + 1]] = -1.0;
+            s1[[i + 1, i]] = -1.0;
+
             s2[[i, i]] = 0.5;
-            s2[[i+1, i+1]] = 0.5;
-            s2[[i, i+1]] = -0.5;
-            s2[[i+1, i]] = -0.5;
+            s2[[i + 1, i + 1]] = 0.5;
+            s2[[i, i + 1]] = -0.5;
+            s2[[i + 1, i]] = -0.5;
         }
-        
+
         // Create uniform weights
         let w = Array1::<f64>::ones(n);
-        
+
         // Set up optimization options with logistic link
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             tol: 1e-6,
             max_iter: 100,
         };
-        
+
         // Fit model and extract results for diagnostic purposes
         let result = optimize_external_design(y.view(), w.view(), x.view(), &[s1, s2], &opts);
-        
+
         // We don't actually assert anything - this test is purely for diagnostics
         // The logs will show any discrepancy between raw and stabilized objectives
         match result {
@@ -7071,7 +7099,7 @@ mod gradient_validation_tests {
                 println!("  - Final rho: {:?}", res.lambdas.mapv(|v| v.ln()));
                 println!("  - Final EDF: {:.3}", res.edf_total);
                 println!("  - Gradient norm: {:.3e}", res.final_grad_norm);
-            },
+            }
             Err(e) => {
                 println!("Optimization failed: {}", e);
             }

@@ -8,6 +8,7 @@ pub mod data;
 
 pub mod calibrator;
 pub mod estimate;
+pub mod faer_ndarray;
 pub mod hull;
 pub mod model;
 pub mod pirls;

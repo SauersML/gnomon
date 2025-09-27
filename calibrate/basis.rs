@@ -1,5 +1,6 @@
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError};
+use faer::Side;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
-use ndarray_linalg::{Eigh, UPLO};
 
 // Imports removed: use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,7 +47,7 @@ pub enum BasisError {
     WeightsDimensionMismatch { expected: usize, found: usize },
 
     #[error("QR decomposition failed while applying constraints: {0}")]
-    LinalgError(#[from] ndarray_linalg::error::LinalgError),
+    LinalgError(#[from] FaerLinalgError),
 
     #[error(
         "Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis."
@@ -278,7 +279,7 @@ pub fn apply_sum_to_zero_constraint(
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
 
-    use ndarray_linalg::SVD;
+    use crate::calibrate::faer_ndarray::FaerSvd;
     let (u_opt, ..) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
     let u = match u_opt {
         Some(u) => u,
@@ -305,7 +306,7 @@ pub fn apply_sum_to_zero_constraint(
 /// - `Z_range_whiten`: Whitened basis for the range space (penalized functions)
 ///   In these coordinates, the penalty becomes an identity matrix.
 pub fn null_range_whiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    let (evals, evecs) = s_1d.eigh(UPLO::Lower).map_err(BasisError::LinalgError)?;
+    let (evals, evecs) = s_1d.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
 
     // Calculate a relative tolerance based on the maximum eigenvalue
     // This is more robust than using a fixed absolute tolerance
