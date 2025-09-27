@@ -143,6 +143,7 @@ pub struct PirlsResult {
 pub fn fit_model_for_fixed_rho(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
+    offset: ArrayView1<f64>,
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
@@ -236,7 +237,8 @@ pub fn fit_model_for_fixed_rho(
 
     // Step 5: Initialize P-IRLS state variables in the TRANSFORMED basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
-    let mut eta = x_transformed.dot(&beta_transformed);
+    let mut eta = offset.to_owned();
+    eta += &x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) =
         update_glm_vectors(y, &eta, config.link_function, prior_weights);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights);
@@ -336,6 +338,7 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(), // Pass transformed x
             z.view(),
             weights.view(),
+            offset.view(),
             &eb_transformed, // Lambda-INDEPENDENT balanced penalty root for rank detection (NOW IN STABLE BASIS)
             e_transformed,   // Lambda-DEPENDENT penalty root for penalty application
             &s_from_e_precomputed, // Precomputed S = EᵀE
@@ -465,6 +468,7 @@ pub fn fit_model_for_fixed_rho(
                     x_transformed.view(),
                     z.view(),
                     weights.view(),
+                    offset.view(),
                     &eb_transformed,
                     e_transformed,
                     &s_from_e_precomputed,
@@ -584,6 +588,7 @@ pub fn fit_model_for_fixed_rho(
                             x_transformed.view(),
                             z.view(),
                             weights.view(),
+                            offset.view(),
                             &eb_transformed,
                             e_transformed,
                             &s_from_e_precomputed,
@@ -673,8 +678,12 @@ pub fn fit_model_for_fixed_rho(
             // Use the cached weights and working response from the solve
             // Suggestion #3: Compute gradient without building WX and WZ
             // grad_data_part = Xᵀ W (Xβ - z); reuse workspace buffers
-            let tmp_eta = x_transformed.dot(&beta_transformed);
-            workspace.working_residual = &tmp_eta - &z_solve; // Xβ - z
+            let tmp_eta = {
+                let mut eta = offset.to_owned();
+                eta += &x_transformed.dot(&beta_transformed);
+                eta
+            };
+            workspace.working_residual = &tmp_eta - &z_solve; // (offset + Xβ) - z
             workspace.weighted_residual = &weights_solve * &workspace.working_residual; // W (Xβ - z)
             let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
             let grad_penalty_part = s_transformed.dot(&beta_transformed);
@@ -711,6 +720,7 @@ pub fn fit_model_for_fixed_rho(
                             x_transformed.view(),
                             z.view(),
                             weights.view(),
+                            offset.view(),
                             &eb_transformed,
                             e_transformed,
                             &s_from_e_precomputed,
@@ -769,6 +779,7 @@ pub fn fit_model_for_fixed_rho(
             x_transformed.view(),
             z.view(),
             weights.view(),
+            offset.view(),
             &eb_transformed,
             e_transformed,
             &s_from_e_precomputed,
@@ -785,7 +796,11 @@ pub fn fit_model_for_fixed_rho(
 
     // Compute a final gradient check w.r.t the last W_solve and z_solve
     let x_transformed_t = x_transformed.t().to_owned();
-    let tmp_eta = x_transformed.dot(&beta_transformed);
+    let tmp_eta = {
+        let mut eta = offset.to_owned();
+        eta += &x_transformed.dot(&beta_transformed);
+        eta
+    };
     workspace.working_residual = &tmp_eta - &last_z_solve; // Xβ - z_solve
     workspace.weighted_residual = &last_weights_solve * &workspace.working_residual; // W_solve (Xβ - z_solve)
     let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
@@ -1243,6 +1258,7 @@ pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
+    offset: ArrayView1<f64>,
     eb: &Array2<f64>, // Balanced penalty root for rank detection (lambda-independent)
     e_transformed: &Array2<f64>, // Lambda-dependent penalty root for penalty application
     s_transformed: &Array2<f64>, // Precomputed S = EᵀE (per rho)
@@ -1260,7 +1276,8 @@ pub fn solve_penalized_least_squares(
         // Weighted design and RHS
         let sqrt_w = weights.mapv(f64::sqrt);
         let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-        let wz = &sqrt_w * &z;
+        let z_eff = &z - &offset;
+        let wz = &sqrt_w * &z_eff;
 
         // 1) Use pivoted QR only to determine rank and column ordering
         let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
@@ -1354,6 +1371,7 @@ pub fn solve_penalized_least_squares(
         workspace.wx.assign(&x_transformed);
         workspace.wx *= &sqrt_w_col; // wx = X .* sqrt_w
         workspace.wz.assign(&z);
+        workspace.wz -= &offset;
         workspace.wz *= &workspace.sqrt_w; // wz = z .* sqrt_w
 
         let xtwx = {
@@ -1813,7 +1831,11 @@ pub fn solve_penalized_least_squares(
     // VERIFICATION: Check that the normal equations hold for the reconstructed beta
     // This is critical to ensure correctness - make it unconditional for now
     {
-        let residual = x_transformed.dot(&beta_transformed) - &z;
+        let residual = {
+            let mut eta = offset.to_owned();
+            eta += &x_transformed.dot(&beta_transformed);
+            eta - &z
+        };
         let weighted_residual = &weights * &residual;
         let grad_dev_part = x_transformed.t().dot(&weighted_residual);
         let grad_pen_part = s_transformed.dot(&beta_transformed);
@@ -2343,9 +2365,11 @@ mod tests {
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
+        let offset = Array1::<f64>::zeros(data.y.len());
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
+            offset.view(),
             data.y.view(),
             data.weights.view(),
             &rs_original,
@@ -2395,10 +2419,12 @@ mod tests {
         // We're using identity link function for the test
         let s = e.t().dot(&e);
         let mut ws = PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
+        let offset = Array1::<f64>::zeros(z.len());
         let result = solve_penalized_least_squares(
             x.view(),
             z.view(),
             weights.view(),
+            offset.view(),
             &e, // For test: use same matrix for both rank detection and penalty
             &e, // For test: use same matrix for both rank detection and penalty
             &s,
@@ -2656,9 +2682,11 @@ mod tests {
         );
 
         // Call the function with first rho vector
+        let offset = Array1::<f64>::zeros(n_samples);
         let result1 = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
             x.view(),
+            offset.view(),
             y.view(),
             weights.view(),
             &rs_original,
@@ -2671,6 +2699,7 @@ mod tests {
         let result2 = super::fit_model_for_fixed_rho(
             rho_vec2.view(),
             x.view(),
+            offset.view(),
             y.view(),
             weights.view(),
             &rs_original,
@@ -2774,9 +2803,11 @@ mod tests {
         let rho_vec = Array1::<f64>::zeros(rs_original.len());
 
         // === PHASE 5: Execute the target function ===
+        let offset = Array1::<f64>::zeros(data.y.len());
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
+            offset.view(),
             data.y.view(),
             data.weights.view(),
             &rs_original,
@@ -2898,9 +2929,11 @@ mod tests {
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         // === Execute P-IRLS ===
+        let offset = Array1::<f64>::zeros(data.y.len());
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
+            offset.view(),
             data.y.view(),
             data.weights.view(),
             &rs_original,
@@ -3158,10 +3191,12 @@ mod tests {
         // Solve once
         let s = e.t().dot(&e);
         let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
+        let offset = Array1::<f64>::zeros(n);
         let (res, ..) = super::solve_penalized_least_squares(
             x.view(),
             z.view(),
             w.view(),
+            offset.view(),
             &e,
             &e,
             &s,
@@ -3219,10 +3254,12 @@ mod tests {
         // WLS solution
         let s = e.t().dot(&e);
         let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
+        let offset = Array1::<f64>::zeros(n);
         let (res, _) = super::solve_penalized_least_squares(
             x.view(),
             y.view(),
             w.view(),
+            offset.view(),
             &e,
             &e,
             &s,
@@ -3278,10 +3315,12 @@ mod tests {
         let e = Array2::<f64>::zeros((0, p));
         let s = e.t().dot(&e);
         let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
+        let offset = Array1::<f64>::zeros(n);
         let (res, _) = super::solve_penalized_least_squares(
             x.view(),
             z_old.view(),
             w_old.view(),
+            offset.view(),
             &e,
             &e,
             &s,
@@ -3351,10 +3390,12 @@ mod tests {
 
         let s = e.t().dot(&e);
         let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
+        let offset = Array1::<f64>::zeros(z.len());
         let (res, rank) = super::solve_penalized_least_squares(
             x.view(),
             z.view(),
             w.view(),
+            offset.view(),
             &e,
             &e,
             &s,
