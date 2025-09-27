@@ -42,7 +42,6 @@ dwldutil = "2.0.4"
 indicatif = "0.17"
 flate2 = "1.1.2"
 ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
-ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-static"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.16"
 toml = "0.8.23"
@@ -50,6 +49,7 @@ polars = { version = "0.50.0", features = ["csv", "ndarray", "fmt", "lazy"] }
 wolfe_bfgs = { git = "https://github.com/SauersML/wolfe_bfgs" }
 log = "0.4.27"
 faer = "0.22.6"
+dyn-stack = "0.13"
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 

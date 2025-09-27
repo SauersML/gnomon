@@ -1,13 +1,14 @@
 use crate::calibrate::construction::{ModelLayout, ReparamResult};
 use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
-use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use ndarray_linalg::{Cholesky, Eigh, UPLO};
-// faer symmetric solvers for SPD/indefinite systems
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Ldlt as FaerLdlt, Lblt as FaerLblt, Solve as FaerSolve};
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
+use log;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::Instant;
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -1276,7 +1277,7 @@ pub fn solve_penalized_least_squares(
         }
 
         // 3) Solve LS on the kept submatrix via SVD (β_kept = V Σ⁺ Uᵀ wz)
-        use ndarray_linalg::SVD;
+        use crate::calibrate::faer_ndarray::FaerSvd;
         let (u_opt, s, vt_opt) = wx_kept
             .svd(true, true)
             .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -1375,7 +1376,7 @@ pub fn solve_penalized_least_squares(
         let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
         if let Ok(chol) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
             // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
-            let cond_bad = match penalized_hessian.eigh(UPLO::Lower) {
+            let cond_bad = match penalized_hessian.eigh(Side::Lower) {
                 Ok((eigs, _)) => {
                     let mut min_ev = f64::INFINITY;
                     let mut max_ev = 0.0f64;
@@ -1702,12 +1703,12 @@ pub fn solve_penalized_least_squares(
     // Perform final pivoted QR on the unscaled, reduced system
     let final_aug_owned = final_aug_matrix.to_owned();
     let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
-    
+
     println!(
         "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
         stage4_timer.elapsed()
     );
-    
+
     // Add tiny ridge jitter to avoid singular/infinite condition number
     let r_final_sq = r_final.slice(s![..rank, ..rank]);
     let eps = 1e-10_f64;
@@ -1717,12 +1718,19 @@ pub fn solve_penalized_least_squares(
     for i in 0..m {
         // ensure strictly positive diagonal to avoid singular/inf cond
         if r_final[[i, i]].abs() < diag_floor {
-            r_final[[i, i]] = if r_final[[i, i]] >= 0.0 { diag_floor } else { -diag_floor };
+            r_final[[i, i]] = if r_final[[i, i]] >= 0.0 {
+                diag_floor
+            } else {
+                -diag_floor
+            };
             any_modified = true;
         }
     }
     if any_modified {
-        println!("[PLS Solver] Applied tiny ridge jitter ({:.3e}) to R diagonal for stability", diag_floor);
+        println!(
+            "[PLS Solver] Applied tiny ridge jitter ({:.3e}) to R diagonal for stability",
+            diag_floor
+        );
     }
 
     //-----------------------------------------------------------------------
@@ -1850,7 +1858,7 @@ pub fn solve_penalized_least_squares(
     // Debug-time guards to verify numerical properties
     #[cfg(debug_assertions)]
     {
-        use ndarray_linalg::{Cholesky, UPLO};
+        use crate::calibrate::faer_ndarray::FaerCholesky;
 
         // (a) Symmetry check (relative)
         let mut asym_sum = 0.0f64;
@@ -1876,7 +1884,7 @@ pub fn solve_penalized_least_squares(
         for i in 0..h_check.nrows() {
             h_check[[i, i]] += ridge;
         }
-        if h_check.cholesky(UPLO::Lower).is_err() {
+        if h_check.cholesky(Side::Lower).is_err() {
             log::warn!(
                 "Penalized Hessian failed Cholesky even after tiny ridge; matrix may be poorly conditioned."
             );
@@ -2134,8 +2142,8 @@ pub fn compute_final_penalized_hessian(
     weights: &Array1<f64>,
     s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
 ) -> Result<Array2<f64>, EstimationError> {
+    use crate::calibrate::faer_ndarray::{FaerEigh, FaerQr};
     use ndarray::s;
-    use ndarray_linalg::{Eigh, QR, UPLO};
 
     let p = x.ncols();
 
@@ -2149,7 +2157,7 @@ pub fn compute_final_penalized_hessian(
     // Step 2: Get the square root of the penalty matrix, E
     // We need to use eigendecomposition as S_lambda is not necessarily from a single root
     let (eigenvalues, eigenvectors) = s_lambda
-        .eigh(UPLO::Lower)
+        .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
 
     // Find the maximum eigenvalue to create a relative tolerance
@@ -3532,7 +3540,7 @@ mod tests {
 /// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
 fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
     // If already PD, do nothing
-    if hess.cholesky(UPLO::Lower).is_ok() {
+    if hess.cholesky(Side::Lower).is_ok() {
         return Ok(());
     }
 
@@ -3543,7 +3551,7 @@ fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationErro
         for i in 0..n {
             hess[[i, i]] += delta;
         }
-        if hess.cholesky(UPLO::Lower).is_ok() {
+        if hess.cholesky(Side::Lower).is_ok() {
             log::warn!(
                 "Penalized Hessian not PD; added ridge {:.1e} on attempt {} to ensure stability.",
                 delta,
@@ -3555,7 +3563,7 @@ fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationErro
     }
 
     // As a last resort, report indefiniteness with min eigenvalue for diagnostics
-    if let Ok((evals, _)) = hess.eigh(UPLO::Lower) {
+    if let Ok((evals, _)) = hess.eigh(Side::Lower) {
         let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         return Err(EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: min_eig,

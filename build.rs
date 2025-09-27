@@ -197,7 +197,8 @@ impl IgnoredTestCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ #[ignore] TEST ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
+        error_msg
+            .push_str("\n⚠️ #[ignore] TEST ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
         error_msg.push_str("   IGNORING TESTS IS NEVER ALLOWED FOR ANY REASON.\n");
         error_msg.push_str("   Fix the test so it can run properly without being ignored.\n");
 
@@ -385,7 +386,7 @@ fn main() {
     // Scan Rust source files for #[allow(dead_code)] attributes
     let dead_code_violations = scan_for_allow_dead_code();
     all_violations.extend(dead_code_violations);
-    
+
     // Scan Rust source files for #[ignore] test attributes
     let ignored_test_violations = scan_for_ignored_tests();
     all_violations.extend(ignored_test_violations);
@@ -394,15 +395,18 @@ fn main() {
     if !all_violations.is_empty() {
         eprintln!("\n❌ VALIDATION ERRORS");
         eprintln!("====================");
-        
+
         let violation_count = all_violations.len();
-        
+
         for violation in all_violations {
             eprintln!("{violation}");
             eprintln!("--------------------");
         }
-        
-        eprintln!("\n⚠️ Found {} total code quality violations. Fix all issues before committing.", violation_count);
+
+        eprintln!(
+            "\n⚠️ Found {} total code quality violations. Fix all issues before committing.",
+            violation_count
+        );
         std::process::exit(1);
     }
 }
@@ -472,7 +476,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     // especially in match statements and destructuring patterns
     let pattern = r"\b(_[a-zA-Z0-9_]+)\b";
     let mut all_violations = Vec::new();
-    
+
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
@@ -499,28 +503,36 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
                     .to_str()
                     .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
                 if is_estimate_rs {
-                    println!("cargo:warning=Analyzing estimate.rs for underscore-prefixed variables");
+                    println!(
+                        "cargo:warning=Analyzing estimate.rs for underscore-prefixed variables"
+                    );
                 }
 
                 // Create a new collector for each file.
                 let mut collector = ViolationCollector::new(path);
 
                 // Search the file using our regex matcher and collector sink.
-                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
                     // Handle search errors gracefully
                     continue;
                 }
-                
+
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
-            all_violations.push(format!("Error creating regex matcher for underscore prefixes: {}", e));
+            all_violations.push(format!(
+                "Error creating regex matcher for underscore prefixes: {}",
+                e
+            ));
         }
     }
 
@@ -562,15 +574,18 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
                 // Use a collector that doesn't filter out doc comments for forbidden words
                 let mut collector = ForbiddenCommentCollector::new(path, true);
-                if searcher.search_path(&forbidden_matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&forbidden_matcher, path, &mut collector)
+                    .is_err()
+                {
                     continue;
                 }
-                
+
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // Record the error but continue checking other patterns
             all_violations.push(format!("Error creating forbidden words regex: {}", e));
@@ -594,15 +609,18 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 // Use a single collector with custom filtering logic
                 // false means don't check for ** in doc comments
                 let mut collector = ForbiddenCommentCollector::new(path, false);
-                if searcher.search_path(&stars_matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&stars_matcher, path, &mut collector)
+                    .is_err()
+                {
                     continue;
                 }
-                
+
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // Record the error but continue checking other patterns
             all_violations.push(format!("Error creating stars pattern regex: {}", e));
@@ -624,15 +642,18 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
                 let path = entry.path();
 
                 let mut custom_collector = CustomUppercaseCollector::new(path);
-                if searcher.search_path(&all_caps_matcher, path, &mut custom_collector).is_err() {
+                if searcher
+                    .search_path(&all_caps_matcher, path, &mut custom_collector)
+                    .is_err()
+                {
                     continue;
                 }
-                
+
                 if let Some(error_message) = custom_collector.check_and_get_error_message() {
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // Record the error but don't return early
             all_violations.push(format!("Error creating uppercase pattern regex: {}", e));
@@ -646,7 +667,7 @@ fn scan_for_allow_dead_code() -> Vec<String> {
     // Regex pattern to find #[allow(dead_code)] attributes
     let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
     let mut all_violations = Vec::new();
-    
+
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
@@ -670,24 +691,27 @@ fn scan_for_allow_dead_code() -> Vec<String> {
                 let mut collector = DeadCodeCollector::new(path);
 
                 // Search the file using our regex matcher and collector sink
-                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
                     // Handle search errors gracefully
                     continue;
                 }
-                
+
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
             all_violations.push(format!("Error creating dead code regex matcher: {}", e));
         }
     }
-    
+
     // Return all violations found
     all_violations
 }
@@ -696,7 +720,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
     // Regex pattern to find #[ignore] test attributes
     let pattern = r"#\s*\[\s*ignore\s*\]";
     let mut all_violations = Vec::new();
-    
+
     match RegexMatcher::new_line_matcher(pattern) {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
@@ -720,24 +744,27 @@ fn scan_for_ignored_tests() -> Vec<String> {
                 let mut collector = IgnoredTestCollector::new(path);
 
                 // Search the file using our regex matcher and collector sink
-                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
                     // Handle search errors gracefully
                     continue;
                 }
-                
+
                 // Process results
                 if let Some(error_message) = collector.check_and_get_error_message() {
                     // Add this error to our collection instead of returning immediately
                     all_violations.push(error_message);
                 }
             }
-        },
+        }
         Err(e) => {
             // If there's an error creating the matcher, report it but don't return early
             all_violations.push(format!("Error creating ignored tests regex matcher: {}", e));
         }
     }
-    
+
     // Return all violations found
     all_violations
 }

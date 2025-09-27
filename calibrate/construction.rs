@@ -1,10 +1,11 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::ModelConfig;
+use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, Axis, s};
-use ndarray_linalg::{Eigh, SVD, UPLO, error::LinalgError};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -860,7 +861,7 @@ pub fn create_balanced_penalty_root(
 
     // Take the matrix square root of the balanced penalty
     let (eigenvalues, eigenvectors) = s_balanced
-        .eigh(ndarray_linalg::UPLO::Lower)
+        .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
 
     // Find the maximum eigenvalue to create a relative tolerance
@@ -908,7 +909,7 @@ pub fn compute_penalty_square_roots(
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
         let (eigenvalues, eigenvectors) = s
-            .eigh(UPLO::Lower)
+            .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // Count positive eigenvalues to determine rank
@@ -1189,7 +1190,7 @@ pub fn stable_reparameterization(
 
         // Eigendecompose the balanced matrix to get stable eigenvalues for rank detection
         let (eigenvalues_for_rank, _) = sb_for_rank
-            .eigh(UPLO::Lower)
+            .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // Determine rank 'r' using these stable eigenvalues
@@ -1262,7 +1263,7 @@ pub fn stable_reparameterization(
         // Eigendecomposition to get eigenvectors 'u' for the similarity transform
         // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
         let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = sb_for_transform
-            .eigh(UPLO::Lower)
+            .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
 
         // SAFETY CHECK: Validate that the two decompositions agree on the rank
@@ -1490,7 +1491,7 @@ pub fn stable_reparameterization(
 
     // Step 3: Compute eigendecomposition of S_lambda
     let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
-        .eigh(UPLO::Lower)
+        .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
     // Use a small constant ridge epsilon for smoothed logdet/inverse; keep it lambda-independent
     // keep for possible future smoothing: not used when using pseudo-determinant
@@ -1597,7 +1598,7 @@ pub struct StablePLSResult {
 /// * `Ok(condition_number)` - The condition number (max_sv / min_sv)
 /// * `Ok(f64::INFINITY)` - If the matrix is effectively singular (min_sv < 1e-12)
 /// * `Err` - If SVD computation fails
-pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, LinalgError> {
+pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinalgError> {
     // Use SVD for all matrices - the cost depends on number of coefficients (p), not samples (n)
     // For typical GAMs, p is much smaller than n, making SVD computationally feasible and reliable
     let (_, s, _) = matrix.svd(false, false)?;

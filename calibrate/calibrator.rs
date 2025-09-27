@@ -10,10 +10,10 @@ use crate::calibrate::pirls; // for PirlsResult
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
+use crate::calibrate::faer_ndarray::FaerSvd;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
-use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 // Use the shared optimizer facade from estimate.rs
 use crate::calibrate::estimate::{ExternalOptimOptions, optimize_external_design};

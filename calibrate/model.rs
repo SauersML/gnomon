@@ -199,7 +199,7 @@ pub enum ModelError {
         "Calibrated prediction requested but no calibrator is present (disabled or missing from model)."
     )]
     CalibratorMissing,
-    
+
     #[error("Estimation error: {0}")]
     EstimationError(#[from] crate::calibrate::estimate::EstimationError),
 }
@@ -266,9 +266,9 @@ impl TrainedModel {
             if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
                 None
             } else {
-                // Solve H v = x^T for each row x, var = x^T v
-                use ndarray_linalg::{Cholesky, Solve, UPLO};
-                let chol = match h.clone().cholesky(UPLO::Lower) {
+                use crate::calibrate::faer_ndarray::FaerCholesky;
+                use faer::Side;
+                let chol = match h.clone().cholesky(Side::Lower) {
                     Ok(c) => c,
                     Err(_) => return Ok((eta, mean, signed_dist, None)),
                 };
@@ -276,12 +276,7 @@ impl TrainedModel {
                 for i in 0..x_new.nrows() {
                     let x_row = x_new.row(i).to_owned();
                     // Solve H v = x^T for v (1D)
-                    let v = match chol.solve(&x_row) {
-                        Ok(sol) => sol,
-                        Err(_) => {
-                            return Ok((eta, mean, signed_dist, None));
-                        }
-                    };
+                    let v = chol.solve_vec(&x_row);
                     let var_i = x_row.dot(&v);
                     vars[i] = if self.config.link_function == LinkFunction::Identity {
                         // For Gaussian identity, scale variance if scale present
