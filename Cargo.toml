@@ -29,7 +29,7 @@ clap = { version = "4.5.46", features = ["derive"] }
 memmap2 = "0.9.8"
 rayon = "1.11.0"
 crossbeam-queue = "0.3.12"
-tokio = { version = "1.47.1", features = ["sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 num_cpus = "1.17.0"
 ryu = "1.0.20"
 crossbeam-channel = "0.5.15"
@@ -42,7 +42,7 @@ ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.16"
 toml = "0.8.23"
-polars = { version = "0.50.0", features = ["csv", "ndarray", "fmt", "lazy"] }
+polars = { version = "0.50.0", features = ["csv", "ndarray"] }
 wolfe_bfgs = { git = "https://github.com/SauersML/wolfe_bfgs" }
 log = "0.4.27"
 faer = "0.22.6"
