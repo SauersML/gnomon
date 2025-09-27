@@ -126,7 +126,7 @@ jobs:
           cat report.md
 
       - name: Build Gnomon binaries (Release and Profiling)
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success'
         run: |
           cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
