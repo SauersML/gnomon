@@ -5318,7 +5318,7 @@ mod tests {
 
         // Time the design matrix construction
         let design_start = Instant::now();
-        let (x_cal, penalties, _, _offset) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, _, _) = build_calibrator_design(&alo_features, &spec).unwrap();
         let design_time = design_start.elapsed();
 
         eprintln!(
