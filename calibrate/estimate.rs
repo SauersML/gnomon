@@ -202,6 +202,7 @@ pub fn train_model(
         let final_fit = pirls::fit_model_for_fixed_rho(
             zero_rho.view(),
             reml_state.x(),
+            reml_state.offset(),
             reml_state.y(),
             reml_state.weights(),
             reml_state.rs_list_ref(),
@@ -981,6 +982,7 @@ pub fn train_model(
     let final_fit = pirls::fit_model_for_fixed_rho(
         final_rho_clamped.view(),
         reml_state.x(), // Use original X
+        reml_state.offset(),
         reml_state.y(),
         reml_state.weights(),     // Pass weights
         reml_state.rs_list_ref(), // Pass original penalty matrices
@@ -1002,7 +1004,8 @@ pub fn train_model(
     let scale_val = match config.link_function {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
-            let fitted = reml_state.x().dot(&final_beta_original);
+            let mut fitted = reml_state.offset().to_owned();
+            fitted += &reml_state.x().dot(&final_beta_original);
             let residuals = reml_state.y().to_owned() - &fitted;
             let weighted_rss: f64 = reml_state
                 .weights()
@@ -1110,7 +1113,7 @@ pub fn train_model(
 
         // Build design and penalties for calibrator
         eprintln!("[CAL] Building calibrator design and penalties...");
-        let (x_cal, penalties_cal, schema) = cal::build_calibrator_design(&features, &spec)
+        let (x_cal, penalties_cal, schema, offset) = cal::build_calibrator_design(&features, &spec)
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e))
             })?;
@@ -1120,6 +1123,7 @@ pub fn train_model(
             reml_state.y(),
             reml_state.weights(),
             x_cal.view(),
+            offset.view(),
             &penalties_cal,
             config.link_function,
             &spec,
@@ -1263,6 +1267,7 @@ pub fn optimize_external_design(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: ArrayView2<'_, f64>,
+    offset: ArrayView1<'_, f64>,
     s_list: &[Array2<f64>],
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError> {
@@ -1281,8 +1286,16 @@ pub fn optimize_external_design(
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.to_owned();
-    let reml_state =
-        internal::RemlState::new(y_o.view(), x_o.view(), w_o.view(), s_vec, &layout, &cfg)?;
+    let offset_o = offset.to_owned();
+    let reml_state = internal::RemlState::new_with_offset(
+        y_o.view(),
+        x_o.view(),
+        w_o.view(),
+        offset_o.view(),
+        s_vec,
+        &layout,
+        &cfg,
+    )?;
     let initial_rho = Array1::<f64>::zeros(k);
     // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
     let initial_z = initial_rho.mapv(|r| {
@@ -1326,6 +1339,7 @@ pub fn optimize_external_design(
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
+        offset_o.view(),
         y_o.view(),
         w_o.view(),
         &rs_list_ref,
@@ -1339,7 +1353,11 @@ pub fn optimize_external_design(
     // Scale (Gaussian) or 1.0 (Logit)
     let scale = match opts.link {
         LinkFunction::Identity => {
-            let fitted = x_o.dot(&beta_orig);
+            let fitted = {
+                let mut eta = offset_o.clone();
+                eta += &x_o.dot(&beta_orig);
+                eta
+            };
             let resid = y_o.to_owned() - &fitted;
             let rss: f64 = w_o
                 .iter()
@@ -1525,6 +1543,7 @@ pub mod internal {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
         weights: ArrayView1<'a, f64>,
+        offset: Array1<f64>,
         // Original penalty matrices S_k (p × p), ρ-independent basis
         s_full_list: Vec<Array2<f64>>,
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
@@ -1574,6 +1593,19 @@ pub mod internal {
             layout: &'a ModelLayout,
             config: &'a ModelConfig,
         ) -> Result<Self, EstimationError> {
+            let zero_offset = Array1::<f64>::zeros(y.len());
+            Self::new_with_offset(y, x, weights, zero_offset.view(), s_list, layout, config)
+        }
+
+        pub(super) fn new_with_offset(
+            y: ArrayView1<'a, f64>,
+            x: ArrayView2<'a, f64>,
+            weights: ArrayView1<'a, f64>,
+            offset: ArrayView1<'_, f64>,
+            s_list: Vec<Array2<f64>>,
+            layout: &'a ModelLayout,
+            config: &'a ModelConfig,
+        ) -> Result<Self, EstimationError> {
             // Pre-compute penalty square roots once
             let rs_list = compute_penalty_square_roots(&s_list)?;
 
@@ -1581,6 +1613,7 @@ pub mod internal {
                 y,
                 x,
                 weights,
+                offset: offset.to_owned(),
                 s_full_list: s_list,
                 rs_list,
                 layout,
@@ -1814,6 +1847,10 @@ pub mod internal {
             self.weights
         }
 
+        pub(super) fn offset(&self) -> ArrayView1<'_, f64> {
+            self.offset.view()
+        }
+
         // Expose error tracking state to parent module
         pub(super) fn consecutive_cost_error_count(&self) -> usize {
             *self.consecutive_cost_errors.borrow()
@@ -1851,6 +1888,7 @@ pub mod internal {
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x.view(),
+                self.offset.view(),
                 self.y,
                 self.weights,
                 &self.rs_list,
@@ -3725,6 +3763,7 @@ pub mod internal {
             crate::calibrate::pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 x.view(),
+                reml_state.offset(),
                 data.y.view(),
                 data.weights.view(),
                 reml_state.rs_list_ref(),
@@ -3835,6 +3874,7 @@ pub mod internal {
             crate::calibrate::pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 x.view(),
+                reml_state.offset(),
                 data.y.view(),
                 data.weights.view(),
                 reml_state.rs_list_ref(),
@@ -4013,9 +4053,11 @@ pub mod internal {
                             .map(|&l| l.ln().clamp(-RHO_BOUND, RHO_BOUND))
                             .collect::<Vec<_>>(),
                     );
+                    let offset = Array1::<f64>::zeros(data_train.y.len());
                     let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
                         rho.view(),
                         x_tr.view(),
+                        offset.view(),
                         data_train.y.view(),
                         data_train.weights.view(),
                         &rs_list,
@@ -5030,9 +5072,11 @@ pub mod internal {
             // Here we need to create the original rs_list to pass to the new function
             let rs_original = compute_penalty_square_roots(&s_list)?;
 
+            let offset = Array1::<f64>::zeros(data.y.len());
             let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
                 extreme_rho.view(),
                 x_matrix.view(),
+                offset.view(),
                 data.y.view(),
                 data.weights.view(),
                 &rs_original,
@@ -7089,7 +7133,15 @@ mod gradient_validation_tests {
         };
 
         // Fit model and extract results for diagnostic purposes
-        let result = optimize_external_design(y.view(), w.view(), x.view(), &[s1, s2], &opts);
+        let offset = Array1::<f64>::zeros(n);
+        let result = optimize_external_design(
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &[s1, s2],
+            &opts,
+        );
 
         // We don't actually assert anything - this test is purely for diagnostics
         // The logs will show any discrepancy between raw and stabilized objectives

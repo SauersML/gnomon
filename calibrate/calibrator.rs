@@ -16,13 +16,16 @@ use faer::Side;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use serde::{Deserialize, Serialize};
 // Use the shared optimizer facade from estimate.rs
-use crate::calibrate::estimate::{ExternalOptimOptions, optimize_external_design};
+use crate::calibrate::estimate::{
+    ExternalOptimOptions, ExternalOptimResult, optimize_external_design,
+};
 
 /// Features used to train the calibrator GAM
 pub struct CalibratorFeatures {
-    pub pred: Array1<f64>, // η̃ (logit) or μ̃ (identity)
-    pub se: Array1<f64>,   // SẼ on the same scale
-    pub dist: Array1<f64>, // signed distance to peeled hull (negative inside)
+    pub pred: Array1<f64>,          // η̃ (logit) or μ̃ (identity)
+    pub se: Array1<f64>,            // SẼ on the same scale
+    pub dist: Array1<f64>,          // signed distance to peeled hull (negative inside)
+    pub pred_identity: Array1<f64>, // baseline η (or μ) to preserve with identity backbone
 }
 
 /// Configuration of the calibrator smooths and penalties
@@ -472,6 +475,7 @@ pub fn compute_alo_features(
         pred,
         se: se_tilde,
         dist,
+        pred_identity: eta_hat,
     })
 }
 
@@ -479,7 +483,7 @@ pub fn compute_alo_features(
 pub fn build_calibrator_design(
     features: &CalibratorFeatures,
     spec: &CalibratorSpec,
-) -> Result<(Array2<f64>, Vec<Array2<f64>>, InternalSchema), EstimationError> {
+) -> Result<(Array2<f64>, Vec<Array2<f64>>, InternalSchema, Array1<f64>), EstimationError> {
     let n = features.pred.len();
 
     if let Some(w) = spec.prior_weights.as_ref() {
@@ -543,7 +547,11 @@ pub fn build_calibrator_design(
     }
 
     let weight_opt = spec.prior_weights.as_ref();
-    let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred, weight_opt);
+    // The spline basis must be built on the same predictor channel that will be
+    // available at inference time (the baseline logits).  Use the identity
+    // backbone features for both the free identity column and the penalized
+    // spline so train and serve stay aligned.
+    let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred_identity, weight_opt);
     let (se_mean, se_std_raw) = mean_and_std_raw(&features.se, weight_opt);
 
     // --- Check SE variability BEFORE standardization ---
@@ -648,7 +656,7 @@ pub fn build_calibrator_design(
         }
     );
 
-    let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred);
+    let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred_identity);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
     let (dist_std, dist_ms) = if use_linear_dist {
         // Center only for linear fallback to avoid extreme scaling
@@ -1226,11 +1234,10 @@ pub fn build_calibrator_design(
     let s_pred = add_fixed_nullspace_ridge(&s_pred_shrink, tau)?;
     let mut s_se = add_fixed_nullspace_ridge(&s_se_shrink, tau)?;
 
-    // For distance smooth: skip penalties for linear fallback to keep it truly unpenalized
+    // For distance smooth: add light regularization even in the linear fallback
     let s_dist = if use_linear_dist {
-        // Ensure a truly unpenalized linear term by keeping the original zero matrix
-        // This is important: when use_linear_dist is true, s_dist_raw is already zeros(1,1)
-        s_dist_raw.clone() // Keep zero: truly unpenalized linear term
+        // Give the fallback a tiny cost so REML must "pay" to use it
+        Array2::<f64>::from_elem((1, 1), 1.0)
     } else {
         // For spline basis, apply both types of penalties to scaled matrix
         let s_dist_shrink = add_nullspace_shrink_tied_to_lambda(&s_dist_raw_sc, kappa)?;
@@ -1244,7 +1251,9 @@ pub fn build_calibrator_design(
         knots_se = Array1::zeros(0); // Empty knots for linear fallback
     }
 
-    // Assemble X = [1 | B_pred | B_se | B_dist] - no unpenalized pred linear channel
+    // Assemble X = [1 | B_pred | B_se | B_dist] and keep the identity backbone as an offset
+    let offset = features.pred_identity.clone();
+    let pred_smooth_start = 1usize;
     let p_cols = 1 + b_pred_c.ncols() + b_se_c.ncols() + b_dist_c.ncols();
     let mut x = Array2::<f64>::zeros((n, p_cols));
     // intercept
@@ -1252,11 +1261,14 @@ pub fn build_calibrator_design(
         x[[i, 0]] = 1.0;
     }
     // B_pred - pred smooth fills columns 1..1+pred_cols directly
-    x.slice_mut(s![.., 1..1 + b_pred_c.ncols()])
-        .assign(&b_pred_c);
+    x.slice_mut(s![
+        ..,
+        pred_smooth_start..pred_smooth_start + b_pred_c.ncols()
+    ])
+    .assign(&b_pred_c);
     // B_se
     // IMPORTANT: the SE block must start after all pred columns
-    let se_off = 1 + b_pred_c.ncols();
+    let se_off = pred_smooth_start + b_pred_c.ncols();
     x.slice_mut(s![.., se_off..se_off + b_se_c.ncols()])
         .assign(&b_se_c);
     // B_dist
@@ -1273,7 +1285,7 @@ pub fn build_calibrator_design(
     // pred penalties: place directly at pred smooth columns (1..1+pred_cols)
     for i in 0..b_pred_c.ncols() {
         for j in 0..b_pred_c.ncols() {
-            s_pred_p[[1 + i, 1 + j]] = s_pred[[i, j]];
+            s_pred_p[[pred_smooth_start + i, pred_smooth_start + j]] = s_pred[[i, j]];
         }
     }
     for i in 0..b_se_c.ncols() {
@@ -1317,7 +1329,7 @@ pub fn build_calibrator_design(
         spec.double_penalty_ridge
     );
     // Create ranges for column spans
-    let pred_range = 1..(1 + b_pred_c.ncols()); // pred smooth only
+    let pred_range = pred_smooth_start..(pred_smooth_start + b_pred_c.ncols()); // pred smooth only
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
@@ -1356,7 +1368,7 @@ pub fn build_calibrator_design(
     // This maintains the scientific meaning of the smoothing parameters
     // -----------------------------------------------------------------------
 
-    Ok((x, penalties, schema))
+    Ok((x, penalties, schema, offset))
 }
 
 /// Predict with a fitted calibrator model given raw features
@@ -1436,22 +1448,26 @@ pub fn predict_calibrator(
         x[[i, 0]] = 1.0;
     }
     if n_pred_cols > 0 {
-        x.slice_mut(s![.., 1..1 + n_pred_cols])
+        x.slice_mut(s![.., pred_range.start..pred_range.end])
             .assign(&b_pred.slice(s![.., ..n_pred_cols]));
     }
     if n_se_cols > 0 {
-        let off = 1 + n_pred_cols;
+        let off = se_range.start;
         x.slice_mut(s![.., off..off + n_se_cols])
             .assign(&b_se.slice(s![.., ..n_se_cols]));
     }
     if n_dist_cols > 0 {
-        let off = 1 + n_pred_cols + n_se_cols;
+        let off = dist_range.start;
         x.slice_mut(s![.., off..off + n_dist_cols])
             .assign(&b_dist.slice(s![.., ..n_dist_cols]));
     }
 
-    // Linear predictor and mean (no offset)
-    let eta = x.dot(&model.coefficients);
+    // Linear predictor adds the baseline identity offset
+    let eta = {
+        let mut eta = pred.to_owned();
+        eta += &x.dot(&model.coefficients);
+        eta
+    };
 
     // Check for invalid values in the linear predictor
     if eta.iter().any(|&x| !x.is_finite()) {
@@ -1503,6 +1519,7 @@ pub fn fit_calibrator(
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>,
     x: ArrayView2<f64>,
+    offset: ArrayView1<f64>,
     penalties: &[Array2<f64>],
     link: LinkFunction,
     spec: &CalibratorSpec,
@@ -1548,18 +1565,28 @@ pub fn fit_calibrator(
     );
     // -----------------------------------------------
 
-    let res = optimize_external_design(y, prior_weights, x, penalties, &opts)?;
+    let res = optimize_external_design(y, prior_weights, x, offset, penalties, &opts)?;
+
+    let ExternalOptimResult {
+        beta,
+        lambdas,
+        scale,
+        edf_by_block,
+        edf_total: _,
+        iterations,
+        final_grad_norm,
+    } = res;
 
     // Extract lambdas directly from optimizer; do not clamp them.
     // They are exp(ρ) and already nonnegative.
-    let lambdas = [res.lambdas[0], res.lambdas[1], res.lambdas[2]];
-    let edf_pred = *res.edf_by_block.get(0).unwrap_or(&0.0);
-    let edf_se = *res.edf_by_block.get(1).unwrap_or(&0.0);
-    let edf_dist = *res.edf_by_block.get(2).unwrap_or(&0.0);
+    let lambdas_arr = [lambdas[0], lambdas[1], lambdas[2]];
+    let edf_pred = *edf_by_block.get(0).unwrap_or(&0.0);
+    let edf_se = *edf_by_block.get(1).unwrap_or(&0.0);
+    let edf_dist = *edf_by_block.get(2).unwrap_or(&0.0);
     // Calculate rho values (log lambdas) for reporting
-    let rho_pred = lambdas[0].ln();
-    let rho_se = lambdas[1].ln();
-    let rho_dist = lambdas[2].ln();
+    let rho_pred = lambdas_arr[0].ln();
+    let rho_se = lambdas_arr[1].ln();
+    let rho_dist = lambdas_arr[2].ln();
     eprintln!("[CAL] fit: done. Complexity controlled solely by REML-optimized lambdas:");
     eprintln!(
         "[CAL] lambdas: pred={:.3e} (rho={:.2}), se={:.3e} (rho={:.2}), dist={:.3e} (rho={:.2})",
@@ -1570,11 +1597,11 @@ pub fn fit_calibrator(
         edf_pred, edf_se, edf_dist, res.edf_total, res.scale
     );
     Ok((
-        res.beta,
-        lambdas,
-        res.scale,
+        beta,
+        lambdas_arr,
+        scale,
         (edf_pred, edf_se, edf_dist),
-        (res.iterations, res.final_grad_norm),
+        (iterations, final_grad_norm),
     ))
 }
 
@@ -2834,9 +2861,10 @@ mod tests {
 
         // Create calibrator features
         let features = CalibratorFeatures {
-            pred: constant_pred, // All 1s
+            pred: constant_pred.clone(), // All 1s
             se,
             dist,
+            pred_identity: constant_pred,
         };
 
         // Create calibrator spec with sum-to-zero constraint
@@ -2864,7 +2892,7 @@ mod tests {
         };
 
         // Build the calibrator design
-        let (x, penalties, schema) = build_calibrator_design(&features, &spec).unwrap();
+        let (x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Fit the model using uniform weights
         let w = Array1::ones(n);
@@ -2872,6 +2900,7 @@ mod tests {
             y.view(),
             w.view(),
             x.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -2938,7 +2967,12 @@ mod tests {
         let se = Array1::from_elem(n, 0.5);
         let dist = Array1::zeros(n);
 
-        let features = CalibratorFeatures { pred, se, dist };
+        let features = CalibratorFeatures {
+            pred: pred.clone(),
+            se,
+            dist,
+            pred_identity: pred,
+        };
 
         // Create two calibrator specs with different ridge values
         let spec_no_ridge = CalibratorSpec {
@@ -2988,9 +3022,9 @@ mod tests {
         };
 
         // Build designs for both specs
-        let (_, penalties_no_ridge, _) =
+        let (_, penalties_no_ridge, _, _) =
             build_calibrator_design(&features, &spec_no_ridge).unwrap();
-        let (x_with_ridge, penalties_with_ridge, _) =
+        let (x_with_ridge, penalties_with_ridge, _, offset_with_ridge) =
             build_calibrator_design(&features, &spec_with_ridge).unwrap();
 
         // Verify the penalties have the expected structure
@@ -3063,6 +3097,7 @@ mod tests {
             y.view(),
             w.view(),
             x_with_ridge.view(),
+            offset_with_ridge.view(),
             &low_penalties,
             LinkFunction::Identity,
             &spec_with_ridge,
@@ -3072,6 +3107,7 @@ mod tests {
             y.view(),
             w.view(),
             x_with_ridge.view(),
+            offset_with_ridge.view(),
             &high_penalties,
             LinkFunction::Identity,
             &spec_with_ridge,
@@ -3129,6 +3165,7 @@ mod tests {
             pred: base_pred.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: base_pred,
         };
 
         // Create calibrator spec
@@ -3156,7 +3193,7 @@ mod tests {
         };
 
         // Build design
-        let (x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // The test now directly uses the design matrix and penalties from build_calibrator_design
         // This ensures that X and penalties always have matching dimensions
@@ -3180,6 +3217,7 @@ mod tests {
             y.view(),
             w.view(),
             x.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -3217,7 +3255,12 @@ mod tests {
         let se = Array1::from_elem(n, 0.5);
         let dist = Array1::zeros(n);
 
-        let features = CalibratorFeatures { pred, se, dist };
+        let features = CalibratorFeatures {
+            pred: pred.clone(),
+            se,
+            dist,
+            pred_identity: pred,
+        };
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -3244,7 +3287,7 @@ mod tests {
         };
 
         // Build design
-        let (x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Create ExternalOptimOptions
         let opts = crate::calibrate::estimate::ExternalOptimOptions {
@@ -3262,6 +3305,7 @@ mod tests {
             y.view(),
             w.view(),
             x.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Identity,
             &spec,
@@ -3318,7 +3362,12 @@ mod tests {
         let se = Array1::from_elem(n, 0.5);
         let dist = Array1::zeros(n);
 
-        let features = CalibratorFeatures { pred, se, dist };
+        let features = CalibratorFeatures {
+            pred: pred.clone(),
+            se,
+            dist,
+            pred_identity: pred,
+        };
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -3345,7 +3394,7 @@ mod tests {
         };
 
         // Build design
-        let (x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::ones(n);
 
         // Simply verify that the optimizer converges successfully
@@ -3353,6 +3402,7 @@ mod tests {
             y.view(),
             w.view(),
             x.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -3422,10 +3472,13 @@ mod tests {
         }
 
         // Create fake calibrator features (just for the test)
+        let pred_vals =
+            Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
         let features = CalibratorFeatures {
-            pred: Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect()),
+            pred: pred_vals.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: pred_vals,
         };
 
         // Create calibrator spec with very small ridge to encourage numerical issues
@@ -3453,7 +3506,7 @@ mod tests {
         };
 
         // Build design
-        let (design_x, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (design_x, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Use uniform weights
         let w = Array1::ones(n);
@@ -3467,6 +3520,7 @@ mod tests {
             y.view(),
             w.view(),
             design_x.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -3487,6 +3541,7 @@ mod tests {
             y.view(),
             w.view(),
             x_wrong_shape.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -3577,13 +3632,15 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, schema) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -3619,7 +3676,7 @@ mod tests {
         // Get calibrated predictions
         let cal_probs = predict_calibrator(
             &cal_model,
-            alo_features.pred.view(),
+            alo_features.pred_identity.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
         )
@@ -3737,20 +3794,21 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, schema) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, edf_se, edf_dist), _) = fit_result;
-
         // Create a CalibratorModel
         let cal_model = CalibratorModel {
             spec: spec.clone(),
@@ -3779,7 +3837,7 @@ mod tests {
         // Get calibrated predictions
         let cal_probs = predict_calibrator(
             &cal_model,
-            alo_features.pred.view(),
+            alo_features.pred_identity.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
         )
@@ -3818,6 +3876,99 @@ mod tests {
             total_edf <= 5.0,
             "Total EDF ({:.2}) should be small for well-calibrated data",
             total_edf
+        );
+    }
+
+    #[test]
+    fn reml_prefers_wiggle_even_on_perfect_data() {
+        // Reuse the perfectly calibrated setup from the do-no-harm test
+        let n = 300;
+        let p = 3;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let normal = Normal::new(0.0, 1.0).unwrap();
+
+        let mut x = Array2::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = normal.sample(&mut rng);
+            }
+        }
+
+        let beta_true = Array1::from_vec(vec![0.5, -0.5, 0.2]);
+        let eta = x.dot(&beta_true);
+        let true_probs = eta.mapv(|e| {
+            let e_f64: f64 = e;
+            1.0 / (1.0 + (-e_f64).exp())
+        });
+
+        let mut y = Array1::zeros(n);
+        for i in 0..n {
+            let dist = Bernoulli::new(true_probs[i]).unwrap();
+            y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
+        }
+
+        let w = Array1::ones(n);
+        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let alo_features =
+            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+
+        let spec = CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            se_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            double_penalty_ridge: 1e-4,
+            distance_hinge: false,
+            nullspace_shrinkage_kappa: Some(1.0),
+            prior_weights: None,
+        };
+
+        let (x_cal, penalties, _, offset) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let fit_result = fit_calibrator(
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            offset.view(),
+            &penalties,
+            LinkFunction::Logit,
+            &spec,
+        )
+        .unwrap();
+        let (_, lambdas_opt, _, _, _) = fit_result;
+        let rho_opt = [
+            lambdas_opt[0].ln(),
+            lambdas_opt[1].ln(),
+            lambdas_opt[2].ln(),
+        ];
+
+        // Evaluate the stabilized LAML objective at the fitted lambdas and at a
+        // "identity" lambda that slams the prediction smooth flat.
+        let rs_blocks: Vec<Array2<f64>> = penalties.iter().cloned().collect();
+        let f_opt =
+            eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_opt);
+
+        let rho_identity = [(1e6_f64).ln(), rho_opt[1], rho_opt[2]];
+        let f_identity =
+            eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_identity);
+
+        assert!(
+            f_opt <= f_identity + 5e-3,
+            "Optimized REML objective ({:.6}) should not be materially worse than the high-λ identity objective ({:.6})",
+            f_opt,
+            f_identity
         );
     }
 
@@ -3866,7 +4017,8 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, schema) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
         let fit_result = fit_calibrator(
@@ -3913,7 +4065,7 @@ mod tests {
         // Get calibrated predictions
         let cal_preds = predict_calibrator(
             &cal_model,
-            alo_features.pred.view(),
+            alo_features.pred_identity.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
         )
@@ -4030,7 +4182,8 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, schema) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
         let fit_result = fit_calibrator(
@@ -4121,11 +4274,12 @@ mod tests {
             pred: test_preds.clone(),
             se: Array1::from_elem(n_test, 0.5), // Fixed SE for test points
             dist: hull_dists,
+            pred_identity: test_preds.clone(),
         };
 
         let cal_preds = predict_calibrator(
             &cal_model,
-            test_alo_features.pred.view(),
+            test_alo_features.pred_identity.view(),
             test_alo_features.se.view(),
             test_alo_features.dist.view(),
         )
@@ -4209,6 +4363,7 @@ mod tests {
             pred: alo_features.pred,
             se: alo_features.se,
             dist: Array1::zeros(n),
+            pred_identity: alo_features.pred_identity,
         };
 
         let spec = CalibratorSpec {
@@ -4234,7 +4389,7 @@ mod tests {
             prior_weights: None,
         };
 
-        let (x_cal, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4286,7 +4441,12 @@ mod tests {
         let y = pred.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 });
 
         // Create calibrator features
-        let features = CalibratorFeatures { pred, se, dist };
+        let features = CalibratorFeatures {
+            pred: pred.clone(),
+            se,
+            dist,
+            pred_identity: pred,
+        };
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -4313,7 +4473,7 @@ mod tests {
         };
 
         // Build design and fit calibrator
-        let (x_cal, penalties, schema) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Verify that linear fallback is triggered
         assert!(
@@ -4340,6 +4500,7 @@ mod tests {
             y.view(),
             weights.view(),
             x_cal.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -4473,11 +4634,13 @@ mod tests {
         };
 
         // Build design and fit calibrator
-        let (x_cal, penalties, schema) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -4513,7 +4676,7 @@ mod tests {
         // Generate predictions with original model
         let original_preds = predict_calibrator(
             &original_cal_model,
-            alo_features.pred.view(),
+            alo_features.pred_identity.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
         )
@@ -4528,7 +4691,7 @@ mod tests {
         // Generate predictions with loaded model
         let loaded_preds = predict_calibrator(
             &loaded_cal_model,
-            alo_features.pred.view(),
+            alo_features.pred_identity.view(),
             alo_features.se.view(),
             alo_features.dist.view(),
         )
@@ -4622,9 +4785,10 @@ mod tests {
 
         // Create calibrator features directly
         let features = CalibratorFeatures {
-            pred: distorted_eta,
+            pred: distorted_eta.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: distorted_eta,
         };
 
         // Create calibrator spec
@@ -4652,12 +4816,13 @@ mod tests {
         };
 
         // Build design and fit calibrator
-        let (x_cal, rs_blocks, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, rs_blocks, _, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::ones(n);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &rs_blocks,
             LinkFunction::Logit,
             &spec,
@@ -4775,9 +4940,10 @@ mod tests {
 
         // Create calibrator features directly
         let features = CalibratorFeatures {
-            pred: mu_true,
+            pred: mu_true.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: mu_true,
         };
 
         // Create calibrator spec
@@ -4805,12 +4971,13 @@ mod tests {
         };
 
         // Build design and fit calibrator
-        let (x_cal, rs_blocks, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, rs_blocks, _, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::ones(n);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &rs_blocks,
             LinkFunction::Identity,
             &spec,
@@ -4999,12 +5166,13 @@ mod tests {
             };
 
             // Build design and fit calibrator
-            let (x_cal, penalties, _) = build_calibrator_design(features, &spec).unwrap();
+            let (x_cal, penalties, _, offset) = build_calibrator_design(features, &spec).unwrap();
             let w = Array1::ones(n);
             let fit_result = fit_calibrator(
                 y.view(),
                 w.view(),
                 x_cal.view(),
+                offset.view(),
                 &penalties,
                 LinkFunction::Logit,
                 &spec,
@@ -5150,7 +5318,7 @@ mod tests {
 
         // Time the design matrix construction
         let design_start = Instant::now();
-        let (x_cal, penalties, _) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, _, _offset) = build_calibrator_design(&alo_features, &spec).unwrap();
         let design_time = design_start.elapsed();
 
         eprintln!(
@@ -5166,6 +5334,7 @@ mod tests {
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &penalties,
             LinkFunction::Logit,
             &spec,
@@ -5245,10 +5414,13 @@ mod tests {
         }
 
         // Create calibrator features directly
+        let pred_vals =
+            Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
         let features = CalibratorFeatures {
-            pred: Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect()),
+            pred: pred_vals.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: pred_vals,
         };
 
         // Create calibrator spec with very large lambda values to force numerical challenges
@@ -5276,7 +5448,7 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Create penalties with explicit extreme lambda values to challenge PIRLS
         let mut extreme_penalties = penalties.clone();
@@ -5291,6 +5463,7 @@ mod tests {
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &extreme_penalties,
             LinkFunction::Logit,
             &spec,
@@ -5360,10 +5533,13 @@ mod tests {
         );
 
         // Create calibrator features directly
+        let pred_vals =
+            Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
         let features = CalibratorFeatures {
-            pred: Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect()),
+            pred: pred_vals.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
+            pred_identity: pred_vals,
         };
 
         // Create calibrator spec
@@ -5391,7 +5567,7 @@ mod tests {
         };
 
         // Build design
-        let (x_cal, penalties, _) = build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, penalties, _, offset) = build_calibrator_design(&features, &spec).unwrap();
 
         // Create penalties with explicit extreme lambda values at RHO_BOUND
         // The RHO_BOUND in estimate.rs is typically around 20
@@ -5409,6 +5585,7 @@ mod tests {
             y.view(),
             w.view(),
             x_cal.view(),
+            offset.view(),
             &large_penalties,
             LinkFunction::Logit,
             &spec,
@@ -5637,9 +5814,10 @@ mod tests {
 
         // Create calibrator features
         let features = CalibratorFeatures {
-            pred: constant_pred, // All 1s
+            pred: constant_pred.clone(), // All 1s
             se,
             dist,
+            pred_identity: constant_pred,
         };
 
         // Create calibrator spec with sum-to-zero constraint and both uniform and non-uniform weights
@@ -5700,13 +5878,14 @@ mod tests {
 
         // Build designs and fit models for both weight cases
         println!("\nCase 1: Uniform weights");
-        let (x_uniform, penalties_uniform, schema_uniform) =
+        let (x_uniform, penalties_uniform, schema_uniform, offset_uniform) =
             build_calibrator_design(&features, &spec_uniform).unwrap();
 
         let fit_uniform = fit_calibrator(
             y.view(),
             Array1::ones(n).view(),
             x_uniform.view(),
+            offset_uniform.view(),
             &penalties_uniform,
             LinkFunction::Logit,
             &spec_uniform,
@@ -5714,13 +5893,14 @@ mod tests {
         .unwrap();
 
         println!("\nCase 2: Non-uniform weights");
-        let (x_nonuniform, penalties_nonuniform, schema_nonuniform) =
+        let (x_nonuniform, penalties_nonuniform, schema_nonuniform, offset_nonuniform) =
             build_calibrator_design(&features, &spec_nonuniform).unwrap();
 
         let fit_nonuniform = fit_calibrator(
             y.view(),
             weights.view(),
             x_nonuniform.view(),
+            offset_nonuniform.view(),
             &penalties_nonuniform,
             LinkFunction::Logit,
             &spec_nonuniform,
