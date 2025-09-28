@@ -48,11 +48,10 @@ jobs:
         if: steps.rust_changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Generate cache keys
-        id: cache_keys
+      - name: Prepare cache metadata
+        id: cache_meta
         run: |
-          SOURCE_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" -o -path "./src/*" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
-          echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          echo "week=$(date -u +%G%V)" >> $GITHUB_OUTPUT
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
 
@@ -63,17 +62,19 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_keys.outputs.deps_hash }}
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_meta.outputs.deps_hash }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Cache Cargo build artifacts
-        uses: actions/cache@v4
+      - name: Restore Cargo build cache
+        id: cargo_build_cache_restore
+        uses: actions/cache/restore@v4
         with:
           path: target
-          key: ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.source_hash }}
+          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-cargo-build-nightly-${{ steps.cache_keys.outputs.deps_hash }}
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-
             ${{ runner.os }}-cargo-build-nightly-
       
       - name: Cache getdoc binary
@@ -130,7 +131,14 @@ jobs:
         run: |
           cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
-      
+
+      - name: Save Cargo build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
+
       - name: Fail job if unit tests failed
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
         run: exit 1
