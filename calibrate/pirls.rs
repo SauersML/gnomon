@@ -278,6 +278,12 @@ pub fn fit_model_for_fixed_rho(
     // Track coefficient norm growth to detect divergence in unpenalized logistic fits
     let mut prev_beta_norm: f64 = 0.0;
 
+    let mut last_deviance_change = f64::NAN;
+    let mut last_penalized_deviance = f64::NAN;
+    let mut last_gradient_norm = f64::NAN;
+    let mut last_gradient_tol = f64::NAN;
+    let mut last_step_halving = 0usize;
+
     for iter in 1..=config.max_iterations {
         last_iter = iter; // Update on every iteration
 
@@ -424,10 +430,6 @@ pub fn fit_model_for_fixed_rho(
             alpha *= 0.5;
         }
 
-        // Print beta norm to track coefficient growth
-        let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
-        println!("[P-IRLS State] Beta Norm: {:.6e}", beta_norm);
-
         // Monitor maximum eta value (to detect separation)
         max_abs_eta = eta
             .iter()
@@ -472,6 +474,10 @@ pub fn fit_model_for_fixed_rho(
             ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
             // Populate the new PirlsResult struct with stable, transformed quantities
+            println!(
+                "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
+                iter, max_abs_eta
+            );
             return Ok(PirlsResult {
                 beta_transformed: beta_transformed.clone(),
                 penalized_hessian_transformed,
@@ -587,6 +593,10 @@ pub fn fit_model_for_fixed_rho(
                     beta_transformed.dot(&s_transformed.dot(&beta_transformed));
                 let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+                println!(
+                    "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
+                    iter, max_abs_eta
+                );
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
@@ -646,14 +656,9 @@ pub fn fit_model_for_fixed_rho(
         } else {
             String::new()
         };
-        println!(
-            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}{}",
-            iter,
-            penalized_deviance_new,
-            deviance_change_scaled,
-            step_halving_info,
-            penalty_info
-        );
+        last_deviance_change = deviance_change_scaled;
+        last_penalized_deviance = penalized_deviance_new;
+        last_step_halving = step_halving_count;
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
@@ -685,10 +690,8 @@ pub fn fit_model_for_fixed_rho(
             // and uses the user's epsilon, not machine epsilon.
             let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
 
-            println!(
-                "[P-IRLS Check] Deviance Change: {:.6e} | Gradient Norm: {:.6e} | Tolerance: {:.6e}",
-                deviance_change_scaled, gradient_norm, gradient_tol
-            );
+            last_gradient_norm = gradient_norm;
+            last_gradient_tol = gradient_tol;
 
             if gradient_norm < gradient_tol && iter >= min_iterations {
                 // SUCCESS: Both deviance and gradient have converged.
@@ -696,6 +699,18 @@ pub fn fit_model_for_fixed_rho(
                     "P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.",
                     deviance_change_scaled,
                     gradient_norm
+                );
+
+                let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
+                println!(
+                    "[P-IRLS] Converged in {} iterations | Δ: {:.3e} | ∥grad∥∞: {:.3e} | β-norm: {:.3e} | Dev: {:.6e}{}{}",
+                    iter,
+                    deviance_change_scaled,
+                    gradient_norm,
+                    beta_norm,
+                    penalized_deviance_new,
+                    step_halving_info,
+                    penalty_info
                 );
 
                 let penalized_hessian_transformed =
@@ -750,6 +765,33 @@ pub fn fit_model_for_fixed_rho(
 
     // If we reach here, we've hit max iterations without converging
     log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
+
+    let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
+    let grad_display = if last_gradient_norm.is_finite() {
+        format!("{:.3e}", last_gradient_norm)
+    } else {
+        "n/a".to_string()
+    };
+    let tol_display = if last_gradient_tol.is_finite() {
+        format!("{:.3e}", last_gradient_tol)
+    } else {
+        "n/a".to_string()
+    };
+    let step_info = if last_step_halving > 0 {
+        format!(" | Step Halving: {}", last_step_halving)
+    } else {
+        String::new()
+    };
+    println!(
+        "[P-IRLS] Exited after {} iterations | Δ: {:.3e} | ∥grad∥∞: {} | tol: {} | β-norm: {:.3e} | Dev: {:.6e}{}",
+        last_iter,
+        last_deviance_change,
+        grad_display,
+        tol_display,
+        beta_norm,
+        last_penalized_deviance,
+        step_info
+    );
 
     // Before returning, perform a final stationarity check using the SAME (W, z) as the last solve.
     // If the gradient is small, we can report a valid stalled minimum for the outer loop to accept.
@@ -1616,7 +1658,6 @@ pub fn solve_penalized_least_squares(
             condition_number: f64::INFINITY,
         });
     }
-
 
     //-----------------------------------------------------------------------
     // STAGE 3: Create rank-reduced system using the rank pivot

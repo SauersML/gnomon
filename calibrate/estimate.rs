@@ -2154,19 +2154,8 @@ pub mod internal {
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let log_det_s = pirls_result.reparam_result.log_det;
-                    eprintln!(
-                        "[Sλ] Using stabilized log|Sλ|+ from reparam: {:.6e}",
-                        log_det_s
-                    );
-
                     // Get effective Hessian (stabilized if needed) and ridge used
                     let (h_eff, _) = self.effective_hessian(&pirls_result);
-                    // Quick diag: min eig of H_eff if eigen OK
-                    if let Ok((eigs, _)) = h_eff.eigh(Side::Lower) {
-                        if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
-                            eprintln!("[Diag] H_eff min_eig={:.3e}", min_eig);
-                        }
-                    }
 
                     // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
                     // that will also be used in the gradient calculation
@@ -2207,35 +2196,15 @@ pub mod internal {
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    println!("[GNOMON COST] LAML Breakdown:");
-                    println!("  - P-IRLS Deviance     : {:.6e}", pirls_result.deviance);
-                    println!(
-                        "  - Penalty Term (β'Sβ) : {:.6e}",
-                        pirls_result.stable_penalty_term
-                    );
-                    println!("  - Penalized LogLik    : {penalised_ll:.6e}");
-                    println!("  - 0.5 * log|S|+       : {:.6e}", 0.5 * log_det_s);
-                    println!("  - 0.5 * log|H|        : {:.6e}", 0.5 * log_det_h);
+                    // Diagnostics: effective degrees of freedom via trace identity
+                    // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
+                    let (h_eff_diag, _) = self.effective_hessian(pirls_result.as_ref());
+                    let p_eff = pirls_result.beta_transformed.len() as f64;
+                    let lambdas = p.mapv(f64::exp);
+                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, &h_eff_diag)?;
+                    let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
-                    // Check if we used eigenvalues for the Hessian determinant
-                    let eigenvals = pirls_result
-                        .penalized_hessian_transformed
-                        .eigh(Side::Lower)
-                        .ok();
-
-                    if let Some((evals, _)) = eigenvals {
-                        let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                        let max_eig = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                        println!(
-                            "    -> (Hessian Eigenvalues: min={min_eig:.3e}, max={max_eig:.3e})"
-                        );
-                    }
-
-                    // Add diagnostic to compare stabilized vs raw Hessian-based objective
-                    // This reconstructs the raw F(ρ) as would be computed by the test suite
-                    // using the unstabilized Hessian in the original basis (XᵀWX + Sλ)
-
-                    // First, compute XᵀWX in the original basis
+                    // Build raw Hessian for diagnostic condition number comparison
                     let mut xtwx =
                         Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     let x_orig = self.x();
@@ -2250,136 +2219,54 @@ pub mod internal {
                         }
                     }
 
-                    // Add penalty (Sλ) to get raw H = XᵀWX + Sλ in original basis
                     let mut h_raw = xtwx.clone();
                     for (k, &lambda) in lambdas.iter().enumerate() {
-                        let s_k = &self.s_full_list[k]; // Get the p×p penalty matrix
+                        let s_k = &self.s_full_list[k];
                         if lambda != 0.0 {
-                            h_raw.scaled_add(lambda, s_k); // Add λ·S_k to H_raw
+                            h_raw.scaled_add(lambda, s_k);
                         }
                     }
 
-                    // Compute log|H_raw| via Cholesky if possible, otherwise use eigh
-                    let log_det_h_raw = match h_raw.cholesky(Side::Lower) {
-                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                        Err(_) => {
-                            if let Ok((evals, _)) = h_raw.eigh(Side::Lower) {
-                                let min_raw_eig =
-                                    evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                                println!("    -> (Raw Hessian min eigenvalue: {min_raw_eig:.3e})");
-                                evals.iter().map(|&ev| ev.max(1e-12).ln()).sum::<f64>()
-                            } else {
-                                println!("    -> (Raw Hessian decomposition failed)");
-                                log_det_h
-                            }
-                        }
-                    };
-
-                    // Compute the raw objective F_raw(ρ)
-                    let f_raw = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h_raw
-                        + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
-
-                    // Report both objectives and the delta
-                    println!("[GNOMON DIAG] Objective function comparison:");
-                    println!("  - F_eff(ρ) (stabilized): {:.6e}", laml);
-                    println!("  - F_raw(ρ) (unstabilized): {:.6e}", f_raw);
-                    println!(
-                        "  - Delta: {:.6e} (rel: {:.3e})",
-                        laml - f_raw,
-                        (laml - f_raw) / f_raw.abs().max(1e-12)
-                    );
-
-                    println!(
-                        "[GNOMON COST] <== Final LAML score: {:.6e} (Cost to minimize: {:.6e})",
-                        laml, -laml
-                    );
-
-                    // Diagnostics: effective degrees of freedom via trace identity
-                    // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
-                    let (h_eff_diag, _) = self.effective_hessian(pirls_result.as_ref());
-                    let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let lambdas = p.mapv(f64::exp);
-                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, &h_eff_diag)?;
-                    let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
-
-                    // Use a simpler approach to show difference in raw vs stabilized
-                    // Instead of trying to compute the exact trace, we'll examine eigenvalues
-                    // of both Hessians to illustrate the stabilization effect
-
-                    // Try to analyze the raw Hessian via eigendecomposition
-                    let eigendecomp_result = h_raw.eigh(Side::Lower);
-
-                    // Extract eigenvalues of the stabilized Hessian (this should always work)
                     let stabilized_eigs = pirls_result
                         .penalized_hessian_transformed
                         .eigh(Side::Lower)
-                        .ok()
+                        .ok();
+
+                    let stab_cond = stabilized_eigs
+                        .as_ref()
                         .map(|(evals, _)| {
-                            let min_stab = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max_stab = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            (min_stab, max_stab, max_stab / min_stab.max(1e-12))
-                        });
+                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                            max / min.max(1e-12)
+                        })
+                        .unwrap_or(f64::NAN);
 
-                    // Handle both success and failure cases for raw Hessian
-                    match eigendecomp_result {
-                        Ok(eigs_raw) => {
-                            // Success case: we can analyze both Hessians
-                            let min_raw_eig =
-                                eigs_raw.0.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max_raw_eig =
-                                eigs_raw.0.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            let cond_raw = max_raw_eig / min_raw_eig.max(1e-12);
+                    let raw_eigs = h_raw.eigh(Side::Lower).ok();
+                    let raw_cond = raw_eigs
+                        .as_ref()
+                        .map(|(evals, _)| {
+                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                            max / min.max(1e-12)
+                        })
+                        .unwrap_or(f64::NAN);
 
-                            // Print comparison of eigenvalue ranges
-                            if let Some((min_stab, max_stab, cond_stab)) = stabilized_eigs {
-                                println!("[GNOMON DIAG] Hessian condition numbers:");
-                                println!(
-                                    "  - Raw Hessian:        min={:.3e}, max={:.3e}, κ={:.3e}",
-                                    min_raw_eig, max_raw_eig, cond_raw
-                                );
-                                println!(
-                                    "  - Stabilized Hessian: min={:.3e}, max={:.3e}, κ={:.3e}",
-                                    min_stab, max_stab, cond_stab
-                                );
-                                println!("  - Stabilization ratio: {:.3e}x", cond_raw / cond_stab);
-                            }
-                        }
-                        Err(_) => {
-                            // Failure case: raw Hessian has issues
-                            println!(
-                                "[GNOMON DIAG] Raw Hessian is not positive definite, can't compute eigendecomposition"
-                            );
-
-                            // Still try to show stabilized Hessian info
-                            if let Some((min_stab, max_stab, cond_stab)) = stabilized_eigs {
-                                println!("[GNOMON DIAG] Stabilized Hessian condition:");
-                                println!(
-                                    "  - min={:.3e}, max={:.3e}, κ={:.3e}",
-                                    min_stab, max_stab, cond_stab
-                                );
-                            }
-                        }
+                    let stable_cond_display = if stab_cond.is_finite() {
+                        format!("{:.3e}", stab_cond)
+                    } else {
+                        "N/A".to_string()
+                    };
+                    let raw_cond_display = if raw_cond.is_finite() {
+                        format!("{:.3e}", raw_cond)
+                    } else {
+                        "N/A".to_string()
                     };
 
-                    // Print information about the stabilized EDF calculations
-                    // We don't try to compute raw EDF directly anymore, just show the stabilized value
-                    println!("[GNOMON DIAG] Stabilized EDF information:");
-                    println!("  - EDF_eff (stabilized): {:.6}", edf);
-                    println!("  - Trace: tr(H^-1 Sλ) = {:.6}", trace_h_inv_s_lambda);
                     println!(
-                        "  - This value would change substantially with an ill-conditioned Hessian"
-                    );
-                    // Note that we can't directly compare stabilized vs raw EDF anymore,
-                    // but the Hessian condition number comparison above helps explain why they differ
-
-                    println!(
-                        "[GNOMON COST] EDF trace: p = {:.3}, tr(H^-1 Sλ) = {:.6}, edf = {:.6}",
-                        p_eff, trace_h_inv_s_lambda, edf
+                        "[GNOMON COST] Final LAML score: {:.6e} | Hessian κ (stable/raw): {} / {} | EDF: {:.6} | tr(H^-1 Sλ): {:.6}",
+                        laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
                     );
 
-                    eprintln!("    [Debug] LAML score calculated: {laml:.6}");
-
-                    // Return negative LAML score for minimization
                     Ok(-laml)
                 }
             }
