@@ -139,6 +139,115 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
 
+      - name: Collect build metadata (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          {
+            echo "branch=${GITHUB_REF_NAME}"
+            echo "commit=${GITHUB_SHA}"
+            echo "week=${{ steps.cache_meta.outputs.week }}"
+            echo "deps_hash=${{ steps.cache_meta.outputs.deps_hash }}"
+            echo ""
+            echo "--- rustc ---"
+            (rustc -Vv || true)
+            echo ""
+            echo "--- cargo ---"
+            (cargo -Vv || true)
+          } > export/build-meta.txt
+
+      - name: Pack Cargo deps (~/.cargo/registry + ~/.cargo/git) (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          # Exclude credentials if present
+          if [[ -d "$HOME/.cargo" ]]; then
+            tar --exclude="$HOME/.cargo/credentials" \
+                -C "$HOME" -cf export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar \
+                -h .cargo/registry .cargo/git 2>/dev/null || true
+          fi
+          ls -al export || true
+
+      - name: Pack target/debug (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          if [[ -d target/debug ]]; then
+            tar -cf export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
+                target/debug target/.rustc_info.json 2>/dev/null || \
+            tar -cf export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
+                target/debug
+          fi
+
+      - name: Pack target/release (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          if [[ -d target/release ]]; then
+            tar -cf export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
+                target/release target/.rustc_info.json 2>/dev/null || \
+            tar -cf export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
+                target/release
+          fi
+
+      - name: Pack target/profiling (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          if [[ -d target/profiling ]]; then
+            tar -cf export/target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
+                target/profiling
+          fi
+
+      - name: Upload artifact – cargo deps (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}
+          path: export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload artifact – target debug (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload artifact – target release (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload artifact – target profiling (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload artifact – build metadata (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-meta-${{ github.ref_name }}-${{ github.sha }}
+          path: export/build-meta.txt
+          retention-days: 30
+
       - name: Fail job if unit tests failed
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
         run: exit 1
