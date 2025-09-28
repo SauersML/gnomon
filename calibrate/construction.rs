@@ -1067,7 +1067,6 @@ pub fn stable_reparameterization(
             break;
         }
 
-
         // Step: Find Frobenius norms of penalties in current sub-problem
         // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
         let mut frob_norms = Vec::new();
@@ -1436,7 +1435,6 @@ pub fn stable_reparameterization(
         k_offset += r; // Increase offset by the rank we processed
         q_current -= r; // Reduce problem size by the rank we processed
         gamma = gamma_prime; // Continue with the subdominant penalties
-
     }
 
     println!(
@@ -1643,7 +1641,7 @@ mod tests {
             })
             .collect();
 
-        let weights = Array1::ones(n_samples);
+        let weights = Array1::<f64>::ones(n_samples);
         let data = TrainingData { y, p, pcs, weights };
 
         // Create config with known parameters - need to provide all required fields

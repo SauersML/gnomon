@@ -1116,115 +1116,123 @@ pub fn train_model(
                 EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e))
             })?;
 
-        eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
-        let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
-            reml_state.y(),
-            reml_state.weights(),
-            x_cal.view(),
-            offset.view(),
-            &penalties_cal,
-            config.link_function,
-        )
-        .map_err(|e| {
-            EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
-        })?;
+        if x_cal.ncols() == 0 {
+            eprintln!(
+                "[CAL] Calibrator design has zero columns; skipping calibrator fit and using the identity mapping."
+            );
+            None
+        } else {
+            eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
+            let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
+                reml_state.y(),
+                reml_state.weights(),
+                x_cal.view(),
+                offset.view(),
+                &penalties_cal,
+                config.link_function,
+            )
+            .map_err(|e| {
+                EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
+            })?;
 
-        eprintln!(
-            "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, se={:.2}, dist={:.2}{}",
-            lambdas_cal[0],
-            lambdas_cal[1],
-            lambdas_cal[2],
-            edf_pair.0,
-            edf_pair.1,
-            edf_pair.2,
-            if config.link_function == LinkFunction::Identity {
-                format!("; scale={:.3e}", scale_cal)
-            } else {
-                String::new()
-            }
-        );
+            eprintln!(
+                "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, se={:.2}, dist={:.2}{}",
+                lambdas_cal[0],
+                lambdas_cal[1],
+                lambdas_cal[2],
+                edf_pair.0,
+                edf_pair.1,
+                edf_pair.2,
+                if config.link_function == LinkFunction::Identity {
+                    format!("; scale={:.3e}", scale_cal)
+                } else {
+                    String::new()
+                }
+            );
 
-        let mut spec_for_model = spec.clone();
-        spec_for_model.prior_weights = None; // Do not persist training weights in the saved model
+            let mut spec_for_model = spec.clone();
+            spec_for_model.prior_weights = None; // Do not persist training weights in the saved model
 
-        let model = cal::CalibratorModel {
-            spec: spec_for_model,
-            knots_pred: schema.knots_pred,
-            knots_se: schema.knots_se,
-            knots_dist: schema.knots_dist,
-            pred_constraint_transform: schema.pred_constraint_transform,
-            stz_se: schema.stz_se,
-            stz_dist: schema.stz_dist,
-            standardize_pred: schema.standardize_pred,
-            standardize_se: schema.standardize_se,
-            standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
-            lambda_pred: lambdas_cal[0],
-            lambda_se: lambdas_cal[1],
-            lambda_dist: lambdas_cal[2],
-            coefficients: beta_cal,
-            column_spans: schema.column_spans,
-            scale: if config.link_function == LinkFunction::Identity {
-                Some(scale_cal)
-            } else {
-                None
-            },
-        };
+            let model = cal::CalibratorModel {
+                spec: spec_for_model,
+                knots_pred: schema.knots_pred,
+                knots_se: schema.knots_se,
+                knots_dist: schema.knots_dist,
+                pred_constraint_transform: schema.pred_constraint_transform,
+                stz_se: schema.stz_se,
+                stz_dist: schema.stz_dist,
+                standardize_pred: schema.standardize_pred,
+                standardize_se: schema.standardize_se,
+                standardize_dist: schema.standardize_dist,
+                se_linear_fallback: schema.se_linear_fallback,
+                dist_linear_fallback: schema.dist_linear_fallback,
+                se_center_offset: schema.se_center_offset,
+                dist_center_offset: schema.dist_center_offset,
+                lambda_pred: lambdas_cal[0],
+                lambda_se: lambdas_cal[1],
+                lambda_dist: lambdas_cal[2],
+                coefficients: beta_cal,
+                column_spans: schema.column_spans,
+                scale: if config.link_function == LinkFunction::Identity {
+                    Some(scale_cal)
+                } else {
+                    None
+                },
+            };
 
-        // Detailed one-time summary after calibration ends
-        let deg_pred = spec.pred_basis.degree;
-        let deg_se = spec.se_basis.degree;
-        let deg_dist = spec.dist_basis.degree;
-        let m_pred_int =
-            (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
-        let m_se_int = (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
-        let m_dist_int =
-            (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
-        let rho_pred = model.lambda_pred.ln();
-        let rho_se = model.lambda_se.ln();
-        let rho_dist = model.lambda_dist.ln();
-        println!(
-            concat!(
-                "[CAL][train] summary:\n",
-                "  design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}\n",
-                "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
-                "  penalty: order_pred={}, order_se={}, order_dist={}\n",
-                "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
-                "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
-                "  opt:     iterations={}, final_grad_norm={:.3e}"
-            ),
-            x_cal.nrows(),
-            x_cal.ncols(),
-            model.column_spans.0.len(),
-            model.column_spans.1.len(),
-            model.column_spans.2.len(),
-            deg_pred,
-            m_pred_int,
-            deg_se,
-            m_se_int,
-            deg_dist,
-            m_dist_int,
-            spec.penalty_order_pred,
-            spec.penalty_order_se,
-            spec.penalty_order_dist,
-            model.lambda_pred,
-            rho_pred,
-            model.lambda_se,
-            rho_se,
-            model.lambda_dist,
-            rho_dist,
-            edf_pair.0,
-            edf_pair.1,
-            edf_pair.2,
-            (edf_pair.0 + edf_pair.1 + edf_pair.2),
-            fit_meta.0,
-            fit_meta.1
-        );
+            // Detailed one-time summary after calibration ends
+            let deg_pred = spec.pred_basis.degree;
+            let deg_se = spec.se_basis.degree;
+            let deg_dist = spec.dist_basis.degree;
+            let m_pred_int =
+                (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
+            let m_se_int =
+                (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
+            let m_dist_int =
+                (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
+            let rho_pred = model.lambda_pred.ln();
+            let rho_se = model.lambda_se.ln();
+            let rho_dist = model.lambda_dist.ln();
+            println!(
+                concat!(
+                    "[CAL][train] summary:\n",
+                    "  design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}\n",
+                    "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
+                    "  penalty: order_pred={}, order_se={}, order_dist={}\n",
+                    "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
+                    "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
+                    "  opt:     iterations={}, final_grad_norm={:.3e}"
+                ),
+                x_cal.nrows(),
+                x_cal.ncols(),
+                model.column_spans.0.len(),
+                model.column_spans.1.len(),
+                model.column_spans.2.len(),
+                deg_pred,
+                m_pred_int,
+                deg_se,
+                m_se_int,
+                deg_dist,
+                m_dist_int,
+                spec.penalty_order_pred,
+                spec.penalty_order_se,
+                spec.penalty_order_dist,
+                model.lambda_pred,
+                rho_pred,
+                model.lambda_se,
+                rho_se,
+                model.lambda_dist,
+                rho_dist,
+                edf_pair.0,
+                edf_pair.1,
+                edf_pair.2,
+                (edf_pair.0 + edf_pair.1 + edf_pair.2),
+                fit_meta.0,
+                fit_meta.1
+            );
 
-        Some(model)
+            Some(model)
+        }
     };
 
     Ok(TrainedModel {
@@ -3015,7 +3023,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Train the model
@@ -3196,14 +3204,14 @@ pub mod internal {
                 y: y.slice(ndarray::s![..n_train]).to_owned(),
                 p: p.slice(ndarray::s![..n_train]).to_owned(),
                 pcs: pcs.slice(ndarray::s![..n_train, ..]).to_owned(),
-                weights: Array1::ones(n_train),
+                weights: Array1::<f64>::ones(n_train),
             };
 
             let test_data = TrainingData {
                 y: y.slice(ndarray::s![n_train..]).to_owned(),
                 p: p.slice(ndarray::s![n_train..]).to_owned(),
                 pcs: pcs.slice(ndarray::s![n_train.., ..]).to_owned(),
-                weights: Array1::ones(y.len() - n_train),
+                weights: Array1::<f64>::ones(y.len() - n_train),
             };
 
             let test_true_probabilities = Array1::from(true_probabilities[n_train..].to_vec());
@@ -3292,7 +3300,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(n),
+                weights: Array1::<f64>::ones(n),
             };
 
             let config = ModelConfig {
@@ -3560,7 +3568,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(n_samples),
+                weights: Array1::<f64>::ones(n_samples),
             };
 
             // Keep interactions - we'll just focus our test on main effects
@@ -3666,7 +3674,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(n_samples),
+                weights: Array1::<f64>::ones(n_samples),
             };
 
             // Keep interactions - we'll just focus our test on main effects
@@ -3870,7 +3878,7 @@ pub mod internal {
                         y: take(&y, &train_idx),
                         p: take(&p, &train_idx),
                         pcs: take_pcs(&pcs, &train_idx),
-                        weights: Array1::ones(train_idx.len()),
+                        weights: Array1::<f64>::ones(train_idx.len()),
                     };
 
                     let data_val_p = take(&p, &val_idx);
@@ -4406,7 +4414,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
             let config = ModelConfig {
                 link_function: LinkFunction::Logit,
@@ -4526,7 +4534,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // --- Model configuration ---
@@ -4750,7 +4758,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs: Array2::zeros((n_samples, 0)), // No PCs for this simple test
-                weights: Array1::ones(n_samples),
+                weights: Array1::<f64>::ones(n_samples),
             };
 
             // --- Model configuration ---
@@ -4872,7 +4880,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             let config = ModelConfig {
@@ -5003,7 +5011,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Use the same config but smaller basis to speed up
@@ -5125,7 +5133,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Over-parameterized model: many knots and PCs for small dataset
@@ -5301,7 +5309,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Create massively over-parameterized model
@@ -5413,7 +5421,7 @@ pub mod internal {
                 y,
                 p,
                 pcs,
-                weights: Array1::ones(n_samples),
+                weights: Array1::<f64>::ones(n_samples),
             };
 
             // Create a minimal model config
@@ -5562,7 +5570,7 @@ pub mod internal {
                     y,
                     p: p.clone(),
                     pcs,
-                    weights: Array1::ones(p.len()),
+                    weights: Array1::<f64>::ones(p.len()),
                 };
 
                 // Stage: Define a simple configuration for a model with only a PGS term
@@ -5673,7 +5681,7 @@ pub mod internal {
                 use rand::SeedableRng;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(42); // Fixed seed for reproducibility
 
-            // Stage: Set up a well-posed, non-trivial problem
+                // Stage: Set up a well-posed, non-trivial problem
                 let n_samples = 600;
 
                 // Use random jitter to prevent perfect separation and improve numerical stability
@@ -5700,7 +5708,7 @@ pub mod internal {
                     y,
                     p: p.clone(),
                     pcs,
-                    weights: Array1::ones(p.len()),
+                    weights: Array1::<f64>::ones(p.len()),
                 };
 
                 // Stage: Define a simple model configuration for a PGS-only model
@@ -5871,7 +5879,7 @@ pub mod internal {
         fn test_fundamental_cost_function_investigation() {
             let n_samples = 100; // Increased from 20 for better conditioning
 
-        // Stage: Define a simple model configuration for the test
+            // Stage: Define a simple model configuration for the test
             let simple_config = ModelConfig {
                 link_function: LinkFunction::Identity, // Use Identity for simpler test
                 penalty_order: 2,
@@ -5920,15 +5928,15 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
-        // Stage: Generate consistent structures using the canonical function
+            // Stage: Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
-        // Stage: Create a RemlState with the consistent objects
+            // Stage: Create a RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
@@ -6061,7 +6069,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Stage: Define a simple model configuration for a PGS-only model
@@ -6179,7 +6187,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
-                weights: Array1::ones(p.len()),
+                weights: Array1::<f64>::ones(p.len()),
             };
 
             // Stage: Define a simple model configuration for a PGS-only model
@@ -6286,7 +6294,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         y,
         p,
         pcs,
-        weights: Array1::ones(n_samples),
+        weights: Array1::<f64>::ones(n_samples),
     };
 
     // Stage: Configure a logit model
@@ -6358,7 +6366,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         y,
         p,
         pcs,
-        weights: Array1::ones(n_samples),
+        weights: Array1::<f64>::ones(n_samples),
     };
 
     // Create a basic config
@@ -6529,7 +6537,7 @@ mod optimizer_progress_tests {
     }
 
     fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
-    // Stage: Generate well-behaved data with a clear, non-linear signal on PC1
+        // Stage: Generate well-behaved data with a clear, non-linear signal on PC1
         // The PGS predictor ('p') is included but is uncorrelated with the outcome.
         let n_samples = 500;
         let mut rng = StdRng::seed_from_u64(42);
@@ -6564,10 +6572,10 @@ mod optimizer_progress_tests {
             y,
             p,
             pcs,
-            weights: Array1::ones(n_samples),
+            weights: Array1::<f64>::ones(n_samples),
         };
 
-    // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
+        // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
         let config = ModelConfig {
             link_function,
             penalty_order: 2,
@@ -6596,7 +6604,7 @@ mod optimizer_progress_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
-    // Stage: Build matrices and the REML state to evaluate cost at specific rho values
+        // Stage: Build matrices and the REML state to evaluate cost at specific rho values
         let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
@@ -6608,7 +6616,7 @@ mod optimizer_progress_tests {
             &config,
         )?;
 
-    // Stage: Compute the initial cost at the same rho used by train_model
+        // Stage: Compute the initial cost at the same rho used by train_model
         assert!(
             layout.num_penalties > 0,
             "Model must have at least one penalty for BFGS to optimize"
@@ -6620,18 +6628,18 @@ mod optimizer_progress_tests {
             "Initial cost must be finite, got {initial_cost}"
         );
 
-    // Stage: Run full training to get optimized lambdas
+        // Stage: Run full training to get optimized lambdas
         let trained = train_model(&data, &config)?;
         let final_rho = Array1::from_vec(trained.lambdas.clone()).mapv(f64::ln);
 
-    // Stage: Compute the final cost at optimized rho using the same RemlState
+        // Stage: Compute the final cost at optimized rho using the same RemlState
         let final_cost = reml_state.compute_cost(&final_rho)?;
         assert!(
             final_cost.is_finite(),
             "Final cost must be finite, got {final_cost}"
         );
 
-    // Stage: Assert that the optimizer made progress beyond the initial guess
+        // Stage: Assert that the optimizer made progress beyond the initial guess
         assert!(
             final_cost < initial_cost - 1e-4,
             "Optimization failed to improve upon the initial guess. Initial: {}, Final: {}",
@@ -6675,7 +6683,7 @@ mod reparam_consistency_tests {
             y,
             p: p.clone(),
             pcs,
-            weights: Array1::ones(n),
+            weights: Array1::<f64>::ones(n),
         };
 
         let config = ModelConfig {
@@ -6829,7 +6837,7 @@ mod gradient_validation_tests {
             y,
             p: p.clone(),
             pcs,
-            weights: Array1::ones(n),
+            weights: Array1::<f64>::ones(n),
         };
 
         let config = ModelConfig {

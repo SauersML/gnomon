@@ -275,7 +275,7 @@ pub fn apply_sum_to_zero_constraint(
             }
             w.to_owned()
         }
-        None => Array1::ones(n),
+        None => Array1::<f64>::ones(n),
     };
     let c = basis_matrix.t().dot(&constraint_vector); // shape k
 
