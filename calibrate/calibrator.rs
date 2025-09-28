@@ -935,7 +935,6 @@ pub fn build_calibrator_design(
         Err(BasisError::ConstraintNullspaceNotFound) => {
             eprintln!(
                 "[CAL] pred basis fully constrained by {{1, eta}}; increase knots/degree for wiggles"
-
             );
             (
                 Array2::<f64>::zeros((n, 0)),
@@ -1348,7 +1347,6 @@ pub fn fit_calibrator(
     offset: ArrayView1<f64>,
     penalties: &[Array2<f64>],
     link: LinkFunction,
-    _spec: &CalibratorSpec,
 ) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
     let opts = ExternalOptimOptions {
         link,
@@ -2723,7 +2721,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
 
@@ -2916,7 +2913,6 @@ mod tests {
             offset_with_ridge.view(),
             &low_penalties,
             LinkFunction::Identity,
-            &spec_with_ridge,
         )
         .unwrap();
         let fit_high = fit_calibrator(
@@ -2926,7 +2922,6 @@ mod tests {
             offset_with_ridge.view(),
             &high_penalties,
             LinkFunction::Identity,
-            &spec_with_ridge,
         )
         .unwrap();
 
@@ -3034,7 +3029,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         // The fit should succeed without error
@@ -3120,7 +3114,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Identity,
-            &spec,
         );
 
         // Check that fit converged successfully
@@ -3215,7 +3208,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         // Should converge successfully
@@ -3331,7 +3323,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         // The fit with correct shape should succeed or at least not fail due to shape mismatch
@@ -3352,7 +3343,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         // The fit should fail due to shape mismatch
@@ -3449,7 +3439,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, _, _), _) = fit_result;
@@ -3608,7 +3597,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, edf_se, edf_dist), _) = fit_result;
@@ -3744,7 +3732,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let (_, lambdas_opt, _, _, _) = fit_result;
@@ -3826,7 +3813,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Identity,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) = fit_result;
@@ -3989,7 +3975,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Identity,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) = fit_result;
@@ -4191,7 +4176,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         );
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
     }
@@ -4296,7 +4280,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -4433,7 +4416,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -4612,7 +4594,6 @@ mod tests {
             offset.view(),
             &rs_blocks,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
 
@@ -4765,7 +4746,6 @@ mod tests {
             offset.view(),
             &rs_blocks,
             LinkFunction::Identity,
-            &spec,
         )
         .unwrap();
 
@@ -4958,7 +4938,6 @@ mod tests {
                 offset.view(),
                 &penalties,
                 LinkFunction::Logit,
-                &spec,
             )
             .unwrap();
             let (beta, lambdas, _, _, _) = fit_result;
@@ -5118,7 +5097,6 @@ mod tests {
             offset.view(),
             &penalties,
             LinkFunction::Logit,
-            &spec,
         )
         .unwrap();
         let fit_time = fit_start.elapsed();
@@ -5245,7 +5223,6 @@ mod tests {
             offset.view(),
             &extreme_penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         match result {
@@ -5365,7 +5342,6 @@ mod tests {
             offset.view(),
             &large_penalties,
             LinkFunction::Logit,
-            &spec,
         );
 
         // The fit should succeed with large lambdas
@@ -5661,7 +5637,6 @@ mod tests {
             offset_uniform.view(),
             &penalties_uniform,
             LinkFunction::Logit,
-            &spec_uniform,
         )
         .unwrap();
 
@@ -5676,7 +5651,6 @@ mod tests {
             offset_nonuniform.view(),
             &penalties_nonuniform,
             LinkFunction::Logit,
-            &spec_nonuniform,
         )
         .unwrap();
 

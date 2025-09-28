@@ -1124,7 +1124,6 @@ pub fn train_model(
             offset.view(),
             &penalties_cal,
             config.link_function,
-            &spec,
         )
         .map_err(|e| {
             EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
