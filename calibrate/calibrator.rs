@@ -1,5 +1,6 @@
 use crate::calibrate::basis::{
-    apply_sum_to_zero_constraint, create_difference_penalty_matrix, null_range_whiten,
+    BasisError, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
+    create_difference_penalty_matrix,
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
@@ -38,13 +39,7 @@ pub struct CalibratorSpec {
     pub penalty_order_pred: usize,
     pub penalty_order_se: usize,
     pub penalty_order_dist: usize,
-    pub double_penalty_ridge: f64, // Deprecated: Use nullspace_shrinkage_kappa instead
     pub distance_hinge: bool,
-    /// Controls nullspace penalty strength relative to wiggly penalty
-    /// Higher values (>1.0) shrink null space more aggressively
-    /// Default (1.0) shrinks nullspace and wiggly components equally
-    /// Setting to 0.0 disables nullspace shrinkage (not recommended)
-    pub nullspace_shrinkage_kappa: Option<f64>,
     /// Optional training weights to use for STZ constraint and fitting
     /// If not provided, uniform weights (1.0) will be used
     pub prior_weights: Option<Array1<f64>>,
@@ -54,11 +49,11 @@ pub struct CalibratorSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalibratorModel {
     pub spec: CalibratorSpec,
-    // Knot vectors and STZ transforms used for each smooth
+    // Knot vectors and constraint transforms used for each smooth
     pub knots_pred: Array1<f64>,
     pub knots_se: Array1<f64>,
     pub knots_dist: Array1<f64>,
-    pub stz_pred: Array2<f64>,
+    pub pred_constraint_transform: Array2<f64>,
     pub stz_se: Array2<f64>,
     pub stz_dist: Array2<f64>,
 
@@ -76,7 +71,6 @@ pub struct CalibratorModel {
     // Centering offsets for linear fallbacks
     pub se_center_offset: f64,   // weighted mean subtracted from se_std
     pub dist_center_offset: f64, // weighted mean subtracted from dist_std
-    pub pred_center_offset: f64, // weighted mean subtracted from pred_std (for linear channel)
 
     // Fitted lambdas
     pub lambda_pred: f64,
@@ -100,7 +94,7 @@ pub struct InternalSchema {
     pub knots_pred: Array1<f64>,
     pub knots_se: Array1<f64>,
     pub knots_dist: Array1<f64>,
-    pub stz_pred: Array2<f64>,
+    pub pred_constraint_transform: Array2<f64>,
     pub stz_se: Array2<f64>,
     pub stz_dist: Array2<f64>,
     pub standardize_pred: (f64, f64),
@@ -110,7 +104,6 @@ pub struct InternalSchema {
     pub dist_linear_fallback: bool,
     pub se_center_offset: f64,   // weighted mean subtracted from se_std
     pub dist_center_offset: f64, // weighted mean subtracted from dist_std
-    pub pred_center_offset: f64, // weighted mean subtracted from pred_std
     pub column_spans: (
         std::ops::Range<usize>,
         std::ops::Range<usize>,
@@ -927,71 +920,30 @@ pub fn build_calibrator_design(
         spec.se_basis.degree,
     )?;
 
-    // Pull training weights for use in STZ (weighted centering)
+    // Pull training weights for use in orthogonality constraints and STZ (weighted centering)
     let w_for_stz = spec.prior_weights.as_ref().map(|w| w.view());
 
-    // Apply weighted sum-to-zero constraints to prevent intercept confounding.
-    // This keeps identifiability by making smooths orthogonal to intercept in the weighted inner product.
-    let (b_pred_c, stz_pred) = apply_sum_to_zero_constraint(b_pred_raw.view(), w_for_stz)?;
-
-    // Add diagnostic to check STZ constraint - verify column means are zero
-    // This is what the constraint guarantees: weighted column means of B·T should be zero
-    // (not that the sum of the coefficients is zero, which is a different constraint)
-    {
-        let n_rows = b_pred_c.nrows();
-        let n_cols = b_pred_c.ncols();
-
-        // Calculate weighted column means to verify STZ constraint
-        let mut max_abs_col_mean: f64 = 0.0;
-        let mut col_means = Vec::with_capacity(n_cols);
-
-        // Use the same weights as used in the STZ constraint
-        match w_for_stz {
-            Some(weights) => {
-                // Calculate weighted column means
-                let w_sum = weights.iter().copied().sum::<f64>().max(1e-12);
-                for j in 0..n_cols {
-                    let col = b_pred_c.column(j);
-                    let weighted_mean = col
-                        .iter()
-                        .zip(weights.iter())
-                        .map(|(&x, &w)| x * w)
-                        .sum::<f64>()
-                        / w_sum;
-                    col_means.push(weighted_mean);
-                    max_abs_col_mean = max_abs_col_mean.max(weighted_mean.abs());
-                }
-            }
-            None => {
-                // Calculate unweighted column means
-                for j in 0..n_cols {
-                    let col = b_pred_c.column(j);
-                    let mean = col.sum() / (n_rows as f64);
-                    col_means.push(mean);
-                    max_abs_col_mean = max_abs_col_mean.max(mean.abs());
-                }
-            }
+    // Build the constraint directions for the predictor smooth: ones and standardized predictor.
+    let mut z_pred = Array2::<f64>::zeros((n, 2));
+    z_pred.column_mut(0).fill(1.0);
+    z_pred.column_mut(1).assign(&pred_std);
+    let (b_pred_c, pred_constraint) = match apply_weighted_orthogonality_constraint(
+        b_pred_raw.view(),
+        z_pred.view(),
+        w_for_stz,
+    ) {
+        Ok(res) => res,
+        Err(BasisError::ConstraintNullspaceNotFound) => {
+            eprintln!(
+                "[CAL] pred basis fully constrained by {1, eta}; increase knots/degree for wiggles"
+            );
+            (
+                Array2::<f64>::zeros((n, 0)),
+                Array2::<f64>::zeros((b_pred_raw.ncols(), 0)),
+            )
         }
-
-        // Print diagnostic info
-        println!("[GNOMON DIAG] STZ constraint verification for pred block:");
-        println!(
-            "  - Max absolute weighted column mean: {:.6e}",
-            max_abs_col_mean
-        );
-        println!(
-            "  - First few column means: [{:.6e}, {:.6e}, ...]",
-            col_means.get(0).copied().unwrap_or(f64::NAN),
-            col_means.get(1).copied().unwrap_or(f64::NAN)
-        );
-
-        // Show that sum of coefficients is generally non-zero
-        // This illustrates what the test incorrectly checks vs what STZ guarantees
-        println!("  - Note: STZ guarantees column means ≈ 0, NOT sum of coefficients = 0");
-        println!(
-            "    The test 'stz_removes_intercept_confounding' incorrectly checks sum of coefficients"
-        );
-    }
+        Err(err) => return Err(EstimationError::BasisError(err)),
+    };
 
     // For SE, check if we need to use linear fallback first (detected before standardization)
     // but always ensure it's centered (weighted if weights provided)
@@ -1054,7 +1006,7 @@ pub fn build_calibrator_design(
             let s0 = Array2::<f64>::zeros((0, 0));
             (b, stz, knots, s0)
         } else {
-            // keep the single centered linear column, unpenalized
+            // Keep the single centered linear column and give it a tiny penalty so REML pays to use it
             // Make sure it's actually centered using the pre-calculated offset
             let mut b = dist_std.clone();
             b.mapv_inplace(|v| v - mu_dist);
@@ -1063,7 +1015,7 @@ pub fn build_calibrator_design(
             let b = b.insert_axis(Axis(1)).to_owned();
             let stz = Array2::<f64>::eye(1);
             let knots = Array1::<f64>::zeros(0);
-            let s0 = Array2::<f64>::zeros((1, 1));
+            let s0 = Array2::<f64>::from_elem((1, 1), 1.0);
             (b, stz, knots, s0)
         }
     } else {
@@ -1090,14 +1042,14 @@ pub fn build_calibrator_design(
     let s_pred_raw0 =
         create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
     let s_se_raw0 = if se_linear_fallback {
-        Array2::<f64>::zeros((1, 1))
+        Array2::<f64>::from_elem((1, 1), 1.0)
     } else {
         create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?
     };
     // s_dist_raw0 is already created in the if-else block above
 
     // S in constrained coordinates: S_c = T^T S_raw T
-    let s_pred_raw = stz_pred.t().dot(&s_pred_raw0).dot(&stz_pred);
+    let s_pred_raw = pred_constraint.t().dot(&s_pred_raw0).dot(&pred_constraint);
     let s_se_raw = stz_se.t().dot(&s_se_raw0).dot(&stz_se);
     let s_dist_raw = stz_dist.t().dot(&s_dist_raw0).dot(&stz_dist);
 
@@ -1122,159 +1074,36 @@ pub fn build_calibrator_design(
         c_pred, c_se, c_dist
     );
 
-    // Add penalty on the nullspace of the wiggliness penalty, tied to the same lambda
-    // This ensures proper shrinkage behavior by penalizing both wiggly and constant/linear components
-    fn add_nullspace_shrink_tied_to_lambda(
-        s_raw: &Array2<f64>,
-        kappa: f64,
-    ) -> Result<Array2<f64>, EstimationError> {
-        if kappa <= 0.0 {
-            return Ok(s_raw.clone());
-        }
-        let (z_null, _) = null_range_whiten(s_raw).map_err(EstimationError::BasisError)?;
-        if z_null.ncols() == 0 {
-            return Ok(s_raw.clone());
-        }
-        // Projector onto col(Z): using SVD (stable): Z = U Σ Vᵀ => P = U Uᵀ (keep cols with σ > tol)
-        let (u_opt, s, vt_opt) = z_null
-            .svd(true, false)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        drop(vt_opt);
-        let u = u_opt.ok_or_else(|| {
-            EstimationError::LayoutError("SVD did not return U for nullspace projector".to_string())
-        })?;
-        let sig_max = s.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-        let tol = sig_max * 1e-12;
-        let keep = s
-            .iter()
-            .enumerate()
-            .filter(|&(_, &val)| val > tol)
-            .map(|(i, _)| i)
-            .collect::<Vec<_>>();
-        if keep.is_empty() {
-            return Ok(s_raw.clone());
-        }
-        let u_keep = u.select(Axis(1), &keep);
-        let p_null = u_keep.dot(&u_keep.t());
-        Ok(s_raw + &p_null.mapv(|v| v * kappa))
-    }
+    // After removing the intercept and slope directions from the predictor block,
+    // the ordinary roughness penalties are sufficient.  The linear nullspaces are
+    // no longer present, so no extra shrinkage or fixed ridges are required.
+    let s_pred = s_pred_raw_sc;
+    let mut s_se = s_se_raw_sc;
+    let s_dist = s_dist_raw_sc;
 
-    // Determine kappa - the relative strength of nullspace vs wiggly penalty
-    // This controls how much the nullspace component gets penalized relative to the wiggly part
-    // Default (1.0) means both shrink at the same rate with increasing lambda
-    // Modern approach: Use nullspace_shrinkage_kappa parameter for relative shrinkage tied to lambda
-    let kappa = match spec.nullspace_shrinkage_kappa {
-        Some(k) => k,
-        None => 1.0, // Default to equal shrinkage for nullspace and wiggly components
-    };
-
-    // Legacy-but-still-used-by-tests: add fixed ridge on the penalty nullspace.
-    // This makes S_λ positive definite in practice even when X has duplicate/degenerate columns.
-    let tau = spec.double_penalty_ridge;
-    if tau > 0.0 {
-        eprintln!(
-            "[CAL] Applying fixed nullspace ridge tau={:.3e} in addition to kappa-tied shrinkage",
-            tau
-        );
-    }
-
-    // Log the nullspace penalty strength being used
-    eprintln!(
-        "[CAL] Using nullspace shrinkage kappa={:.3e}, legacy tau={:.3e}",
-        kappa, tau
-    );
-
-    // Helper function to add fixed ridge if needed
-    fn add_fixed_nullspace_ridge(
-        s: &Array2<f64>,
-        tau: f64,
-    ) -> Result<Array2<f64>, EstimationError> {
-        if tau <= 0.0 {
-            return Ok(s.clone());
-        }
-
-        // Get nullspace projector
-        let (z_null, _) = null_range_whiten(s).map_err(|e| EstimationError::BasisError(e))?;
-        if z_null.ncols() == 0 {
-            return Ok(s.clone());
-        }
-
-        // SVD projector onto col(Z): P = U_keep U_keepᵀ
-        let (u_opt, svals, vt_opt) = z_null
-            .svd(true, false)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        drop(vt_opt);
-        let u = u_opt.ok_or_else(|| {
-            EstimationError::LayoutError("SVD did not return U for nullspace projector".to_string())
-        })?;
-        let sig_max = svals.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-        let tol = sig_max * 1e-12;
-        let keep = svals
-            .iter()
-            .enumerate()
-            .filter(|&(_, &val)| val > tol)
-            .map(|(i, _)| i)
-            .collect::<Vec<_>>();
-        if keep.is_empty() {
-            return Ok(s.clone());
-        }
-        let u_keep = u.select(Axis(1), &keep);
-        let p_null = u_keep.dot(&u_keep.t());
-
-        // Add fixed ridge on nullspace
-        Ok(s + &p_null.mapv(|v| v * tau))
-    }
-
-    // For pred and se, apply both nullspace shrinkage tied to lambda and fixed ridge
-    // First apply kappa (tied to lambda) to scaled penalties
-    let s_pred_shrink = add_nullspace_shrink_tied_to_lambda(&s_pred_raw_sc, kappa)?;
-    let s_se_shrink = add_nullspace_shrink_tied_to_lambda(&s_se_raw_sc, kappa)?;
-
-    // Then apply fixed ridge tau if needed
-    let s_pred = add_fixed_nullspace_ridge(&s_pred_shrink, tau)?;
-    let mut s_se = add_fixed_nullspace_ridge(&s_se_shrink, tau)?;
-
-    // For distance smooth: add light regularization even in the linear fallback
-    let s_dist = if use_linear_dist {
-        // Give the fallback a tiny cost so REML must "pay" to use it
-        Array2::<f64>::from_elem((1, 1), 1.0)
-    } else {
-        // For spline basis, apply both types of penalties to scaled matrix
-        let s_dist_shrink = add_nullspace_shrink_tied_to_lambda(&s_dist_raw_sc, kappa)?;
-        add_fixed_nullspace_ridge(&s_dist_shrink, tau)?
-    };
-
-    // SE linear fallback was already handled earlier when creating the basis
     if se_linear_fallback {
-        // Update penalty and knots for consistency
-        s_se = Array2::<f64>::zeros((1, 1)); // Unpenalized linear term
-        knots_se = Array1::zeros(0); // Empty knots for linear fallback
+        knots_se = Array1::zeros(0);
     }
 
-    // Assemble X = [1 | B_pred | B_se | B_dist] and keep the identity backbone as an offset
+    // Assemble X = [B_pred | B_se | B_dist] and keep the identity backbone as an offset
     let offset = features.pred_identity.clone();
-    let pred_smooth_start = 1usize;
-    let p_cols = 1 + b_pred_c.ncols() + b_se_c.ncols() + b_dist_c.ncols();
+    let pred_off = 0usize;
+    let p_cols = b_pred_c.ncols() + b_se_c.ncols() + b_dist_c.ncols();
     let mut x = Array2::<f64>::zeros((n, p_cols));
-    // intercept
-    for i in 0..n {
-        x[[i, 0]] = 1.0;
+    if b_pred_c.ncols() > 0 {
+        x.slice_mut(s![.., pred_off..pred_off + b_pred_c.ncols()])
+            .assign(&b_pred_c);
     }
-    // B_pred - pred smooth fills columns 1..1+pred_cols directly
-    x.slice_mut(s![
-        ..,
-        pred_smooth_start..pred_smooth_start + b_pred_c.ncols()
-    ])
-    .assign(&b_pred_c);
-    // B_se
-    // IMPORTANT: the SE block must start after all pred columns
-    let se_off = pred_smooth_start + b_pred_c.ncols();
-    x.slice_mut(s![.., se_off..se_off + b_se_c.ncols()])
-        .assign(&b_se_c);
-    // B_dist
+    let se_off = pred_off + b_pred_c.ncols();
+    if b_se_c.ncols() > 0 {
+        x.slice_mut(s![.., se_off..se_off + b_se_c.ncols()])
+            .assign(&b_se_c);
+    }
     let dist_off = se_off + b_se_c.ncols();
-    x.slice_mut(s![.., dist_off..dist_off + b_dist_c.ncols()])
-        .assign(&b_dist_c);
+    if b_dist_c.ncols() > 0 {
+        x.slice_mut(s![.., dist_off..dist_off + b_dist_c.ncols()])
+            .assign(&b_dist_c);
+    }
 
     // Full penalty matrices aligned to X columns (zeros for unpenalized cols)
     let p = x.ncols();
@@ -1285,7 +1114,7 @@ pub fn build_calibrator_design(
     // pred penalties: place directly at pred smooth columns (1..1+pred_cols)
     for i in 0..b_pred_c.ncols() {
         for j in 0..b_pred_c.ncols() {
-            s_pred_p[[pred_smooth_start + i, pred_smooth_start + j]] = s_pred[[i, j]];
+            s_pred_p[[pred_off + i, pred_off + j]] = s_pred[[i, j]];
         }
     }
     for i in 0..b_se_c.ncols() {
@@ -1294,8 +1123,7 @@ pub fn build_calibrator_design(
         }
     }
 
-    // Only copy distance penalties when the block actually has columns
-    if !use_linear_dist && b_dist_c.ncols() > 0 {
+    if b_dist_c.ncols() > 0 {
         for i in 0..b_dist_c.ncols() {
             for j in 0..b_dist_c.ncols() {
                 s_dist_p[[dist_off + i, dist_off + j]] = s_dist[[i, j]];
@@ -1320,16 +1148,15 @@ pub fn build_calibrator_design(
         b_dist_c.ncols()
     );
     eprintln!(
-        "[CAL] spline params: pred(degree={}, knots={}), se(knots={}), dist(knots={}), penalty_order={}, nullspace_ridge={}",
-        spec.pred_basis.degree,
-        m_pred_int,
-        m_se_int,
-        m_dist_int,
-        spec.penalty_order_pred,
-        spec.double_penalty_ridge
+        "[CAL] spline params: pred(degree={}, knots={}), se(knots={}), dist(knots={}), penalty_order={}",
+        spec.pred_basis.degree, m_pred_int, m_se_int, m_dist_int, spec.penalty_order_pred
+    );
+    eprintln!(
+        "[CAL] pred block orthogonalized against intercept and slope; cols={}",
+        b_pred_c.ncols()
     );
     // Create ranges for column spans
-    let pred_range = pred_smooth_start..(pred_smooth_start + b_pred_c.ncols()); // pred smooth only
+    let pred_range = pred_off..(pred_off + b_pred_c.ncols());
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
@@ -1337,7 +1164,7 @@ pub fn build_calibrator_design(
         knots_pred,
         knots_se,
         knots_dist,
-        stz_pred,
+        pred_constraint_transform: pred_constraint.clone(),
         stz_se,
         stz_dist,
         standardize_pred: pred_ms,
@@ -1348,7 +1175,6 @@ pub fn build_calibrator_design(
         se_center_offset: mu_se,
         dist_center_offset: mu_dist,
         column_spans: (pred_range, se_range, dist_range),
-        pred_center_offset: 0.0, // No longer used since we removed the linear channel
     };
 
     // Early self-check to ensure built penalties match X width
@@ -1371,7 +1197,10 @@ pub fn build_calibrator_design(
     Ok((x, penalties, schema, offset))
 }
 
-/// Predict with a fitted calibrator model given raw features
+/// Predict with a fitted calibrator model given raw features.
+///
+/// The `pred` argument must be the baseline linear predictor (η) or mean (μ)
+/// that was used as the identity offset during training.
 pub fn predict_calibrator(
     model: &CalibratorModel,
     pred: ArrayView1<f64>,
@@ -1416,7 +1245,7 @@ pub fn predict_calibrator(
         b_se_raw.dot(&model.stz_se)
     };
 
-    let b_pred = b_pred_raw.dot(&model.stz_pred);
+    let b_pred = b_pred_raw.dot(&model.pred_constraint_transform);
     // No separate linear channel - use only the pred smooth
 
     // Handle distance basis, with special case for linear fallback
@@ -1436,17 +1265,14 @@ pub fn predict_calibrator(
         b_dist_raw.dot(&model.stz_dist)
     };
 
-    // Assemble X = [1 | B_pred | B_se | B_dist]
+    // Assemble X = [B_pred | B_se | B_dist]
     let n = pred.len();
     let (pred_range, se_range, dist_range) = &model.column_spans;
     let n_pred_cols = pred_range.end - pred_range.start;
     let n_se_cols = se_range.end - se_range.start;
     let n_dist_cols = dist_range.end - dist_range.start;
-    let p_cols = 1 + n_pred_cols + n_se_cols + n_dist_cols;
+    let p_cols = n_pred_cols + n_se_cols + n_dist_cols;
     let mut x = Array2::<f64>::zeros((n, p_cols));
-    for i in 0..n {
-        x[[i, 0]] = 1.0;
-    }
     if n_pred_cols > 0 {
         x.slice_mut(s![.., pred_range.start..pred_range.end])
             .assign(&b_pred.slice(s![.., ..n_pred_cols]));
@@ -1524,14 +1350,9 @@ pub fn fit_calibrator(
     link: LinkFunction,
     spec: &CalibratorSpec,
 ) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
-    // Use the spec parameter to configure options based on the penalty settings
     let opts = ExternalOptimOptions {
         link,
-        max_iter: if spec.double_penalty_ridge > 0.0 {
-            50
-        } else {
-            75
-        }, // More iterations for no ridge
+        max_iter: 75,
         tol: 1e-3,
     };
     eprintln!(
@@ -2885,9 +2706,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: true,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -2992,9 +2811,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 0.0, // No nullspace ridge
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3015,9 +2832,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-3, // Small nullspace ridge
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3186,9 +3001,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3280,9 +3093,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3387,9 +3198,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3499,9 +3308,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-10, // Very small ridge to encourage issues
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3625,9 +3432,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3654,7 +3459,7 @@ mod tests {
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -3664,7 +3469,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3787,9 +3591,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -3815,7 +3617,7 @@ mod tests {
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -3825,7 +3627,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -3930,9 +3731,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -4010,9 +3809,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -4044,7 +3841,7 @@ mod tests {
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -4054,7 +3851,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -4176,9 +3972,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: true,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None, // Enable distance hinging
         };
 
@@ -4210,7 +4004,7 @@ mod tests {
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -4220,7 +4014,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -4385,9 +4178,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -4469,9 +4260,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: true, // Enable distance hinging
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: Some(weights.clone()), // Use non-uniform weights
         };
 
@@ -4517,7 +4306,7 @@ mod tests {
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -4527,7 +4316,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -4630,9 +4418,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -4657,7 +4443,7 @@ mod tests {
             knots_pred: schema.knots_pred.clone(),
             knots_se: schema.knots_se.clone(),
             knots_dist: schema.knots_dist.clone(),
-            stz_pred: schema.stz_pred.clone(),
+            pred_constraint_transform: schema.pred_constraint_transform.clone(),
             stz_se: schema.stz_se.clone(),
             stz_dist: schema.stz_dist.clone(),
             standardize_pred: schema.standardize_pred,
@@ -4667,7 +4453,6 @@ mod tests {
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas[0],
             lambda_se: lambdas[1],
             lambda_dist: lambdas[2],
@@ -4812,9 +4597,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -4967,9 +4750,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -5162,9 +4943,7 @@ mod tests {
                 penalty_order_pred: 2,
                 penalty_order_se: 2,
                 penalty_order_dist: 2,
-                double_penalty_ridge: 1e-4,
                 distance_hinge: false,
-                nullspace_shrinkage_kappa: Some(1.0),
                 prior_weights: None,
             };
 
@@ -5313,9 +5092,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -5444,9 +5221,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -5563,9 +5338,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: false,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None,
         };
 
@@ -5841,9 +5614,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: true,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: None, // Uniform weights
         };
 
@@ -5873,9 +5644,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            double_penalty_ridge: 1e-4,
             distance_hinge: true,
-            nullspace_shrinkage_kappa: Some(1.0),
             prior_weights: Some(weights.clone()), // Non-uniform weights
         };
 
