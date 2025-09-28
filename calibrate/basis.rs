@@ -1,4 +1,4 @@
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
@@ -344,8 +344,8 @@ pub fn apply_weighted_orthogonality_constraint(
 
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
 
-    use crate::calibrate::faer_ndarray::FaerSvd;
-    let mut constraint_cross_t = constraint_cross.t().to_owned();
+    let constraint_cross_t = constraint_cross.t().to_owned();
+
     let (_, singular_values, vt_opt) = constraint_cross_t
         .svd(false, true)
         .map_err(BasisError::LinalgError)?;
@@ -358,25 +358,20 @@ pub fn apply_weighted_orthogonality_constraint(
     let max_sigma = singular_values
         .iter()
         .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
-    let dim_scale = k.max(q) as f64;
     let tol = if max_sigma > 0.0 {
-        max_sigma * 1e-9 * dim_scale
+        (k.max(q) as f64) * 1e-12 * max_sigma
     } else {
         1e-12
     };
+    let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
 
-    let mut zero_sigma_indices = Vec::new();
-    for (idx, &sigma) in singular_values.iter().enumerate() {
-        if sigma <= tol {
-            zero_sigma_indices.push(idx);
-        }
-    }
-
-    if zero_sigma_indices.is_empty() {
+    let total_cols = v.ncols();
+    if rank >= total_cols {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
-    let transform = v.select(Axis(1), &zero_sigma_indices);
+    let transform = v.slice(s![.., rank..]).to_owned();
+
     if transform.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }

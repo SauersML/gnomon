@@ -11,7 +11,6 @@ use crate::calibrate::pirls; // for PirlsResult
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
-use crate::calibrate::faer_ndarray::FaerSvd;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
@@ -935,7 +934,8 @@ pub fn build_calibrator_design(
         Ok(res) => res,
         Err(BasisError::ConstraintNullspaceNotFound) => {
             eprintln!(
-                "[CAL] pred basis fully constrained by {1, eta}; increase knots/degree for wiggles"
+                "[CAL] pred basis fully constrained by {{1, eta}}; increase knots/degree for wiggles"
+
             );
             (
                 Array2::<f64>::zeros((n, 0)),
@@ -1348,7 +1348,7 @@ pub fn fit_calibrator(
     offset: ArrayView1<f64>,
     penalties: &[Array2<f64>],
     link: LinkFunction,
-    spec: &CalibratorSpec,
+    _spec: &CalibratorSpec,
 ) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
     let opts = ExternalOptimOptions {
         link,
@@ -1431,6 +1431,7 @@ pub fn fit_calibrator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::basis::null_range_whiten;
     use ndarray::{Array1, Array2, Axis};
     use rand::prelude::*;
     use rand_distr::{Bernoulli, Distribution, Normal, Uniform};
@@ -4260,7 +4261,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
-            distance_hinge: true, // Enable distance hinging
+            distance_hinge: true,                 // Enable distance hinging
             prior_weights: Some(weights.clone()), // Use non-uniform weights
         };
 
