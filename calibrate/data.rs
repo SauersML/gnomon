@@ -22,8 +22,6 @@ use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
 
-// Removed custom CSV parser in favor of using the Polars built-in functionality
-
 // --- Public Data Structures ---
 
 /// A container for validated data ready for model training.
@@ -129,7 +127,7 @@ mod internal {
             Ok(())
         }
 
-        // --- 1. Generate the exact list of required column names ---
+        // --- Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
         if include_phenotype {
@@ -138,7 +136,7 @@ mod internal {
         required_cols.push("score".to_string());
         required_cols.extend_from_slice(&pc_names);
 
-        // --- 2. Read and validate the DataFrame using Polars ---
+        // --- Read and validate the DataFrame using Polars ---
         println!("Loading data from '{path}'");
 
         // Use the Polars CsvReader for efficiency
@@ -179,7 +177,7 @@ mod internal {
             println!("Required 'weights' column found.");
         }
 
-        // --- 3. Convert columns efficiently to ndarray structures ---
+        // --- Convert columns efficiently to ndarray structures ---
 
         // Process phenotype column if needed
         let phenotype_opt = if include_phenotype {

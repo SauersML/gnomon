@@ -132,11 +132,11 @@ pub struct PirlsResult {
 /// This function implements the complete algorithm from mgcv's gam.fit3 function
 /// for fitting a GAM model with a fixed set of smoothing parameters:
 ///
-/// 1. Perform stable reparameterization ONCE at the beginning (mgcv's gam.reparam)
-/// 2. Transform the design matrix into this stable basis
-/// 3. Extract a single penalty square root from the transformed penalty
-/// 4. Run the P-IRLS loop entirely in the transformed basis
-/// 5. Transform the coefficients back to the original basis only when returning
+/// - Perform stable reparameterization ONCE at the beginning (mgcv's gam.reparam)
+/// - Transform the design matrix into this stable basis
+/// - Extract a single penalty square root from the transformed penalty
+/// - Run the P-IRLS loop entirely in the transformed basis
+/// - Transform the coefficients back to the original basis only when returning
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.  
@@ -151,7 +151,7 @@ pub fn fit_model_for_fixed_rho(
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
     // No test-specific hacks - the properly implemented algorithm should handle all cases
-    // Step 1: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
+    // Stage: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
     let lambdas = rho_vec.mapv(f64::exp);
 
     log::info!(
@@ -168,7 +168,7 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Step 2: Create lambda-INDEPENDENT balanced penalty root for stable rank detection
+    // Stage: Create the lambda-independent balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
     log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
 
@@ -188,7 +188,7 @@ pub fn fit_model_for_fixed_rho(
         eb.shape()
     );
 
-    // Step 3: Perform stable reparameterization EXACTLY ONCE before P-IRLS loop
+    // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
     println!("[Reparam] ==> Entering stable_reparameterization...");
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
@@ -207,7 +207,7 @@ pub fn fit_model_for_fixed_rho(
         reparam_result.qs.shape()
     );
 
-    // Step 3: Transform the design matrix into the stable basis
+    // Stage: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
 
     println!(
@@ -225,7 +225,7 @@ pub fn fit_model_for_fixed_rho(
         eb_transformed.sum()
     );
 
-    // Step 4: Extract penalty matrices using the TRULY lambda-independent eb
+    // Stage: Extract penalty matrices using the truly lambda-independent eb
     // Note: eb is computed from unweighted penalties and never changes with lambda
     let s_transformed = &reparam_result.s_transformed;
     // eb is already computed above as lambda-INDEPENDENT
@@ -235,7 +235,7 @@ pub fn fit_model_for_fixed_rho(
     let s_from_e_precomputed = e_transformed.t().dot(e_transformed);
     let x_transformed_t = x_transformed.t().to_owned();
 
-    // Step 5: Initialize P-IRLS state variables in the TRANSFORMED basis
+    // Stage: Initialize P-IRLS state variables in the transformed basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = offset.to_owned();
     eta += &x_transformed.dot(&beta_transformed);
@@ -1184,15 +1184,15 @@ pub fn update_glm_vectors(
             let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
             mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
 
-            // 1. Calculate dμ/dη, which is μ(1-μ) for the logit link.
+            // Stage: Calculate dμ/dη, which is μ(1-μ) for the logit link.
             // This term must NOT include prior weights.
             let dmu_deta = &mu * &(1.0 - &mu);
 
-            // 2a. Weights: use true Fisher weights with a tiny floor to avoid literal zeros
+            // Stage: Form the true Fisher weights with a tiny floor to avoid literal zeros
             let fisher_w = dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
             let weights = &prior_weights * &fisher_w;
 
-            // 2b. Working response denominator: allow a slightly larger floor for stability
+            // Stage: Build the working-response denominator with a slightly larger floor for stability
             let denom_z = dmu_deta.mapv(|v| v.max(MIN_D_FOR_Z));
             let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &denom_z);
 
@@ -1307,21 +1307,21 @@ pub fn solve_penalized_least_squares(
         let z_eff = &z - &offset;
         let wz = &sqrt_w * &z_eff;
 
-        // 1) Use pivoted QR only to determine rank and column ordering
+        // Stage: Use pivoted QR only to determine rank and column ordering
         let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
         let diag = r_factor.diag();
         let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         let tol = max_diag * 1e-12;
         let rank = diag.iter().filter(|&&v| v.abs() > tol).count();
 
-        // 2) Build submatrix from the first `rank` pivoted columns (in original index space)
+        // Stage: Build the submatrix from the first `rank` pivoted columns (in original index space)
         let kept_cols = &pivot[..rank];
         let mut wx_kept = Array2::<f64>::zeros((wx.nrows(), rank));
         for (j_new, &j_orig) in kept_cols.iter().enumerate() {
             wx_kept.column_mut(j_new).assign(&wx.column(j_orig));
         }
 
-        // 3) Solve LS on the kept submatrix via SVD (β_kept = V Σ⁺ Uᵀ wz)
+        // Stage: Solve least squares on the kept submatrix via SVD (β_kept = V Σ⁺ Uᵀ wz)
         use crate::calibrate::faer_ndarray::FaerSvd;
         let (u_opt, s, vt_opt) = wx_kept
             .svd(true, true)
@@ -1348,13 +1348,13 @@ pub fn solve_penalized_least_squares(
         }
         let beta_kept = vt.t().dot(&s_inv_utb); // length = rank
 
-        // 4) Construct full beta with dropped columns set to zero
+        // Stage: Construct the full beta vector with dropped columns set to zero
         let mut beta_transformed = Array1::<f64>::zeros(x_transformed.ncols());
         for (j_new, &j_orig) in kept_cols.iter().enumerate() {
             beta_transformed[j_orig] = beta_kept[j_new];
         }
 
-        // 5) Build Hessian H = Xᵀ W X (since S=0) using preallocated buffer
+        // Stage: Build the Hessian H = Xᵀ W X (since S=0) using the preallocated buffer
         use ndarray::linalg::{general_mat_mul, general_mat_vec_mul};
         let p_wx = wx.ncols();
         if workspace.xtwx_buf.dim() != (p_wx, p_wx) {
@@ -1559,9 +1559,7 @@ pub fn solve_penalized_least_squares(
 
     // EXACTLY following mgcv's pls_fit1 multi-stage approach:
 
-    //-----------------------------------------------------------------------
-    // STAGE 1: Initial QR decomposition of weighted design matrix
-    //-----------------------------------------------------------------------
+    // Stage: Initial QR decomposition of the weighted design matrix
 
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
     workspace.sqrt_w.assign(&weights.mapv(f64::sqrt)); // Weights are guaranteed non-negative
@@ -1591,9 +1589,7 @@ pub fn solve_penalized_least_squares(
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(wz);
 
-    //-----------------------------------------------------------------------
-    // STAGE 2: Rank determination using scaled augmented system
-    //-----------------------------------------------------------------------
+    // Stage: Rank determination using the scaled augmented system
 
     // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
     // This ensures the columns of both matrices are aligned correctly
@@ -1659,9 +1655,7 @@ pub fn solve_penalized_least_squares(
         });
     }
 
-    //-----------------------------------------------------------------------
-    // STAGE 3: Create rank-reduced system using the rank pivot
-    //-----------------------------------------------------------------------
+    // Stage: Create the rank-reduced system using the rank pivot
 
     // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
     let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
@@ -1683,9 +1677,7 @@ pub fn solve_penalized_least_squares(
     // Record kept positions in the initial pivoted order for later reconstruction
     let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
 
-    //-----------------------------------------------------------------------
-    // STAGE 4: Final QR decomposition on the unscaled, reduced system
-    //-----------------------------------------------------------------------
+    // Stage: Final QR decomposition on the unscaled, reduced system
 
     // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
     // This uses the lambda-DEPENDENT penalty for actual penalty application
@@ -1734,9 +1726,7 @@ pub fn solve_penalized_least_squares(
         );
     }
 
-    //-----------------------------------------------------------------------
-    // STAGE 5: Apply second transformation to the RHS and solve system
-    //-----------------------------------------------------------------------
+    // Stage: Apply the second transformation to the RHS and solve the system
 
     // Prepare the full RHS for the final system
     assert!(workspace.rhs_full.len() >= final_aug_rows);
@@ -1792,9 +1782,7 @@ pub fn solve_penalized_least_squares(
         beta_dropped[i] = sum / r_square[[i, i]];
     }
 
-    //-----------------------------------------------------------------------
-    // STAGE 6: Reconstruct the full coefficient vector
-    //-----------------------------------------------------------------------
+    // Stage: Reconstruct the full coefficient vector
     // Direct composition approach: orig_j = initial_pivot[ kept_positions[ final_pivot[j] ] ]
     // This maps each solved coefficient directly to its original column index
 
@@ -1834,9 +1822,7 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    //-----------------------------------------------------------------------
-    // STAGE 7: Construct the penalized Hessian
-    //-----------------------------------------------------------------------
+    // Stage: Construct the penalized Hessian
     // Build XtWX without re-touching n using Stage 1 QR result.
     // From (sqrt(W)X) * P = Q * R  =>  Xᵀ W X = P (Rᵀ R) Pᵀ
     // Compute RᵀR into a preallocated buffer
@@ -1893,9 +1879,7 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    //-----------------------------------------------------------------------
-    // STAGE 8: Calculate EDF and scale parameter
-    //-----------------------------------------------------------------------
+    // Stage: Calculate the EDF and scale parameter
 
     // Calculate effective degrees of freedom using H and XtWX directly (stable)
     let mut edf = calculate_edf(&penalized_hessian, e_transformed)?;
@@ -1961,7 +1945,7 @@ fn pivoted_qr_faer(
     let n = matrix.ncols();
     let k = m.min(n);
 
-    // Step 1: Convert ndarray to faer Mat
+    // Stage: Convert ndarray to a faer matrix
     let mut a_faer = Mat::zeros(m, n);
     for i in 0..m {
         for j in 0..n {
@@ -1969,11 +1953,11 @@ fn pivoted_qr_faer(
         }
     }
 
-    // Step 2: Perform the column-pivoted QR decomposition using the high-level API
+    // Stage: Perform the column-pivoted QR decomposition using the high-level API
     // This guarantees that Q, R, and P are all from the same consistent decomposition
     let qr = ColPivQr::new(a_faer.as_ref());
 
-    // Step 3: Extract the consistent Q factor (thin version)
+    // Stage: Extract the consistent Q factor (thin version)
     let q_faer = qr.compute_thin_Q();
     let mut q = Array2::zeros((m, k));
     for i in 0..m {
@@ -1982,7 +1966,7 @@ fn pivoted_qr_faer(
         }
     }
 
-    // Step 4: Extract the consistent R factor
+    // Stage: Extract the consistent R factor
     let r_faer = qr.R();
     let mut r = Array2::zeros((k, n));
     for i in 0..k {
@@ -1991,7 +1975,7 @@ fn pivoted_qr_faer(
         }
     }
 
-    // Step 5: Extract the consistent column permutation (pivot)
+    // Stage: Extract the consistent column permutation (pivot)
     let perm = qr.P();
     let (p0_slice, p1_slice) = perm.arrays();
     let p0: Vec<usize> = p0_slice.to_vec();
@@ -2141,14 +2125,14 @@ pub fn compute_final_penalized_hessian(
 
     let p = x.ncols();
 
-    // Step 1: Perform the QR decomposition of sqrt(W)X to get R_bar
+    // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
     let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
     let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
     let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
     let r_rows = r_bar.nrows().min(p);
     let r1_full = r_bar.slice(s![..r_rows, ..]);
 
-    // Step 2: Get the square root of the penalty matrix, E
+    // Stage: Get the square root of the penalty matrix, E
     // We need to use eigendecomposition as S_lambda is not necessarily from a single root
     let (eigenvalues, eigenvectors) = s_lambda
         .eigh(Side::Lower)
@@ -2176,7 +2160,7 @@ pub fn compute_final_penalized_hessian(
         }
     }
 
-    // Step 3: Form the augmented matrix [R1; E_t]
+    // Stage: Form the augmented matrix [R1; E_t]
     // Note: Here we use the full, un-truncated matrices because we are just computing
     // the Hessian for a given model, not performing rank detection.
     let e_t = e.t();
@@ -2187,12 +2171,12 @@ pub fn compute_final_penalized_hessian(
         .assign(&r1_full);
     augmented_matrix.slice_mut(s![r_rows.., ..]).assign(&e_t);
 
-    // Step 4: Perform QR decomposition on the augmented matrix
+    // Stage: Perform the QR decomposition on the augmented matrix
     let (_, r_aug) = augmented_matrix
         .qr()
         .map_err(EstimationError::LinearSystemSolveFailed)?;
 
-    // Step 5: The penalized Hessian is R_aug' * R_aug
+    // Stage: Recognize that the penalized Hessian is R_aug' * R_aug
     let h_final = r_aug.t().dot(&r_aug);
 
     Ok(h_final)
@@ -2272,7 +2256,7 @@ mod tests {
         link_function: LinkFunction,
         signal_type: SignalType,
     ) -> Result<TestScenarioResult, Box<dyn std::error::Error>> {
-        // --- 1. Data Generation ---
+        // --- Data generation ---
         let n_samples = 1000;
         let mut rng = StdRng::seed_from_u64(42);
         let p = Array1::linspace(-2.0, 2.0, n_samples);
@@ -2311,7 +2295,7 @@ mod tests {
             weights: Array1::from_elem(n_samples, 1.0),
         };
 
-        // --- 2. Model Configuration ---
+        // --- Model configuration ---
         let config = ModelConfig {
             link_function,
             penalty_order: 2,
@@ -2333,7 +2317,7 @@ mod tests {
             interaction_orth_alpha: HashMap::new(),
         };
 
-        // --- 3. Run the Fit ---
+        // --- Run the fit ---
         let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
@@ -2349,7 +2333,7 @@ mod tests {
             &config,
         )?;
 
-        // --- 4. Return all necessary components for assertion ---
+        // --- Return all necessary components for assertion ---
         Ok(TestScenarioResult {
             pirls_result,
             x_matrix,
@@ -2790,7 +2774,7 @@ mod tests {
 
         // === PHASE 6: Assert stability and correctness ===
 
-        // 1. Assert Finiteness: The result must not contain any non-finite numbers.
+        // Stage: Assert finiteness by ensuring the result contains no non-finite numbers
         assert!(
             pirls_result.deviance.is_finite(),
             "Deviance must be a finite number, but was {}",
@@ -2808,7 +2792,7 @@ mod tests {
             "The penalized Hessian must be finite."
         );
 
-        // 2. Assert Correctness (Sanity Check): The model should learn a flat function.
+        // Stage: Assert correctness by verifying the model learns a flat function
         // Transform beta back to the original, interpretable basis.
         let beta_original = pirls_result
             .reparam_result
@@ -3507,7 +3491,7 @@ mod tests {
     fn test_pivoted_qr_permutation_is_reliable() {
         use ndarray::arr2;
 
-        // 1. SETUP: Create a matrix that is tricky to pivot.
+        // Stage: Set up a matrix that is tricky to pivot
         // It's nearly rank-deficient, with highly correlated columns, forcing a non-trivial pivot.
         // This is representative of the design matrices created in the model tests.
         let a = arr2(&[
@@ -3517,10 +3501,10 @@ mod tests {
             [8.0, 9.0, 17.0, 8.0000004],
         ]);
 
-        // 2. EXECUTION: Call the function under test.
+        // Stage: Execute the function under test
         let (q, r, pivot) = pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
 
-        // 3. VERIFICATION: Check if the fundamental QR identity holds.
+        // Stage: Verify that the fundamental QR identity holds
         // First, apply the permutation to the original matrix 'a'.
         let a_pivoted = pivot_columns(a.view(), &pivot);
 
@@ -3537,7 +3521,7 @@ mod tests {
         println!("Q*R Product:\n{:?}", qr_product);
         println!("Reconstruction Error Norm: {}", reconstruction_error_norm);
 
-        // 4. ASSERTION: The reconstruction error must be small, proving the pivot is correct.
+        // Stage: Assert that the reconstruction error is small, proving the pivot is correct
         // A correct implementation should have an error norm close to machine epsilon (~1e-15).
         // An error norm greater than 1e-6 would be a definitive failure.
         assert!(

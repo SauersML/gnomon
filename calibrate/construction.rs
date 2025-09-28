@@ -386,7 +386,7 @@ pub fn build_design_and_penalty_matrices(
     interaction_centering_means.reserve(n_pcs);
     interaction_orth_alpha.reserve(n_pcs);
 
-    // 1. Generate basis for PGS and apply sum-to-zero constraint
+    // Stage: Generate the PGS basis and apply the sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
         data.p.view(),
         config.pgs_range,
@@ -398,7 +398,6 @@ pub fn build_design_and_penalty_matrices(
     knot_vectors.insert("pgs".to_string(), pgs_knots);
 
     // Build PGS penalty on FULL basis (not arbitrarily sliced)
-    // Note: previous eigen-decomposition and range extraction were unused and removed
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
@@ -416,7 +415,7 @@ pub fn build_design_and_penalty_matrices(
     // Save the PGS sum-to-zero constraint transformation
     sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform);
 
-    // 2. Generate range-only bases for PCs (functional ANOVA decomposition)
+    // Stage: Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
     let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut pc_unconstrained_bases_main: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
@@ -439,8 +438,6 @@ pub fn build_design_and_penalty_matrices(
 
         // Save PC knot vector
         knot_vectors.insert(pc_name.clone(), pc_knots);
-
-        // Note: previous eigen-decomposition and range extraction were unused and removed
 
         // For PC main effects: use non-intercept columns for whitened range basis
         let pc_main_basis_unc = pc_basis_unc.slice(s![.., 1..]);
@@ -468,7 +465,7 @@ pub fn build_design_and_penalty_matrices(
         range_transforms.insert(pc_name.clone(), z_range_pc);
     }
 
-    // 3. Calculate layout first to determine matrix dimensions
+    // Stage: Calculate the layout first to determine matrix dimensions
     let pc_range_ncols: Vec<usize> = pc_range_bases.iter().map(|b| b.ncols()).collect();
     let pc_null_ncols: Vec<usize> = pc_null_bases
         .iter()
@@ -488,7 +485,7 @@ pub fn build_design_and_penalty_matrices(
         pgs_range_ncols, // Use PGS range size for interactions
     )?;
 
-    // 4. Create individual penalty matrices - one per PC main and two per interaction
+    // Stage: Create individual penalty matrices—one per PC main and two per interaction
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
     let mut s_list = Vec::with_capacity(layout.num_penalties);
@@ -537,14 +534,14 @@ pub fn build_design_and_penalty_matrices(
 
     // Range transformations will be returned directly to the caller
 
-    // 5. Assemble the full design matrix `X` using the layout as the guide
+    // Stage: Assemble the full design matrix `X` using the layout as the guide
     // Following a strict canonical order to match the coefficient flattening logic in model.rs
     let mut x_matrix = Array2::zeros((n_samples, layout.total_coeffs));
 
-    // 1. Intercept - always the first column
+    // Stage: Populate the intercept column first
     x_matrix.column_mut(layout.intercept_col).fill(1.0);
 
-    // 2. Main PC effects: first unpenalized null-space (if any), then penalized range
+    // Stage: Fill main PC effects (null-space first, then penalized range)
     for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
         let pc_name = &pc_config.name;
         // Fill null-space columns
@@ -600,7 +597,7 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
-    // 3. Main PGS effect - directly use the layout range
+    // Stage: Populate the main PGS effect directly from the layout range
     let pgs_range = layout.pgs_main_cols.clone();
 
     // Validate dimensions before assignment
@@ -623,7 +620,7 @@ pub fn build_design_and_penalty_matrices(
         .slice_mut(s![.., pgs_range])
         .assign(&pgs_main_basis);
 
-    // 4. Tensor product interaction effects - Range × Range only (fully penalized)
+    // Stage: Populate tensor product interaction effects using Range × Range (fully penalized)
     if pgs_range_ncols > 0 && !pc_range_bases.is_empty() {
         // Use WHITENED marginals for interactions to match main effect scaling
         let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
@@ -1070,7 +1067,8 @@ pub fn stable_reparameterization(
             break;
         }
 
-        // Step 1: Find Frobenius norms of penalties in current sub-problem
+
+        // Step: Find Frobenius norms of penalties in current sub-problem
         // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
         let mut frob_norms = Vec::new();
         let mut max_omega: f64 = 0.0;
@@ -1103,7 +1101,7 @@ pub fn stable_reparameterization(
             break; // All remaining penalties are numerically zero
         }
 
-        // Step 2: Partition into dominant α and subdominant γ' sets
+        // Stage: Partition into dominant α and subdominant γ' sets
         // This is the most critical part of the algorithm
         // We must ensure this logic exactly matches mgcv's get_stableS function
         let threshold = eps * max_omega;
@@ -1146,7 +1144,7 @@ pub fn stable_reparameterization(
 
         // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
 
-        // Step 3a: Form SCALED sum for STABLE RANK DETECTION (lambda-INDEPENDENT)
+        // Stage: Form a scaled sum for stable rank detection (lambda-independent)
         // This creates a lambda-independent, balanced matrix for reliable rank detection
         let mut sb_for_rank = Array2::zeros((q_current, q_current));
         for &i in &alpha {
@@ -1227,7 +1225,7 @@ pub fn stable_reparameterization(
             }
         }
 
-        // Step 3b: Form WEIGHTED sum for TRANSFORMATION (lambda-weighted for eigenvectors)
+        // Stage: Form a weighted sum for the transformation (lambda-weighted for eigenvectors)
         // This matrix provides the eigenvectors for the similarity transform
         let mut sb_for_transform = Array2::zeros((q_current, q_current));
         for &i in &alpha {
@@ -1303,7 +1301,7 @@ pub fn stable_reparameterization(
         let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])
             .expect("Failed to reorder eigenvectors");
 
-        // Step 5B: Update global transformation matrix Qf using the REORDERED basis
+        // Stage: Update the global transformation matrix Qf using the reordered basis
         let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
         let qf_new = qf_block.dot(&u_reordered);
         qf.slice_mut(s![.., k_offset..k_offset + q_current])
@@ -1332,7 +1330,7 @@ pub fn stable_reparameterization(
                 .assign(&transformed_sub_block);
         }
 
-        // Step 6: Transform ALL active penalty roots by the REORDERED eigenvector matrix U.
+        // Stage: Transform all active penalty roots by the reordered eigenvector matrix U.
         // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.
         for &i in &gamma {
             if rs_current[i].nrows() == 0 || q_current == 0 {
@@ -1352,7 +1350,7 @@ pub fn stable_reparameterization(
         }
 
         // ---
-        // Step 7: Partitioning logic
+        // Stage: Partitioning logic
         // After transforming with `u_reordered`, the first `r` rows correspond to the range
         // space, and the last `q_current - r` rows correspond to the null space.
         // ---
@@ -1448,10 +1446,10 @@ pub fn stable_reparameterization(
 
     // AFTER LOOP: Generate final outputs from the transformed penalty roots
 
-    // Step 1: The loop has finished - rs_current now contains the fully transformed penalty roots
+    // Stage: The loop has finished - rs_current now contains the fully transformed penalty roots
     let final_rs_transformed = rs_current;
 
-    // Step 2: Construct the final transformed total penalty matrix
+    // Stage: Construct the final transformed total penalty matrix
     let mut s_transformed = Array2::zeros((p, p));
     for i in 0..m {
         // Form full penalty from transformed root: S_k = rS_k^T * rS_k
@@ -1459,7 +1457,7 @@ pub fn stable_reparameterization(
         s_transformed.scaled_add(lambdas[i], &s_k_transformed);
     }
 
-    // Step 3: Compute eigendecomposition of S_lambda
+    // Stage: Compute the eigendecomposition of S_lambda
     let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
         .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
@@ -1497,14 +1495,14 @@ pub fn stable_reparameterization(
     // This represents the true penalty strength and changes with lambda values
     let e_transformed = e_matrix.t().to_owned();
 
-    // Step 4: Calculate log-pseudo-determinant from the positive eigenvalues
+    // Stage: Calculate the log-pseudo-determinant from the positive eigenvalues
     let log_det: f64 = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
         .map(|&ev| ev.ln())
         .sum();
 
-    // Step 5: Calculate derivatives using the correct transformed matrices
+    // Stage: Calculate derivatives using the correct transformed matrices
     let mut det1 = Array1::zeros(lambdas.len());
 
     // Compute pseudo-inverse S_lambda^+ using only eigenvalues above tolerance
@@ -1705,7 +1703,7 @@ mod tests {
 
         // The design matrix should be full-rank by construction
         // The code cleverly builds interaction terms using main effect bases that already
-        // have intercept columns removed, preventing rank deficiency from the start
+        // omit intercept columns to prevent rank deficiency from the start
         assert_eq!(
             rank,
             x.ncols(),

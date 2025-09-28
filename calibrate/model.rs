@@ -220,7 +220,7 @@ impl TrainedModel {
         ),
         ModelError,
     > {
-        // --- 1. Validate Inputs ---
+        // --- Validate inputs ---
         if pcs_new.ncols() != self.config.pc_configs.len() {
             return Err(ModelError::MismatchedPcCount {
                 found: pcs_new.ncols(),
@@ -228,7 +228,7 @@ impl TrainedModel {
             });
         }
 
-        // --- 2. Geometry: compute signed distance and projection in one pass ---
+        // --- Geometry: compute signed distance and projection in one pass ---
         let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
         let (signed_dist, x_corr) = if let Some(hull) = &self.hull {
             hull.signed_distance_and_project_many(raw.view())
@@ -237,7 +237,7 @@ impl TrainedModel {
         };
         let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
 
-        // --- 3. Build design and coefficients ---
+        // --- Build design and coefficients ---
         let x_new = internal::construct_design_matrix(
             p_corr.view(),
             pcs_corr.view(),
@@ -249,7 +249,7 @@ impl TrainedModel {
             return Err(ModelError::InternalStackingError);
         }
 
-        // --- 4. Linear predictor and mean ---
+        // --- Linear predictor and mean ---
         let eta = x_new.dot(&beta);
         let mean = match self.config.link_function {
             LinkFunction::Logit => {
@@ -261,7 +261,7 @@ impl TrainedModel {
             LinkFunction::Identity => eta.clone(),
         };
 
-        // --- 5. Optional SE for eta using penalized Hessian ---
+        // --- Optional SE for eta using the penalized Hessian ---
         let se_eta_opt = if let Some(h) = &self.penalized_hessian {
             if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
                 None
@@ -300,9 +300,9 @@ impl TrainedModel {
     /// Predicts outcomes for new individuals using the trained model.
     ///
     /// This is the core inference engine. It is a fast, non-iterative process that:
-    /// 1. Reconstructs the mathematical model (design matrix and coefficient vector)
-    ///    from the stored configuration.
-    /// 2. Computes the final prediction via matrix algebra.
+    /// - Reconstructs the mathematical model (design matrix and coefficient vector)
+    ///   from the stored configuration.
+    /// - Computes the final prediction via matrix algebra.
     ///
     /// # Arguments
     /// * `p_new`: A 1D array view of new PGS values.
@@ -329,14 +329,14 @@ impl TrainedModel {
         p_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
-        // 1) Baseline predictions
+        // Stage: Compute baseline predictions
         let baseline = self.predict(p_new, pcs_new)?;
-        // 2) If no calibrator present, error loudly (no silent fallback)
+        // Stage: If no calibrator is present, error loudly (no silent fallback)
         if self.calibrator.is_none() {
             return Err(ModelError::CalibratorMissing);
         }
 
-        // 3) Get eta, signed distance, and se(eta) via detailed path
+        // Stage: Retrieve eta, signed distance, and se(eta) via the detailed path
         let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
         let pred_in = match self.config.link_function {
@@ -456,8 +456,6 @@ mod internal {
         (p, pcs)
     }
 
-    // (projection helper removed; call hull.project_if_needed directly)
-
     /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
     /// This creates the design matrix columns for tensor product interactions.
     /// Each row of the result is the outer product of the corresponding rows from A and B.
@@ -502,7 +500,7 @@ mod internal {
                 pcs_new.nrows()
             )));
         }
-        // 1. Generate basis for PGS using saved knot vector if available
+        // Stage: Generate the PGS basis using the saved knot vector if available
         // Only use saved knot vectors - remove fallback to ensure consistency
         let saved_knots = config
             .knot_vectors
@@ -559,10 +557,7 @@ mod internal {
         // without a corresponding change to the layout logic will cause a dimension mismatch and lead
         // to silently incorrect predictions. The debug_assert in TrainedModel::predict guards against this.
 
-        // This closure was not used - removed
-        // Previously defined a helper to fetch Z transform from model
-
-        // 2. Generate bases for PCs (functional ANOVA decomposition: null + range)
+        // Stage: Generate bases for PCs (functional ANOVA decomposition: null + range)
         let mut pc_range_bases = Vec::new();
         let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::new();
         let mut pc_unconstrained_bases_main = Vec::new();
@@ -627,14 +622,14 @@ mod internal {
             }
         }
 
-        // 3. Assemble the design matrix following the canonical order
+        // Stage: Assemble the design matrix following the canonical order
         let n_samples = p_new.len();
         let mut owned_cols: Vec<Array1<f64>> = Vec::new();
 
-        // 1. Intercept
+    // Stage: Populate the intercept column
         owned_cols.push(Array1::ones(n_samples));
 
-        // 2. Main PC effects per PC: null first (if any), then range
+    // Stage: Add main PC effects per PC—null first (if any), then range
         for pc_idx in 0..config.pc_configs.len() {
             if let Some(ref null_basis) = pc_null_bases[pc_idx] {
                 for col in null_basis.axis_iter(Axis(1)) {
@@ -646,12 +641,12 @@ mod internal {
             }
         }
 
-        // 3. Main PGS effect
+    // Stage: Add the main PGS effect
         for col in pgs_main_basis.axis_iter(Axis(1)) {
             owned_cols.push(col.to_owned());
         }
 
-        // 4. Tensor product interaction effects - only if PCs are present
+    // Stage: Add tensor product interaction effects (only if PCs are present)
         if !config.pc_configs.is_empty() {
             // Use WHITENED basis for consistency with training
             let z_range_pgs_pred = config
@@ -760,10 +755,10 @@ mod internal {
         let mut flattened: Vec<f64> = Vec::new();
 
         // Order of concatenation MUST exactly match `construct_design_matrix`.
-        // 1. Intercept
+        // Stage: Intercept
         flattened.push(coeffs.intercept);
 
-        // 2. Main PC effects (ordered by pc_configs for determinism).
+        // Stage: Main PC effects (ordered by pc_configs for determinism)
         for pc_config in &config.pc_configs {
             let pc_name = &pc_config.name;
             let c = coeffs
@@ -774,10 +769,10 @@ mod internal {
             flattened.extend_from_slice(c);
         }
 
-        // 3. Main PGS effects (for basis functions m > 0).
+        // Stage: Main PGS effects (for basis functions m > 0)
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
 
-        // 4. Tensor product interaction effects (ordered by PC)
+        // Stage: Tensor product interaction effects (ordered by PC)
         for pc_config in &config.pc_configs {
             let tensor_key = format!("f(PGS,{})", pc_config.name);
             if let Some(tensor_coeffs) = coeffs.interaction_effects.get(&tensor_key) {
@@ -870,21 +865,21 @@ mod tests {
 
         // --- Calculate the expected result CORRECTLY ---
         // The manual calculation was flawed. Here's the correct way to derive the ground truth:
-        // 1. Generate the raw, unconstrained basis at the test points.
+    // Stage: Generate the raw, unconstrained basis at the test points
         let (full_basis_unc, _) =
             basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
                 .unwrap();
 
-        // 2. Isolate the main effect part of the basis (all columns except the intercept).
+    // Stage: Isolate the main effect part of the basis (all columns except the intercept)
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
 
-        // 3. Apply the same sum-to-zero constraint transformation.
+    // Stage: Apply the same sum-to-zero constraint transformation
         let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
 
-        // 4. Get the coefficients for the constrained basis.
+    // Stage: Get the coefficients for the constrained basis
         let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
 
-        // 5. Calculate the final expected linear predictor: intercept + constrained_basis * coeffs
+    // Stage: Calculate the final expected linear predictor as intercept + constrained_basis * coeffs
         let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
 
         // Get the model's prediction using the actual `predict` method
@@ -1038,10 +1033,10 @@ mod tests {
             .expect("flatten_coefficients should succeed for well-formed inputs");
 
         // Verify the canonical order of flattening:
-        // 1. Intercept
-        // 2. PC main effects (ordered by config.pc_configs)
-        // 3. PGS main effects
-        // 4. Interaction effects (PGS basis function 1, then PC1, PC2, etc.; then PGS basis function 2...)
+        // Stage: Intercept
+        // Stage: PC main effects (ordered by config.pc_configs)
+        // Stage: PGS main effects
+        // Stage: Interaction effects (PGS basis function 1, then PC1, PC2, etc.; followed by additional PGS basis functions)
 
         // Define expected order based on the canonical ordering rules
         let expected = vec![
@@ -1239,7 +1234,7 @@ mod tests {
 
         // Compare the models
 
-        // 1. Check model configuration
+        // Stage: Check model configuration
         assert_eq!(
             loaded_model.config.link_function,
             original_model.config.link_function
@@ -1284,7 +1279,7 @@ mod tests {
             original_model.config.pgs_range
         );
 
-        // 2. Check sum_to_zero_constraints transformations exist for PGS main effect only
+        // Stage: Confirm sum_to_zero_constraints transformations exist for the PGS main effect only
         assert!(
             loaded_model
                 .config
@@ -1292,7 +1287,7 @@ mod tests {
                 .contains_key("pgs_main")
         );
 
-        // 3. Check coefficient values
+        // Stage: Check coefficient values
         assert_eq!(
             loaded_model.coefficients.intercept,
             original_model.coefficients.intercept
@@ -1316,7 +1311,7 @@ mod tests {
             panic!("Loaded model missing PC1 main effects");
         }
 
-        // 4. Check interaction effects
+        // Stage: Check interaction effects
         assert_eq!(
             loaded_model.coefficients.interaction_effects.len(),
             original_model.coefficients.interaction_effects.len()
@@ -1343,10 +1338,10 @@ mod tests {
             panic!("Missing {} interaction effect", key_interaction);
         }
 
-        // 5. Check lambdas
+        // Stage: Check lambdas
         assert_eq!(loaded_model.lambdas, original_model.lambdas);
 
-        // 6. Test that we can use the loaded model for prediction
+        // Stage: Verify that we can use the loaded model for prediction
         let test_pgs = Array1::linspace(-0.5, 0.5, 3);
         let test_pcs = Array2::from_shape_fn((3, 1), |(i, _)| {
             (i as f64 - 1.0) * 0.25 // Values: -0.25, 0, 0.25

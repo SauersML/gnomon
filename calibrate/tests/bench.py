@@ -77,9 +77,6 @@ def run_capture(cmd, cwd=None, env=None):
     return ret, lines
 
 
-# (Removed OpenBLAS annotate helpers and DSO priming)
-
-
 def _filter_tree(lines: list[str]) -> list[str]:
     """Filter perf tree output by stanza and drop 0-children stanzas.
 
@@ -557,8 +554,6 @@ def main():
             f.write("</pre>")
         else:
             f.write("<p>Subpath merge unavailable (install inferno-collapse-perf).</p>")
-
-        # (Removed OpenBLAS annotate section)
 
     print(f"\nHTML report -> {html_path}")
     try:
