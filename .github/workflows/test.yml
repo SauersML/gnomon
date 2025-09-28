@@ -110,7 +110,6 @@ jobs:
           echo "Found test harness at: $TEST_HARNESS_PATH"
 
           # Step 4: Inspect the functions using the correct strategy
-
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
           echo "---"
@@ -139,6 +138,16 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
 
+      - name: Compute safe artifact names (always)
+        id: naming
+        if: always()
+        shell: bash
+        run: |
+          SAFE_REF="$(printf '%s' "${GITHUB_REF_NAME:-unknown}" | tr -c 'A-Za-z0-9_.-' '-')"
+          SHORT_SHA="$(printf '%.12s' "${GITHUB_SHA}")"
+          echo "safe_ref=$SAFE_REF" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Collect build metadata (always)
         if: always()
         shell: bash
@@ -146,7 +155,9 @@ jobs:
           mkdir -p export
           {
             echo "branch=${GITHUB_REF_NAME}"
+            echo "branch_sanitized=${{ steps.naming.outputs.safe_ref }}"
             echo "commit=${GITHUB_SHA}"
+            echo "short_commit=${{ steps.naming.outputs.short_sha }}"
             echo "week=${{ steps.cache_meta.outputs.week }}"
             echo "deps_hash=${{ steps.cache_meta.outputs.deps_hash }}"
             echo ""
@@ -162,10 +173,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p export
-          # Exclude credentials if present
           if [[ -d "$HOME/.cargo" ]]; then
             tar --exclude="$HOME/.cargo/credentials" \
-                -C "$HOME" -cf export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar \
+                -C "$HOME" -cf "export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar" \
                 -h .cargo/registry .cargo/git 2>/dev/null || true
           fi
           ls -al export || true
@@ -176,10 +186,12 @@ jobs:
         run: |
           mkdir -p export
           if [[ -d target/debug ]]; then
-            tar -cf export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
-                target/debug target/.rustc_info.json 2>/dev/null || \
-            tar -cf export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
-                target/debug
+            TAR="export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
+            if [[ -f target/.rustc_info.json ]]; then
+              tar -cf "$TAR" target/debug target/.rustc_info.json
+            else
+              tar -cf "$TAR" target/debug
+            fi
           fi
 
       - name: Pack target/release (always)
@@ -188,10 +200,12 @@ jobs:
         run: |
           mkdir -p export
           if [[ -d target/release ]]; then
-            tar -cf export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
-                target/release target/.rustc_info.json 2>/dev/null || \
-            tar -cf export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
-                target/release
+            TAR="export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
+            if [[ -f target/.rustc_info.json ]]; then
+              tar -cf "$TAR" target/release target/.rustc_info.json
+            else
+              tar -cf "$TAR" target/release
+            fi
           fi
 
       - name: Pack target/profiling (always)
@@ -200,8 +214,8 @@ jobs:
         run: |
           mkdir -p export
           if [[ -d target/profiling ]]; then
-            tar -cf export/target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar \
-                target/profiling
+            TAR="export/target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
+            tar -cf "$TAR" target/profiling
           fi
 
       - name: Upload artifact – cargo deps (always)
@@ -217,8 +231,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-debug-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          name: target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
           retention-days: 7
 
@@ -226,8 +240,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-release-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          name: target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
           retention-days: 7
 
@@ -235,8 +249,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-profiling-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}.tar
+          name: target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
           retention-days: 7
 
@@ -244,7 +258,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-meta-${{ github.ref_name }}-${{ github.sha }}
+          name: build-meta-${{ steps.naming.outputs.safe_ref }}-${{ steps.naming.outputs.short_sha }}
           path: export/build-meta.txt
           retention-days: 30
 
