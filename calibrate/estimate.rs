@@ -2007,21 +2007,30 @@ pub mod internal {
             let (_, ridge_used) = self.effective_hessian(pirls_result.as_ref());
 
             // Only check eigenvalues if we needed to add a ridge
+            const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             if ridge_used > 0.0 {
                 if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
                 {
-                    let all_nonpos = eigs.iter().all(|&x| x <= 0.0);
-                    if all_nonpos {
-                        // Truly pathological: everything ≤ 0
-                        return Err(EstimationError::HessianNotPositiveDefinite {
-                            min_eigenvalue: eigs.iter().cloned().fold(f64::INFINITY, f64::min),
-                        });
-                    }
-                    log::warn!(
-                        "Penalized Hessian not PD (min eig <= 0). Proceeding with stabilized logdet."
-                    );
                     if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
                         eprintln!("[Diag] H min_eig={:.3e}", min_eig);
+
+                        if min_eig <= 0.0 {
+                            log::warn!(
+                                "Penalized Hessian not PD (min eig <= 0). Treating as a fatal singularity."
+                            );
+                        }
+
+                        if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                            let condition_number = calculate_condition_number(
+                                &pirls_result.penalized_hessian_transformed,
+                            )
+                            .ok()
+                            .unwrap_or(f64::INFINITY);
+
+                            return Err(EstimationError::ModelIsIllConditioned {
+                                condition_number,
+                            });
+                        }
                     }
                 }
             }

@@ -1063,30 +1063,12 @@ pub fn stable_reparameterization(
         // Increment iteration counter
         iteration += 1;
 
-        println!(
-            "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
-            iteration,
-            gamma.len(),
-            q_current
-        );
-
         if gamma.is_empty() || q_current == 0 {
             break;
         }
 
-        println!(
-            "[Reparam Iteration #{}] Starting. Active penalties: {}, Problem size: {}",
-            iteration,
-            gamma.len(),
-            q_current
-        );
 
-        println!(
-            "Iteration {}: k_offset={}, q_current={}, gamma={:?}",
-            iteration, k_offset, q_current, gamma
-        );
-
-        // Stage: Find Frobenius norms of penalties in the current sub-problem
+        // Step: Find Frobenius norms of penalties in current sub-problem
         // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
         let mut frob_norms = Vec::new();
         let mut max_omega: f64 = 0.0;
@@ -1455,17 +1437,6 @@ pub fn stable_reparameterization(
         q_current -= r; // Reduce problem size by the rank we processed
         gamma = gamma_prime; // Continue with the subdominant penalties
 
-        println!(
-            "Updated for next iteration: k_offset={}, q_current={}, gamma.len()={}",
-            k_offset,
-            q_current,
-            gamma.len()
-        );
-
-        println!(
-            "[Reparam Iteration #{}] Finished. Determined rank: {}. Next problem size: {}",
-            iteration, r, q_current
-        );
     }
 
     println!(

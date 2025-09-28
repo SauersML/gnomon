@@ -316,21 +316,10 @@ pub fn fit_model_for_fixed_rho(
         // QR decomposition with careful handling of potential rank deficiencies in the weighted
         // design matrix. It applies 5-stage numerical stability techniques following Wood (2011).
         let penalty_info = if !lambdas.is_empty() {
-            format!("with penalty weight λ={:.4e}", lambdas[0])
+            format!(" | λ={:.4e}", lambdas[0])
         } else {
-            "(no penalties)".to_string()
+            String::new()
         };
-        println!(
-            "[P-IRLS Iter #{}, Dev: {:.4e}] Solving weighted least squares {}",
-            iter, last_deviance, penalty_info
-        );
-
-        // The logger outputs detailed matrix dimensions and timings for each sub-stage
-        // of the solver, which helps identify potential numerical issues.
-        println!(
-            "[P-IRLS Loop Iter #{}] Logger configuration check: debug-level logs enabled",
-            iter
-        );
 
         // Use our robust solver that handles rank deficiency correctly
         // Note: Pass both penalty matrices for proper separation of concerns
@@ -353,11 +342,6 @@ pub fn fit_model_for_fixed_rho(
         // Capture the EDF from the solver for correct scale calculation
         let edf_from_solver = stable_result.0.edf;
 
-        // The solver now returns beta in the transformed basis which is what we need for the P-IRLS loop
-        println!(
-            "P-IRLS Iteration #{}: Getting solver result in transformed basis",
-            iter
-        );
         let beta_trial_initial = stable_result.0.beta.clone();
         let mut step_halving_count = 0;
         let mut last_halving_change: f64 = f64::NAN;
@@ -657,16 +641,18 @@ pub fn fit_model_for_fixed_rho(
         let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
 
         // Log iteration info
+        let step_halving_info = if step_halving_count > 0 {
+            format!(" | Step Halving: {} attempts", step_halving_count)
+        } else {
+            String::new()
+        };
         println!(
-            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}",
+            "P-IRLS Iteration #{:<2} | Penalized Deviance: {:<13.7} | Change: {:>12.6e}{}{}",
             iter,
             penalized_deviance_new,
             deviance_change_scaled,
-            if step_halving_count > 0 {
-                format!(" | Step Halving: {} attempts", step_halving_count)
-            } else {
-                String::new()
-            }
+            step_halving_info,
+            penalty_info
         );
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
@@ -1533,9 +1519,6 @@ pub fn solve_penalized_least_squares(
 
     // Stage: Initial QR decomposition of the weighted design matrix
 
-    let stage1_timer = Instant::now();
-    println!("[PLS Solver] Stage 1/5: Starting initial QR on weighted design matrix...");
-
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
     workspace.sqrt_w.assign(&weights.mapv(f64::sqrt)); // Weights are guaranteed non-negative
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
@@ -1561,20 +1544,10 @@ pub fn solve_penalized_least_squares(
     // DO NOT UN-PIVOT r1_pivoted. Keep it in its stable, pivoted form.
     // The columns of R1 are currently permuted according to `initial_pivot`.
     // This permutation is crucial for numerical stability in rank detection.
-    println!("Keeping R1 matrix in pivoted order for maximum numerical stability");
-
     // Transform RHS using Q1' (first transformation of the RHS)
     let q1_t_wz = q1.t().dot(wz);
 
-    println!(
-        "[PLS Solver] Stage 1/5: Initial QR complete. [{:.2?}]",
-        stage1_timer.elapsed()
-    );
-
     // Stage: Rank determination using the scaled augmented system
-
-    let stage2_timer = Instant::now();
-    println!("[PLS Solver] Stage 2/5: Starting rank determination via scaled QR...");
 
     // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
     // This ensures the columns of both matrices are aligned correctly
@@ -1587,8 +1560,6 @@ pub fn solve_penalized_least_squares(
     } else {
         1.0
     };
-
-    println!("Frobenius norms: R_norm={}, Eb_norm={}", r_norm, eb_norm);
 
     // Create the scaled augmented matrix for numerical stability using pivoted matrices
     // [R1_pivoted/Rnorm; Eb_pivoted/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
@@ -1642,24 +1613,8 @@ pub fn solve_penalized_least_squares(
         });
     }
 
-    println!(
-        "Solver determined rank {}/{} using scaled matrix",
-        rank, p_dim
-    );
-    println!(
-        "[PLS Solver] Stage 2/5: Rank determined to be {}/{}. [{:.2?}]",
-        rank,
-        p_dim,
-        stage2_timer.elapsed()
-    );
 
     // Stage: Create the rank-reduced system using the rank pivot
-
-    let stage3_timer = Instant::now();
-    println!(
-        "[PLS Solver] Stage 3/5: Reducing system to rank {}...",
-        rank
-    );
 
     // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
     let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
@@ -1681,15 +1636,7 @@ pub fn solve_penalized_least_squares(
     // Record kept positions in the initial pivoted order for later reconstruction
     let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
 
-    println!(
-        "[PLS Solver] Stage 3/5: System reduction complete. [{:.2?}]",
-        stage3_timer.elapsed()
-    );
-
     // Stage: Final QR decomposition on the unscaled, reduced system
-
-    let stage4_timer = Instant::now();
-    println!("[PLS Solver] Stage 4/5: Starting final QR on reduced system...");
 
     // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
     // This uses the lambda-DEPENDENT penalty for actual penalty application
@@ -1714,11 +1661,6 @@ pub fn solve_penalized_least_squares(
     let final_aug_owned = final_aug_matrix.to_owned();
     let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
 
-    println!(
-        "[PLS Solver] Stage 4/5: Final QR complete. [{:.2?}]",
-        stage4_timer.elapsed()
-    );
-
     // Add tiny ridge jitter to avoid singular/infinite condition number
     let r_final_sq = r_final.slice(s![..rank, ..rank]);
     let eps = 1e-10_f64;
@@ -1737,16 +1679,13 @@ pub fn solve_penalized_least_squares(
         }
     }
     if any_modified {
-        println!(
+        log::info!(
             "[PLS Solver] Applied tiny ridge jitter ({:.3e}) to R diagonal for stability",
             diag_floor
         );
     }
 
     // Stage: Apply the second transformation to the RHS and solve the system
-
-    let stage5_timer = Instant::now();
-    println!("[PLS Solver] Stage 5/5: Solving system and reconstructing results...");
 
     // Prepare the full RHS for the final system
     assert!(workspace.rhs_full.len() >= final_aug_rows);
@@ -1918,26 +1857,18 @@ pub fn solve_penalized_least_squares(
         link_function,
     );
 
-    println!(
-        "[PLS Solver] Stage 5/5: System solved and results reconstructed. [{:.2?}]",
-        stage5_timer.elapsed()
-    );
-    println!(
-        "[PLS Solver] Exiting. Total time: [{:.2?}]",
-        function_timer.elapsed()
-    );
-
     // At this point, the solver has completed:
     // - Computing coefficient estimates (beta) for the current iteration
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
     println!(
-        "[PLS Solver] Completed with edf={:.2}, scale={:.4e}, rank={}/{}",
+        "[PLS Solver] QR path completed with edf={:.2}, scale={:.4e}, rank={}/{} [{:.2?}]",
         edf,
         scale,
         rank,
-        x_transformed.ncols()
+        x_transformed.ncols(),
+        function_timer.elapsed()
     );
 
     // Return the result
