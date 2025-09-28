@@ -1,4 +1,4 @@
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
@@ -344,8 +344,8 @@ pub fn apply_weighted_orthogonality_constraint(
 
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
 
-    use crate::calibrate::faer_ndarray::FaerSvd;
     let constraint_cross_t = constraint_cross.t().to_owned();
+
     let (_, singular_values, vt_opt) = constraint_cross_t
         .svd(false, true)
         .map_err(BasisError::LinalgError)?;
@@ -371,6 +371,7 @@ pub fn apply_weighted_orthogonality_constraint(
     }
 
     let transform = v.slice(s![.., rank..]).to_owned();
+
     if transform.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }

@@ -935,6 +935,7 @@ pub fn build_calibrator_design(
         Err(BasisError::ConstraintNullspaceNotFound) => {
             eprintln!(
                 "[CAL] pred basis fully constrained by {{1, eta}}; increase knots/degree for wiggles"
+
             );
             (
                 Array2::<f64>::zeros((n, 0)),
