@@ -42,6 +42,14 @@ pub enum BasisError {
     InsufficientColumnsForConstraint { found: usize },
 
     #[error(
+        "Constraint matrix must have the same number of rows as the basis: basis has {basis_rows}, constraint has {constraint_rows}."
+    )]
+    ConstraintMatrixRowMismatch {
+        basis_rows: usize,
+        constraint_rows: usize,
+    },
+
+    #[error(
         "Weights dimension mismatch: expected {expected} weights to match basis matrix rows, but got {found}."
     )]
     WeightsDimensionMismatch { expected: usize, found: usize },
@@ -291,6 +299,84 @@ pub fn apply_sum_to_zero_constraint(
     // Constrained basis
     let constrained = basis_matrix.dot(&z);
     Ok((constrained, z))
+}
+
+/// Reparameterizes a basis matrix so its columns are orthogonal (with optional weights)
+/// to a supplied constraint matrix.
+///
+/// Given a basis `B` (n×k), a constraint matrix `Z` (n×q), and optional observation weights
+/// `w`, this function returns a new basis `B_c = B K` where the columns of `B_c` satisfy
+/// `(B_c)^T W Z = 0`. The transformation matrix `K` spans the nullspace of `B^T W Z`, so the
+/// constrained basis cannot express any function correlated with the provided constraints.
+pub fn apply_weighted_orthogonality_constraint(
+    basis_matrix: ArrayView2<f64>,
+    constraint_matrix: ArrayView2<f64>,
+    weights: Option<ArrayView1<f64>>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let n = basis_matrix.nrows();
+    let k = basis_matrix.ncols();
+    if constraint_matrix.nrows() != n {
+        return Err(BasisError::ConstraintMatrixRowMismatch {
+            basis_rows: n,
+            constraint_rows: constraint_matrix.nrows(),
+        });
+    }
+    if k == 0 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
+    }
+    let q = constraint_matrix.ncols();
+    if q == 0 {
+        return Ok((basis_matrix.to_owned(), Array2::eye(k)));
+    }
+
+    let mut weighted_constraints = constraint_matrix.to_owned();
+    if let Some(w) = weights {
+        if w.len() != n {
+            return Err(BasisError::WeightsDimensionMismatch {
+                expected: n,
+                found: w.len(),
+            });
+        }
+        for (mut row, &weight) in weighted_constraints.axis_iter_mut(Axis(0)).zip(w.iter()) {
+            row *= weight;
+        }
+    }
+
+    let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
+
+    use crate::calibrate::faer_ndarray::FaerSvd;
+    let constraint_cross_t = constraint_cross.t().to_owned();
+    let (_, singular_values, vt_opt) = constraint_cross_t
+        .svd(false, true)
+        .map_err(BasisError::LinalgError)?;
+    let vt = match vt_opt {
+        Some(vt) => vt,
+        None => return Err(BasisError::ConstraintNullspaceNotFound),
+    };
+    let v = vt.t().to_owned();
+
+    let max_sigma = singular_values
+        .iter()
+        .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
+    let tol = if max_sigma > 0.0 {
+        (k.max(q) as f64) * 1e-12 * max_sigma
+    } else {
+        1e-12
+    };
+    let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
+
+    let total_cols = v.ncols();
+    if rank >= total_cols {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    let transform = v.slice(s![.., rank..]).to_owned();
+    if transform.ncols() == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    let constrained_basis = basis_matrix.dot(&transform);
+    Ok((constrained_basis, transform))
 }
 
 /// Decomposes a penalty matrix S into its null-space and whitened range-space components.

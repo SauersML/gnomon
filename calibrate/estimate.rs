@@ -1105,9 +1105,7 @@ pub fn train_model(
             penalty_order_pred: base_penalty_order,
             penalty_order_se: base_penalty_order,
             penalty_order_dist: base_penalty_order,
-            double_penalty_ridge: 1e-6, // Keep the tiny ridge on the nullspace
-            distance_hinge: true,       // Keep the distance hinge behavior
-            nullspace_shrinkage_kappa: Some(1.0), // Default equal shrinkage
+            distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
         };
 
@@ -1155,7 +1153,7 @@ pub fn train_model(
             knots_pred: schema.knots_pred,
             knots_se: schema.knots_se,
             knots_dist: schema.knots_dist,
-            stz_pred: schema.stz_pred,
+            pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
             standardize_pred: schema.standardize_pred,
@@ -1165,7 +1163,6 @@ pub fn train_model(
             dist_linear_fallback: schema.dist_linear_fallback,
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
-            pred_center_offset: schema.pred_center_offset,
             lambda_pred: lambdas_cal[0],
             lambda_se: lambdas_cal[1],
             lambda_dist: lambdas_cal[2],
@@ -1195,7 +1192,7 @@ pub fn train_model(
                 "[CAL][train] summary:\n",
                 "  design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}\n",
                 "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
-                "  penalty: order_pred={}, order_se={}, order_dist={}, nullspace_ridge={}\n",
+                "  penalty: order_pred={}, order_se={}, order_dist={}\n",
                 "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
                 "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
                 "  opt:     iterations={}, final_grad_norm={:.3e}"
@@ -1214,7 +1211,6 @@ pub fn train_model(
             spec.penalty_order_pred,
             spec.penalty_order_se,
             spec.penalty_order_dist,
-            spec.double_penalty_ridge,
             model.lambda_pred,
             rho_pred,
             model.lambda_se,
