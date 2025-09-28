@@ -1077,7 +1077,7 @@ pub fn build_calibrator_design(
     // the ordinary roughness penalties are sufficient.  The linear nullspaces are
     // no longer present, so no extra shrinkage or fixed ridges are required.
     let s_pred = s_pred_raw_sc;
-    let mut s_se = s_se_raw_sc;
+    let s_se = s_se_raw_sc;
     let s_dist = s_dist_raw_sc;
 
     if se_linear_fallback {
