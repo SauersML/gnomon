@@ -920,7 +920,7 @@ pub fn train_model(
             }
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
-            // 1. Print the warning message.
+            // Stage: Emit a warning about the lack of convergence
             eprintln!(
                 "\n[WARNING] BFGS optimization failed to converge within the maximum number of iterations."
             );
@@ -929,7 +929,7 @@ pub fn train_model(
                 last_solution.final_gradient_norm
             );
 
-            // 2. Accept the solution.
+            // Stage: Accept the best solution produced by BFGS
             *last_solution
         }
         // Rationale: This is our safety net. Any other error from the optimizer
@@ -1482,8 +1482,6 @@ fn compute_fd_gradient(
     Ok(fd_grad)
 }
 
-// (check_gradient helper removed; we compute metrics inline to keep strict gates centralized)
-
 /// Helper to log the final model structure.
 fn log_layout_info(layout: &ModelLayout) {
     log::info!(
@@ -1697,9 +1695,6 @@ pub mod internal {
 
             Ok(edf)
         }
-
-        // rho_key has been replaced by the more robust rho_key_sanitized method
-
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
         /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
         /// Using these avoids accidental double counting of λ when forming derivatives.
@@ -2567,10 +2562,10 @@ pub mod internal {
         ///
         /// This method handles two distinct statistical criteria for marginal likelihood optimization:
         ///
-        /// 1. For Gaussian models (Identity link), this calculates the exact REML gradient
-        ///    (Restricted Maximum Likelihood).
-        /// 2. For non-Gaussian GLMs, this calculates the LAML gradient (Laplace Approximate
-        ///    Marginal Likelihood) as derived in Wood (2011, Appendix C & D).
+        /// - For Gaussian models (Identity link), this calculates the exact REML gradient
+        ///   (Restricted Maximum Likelihood).
+        /// - For non-Gaussian GLMs, this calculates the LAML gradient (Laplace Approximate
+        ///   Marginal Likelihood) as derived in Wood (2011, Appendix C & D).
         ///
         /// # Mathematical Theory
         ///
@@ -2596,13 +2591,12 @@ pub mod internal {
         ///   deviance component. The derivative of the penalized deviance must include both
         ///   d(D)/dρ_k and d(βᵀSβ)/dρ_k. Our implementation follows mgcv’s gdi1: we add the penalty
         ///   derivative to the deviance derivative before applying the 1/2 factor.
-        // 1.  Start with the chain rule.  For any λₖ,
+        // Stage: Start with the chain rule for any λₖ,
         //     dV/dλₖ = ∂V/∂λₖ  (holding β̂ fixed)  +  (∂V/∂β̂)ᵀ · (∂β̂/∂λₖ).
         //     The first summand is called the direct part, the second the indirect part.
         //
-        // 2.  Two different outer criteria are used.  With a Gaussian likelihood the programme maximises the
-        //     restricted maximum likelihood (REML).  With a non-Gaussian likelihood it maximises a Laplace
-        //     approximation to the marginal likelihood (LAML).  These objectives respond differently to β̂.
+        // Stage: Note the two outer criteria—Gaussian likelihood maximizes REML, while non-Gaussian likelihood
+        //     maximizes a Laplace approximation to the marginal likelihood (LAML). These objectives respond differently to β̂.
         //
         //     2.1  Gaussian case, REML.
         //          The REML construction integrates the fixed effects out of the likelihood.  At the optimum
@@ -2628,7 +2622,7 @@ pub mod internal {
         //          commented out and assembles
         //          gradient[k] = 0.5 * λₖ * (s_inv_trace_term − trace_term) - 0.5 * weight_deriv_term.
         //
-        // 3.  The sign of ∂β̂/∂λₖ matters.  From the implicit-function theorem the linear solve reads
+        // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -2673,7 +2667,7 @@ pub mod internal {
             let beta_transformed = &pirls_result.beta_transformed;
             let hessian_transformed = &pirls_result.penalized_hessian_transformed;
             let reparam_result = &pirls_result.reparam_result;
-            // Use cached X·Qs from PIRLS (currently unused in this path)
+            // Use cached X·Qs from PIRLS
             let rs_transformed = &reparam_result.rs_transformed;
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
@@ -3048,8 +3042,6 @@ pub mod internal {
         use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
-        // The generate_realistic_binary_data and generate_y_from_logit functions
-        // have been moved to the shared test_helpers module
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
@@ -3065,7 +3057,6 @@ pub mod internal {
         ///
         /// # Returns
         /// An `Array1<f64>` of binary outcomes (0.0 or 1.0).
-        // Function generate_realistic_binary_data has been moved to test_helpers module
 
         /// Generates a non-separable binary outcome vector 'y' from a vector of logits.
         ///
@@ -3079,23 +3070,6 @@ pub mod internal {
         ///
         /// Returns:
         /// - Array1<f64>: Binary outcome array (0.0 or 1.0 values)
-        // Function generate_y_from_logit has been moved to test_helpers module
-
-        // Function generate_stable_test_data removed to fix dead code warning
-
-        // Function no longer needed
-        // Function implementation removed
-        // Rest of implementation removed
-        // End of removed function
-
-        // ======== Numerical gradient helpers ========
-        // The following functions have been removed to fix dead code warnings:
-        // - adaptive_step_size
-        // - safe_compute_cost
-        // - compute_numerical_gradient_robust
-        // - try_numerical_gradient
-        // - compute_error_metric
-        // - check_difference_symmetry
 
         /// Tests the inner P-IRLS fitting mechanism with fixed smoothing parameters.
         /// This test verifies that the coefficient estimation is correct for a known dataset
@@ -3657,14 +3631,6 @@ pub mod internal {
             );
         }
 
-        /// Helper struct for per-term smoothness metrics
-        // Unused struct removed
-        // Struct fields removed
-
-        // Unused function signature removed
-        // Function implementation removed
-        // End of removed implementation
-
         /// **Test 3: The Automatic Smoothing Test (Most Informative!)**
         /// Verifies the core "magic" of GAMs: that the REML/LAML optimization automatically
         /// identifies and penalizes irrelevant "noise" predictors.
@@ -3767,15 +3733,10 @@ pub mod internal {
             )
             .unwrap();
 
-            // Test removed - uses removed metrics function
-            // Skipping test since per_term_metrics function was removed
             println!("Test skipped: per_term_metrics function removed");
 
             // The test would have verified that a noise predictor (PC2) gets heavily penalized
             // compared to a predictor with real signal (PC1)
-
-            // Remaining assertions and prints removed
-
             println!("✓ Automatic smoothing test skipped!");
         }
 
@@ -3878,17 +3839,10 @@ pub mod internal {
             )
             .unwrap();
 
-            // Per-term metrics computation removed
             println!("Per-term metrics calculation skipped - function removed");
 
-            // PC1 and PC2 penalty indices removed
-
-            // Metrics analysis removed - function no longer exists
             println!("=== Relative Smoothness Analysis ===");
             println!("Test skipped - metrics calculation removed");
-
-            // Assertions and comparisons removed - metrics no longer available
-            // More assertions removed
 
             println!("✓ Relative smoothness test skipped!");
         }
@@ -4241,14 +4195,14 @@ pub mod internal {
         /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
         ///
         /// This implementation is robust to several common issues:
-        /// 1. **Tie Handling**: Processes all data points with the same prediction score as a single
-        ///    group, creating a single point on the ROC curve. This is the correct way to
-        ///    handle ties and avoids creating artificial diagonal segments.
-        /// 2. **Edge Cases**: If all outcomes belong to a single class (all positives or all
-        ///    negatives), AUC is mathematically undefined. This function follows the common
-        ///    convention of returning 0.5 in such cases, representing the performance of a
-        ///    random classifier.
-        /// 3. **Numerical Stability**: Uses `sort_unstable_by` for safe and efficient sorting of floating-point scores.
+        /// - **Tie Handling**: Processes all data points with the same prediction score as a single
+        ///   group, creating a single point on the ROC curve. This is the correct way to
+        ///   handle ties and avoids creating artificial diagonal segments.
+        /// - **Edge Cases**: If all outcomes belong to a single class (all positives or all
+        ///   negatives), AUC is mathematically undefined. This function follows the common
+        ///   convention of returning 0.5 in such cases, representing the performance of a
+        ///   random classifier.
+        /// - **Numerical Stability**: Uses `sort_unstable_by` for safe and efficient sorting of floating-point scores.
         ///
         /// # Arguments
         /// * `predictions`: A 1D array of predicted scores or probabilities. Higher scores should
@@ -4521,7 +4475,7 @@ pub mod internal {
         #[test]
         fn test_logit_model_with_three_pcs_and_interactions()
         -> Result<(), Box<dyn std::error::Error>> {
-            // --- 1. SETUP: Generate test data ---
+            // --- Setup: Generate test data ---
             let n_samples = 200;
             let mut rng = StdRng::seed_from_u64(42);
 
@@ -4551,7 +4505,7 @@ pub mod internal {
             // Generate binary outcomes
             let y = test_helpers::generate_y_from_logit(&true_logits, &mut rng);
 
-            // --- 2. Create configuration ---
+            // --- Create configuration ---
             let data = TrainingData {
                 y,
                 p: p.clone(),
@@ -4604,10 +4558,10 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            // --- 3. Train model ---
+            // --- Train model ---
             let model_result = train_model(&data, &config);
 
-            // --- 4. Verify model performance ---
+            // --- Verify model performance ---
             // Print the exact failure reason instead of a generic message
             let model = model_result.unwrap_or_else(|e| panic!("Model training failed: {:?}", e));
 
@@ -4639,7 +4593,7 @@ pub mod internal {
 
             // Using a simplified version of the previous test with known-stable structure
 
-            // --- 1. Setup: Generate data where y depends on PC1 but has NO relationship with PC2 ---
+            // --- Setup: Generate data where y depends on PC1 but has NO relationship with PC2 ---
             let n_samples = 100; // Reduced for better numerical stability
 
             // Use a fixed seed for reproducibility
@@ -4679,7 +4633,7 @@ pub mod internal {
                 weights: Array1::ones(p.len()),
             };
 
-            // --- 2. Model Configuration ---
+            // --- Model configuration ---
             let config = ModelConfig {
                 link_function: LinkFunction::Identity, // More stable
                 penalty_order: 2,
@@ -4718,7 +4672,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            // --- 3. Build Model Structure ---
+            // --- Build model structure ---
             let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
@@ -4738,7 +4692,7 @@ pub mod internal {
                 s.mapv_inplace(|x| x * penalty_scale_factor);
             }
 
-            // --- 4. Find the penalty indices corresponding to the main effects of PC1 and PC2 ---
+            // --- Identify the penalty indices corresponding to the main effects of PC1 and PC2 ---
             let pc1_penalty_idx = layout
                 .penalty_map
                 .iter()
@@ -4753,7 +4707,7 @@ pub mod internal {
                 .expect("PC2 penalty not found")
                 .penalty_indices[0]; // Main effects have single penalty
 
-            // --- 5. Instead of using the gradient, we'll directly compare costs at different penalty levels ---
+            // --- Compare costs at different penalty levels instead of using the gradient ---
             // This is a more robust approach that avoids potential issues with P-IRLS convergence
 
             // Create a reml_state that we'll use to evaluate costs
@@ -4769,7 +4723,7 @@ pub mod internal {
 
             println!("Comparing costs when penalizing signal term (PC1) vs. noise term (PC2)");
 
-            // --- 6. Compare the cost at different points ---
+            // --- Compare the cost at different points ---
             // First, create a baseline with minimal penalties for both terms
             let baseline_rho = Array1::from_elem(layout.num_penalties, -2.0); // λ ≈ 0.135
 
@@ -4785,11 +4739,11 @@ pub mod internal {
             println!("Baseline cost (minimal penalties): {:.6}", baseline_cost);
 
             // --- Create two test cases: ---
-            // 1. Penalize PC1 heavily, PC2 lightly
+            // Stage: Penalize PC1 heavily while keeping PC2 lightly penalized
             let mut pc1_heavy_rho = baseline_rho.clone();
             pc1_heavy_rho[pc1_penalty_idx] = 2.0; // λ ≈ 7.4 for PC1 (signal)
 
-            // 2. Penalize PC2 heavily, PC1 lightly
+            // Stage: Penalize PC2 heavily while keeping PC1 lightly penalized
             let mut pc2_heavy_rho = baseline_rho.clone();
             pc2_heavy_rho[pc2_penalty_idx] = 2.0; // λ ≈ 7.4 for PC2 (noise)
 
@@ -4825,7 +4779,7 @@ pub mod internal {
                 pc2_heavy_cost
             );
 
-            // --- 7. Key assertion: Penalizing noise (PC2) should reduce cost more than penalizing signal (PC1) ---
+            // --- Key assertion: Penalizing noise (PC2) should reduce cost more than penalizing signal (PC1) ---
             // If either cost is MAX, we can't make a valid comparison
             if pc1_heavy_cost != f64::MAX && pc2_heavy_cost != f64::MAX {
                 let cost_difference = pc1_heavy_cost - pc2_heavy_cost;
@@ -4881,7 +4835,7 @@ pub mod internal {
         /// relying on the unstable BFGS optimization.
         #[test]
         fn test_basic_model_estimation() {
-            // --- 1. SETUP: Generate more realistic, non-separable data ---
+            // --- Setup: Generate more realistic, non-separable data ---
             let n_samples = 100; // A slightly larger sample size for stability
             use rand::{Rng, SeedableRng};
             let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -4903,7 +4857,7 @@ pub mod internal {
                 weights: Array1::ones(n_samples),
             };
 
-            // --- 2. Model Configuration ---
+            // --- Model configuration ---
             let mut config = ModelConfig {
                 link_function: LinkFunction::Logit,
                 penalty_order: 2,
@@ -4928,18 +4882,18 @@ pub mod internal {
             config.pc_configs.clear();
             config.pgs_basis_config.num_knots = 4; // A reasonable number of knots
 
-            // --- 3. TRAIN THE MODEL (using the existing `train_model` function) ---
+            // --- Train the model (using the existing `train_model` function) ---
             let trained_model = train_model(&data, &config).unwrap_or_else(|e| {
                 panic!("Model training failed on this well-posed data: {:?}", e)
             });
 
-            // --- 4. Evaluate the Model ---
+            // --- Evaluate the model ---
             // Get model predictions on the training data
             let predictions = trained_model
                 .predict(data.p.view(), data.pcs.view())
                 .unwrap();
 
-            // --- 5. Dynamic Assertions against the Oracle ---
+            // --- Dynamic assertions against the oracle ---
             // The "Oracle" knows the `true_probabilities`. We compare our model to it.
 
             // Metric 1: Correlation (the original test's metric, now made robust)
@@ -5235,10 +5189,10 @@ pub mod internal {
         /// due to the different formulations required for Gaussian (REML) vs. non-Gaussian (LAML) models.
         ///
         /// For each link function (Identity/Gaussian and Logit), the test:
-        /// 1. Sets up a small, well-conditioned test problem
-        /// 2. Calculates the analytical gradient at a specific point
-        /// 3. Approximates the numerical gradient using central differences
-        /// 4. Verifies that they match within numerical precision
+        /// - Sets up a small, well-conditioned test problem
+        /// - Calculates the analytical gradient at a specific point
+        /// - Approximates the numerical gradient using central differences
+        /// - Verifies that they match within numerical precision
         ///
         /// This is the gold standard test for validating gradient implementations and ensures the
         /// optimization process receives correct gradient information.
@@ -5250,10 +5204,10 @@ pub mod internal {
         /// due to the different formulations required for Gaussian (REML) vs. non-Gaussian (LAML) models.
         ///
         /// For each link function (Identity/Gaussian and Logit), the test:
-        /// 1. Sets up a small, well-conditioned test problem.
-        /// 2. Calculates the analytical gradient at a specific point.
-        /// 3. Approximates the numerical gradient using central differences.
-        /// 4. Verifies that they match within numerical precision.
+        /// - Sets up a small, well-conditioned test problem.
+        /// - Calculates the analytical gradient at a specific point.
+        /// - Approximates the numerical gradient using central differences.
+        /// - Verifies that they match within numerical precision.
         ///
         /// This is the gold standard test for validating gradient implementations and ensures the
         /// optimization process receives correct gradient information.
@@ -5693,7 +5647,7 @@ pub mod internal {
             // The cost should decrease as rho increases, so d(cost)/d(rho) must be negative.
 
             let test_for_link = |link_function: LinkFunction| {
-                // 1. Create simple data without perfect separation
+                // Stage: Create simple data without perfect separation
                 let n_samples = 50; // Do not increase
                 // Use a single RNG instance for consistency
                 let mut rng = StdRng::seed_from_u64(42);
@@ -5715,7 +5669,7 @@ pub mod internal {
                     weights: Array1::ones(p.len()),
                 };
 
-                // 2. Define a SIMPLE config for a model with ONLY a PGS term.
+                // Stage: Define a simple configuration for a model with only a PGS term
                 let mut simple_config = ModelConfig {
                     link_function: LinkFunction::Logit,
                     penalty_order: 2,
@@ -5739,7 +5693,7 @@ pub mod internal {
                 simple_config.link_function = link_function;
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
-                // 3. Build GUARANTEED CONSISTENT structures for this simple model.
+                // Stage: Build guaranteed-consistent structures for this simple model
                 let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
@@ -5753,7 +5707,7 @@ pub mod internal {
                     return;
                 }
 
-                // 4. Create the RemlState using these consistent objects.
+                // Stage: Create the RemlState using these consistent objects
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
                     x_simple.view(), // Use the simple design matrix
@@ -5764,10 +5718,10 @@ pub mod internal {
                 )
                 .unwrap();
 
-                // 5. Start with a very low penalty (rho = -5 => lambda ≈ 6.7e-3)
+                // Stage: Start with a very low penalty (rho = -5 => lambda ≈ 6.7e-3)
                 let rho_start = Array1::from_elem(layout_simple.num_penalties, -5.0);
 
-                // 6. Calculate the gradient
+                // Stage: Calculate the gradient
                 let grad = reml_state
                     .compute_gradient(&rho_start)
                     .unwrap_or_else(|e| panic!("Gradient failed for {:?}: {:?}", link_function, e));
@@ -5823,7 +5777,7 @@ pub mod internal {
                 use rand::SeedableRng;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(42); // Fixed seed for reproducibility
 
-                // 1. Setup a well-posed, non-trivial problem.
+            // Stage: Set up a well-posed, non-trivial problem
                 let n_samples = 600;
 
                 // Use random jitter to prevent perfect separation and improve numerical stability
@@ -5853,7 +5807,7 @@ pub mod internal {
                     weights: Array1::ones(p.len()),
                 };
 
-                // 1. Define a simple model config for a PGS-only model
+                // Stage: Define a simple model configuration for a PGS-only model
                 let mut simple_config = ModelConfig {
                     link_function: link_function,
                     penalty_order: 2,
@@ -5878,13 +5832,13 @@ pub mod internal {
                 // Use a simple basis with fewer knots to reduce complexity
                 simple_config.pgs_basis_config.num_knots = 3;
 
-                // 2. Generate consistent structures using the canonical function
+                // Stage: Generate consistent structures using the canonical function
                 let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
 
-                // 3. Create RemlState with the consistent objects
+                // Stage: Create a RemlState with the consistent objects
                 let reml_state = internal::RemlState::new(
                     data.y.view(),
                     x_simple.view(),
@@ -5901,11 +5855,11 @@ pub mod internal {
                     return;
                 }
 
-                // 4. Choose a starting point that is not at the minimum.
+                // Stage: Choose a starting point that is not at the minimum
                 // Use -1.0 instead of 0.0 to avoid potential stationary points
                 let rho_start = Array1::from_elem(layout_simple.num_penalties, -1.0);
 
-                // 3. Compute cost and gradient at the starting point.
+                // Stage: Compute the cost and gradient at the starting point
                 // Handle potential PirlsDidNotConverge errors
                 let cost_start = match reml_state.compute_cost(&rho_start) {
                     Ok(cost) => cost,
@@ -5938,14 +5892,14 @@ pub mod internal {
                     return; // Skip this test case rather than fail with meaningless assertion
                 }
 
-                // 4. Take small steps in both positive and negative gradient directions.
+                // Stage: Take small steps in both positive and negative gradient directions
                 // This way we can verify that one of them decreases cost.
                 // Use an adaptive step size based on gradient magnitude
                 let step_size = 1e-5 / grad_start[0].abs().max(1.0);
                 let rho_neg_step = &rho_start - step_size * &grad_start;
                 let rho_pos_step = &rho_start + step_size * &grad_start;
 
-                // 5. Compute the cost at the new points.
+                // Stage: Compute the cost at the new points
                 // Handle potential PirlsDidNotConverge errors
                 let cost_neg_step = match reml_state.compute_cost(&rho_neg_step) {
                     Ok(cost) => cost,
@@ -5980,7 +5934,7 @@ pub mod internal {
                 println!("Gradient at starting point: {:.8}", grad_start[0]);
                 println!("Step size used: {:.8e}", step_size);
 
-                // 6. Assert that at least one direction decreases the cost.
+                // Stage: Assert that at least one direction decreases the cost
                 // To make test more robust, also check if we're very close to minimum already
                 let relative_change = (cost_next - cost_start) / (cost_start.abs() + 1e-10);
                 let is_decrease = cost_next < cost_start;
@@ -6021,7 +5975,7 @@ pub mod internal {
         fn test_fundamental_cost_function_investigation() {
             let n_samples = 100; // Increased from 20 for better conditioning
 
-            // 1. Define a simple model config for the test
+        // Stage: Define a simple model configuration for the test
             let simple_config = ModelConfig {
                 link_function: LinkFunction::Identity, // Use Identity for simpler test
                 penalty_order: 2,
@@ -6073,12 +6027,12 @@ pub mod internal {
                 weights: Array1::ones(p.len()),
             };
 
-            // 2. Generate consistent structures using the canonical function
+        // Stage: Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
-            // 3. Create RemlState with the consistent objects
+        // Stage: Create a RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
@@ -6134,7 +6088,7 @@ pub mod internal {
                 }
             };
 
-            // --- 1. Calculate the cost at two very different smoothing levels ---
+            // --- Calculate the cost at two very different smoothing levels ---
 
             // A low smoothing level (high flexibility)
             let rho_low_smoothing = Array1::from_elem(layout_simple.num_penalties, -5.0); // lambda ~ 0.007
@@ -6144,11 +6098,11 @@ pub mod internal {
             let rho_high_smoothing = Array1::from_elem(layout_simple.num_penalties, 5.0); // lambda ~ 148
             let cost_high_smoothing = compute_cost_safe(&rho_high_smoothing);
 
-            // --- 2. Calculate gradient at a mid point ---
+            // --- Calculate gradient at a mid point ---
             let rho_mid = Array1::from_elem(layout_simple.num_penalties, 0.0); // lambda = 1.0
             let grad_mid = compute_gradient_safe(&rho_mid);
 
-            // --- 3. VERIFY: Assert that the costs are different ---
+            // --- Verify that the costs are different ---
             // This confirms that the smoothing parameter has a non-zero effect on the model's fit
             let difference = (cost_low_smoothing - cost_high_smoothing).abs();
             assert!(
@@ -6162,7 +6116,7 @@ pub mod internal {
                 difference
             );
 
-            // --- 4. VERIFY: Assert that taking a step in the negative gradient direction decreases cost ---
+            // --- Verify that taking a step in the negative gradient direction decreases cost ---
             // Test the fundamental descent property with proper step size
             let cost_mid = compute_cost_safe(&rho_mid);
             let grad_norm = grad_mid.dot(&grad_mid).sqrt();
@@ -6214,7 +6168,7 @@ pub mod internal {
                 weights: Array1::ones(p.len()),
             };
 
-            // 1. Define a simple model config for a PGS-only model
+            // Stage: Define a simple model configuration for a PGS-only model
             let simple_config = ModelConfig {
                 link_function: LinkFunction::Identity,
                 penalty_order: 2,
@@ -6236,7 +6190,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            // 2. Generate consistent structures using the canonical function
+            // Stage: Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
@@ -6249,7 +6203,7 @@ pub mod internal {
                 return;
             }
 
-            // 3. Create RemlState with the consistent objects
+            // Stage: Create a RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
@@ -6332,7 +6286,7 @@ pub mod internal {
                 weights: Array1::ones(p.len()),
             };
 
-            // 1. Define a simple model config for a PGS-only model
+            // Stage: Define a simple model configuration for a PGS-only model
             let simple_config = ModelConfig {
                 link_function: LinkFunction::Identity,
                 penalty_order: 2,
@@ -6354,12 +6308,12 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            // 2. Generate consistent structures using the canonical function
+            // Stage: Generate consistent structures using the canonical function
             let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
-            // 3. Create RemlState with the consistent objects
+            // Stage: Create a RemlState with the consistent objects
             let reml_state = internal::RemlState::new(
                 data.y.view(),
                 x_simple.view(),
@@ -6427,7 +6381,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
     use crate::calibrate::model::BasisConfig;
     use std::collections::HashMap;
 
-    // 1. Create a perfectly separated dataset
+    // Stage: Create a perfectly separated dataset
     let n_samples = 400;
     let p = Array1::linspace(-1.0, 1.0, n_samples);
     let y = p.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 }); // Perfect separation by PGS
@@ -6439,7 +6393,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         weights: Array1::ones(n_samples),
     };
 
-    // 2. Configure a logit model
+    // Stage: Configure a logit model
     let config = ModelConfig {
         link_function: LinkFunction::Logit,
         penalty_order: 2,
@@ -6461,11 +6415,11 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         interaction_orth_alpha: HashMap::new(),
     };
 
-    // 3. Train the model and expect an error
+    // Stage: Train the model and expect an error
     println!("Testing perfect separation detection with perfectly separated data...");
     let result = train_model(&data, &config);
 
-    // 4. Assert that we get the correct, specific error
+    // Stage: Assert that we get the correct, specific error
     assert!(
         result.is_err(),
         "Expected model training to fail due to perfect separation"
@@ -6679,7 +6633,7 @@ mod optimizer_progress_tests {
     }
 
     fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
-        // 1) Generate well-behaved data with a clear, non-linear signal on PC1.
+    // Stage: Generate well-behaved data with a clear, non-linear signal on PC1
         // The PGS predictor ('p') is included but is uncorrelated with the outcome.
         let n_samples = 500;
         let mut rng = StdRng::seed_from_u64(42);
@@ -6717,7 +6671,7 @@ mod optimizer_progress_tests {
             weights: Array1::ones(n_samples),
         };
 
-        // 2) Configure a simple, stable model. It includes penalties for PC1, PGS, and the interaction.
+    // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
         let config = ModelConfig {
             link_function,
             penalty_order: 2,
@@ -6746,7 +6700,7 @@ mod optimizer_progress_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
-        // 3) Build matrices and REML state to evaluate cost at specific rho
+    // Stage: Build matrices and the REML state to evaluate cost at specific rho values
         let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)?;
         let reml_state = internal::RemlState::new(
@@ -6758,7 +6712,7 @@ mod optimizer_progress_tests {
             &config,
         )?;
 
-        // 4) Compute initial cost at the same initial rho used by train_model
+    // Stage: Compute the initial cost at the same rho used by train_model
         assert!(
             layout.num_penalties > 0,
             "Model must have at least one penalty for BFGS to optimize"
@@ -6770,18 +6724,18 @@ mod optimizer_progress_tests {
             "Initial cost must be finite, got {initial_cost}"
         );
 
-        // 5) Run full training to get optimized lambdas
+    // Stage: Run full training to get optimized lambdas
         let trained = train_model(&data, &config)?;
         let final_rho = Array1::from_vec(trained.lambdas.clone()).mapv(f64::ln);
 
-        // 6) Compute final cost at optimized rho using the same RemlState
+    // Stage: Compute the final cost at optimized rho using the same RemlState
         let final_cost = reml_state.compute_cost(&final_rho)?;
         assert!(
             final_cost.is_finite(),
             "Final cost must be finite, got {final_cost}"
         );
 
-        // 7) Assert optimizer made progress beyond the initial guess
+    // Stage: Assert that the optimizer made progress beyond the initial guess
         assert!(
             final_cost < initial_cost - 1e-4,
             "Optimization failed to improve upon the initial guess. Initial: {}, Final: {}",
@@ -6814,7 +6768,7 @@ mod reparam_consistency_tests {
     // a finite-difference gradient computed in lambda-space and mapped by diag(lambda).
     #[test]
     fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
-        // 1) Small, deterministic Gaussian/Identity problem
+        // Stage: Build a small, deterministic Gaussian/Identity problem
         let n = 400;
         let mut rng = StdRng::seed_from_u64(12345);
         let p = Array1::from_shape_fn(n, |_| rng.gen_range(-1.0..1.0));
@@ -6867,12 +6821,12 @@ mod reparam_consistency_tests {
         )
         .expect("RemlState");
 
-        // 2) Moderate random rho in [-1, 1]
+        // Stage: Sample a moderate random rho in [-1, 1]
         let k = layout.num_penalties;
         let rho = Array1::from_shape_fn(k, |_| rng.gen_range(-1.0..1.0));
         let lambda = rho.mapv(f64::exp);
 
-        // 3) Analytic gradient wrt rho
+        // Stage: Compute the analytic gradient with respect to rho
         let g_rho = match reml_state.compute_gradient(&rho) {
             Ok(g) => g,
             Err(EstimationError::PirlsDidNotConverge { .. }) => {
@@ -6882,7 +6836,7 @@ mod reparam_consistency_tests {
             Err(e) => panic!("Analytic gradient failed: {:?}", e),
         };
 
-        // 4) Finite-difference gradient wrt lambda (central diff, relative step)
+        // Stage: Compute the finite-difference gradient with respect to lambda (central difference, relative step)
         let objective = |rv: &Array1<f64>| -> Option<f64> {
             match reml_state.compute_cost(rv) {
                 Ok(c) if c.is_finite() => Some(c),
@@ -6931,7 +6885,7 @@ mod reparam_consistency_tests {
             g_lambda_fd[i] = (c_plus - c_minus) / (2.0 * hi);
         }
 
-        // 5) Compare: g_rho ?= diag(lambda) * g_lambda_fd
+        // Stage: Compare g_rho to diag(lambda) * g_lambda_fd
         let rhs = &lambda * &g_lambda_fd; // elementwise
 
         let dot = g_rho.dot(&rhs);
@@ -6963,7 +6917,7 @@ mod gradient_validation_tests {
 
     #[test]
     fn test_laml_gradient_matches_finite_difference() {
-        // --- 1. SETUP: Identical to the original test ---
+        // --- Setup: Identical to the original test ---
         let n = 120;
         let mut rng = StdRng::seed_from_u64(123);
         let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
@@ -7027,7 +6981,7 @@ mod gradient_validation_tests {
         )
         .expect("state");
 
-        // Step 2: use a larger step size for the numerical gradient
+        // Stage: Use a larger step size for the numerical gradient
 
         // Evaluate at rho = 0 (λ = 1)
         let rho0 = Array1::zeros(layout.num_penalties);

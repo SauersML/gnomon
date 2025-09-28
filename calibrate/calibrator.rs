@@ -347,9 +347,9 @@ pub fn compute_alo_features(
         //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
         //
         // Mathematical justification:
-        // 1. Define z_i = η̂_i + (y_i - μ_i)/v_i as the working response
-        // 2. The LOO predictor is β̂^{(-i)} * x_i, where β̂^{(-i)} is fit without obs i
-        // 3. Using Sherman-Morrison formula for rank-1 update to the inverse:
+        // - Define z_i = η̂_i + (y_i - μ_i)/v_i as the working response
+        // - The LOO predictor is β̂^{(-i)} * x_i, where β̂^{(-i)} is fit without obs i
+        // - Using the Sherman-Morrison formula for the rank-1 update to the inverse:
         //    η̂^{(-i)} = (η̂_i - a_ii z_i) / (1 - a_ii)
         //    where a_ii = x_i^T(X^TWX)^{-1}x_i is the leverage
         //
@@ -569,7 +569,7 @@ pub fn build_calibrator_design(
 
     // Advanced heuristic for linear fallback with multiple criteria
 
-    // 1. Count zeros and compute distribution statistics
+    // Stage: Count zeros and compute distribution statistics
     let mut zeros_count = 0;
     let mut pos_count = 0;
     // Using a map to handle f64 keys since BTreeSet requires Ord trait
@@ -1259,8 +1259,6 @@ pub fn predict_calibrator(
             model.knots_dist.view(),
             model.spec.dist_basis.degree,
         )?;
-        // Since we've removed STZ from distance smooth, model.stz_dist should be identity,
-        // but we still multiply by it for consistency with the training code
         b_dist_raw.dot(&model.stz_dist)
     };
 
@@ -1424,8 +1422,6 @@ pub fn fit_calibrator(
     ))
 }
 
-// (removed local optimizer; using shared optimize_external_design)
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1454,14 +1450,14 @@ mod tests {
             linalg::solvers::{Llt, Solve},
         };
 
-        // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
+    // Stage: Form S_lambda for the βᵀ Sλ β term (invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
             let lam = rho[j].exp();
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
 
-        // 1b) Stabilized reparameterization
+    // Stage: Run the stabilized reparameterization
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("roots");
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
@@ -1470,7 +1466,7 @@ mod tests {
         // Transform X to stabilized basis
         let x_trans = x.dot(&reparam.qs);
 
-        // 2) penalized IRLS to convergence (in transformed coordinates)
+    // Stage: Run penalized IRLS to convergence in the transformed coordinates
         let n = x.nrows();
         let p = x.ncols();
         let mut beta_trans = Array1::<f64>::zeros(p);
@@ -1527,7 +1523,7 @@ mod tests {
             beta_trans = beta_trans_new;
         }
 
-        // 3) pieces for F - compute final objective using stabilized values
+    // Stage: Assemble the pieces for F and compute the final objective using stabilized values
         let beta = reparam.qs.dot(&beta_trans);
         let eta = x.dot(&beta);
         let mu = eta
@@ -1595,14 +1591,14 @@ mod tests {
             linalg::solvers::{Llt, Solve},
         };
 
-        // 1) S_lambda (for βᵀ Sλ β term - invariant under transformation)
+    // Stage: Form S_lambda for the βᵀ Sλ β term (invariant under transformation)
         let mut s_lambda = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for (j, Rj) in rs_blocks.iter().enumerate() {
             let lam = rho[j].exp();
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
 
-        // 1b) Stabilized reparameterization
+    // Stage: Run the stabilized reparameterization
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("roots");
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
@@ -1611,7 +1607,7 @@ mod tests {
         // Transform X to stabilized basis
         let x_trans = x.dot(&reparam.qs);
 
-        // 2) Direct least squares solution in transformed coordinates
+    // Stage: Solve the least squares problem directly in the transformed coordinates
         let n = x.nrows();
         let p = x.ncols();
 
@@ -1644,7 +1640,7 @@ mod tests {
         let beta_trans = Array1::from_iter((0..p).map(|i| sol[(i, 0)]));
         let beta = reparam.qs.dot(&beta_trans);
 
-        // 3) pieces for F - compute final objective using stabilized values
+    // Stage: Assemble the pieces for F and compute the final objective using stabilized values
         let eta = x.dot(&beta);
 
         // -log-lik with prior weights (weighted RSS term)
@@ -2179,8 +2175,6 @@ mod tests {
         })
     }
 
-    // QR decomposition and triangular solve helpers removed as they were unused
-
     // ===== ALO Correctness Tests =====
 
     #[test]
@@ -2337,13 +2331,13 @@ mod tests {
 
         // Verify properties of hat diagonal elements:
 
-        // 1. Basic sanity checks
+        // Stage: Basic sanity checks
         for &a in aii.iter() {
             assert!(a >= 0.0, "Hat diagonal should be non-negative");
             assert!(a < 1.0, "Hat diagonal should be less than 1.0");
         }
 
-        // 2. Mean should be approximately trace(A)/n = p/n
+        // Stage: Check that the mean approximates trace(A)/n = p/n
         let a_mean: f64 = aii.iter().sum::<f64>() / (n as f64);
         let expected_mean = (p as f64) / (n as f64);
         assert!(
@@ -2353,7 +2347,7 @@ mod tests {
             expected_mean
         );
 
-        // 3. Hat diagonals should correlate with leverage (x_i magnitude)
+        // Stage: Confirm that hat diagonals correlate with leverage (x_i magnitude)
         let x_leverage: Vec<f64> = (0..n).map(|i| x.row(i).dot(&x.row(i))).collect();
 
         // Calculate correlation between hat diagonals and leverage
@@ -2385,7 +2379,7 @@ mod tests {
             correlation
         );
 
-        // 4. If any w_i=0, the corresponding a_ii should be 0
+        // Stage: Verify that zero weights force the corresponding a_ii to zero
         let mut w_zero = w.clone();
         let test_idx = 10;
         w_zero[test_idx] = 0.0;
@@ -2729,7 +2723,7 @@ mod tests {
         let intercept = beta[0];
 
         // Check that STZ constraint has worked:
-        // 1. The intercept should be close to the logit of the mean
+        // Stage: Confirm that the intercept is close to the logit of the mean
         assert!(
             (intercept - logit_mean_y).abs() < 0.1,
             "Intercept {:.4} should be close to logit(mean_y) {:.4}",
@@ -2737,14 +2731,14 @@ mod tests {
             logit_mean_y
         );
 
-        // 2. The smooth coefficient should be very small (effectively zero)
+        // Stage: Ensure the smooth coefficient is very small (effectively zero)
         assert!(
             edf_pred < 0.5,
             "EDF for the pred smooth should be small when using constant predictor, got {:.4}",
             edf_pred
         );
 
-        // 3. Verify the weighted column means are approximately zero
+        // Stage: Verify the weighted column means are approximately zero
         // This is what STZ constraint actually guarantees
         let pred_range = schema.column_spans.0.clone();
         let b_pred = x.slice(s![.., pred_range.clone()]);
@@ -3011,10 +3005,10 @@ mod tests {
         // we'll make our test more realistic by modifying the calibrator features to
         // create near collinearity directly in the input data
         //
-        // For reference, this is what the test used to do:
-        // 1. Duplicate a column in X matrix
-        // 2. Manually expand penalty matrices with zero row/col
-        // That approach is error-prone as it can lead to dimension mismatch errors
+        // For reference, the previous version of this test duplicated a column in X and manually
+        // expanded the penalty matrices with zero rows/columns. That approach was error-prone and
+        // often led to dimension mismatches, so we now create the collinearity directly via the
+        // feature inputs.
 
         // Uniform weights
         let w = Array1::ones(n);
@@ -3645,14 +3639,14 @@ mod tests {
         }
 
         // Verify "do no harm" properties:
-        // 1. Predictions shouldn't change much
+        // Stage: Ensure predictions do not change significantly
         assert!(
             max_abs_diff < 5e-3,
             "Max absolute difference between predictions should be small (<= 5e-3), got {:.4e}",
             max_abs_diff
         );
 
-        // 2. ECE should not get worse
+        // Stage: Confirm that ECE does not get worse
         assert!(
             cal_ece <= base_ece + 1e-3,
             "Calibrated ECE ({:.4e}) should not be worse than base ECE ({:.4e})",
@@ -3660,7 +3654,7 @@ mod tests {
             base_ece
         );
 
-        // 3. EDF for all smooths should be small (minimal complexity needed)
+        // Stage: Check that the EDF for all smooths stays small (minimal complexity needed)
         let total_edf = edf_pred + edf_se + edf_dist;
         assert!(
             total_edf <= 5.0,
@@ -4123,10 +4117,6 @@ mod tests {
     }
 
     // ===== Integration Tests =====
-
-    // Removed problematic test that mocked non-existent struct fields
-
-    // Removed problematic test - replaced with simple roundtrip test
     // Storage for projected points needs to be mutable
     #[test]
     fn simple_calibrator_roundtrip() {
@@ -4327,7 +4317,7 @@ mod tests {
         );
 
         // Test two prediction approaches for consistency:
-        // 1. With the full centering (our fix)
+        // Stage: Evaluate predictions with the full centering (our fix)
         let pred1 = predict_calibrator(
             &cal_model,
             test_pred.view(),
@@ -4336,7 +4326,7 @@ mod tests {
         )
         .unwrap();
 
-        // 2. With a "manually" centered version that accounts for standardization
+        // Stage: Evaluate a manually centered version that accounts for standardization
         // The offset is in standardized units, so we need to convert it to raw units
         // by multiplying by the standard deviation
         let (_, se_std) = schema.standardize_se;
@@ -5545,8 +5535,8 @@ mod tests {
     #[test]
     fn test_stz_checks_column_means_not_coef_sums() {
         // This test demonstrates the difference between:
-        // 1. Column means of basis matrix being zero (STZ guarantee)
-        // 2. Sum of coefficients being zero (incorrect test assertion)
+        // - Column means of the basis matrix being zero (the STZ guarantee)
+        // - The sum of coefficients being zero (an incorrect test assertion)
 
         // Create a simple dataset with just a constant predictor
         let n = 100;
@@ -5659,7 +5649,7 @@ mod tests {
         let (beta_nonuniform, ..) = fit_nonuniform;
 
         // Verify column means vs coefficient sums
-        // 1. Column means should be ~0 in both cases (STZ guarantee)
+        // Stage: Confirm that column means are approximately zero in both cases (STZ guarantee)
         println!("\nVerifying column means of the basis matrix after STZ constraint:");
 
         // Get pred block span for uniform case
@@ -5701,7 +5691,7 @@ mod tests {
             max_abs_col_mean_nonuniform
         );
 
-        // 2. But sum of coefficients is generally NOT zero (the test's incorrect assertion)
+        // Stage: Highlight that the sum of coefficients is generally NOT zero (the test's incorrect assertion)
         let pred_coef_sum_uniform: f64 = beta_uniform.slice(s![pred_range_uniform]).sum();
         let pred_coef_sum_nonuniform: f64 = beta_nonuniform.slice(s![pred_range_nonuniform]).sum();
 
@@ -5715,7 +5705,7 @@ mod tests {
             pred_coef_sum_nonuniform
         );
 
-        // 3. But the intercept should be close to logit(mean_y) in both cases (the correct assertion)
+        // Stage: Check that the intercept is close to logit(mean_y) in both cases (the correct assertion)
         let intercept_uniform = beta_uniform[0];
         let intercept_nonuniform = beta_nonuniform[0];
 
