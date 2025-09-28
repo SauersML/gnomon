@@ -13,8 +13,7 @@ TRUNCATE_KEEP = 100       # Keep this many items at the start and end
 
 def main():
     """Converts an RDS file to a rounded and truncated R script."""
-    # Step 0: Pre-flight checks for input file and Rscript
-    # ----------------------------------------------------
+    # Stage: Pre-flight checks for the input file and Rscript
     if not INPUT.exists():
         sys.stderr.write(f"Error: Input file '{INPUT}' not found in {Path('.').resolve()}\n")
         sys.exit(1)
@@ -27,21 +26,18 @@ def main():
         )
         sys.exit(2)
 
-    # Step 1: Generate the full-precision R file using Rscript.
-    # -----------------------------------------------------------
+    # Stage: Generate the full-precision R file using Rscript.
     print(f"1. Generating full-precision R code from '{INPUT}'...")
     generate_r_file()
     print(f"   Successfully generated intermediate file '{OUTPUT}'.")
 
-    # Step 2: Read the generated file and round all floating-point numbers.
-    # ----------------------------------------------------------------------
+    # Stage: Read the generated file and round all floating-point numbers.
     print(f"2. Rounding all floating-point numbers to {DECIMAL_PLACES} decimal places...")
     content = OUTPUT.read_text()
     rounded_content = round_floats_in_text(content)
     print("   Rounding complete.")
 
-    # Step 3: Find and truncate very long lists of numbers in the rounded content.
-    # --------------------------------------------------------------------------
+    # Stage: Find and truncate very long lists of numbers in the rounded content.
     print(f"3. Truncating number lists longer than {TRUNCATE_THRESHOLD} elements...")
     final_content, num_truncated = truncate_long_lists_in_text(rounded_content)
     if num_truncated > 0:
@@ -50,7 +46,6 @@ def main():
         print("   No lists were long enough to require truncation.")
 
     # Final Step: Write the processed content back to the file.
-    # ---------------------------------------------------------
     OUTPUT.write_text(final_content)
 
     print("\n--- Success! ---")

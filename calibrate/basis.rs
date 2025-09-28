@@ -1,8 +1,6 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
-
-// Imports removed: use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -80,8 +78,8 @@ pub enum BasisError {
 /// # Returns
 ///
 /// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
-/// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
-/// 2.  A copy of the **knot vector** used.
+/// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
+/// - A copy of the **knot vector** used.
 pub fn create_bspline_basis_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -156,9 +154,9 @@ pub fn create_bspline_basis_with_knots(
 /// # Returns
 ///
 /// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
-/// 1.  The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
-///     The number of basis functions is `num_internal_knots + degree + 1`.
-/// 2.  The **knot vector**, containing all knots including repeated boundary knots.
+/// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
+///   The number of basis functions is `num_internal_knots + degree + 1`.
+/// - The **knot vector**, containing all knots including repeated boundary knots.
 ///
 /// # Mathematical Background
 ///
@@ -254,8 +252,8 @@ pub fn create_difference_penalty_matrix(
 ///
 /// # Returns
 /// A tuple containing:
-/// 1. The new, constrained basis matrix (with one fewer column).
-/// 2. The transformation matrix `Z` used to create it.
+/// - The new, constrained basis matrix (with one fewer column).
+/// - The transformation matrix `Z` used to create it.
 pub fn apply_sum_to_zero_constraint(
     basis_matrix: ArrayView2<f64>,
     weights: Option<ArrayView1<f64>>,
@@ -1111,16 +1109,16 @@ mod tests {
         // This test replaces a previously flawed version. The goal is to verify that
         // the prediction logic for a constrained B-spline basis is consistent and correct.
         // We perform two checks:
-        // 1. On-Grid Consistency: Ensure calculating a prediction for a single point that
+        // Stage: On-grid consistency—ensure calculating a prediction for a single point that
         //    is ON the original grid yields the same result as the batch calculation.
-        // 2. Off-Grid Interpolation: Ensure a prediction for a point OFF the grid
+        // Stage: Off-grid interpolation—ensure a prediction for a point off the grid
         //    (e.g., 0.65) produces a value that lies between its neighbors (0.6 and 0.7),
         //    validating the spline's interpolation property.
         //
         // The previous test incorrectly asserted that the value at 0.65 should equal
         // the value at 0.6, which is false for a non-flat cubic spline.
 
-        // --- 1. Setup: Same as the original test ---
+        // --- Setup: Same as the original test ---
         let data = Array::linspace(0.0, 1.0, 11);
         let degree = 3;
         let num_internal_knots = 5;
@@ -1136,10 +1134,10 @@ mod tests {
         let num_con_coeffs = main_basis_con.ncols();
         let main_coeffs = Array1::from_shape_fn(num_con_coeffs, |i| (i as f64 + 1.0) * 0.1);
 
-        // --- 2. Calculate Batch Predictions on the Grid (Our Ground Truth) ---
+        // --- Calculate batch predictions on the grid (our ground truth) ---
         let predictions_on_grid = intercept_coeff + main_basis_con.dot(&main_coeffs);
 
-        // --- 3. On-Grid Consistency Check ---
+        // --- On-grid consistency check ---
         // Let's test the point x=0.6, which corresponds to index 6 in our `data` grid.
         let test_point_on_grid_x = 0.6;
         let on_grid_idx = 6;
@@ -1164,7 +1162,7 @@ mod tests {
             epsilon = 1e-12 // Use a tight epsilon for this identity check
         );
 
-        // --- 4. Off-Grid Interpolation Check ---
+        // --- Off-grid interpolation check ---
         // Now test the off-grid point x=0.65, which lies between grid points 0.6 and 0.7.
         let test_point_off_grid_x = 0.65;
 
