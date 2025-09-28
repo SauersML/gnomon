@@ -626,10 +626,10 @@ mod internal {
         let n_samples = p_new.len();
         let mut owned_cols: Vec<Array1<f64>> = Vec::new();
 
-    // Stage: Populate the intercept column
-        owned_cols.push(Array1::ones(n_samples));
+        // Stage: Populate the intercept column
+        owned_cols.push(Array1::<f64>::ones(n_samples));
 
-    // Stage: Add main PC effects per PC—null first (if any), then range
+        // Stage: Add main PC effects per PC—null first (if any), then range
         for pc_idx in 0..config.pc_configs.len() {
             if let Some(ref null_basis) = pc_null_bases[pc_idx] {
                 for col in null_basis.axis_iter(Axis(1)) {
@@ -641,12 +641,12 @@ mod internal {
             }
         }
 
-    // Stage: Add the main PGS effect
+        // Stage: Add the main PGS effect
         for col in pgs_main_basis.axis_iter(Axis(1)) {
             owned_cols.push(col.to_owned());
         }
 
-    // Stage: Add tensor product interaction effects (only if PCs are present)
+        // Stage: Add tensor product interaction effects (only if PCs are present)
         if !config.pc_configs.is_empty() {
             // Use WHITENED basis for consistency with training
             let z_range_pgs_pred = config
@@ -695,7 +695,7 @@ mod internal {
                             })?;
 
                     // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
-                    let intercept = Array1::ones(n_samples).insert_axis(Axis(1));
+                    let intercept = Array1::<f64>::ones(n_samples).insert_axis(Axis(1));
                     // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
                     let mut m_cols: Vec<Array1<f64>> =
                         intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
@@ -865,21 +865,21 @@ mod tests {
 
         // --- Calculate the expected result CORRECTLY ---
         // The manual calculation was flawed. Here's the correct way to derive the ground truth:
-    // Stage: Generate the raw, unconstrained basis at the test points
+        // Stage: Generate the raw, unconstrained basis at the test points
         let (full_basis_unc, _) =
             basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
                 .unwrap();
 
-    // Stage: Isolate the main effect part of the basis (all columns except the intercept)
+        // Stage: Isolate the main effect part of the basis (all columns except the intercept)
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
 
-    // Stage: Apply the same sum-to-zero constraint transformation
+        // Stage: Apply the same sum-to-zero constraint transformation
         let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
 
-    // Stage: Get the coefficients for the constrained basis
+        // Stage: Get the coefficients for the constrained basis
         let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
 
-    // Stage: Calculate the final expected linear predictor as intercept + constrained_basis * coeffs
+        // Stage: Calculate the final expected linear predictor as intercept + constrained_basis * coeffs
         let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
 
         // Get the model's prediction using the actual `predict` method
@@ -1120,7 +1120,7 @@ mod tests {
                 Array1::linspace(-0.5, 0.5, n_samples).to_vec(),
             )
             .unwrap(),
-            weights: Array1::ones(n_samples),
+            weights: Array1::<f64>::ones(n_samples),
         };
 
         // Generate the correct constraints, structure, and range transforms using the actual model-building code
