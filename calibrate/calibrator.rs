@@ -1,6 +1,5 @@
 use crate::calibrate::basis::{
-    BasisError, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
-    create_difference_penalty_matrix,
+    BasisError, apply_weighted_orthogonality_constraint, create_difference_penalty_matrix,
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
@@ -529,6 +528,22 @@ pub fn build_calibrator_design(
         );
     }
 
+    fn polynomial_constraint_matrix(values: &Array1<f64>, order: usize) -> Array2<f64> {
+        if order == 0 {
+            return Array2::<f64>::zeros((values.len(), 0));
+        }
+
+        let mut constraints = Array2::<f64>::zeros((values.len(), order));
+        constraints.column_mut(0).fill(1.0);
+        for degree in 1..order {
+            let mut col = constraints.column_mut(degree);
+            for (idx, &v) in values.iter().enumerate() {
+                col[idx] = v.powi(degree as i32);
+            }
+        }
+        constraints
+    }
+
     if let Some(w) = spec.prior_weights.as_ref() {
         if w.len() != n {
             return Err(EstimationError::InvalidSpecification(format!(
@@ -969,6 +984,8 @@ pub fn build_calibrator_design(
         knots_se.view(),
         spec.se_basis.degree,
     )?;
+    let pred_raw_cols = b_pred_raw.ncols();
+    let se_raw_cols = b_se_raw.ncols();
 
     // Pull training weights for use in orthogonality constraints and STZ (weighted centering)
     let w_for_stz = spec.prior_weights.as_ref().map(|w| w.view());
@@ -1031,9 +1048,21 @@ pub fn build_calibrator_design(
         col.mapv_inplace(|v| v - mu_se); // Apply centering using the pre-calculated offset
         (col.insert_axis(Axis(1)).to_owned(), Array2::<f64>::eye(1))
     } else {
-        // Apply weighted STZ constraint using the provided training weights
-        // This ensures consistency across all smooths and maintains identifiability
-        apply_sum_to_zero_constraint(b_se_raw.view(), w_for_stz)?
+        let constraint_order = spec.penalty_order_se.min(se_raw_cols);
+        let z = polynomial_constraint_matrix(&se_std, constraint_order);
+        match apply_weighted_orthogonality_constraint(b_se_raw.view(), z.view(), w_for_stz) {
+            Ok(res) => res,
+            Err(BasisError::ConstraintNullspaceNotFound) => {
+                eprintln!(
+                    "[CAL] se basis fully constrained by polynomial nullspace; dropping block"
+                );
+                (
+                    Array2::<f64>::zeros((n, 0)),
+                    Array2::<f64>::zeros((se_raw_cols, 0)),
+                )
+            }
+            Err(err) => return Err(EstimationError::BasisError(err)),
+        }
     };
 
     prune_near_zero_columns(&mut b_se_c, &mut stz_se, "se");
@@ -1059,14 +1088,14 @@ pub fn build_calibrator_design(
         0.0 // No centering for spline basis or when all distances are zero
     };
 
-    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0) = if use_linear_dist {
+    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, dist_raw_cols) = if use_linear_dist {
         // If the "hinged+centered" distance is effectively constant/zero, drop the term entirely.
         if dist_all_zero {
             let b = Array2::<f64>::zeros((n, 0));
             let stz = Array2::<f64>::eye(0);
             let knots = Array1::<f64>::zeros(0);
             let s0 = Array2::<f64>::zeros((0, 0));
-            (b, stz, knots, s0)
+            (b, stz, knots, s0, 0)
         } else {
             // Keep the single centered linear column and give it a tiny penalty so REML pays to use it
             // Make sure it's actually centered using the pre-calculated offset
@@ -1078,7 +1107,7 @@ pub fn build_calibrator_design(
             let stz = Array2::<f64>::eye(1);
             let knots = Array1::<f64>::zeros(0);
             let s0 = Array2::<f64>::from_elem((1, 1), 1.0);
-            (b, stz, knots, s0)
+            (b, stz, knots, s0, 1)
         }
     } else {
         // Create the spline basis for distance
@@ -1087,14 +1116,33 @@ pub fn build_calibrator_design(
             knots_dist_generated.view(),
             spec.dist_basis.degree,
         )?;
+        let dist_raw_cols = b_dist_raw.ncols();
 
-        // Always apply STZ to ensure identifiability for all λ values
-        // This is fundamental: STZ is required for proper identifiability regardless of penalties
-        eprintln!("[CAL] Applying STZ to distance smooth for identifiability");
-        let (b_dist_c, stz_dist) = apply_sum_to_zero_constraint(b_dist_raw.view(), w_for_stz)?;
+        // Always enforce identifiability constraints so the optimizer sees the true nullspace
+        // Replace STZ with full polynomial nullspace removal to match penalty nullspace
+        eprintln!("[CAL] Applying orthogonality constraints to distance smooth");
+        let constraint_order = spec.penalty_order_dist.min(dist_raw_cols);
+        let z = polynomial_constraint_matrix(&dist_std, constraint_order);
+        let (b_dist_c, stz_dist) = match apply_weighted_orthogonality_constraint(
+            b_dist_raw.view(),
+            z.view(),
+            w_for_stz,
+        ) {
+            Ok(res) => res,
+            Err(BasisError::ConstraintNullspaceNotFound) => {
+                eprintln!(
+                    "[CAL] dist basis fully constrained by polynomial nullspace; dropping block"
+                );
+                (
+                    Array2::<f64>::zeros((n, 0)),
+                    Array2::<f64>::zeros((dist_raw_cols, 0)),
+                )
+            }
+            Err(err) => return Err(EstimationError::BasisError(err)),
+        };
         let s_dist_raw0 =
             create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
-        (b_dist_c, stz_dist, knots_dist_generated, s_dist_raw0)
+        (b_dist_c, stz_dist, knots_dist_generated, s_dist_raw0, dist_raw_cols)
     };
 
     prune_near_zero_columns(&mut b_dist_c, &mut stz_dist, "dist");
@@ -1225,22 +1273,37 @@ pub fn build_calibrator_design(
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
+    let pred_constraints_applied = pred_raw_cols.saturating_sub(pred_constraint.ncols());
+    let se_constraints_applied = if se_linear_fallback {
+        0
+    } else {
+        se_raw_cols.saturating_sub(stz_se.ncols())
+    };
+    let dist_constraints_applied = if use_linear_dist {
+        0
+    } else {
+        dist_raw_cols.saturating_sub(stz_dist.ncols())
+    };
+
     let pred_null_dim = spec
         .penalty_order_pred
-        .min(b_pred_raw.ncols())
-        .min(2);
+        .min(pred_raw_cols)
+        .saturating_sub(pred_constraints_applied);
     let se_null_dim = if se_linear_fallback {
         0
     } else {
-        spec.penalty_order_se.min(b_se_raw.ncols()).min(2)
+        spec
+            .penalty_order_se
+            .min(se_raw_cols)
+            .saturating_sub(se_constraints_applied)
     };
     let dist_null_dim = if use_linear_dist {
         0
     } else {
         spec
             .penalty_order_dist
-            .min(s_dist_raw0.nrows())
-            .min(b_dist_c.ncols())
+            .min(dist_raw_cols)
+            .saturating_sub(dist_constraints_applied)
     };
 
     let schema = InternalSchema {
