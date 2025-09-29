@@ -70,6 +70,29 @@ const RHO_BOUND: f64 = 20.0;
 const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
 const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
 
+fn atanh_clamped(x: f64) -> f64 {
+    0.5 * ((1.0 + x) / (1.0 - x)).ln()
+}
+
+fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
+    rho.mapv(|r| {
+        // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
+        let ratio = r / RHO_BOUND;
+        let xr = if ratio < -0.999_999 {
+            -0.999_999
+        } else if ratio > 0.999_999 {
+            0.999_999
+        } else {
+            ratio
+        };
+        atanh_clamped(xr)
+    })
+}
+
+fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
+    z.mapv(|v| RHO_BOUND * v.tanh())
+}
+
 /// A comprehensive error type for the model estimation process.
 #[derive(Error)]
 pub enum EstimationError {
@@ -292,25 +315,6 @@ pub fn train_model(
         });
     }
 
-    // Helper: map bounded rho -> unconstrained z
-    fn atanh_clamped(x: f64) -> f64 {
-        0.5 * ((1.0 + x) / (1.0 - x)).ln()
-    }
-    fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
-        rho.mapv(|r| {
-            // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
-            let ratio = r / RHO_BOUND;
-            let xr = if ratio < -0.999_999 {
-                -0.999_999
-            } else if ratio > 0.999_999 {
-                0.999_999
-            } else {
-                ratio
-            };
-            atanh_clamped(xr)
-        })
-    }
-
     // Multi-start seeding with asymmetric perturbations to break symmetry
     // This prevents the optimizer from getting trapped when PC penalties are identical
     let mut seed_candidates = Vec::new();
@@ -494,7 +498,7 @@ pub fn train_model(
     });
 
     // Map to rho space for gradient check (always-on)
-    let initial_rho = initial_z.mapv(|v| RHO_BOUND * v.tanh());
+    let initial_rho = to_rho_from_z(&initial_z);
 
     // Always-on gradient check - run once at the initial point (release builds included)
     eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy at initial point");
@@ -670,19 +674,21 @@ pub fn train_model(
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
 
-    // Calculate and store the initial cost for fallback comparison
-    // Evaluate cost at the unconstrained initial point (z space)
-    let (initial_cost, _) = reml_state.cost_and_grad(&initial_z);
-
     // --- Run the BFGS Optimizer ---
     // The closure is now a simple, robust method call.
     // Rationale: We store the result instead of immediately crashing with `?`
     // This allows us to inspect the error type and handle it gracefully.
     // Run BFGS in unconstrained space z, with mapping handled inside cost_and_grad
-    let bfgs_result = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
-        .run();
+        // optional but recommended: make the floating-point guards a bit tighter for smoother models
+        .with_fp_tolerances(1e2, 1e2)
+        // let the optimizer stop on "no meaningful improvement" without you checking it again
+        .with_no_improve_stop(1e-8, 5)
+        // determinism for the (small) stochastic jiggling used to escape flats
+        .with_rng_seed(0xC0FFEE_u64);
+    let bfgs_result = solver.run();
 
     // Rationale: This `match` block is the new control structure. It allows us
     // to define different behaviors for a successful run vs. a failed run.
@@ -703,222 +709,10 @@ pub fn train_model(
         // helpful warning and extract `last_solution` (the best result found before
         // failure), allowing the program to continue.
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            // Check if the optimizer made ANY progress from the start.
-            if last_solution.final_value >= initial_cost {
-                eprintln!(
-                    "\n[WARNING] BFGS line search failed to make any progress from the initial point."
-                );
-                eprintln!(
-                    "Initial Cost: {:.4}, Final Cost: {:.4}",
-                    initial_cost, last_solution.final_value
-                );
-
-                // Small-λ restarts: try several asymmetric seeds to escape symmetry traps
-                eprintln!("[INFO] Attempting small-λ asymmetric restarts...");
-
-                // Build deterministic asymmetric restart seeds in rho-space
-                let mut restart_rhos: Vec<Array1<f64>> = Vec::new();
-                // Always include the symmetric -4 baseline to match previous behavior
-                restart_rhos.push(Array1::from_elem(layout.num_penalties, -4.0));
-                // If there are at least 2 penalties, add a few asymmetric patterns
-                if layout.num_penalties >= 2 {
-                    // Pattern A: [-4, -6, -4, -6, ...]
-                    let mut a = Array1::zeros(layout.num_penalties);
-                    for i in 0..layout.num_penalties {
-                        a[i] = if i % 2 == 0 { -4.0 } else { -6.0 };
-                    }
-                    restart_rhos.push(a);
-
-                    // Pattern B: [-2, -4, -2, -4, ...]
-                    let mut b = Array1::zeros(layout.num_penalties);
-                    for i in 0..layout.num_penalties {
-                        b[i] = if i % 2 == 0 { -2.0 } else { -4.0 };
-                    }
-                    restart_rhos.push(b);
-
-                    // Pattern C: a single heavier push along first coordinate
-                    let mut c = Array1::from_elem(layout.num_penalties, -4.0);
-                    c[0] = -8.0;
-                    restart_rhos.push(c);
-                }
-
-                // Evaluate each restart with a short BFGS run and require small gradient norm
-                let short_iters = (config.reml_max_iterations as usize).min(50).max(10);
-                let mut best_alt: Option<BfgsSolution> = None;
-                let mut best_alt_grad_norm_z: f64 = f64::INFINITY;
-                let mut best_alt_value: f64 = f64::INFINITY;
-
-                // Helper to compute gradient norms at a given z (optimizer space)
-                fn grad_norms_in_z_and_rho(
-                    state: &internal::RemlState,
-                    z: &Array1<f64>,
-                ) -> (f64, f64) {
-                    let rho = z.mapv(|v| RHO_BOUND * v.tanh());
-                    let mut g_rho = match state.compute_gradient(&rho) {
-                        Ok(g) => g,
-                        Err(_) => return (f64::INFINITY, f64::INFINITY),
-                    };
-                    // Projected/KKT handling at active bounds in rho-space
-                    let tol = 1e-8;
-                    for i in 0..rho.len() {
-                        if rho[i] <= -RHO_BOUND + tol && g_rho[i] > 0.0 {
-                            g_rho[i] = 0.0; // can't move outward below lower bound
-                        }
-                        if rho[i] >= RHO_BOUND - tol && g_rho[i] < 0.0 {
-                            g_rho[i] = 0.0; // can't move outward above upper bound
-                        }
-                    }
-                    let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
-                    let g_z = &g_rho * &jac;
-                    let norm_z = g_z.dot(&g_z).sqrt();
-                    let norm_rho = g_rho.dot(&g_rho).sqrt();
-                    (norm_z, norm_rho)
-                }
-
-                for (idx, rho_seed) in restart_rhos.iter().enumerate() {
-                    let start_z = to_z_from_rho(rho_seed);
-                    eprintln!("  - Restart #{idx}: rho seed = {:?}", rho_seed);
-                    let run = Bfgs::new(start_z, |z| reml_state.cost_and_grad(z))
-                        .with_tolerance(config.reml_convergence_tolerance)
-                        .with_max_iterations(short_iters)
-                        .run();
-
-                    let candidate = match run {
-                        Ok(sol) => sol,
-                        Err(wolfe_bfgs::BfgsError::LineSearchFailed {
-                            last_solution: ls, ..
-                        }) => *ls,
-                        Err(_) => continue,
-                    };
-
-                    // Compute z-space gradient norm for acceptance (consistent with optimizer)
-                    let (grad_norm_z, grad_norm_rho) =
-                        grad_norms_in_z_and_rho(&reml_state, &candidate.final_point);
-
-                    eprintln!(
-                        "    -> cand value = {:.6}, ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
-                        candidate.final_value, grad_norm_z, grad_norm_rho
-                    );
-
-                    // Track best candidate by value, with z-gradient-norm tie-breaker
-                    if candidate.final_value < best_alt_value
-                        || (candidate.final_value - best_alt_value).abs() <= 1e-9
-                            && grad_norm_z < best_alt_grad_norm_z
-                    {
-                        best_alt_value = candidate.final_value;
-                        best_alt_grad_norm_z = grad_norm_z;
-                        best_alt = Some(candidate);
-                    }
-                }
-
-                // Acceptance rule: require reasonable near-stationarity
-                // Build scale-aware thresholds and use Jacobian-aware scaling for z-space
-                let cost_scale = 0.1 + last_solution.final_value.abs();
-                let grad_tol = config.reml_convergence_tolerance * cost_scale;
-                let grad_norm_accept_rho = 10.0 * grad_tol;
-                // Compute last solution's gradient norms and Jacobian scale
-                let (last_grad_norm_z, last_grad_norm_rho) =
-                    grad_norms_in_z_and_rho(&reml_state, &last_solution.final_point);
-                let jac_max_last = last_solution
-                    .final_point
-                    .iter()
-                    .map(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)))
-                    .fold(0.0f64, |a, b| a.max(b.abs()));
-                let grad_norm_accept_z = jac_max_last * grad_norm_accept_rho;
-                eprintln!(
-                    "[Restart Baseline] last value = {:.6}, ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
-                    last_solution.final_value, last_grad_norm_z, last_grad_norm_rho
-                );
-
-                if let Some(alt) = best_alt {
-                    let fv0 = last_solution.final_value;
-                    let fv1 = alt.final_value;
-                    let rel_diff = ((fv0 - fv1).abs()) / (1.0 + fv0.abs().max(fv1.abs()));
-
-                    // Meaningful improvement OR close values with better gradient
-                    let cost_improved = fv1 < fv0 - 1e-6 * cost_scale;
-                    let similar_cost_better_grad =
-                        rel_diff < 1e-6 && best_alt_grad_norm_z < 0.9 * last_grad_norm_z;
-
-                    if (cost_improved || similar_cost_better_grad)
-                        && (best_alt_grad_norm_z <= grad_norm_accept_z
-                            || best_alt_grad_norm_z <= grad_norm_accept_rho)
-                    {
-                        eprintln!(
-                            "[INFO] Accepting asymmetric restart (Δcost={:.3e}, ||grad_z||={:.2e}).",
-                            fv0 - fv1,
-                            best_alt_grad_norm_z
-                        );
-                        alt
-                    } else {
-                        eprintln!(
-                            "[INFO] Rejecting restarts (insufficient improvement or large gradient). Keeping original."
-                        );
-                        *last_solution
-                    }
-                } else {
-                    eprintln!("[INFO] All restarts failed. Proceeding with the initial solution.");
-                    *last_solution
-                }
-            } else {
-                eprintln!(
-                    "\n[WARNING] BFGS line search could not find further improvement, which is common near an optimum."
-                );
-
-                // Compute both rho- and z-space gradient norms at last_solution
-                let z_last = &last_solution.final_point;
-                let rho_last = z_last.mapv(|v| RHO_BOUND * v.tanh());
-                let (gradient_norm_z, gradient_norm_rho) = {
-                    let g_rho = match reml_state.compute_gradient(&rho_last) {
-                        Ok(g) => g,
-                        Err(_) => Array1::from_elem(rho_last.len(), f64::INFINITY),
-                    };
-                    let jac = z_last.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
-                    let g_z = &g_rho * &jac;
-                    (g_z.dot(&g_z).sqrt(), g_rho.dot(&g_rho).sqrt())
-                };
-
-                // If we've already improved relative to the initial cost, accept the
-                // best-so-far parameters regardless of gradient size. Otherwise, fall
-                // back to the gradient-norm acceptance below.
-                if last_solution.final_value < initial_cost - 1e-9 {
-                    eprintln!(
-                        "[INFO] Accepting improved best-so-far solution based on cost improvement (initial: {:.6}, best: {:.6}).",
-                        initial_cost, last_solution.final_value
-                    );
-                    *last_solution
-                } else {
-                    // Only accept the solution if gradient norm is small enough
-                    // Use a scale-aware threshold and Jacobian-aware scaling between spaces
-                    let cost_scale = 0.1 + last_solution.final_value.abs();
-                    let grad_tol = config.reml_convergence_tolerance * cost_scale;
-                    let max_grad_norm_rho = 50.0 * grad_tol;
-                    let jac_max = z_last
-                        .iter()
-                        .map(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)))
-                        .fold(0.0f64, |a, b| a.max(b.abs()));
-                    let max_grad_norm_z = jac_max * max_grad_norm_rho;
-
-                    // Log both gradient norms for diagnostics
-                    eprintln!(
-                        "[Diag] Line-search stop gradients: ||grad_z|| = {:.3e}, ||grad_rho|| = {:.3e}",
-                        gradient_norm_z, gradient_norm_rho
-                    );
-
-                    if gradient_norm_z > max_grad_norm_z && gradient_norm_rho > max_grad_norm_rho {
-                        return Err(EstimationError::RemlOptimizationFailed(format!(
-                            "Line-search failed far from a stationary point in z-space. ||grad_z||: {:.2e}",
-                            gradient_norm_z
-                        )));
-                    }
-
-                    eprintln!(
-                        "[INFO] Accepting the best parameters found as the final result (||grad_z||: {:.2e}, ||grad_rho||: {:.2e}).",
-                        gradient_norm_z, gradient_norm_rho
-                    );
-                    *last_solution
-                }
-            }
+            eprintln!(
+                "[INFO] Line search stopped early; using best-so-far parameters."
+            );
+            *last_solution
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
             // Stage: Emit a warning about the lack of convergence
@@ -968,7 +762,7 @@ pub fn train_model(
 
     // --- Finalize the Model (same as before) ---
     // Map final unconstrained point to bounded rho, then clamp for safety
-    let final_rho = final_z.mapv(|v| RHO_BOUND * v.tanh());
+    let final_rho = to_rho_from_z(&final_z);
     let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
     let final_lambda = final_rho_clamped.mapv(f64::exp);
     log::info!(
@@ -1311,21 +1105,14 @@ pub fn optimize_external_design(
     )?;
     let initial_rho = Array1::<f64>::zeros(k);
     // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
-    let initial_z = initial_rho.mapv(|r| {
-        let ratio = r / RHO_BOUND;
-        let xr = if ratio < -0.999_999 {
-            -0.999_999
-        } else if ratio > 0.999_999 {
-            0.999_999
-        } else {
-            ratio
-        };
-        0.5 * ((1.0 + xr) / (1.0 - xr)).ln()
-    });
-    let result = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+    let initial_z = to_z_from_rho(&initial_rho);
+    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(opts.tol)
         .with_max_iterations(opts.max_iter)
-        .run();
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0xC0FFEE_u64);
+    let result = solver.run();
     let (final_point, iters, grad_norm_reported) = match result {
         Ok(BfgsSolution {
             final_point,
@@ -1347,7 +1134,7 @@ pub fn optimize_external_design(
     };
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
-    let final_rho = final_point.mapv(|v| RHO_BOUND * v.tanh());
+    let final_rho = to_rho_from_z(&final_point);
     let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
