@@ -25,7 +25,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Help minimize network chatter in modern Cargo
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
@@ -55,9 +54,9 @@ jobs:
         id: cache_meta
         shell: bash
         run: |
-          echo "week=$(date -u +%G%V)" >> $GITHUB_OUTPUT
+          echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
-          echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
+          echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo registry (CI speed only)
         uses: actions/cache@v4
@@ -86,21 +85,18 @@ jobs:
         if: steps.rust_changes.outputs.rust == 'true'
         run: cargo +nightly fetch
 
-        # Compile debug artifacts & tests (no-run) so target/debug tree is hot
-      - name: Prebuild debug: lib/bin/tests (no run)
+      - name: "Prebuild debug (lib/bin/tests, no-run)"
         if: steps.rust_changes.outputs.rust == 'true'
         run: |
           cargo +nightly build
           cargo +nightly test --no-run
 
-        # Run real unit tests (as before)
       - name: Run Rust unit tests
         id: test_step
         if: steps.rust_changes.outputs.rust == 'true'
         run: cargo +nightly test --release -- --show-output
         continue-on-error: true
 
-      # When no Rust changed, do “asm” analysis path (unchanged)
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
         run: |
@@ -118,7 +114,6 @@ jobs:
           echo "---"
           cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
 
-      # Optional: getdoc on failure (unchanged)
       - name: Cache getdoc binary
         id: getdoc_cache
         uses: actions/cache@v4
@@ -136,7 +131,6 @@ jobs:
           ~/.cargo/bin/getdoc --features default
           cat report.md
 
-      # Build release + profiling binaries (unchanged logic)
       - name: Build Gnomon binaries (Release and Profiling)
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success'
         run: |
@@ -185,7 +179,6 @@ jobs:
             (uname -a || true)
           } > export/build-meta.txt
 
-      # The full deps mirror used by this run (registry + git)
       - name: Pack Cargo deps (~/.cargo/registry + ~/.cargo/git) (always)
         if: always()
         shell: bash
@@ -198,7 +191,6 @@ jobs:
           fi
           ls -al export || true
 
-      # Individual subtrees for targeted restores
       - name: Pack target/debug subtree (always)
         if: always()
         shell: bash
@@ -206,7 +198,11 @@ jobs:
           mkdir -p export
           if [[ -d target/debug ]]; then
             TAR="export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            tar -cf "$TAR" target/debug target/.rustc_info.json 2>/dev/null || tar -cf "$TAR" target/debug
+            if [[ -f target/.rustc_info.json ]]; then
+              tar -cf "$TAR" target/debug target/.rustc_info.json
+            else
+              tar -cf "$TAR" target/debug
+            fi
           fi
 
       - name: Pack target/release subtree (always)
@@ -216,7 +212,11 @@ jobs:
           mkdir -p export
           if [[ -d target/release ]]; then
             TAR="export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            tar -cf "$TAR" target/release target/.rustc_info.json 2>/dev/null || tar -cf "$TAR" target/release
+            if [[ -f target/.rustc_info.json ]]; then
+              tar -cf "$TAR" target/release target/.rustc_info.json
+            else
+              tar -cf "$TAR" target/release
+            fi
           fi
 
       - name: Pack target/profiling subtree (always)
@@ -229,7 +229,6 @@ jobs:
             tar -cf "$TAR" target/profiling
           fi
 
-      # Entire target tree (debug + release + profiling + fingerprints + incremental)
       - name: Pack FULL target tree (always)
         if: always()
         shell: bash
@@ -240,7 +239,6 @@ jobs:
             tar -cf "$TAR" target
           fi
 
-      # Upload everything with sanitized names (no slashes) --------------------
       - name: Upload artifact – cargo deps (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -293,7 +291,6 @@ jobs:
           name: build-meta-${{ steps.naming.outputs.safe_ref }}-${{ steps.naming.outputs.short_sha }}
           path: export/build-meta.txt
           retention-days: 30
-      # -----------------------------------------------------------------------
 
       - name: Fail job if unit tests failed
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
@@ -307,7 +304,7 @@ jobs:
             target
             report.md
           retention-days: 1
-          if-no-files-found: ignore   # safely handles “no rebuild” case
+          if-no-files-found: ignore
 
   python_test_integration:
     runs-on: ubuntu-latest
