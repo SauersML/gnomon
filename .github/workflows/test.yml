@@ -2,6 +2,7 @@ name: Rust Test CI
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 on:
   push:
     branches: [main]
@@ -20,9 +21,12 @@ on:
       - 'score/**'
       - 'test/**'
       - 'calibrate/**'
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Help minimize network chatter in modern Cargo
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
   build_and_test:
@@ -41,7 +45,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '**/*.rs'
-
       # -----------------------------------------------------------------------
 
       - name: Install Rust nightly
@@ -50,12 +53,13 @@ jobs:
 
       - name: Prepare cache metadata
         id: cache_meta
+        shell: bash
         run: |
           echo "week=$(date -u +%G%V)" >> $GITHUB_OUTPUT
           DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "deps_hash=$DEPS_HASH" >> $GITHUB_OUTPUT
 
-      - name: Cache Cargo registry
+      - name: Cache Cargo registry (CI speed only)
         uses: actions/cache@v4
         with:
           path: |
@@ -66,7 +70,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Restore Cargo build cache
+      - name: Restore Cargo build cache (CI speed only)
         id: cargo_build_cache_restore
         uses: actions/cache/restore@v4
         with:
@@ -76,7 +80,45 @@ jobs:
             ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-
             ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-
             ${{ runner.os }}-cargo-build-nightly-
-      
+
+      # -------------------- PREWARM EVERYTHING (so artifacts are complete) --------------------
+      - name: Cargo fetch (prepopulate deps cache)
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: cargo +nightly fetch
+
+        # Compile debug artifacts & tests (no-run) so target/debug tree is hot
+      - name: Prebuild debug: lib/bin/tests (no run)
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: |
+          cargo +nightly build
+          cargo +nightly test --no-run
+
+        # Run real unit tests (as before)
+      - name: Run Rust unit tests
+        id: test_step
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: cargo +nightly test --release -- --show-output
+        continue-on-error: true
+
+      # When no Rust changed, do “asm” analysis path (unchanged)
+      - name: Inspect Assembly for Performance Analysis
+        if: steps.rust_changes.outputs.rust == 'false'
+        run: |
+          cargo +nightly install cargo-show-asm --features disasm
+          echo "--- Building test harness for inspection ---"
+          cargo +nightly test --release --no-run
+          TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
+          if [[ -z "$TEST_HARNESS_PATH" ]]; then
+            echo "::error::Could not find compiled test harness."
+            exit 1
+          fi
+          echo "Found test harness at: $TEST_HARNESS_PATH"
+          echo "---"
+          echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
+          echo "---"
+          cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
+
+      # Optional: getdoc on failure (unchanged)
       - name: Cache getdoc binary
         id: getdoc_cache
         uses: actions/cache@v4
@@ -84,37 +126,6 @@ jobs:
           path: ~/.cargo/bin/getdoc
           key: ${{ runner.os }}-getdoc-v1
 
-      - name: Run Rust unit tests
-        id: test_step
-        if: steps.rust_changes.outputs.rust == 'true'
-        run: |
-          cargo +nightly test --release -- --show-output
-        continue-on-error: true
-
-      - name: Inspect Assembly for Performance Analysis
-        if: steps.rust_changes.outputs.rust == 'false'
-        run: |
-          # Step 1: Install the tool with the required 'disasm' feature
-          cargo +nightly install cargo-show-asm --features disasm
-
-          # Step 2: Build the test harness to ensure the executable exists
-          echo "--- Building test harness for inspection ---"
-          cargo +nightly test --release --no-run
-
-          # Step 3: Find the exact path to the compiled test harness executable
-          TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
-          if [[ -z "$TEST_HARNESS_PATH" ]]; then
-            echo "::error::Could not find compiled test harness."
-            exit 1
-          fi
-          echo "Found test harness at: $TEST_HARNESS_PATH"
-
-          # Step 4: Inspect the functions using the correct strategy
-          echo "---"
-          echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
-          echo "---"
-          cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
-          
       - name: Install getdoc
         if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
         run: cargo +nightly install getdoc --locked
@@ -125,19 +136,22 @@ jobs:
           ~/.cargo/bin/getdoc --features default
           cat report.md
 
+      # Build release + profiling binaries (unchanged logic)
       - name: Build Gnomon binaries (Release and Profiling)
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success'
         run: |
           cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
+      # ----------------------------------------------------------------------------------------
 
-      - name: Save Cargo build cache
+      - name: Save Cargo build cache (CI speed only)
         if: always()
         uses: actions/cache/save@v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
 
+      # -------------------- EXPORT: TAR EVERYTHING NEEDED FOR INSTANT LOCAL BUILDS --------------------
       - name: Compute safe artifact names (always)
         id: naming
         if: always()
@@ -166,8 +180,12 @@ jobs:
             echo ""
             echo "--- cargo ---"
             (cargo -Vv || true)
+            echo ""
+            echo "--- host uname ---"
+            (uname -a || true)
           } > export/build-meta.txt
 
+      # The full deps mirror used by this run (registry + git)
       - name: Pack Cargo deps (~/.cargo/registry + ~/.cargo/git) (always)
         if: always()
         shell: bash
@@ -180,35 +198,28 @@ jobs:
           fi
           ls -al export || true
 
-      - name: Pack target/debug (always)
+      # Individual subtrees for targeted restores
+      - name: Pack target/debug subtree (always)
         if: always()
         shell: bash
         run: |
           mkdir -p export
           if [[ -d target/debug ]]; then
             TAR="export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            if [[ -f target/.rustc_info.json ]]; then
-              tar -cf "$TAR" target/debug target/.rustc_info.json
-            else
-              tar -cf "$TAR" target/debug
-            fi
+            tar -cf "$TAR" target/debug target/.rustc_info.json 2>/dev/null || tar -cf "$TAR" target/debug
           fi
 
-      - name: Pack target/release (always)
+      - name: Pack target/release subtree (always)
         if: always()
         shell: bash
         run: |
           mkdir -p export
           if [[ -d target/release ]]; then
             TAR="export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            if [[ -f target/.rustc_info.json ]]; then
-              tar -cf "$TAR" target/release target/.rustc_info.json
-            else
-              tar -cf "$TAR" target/release
-            fi
+            tar -cf "$TAR" target/release target/.rustc_info.json 2>/dev/null || tar -cf "$TAR" target/release
           fi
 
-      - name: Pack target/profiling (always)
+      - name: Pack target/profiling subtree (always)
         if: always()
         shell: bash
         run: |
@@ -218,6 +229,18 @@ jobs:
             tar -cf "$TAR" target/profiling
           fi
 
+      # Entire target tree (debug + release + profiling + fingerprints + incremental)
+      - name: Pack FULL target tree (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          if [[ -d target ]]; then
+            TAR="export/target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
+            tar -cf "$TAR" target
+          fi
+
+      # Upload everything with sanitized names (no slashes) --------------------
       - name: Upload artifact – cargo deps (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -225,7 +248,7 @@ jobs:
           name: cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}
           path: export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload artifact – target debug (always)
         if: always()
@@ -234,7 +257,7 @@ jobs:
           name: target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
           path: export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload artifact – target release (always)
         if: always()
@@ -243,7 +266,7 @@ jobs:
           name: target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
           path: export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload artifact – target profiling (always)
         if: always()
@@ -252,7 +275,16 @@ jobs:
           name: target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
           path: export/target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
+
+      - name: Upload artifact – target FULL tree (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
+          path: export/target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload artifact – build metadata (always)
         if: always()
@@ -261,6 +293,7 @@ jobs:
           name: build-meta-${{ steps.naming.outputs.safe_ref }}-${{ steps.naming.outputs.short_sha }}
           path: export/build-meta.txt
           retention-days: 30
+      # -----------------------------------------------------------------------
 
       - name: Fail job if unit tests failed
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
@@ -367,7 +400,7 @@ jobs:
         run: |
           echo "--- System Information ---"
           echo "Kernel: $(uname -a)"
-          echo "Distribution: $(lsb_release -a)"
+          echo "Distribution: $(lsb_release -a || true)"
           echo "CPU Cores: $(nproc)"
           echo "--- Memory ---"
           free -h
