@@ -761,10 +761,10 @@ pub fn train_model(
                     // Projected/KKT handling at active bounds in rho-space
                     let tol = 1e-8;
                     for i in 0..rho.len() {
-                        if rho[i] <= -RHO_BOUND + tol && g_rho[i] < 0.0 {
+                        if rho[i] <= -RHO_BOUND + tol && g_rho[i] > 0.0 {
                             g_rho[i] = 0.0; // can't move outward below lower bound
                         }
-                        if rho[i] >= RHO_BOUND - tol && g_rho[i] > 0.0 {
+                        if rho[i] >= RHO_BOUND - tol && g_rho[i] < 0.0 {
                             g_rho[i] = 0.0; // can't move outward above upper bound
                         }
                     }
@@ -2359,10 +2359,10 @@ pub mod internal {
                             // Projected/KKT handling at active bounds in rho-space
                             let tol = 1e-8;
                             for i in 0..rho.len() {
-                                if rho[i] <= -RHO_BOUND + tol && grad[i] < 0.0 {
+                                if rho[i] <= -RHO_BOUND + tol && grad[i] > 0.0 {
                                     grad[i] = 0.0;
                                 }
-                                if rho[i] >= RHO_BOUND - tol && grad[i] > 0.0 {
+                                if rho[i] >= RHO_BOUND - tol && grad[i] < 0.0 {
                                     grad[i] = 0.0;
                                 }
                             }
