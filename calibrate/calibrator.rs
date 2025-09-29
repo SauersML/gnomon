@@ -4003,6 +4003,7 @@ mod tests {
             pred_constraint_transform: schema.pred_constraint_transform,
             stz_se: schema.stz_se,
             stz_dist: schema.stz_dist,
+            penalty_nullspace_dims: schema.penalty_nullspace_dims,
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
