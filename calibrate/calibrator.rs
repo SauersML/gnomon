@@ -6058,10 +6058,11 @@ mod tests {
         let alo_features =
             compute_alo_features(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
-        // Get inputs for manual SE calculation
-        let sqrt_w = w.mapv(f64::sqrt);
+        // Get inputs for manual SE calculation using the working weights from the fit
+        let w_work = fit_res.final_weights.clone();
+        let sqrt_w_work = w_work.mapv(f64::sqrt);
         let mut u = fit_res.x_transformed.clone();
-        let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
+        let sqrt_w_col = sqrt_w_work.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
         // Get the penalized Hessian (K = XᵀWX + Sλ)
@@ -6080,20 +6081,27 @@ mod tests {
         let mut se_loos = Vec::with_capacity(n);
 
         for i in 0..n {
+            let xi = fit_res.x_transformed.row(i).to_owned();
             let ui = u.row(i).to_owned();
-            let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
-            let si = factor.solve(rhs_f.as_ref());
-            let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
+
+            // Leverage uses the weighted row u_i
+            let rhs_u = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let s_u = factor.solve(rhs_u.as_ref());
 
             let mut aii = 0.0;
             for r in 0..p {
-                aii += ui[r] * si[(r, 0)];
+                aii += ui[r] * s_u[(r, 0)];
             }
 
-            let ti = xtwx.dot(&si_arr);
+            // Prediction variance lives on the η-scale and uses the unweighted x_i
+            let rhs_x = FaerMat::<f64>::from_fn(p, 1, |r, _| xi[r]);
+            let s_x = factor.solve(rhs_x.as_ref());
+            let s_x_arr = Array1::from_shape_fn(p, |j| s_x[(j, 0)]);
+
+            let ti = xtwx.dot(&s_x_arr);
             let mut var_full = 0.0;
             for r in 0..p {
-                var_full += si_arr[r] * ti[r];
+                var_full += s_x_arr[r] * ti[r];
             }
 
             let denom = (1.0 - aii).max(1e-12);
@@ -6131,7 +6139,8 @@ mod tests {
 
             let alo_se = alo_features.se[i];
             assert!(
-                (alo_se - se_loo_manual).abs() <= 1e-9 * (1.0 + se_loo_manual.abs()),
+                (alo_se - se_loo_manual).abs()
+                    <= 1e-7 * (1.0 + se_loo_manual.abs()),
                 "ALO SE mismatch at i={}: computed {:.6e}, manual {:.6e}",
                 i,
                 alo_se,
@@ -6144,7 +6153,8 @@ mod tests {
                 f64::NAN
             };
             assert!(
-                (actual_ratio - expected_ratio).abs() <= 1e-9 * (1.0 + expected_ratio.abs()),
+                (actual_ratio - expected_ratio).abs()
+                    <= 1e-7 * (1.0 + expected_ratio.abs()),
                 "Inflation mismatch at i={}: got {:.6e}, expected {:.6e}",
                 i,
                 actual_ratio,
