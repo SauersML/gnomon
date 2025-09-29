@@ -190,6 +190,7 @@ pub fn train_model(
         s_list,
         &layout,
         config,
+        None,
     )?;
 
     // Fast-path: if there are no penalties, skip outer REML/BFGS optimization entirely.
@@ -1123,12 +1124,18 @@ pub fn train_model(
             None
         } else {
             eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
+            let penalty_nullspace_dims = [
+                schema.penalty_nullspace_dims.0,
+                schema.penalty_nullspace_dims.1,
+                schema.penalty_nullspace_dims.2,
+            ];
             let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
                 reml_state.y(),
                 reml_state.weights(),
                 x_cal.view(),
                 offset.view(),
                 &penalties_cal,
+                &penalty_nullspace_dims,
                 config.link_function,
             )
             .map_err(|e| {
@@ -1161,6 +1168,7 @@ pub fn train_model(
                 pred_constraint_transform: schema.pred_constraint_transform,
                 stz_se: schema.stz_se,
                 stz_dist: schema.stz_dist,
+                penalty_nullspace_dims: schema.penalty_nullspace_dims,
                 standardize_pred: schema.standardize_pred,
                 standardize_se: schema.standardize_se,
                 standardize_dist: schema.standardize_dist,
@@ -1253,6 +1261,7 @@ pub struct ExternalOptimOptions {
     pub link: LinkFunction,
     pub max_iter: usize,
     pub tol: f64,
+    pub nullspace_dims: Vec<usize>,
 }
 
 pub struct ExternalOptimResult {
@@ -1298,6 +1307,7 @@ pub fn optimize_external_design(
         s_vec,
         &layout,
         &cfg,
+        Some(opts.nullspace_dims.clone()),
     )?;
     let initial_rho = Array1::<f64>::zeros(k);
     // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
@@ -1550,6 +1560,7 @@ pub mod internal {
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
+        nullspace_dims: Vec<usize>,
 
         cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
         faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
@@ -1593,9 +1604,19 @@ pub mod internal {
             s_list: Vec<Array2<f64>>,
             layout: &'a ModelLayout,
             config: &'a ModelConfig,
+            nullspace_dims: Option<Vec<usize>>,
         ) -> Result<Self, EstimationError> {
             let zero_offset = Array1::<f64>::zeros(y.len());
-            Self::new_with_offset(y, x, weights, zero_offset.view(), s_list, layout, config)
+            Self::new_with_offset(
+                y,
+                x,
+                weights,
+                zero_offset.view(),
+                s_list,
+                layout,
+                config,
+                nullspace_dims,
+            )
         }
 
         pub(super) fn new_with_offset(
@@ -1606,9 +1627,25 @@ pub mod internal {
             s_list: Vec<Array2<f64>>,
             layout: &'a ModelLayout,
             config: &'a ModelConfig,
+            nullspace_dims: Option<Vec<usize>>,
         ) -> Result<Self, EstimationError> {
             // Pre-compute penalty square roots once
             let rs_list = compute_penalty_square_roots(&s_list)?;
+
+            let expected_len = s_list.len();
+            let nullspace_dims = match nullspace_dims {
+                Some(dims) => {
+                    if dims.len() != expected_len {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "nullspace_dims length {} does not match penalties {}",
+                            dims.len(),
+                            expected_len
+                        )));
+                    }
+                    dims
+                }
+                None => vec![0; expected_len],
+            };
 
             Ok(Self {
                 y,
@@ -1619,6 +1656,7 @@ pub mod internal {
                 rs_list,
                 layout,
                 config,
+                nullspace_dims,
                 cache: RefCell::new(HashMap::new()),
                 faer_factor_cache: RefCell::new(HashMap::new()),
                 eval_count: RefCell::new(0),
@@ -2008,6 +2046,13 @@ pub mod internal {
                         kλ, kR, kD
                     )));
                 }
+                if self.nullspace_dims.len() != kλ {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Nullspace dimension mismatch: expected {} entries, got {}",
+                        kλ,
+                        self.nullspace_dims.len()
+                    )));
+                }
             }
 
             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
@@ -2156,7 +2201,16 @@ pub mod internal {
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                    let log_det_s = pirls_result.reparam_result.log_det;
+                    let mut log_det_s = pirls_result.reparam_result.log_det;
+                    if !self.nullspace_dims.is_empty() {
+                        let nullspace_adjust: f64 = self
+                            .nullspace_dims
+                            .iter()
+                            .zip(p.iter())
+                            .map(|(&dim, &rho)| (dim as f64) * rho)
+                            .sum();
+                        log_det_s -= nullspace_adjust;
+                    }
                     // Get effective Hessian (stabilized if needed) and ridge used
                     let (h_eff, _) = self.effective_hessian(&pirls_result);
 
@@ -2566,6 +2620,13 @@ pub mod internal {
                     kλ, kR, kD
                 )));
             }
+            if self.nullspace_dims.len() != kλ {
+                return Err(EstimationError::LayoutError(format!(
+                    "Nullspace dimension mismatch: expected {} entries, got {}",
+                    kλ,
+                    self.nullspace_dims.len()
+                )));
+            }
 
             // --- Extract stable transformed quantities ---
             let beta_transformed = &pirls_result.beta_transformed;
@@ -2746,7 +2807,14 @@ pub mod internal {
                     // Summaries of numeric components (helpful in release logs)
                     let sum_pll = g_pll.sum();
                     let sum_half_logh = g_half_logh.sum();
-                    let sum_neg_half_logs = -0.5 * det1_full.iter().copied().sum::<f64>();
+                    let sum_neg_half_logs: f64 = det1_full
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &val)| {
+                            let null_dim = self.nullspace_dims.get(idx).copied().unwrap_or(0);
+                            -0.5 * val + 0.5 * null_dim as f64
+                        })
+                        .sum();
                     eprintln!(
                         "[LAML sum] Σ d(-ℓ_p)={:+.6e}  Σ ½ dlog|H|={:+.6e}  Σ (-½ dlog|S|)={:+.6e}",
                         sum_pll, sum_half_logh, sum_neg_half_logs
@@ -2758,7 +2826,9 @@ pub mod internal {
                         let log_det_h_grad_term = g_half_logh[k];
 
                         // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
-                        let log_det_s_grad_term = 0.5 * det1_full[k];
+                        let nullspace_dim = self.nullspace_dims.get(k).copied().unwrap_or(0);
+                        let log_det_s_grad_term =
+                            0.5 * det1_full[k] - 0.5 * nullspace_dim as f64;
 
                         // (3) Numerical derivative of penalized log-likelihood part
                         let pll_grad_term = g_pll[k];
@@ -3352,6 +3422,7 @@ pub mod internal {
                 s_list,
                 Box::leak(Box::new(layout)),
                 Box::leak(Box::new(config)),
+                None,
             )
             .expect("RemlState");
 
@@ -3621,6 +3692,7 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -3727,6 +3799,7 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -4622,6 +4695,7 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -5054,6 +5128,7 @@ pub mod internal {
                 s_list,
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -5619,6 +5694,7 @@ pub mod internal {
                     s_list_simple,  // Use the simple penalty list
                     &layout_simple, // Use the simple layout
                     &simple_config,
+                    None,
                 )
                 .unwrap();
 
@@ -5750,6 +5826,7 @@ pub mod internal {
                     s_list_simple,
                     &layout_simple,
                     &simple_config,
+                    None,
                 )
                 .unwrap();
 
@@ -5944,6 +6021,7 @@ pub mod internal {
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
+                None,
             )
             .unwrap();
 
@@ -6115,6 +6193,7 @@ pub mod internal {
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
+                None,
             )
             .unwrap();
 
@@ -6225,6 +6304,7 @@ pub mod internal {
                 s_list_simple,
                 &layout_simple,
                 &simple_config,
+                None,
             )
             .unwrap();
 
@@ -6408,6 +6488,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
             s_list,
             &layout,
             &config,
+            None,
         );
 
         if let Ok(reml_state) = reml_state_result {
@@ -6605,16 +6686,17 @@ mod optimizer_progress_tests {
         };
 
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
-            build_design_and_penalty_matrices(&data, &config)?;
-        let reml_state = internal::RemlState::new(
-            data.y.view(),
-            x_matrix.view(),
-            data.weights.view(),
-            s_list,
-            &layout,
-            &config,
-        )?;
+    let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        build_design_and_penalty_matrices(&data, &config)?;
+    let reml_state = internal::RemlState::new(
+        data.y.view(),
+        x_matrix.view(),
+        data.weights.view(),
+        s_list,
+        &layout,
+        &config,
+        None,
+    )?;
 
         // Stage: Compute the initial cost at the same rho used by train_model
         assert!(
@@ -6715,15 +6797,16 @@ mod reparam_consistency_tests {
             return;
         }
 
-        let reml_state = internal::RemlState::new(
-            data.y.view(),
-            x.view(),
-            data.weights.view(),
-            s_list,
-            &layout,
-            &config,
-        )
-        .expect("RemlState");
+    let reml_state = internal::RemlState::new(
+        data.y.view(),
+        x.view(),
+        data.weights.view(),
+        s_list,
+        &layout,
+        &config,
+        None,
+    )
+    .expect("RemlState");
 
         // Stage: Sample a moderate random rho in [-1, 1]
         let k = layout.num_penalties;
@@ -6875,15 +6958,16 @@ mod gradient_validation_tests {
             "Model must have at least one penalty"
         );
 
-        let reml_state = internal::RemlState::new(
-            data.y.view(),
-            x.view(),
-            data.weights.view(),
-            s_list,
-            &layout,
-            &config,
-        )
-        .expect("state");
+    let reml_state = internal::RemlState::new(
+        data.y.view(),
+        x.view(),
+        data.weights.view(),
+        s_list,
+        &layout,
+        &config,
+        None,
+    )
+    .expect("state");
 
         // Stage: Use a larger step size for the numerical gradient
 
@@ -6983,6 +7067,7 @@ mod gradient_validation_tests {
             link: LinkFunction::Logit,
             tol: 1e-6,
             max_iter: 100,
+            nullspace_dims: vec![0, 0],
         };
 
         // Fit model and extract results for diagnostic purposes
