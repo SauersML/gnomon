@@ -2336,8 +2336,11 @@ mod tests {
         u *= &sqrt_w_col;
 
         // K = X' W X + S_λ (same K the ALO code uses)
-        let k = fit_res.penalized_hessian_transformed.clone();
+        let mut k = fit_res.penalized_hessian_transformed.clone();
         let p = k.nrows();
+        for d in 0..p {
+            k[[d, d]] += 1e-12;
+        }
         let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
         let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
 
@@ -6065,8 +6068,11 @@ mod tests {
         let sqrt_w_col = sqrt_w_work.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
-        // Get the penalized Hessian (K = XᵀWX + Sλ)
-        let k = fit_res.penalized_hessian_transformed.clone();
+        // Get the penalized Hessian (K = Xᵀ W X + Sλ) and match the ridge in production.
+        let mut k = fit_res.penalized_hessian_transformed.clone();
+        for d in 0..p {
+            k[[d, d]] += 1e-12;
+        }
         let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
         let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
 
@@ -6140,7 +6146,7 @@ mod tests {
             let alo_se = alo_features.se[i];
             assert!(
                 (alo_se - se_loo_manual).abs()
-                    <= 1e-7 * (1.0 + se_loo_manual.abs()),
+                    <= 1e-9 * (1.0 + se_loo_manual.abs()),
                 "ALO SE mismatch at i={}: computed {:.6e}, manual {:.6e}",
                 i,
                 alo_se,
@@ -6154,7 +6160,7 @@ mod tests {
             };
             assert!(
                 (actual_ratio - expected_ratio).abs()
-                    <= 1e-7 * (1.0 + expected_ratio.abs()),
+                    <= 1e-9 * (1.0 + expected_ratio.abs()),
                 "Inflation mismatch at i={}: got {:.6e}, expected {:.6e}",
                 i,
                 actual_ratio,
