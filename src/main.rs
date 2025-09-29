@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process;
 
-// Import the calibrate functionality
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
