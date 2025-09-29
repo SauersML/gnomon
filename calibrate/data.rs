@@ -6,7 +6,6 @@
 //! into the clean `ndarray` structures required by the application's
 //! statistical core.
 //!
-//! ## Design Philosophy
 //! - Strict Schema: Column names are not configurable. The module enforces
 //!   the use of `phenotype`, `score`, `PC1`, `PC2`, etc. This simplifies the
 //!   user interface and eliminates a class of configuration errors.
