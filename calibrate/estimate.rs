@@ -1996,16 +1996,7 @@ pub mod internal {
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                    let mut log_det_s = pirls_result.reparam_result.log_det;
-                    if !self.nullspace_dims.is_empty() {
-                        let nullspace_adjust: f64 = self
-                            .nullspace_dims
-                            .iter()
-                            .zip(p.iter())
-                            .map(|(&dim, &rho)| (dim as f64) * rho)
-                            .sum();
-                        log_det_s -= nullspace_adjust;
-                    }
+                    let log_det_s = pirls_result.reparam_result.log_det;
                     // Get effective Hessian (stabilized if needed) and ridge used
                     let (h_eff, _) = self.effective_hessian(&pirls_result);
 
@@ -2602,14 +2593,7 @@ pub mod internal {
                     // Summaries of numeric components (helpful in release logs)
                     let sum_pll = g_pll.sum();
                     let sum_half_logh = g_half_logh.sum();
-                    let sum_neg_half_logs: f64 = det1_full
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, &val)| {
-                            let null_dim = self.nullspace_dims.get(idx).copied().unwrap_or(0);
-                            -0.5 * val + 0.5 * null_dim as f64
-                        })
-                        .sum();
+                    let sum_neg_half_logs: f64 = det1_full.iter().map(|&val| -0.5 * val).sum();
                     eprintln!(
                         "[LAML sum] Σ d(-ℓ_p)={:+.6e}  Σ ½ dlog|H|={:+.6e}  Σ (-½ dlog|S|)={:+.6e}",
                         sum_pll, sum_half_logh, sum_neg_half_logs
@@ -2621,8 +2605,7 @@ pub mod internal {
                         let log_det_h_grad_term = g_half_logh[k];
 
                         // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
-                        let nullspace_dim = self.nullspace_dims.get(k).copied().unwrap_or(0);
-                        let log_det_s_grad_term = 0.5 * det1_full[k] - 0.5 * nullspace_dim as f64;
+                        let log_det_s_grad_term = 0.5 * det1_full[k];
 
                         // (3) Numerical derivative of penalized log-likelihood part
                         let pll_grad_term = g_pll[k];
