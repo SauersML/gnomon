@@ -995,21 +995,21 @@ pub fn build_calibrator_design(
     // Detect whether the predictor has any variation after standardization.
     let pred_is_const = pred_std_raw < 1e-8_f64;
 
-    // Build the constraint directions for the predictor smooth: ones and standardized predictor.
+    // Build the constraint directions for the predictor smooth: remove the polynomial nullspace
+    // so the remaining columns are pure wiggles.
     let (mut b_pred_c, mut pred_constraint) = if pred_is_const {
         (
             Array2::<f64>::zeros((n, 0)),
             Array2::<f64>::zeros((b_pred_raw.ncols(), 0)),
         )
     } else {
-        let mut z_pred = Array2::<f64>::zeros((n, 2));
-        z_pred.column_mut(0).fill(1.0);
-        z_pred.column_mut(1).assign(&pred_std);
+        let constraint_order = spec.penalty_order_pred.min(pred_raw_cols);
+        let z_pred = polynomial_constraint_matrix(&pred_std, constraint_order);
         match apply_weighted_orthogonality_constraint(b_pred_raw.view(), z_pred.view(), w_for_stz) {
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
-                    "[CAL] pred basis fully constrained by {{1, eta}}; increase knots/degree for wiggles"
+                    "[CAL] pred basis fully constrained by polynomial nullspace; increase knots/degree for wiggles"
                 );
                 (
                     Array2::<f64>::zeros((n, 0)),
@@ -1025,28 +1025,14 @@ pub fn build_calibrator_design(
     // For SE, check if we need to use linear fallback first (detected before standardization)
     // but always ensure it's centered (weighted if weights provided)
     // Calculate the centering offset once and store it for later use
-    let mu_se = if se_linear_fallback {
-        // Calculate weighted mean for centering
-        if let Some(w) = w_for_stz {
-            let ws = w.iter().copied().sum::<f64>().max(1e-12);
-            se_std
-                .iter()
-                .zip(w.iter())
-                .map(|(v, wi)| v * wi)
-                .sum::<f64>()
-                / ws
-        } else {
-            se_std.mean().unwrap_or(0.0)
-        }
-    } else {
-        0.0 // No centering for spline basis (handled by STZ)
-    };
+    let mu_se = 0.0;
 
     let (mut b_se_c, mut stz_se) = if se_linear_fallback {
-        // For SE linear fallback: make the single column weighted mean zero to keep it orthogonal to the intercept
-        let mut col = se_std.clone();
-        col.mapv_inplace(|v| v - mu_se); // Apply centering using the pre-calculated offset
-        (col.insert_axis(Axis(1)).to_owned(), Array2::<f64>::eye(1))
+        eprintln!("[CAL] Dropping se block due to linear fallback (wiggle-only policy)");
+        (
+            Array2::<f64>::zeros((n, 0)),
+            Array2::<f64>::zeros((se_raw_cols, 0)),
+        )
     } else {
         let constraint_order = spec.penalty_order_se.min(se_raw_cols);
         let z = polynomial_constraint_matrix(&se_std, constraint_order);
@@ -1071,44 +1057,17 @@ pub fn build_calibrator_design(
     // Linear fallback when: low variance or mostly zeros (from hinging)
     // Calculate the distance centering offset first
     let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
-    let mu_dist = if use_linear_dist && !dist_all_zero {
-        // Calculate the weighted mean for centering
-        if let Some(w) = w_for_stz {
-            let ws = w.iter().copied().sum::<f64>().max(1e-12);
-            dist_std
-                .iter()
-                .zip(w.iter())
-                .map(|(v, wi)| v * wi)
-                .sum::<f64>()
-                / ws
-        } else {
-            dist_std.mean().unwrap_or(0.0)
-        }
-    } else {
-        0.0 // No centering for spline basis or when all distances are zero
-    };
+    let mu_dist = 0.0;
 
-    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, dist_raw_cols) = if use_linear_dist {
-        // If the "hinged+centered" distance is effectively constant/zero, drop the term entirely.
-        if dist_all_zero {
-            let b = Array2::<f64>::zeros((n, 0));
-            let stz = Array2::<f64>::eye(0);
-            let knots = Array1::<f64>::zeros(0);
-            let s0 = Array2::<f64>::zeros((0, 0));
-            (b, stz, knots, s0, 0)
-        } else {
-            // Keep the single centered linear column and give it a tiny penalty so REML pays to use it
-            // Make sure it's actually centered using the pre-calculated offset
-            let mut b = dist_std.clone();
-            b.mapv_inplace(|v| v - mu_dist);
-
-            // Now insert as a column
-            let b = b.insert_axis(Axis(1)).to_owned();
-            let stz = Array2::<f64>::eye(1);
-            let knots = Array1::<f64>::zeros(0);
-            let s0 = Array2::<f64>::from_elem((1, 1), 1.0);
-            (b, stz, knots, s0, 1)
+    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _dist_raw_cols) = if use_linear_dist {
+        if !dist_all_zero {
+            eprintln!("[CAL] Dropping dist block due to linear fallback (wiggle-only policy)");
         }
+        let b = Array2::<f64>::zeros((n, 0));
+        let stz = Array2::<f64>::zeros((0, 0));
+        let knots = Array1::<f64>::zeros(0);
+        let s0 = Array2::<f64>::zeros((0, 0));
+        (b, stz, knots, s0, 0)
     } else {
         // Create the spline basis for distance
         let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
@@ -1154,7 +1113,7 @@ pub fn build_calibrator_design(
     let s_pred_raw0 =
         create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
     let s_se_raw0 = if se_linear_fallback {
-        Array2::<f64>::from_elem((1, 1), 1.0)
+        Array2::<f64>::zeros((b_se_raw.ncols(), b_se_raw.ncols()))
     } else {
         create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?
     };
@@ -1265,7 +1224,7 @@ pub fn build_calibrator_design(
         spec.pred_basis.degree, m_pred_int, m_se_int, m_dist_int, spec.penalty_order_pred
     );
     eprintln!(
-        "[CAL] pred block orthogonalized against intercept and slope; cols={}",
+        "[CAL] pred block orthogonalized against polynomial nullspace; cols={}",
         b_pred_c.ncols()
     );
     // Create ranges for column spans
@@ -1273,17 +1232,9 @@ pub fn build_calibrator_design(
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
-    let pred_null_dim = spec.penalty_order_pred.min(pred_raw_cols);
-    let se_null_dim = if se_linear_fallback {
-        0
-    } else {
-        spec.penalty_order_se.min(se_raw_cols)
-    };
-    let dist_null_dim = if use_linear_dist {
-        0
-    } else {
-        spec.penalty_order_dist.min(dist_raw_cols)
-    };
+    let pred_null_dim = 0;
+    let se_null_dim = 0;
+    let dist_null_dim = 0;
 
     let schema = InternalSchema {
         knots_pred,
@@ -1349,19 +1300,25 @@ pub fn predict_calibrator(
     };
     let dist_std = dist_hinged.mapv(|x| (x - md) / sd.max(1e-8_f64));
 
-    // Build bases using stored knots, then apply stored STZ transforms
-    let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
-        pred_std.view(),
-        model.knots_pred.view(),
-        model.spec.pred_basis.degree,
-    )?;
+    // Build bases using stored knots only when the schema recorded non-empty blocks.
+    let n = pred.len();
+    let (pred_range, se_range, dist_range) = &model.column_spans;
+    let n_pred_cols = pred_range.end - pred_range.start;
+    let n_se_cols = se_range.end - se_range.start;
+    let n_dist_cols = dist_range.end - dist_range.start;
+    let b_pred = if n_pred_cols == 0 {
+        Array2::<f64>::zeros((n, 0))
+    } else {
+        let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+            pred_std.view(),
+            model.knots_pred.view(),
+            model.spec.pred_basis.degree,
+        )?;
+        b_pred_raw.dot(&model.pred_constraint_transform)
+    };
 
-    // Handle SE basis, with special case for linear fallback
-    let b_se = if model.se_linear_fallback {
-        // Apply the same centering that was used during training
-        (se_std.mapv(|v| v - model.se_center_offset))
-            .insert_axis(Axis(1))
-            .to_owned()
+    let b_se = if n_se_cols == 0 {
+        Array2::<f64>::zeros((n, 0))
     } else {
         let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             se_std.view(),
@@ -1371,15 +1328,8 @@ pub fn predict_calibrator(
         b_se_raw.dot(&model.stz_se)
     };
 
-    let b_pred = b_pred_raw.dot(&model.pred_constraint_transform);
-    // No separate linear channel - use only the pred smooth
-
-    // Handle distance basis, with special case for linear fallback
-    let b_dist = if model.dist_linear_fallback || model.knots_dist.len() == 0 {
-        // Apply the same centering that was used during training
-        (dist_std.mapv(|v| v - model.dist_center_offset))
-            .insert_axis(Axis(1))
-            .to_owned()
+    let b_dist = if n_dist_cols == 0 {
+        Array2::<f64>::zeros((n, 0))
     } else {
         let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
             dist_std.view(),
@@ -1390,11 +1340,6 @@ pub fn predict_calibrator(
     };
 
     // Assemble X = [B_pred | B_se | B_dist]
-    let n = pred.len();
-    let (pred_range, se_range, dist_range) = &model.column_spans;
-    let n_pred_cols = pred_range.end - pred_range.start;
-    let n_se_cols = se_range.end - se_range.start;
-    let n_dist_cols = dist_range.end - dist_range.start;
     let total_cols = n_pred_cols + n_se_cols + n_dist_cols;
     let mut x = Array2::<f64>::zeros((n, total_cols));
     if n_pred_cols > 0 {
@@ -4749,14 +4694,32 @@ mod tests {
             "Distance linear fallback should be triggered"
         );
 
-        // Verify that center offsets are non-zero (since we're using weighted centering)
-        assert!(
-            schema.se_center_offset.abs() > 0.0,
-            "SE center offset should be non-zero"
+        // Wiggle-only fallback drops the blocks entirely, so they contribute no columns
+        // and report zero offsets/nullspaces.
+        assert_eq!(
+            schema.column_spans.1.end - schema.column_spans.1.start,
+            0,
+            "SE block should contribute no columns when fallback triggers",
         );
-        assert!(
-            schema.dist_center_offset.abs() > 0.0,
-            "Distance center offset should be non-zero"
+        assert_eq!(
+            schema.column_spans.2.end - schema.column_spans.2.start,
+            0,
+            "Distance block should contribute no columns when fallback triggers",
+        );
+        assert_eq!(
+            schema.se_center_offset,
+            0.0,
+            "SE center offset should be zero under wiggle-only fallback",
+        );
+        assert_eq!(
+            schema.dist_center_offset,
+            0.0,
+            "Distance center offset should be zero under wiggle-only fallback",
+        );
+        assert_eq!(
+            schema.penalty_nullspace_dims,
+            (0, 0, 0),
+            "All penalty nullspaces should be reported as zero after projection",
         );
 
         // Fit calibrator
@@ -4819,8 +4782,7 @@ mod tests {
                 .collect(),
         );
 
-        // Test two prediction approaches for consistency:
-        // Stage: Evaluate predictions with the full centering (our fix)
+        // Evaluate predictions to ensure the dropped blocks don't cause runtime issues.
         let pred1 = predict_calibrator(
             &cal_model,
             test_pred.view(),
@@ -4828,38 +4790,7 @@ mod tests {
             test_dist.view(),
         )
         .unwrap();
-
-        // Stage: Evaluate a manually centered version that accounts for standardization
-        // The offset is in standardized units, so we need to convert it to raw units
-        // by multiplying by the standard deviation
-        let (_, se_std) = schema.standardize_se;
-        let (_, dist_std) = schema.standardize_dist;
-        let test_se_centered = test_se.mapv(|v| v - schema.se_center_offset * se_std);
-        let test_dist_centered = test_dist.mapv(|v| v - schema.dist_center_offset * dist_std);
-
-        // Create a model with zero offsets (to simulate old behavior with manual centering)
-        let mut cal_model_zero_offsets = cal_model.clone();
-        cal_model_zero_offsets.se_center_offset = 0.0;
-        cal_model_zero_offsets.dist_center_offset = 0.0;
-
-        // Predict with pre-centered data but zero offsets in model
-        let pred2 = predict_calibrator(
-            &cal_model_zero_offsets,
-            test_pred.view(),
-            test_se_centered.view(),
-            test_dist_centered.view(),
-        )
-        .unwrap();
-
-        // The predictions should be identical
-        for i in 0..n_test {
-            assert!(
-                (pred1[i] - pred2[i]).abs() < 1e-9,
-                "Predictions should match closely between proper centering and manual centering (diff at i={}: {:.2e})",
-                i,
-                (pred1[i] - pred2[i]).abs()
-            );
-        }
+        assert_eq!(pred1.len(), n_test);
     }
 
     #[test]
