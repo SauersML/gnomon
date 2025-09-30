@@ -3,8 +3,11 @@ use crate::calibrate::basis::{
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::model::BasisConfig;
-use crate::calibrate::model::LinkFunction;
+#[cfg(test)]
+use crate::calibrate::construction::ModelLayout;
+use crate::calibrate::model::{BasisConfig, LinkFunction};
+#[cfg(test)]
+use crate::calibrate::model::ModelConfig;
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
 
@@ -2335,118 +2338,39 @@ mod tests {
         (points_array, is_outside)
     }
 
-    // A simpler version of PIRLS for testing that provides a single base fit
-    pub fn simple_pirls_fit(
+    #[cfg(test)]
+    fn real_unpenalized_fit(
         x: &Array2<f64>,
         y: &Array1<f64>,
         w_prior: &Array1<f64>,
         link: LinkFunction,
-    ) -> Result<pirls::PirlsResult, EstimationError> {
+    ) -> pirls::PirlsResult {
         let n = x.nrows();
         let p = x.ncols();
 
-        // State
-        let mut beta = Array1::<f64>::zeros(p);
-        let mut eta = Array1::<f64>::zeros(n);
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut w = Array1::<f64>::zeros(n); // IRLS working weights W^(t)
-        let mut z = Array1::<f64>::zeros(n); // IRLS working response z^(t)
+        let rs_original: Vec<Array2<f64>> = Vec::new();
+        let rho = Array1::<f64>::zeros(0);
+        let offset = Array1::<f64>::zeros(n);
 
-        match link {
-            LinkFunction::Logit => {
-                // Initialize (common safe start)
-                eta.fill(0.0);
-                mu.fill(0.5);
+        let layout = ModelLayout::external(p, 0);
+        let cfg = ModelConfig::external(link, 1e-10, 100);
 
-                // Plain IRLS with proper WLS step each iteration
-                let max_iter = 20;
-                for iter in 0..max_iter {
-                    // Debug iteration progress if needed
-                    if iter == max_iter - 1 {
-                        eprintln!("[PIRLS] Reached max iterations: {}", iter + 1);
-                    }
-                    // W = w_prior * mu*(1-mu), z = eta + (y - mu) / (mu*(1-mu))
-                    for i in 0..n {
-                        let p_i = mu[i].clamp(1e-8, 1.0 - 1e-8);
-                        let vi = p_i * (1.0 - p_i); // variance function
-                        w[i] = w_prior[i] * vi;
-                        z[i] = eta[i] + (y[i] - p_i) / vi.max(1e-12);
-                    }
+        pirls::fit_model_for_fixed_rho(
+            rho.view(),
+            x.view(),
+            offset.view(),
+            y.view(),
+            w_prior.view(),
+            &rs_original,
+            &layout,
+            &cfg,
+        )
+        .expect("real PIRLS fit failed")
+    }
 
-                    // Form weighted design Z = diag(sqrt(w)) * X and weighted RHS u = sqrt(w) ⊙ z
-                    let sqrt_w = w.mapv(f64::sqrt);
-                    let mut z_design = x.clone(); // Z
-                    z_design *= &sqrt_w.view().insert_axis(Axis(1));
-                    let u_rhs = &sqrt_w * &z;
-
-                    // Solve weighted least squares directly with LLT
-                    beta = solve_wls_llt(&z_design, &u_rhs)?;
-
-                    // Update linear predictor and mean
-                    eta = x.dot(&beta);
-                    mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-                }
-            }
-
-            LinkFunction::Identity => {
-                // Single proper WLS solve: minimize || sqrt(w_prior) * (y - X beta) ||_2
-                let sqrt_w = w_prior.mapv(f64::sqrt);
-                let mut z_design = x.clone(); // Z
-                z_design *= &sqrt_w.view().insert_axis(Axis(1));
-                let u_rhs = &sqrt_w * y;
-
-                beta = solve_wls_llt(&z_design, &u_rhs)?;
-
-                eta = x.dot(&beta);
-                mu = eta.clone();
-                w = w_prior.clone();
-                z = y.clone();
-            }
-        }
-
-        // Build "Hessian" Xᵀ W X (unpenalized) for ALO helpers
-        let mut xtwx = Array2::<f64>::zeros((p, p));
-        for j in 0..p {
-            for k in j..p {
-                let mut s = 0.0;
-                for i in 0..n {
-                    s += w[i] * x[[i, j]] * x[[i, k]];
-                }
-                xtwx[[j, k]] = s;
-                xtwx[[k, j]] = s;
-            }
-        }
-
-        // Minimal reparam stub (same as before)
-        use crate::calibrate::construction::ReparamResult;
-        let reparam_result = ReparamResult {
-            qs: Array2::eye(p),
-            s_transformed: Array2::zeros((p, p)),
-            log_det: 0.0,
-            det1: Array1::zeros(p),
-            rs_transformed: Vec::new(),
-            rs_transposed: Vec::new(),
-            e_transformed: Array2::eye(p),
-        };
-
-        Ok(pirls::PirlsResult {
-            beta_transformed: beta.clone(),
-            penalized_hessian_transformed: xtwx.clone(),
-            stabilized_hessian_transformed: xtwx,
-            deviance: 0.0,
-            edf: p as f64,
-            stable_penalty_term: 0.0,
-            final_weights: w.clone(), // W^(final)
-            final_mu: mu.clone(),     // μ^(final)
-            solve_weights: w,
-            solve_working_response: z, // z^(final) (useful for ALO)
-            solve_mu: mu,
-            status: pirls::PirlsStatus::Converged,
-            iteration: 0,
-            max_abs_eta: 0.0,
-            reparam_result,
-            x_transformed: x.clone(), // keep original X for tests
-        })
+    #[cfg(test)]
+    fn beta_in_original_basis(fit: &pirls::PirlsResult) -> Array1<f64> {
+        fit.reparam_result.qs.dot(&fit.beta_transformed)
     }
 
     // ===== ALO Correctness Tests =====
@@ -2472,7 +2396,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         // Fit a simple model
-        let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        let fit_res = real_unpenalized_fit(&x, &y, &w, link);
 
         // Run ALO with our fixed code
         let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
@@ -2553,7 +2477,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         // Fit a simple model to get baseline predictions
-        let fit_res = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        let fit_res = real_unpenalized_fit(&x, &y, &w, link);
 
         // Compute ALO features
         compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
@@ -2658,7 +2582,7 @@ mod tests {
         let test_idx = 10;
         w_zero[test_idx] = 0.0;
 
-        let fit_with_zero = simple_pirls_fit(&x, &y, &w_zero, link).unwrap();
+        let fit_with_zero = real_unpenalized_fit(&x, &y, &w_zero, link);
         compute_alo_features(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
 
         // Check directly with small custom calculation
@@ -2710,7 +2634,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         // Fit full model
-        let full_fit = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        let full_fit = real_unpenalized_fit(&x, &y, &w, link);
 
         // Compute ALO features
         let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
@@ -2738,19 +2662,21 @@ mod tests {
             }
 
             // Fit LOO model
-            let loo_fit = simple_pirls_fit(&x_loo, &y_loo, &w_loo, link).unwrap();
+            let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
 
-            // Predict for held-out point
+            // Predict for held-out point using the original coefficient basis
+            let beta_loo = beta_in_original_basis(&loo_fit);
             let x_i = x.row(i).to_owned();
-            let eta_i = x_i.dot(&loo_fit.beta_transformed);
+            let eta_i = x_i.dot(&beta_loo);
 
             // Standard error calculation using LLT approach
             // For weighted regression, SE of prediction at x0 is sqrt(x0' (X'WX)^(-1) x0)
 
             // Build K = X^T W X at the LOO fit, add tiny ridge
             let mut k = Array2::<f64>::zeros((p, p));
+            let w_fish_loo = loo_fit.final_weights.clone();
             for r in 0..(n - 1) {
-                let wi = w_loo[r];
+                let wi = w_fish_loo[r];
                 if wi == 0.0 {
                     continue;
                 }
@@ -2770,7 +2696,6 @@ mod tests {
             let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
 
             // Solve for c_i = x_i^T K^{-1} x_i
-            let x_i = x.row(i).to_owned();
             let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
             let s = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
@@ -2781,10 +2706,8 @@ mod tests {
             // Correct "true" LOO SE: uses inflation by 1/(1-aii) from the full fit
             // We have the K from the LOO fit, which already includes the 1/(1-aii) inflation effect
             // This matches our correct ALO formula: SE = sqrt(phi * ci / (1-aii))
-            let se_i = ci.sqrt();
-
             loo_pred[i] = eta_i;
-            loo_se[i] = se_i;
+            loo_se[i] = ci.sqrt();
         }
 
         // Compare ALO predictions with true LOO
@@ -2840,7 +2763,7 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let link = LinkFunction::Logit;
 
-        let full_fit = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        let full_fit = real_unpenalized_fit(&x, &y, &w, link);
         let alo_full = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         let mut loo_pred = Array1::<f64>::zeros(n);
@@ -2860,13 +2783,14 @@ mod tests {
             }
 
             let w_loo = Array1::<f64>::ones(n - 1);
-            let loo_fit = simple_pirls_fit(&x_loo, &y_loo, &w_loo, link).unwrap();
+            let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
+            let beta_loo = beta_in_original_basis(&loo_fit);
             let x_i = x.row(i);
-            loo_pred[i] = x_i.dot(&loo_fit.beta_transformed);
+            loo_pred[i] = x_i.dot(&beta_loo);
 
             let mut xtwx = Array2::<f64>::zeros((p, p));
             for r in 0..(n - 1) {
-                let wi = loo_fit.solve_weights[r];
+                let wi = loo_fit.final_weights[r];
                 if wi == 0.0 {
                     continue;
                 }
@@ -2900,7 +2824,8 @@ mod tests {
             rmse_pred, max_abs_pred
         );
 
-        let eta_full = x.dot(&full_fit.beta_transformed);
+        let beta_full = beta_in_original_basis(&full_fit);
+        let eta_full = x.dot(&beta_full);
         let z_full = full_fit.solve_working_response.clone();
         let max_working_jump = z_full
             .iter()
@@ -3957,7 +3882,7 @@ mod tests {
         // Create simple PIRLS fit for the base predictions
         let w = Array1::<f64>::ones(n);
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_eta[i]);
-        let base_fit = simple_pirls_fit(&fake_x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
         // Generate ALO features
         let mut alo_features = compute_alo_features(
@@ -4135,7 +4060,7 @@ mod tests {
             let base_probs = distorted_eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
             let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_eta[i]);
-            let base_fit = simple_pirls_fit(&fake_x, &y, &w, LinkFunction::Logit).unwrap();
+            let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
             let mut alo_features = compute_alo_features(
                 &base_fit,
@@ -4296,7 +4221,7 @@ mod tests {
         // Base PIRLS fit uses the distorted logits as the single predictor (identity backbone)
         let w = Array1::<f64>::ones(n);
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_logits[i]);
-        let base_fit = simple_pirls_fit(&fake_x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
         let mut alo_features = compute_alo_features(
             &base_fit,
@@ -4510,7 +4435,7 @@ mod tests {
 
         // Create simple PIRLS fit for base predictions
         let w = Array1::<f64>::ones(n);
-        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
 
         // Base predictions should already be well-calibrated
         let base_preds = base_fit.solve_mu.clone();
@@ -4651,7 +4576,7 @@ mod tests {
             y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
         }
 
-        let fit = simple_pirls_fit(&x, &y, &Array1::<f64>::ones(n), LinkFunction::Logit).unwrap();
+        let fit = real_unpenalized_fit(&x, &y, &Array1::<f64>::ones(n), LinkFunction::Logit);
         let alo_features =
             compute_alo_features(&fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
@@ -4745,7 +4670,7 @@ mod tests {
         }
 
         let w = Array1::<f64>::ones(n);
-        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
             compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
@@ -4821,7 +4746,7 @@ mod tests {
 
         // Train a simple model that estimates just the mean
         let w = Array1::<f64>::ones(n);
-        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Identity).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Identity);
 
         // Base predictions
         let base_preds = base_fit.solve_mu.clone();
@@ -4955,7 +4880,7 @@ mod tests {
         let w = Array1::<f64>::ones(n);
 
         // Just test that we can fit a calibrator
-        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
             compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
@@ -5192,7 +5117,7 @@ mod tests {
 
         // Train base model
         let w = Array1::<f64>::ones(n);
-        let base_fit = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
 
         // Generate ALO features
         let alo_features =
@@ -5869,14 +5794,14 @@ mod tests {
 
         // First run
         let w = Array1::<f64>::ones(n);
-        let base_fit1 = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit1 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features1 =
             compute_alo_features(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
         let (beta1, lambdas1) = create_calibrator(&features1);
 
         // Second run - should be identical
-        let base_fit2 = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let base_fit2 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features2 =
             compute_alo_features(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
@@ -5921,7 +5846,7 @@ mod tests {
         let w_small = Array1::<f64>::ones(n_small);
 
         // Fit model on small dataset for verification
-        let small_fit = simple_pirls_fit(&x_small, &y_small, &w_small, link).unwrap();
+        let small_fit = real_unpenalized_fit(&x_small, &y_small, &w_small, link);
 
         // Compare results for small dataset using both original and blocked computation
         // Note: This is checking the internal implementation of compute_alo_features
@@ -5932,7 +5857,7 @@ mod tests {
         let start = Instant::now();
 
         // Fit model on large dataset
-        let large_fit = simple_pirls_fit(&x_large, &y_large, &w_large, link).unwrap();
+        let large_fit = real_unpenalized_fit(&x_large, &y_large, &w_large, link);
         eprintln!("Large model fit completed in {:?}", start.elapsed());
 
         // Time just the ALO computation
@@ -5968,7 +5893,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         // Fit base model
-        let base_fit = simple_pirls_fit(&x, &y, &w, link).unwrap();
+        let base_fit = real_unpenalized_fit(&x, &y, &w, link);
 
         // Generate ALO features
         let alo_features = compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
@@ -6358,7 +6283,7 @@ mod tests {
         // Rest stay at 1.0
 
         // Fit a simple model to get the ALO features
-        let fit_res = simple_pirls_fit(&x, &y, &w, LinkFunction::Logit).unwrap();
+        let fit_res = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
 
         // Compute ALO features
         let alo_features =
