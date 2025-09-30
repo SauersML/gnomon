@@ -3823,7 +3823,14 @@ mod tests {
 
         // Create base predictions with sinusoidal miscalibration
         let eta = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 4.0 - 2.0).collect()); // Linear predictor from -2 to 2
-        let distorted_eta = add_sinusoidal_miscalibration(&eta, 0.8, 1.0); // Add wiggle
+        let eta_min = eta[0];
+        let eta_max = eta[n - 1];
+        let eta_range = eta_max - eta_min;
+        let one_period_frequency = 2.0 * PI / eta_range;
+        let shifted_eta = eta.mapv(|e| e - eta_min);
+        let distorted_eta_shifted =
+            add_sinusoidal_miscalibration(&shifted_eta, 1.1, one_period_frequency);
+        let distorted_eta = distorted_eta_shifted + eta_min; // Stronger single-period wiggle
 
         // Convert to probabilities for the true (linear) and distorted models
         let true_probs = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
