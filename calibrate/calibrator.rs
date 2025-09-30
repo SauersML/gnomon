@@ -2225,7 +2225,17 @@ mod tests {
         amplitude: f64,
         frequency: f64,
     ) -> Array1<f64> {
-        eta.mapv(|e| e + amplitude * (frequency * e).sin())
+        add_sinusoidal_miscalibration_with_linear_coeff(eta, amplitude, frequency, 1.0)
+    }
+
+    /// Generate sinusoidal miscalibration pattern with a configurable linear slope
+    pub fn add_sinusoidal_miscalibration_with_linear_coeff(
+        eta: &Array1<f64>,
+        amplitude: f64,
+        frequency: f64,
+        linear_coeff: f64,
+    ) -> Array1<f64> {
+        eta.mapv(|e| linear_coeff * e + amplitude * (frequency * e).sin())
     }
 
     /// Create convex hull test points with known inside/outside status
@@ -3911,9 +3921,26 @@ mod tests {
         let eta_range = eta_max - eta_min;
         let one_period_frequency = 2.0 * PI / eta_range;
         let shifted_eta = eta.mapv(|e| e - eta_min);
-        let distorted_eta_shifted =
-            add_sinusoidal_miscalibration(&shifted_eta, 1.1, one_period_frequency);
-        let distorted_eta = distorted_eta_shifted + eta_min; // Stronger single-period wiggle
+        let amplitude = 0.6; // Pure sine miscalibration with enough margin to stay monotone
+        let distorted_eta_shifted = add_sinusoidal_miscalibration(
+            &shifted_eta,
+            amplitude,
+            one_period_frequency,
+        );
+        let distorted_eta = distorted_eta_shifted + eta_min; // Identity + sine only (no extra slope/intercept)
+
+        let mut min_slope = f64::INFINITY;
+        for i in 1..n {
+            let delta_eta = eta[i] - eta[i - 1];
+            if delta_eta <= 0.0 {
+                continue;
+            }
+            let slope = (distorted_eta[i] - distorted_eta[i - 1]) / delta_eta;
+            if slope < min_slope {
+                min_slope = slope;
+            }
+        }
+        assert!(min_slope > 0.0, "distorted logits must be monotone to remain injective");
 
         // Convert to probabilities for the true (linear) and distorted models
         let true_probs = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
