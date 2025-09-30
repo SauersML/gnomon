@@ -2480,7 +2480,7 @@ mod tests {
 
         // Prepare U = sqrt(W)X
         let w = &fit_res.final_weights;
-        let sqrt_w = w.mapv(f64::sqrt);
+        let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
         let mut u = fit_res.x_transformed.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
@@ -6128,26 +6128,52 @@ mod tests {
         let alo_features =
             compute_alo_features(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
-        // Get inputs for manual SE calculation
-        let sqrt_w = w.mapv(f64::sqrt);
+        // Get inputs for manual SE calculation using the final PIRLS weights
+        let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
         let mut u = fit_res.x_transformed.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
         // Get the penalized Hessian (K = XᵀWX + Sλ)
-        let k = fit_res.penalized_hessian_transformed.clone();
+        let mut k = fit_res.penalized_hessian_transformed.clone();
+        for d in 0..p {
+            k[[d, d]] += 1e-12;
+        }
         let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-        let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+
+        enum Factor {
+            Llt(FaerLlt<f64>),
+            Ldlt(FaerLdlt<f64>),
+        }
+        impl Factor {
+            fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+                match self {
+                    Factor::Llt(f) => f.solve(rhs),
+                    Factor::Ldlt(f) => f.solve(rhs),
+                }
+            }
+        }
+
+        let factor = FaerLlt::new(k_f.as_ref(), Side::Lower)
+            .map(Factor::Llt)
+            .unwrap_or_else(|_| {
+                Factor::Ldlt(
+                    FaerLdlt::new(k_f.as_ref(), Side::Lower)
+                        .expect("LDLT factorization should succeed for test"),
+                )
+            });
 
         // Compute hat diagonals and both SE conventions for a few observations
         println!("\nALO weighting convention test:");
-        println!("| i | weight | a_ii | 1-a_ii | var_full | SE_full | SE_loo | Ratio (loo/full) |");
-        println!("|---|--------|------|--------|----------|---------|--------|------------------|");
+        println!("| i | orig_w | final_w | a_ii | 1-a_ii | var_full | SE_full | SE_loo | Ratio (loo/full) |");
+        println!("|---|--------|---------|------|--------|----------|---------|--------|------------------|");
 
         let xtwx = u.t().dot(&u);
         let mut hat_diagonals = Vec::with_capacity(n);
         let mut se_fulls = Vec::with_capacity(n);
         let mut se_loos = Vec::with_capacity(n);
+        let final_weights = fit_res.final_weights.clone();
+        let phi = 1.0; // Logistic dispersion
 
         for i in 0..n {
             let ui = u.row(i).to_owned();
@@ -6161,13 +6187,17 @@ mod tests {
             }
 
             let ti = xtwx.dot(&si_arr);
-            let mut var_full = 0.0;
+            let mut quad = 0.0;
             for r in 0..p {
-                var_full += si_arr[r] * ti[r];
+                quad += si_arr[r] * ti[r];
             }
 
-            let denom = (1.0 - aii).max(1e-12);
-            let var_loo = var_full / denom;
+            let wi = final_weights[i].max(1e-12);
+            let var_full = phi * (quad / wi);
+            let denom_raw = 1.0 - aii;
+            let denom = denom_raw.max(1e-12);
+            let var_without_i = (var_full - phi * (aii * aii) / wi).max(0.0);
+            let var_loo = var_without_i / (denom * denom);
             let se_full = var_full.sqrt();
             let se_loo = var_loo.sqrt();
 
@@ -6178,15 +6208,19 @@ mod tests {
 
         for i in 0..std::cmp::min(10, n) {
             let aii = hat_diagonals[i];
-            let denom = (1.0 - aii).max(1e-12);
+            let denom_raw = 1.0 - aii;
+            let denom = denom_raw.max(1e-12);
             let se_full = se_fulls[i];
             let se_loo_manual = se_loos[i];
+            let wi = final_weights[i].max(1e-12);
             let var_full = se_full * se_full;
+            let var_without_i = (var_full - phi * (aii * aii) / wi).max(0.0);
 
             println!(
-                "| {:2} | {:6.3} | {:5.3} | {:6.3} | {:8.3e} | {:8.3e} | {:8.3e} | {:12.3e} |",
+                "| {:2} | {:6.3} | {:7.3} | {:5.3} | {:6.3} | {:8.3e} | {:8.3e} | {:8.3e} | {:12.3e} |",
                 i,
                 w[i],
+                final_weights[i],
                 aii,
                 denom,
                 var_full,
@@ -6207,7 +6241,11 @@ mod tests {
                 alo_se,
                 se_loo_manual
             );
-            let expected_ratio = denom.sqrt().recip();
+            let expected_ratio = if var_full > 0.0 {
+                (var_without_i / var_full).sqrt() / denom
+            } else {
+                f64::NAN
+            };
             let actual_ratio = if se_full > 0.0 {
                 se_loo_manual / se_full
             } else {
@@ -6226,8 +6264,16 @@ mod tests {
         for i in [0, n / 3, 2 * n / 3] {
             // Sample from each weight group
             let aii = hat_diagonals[i];
-            let denom = (1.0 - aii).max(1e-12);
-            let expected_ratio = denom.sqrt().recip();
+            let wi = final_weights[i].max(1e-12);
+            let denom_raw = 1.0 - aii;
+            let denom = denom_raw.max(1e-12);
+            let var_full = se_fulls[i] * se_fulls[i];
+            let var_without_i = (var_full - phi * (aii * aii) / wi).max(0.0);
+            let expected_ratio = if var_full > 0.0 {
+                (var_without_i / var_full).sqrt() / denom
+            } else {
+                f64::NAN
+            };
             let se_full = se_fulls[i];
             let se_loo = alo_features.se[i];
             let actual_ratio = if se_full > 0.0 {
