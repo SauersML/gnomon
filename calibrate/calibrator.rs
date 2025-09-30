@@ -1815,7 +1815,10 @@ mod tests {
         let logdet_s = reparam.log_det;
 
         let penalised_ll = ll - pen;
-        let laml = penalised_ll + 0.5 * logdet_s - 0.5 * logdet_h;
+        // Laplace approximate marginal log-likelihood (Wood 2011, Eq. 14):
+        // L = ℓ_p(β̂) - 0.5 log|S_λ|_+ + 0.5 log|H_eff|.
+        // Here ℓ_p = log-likelihood minus 0.5 βᵀ S_λ β.
+        let laml = penalised_ll - 0.5 * logdet_s + 0.5 * logdet_h;
         let cost = -laml;
 
         LamlBreakdown {

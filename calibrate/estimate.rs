@@ -2034,7 +2034,7 @@ pub mod internal {
                         }
                     };
 
-                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
+                    // The LAML score is Lp - 0.5*log|S| + 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
                     let phi = 1.0; // Logit family typically has dispersion parameter = 1
@@ -2045,7 +2045,7 @@ pub mod internal {
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = (self.layout.total_coeffs - penalty_rank) as f64;
 
-                    let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
+                    let laml = penalised_ll - 0.5 * log_det_s + 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Diagnostics: effective degrees of freedom via trace identity
