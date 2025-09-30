@@ -6249,9 +6249,15 @@ mod tests {
         // - Column means of the basis matrix being zero (the STZ guarantee)
         // - The sum of coefficients being zero (an incorrect test assertion)
 
-        // Create a simple dataset with just a constant predictor
+        // Create a dataset whose predictor varies (so that the spline basis has
+        // non-trivial columns after the STZ constraint is applied).
         let n = 100;
-        let constant_pred = Array1::<f64>::ones(n);
+        let mut varying_pred = Array1::<f64>::zeros(n);
+        for (i, value) in varying_pred.iter_mut().enumerate() {
+            // Scaled to roughly [-1, 1].
+            let frac = (i as f64) / ((n - 1) as f64);
+            *value = 2.0 * frac - 1.0;
+        }
         let se = Array1::from_elem(n, 0.5);
         let dist = Array1::zeros(n);
 
@@ -6268,10 +6274,10 @@ mod tests {
 
         // Create calibrator features
         let features = CalibratorFeatures {
-            pred: constant_pred.clone(), // All 1s
+            pred: varying_pred.clone(),
             se,
             dist,
-            pred_identity: constant_pred,
+            pred_identity: varying_pred,
         };
 
         // Create calibrator spec with sum-to-zero constraint and both uniform and non-uniform weights
@@ -6371,11 +6377,11 @@ mod tests {
 
         // Verify column means vs coefficient sums
         // Stage: Confirm that column means are approximately zero in both cases (STZ guarantee)
-        println!("\nVerifying column means of the basis matrix after STZ constraint:");
-
-        // Get pred block span for uniform case
+        // Extract the design slices corresponding to the predictor spline block.
         let pred_range_uniform = schema_uniform.column_spans.0.clone();
+        let pred_range_nonuniform = schema_nonuniform.column_spans.0.clone();
         let b_pred_uniform = x_uniform.slice(s![.., pred_range_uniform.clone()]);
+        let b_pred_nonuniform = x_nonuniform.slice(s![.., pred_range_nonuniform.clone()]);
 
         // Calculate column means for uniform case
         let mut max_abs_col_mean_uniform: f64 = 0.0;
@@ -6384,10 +6390,6 @@ mod tests {
             let mean = col.sum() / (n as f64);
             max_abs_col_mean_uniform = max_abs_col_mean_uniform.max(mean.abs());
         }
-
-        // Get pred block span for non-uniform case
-        let pred_range_nonuniform = schema_nonuniform.column_spans.0.clone();
-        let b_pred_nonuniform = x_nonuniform.slice(s![.., pred_range_nonuniform.clone()]);
 
         // Calculate weighted column means for non-uniform case
         let w_sum = weights.sum();
@@ -6400,41 +6402,30 @@ mod tests {
                 .map(|(&x, &w)| x * w)
                 .sum::<f64>()
                 / w_sum;
-            max_abs_col_mean_nonuniform = max_abs_col_mean_nonuniform.max(weighted_mean.abs());
+            max_abs_col_mean_nonuniform =
+                max_abs_col_mean_nonuniform.max(weighted_mean.abs());
         }
 
-        println!(
-            "  Uniform weights case: max absolute column mean = {:.6e}",
-            max_abs_col_mean_uniform
+        assert!(
+            max_abs_col_mean_uniform < 1e-10,
+            "STZ failed to zero unweighted column means: max |mean| = {max_abs_col_mean_uniform:e}"
         );
-        println!(
-            "  Non-uniform weights case: max absolute weighted column mean = {:.6e}",
-            max_abs_col_mean_nonuniform
+        assert!(
+            max_abs_col_mean_nonuniform < 1e-10,
+            "STZ failed to zero weighted column means: max |mean| = {max_abs_col_mean_nonuniform:e}"
         );
 
-        // Stage: Highlight that the sum of coefficients is generally NOT zero (the test's incorrect assertion)
+        // Highlight that the sum of coefficients is generally NOT zero (the test's incorrect assertion)
         let pred_coef_sum_uniform: f64 = beta_uniform.slice(s![pred_range_uniform]).sum();
         let pred_coef_sum_nonuniform: f64 = beta_nonuniform.slice(s![pred_range_nonuniform]).sum();
 
-        println!("\nTesting the test's incorrect assumption:");
-        println!(
-            "  Uniform weights case: sum of pred coefficients = {:.6e}",
-            pred_coef_sum_uniform
+        assert!(
+            pred_coef_sum_uniform.abs() > 1e-6,
+            "Sum-to-zero constraint should not force coefficients to sum to zero (uniform case)"
         );
-        println!(
-            "  Non-uniform weights case: sum of pred coefficients = {:.6e}",
-            pred_coef_sum_nonuniform
+        assert!(
+            pred_coef_sum_nonuniform.abs() > 1e-6,
+            "Sum-to-zero constraint should not force coefficients to sum to zero (non-uniform case)"
         );
-
-        // Note that the test's assertion about sum of coefficients is invalid
-        println!("\nConclusion:");
-        println!(
-            "  - STZ guarantees column means ≈ 0 (TRUE for both cases: {:.2e}, {:.2e})",
-            max_abs_col_mean_uniform, max_abs_col_mean_nonuniform
-        );
-        println!(
-            "  - Sum of coefficients = 0 is NOT guaranteed by STZ. Test assertion is INVALID."
-        );
-        println!("  - The correct test should check column means, not coefficient sums.");
     }
 }
