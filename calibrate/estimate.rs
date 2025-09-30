@@ -1219,8 +1219,10 @@ pub fn optimize_external_design(
         }
         traces[kk] = lambdas[kk] * frob;
     }
-    let edf_total = (pirls_res.beta_transformed.len() as f64 - traces.iter().sum::<f64>())
-        .clamp(0.0, pirls_res.beta_transformed.len() as f64);
+    let p_dim = pirls_res.beta_transformed.len();
+    let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+    let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
+    let edf_total = (p_dim as f64 - traces.iter().sum::<f64>()).clamp(mp, p_dim as f64);
     // Per-block EDF: use block range dimension (rank of R_k) minus λ tr(H^{-1} S_k)
     // This better reflects penalized coefficients in the transformed basis
     let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
@@ -1519,9 +1521,11 @@ pub mod internal {
                 acc
             };
 
-            // Calculate EDF as p - trace, with a minimum of 1.0
+            // Calculate EDF as p - trace, clamped to the penalty nullspace dimension
             let p = pr.beta_transformed.len() as f64;
-            let edf = (p - trace_h_inv_s_lambda).max(1.0);
+            let rank_s = pr.reparam_result.e_transformed.nrows() as f64;
+            let mp = (p - rank_s).max(0.0);
+            let edf = (p - trace_h_inv_s_lambda).clamp(mp, p);
 
             // Numerically consistent cross-check using the same identity:
             // EDF_alt = p - tr(H^{-1} S_λ) == EDF. This avoids redundant solves and
@@ -2453,7 +2457,6 @@ pub mod internal {
             let mut cost_gradient = Array1::zeros(lambdas.len());
 
             let n = self.y.len() as f64;
-            let num_coeffs = beta_transformed.len() as f64;
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
@@ -2469,18 +2472,9 @@ pub mod internal {
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance
 
-                    // EDF calculation in transformed basis using FAER and Rt RHS
+                    // EDF calculation in transformed basis using shared helper
                     let factor_g = self.get_faer_factor(p, hessian);
-                    let mut trace_h_inv_s_lambda = 0.0;
-                    for k in 0..lambdas.len() {
-                        let r_k = &rs_transformed[k];
-                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
-                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
-                        let x = factor_g.solve(rt.as_ref());
-                        trace_h_inv_s_lambda +=
-                            lambdas[k] * faer_frob_inner(x.as_ref(), rt.as_ref());
-                    }
-                    let edf = (num_coeffs - trace_h_inv_s_lambda).max(1.0);
+                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, hessian)?;
                     let scale = dp / (n - edf).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
