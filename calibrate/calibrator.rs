@@ -3839,39 +3839,37 @@ mod tests {
         let p = 5;
         generate_synthetic_binary_data(n, p, Some(42));
 
-        // Create base predictions with sinusoidal miscalibration
-        let eta = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 4.0 - 2.0).collect()); // Linear predictor from -2 to 2
-        let eta_min = eta[0];
-        let eta_max = eta[n - 1];
-        let eta_range = eta_max - eta_min;
-        let one_period_frequency = 2.0 * PI / eta_range;
-        let shifted_eta = eta.mapv(|e| e - eta_min);
-        let amplitude = 0.6; // Pure sine miscalibration with enough margin to stay monotone
-        let distorted_eta_shifted = add_sinusoidal_miscalibration(
-            &shifted_eta,
-            amplitude,
-            one_period_frequency,
+        // ----- Calibrator coordinate (backbone) -----
+        let l = 6.0;
+        let s = Array1::from_vec(
+            (0..n)
+                .map(|i| -l + (2.0 * l) * (i as f64) / ((n as f64) - 1.0))
+                .collect(),
         );
-        let distorted_eta = distorted_eta_shifted + eta_min; // Identity + sine only (no extra slope/intercept)
 
-        let mut min_slope = f64::INFINITY;
-        for i in 1..n {
-            let delta_eta = eta[i] - eta[i - 1];
-            if delta_eta <= 0.0 {
-                continue;
-            }
-            let slope = (distorted_eta[i] - distorted_eta[i - 1]) / delta_eta;
-            if slope < min_slope {
-                min_slope = slope;
+        // One full period over [-l, l], large-but-monotone amplitude
+        let omega = std::f64::consts::PI / l; // period = 2l
+        let amplitude = 0.9 / omega; // ensures 1 + A*omega*cos(·) > 0
+
+        // Truth and base in the SAME coordinate s
+        let eta_true = add_sinusoidal_miscalibration(&s, amplitude, omega); // = s + A sin(ω s)
+        let eta_base = s.clone(); // base is identity in s
+
+        // (Optional sanity) assert monotone mapping
+        let mut min_deriv = f64::INFINITY;
+        for &si in s.iter() {
+            let deriv = 1.0 + amplitude * omega * (omega * si).cos();
+            if deriv < min_deriv {
+                min_deriv = deriv;
             }
         }
-        assert!(min_slope > 0.0, "distorted logits must be monotone to remain injective");
+        assert!(min_deriv > 0.0, "eta_true must be monotone in s");
 
-        // Convert to probabilities for the true (linear) and distorted models
-        let true_probs = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-        let base_probs = distorted_eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        // Probabilities for truth and base (base is miscalibrated vs truth)
+        let true_probs = eta_true.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        let base_probs = eta_base.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
-        // Generate outcomes from the true straight-line probabilities
+        // Generate outcomes from the truth
         let mut rng = StdRng::seed_from_u64(42);
         let mut y = Array1::zeros(n);
         for i in 0..n {
@@ -3879,9 +3877,9 @@ mod tests {
             y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
         }
 
-        // Create simple PIRLS fit for the base predictions
+        // Fit the baseline on the backbone coordinate s (NOT the sine-wiggled truth)
         let w = Array1::<f64>::ones(n);
-        let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_eta[i]);
+        let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| eta_base[i]);
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
         // Generate ALO features
@@ -3894,8 +3892,8 @@ mod tests {
         )
         .unwrap();
 
-        // Preserve the miscalibrated base logits as the identity backbone
-        alo_features.pred_identity = distorted_eta.clone();
+        // Critically: the calibrator’s backbone/offset is the SAME s used above
+        alo_features.pred_identity = eta_base.clone();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
