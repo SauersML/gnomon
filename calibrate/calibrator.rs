@@ -1059,7 +1059,7 @@ pub fn build_calibrator_design(
     let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
     let mu_dist = 0.0;
 
-    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _dist_raw_cols) = if use_linear_dist {
+    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _) = if use_linear_dist {
         if !dist_all_zero {
             eprintln!("[CAL] Dropping dist block due to linear fallback (wiggle-only policy)");
         }
