@@ -4224,6 +4224,230 @@ mod tests {
     }
 
     #[test]
+    fn calibrator_sine_noninjective_oversmooths_and_doesnt_help() {
+        // This test intentionally violates (c > Aω) so s(η) folds. A univariate calibrator f(s)
+        // cannot undo a fold; REML pushes λ↑, EDF↓, and ECE/Brier barely improve.
+
+        let n = 800;
+        let eta = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 4.0 - 2.0).collect());
+        let eta_min = eta[0];
+        let delta_eta = eta[1] - eta[0];
+        let amplitude = 1.1;
+        let omega = std::f64::consts::PI / 2.0; // one full period over [-2, 2]
+
+        let distorted_logits = eta.mapv(|e| {
+            let shifted = e - eta_min;
+            e + amplitude * (omega * shifted).sin()
+        });
+
+        // Confirm the folding by checking the discrete slope becomes negative somewhere
+        let mut min_ratio = f64::INFINITY;
+        for i in 0..(n - 1) {
+            let ds = distorted_logits[i + 1] - distorted_logits[i];
+            let ratio = ds / delta_eta;
+            if ratio < min_ratio {
+                min_ratio = ratio;
+            }
+        }
+        assert!(
+            min_ratio < -1e-6,
+            "Expected non-monotonic distorted logits; minimum discrete slope ratio = {:.6e}",
+            min_ratio
+        );
+
+        // True probabilities follow the unimpaired logits; outcomes sampled from them
+        let true_probs = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        let base_probs = distorted_logits.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut y = Array1::zeros(n);
+        for i in 0..n {
+            let dist = Bernoulli::new(true_probs[i]).unwrap();
+            y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
+        }
+
+        // Base PIRLS fit uses the distorted logits as the single predictor (identity backbone)
+        let w = Array1::<f64>::ones(n);
+        let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_logits[i]);
+        let base_fit = simple_pirls_fit(&fake_x, &y, &w, LinkFunction::Logit).unwrap();
+
+        let mut alo_features = compute_alo_features(
+            &base_fit,
+            y.view(),
+            fake_x.view(),
+            None,
+            LinkFunction::Logit,
+        )
+        .unwrap();
+        alo_features.pred_identity = distorted_logits.clone();
+
+        let spec = CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: BasisConfig {
+                degree: 3,
+                num_knots: 10,
+            },
+            se_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            distance_hinge: false,
+            prior_weights: None,
+        };
+
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
+
+        // Distance axis should be absent / collapsed when no hull inputs are available
+        let dist_block_empty = schema.column_spans.2.start == schema.column_spans.2.end;
+        assert!(
+            (dist_block_empty && schema.knots_dist.len() == 0) || schema.dist_linear_fallback,
+            "Distance block expected to be empty or in linear fallback"
+        );
+
+        let penalty_nullspace_dims = [
+            schema.penalty_nullspace_dims.0,
+            schema.penalty_nullspace_dims.1,
+            schema.penalty_nullspace_dims.2,
+        ];
+        let fit_result = fit_calibrator(
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            offset.view(),
+            &penalties,
+            &penalty_nullspace_dims,
+            LinkFunction::Logit,
+        )
+        .unwrap();
+        let (beta, lambdas, _, (edf_pred, edf_se, edf_dist), _) = fit_result;
+
+        let rho_pred = lambdas[0].ln();
+        assert!(
+            lambdas[0] >= 1e8 || rho_pred >= 18.0,
+            "Expected pred lambda to diverge; λ={:.3e}, ρ={:.3}",
+            lambdas[0],
+            rho_pred
+        );
+        assert!(
+            edf_pred <= 0.10 + 1e-12,
+            "Pred EDF should collapse, got {:.6}",
+            edf_pred
+        );
+        assert!(
+            edf_se <= 0.02 + 1e-12,
+            "SE EDF should collapse, got {:.6}",
+            edf_se
+        );
+        assert!(
+            edf_dist <= 1e-12,
+            "Distance EDF should be zero, got {:.6}",
+            edf_dist
+        );
+
+        // Coefficients should be nearly zero under extreme smoothing
+        let beta_l2 = beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            beta_l2 <= 1e-2,
+            "Calibrator coefficients should shrink to ~0; ||β||₂ = {:.6}",
+            beta_l2
+        );
+
+        // Build calibrated predictions and compare against the miscalibrated baseline
+        let cal_model = CalibratorModel {
+            spec: spec.clone(),
+            knots_pred: schema.knots_pred.clone(),
+            knots_se: schema.knots_se.clone(),
+            knots_dist: schema.knots_dist.clone(),
+            pred_constraint_transform: schema.pred_constraint_transform.clone(),
+            stz_se: schema.stz_se.clone(),
+            stz_dist: schema.stz_dist.clone(),
+            penalty_nullspace_dims: schema.penalty_nullspace_dims,
+            standardize_pred: schema.standardize_pred,
+            standardize_se: schema.standardize_se,
+            standardize_dist: schema.standardize_dist,
+            se_linear_fallback: schema.se_linear_fallback,
+            dist_linear_fallback: schema.dist_linear_fallback,
+            se_center_offset: schema.se_center_offset,
+            dist_center_offset: schema.dist_center_offset,
+            lambda_pred: lambdas[0],
+            lambda_se: lambdas[1],
+            lambda_dist: lambdas[2],
+            coefficients: beta.clone(),
+            column_spans: schema.column_spans.clone(),
+            scale: None,
+        };
+        let cal_probs = predict_calibrator(
+            &cal_model,
+            alo_features.pred_identity.view(),
+            alo_features.se.view(),
+            alo_features.dist.view(),
+        )
+        .unwrap();
+
+        let max_prob_delta = cal_probs
+            .iter()
+            .zip(base_probs.iter())
+            .map(|(c, b)| (c - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            max_prob_delta <= 0.02 + 1e-12,
+            "Calibrated probabilities should stay near baseline; max |Δp| = {:.6}",
+            max_prob_delta
+        );
+
+        let base_ece = ece(&y, &base_probs, 50);
+        let cal_ece = ece(&y, &cal_probs, 50);
+        if base_ece > 0.0 {
+            assert!(
+                cal_ece + 1e-12 >= 0.95 * base_ece,
+                "ECE should not improve materially: base={:.6}, cal={:.6}",
+                base_ece,
+                cal_ece
+            );
+        }
+        assert!(
+            base_ece - cal_ece <= 0.002 + 1e-12,
+            "ECE improvement too large: base={:.6}, cal={:.6}",
+            base_ece,
+            cal_ece
+        );
+
+        let base_brier = brier(&y, &base_probs);
+        let cal_brier = brier(&y, &cal_probs);
+        assert!(
+            base_brier - cal_brier <= 0.001 + 1e-12,
+            "Brier improvement too large: base={:.6}, cal={:.6}",
+            base_brier,
+            cal_brier
+        );
+
+        let base_auc = auc(&y, &base_probs);
+        let cal_auc = auc(&y, &cal_probs);
+        assert!(
+            cal_auc + 1e-12 >= base_auc - 0.02,
+            "AUC should remain similar: base={:.6}, cal={:.6}",
+            base_auc,
+            cal_auc
+        );
+
+        let pred_cols = schema.column_spans.0.end - schema.column_spans.0.start;
+        assert!(pred_cols > 0, "Pred block should exist");
+        assert!(
+            edf_pred <= 0.10 + 1e-12,
+            "Pred EDF should remain collapsed despite available columns: {:.6}",
+            edf_pred
+        );
+    }
+
+    #[test]
     fn calibrator_does_no_harm_when_perfectly_calibrated() {
         // Create perfectly calibrated data
         let n = 300;
