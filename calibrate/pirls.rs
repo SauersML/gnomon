@@ -1482,7 +1482,8 @@ pub fn solve_penalized_least_squares(
                         frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
                     }
                 }
-                let edf = (p_dim as f64 - frob).clamp(0.0, p_dim as f64);
+                let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
+                let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
                 if !edf.is_finite() {
                     return Err(EstimationError::ModelIsIllConditioned {
                         condition_number: f64::INFINITY,
@@ -1885,7 +1886,9 @@ pub fn solve_penalized_least_squares(
     let mut edf = calculate_edf(&penalized_hessian, e_transformed)?;
     if !edf.is_finite() || edf.is_nan() {
         // robust fallback for rank-deficient/near-singular cases
-        edf = e_transformed.nrows() as f64; // Use the penalty rank as fallback
+        let p = penalized_hessian.ncols() as f64;
+        let rank_s = e_transformed.nrows() as f64;
+        edf = (p - rank_s).max(0.0);
     }
 
     // Calculate scale parameter
@@ -2029,6 +2032,7 @@ fn calculate_edf(
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
     let r = e_transformed.nrows();
+    let mp = ((p - r) as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -2044,7 +2048,7 @@ fn calculate_edf(
                 tr += sol[(i, j)] * e_transformed[(j, i)];
             }
         }
-        return Ok((p as f64 - tr).clamp(0.0, p as f64));
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Try LDLᵀ (semi-definite)
@@ -2056,7 +2060,7 @@ fn calculate_edf(
                 tr += sol[(i, j)] * e_transformed[(j, i)];
             }
         }
-        return Ok((p as f64 - tr).clamp(0.0, p as f64));
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
@@ -2069,7 +2073,7 @@ fn calculate_edf(
                 tr += sol[(i, j)] * e_transformed[(j, i)];
             }
         }
-        return Ok((p as f64 - tr).clamp(0.0, p as f64));
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     Err(EstimationError::ModelIsIllConditioned {
