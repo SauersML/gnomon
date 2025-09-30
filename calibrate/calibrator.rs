@@ -507,6 +507,7 @@ pub fn build_calibrator_design(
         }
 
         let dropped = basis.ncols() - keep.len();
+        let kept = keep.len();
         let rows = basis.nrows();
         let t_rows = transform.nrows();
 
@@ -521,10 +522,8 @@ pub fn build_calibrator_design(
         }
 
         eprintln!(
-            "[CAL] Dropping {} near-zero columns from {} block; kept {}",
-            dropped,
-            label,
-            keep.len()
+            "[CAL][WARN] block={} reason=near_zero_columns_pruned action=drop_cols removed={} kept={}",
+            label, dropped, kept
         );
     }
 
@@ -615,12 +614,6 @@ pub fn build_calibrator_design(
     // --- Check SE variability BEFORE standardization ---
     // Detect near-constant SE values that would lead to numerical issues
     let se_linear_fallback = se_std_raw < 1e-8_f64;
-    if se_linear_fallback {
-        eprintln!(
-            "[CAL] SE component has low variability (std={:.2e}), using linear fallback",
-            se_std_raw
-        );
-    }
 
     // --- Apply distance hinge in raw space before standardization ---
     // This preserves the special meaning of zero (hull boundary)
@@ -728,6 +721,7 @@ pub fn build_calibrator_design(
 
     // Build spline bases using mid-quantile knots for even coverage of the data
     fn make_midquantile_knots(
+        block_label: &str,
         vals_std: &Array1<f64>,
         degree: usize,
         target_internal: usize,
@@ -749,10 +743,12 @@ pub fn build_calibrator_design(
         // Check if we're reducing knots; if so, issue a warning but don't fail
         if m < k.saturating_sub(degree + 1) {
             eprintln!(
-                "[CAL] Warning: Requested {} basis functions which would require {} internal knots, but using max of {}",
+                "[CAL][WARN] block={} reason=knot_request_capped action=reduce_internal_knots requested={} needed={} cap={} degree={}",
+                block_label,
                 k,
                 k.saturating_sub(degree + 1),
-                max_internal
+                max_internal,
+                degree
             );
         }
 
@@ -768,15 +764,18 @@ pub fn build_calibrator_design(
             for _ in 0..(degree + 1) {
                 knots.push(right);
             }
-            eprintln!("[CAL] Warning: creating dummy knots with empty data");
+            eprintln!(
+                "[CAL][WARN] block={} reason=knot_empty_data action=create_dummy_boundary_knots degree={} left={:.3e} right={:.3e}",
+                block_label, degree, left, right
+            );
             return A1::from(knots);
         }
 
         if n < degree + 1 {
             // Not enough data points for this degree, but we still create valid boundary knots
             eprintln!(
-                "[CAL] Warning: not enough data points ({}) for spline degree {}",
-                n, degree
+                "[CAL][WARN] block={} reason=knot_insufficient_data action=use_boundary_knots n={} degree={}",
+                block_label, n, degree
             );
             // Find min/max with guards against NaN/infinity
             let mut min_val = f64::INFINITY;
@@ -790,7 +789,10 @@ pub fn build_calibrator_design(
 
             // If we couldn't find valid min/max, use defaults
             if !min_val.is_finite() || !max_val.is_finite() || min_val >= max_val {
-                eprintln!("[CAL] Warning: invalid data range, using defaults");
+                eprintln!(
+                    "[CAL][WARN] block={} reason=knot_invalid_range action=use_default_bounds degree={} left={:.3e} right={:.3e}",
+                    block_label, degree, -1.0, 1.0
+                );
                 min_val = -1.0;
                 max_val = 1.0;
             }
@@ -815,9 +817,12 @@ pub fn build_calibrator_design(
 
         // If no valid values, fall back to defaults
         if v.is_empty() {
-            eprintln!("[CAL] Warning: no finite values for knot placement");
             let left = -1.0;
             let right = 1.0;
+            eprintln!(
+                "[CAL][WARN] block={} reason=knot_no_finite_values action=use_default_bounds degree={} left={:.3e} right={:.3e}",
+                block_label, degree, left, right
+            );
             let mut knots = Vec::with_capacity(2 * (degree + 1));
             for _ in 0..(degree + 1) {
                 knots.push(left);
@@ -875,8 +880,10 @@ pub fn build_calibrator_design(
         // If we lost too many knots to deduplication, log a warning
         if unique_internal.len() < internal.len() * 3 / 4 {
             eprintln!(
-                "[CAL] Warning: removed {} duplicate knots",
-                internal.len() - unique_internal.len()
+                "[CAL][WARN] block={} reason=knot_duplicates_removed action=dedup_internal_knots removed={} kept={}",
+                block_label,
+                internal.len() - unique_internal.len(),
+                unique_internal.len()
             );
         }
 
@@ -910,8 +917,8 @@ pub fn build_calibrator_design(
         if h < 1e-6_f64 * range || !h.is_finite() {
             h = 0.25 * range;
             eprintln!(
-                "[CAL] Warning: knot spacing too small or invalid, using artificial spacing h={:.4e}",
-                h
+                "[CAL][WARN] block={} reason=knot_spacing_too_small action=use_artificial_spacing degree={} h={:.4e} range={:.4e}",
+                block_label, degree, h, range
             );
         }
 
@@ -930,7 +937,10 @@ pub fn build_calibrator_design(
 
         // Final check for the range of all knots
         if (right - left) < 1e-6_f64 * range {
-            eprintln!("[CAL] Warning: knot range too small, expanding");
+            eprintln!(
+                "[CAL][WARN] block={} reason=knot_range_too_small action=expand_boundary_range left={:.4e} right={:.4e} range={:.4e}",
+                block_label, left, right, range
+            );
             let mid = (left + right) / 2.0;
             let new_half_range = 0.5 * range;
             let new_left = mid - new_half_range;
@@ -968,11 +978,24 @@ pub fn build_calibrator_design(
 
     // Create knots at mid-quantiles (half-step) on each calibrator axis
     // This creates a principled placement that's dependent only on the data distribution
-    let knots_pred =
-        make_midquantile_knots(&pred_std, spec.pred_basis.degree, pred_knots, 3, usize::MAX);
-    let knots_se = make_midquantile_knots(&se_std, spec.se_basis.degree, se_knots, 3, usize::MAX);
-    let knots_dist_generated =
-        make_midquantile_knots(&dist_std, spec.dist_basis.degree, dist_knots, 3, usize::MAX);
+    let knots_pred = make_midquantile_knots(
+        "pred",
+        &pred_std,
+        spec.pred_basis.degree,
+        pred_knots,
+        3,
+        usize::MAX,
+    );
+    let knots_se =
+        make_midquantile_knots("se", &se_std, spec.se_basis.degree, se_knots, 3, usize::MAX);
+    let knots_dist_generated = make_midquantile_knots(
+        "dist",
+        &dist_std,
+        spec.dist_basis.degree,
+        dist_knots,
+        3,
+        usize::MAX,
+    );
 
     let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
         pred_std.view(),
@@ -998,6 +1021,14 @@ pub fn build_calibrator_design(
     // Build the constraint directions for the predictor smooth: remove the polynomial nullspace
     // so the remaining columns are pure wiggles.
     let (mut b_pred_c, mut pred_constraint) = if pred_is_const {
+        eprintln!(
+            "[CAL][WARN] block=pred reason=predictor_constant_after_standardization action=drop_block raw_std={:.3e} raw_cols={} degree={} knots={} penalty_order={}",
+            pred_std_raw,
+            b_pred_raw.ncols(),
+            spec.pred_basis.degree,
+            knots_pred.len(),
+            spec.penalty_order_pred
+        );
         (
             Array2::<f64>::zeros((n, 0)),
             Array2::<f64>::zeros((b_pred_raw.ncols(), 0)),
@@ -1009,7 +1040,11 @@ pub fn build_calibrator_design(
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
-                    "[CAL] pred basis fully constrained by polynomial nullspace; increase knots/degree for wiggles"
+                    "[CAL][WARN] block=pred reason=nullspace_consumes_basis action=drop_block constraint_order={} raw_cols={} degree={} knots={}",
+                    constraint_order,
+                    b_pred_raw.ncols(),
+                    spec.pred_basis.degree,
+                    knots_pred.len()
                 );
                 (
                     Array2::<f64>::zeros((n, 0)),
@@ -1028,7 +1063,15 @@ pub fn build_calibrator_design(
     let mu_se = 0.0;
 
     let (mut b_se_c, mut stz_se) = if se_linear_fallback {
-        eprintln!("[CAL] Dropping se block due to linear fallback (wiggle-only policy)");
+        eprintln!(
+            "[CAL][WARN] block=se reason=linear_fallback_triggered action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
+            se_std_raw,
+            se_raw_cols,
+            spec.se_basis.degree,
+            knots_se.len(),
+            spec.penalty_order_se,
+            w_for_stz.is_some()
+        );
         (
             Array2::<f64>::zeros((n, 0)),
             Array2::<f64>::zeros((se_raw_cols, 0)),
@@ -1040,7 +1083,11 @@ pub fn build_calibrator_design(
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
-                    "[CAL] se basis fully constrained by polynomial nullspace; dropping block"
+                    "[CAL][WARN] block=se reason=nullspace_consumes_basis action=drop_block constraint_order={} raw_cols={} degree={} knots={}",
+                    constraint_order,
+                    b_se_raw.ncols(),
+                    spec.se_basis.degree,
+                    knots_se.len()
                 );
                 (
                     Array2::<f64>::zeros((n, 0)),
@@ -1059,9 +1106,46 @@ pub fn build_calibrator_design(
     let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
     let mu_dist = 0.0;
 
+    let dist_expected_raw_cols = knots_dist_generated
+        .len()
+        .saturating_sub(spec.dist_basis.degree + 1);
     let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _) = if use_linear_dist {
-        if !dist_all_zero {
-            eprintln!("[CAL] Dropping dist block due to linear fallback (wiggle-only policy)");
+        let raw_cols_warn = if dist_all_zero {
+            0
+        } else {
+            dist_expected_raw_cols
+        };
+        let knots_warn = if dist_all_zero {
+            0
+        } else {
+            knots_dist_generated.len()
+        };
+        if dist_all_zero {
+            eprintln!(
+                "[CAL][WARN] block=dist reason=all_zero_after_hinge action=drop_block std_before={:.3e} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2} hinge={} raw_cols={} degree={} knots={} penalty_order={}",
+                dist_std_raw,
+                100.0 * zeros_frac,
+                100.0 * pos_frac,
+                unique_frac,
+                spec.distance_hinge,
+                raw_cols_warn,
+                spec.dist_basis.degree,
+                knots_warn,
+                spec.penalty_order_dist
+            );
+        } else {
+            eprintln!(
+                "[CAL][WARN] block=dist reason=linear_fallback_triggered action=drop_block_wiggle_only std_before={:.3e} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2} hinge={} raw_cols={} degree={} knots={} penalty_order={}",
+                dist_std_raw,
+                100.0 * zeros_frac,
+                100.0 * pos_frac,
+                unique_frac,
+                spec.distance_hinge,
+                raw_cols_warn,
+                spec.dist_basis.degree,
+                knots_warn,
+                spec.penalty_order_dist
+            );
         }
         let b = Array2::<f64>::zeros((n, 0));
         let stz = Array2::<f64>::zeros((0, 0));
@@ -1090,7 +1174,11 @@ pub fn build_calibrator_design(
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
-                    "[CAL] dist basis fully constrained by polynomial nullspace; dropping block"
+                    "[CAL][WARN] block=dist reason=nullspace_consumes_basis action=drop_block constraint_order={} raw_cols={} degree={} knots={}",
+                    constraint_order,
+                    b_dist_raw.ncols(),
+                    spec.dist_basis.degree,
+                    knots_dist_generated.len()
                 );
                 (
                     Array2::<f64>::zeros((n, 0)),
@@ -1101,7 +1189,13 @@ pub fn build_calibrator_design(
         };
         let s_dist_raw0 =
             create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
-        (b_dist_c, stz_dist, knots_dist_generated, s_dist_raw0, dist_raw_cols)
+        (
+            b_dist_c,
+            stz_dist,
+            knots_dist_generated,
+            s_dist_raw0,
+            dist_raw_cols,
+        )
     };
 
     prune_near_zero_columns(&mut b_dist_c, &mut stz_dist, "dist");
@@ -1227,6 +1321,19 @@ pub fn build_calibrator_design(
         "[CAL] pred block orthogonalized against polynomial nullspace; cols={}",
         b_pred_c.ncols()
     );
+    if b_pred_c.ncols() == 0 && b_se_c.ncols() == 0 && b_dist_c.ncols() == 0 {
+        eprintln!(
+            "[CAL][WARN] block=summary reason=all_axes_frozen action=proceed_no_random_effects x_p={} note=\"calibrator reduces to identity+offset\"",
+            x.ncols()
+        );
+    } else if b_pred_c.ncols() == 0 || b_se_c.ncols() == 0 || b_dist_c.ncols() == 0 {
+        eprintln!(
+            "[CAL][WARN] block=summary reason=one_or_more_axes_frozen action=proceed pred_cols={} se_cols={} dist_cols={}",
+            b_pred_c.ncols(),
+            b_se_c.ncols(),
+            b_dist_c.ncols()
+        );
+    }
     // Create ranges for column spans
     let pred_range = pred_off..(pred_off + b_pred_c.ncols());
     let se_range = se_off..(se_off + b_se_c.ncols());
@@ -1306,6 +1413,21 @@ pub fn predict_calibrator(
     let n_pred_cols = pred_range.end - pred_range.start;
     let n_se_cols = se_range.end - se_range.start;
     let n_dist_cols = dist_range.end - dist_range.start;
+    let warn_variation_threshold = 1e-6_f64;
+    let max_abs_std_se = se_std.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    if n_se_cols == 0 && max_abs_std_se > warn_variation_threshold {
+        eprintln!(
+            "[CAL][WARN] block=se reason=axis_frozen_but_input_varies action=no_effect_on_eta max_abs_std_input={:.3e}",
+            max_abs_std_se
+        );
+    }
+    let any_positive_after_hinge =
+        model.spec.distance_hinge && dist_hinged.iter().any(|&v| v > warn_variation_threshold);
+    if n_dist_cols == 0 && any_positive_after_hinge {
+        eprintln!(
+            "[CAL][WARN] block=dist reason=axis_frozen_but_hinge_active action=no_effect_on_eta any_positive_after_hinge=true"
+        );
+    }
     let b_pred = if n_pred_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
@@ -1420,10 +1542,7 @@ pub fn fit_calibrator(
     link: LinkFunction,
 ) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
     // Row-shape sanity checks
-    if !(y.len() == prior_weights.len()
-        && y.len() == x.nrows()
-        && y.len() == offset.len())
-    {
+    if !(y.len() == prior_weights.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
             "Row mismatch: y={}, w={}, X.rows={}, offset={}",
             y.len(),
@@ -1508,6 +1627,26 @@ pub fn fit_calibrator(
         "[CAL] edf: pred={:.2}, se={:.2}, dist={:.2}, total={:.2}, scale={:.3e}",
         edf_pred, edf_se, edf_dist, res.edf_total, res.scale
     );
+    let penalty_freeze_edf_threshold = 1e-3_f64;
+    let penalty_freeze_lambda_threshold = 1e8_f64;
+    if edf_pred < penalty_freeze_edf_threshold || lambdas_arr[0] > penalty_freeze_lambda_threshold {
+        eprintln!(
+            "[CAL][WARN] block=pred reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
+            edf_pred, lambdas_arr[0]
+        );
+    }
+    if edf_se < penalty_freeze_edf_threshold || lambdas_arr[1] > penalty_freeze_lambda_threshold {
+        eprintln!(
+            "[CAL][WARN] block=se reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
+            edf_se, lambdas_arr[1]
+        );
+    }
+    if edf_dist < penalty_freeze_edf_threshold || lambdas_arr[2] > penalty_freeze_lambda_threshold {
+        eprintln!(
+            "[CAL][WARN] block=dist reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
+            edf_dist, lambdas_arr[2]
+        );
+    }
     Ok((
         beta,
         lambdas_arr,
@@ -3689,7 +3828,8 @@ mod tests {
         };
 
         // Build design
-        let (design_x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
+        let (design_x, penalties, schema, offset) =
+            build_calibrator_design(&features, &spec).unwrap();
         // Use uniform weights
         let w = Array1::<f64>::ones(n);
 
@@ -4379,7 +4519,8 @@ mod tests {
             prior_weights: None,
         };
 
-        let (x_cal, penalties, schema, offset) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4707,13 +4848,11 @@ mod tests {
             "Distance block should contribute no columns when fallback triggers",
         );
         assert_eq!(
-            schema.se_center_offset,
-            0.0,
+            schema.se_center_offset, 0.0,
             "SE center offset should be zero under wiggle-only fallback",
         );
         assert_eq!(
-            schema.dist_center_offset,
-            0.0,
+            schema.dist_center_offset, 0.0,
             "Distance center offset should be zero under wiggle-only fallback",
         );
         assert_eq!(
@@ -5607,7 +5746,8 @@ mod tests {
 
         // Time the design matrix construction
         let design_start = Instant::now();
-        let (x_cal, penalties, schema, offset) = build_calibrator_design(&alo_features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
         let design_time = design_start.elapsed();
 
         eprintln!(
@@ -6010,8 +6150,12 @@ mod tests {
 
         // Compute hat diagonals and both SE conventions for a few observations
         println!("\nALO weighting convention test:");
-        println!("| i | orig_w | final_w | a_ii | 1-a_ii | var_full | SE_full | SE_loo | Ratio (loo/full) |");
-        println!("|---|--------|---------|------|--------|----------|---------|--------|------------------|");
+        println!(
+            "| i | orig_w | final_w | a_ii | 1-a_ii | var_full | SE_full | SE_loo | Ratio (loo/full) |"
+        );
+        println!(
+            "|---|--------|---------|------|--------|----------|---------|--------|------------------|"
+        );
 
         let xtwx = u.t().dot(&u);
         let mut hat_diagonals = Vec::with_capacity(n);
@@ -6293,8 +6437,7 @@ mod tests {
                 .map(|(&x, &w)| x * w)
                 .sum::<f64>()
                 / w_sum;
-            max_abs_col_mean_nonuniform =
-                max_abs_col_mean_nonuniform.max(weighted_mean.abs());
+            max_abs_col_mean_nonuniform = max_abs_col_mean_nonuniform.max(weighted_mean.abs());
         }
 
         assert!(

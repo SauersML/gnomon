@@ -709,9 +709,7 @@ pub fn train_model(
         // helpful warning and extract `last_solution` (the best result found before
         // failure), allowing the program to continue.
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            eprintln!(
-                "[INFO] Line search stopped early; using best-so-far parameters."
-            );
+            eprintln!("[INFO] Line search stopped early; using best-so-far parameters.");
             *last_solution
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
@@ -2624,8 +2622,7 @@ pub mod internal {
 
                         // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
                         let nullspace_dim = self.nullspace_dims.get(k).copied().unwrap_or(0);
-                        let log_det_s_grad_term =
-                            0.5 * det1_full[k] - 0.5 * nullspace_dim as f64;
+                        let log_det_s_grad_term = 0.5 * det1_full[k] - 0.5 * nullspace_dim as f64;
 
                         // (3) Numerical derivative of penalized log-likelihood part
                         let pll_grad_term = g_pll[k];
@@ -6483,17 +6480,17 @@ mod optimizer_progress_tests {
         };
 
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
-    let (x_matrix, s_list, layout, _, _, _, _, _, _) =
-        build_design_and_penalty_matrices(&data, &config)?;
-    let reml_state = internal::RemlState::new(
-        data.y.view(),
-        x_matrix.view(),
-        data.weights.view(),
-        s_list,
-        &layout,
-        &config,
-        None,
-    )?;
+        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            build_design_and_penalty_matrices(&data, &config)?;
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x_matrix.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+            None,
+        )?;
 
         // Stage: Compute the initial cost at the same rho used by train_model
         assert!(
@@ -6594,16 +6591,16 @@ mod reparam_consistency_tests {
             return;
         }
 
-    let reml_state = internal::RemlState::new(
-        data.y.view(),
-        x.view(),
-        data.weights.view(),
-        s_list,
-        &layout,
-        &config,
-        None,
-    )
-    .expect("RemlState");
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+            None,
+        )
+        .expect("RemlState");
 
         // Stage: Sample a moderate random rho in [-1, 1]
         let k = layout.num_penalties;
@@ -6755,16 +6752,16 @@ mod gradient_validation_tests {
             "Model must have at least one penalty"
         );
 
-    let reml_state = internal::RemlState::new(
-        data.y.view(),
-        x.view(),
-        data.weights.view(),
-        s_list,
-        &layout,
-        &config,
-        None,
-    )
-    .expect("state");
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x.view(),
+            data.weights.view(),
+            s_list,
+            &layout,
+            &config,
+            None,
+        )
+        .expect("state");
 
         // Stage: Use a larger step size for the numerical gradient
 
