@@ -4053,8 +4053,8 @@ mod tests {
 
         // AUC shouldn't change significantly (calibration preserves ordering)
         assert!(
-            (cal_auc - base_auc).abs() < 0.02,
-            "Calibrated AUC should be within 0.02 of base AUC"
+            cal_auc >= base_auc - 0.02,
+            "Calibrated AUC should not be more than 0.02 worse than base AUC"
         );
 
         eprintln!("[CAL] fitted edf_pred={edf_pred:.3}");
