@@ -3971,6 +3971,169 @@ mod tests {
     }
 
     #[test]
+    fn calibrator_improves_more_for_large_miscalibration_binary() {
+        let n = 800;
+        let p = 5;
+
+        // We don't need the generated data directly, but calling this helper keeps RNG usage consistent
+        generate_synthetic_binary_data(n, p, Some(4242));
+
+        // Base (well-calibrated) logits sweep from -2 to 2
+        let eta = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 4.0 - 2.0).collect());
+
+        // True probabilities and corresponding sampled outcomes
+        let true_probs = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        let mut rng = StdRng::seed_from_u64(4242);
+        let mut y = Array1::zeros(n);
+        for i in 0..n {
+            let dist = Bernoulli::new(true_probs[i]).unwrap();
+            y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
+        }
+
+        let w = Array1::<f64>::ones(n);
+
+        let spec = CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: BasisConfig {
+                degree: 3,
+                num_knots: 10,
+            },
+            se_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            distance_hinge: false,
+            prior_weights: None,
+        };
+
+        let ece_improvement_for_amplitude = |amplitude: f64| -> f64 {
+            let distorted_eta = add_sinusoidal_miscalibration(&eta, amplitude, 1.0);
+            let base_probs = distorted_eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+
+            let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_eta[i]);
+            let base_fit = simple_pirls_fit(&fake_x, &y, &w, LinkFunction::Logit).unwrap();
+
+            let mut alo_features = compute_alo_features(
+                &base_fit,
+                y.view(),
+                fake_x.view(),
+                None,
+                LinkFunction::Logit,
+            )
+            .unwrap();
+
+            // Preserve the miscalibrated base logits as the identity backbone
+            alo_features.pred_identity = distorted_eta.clone();
+
+            let (x_cal, penalties, schema, offset) =
+                build_calibrator_design(&alo_features, &spec).unwrap();
+
+            let penalty_nullspace_dims = [
+                schema.penalty_nullspace_dims.0,
+                schema.penalty_nullspace_dims.1,
+                schema.penalty_nullspace_dims.2,
+            ];
+
+            let fit_result = fit_calibrator(
+                y.view(),
+                w.view(),
+                x_cal.view(),
+                offset.view(),
+                &penalties,
+                &penalty_nullspace_dims,
+                LinkFunction::Logit,
+            )
+            .unwrap();
+
+            let (beta, lambdas, _, _, _) = fit_result;
+
+            let cal_model = CalibratorModel {
+                spec: spec.clone(),
+                knots_pred: schema.knots_pred,
+                knots_se: schema.knots_se,
+                knots_dist: schema.knots_dist,
+                pred_constraint_transform: schema.pred_constraint_transform,
+                stz_se: schema.stz_se,
+                stz_dist: schema.stz_dist,
+                penalty_nullspace_dims: schema.penalty_nullspace_dims,
+                standardize_pred: schema.standardize_pred,
+                standardize_se: schema.standardize_se,
+                standardize_dist: schema.standardize_dist,
+                se_linear_fallback: schema.se_linear_fallback,
+                dist_linear_fallback: schema.dist_linear_fallback,
+                se_center_offset: schema.se_center_offset,
+                dist_center_offset: schema.dist_center_offset,
+                lambda_pred: lambdas[0],
+                lambda_se: lambdas[1],
+                lambda_dist: lambdas[2],
+                coefficients: beta,
+                column_spans: schema.column_spans,
+                scale: None,
+            };
+
+            let cal_probs = predict_calibrator(
+                &cal_model,
+                alo_features.pred_identity.view(),
+                alo_features.se.view(),
+                alo_features.dist.view(),
+            )
+            .unwrap();
+
+            let base_ece = ece(&y, &base_probs, 50);
+            let cal_ece = ece(&y, &cal_probs, 50);
+
+            let base_rmse = {
+                let mse = base_probs
+                    .iter()
+                    .zip(true_probs.iter())
+                    .map(|(p, t)| {
+                        let diff = p - t;
+                        diff * diff
+                    })
+                    .sum::<f64>()
+                    / (n as f64);
+                mse.sqrt()
+            };
+
+            let cal_rmse = {
+                let mse = cal_probs
+                    .iter()
+                    .zip(true_probs.iter())
+                    .map(|(p, t)| {
+                        let diff = p - t;
+                        diff * diff
+                    })
+                    .sum::<f64>()
+                    / (n as f64);
+                mse.sqrt()
+            };
+
+            println!(
+                "[amp {amplitude:.2}] base ECE={base_ece:.6}, cal ECE={cal_ece:.6}, base RMSE={base_rmse:.6}, cal RMSE={cal_rmse:.6}"
+            );
+
+            base_ece - cal_ece
+        };
+
+        let small_improvement = ece_improvement_for_amplitude(0.05);
+        let large_improvement = ece_improvement_for_amplitude(2.0);
+
+        assert!(
+            large_improvement >= small_improvement + 0.05,
+            "Expected larger miscalibration to benefit more: large ΔECE = {:.4}, small ΔECE = {:.4}",
+            large_improvement,
+            small_improvement
+        );
+    }
+
+    #[test]
     fn calibrator_does_no_harm_when_perfectly_calibrated() {
         // Create perfectly calibrated data
         let n = 300;
