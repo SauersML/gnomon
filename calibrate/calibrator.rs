@@ -1474,6 +1474,20 @@ pub fn fit_calibrator(
     penalty_nullspace_dims: &[usize],
     link: LinkFunction,
 ) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
+    // Row-shape sanity checks
+    if !(y.len() == prior_weights.len()
+        && y.len() == x.nrows()
+        && y.len() == offset.len())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            prior_weights.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+
     let opts = ExternalOptimOptions {
         link,
         max_iter: 75,
@@ -3731,13 +3745,12 @@ mod tests {
 
         // Build design
         let (design_x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
-
         // Use uniform weights
         let w = Array1::<f64>::ones(n);
 
         // Create alternative approach that will cause shape mismatch
-        // Create X with wrong shape on purpose to test shape guard
-        let x_wrong_shape = x; // x has shape (n, p) which doesn't match penalties
+        // Drop the last row so X has one fewer observation than y/offset/weights
+        let x_wrong_shape = x.slice(s![..n - 1, ..]).to_owned();
 
         // First verify that correct shape design works
         let penalty_nullspace_dims = [

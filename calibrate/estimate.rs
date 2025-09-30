@@ -1077,6 +1077,16 @@ pub fn optimize_external_design(
     s_list: &[Array2<f64>],
     opts: &ExternalOptimOptions,
 ) -> Result<ExternalOptimResult, EstimationError> {
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+
     use crate::calibrate::construction::compute_penalty_square_roots;
     use crate::calibrate::model::ModelConfig;
 
