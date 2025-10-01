@@ -3,7 +3,6 @@ use crate::calibrate::basis::{
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 #[cfg(test)]
 use crate::calibrate::model::ModelConfig;
@@ -69,10 +68,6 @@ pub struct CalibratorModel {
     // Flag for distance linear fallback when distance range is negligible
     pub dist_linear_fallback: bool,
 
-    // Centering offsets for linear fallbacks
-    pub se_center_offset: f64,   // weighted mean subtracted from se_std
-    pub dist_center_offset: f64, // weighted mean subtracted from dist_std
-
     // Fitted lambdas
     pub lambda_pred: f64,
     pub lambda_pred_param: f64,
@@ -105,8 +100,6 @@ pub struct InternalSchema {
     pub standardize_dist: (f64, f64),
     pub se_linear_fallback: bool,
     pub dist_linear_fallback: bool,
-    pub se_center_offset: f64,   // weighted mean subtracted from se_std
-    pub dist_center_offset: f64, // weighted mean subtracted from dist_std
     pub penalty_nullspace_dims: (usize, usize, usize, usize),
     pub column_spans: (
         std::ops::Range<usize>,
@@ -1095,11 +1088,6 @@ pub fn build_calibrator_design(
         }
     }
 
-    // For SE, check if we need to use linear fallback first (detected before standardization)
-    // but always ensure it's centered (weighted if weights provided)
-    // Calculate the centering offset once and store it for later use
-    let mu_se = 0.0;
-
     let (mut b_se_c, mut stz_se) = if se_linear_fallback {
         eprintln!(
             "[CAL][WARN] block=se reason=channel_constant_after_standardization action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
@@ -1159,7 +1147,6 @@ pub fn build_calibrator_design(
     // Linear fallback when: low variance or mostly zeros (from hinging)
     // Calculate the distance centering offset first
     let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
-    let mu_dist = 0.0;
 
     let dist_expected_raw_cols = knots_dist_generated
         .len()
@@ -1459,8 +1446,6 @@ pub fn build_calibrator_design(
         standardize_dist: dist_ms,
         se_linear_fallback,
         dist_linear_fallback: use_linear_dist,
-        se_center_offset: mu_se,
-        dist_center_offset: mu_dist,
         penalty_nullspace_dims: (
             pred_null_dim,
             pred_param_null_dim,
@@ -1922,6 +1907,7 @@ pub fn fit_calibrator(
 
 #[cfg(test)]
 mod tests {
+    use crate::calibrate::construction::ModelLayout;
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
     use ndarray::{Array1, Array2, Axis};
@@ -4216,8 +4202,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -4376,8 +4360,6 @@ mod tests {
                 standardize_dist: schema.standardize_dist,
                 se_linear_fallback: schema.se_linear_fallback,
                 dist_linear_fallback: schema.dist_linear_fallback,
-                se_center_offset: schema.se_center_offset,
-                dist_center_offset: schema.dist_center_offset,
                 lambda_pred: lambdas[0],
                 lambda_pred_param: lambdas[1],
                 lambda_se: lambdas[2],
@@ -4541,8 +4523,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -4704,8 +4684,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5027,8 +5005,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5230,14 +5206,6 @@ mod tests {
             "Distance block should contribute no columns when fallback triggers",
         );
         assert_eq!(
-            schema.se_center_offset, 0.0,
-            "SE center offset should be zero under wiggle-only fallback",
-        );
-        assert_eq!(
-            schema.dist_center_offset, 0.0,
-            "Distance center offset should be zero under wiggle-only fallback",
-        );
-        assert_eq!(
             schema.penalty_nullspace_dims,
             (0, 0, 0, 0),
             "All penalty nullspaces should be reported as zero after projection",
@@ -5276,8 +5244,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5389,8 +5355,6 @@ mod tests {
             standardize_dist: schema.standardize_dist,
             se_linear_fallback: schema.se_linear_fallback,
             dist_linear_fallback: schema.dist_linear_fallback,
-            se_center_offset: schema.se_center_offset,
-            dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
