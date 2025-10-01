@@ -2474,16 +2474,22 @@ pub mod internal {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
-                    // Calculate scale parameter
+                    // Calculate scale parameter.  In the Gaussian/REML case we *profile* the
+                    // scale (φ) by plugging in φ̂(ρ) = D_p /(n - EDF); that is exactly what mgcv
+                    // does before evaluating the gradient.
                     let rss = pirls_result.deviance;
 
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
-                    let dp = rss + penalty; // Penalized deviance
+                    let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
 
                     // EDF calculation in transformed basis using shared helper
                     let factor_g = self.get_faer_factor(p, hessian);
                     let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, hessian)?;
+                    // Because φ has been profiled out, the envelope theorem tells us that the
+                    // derivative of the profiled objective with respect to ρ is given by the
+                    // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
+                    // propagated below—exactly mirroring mgcv’s REML gradient implementation.
                     let scale = dp / (n - edf).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
@@ -2511,8 +2517,10 @@ pub mod internal {
 
                         // ---
                         // Component 1: Derivative of the Penalized Deviance
-                        // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term
-                        // R/C Counterpart: `oo$D1/(2*scale*gamma)`
+                        // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
+                        // φ is treated as fixed at φ̂ when taking the derivative, so there is no hidden
+                        // dφ/dρ contribution.  This matches Wood (2011) and mgcv’s
+                        // `REML1 <- oo$D1/(2*scale*gamma)` expression.
                         // ---
 
                         let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
@@ -2542,6 +2550,9 @@ pub mod internal {
                         // This calculation now DIRECTLY AND LITERALLY matches the formula for `REML1`
                         // in `gam.fit3.R`, which is the gradient of the cost function that `newton` MINIMIZES.
                         // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`
+                        // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
+                        // the gradient already accounts for the changing scale; adding dφ/dρ here would
+                        // double-count the effect and contradict the envelope theorem.
                         // ---
                         cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
                                          + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
