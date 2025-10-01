@@ -920,6 +920,7 @@ pub fn train_model(
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ];
             let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
                 reml_state.y(),
@@ -935,13 +936,15 @@ pub fn train_model(
             })?;
 
             eprintln!(
-                "[CAL] Done. lambdas: pred={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, se={:.2}, dist={:.2}{}",
+                "[CAL] Done. lambdas: pred={:.3e}, pred_param={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}{}",
                 lambdas_cal[0],
                 lambdas_cal[1],
                 lambdas_cal[2],
+                lambdas_cal[3],
                 edf_pair.0,
                 edf_pair.1,
                 edf_pair.2,
+                edf_pair.3,
                 if config.link_function == LinkFunction::Identity {
                     format!("; scale={:.3e}", scale_cal)
                 } else {
@@ -969,10 +972,12 @@ pub fn train_model(
                 se_center_offset: schema.se_center_offset,
                 dist_center_offset: schema.dist_center_offset,
                 lambda_pred: lambdas_cal[0],
-                lambda_se: lambdas_cal[1],
-                lambda_dist: lambdas_cal[2],
+                lambda_pred_param: lambdas_cal[1],
+                lambda_se: lambdas_cal[2],
+                lambda_dist: lambdas_cal[3],
                 coefficients: beta_cal,
                 column_spans: schema.column_spans,
+                pred_param_range: schema.pred_param_range.clone(),
                 scale: if config.link_function == LinkFunction::Identity {
                     Some(scale_cal)
                 } else {
@@ -991,21 +996,23 @@ pub fn train_model(
             let m_dist_int =
                 (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
             let rho_pred = model.lambda_pred.ln();
+            let rho_pred_param = model.lambda_pred_param.ln();
             let rho_se = model.lambda_se.ln();
             let rho_dist = model.lambda_dist.ln();
             println!(
                 concat!(
                     "[CAL][train] summary:\n",
-                    "  design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}\n",
+                    "  design: n={}, p={}, pred_wiggle_cols={}, pred_param_cols={}, se_cols={}, dist_cols={}\n",
                     "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
                     "  penalty: order_pred={}, order_se={}, order_dist={}\n",
-                    "  lambdas: pred={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
-                    "  edf:     pred={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
+                    "  lambdas: pred={:.3e} (rho={:.3}), pred_param={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
+                    "  edf:     pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
                     "  opt:     iterations={}, final_grad_norm={:.3e}"
                 ),
                 x_cal.nrows(),
                 x_cal.ncols(),
                 model.column_spans.0.len(),
+                model.pred_param_range.len(),
                 model.column_spans.1.len(),
                 model.column_spans.2.len(),
                 deg_pred,
@@ -1019,6 +1026,8 @@ pub fn train_model(
                 spec.penalty_order_dist,
                 model.lambda_pred,
                 rho_pred,
+                model.lambda_pred_param,
+                rho_pred_param,
                 model.lambda_se,
                 rho_se,
                 model.lambda_dist,
@@ -1026,7 +1035,8 @@ pub fn train_model(
                 edf_pair.0,
                 edf_pair.1,
                 edf_pair.2,
-                (edf_pair.0 + edf_pair.1 + edf_pair.2),
+                edf_pair.3,
+                (edf_pair.0 + edf_pair.1 + edf_pair.2 + edf_pair.3),
                 fit_meta.0,
                 fit_meta.1
             );

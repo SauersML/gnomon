@@ -57,7 +57,7 @@ pub struct CalibratorModel {
     pub pred_constraint_transform: Array2<f64>,
     pub stz_se: Array2<f64>,
     pub stz_dist: Array2<f64>,
-    pub penalty_nullspace_dims: (usize, usize, usize),
+    pub penalty_nullspace_dims: (usize, usize, usize, usize),
 
     // Standardization parameters for inputs
     pub standardize_pred: (f64, f64), // mean, std
@@ -76,6 +76,7 @@ pub struct CalibratorModel {
 
     // Fitted lambdas
     pub lambda_pred: f64,
+    pub lambda_pred_param: f64,
     pub lambda_se: f64,
     pub lambda_dist: f64,
 
@@ -85,7 +86,8 @@ pub struct CalibratorModel {
         std::ops::Range<usize>,
         std::ops::Range<usize>,
         std::ops::Range<usize>,
-    ), // ranges for pred, se, dist
+    ), // ranges for pred wiggle, se, dist
+    pub pred_param_range: std::ops::Range<usize>,
 
     // Optional Gaussian scale
     pub scale: Option<f64>,
@@ -106,12 +108,13 @@ pub struct InternalSchema {
     pub dist_linear_fallback: bool,
     pub se_center_offset: f64,   // weighted mean subtracted from se_std
     pub dist_center_offset: f64, // weighted mean subtracted from dist_std
-    pub penalty_nullspace_dims: (usize, usize, usize),
+    pub penalty_nullspace_dims: (usize, usize, usize, usize),
     pub column_spans: (
         std::ops::Range<usize>,
         std::ops::Range<usize>,
         std::ops::Range<usize>,
     ),
+    pub pred_param_range: std::ops::Range<usize>,
 }
 
 /// Compute ALO features (η̃/μ̃, SẼ, signed distance) from a single base fit
@@ -617,6 +620,12 @@ pub fn build_calibrator_design(
     // --- Check SE variability BEFORE standardization ---
     // Detect near-constant SE values that would lead to numerical issues
     let se_linear_fallback = se_std_raw < 1e-8_f64;
+    if se_linear_fallback {
+        eprintln!(
+            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=linear_fallback raw_std={:.3e}",
+            se_std_raw
+        );
+    }
 
     // --- Apply distance hinge in raw space before standardization ---
     // This preserves the special meaning of zero (hull boundary)
@@ -683,6 +692,18 @@ pub fn build_calibrator_design(
     };
 
     // Analyze the patterns to make an informed decision
+    let dist_near_constant = dist_std_raw < 1e-8_f64;
+    if dist_near_constant {
+        eprintln!(
+            "[CAL][WARN] block=dist reason=channel_constant_after_standardization action=linear_fallback_candidate raw_std={:.3e} hinge={} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2}",
+            dist_std_raw,
+            spec.distance_hinge,
+            100.0 * zeros_frac,
+            100.0 * pos_frac,
+            unique_frac
+        );
+    }
+
     let use_linear_dist =
         // Basic criteria:
         dist_std_raw < 1e-6_f64 ||                  // Low variance
@@ -1023,6 +1044,7 @@ pub fn build_calibrator_design(
 
     // Build the constraint directions for the predictor smooth: remove the polynomial nullspace
     // so the remaining columns are pure wiggles.
+    let mut pred_constraint_order = 0usize;
     let (mut b_pred_c, mut pred_constraint) = if pred_is_const {
         eprintln!(
             "[CAL][WARN] block=pred reason=predictor_constant_after_standardization action=drop_block raw_std={:.3e} raw_cols={} degree={} knots={} penalty_order={}",
@@ -1037,14 +1059,14 @@ pub fn build_calibrator_design(
             Array2::<f64>::zeros((b_pred_raw.ncols(), 0)),
         )
     } else {
-        let constraint_order = spec.penalty_order_pred.min(pred_raw_cols);
-        let z_pred = polynomial_constraint_matrix(&pred_std, constraint_order);
+        pred_constraint_order = spec.penalty_order_pred.min(pred_raw_cols);
+        let z_pred = polynomial_constraint_matrix(&pred_std, pred_constraint_order);
         match apply_weighted_orthogonality_constraint(b_pred_raw.view(), z_pred.view(), w_for_stz) {
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
                     "[CAL][WARN] block=pred reason=nullspace_consumes_basis action=drop_block constraint_order={} raw_cols={} degree={} knots={}",
-                    constraint_order,
+                    pred_constraint_order,
                     b_pred_raw.ncols(),
                     spec.pred_basis.degree,
                     knots_pred.len()
@@ -1060,6 +1082,20 @@ pub fn build_calibrator_design(
 
     prune_near_zero_columns(&mut b_pred_c, &mut pred_constraint, "pred");
 
+    let mut b_pred_param = Array2::<f64>::zeros((n, 0));
+    if !pred_is_const {
+        let param_dim = pred_constraint_order.min(2);
+        if param_dim > 0 {
+            b_pred_param = Array2::<f64>::zeros((n, param_dim));
+            b_pred_param.column_mut(0).fill(1.0);
+            if param_dim > 1 {
+                b_pred_param
+                    .column_mut(1)
+                    .assign(&features.pred_identity);
+            }
+        }
+    }
+
     // For SE, check if we need to use linear fallback first (detected before standardization)
     // but always ensure it's centered (weighted if weights provided)
     // Calculate the centering offset once and store it for later use
@@ -1067,7 +1103,7 @@ pub fn build_calibrator_design(
 
     let (mut b_se_c, mut stz_se) = if se_linear_fallback {
         eprintln!(
-            "[CAL][WARN] block=se reason=linear_fallback_triggered action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
+            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
             se_std_raw,
             se_raw_cols,
             spec.se_basis.degree,
@@ -1138,7 +1174,12 @@ pub fn build_calibrator_design(
             );
         } else {
             eprintln!(
-                "[CAL][WARN] block=dist reason=linear_fallback_triggered action=drop_block_wiggle_only std_before={:.3e} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2} hinge={} raw_cols={} degree={} knots={} penalty_order={}",
+                "[CAL][WARN] block=dist reason={} action=drop_block_wiggle_only std_before={:.3e} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2} hinge={} raw_cols={} degree={} knots={} penalty_order={}",
+                if dist_near_constant {
+                    "channel_constant_after_standardization"
+                } else {
+                    "linear_fallback_triggered"
+                },
                 dist_std_raw,
                 100.0 * zeros_frac,
                 100.0 * pos_frac,
@@ -1216,6 +1257,12 @@ pub fn build_calibrator_design(
     };
     // s_dist_raw0 is already created in the if-else block above
 
+    let s_pred_param_raw = if b_pred_param.ncols() > 0 {
+        Array2::<f64>::eye(b_pred_param.ncols())
+    } else {
+        Array2::<f64>::zeros((0, 0))
+    };
+
     // S in constrained coordinates: S_c = T^T S_raw T
     let s_pred_raw = pred_constraint.t().dot(&s_pred_raw0).dot(&pred_constraint);
     let s_se_raw = stz_se.t().dot(&s_se_raw0).dot(&stz_se);
@@ -1234,18 +1281,17 @@ pub fn build_calibrator_design(
 
     // Scale each block in constrained coordinates
     let (s_pred_raw_sc, c_pred) = scale_penalty_to_unit_mean_eig(&s_pred_raw);
+    let (s_pred_param_sc, c_pred_param) = scale_penalty_to_unit_mean_eig(&s_pred_param_raw);
     let (s_se_raw_sc, c_se) = scale_penalty_to_unit_mean_eig(&s_se_raw);
     let (s_dist_raw_sc, c_dist) = scale_penalty_to_unit_mean_eig(&s_dist_raw);
 
     eprintln!(
-        "[CAL] Penalty scaling factors: pred={:.3e}, se={:.3e}, dist={:.3e}",
-        c_pred, c_se, c_dist
+        "[CAL] Penalty scaling factors: pred={:.3e}, pred_param={:.3e}, se={:.3e}, dist={:.3e}",
+        c_pred, c_pred_param, c_se, c_dist
     );
 
-    // After removing the intercept and slope directions from the predictor block,
-    // the ordinary roughness penalties are sufficient.  The linear nullspaces are
-    // no longer present, so no extra shrinkage or fixed ridges are required.
     let s_pred = s_pred_raw_sc;
+    let s_pred_param = s_pred_param_sc;
     let s_se = s_se_raw_sc;
     let s_dist = s_dist_raw_sc;
 
@@ -1253,17 +1299,22 @@ pub fn build_calibrator_design(
         knots_se = Array1::zeros(0);
     }
 
-    // Assemble X = [B_pred | B_se | B_dist] and keep the identity backbone as an offset.
-    // With the {1, η} directions removed from the predictor block, the calibrator can only
-    // add wiggles (no intercept or slope adjustments).
+    // Assemble X = [B_pred_wiggle | B_pred_param | B_se | B_dist] and keep the identity
+    // backbone as an offset.  The wiggle block has the polynomial nullspace removed;
+    // the intercept and slope adjustments live in the param block with their own ridge.
     let pred_off = 0usize;
-    let p_cols = b_pred_c.ncols() + b_se_c.ncols() + b_dist_c.ncols();
+    let pred_param_off = pred_off + b_pred_c.ncols();
+    let p_cols = b_pred_c.ncols() + b_pred_param.ncols() + b_se_c.ncols() + b_dist_c.ncols();
     let mut x = Array2::<f64>::zeros((n, p_cols));
     if b_pred_c.ncols() > 0 {
         x.slice_mut(s![.., pred_off..pred_off + b_pred_c.ncols()])
             .assign(&b_pred_c);
     }
-    let se_off = pred_off + b_pred_c.ncols();
+    if b_pred_param.ncols() > 0 {
+        x.slice_mut(s![.., pred_param_off..pred_param_off + b_pred_param.ncols()])
+            .assign(&b_pred_param);
+    }
+    let se_off = pred_param_off + b_pred_param.ncols();
     if b_se_c.ncols() > 0 {
         x.slice_mut(s![.., se_off..se_off + b_se_c.ncols()])
             .assign(&b_se_c);
@@ -1277,6 +1328,7 @@ pub fn build_calibrator_design(
     // Full penalty matrices aligned to X columns (zeros for unpenalized cols)
     let p = x.ncols();
     let mut s_pred_p = Array2::<f64>::zeros((p, p));
+    let mut s_pred_param_p = Array2::<f64>::zeros((p, p));
     let mut s_se_p = Array2::<f64>::zeros((p, p));
     let mut s_dist_p = Array2::<f64>::zeros((p, p));
     // Place into the appropriate diagonal blocks
@@ -1284,6 +1336,11 @@ pub fn build_calibrator_design(
     for i in 0..b_pred_c.ncols() {
         for j in 0..b_pred_c.ncols() {
             s_pred_p[[pred_off + i, pred_off + j]] = s_pred[[i, j]];
+        }
+    }
+    for i in 0..b_pred_param.ncols() {
+        for j in 0..b_pred_param.ncols() {
+            s_pred_param_p[[pred_param_off + i, pred_param_off + j]] = s_pred_param[[i, j]];
         }
     }
     for i in 0..b_se_c.ncols() {
@@ -1300,7 +1357,7 @@ pub fn build_calibrator_design(
         }
     }
 
-    let penalties = vec![s_pred_p, s_se_p, s_dist_p];
+    let penalties = vec![s_pred_p, s_pred_param_p, s_se_p, s_dist_p];
     // Diagnostics: design summary
     let m_pred_int =
         (knots_pred.len() as isize - 2 * (spec.pred_basis.degree as isize + 1)).max(0) as usize;
@@ -1309,10 +1366,11 @@ pub fn build_calibrator_design(
     let m_dist_int =
         (knots_dist.len() as isize - 2 * (spec.dist_basis.degree as isize + 1)).max(0) as usize;
     eprintln!(
-        "[CAL] design: n={}, p={}, pred_cols={}, se_cols={}, dist_cols={}",
+        "[CAL] design: n={}, p={}, pred_wiggle_cols={}, pred_param_cols={}, se_cols={}, dist_cols={}",
         n,
         x.ncols(),
         b_pred_c.ncols(),
+        b_pred_param.ncols(),
         b_se_c.ncols(),
         b_dist_c.ncols()
     );
@@ -1324,25 +1382,35 @@ pub fn build_calibrator_design(
         "[CAL] pred block orthogonalized against polynomial nullspace; cols={}",
         b_pred_c.ncols()
     );
-    if b_pred_c.ncols() == 0 && b_se_c.ncols() == 0 && b_dist_c.ncols() == 0 {
+    if b_pred_c.ncols() == 0
+        && b_pred_param.ncols() == 0
+        && b_se_c.ncols() == 0
+        && b_dist_c.ncols() == 0
+    {
         eprintln!(
             "[CAL][WARN] block=summary reason=all_axes_frozen action=proceed_no_random_effects x_p={} note=\"calibrator reduces to identity+offset\"",
             x.ncols()
         );
-    } else if b_pred_c.ncols() == 0 || b_se_c.ncols() == 0 || b_dist_c.ncols() == 0 {
+    } else if (b_pred_c.ncols() == 0 && b_pred_param.ncols() == 0)
+        || b_se_c.ncols() == 0
+        || b_dist_c.ncols() == 0
+    {
         eprintln!(
-            "[CAL][WARN] block=summary reason=one_or_more_axes_frozen action=proceed pred_cols={} se_cols={} dist_cols={}",
+            "[CAL][WARN] block=summary reason=one_or_more_axes_frozen action=proceed pred_wiggle_cols={} pred_param_cols={} se_cols={} dist_cols={}",
             b_pred_c.ncols(),
+            b_pred_param.ncols(),
             b_se_c.ncols(),
             b_dist_c.ncols()
         );
     }
     // Create ranges for column spans
     let pred_range = pred_off..(pred_off + b_pred_c.ncols());
+    let pred_param_range = pred_param_off..(pred_param_off + b_pred_param.ncols());
     let se_range = se_off..(se_off + b_se_c.ncols());
     let dist_range = dist_off..(dist_off + b_dist_c.ncols());
 
     let pred_null_dim = 0;
+    let pred_param_null_dim = 0;
     let se_null_dim = 0;
     let dist_null_dim = 0;
 
@@ -1360,8 +1428,14 @@ pub fn build_calibrator_design(
         dist_linear_fallback: use_linear_dist,
         se_center_offset: mu_se,
         dist_center_offset: mu_dist,
-        penalty_nullspace_dims: (pred_null_dim, se_null_dim, dist_null_dim),
+        penalty_nullspace_dims: (
+            pred_null_dim,
+            pred_param_null_dim,
+            se_null_dim,
+            dist_null_dim,
+        ),
         column_spans: (pred_range, se_range, dist_range),
+        pred_param_range,
     };
 
     // Early self-check to ensure built penalties match X width
@@ -1413,7 +1487,9 @@ pub fn predict_calibrator(
     // Build bases using stored knots only when the schema recorded non-empty blocks.
     let n = pred.len();
     let (pred_range, se_range, dist_range) = &model.column_spans;
+    let pred_param_range = &model.pred_param_range;
     let n_pred_cols = pred_range.end - pred_range.start;
+    let n_pred_param_cols = pred_param_range.end - pred_param_range.start;
     let n_se_cols = se_range.end - se_range.start;
     let n_dist_cols = dist_range.end - dist_range.start;
     let warn_variation_threshold = 1e-6_f64;
@@ -1442,6 +1518,17 @@ pub fn predict_calibrator(
         b_pred_raw.dot(&model.pred_constraint_transform)
     };
 
+    let b_pred_param = if n_pred_param_cols == 0 {
+        Array2::<f64>::zeros((n, 0))
+    } else {
+        let mut cols = Array2::<f64>::zeros((n, n_pred_param_cols));
+        cols.column_mut(0).fill(1.0);
+        if n_pred_param_cols > 1 {
+            cols.column_mut(1).assign(&pred);
+        }
+        cols
+    };
+
     let b_se = if n_se_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
@@ -1464,12 +1551,16 @@ pub fn predict_calibrator(
         b_dist_raw.dot(&model.stz_dist)
     };
 
-    // Assemble X = [B_pred | B_se | B_dist]
-    let total_cols = n_pred_cols + n_se_cols + n_dist_cols;
+    // Assemble X = [B_pred_wiggle | B_pred_param | B_se | B_dist]
+    let total_cols = n_pred_cols + n_pred_param_cols + n_se_cols + n_dist_cols;
     let mut x = Array2::<f64>::zeros((n, total_cols));
     if n_pred_cols > 0 {
         x.slice_mut(s![.., pred_range.start..pred_range.end])
             .assign(&b_pred.slice(s![.., ..n_pred_cols]));
+    }
+    if n_pred_param_cols > 0 {
+        x.slice_mut(s![.., pred_param_range.start..pred_param_range.end])
+            .assign(&b_pred_param.slice(s![.., ..n_pred_param_cols]));
     }
     if n_se_cols > 0 {
         let off = se_range.start;
@@ -1531,9 +1622,9 @@ pub fn predict_calibrator(
 ///
 /// Returns:
 /// - `Array1<f64>`: Coefficient vector (beta)
-/// - `[f64; 3]`: Lambda values [pred_lambda, se_lambda, dist_lambda] (complexity parameters)
+/// - `[f64; 4]`: Lambda values [pred_lambda, pred_param_lambda, se_lambda, dist_lambda]
 /// - `f64`: Scale parameter (for Identity link)
-/// - `(f64, f64, f64)`: EDF values for each smooth (pred, se, dist)
+/// - `(f64, f64, f64, f64)`: EDF values for each block (pred wiggle, pred param, se, dist)
 /// - `(usize, f64)`: Optimization information (iterations, final gradient norm)
 pub fn fit_calibrator(
     y: ArrayView1<f64>,
@@ -1543,7 +1634,10 @@ pub fn fit_calibrator(
     penalties: &[Array2<f64>],
     penalty_nullspace_dims: &[usize],
     link: LinkFunction,
-) -> Result<(Array1<f64>, [f64; 3], f64, (f64, f64, f64), (usize, f64)), EstimationError> {
+) -> Result<
+    (Array1<f64>, [f64; 4], f64, (f64, f64, f64, f64), (usize, f64)),
+    EstimationError,
+> {
     // Row-shape sanity checks
     if !(y.len() == prior_weights.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -1613,22 +1707,44 @@ pub fn fit_calibrator(
 
     // Extract lambdas directly from optimizer; do not clamp them.
     // They are exp(ρ) and already nonnegative.
-    let lambdas_arr = [lambdas[0], lambdas[1], lambdas[2]];
+    if lambdas.len() != penalties.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "Optimizer returned {} lambdas but {} penalties were supplied",
+            lambdas.len(),
+            penalties.len()
+        )));
+    }
+
+    let lambdas_arr = [lambdas[0], lambdas[1], lambdas[2], lambdas[3]];
     let edf_pred = *edf_by_block.get(0).unwrap_or(&0.0);
-    let edf_se = *edf_by_block.get(1).unwrap_or(&0.0);
-    let edf_dist = *edf_by_block.get(2).unwrap_or(&0.0);
+    let edf_pred_param = *edf_by_block.get(1).unwrap_or(&0.0);
+    let edf_se = *edf_by_block.get(2).unwrap_or(&0.0);
+    let edf_dist = *edf_by_block.get(3).unwrap_or(&0.0);
     // Calculate rho values (log lambdas) for reporting
     let rho_pred = lambdas_arr[0].ln();
-    let rho_se = lambdas_arr[1].ln();
-    let rho_dist = lambdas_arr[2].ln();
+    let rho_pred_param = lambdas_arr[1].ln();
+    let rho_se = lambdas_arr[2].ln();
+    let rho_dist = lambdas_arr[3].ln();
     eprintln!("[CAL] fit: done. Complexity controlled solely by REML-optimized lambdas:");
     eprintln!(
-        "[CAL] lambdas: pred={:.3e} (rho={:.2}), se={:.3e} (rho={:.2}), dist={:.3e} (rho={:.2})",
-        lambdas[0], rho_pred, lambdas[1], rho_se, lambdas[2], rho_dist
+        "[CAL] lambdas: pred={:.3e} (rho={:.2}), pred_param={:.3e} (rho={:.2}), se={:.3e} (rho={:.2}), dist={:.3e} (rho={:.2})",
+        lambdas[0],
+        rho_pred,
+        lambdas[1],
+        rho_pred_param,
+        lambdas[2],
+        rho_se,
+        lambdas[3],
+        rho_dist
     );
     eprintln!(
-        "[CAL] edf: pred={:.2}, se={:.2}, dist={:.2}, total={:.2}, scale={:.3e}",
-        edf_pred, edf_se, edf_dist, res.edf_total, res.scale
+        "[CAL] edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}, scale={:.3e}",
+        edf_pred,
+        edf_pred_param,
+        edf_se,
+        edf_dist,
+        res.edf_total,
+        res.scale
     );
     let penalty_freeze_edf_threshold = 1e-3_f64;
     let penalty_freeze_lambda_threshold = 1e8_f64;
@@ -1638,23 +1754,29 @@ pub fn fit_calibrator(
             edf_pred, lambdas_arr[0]
         );
     }
-    if edf_se < penalty_freeze_edf_threshold || lambdas_arr[1] > penalty_freeze_lambda_threshold {
+    if edf_pred_param < penalty_freeze_edf_threshold || lambdas_arr[1] > penalty_freeze_lambda_threshold {
         eprintln!(
-            "[CAL][WARN] block=se reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
-            edf_se, lambdas_arr[1]
+            "[CAL][WARN] block=pred_param reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
+            edf_pred_param, lambdas_arr[1]
         );
     }
-    if edf_dist < penalty_freeze_edf_threshold || lambdas_arr[2] > penalty_freeze_lambda_threshold {
+    if edf_se < penalty_freeze_edf_threshold || lambdas_arr[2] > penalty_freeze_lambda_threshold {
+        eprintln!(
+            "[CAL][WARN] block=se reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
+            edf_se, lambdas_arr[2]
+        );
+    }
+    if edf_dist < penalty_freeze_edf_threshold || lambdas_arr[3] > penalty_freeze_lambda_threshold {
         eprintln!(
             "[CAL][WARN] block=dist reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
-            edf_dist, lambdas_arr[2]
+            edf_dist, lambdas_arr[3]
         );
     }
     Ok((
         beta,
         lambdas_arr,
         scale,
-        (edf_pred, edf_se, edf_dist),
+        (edf_pred, edf_pred_param, edf_se, edf_dist),
         (iterations, final_grad_norm),
     ))
 }
@@ -3461,6 +3583,7 @@ mod tests {
             schema.penalty_nullspace_dims.0,
             schema.penalty_nullspace_dims.1,
             schema.penalty_nullspace_dims.2,
+            schema.penalty_nullspace_dims.3,
         ];
         let fit_result = fit_calibrator(
             y.view(),
@@ -3545,6 +3668,7 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
         };
 
@@ -3557,6 +3681,7 @@ mod tests {
             schema.penalty_nullspace_dims.0,
             schema.penalty_nullspace_dims.1,
             schema.penalty_nullspace_dims.2,
+            schema.penalty_nullspace_dims.3,
         ];
         let fit_result = fit_calibrator(
             y.view(),
@@ -3570,7 +3695,7 @@ mod tests {
 
         // Check that fit converged successfully
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
-        let (beta, _, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) =
+        let (beta, _, scale, (edf_pred, _edf_pred_param, edf_se, edf_dist), (iters, grad_norm)) =
             fit_result.unwrap();
 
         // Verify results make sense
@@ -3777,6 +3902,7 @@ mod tests {
             schema.penalty_nullspace_dims.0,
             schema.penalty_nullspace_dims.1,
             schema.penalty_nullspace_dims.2,
+            schema.penalty_nullspace_dims.3,
         ];
         let fit_result_correct = fit_calibrator(
             y.view(),
@@ -3937,7 +4063,7 @@ mod tests {
             LinkFunction::Logit,
         )
         .unwrap();
-        let (beta, lambdas, _, (edf_pred, _, _), _) = fit_result;
+        let (beta, lambdas, _, (edf_pred, _, _, _), _) = fit_result;
 
         // Create a CalibratorModel
         let cal_model = CalibratorModel {
@@ -3957,10 +4083,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta,
             column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
             scale: None, // Not used for logistic regression
         };
 
@@ -4079,6 +4207,7 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ];
 
             let fit_result = fit_calibrator(
@@ -4111,10 +4240,12 @@ mod tests {
                 se_center_offset: schema.se_center_offset,
                 dist_center_offset: schema.dist_center_offset,
                 lambda_pred: lambdas[0],
-                lambda_se: lambdas[1],
-                lambda_dist: lambdas[2],
+                lambda_pred_param: lambdas[1],
+                lambda_se: lambdas[2],
+                lambda_dist: lambdas[3],
                 coefficients: beta,
                 column_spans: schema.column_spans,
+                pred_param_range: schema.pred_param_range.clone(),
                 scale: None,
             };
 
@@ -4277,7 +4408,7 @@ mod tests {
             LinkFunction::Logit,
         )
         .unwrap();
-        let (beta, lambdas, _, (edf_pred, edf_se, edf_dist), _) = fit_result;
+        let (beta, lambdas, _, (edf_pred, _edf_pred_param, edf_se, edf_dist), _) = fit_result;
 
         let rho_pred = lambdas[0].ln();
         assert!(
@@ -4328,10 +4459,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta.clone(),
             column_spans: schema.column_spans.clone(),
+            pred_param_range: schema.pred_param_range.clone(),
             scale: None,
         };
         let cal_probs = predict_calibrator(
@@ -4479,11 +4612,12 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
             LinkFunction::Logit,
         )
         .unwrap();
-        let (beta, lambdas, _, (edf_pred, edf_se, edf_dist), _) = fit_result;
+        let (beta, lambdas, _, (edf_pred, _edf_pred_param, edf_se, edf_dist), _) = fit_result;
         // Create a CalibratorModel
         let cal_model = CalibratorModel {
             spec: spec.clone(),
@@ -4502,10 +4636,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta,
             column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
             scale: None, // Not used for logistic regression
         };
 
@@ -4791,11 +4927,13 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
             LinkFunction::Identity,
         )
         .unwrap();
-        let (beta, lambdas, scale, (edf_pred, edf_se, edf_dist), (iters, grad_norm)) = fit_result;
+        let (beta, lambdas, scale, (edf_pred, _edf_pred_param, edf_se, edf_dist), (iters, grad_norm)) =
+            fit_result;
         // Use the values to print calibration metrics
         eprintln!(
             "Calibrator fit results - edf_pred: {:.2}, edf_se: {:.2}, edf_dist: {:.2}, iters: {}, convergence: {:.4e}",
@@ -4820,10 +4958,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta,
             column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
             scale: Some(scale),
         };
 
@@ -5031,7 +5171,7 @@ mod tests {
         );
         assert_eq!(
             schema.penalty_nullspace_dims,
-            (0, 0, 0),
+            (0, 0, 0, 0),
             "All penalty nullspaces should be reported as zero after projection",
         );
 
@@ -5046,6 +5186,7 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
             LinkFunction::Logit,
         )
@@ -5070,10 +5211,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta,
             column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
             scale: None,
         };
 
@@ -5156,6 +5299,7 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
             LinkFunction::Logit,
         )
@@ -5180,10 +5324,12 @@ mod tests {
             se_center_offset: schema.se_center_offset,
             dist_center_offset: schema.dist_center_offset,
             lambda_pred: lambdas[0],
-            lambda_se: lambdas[1],
-            lambda_dist: lambdas[2],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
             coefficients: beta.clone(),
             column_spans: schema.column_spans.clone(),
+            pred_param_range: schema.pred_param_range.clone(),
             scale: None,
         };
 
@@ -5233,6 +5379,9 @@ mod tests {
 
         // Check lambdas
         assert!((original_cal_model.lambda_pred - loaded_cal_model.lambda_pred).abs() < 1e-10);
+        assert!(
+            (original_cal_model.lambda_pred_param - loaded_cal_model.lambda_pred_param).abs() < 1e-10
+        );
         assert!((original_cal_model.lambda_se - loaded_cal_model.lambda_se).abs() < 1e-10);
         assert!((original_cal_model.lambda_dist - loaded_cal_model.lambda_dist).abs() < 1e-10);
 
@@ -5272,6 +5421,14 @@ mod tests {
         assert_eq!(
             original_cal_model.column_spans.2.end,
             loaded_cal_model.column_spans.2.end
+        );
+        assert_eq!(
+            original_cal_model.pred_param_range.start,
+            loaded_cal_model.pred_param_range.start
+        );
+        assert_eq!(
+            original_cal_model.pred_param_range.end,
+            loaded_cal_model.pred_param_range.end
         );
     }
 
