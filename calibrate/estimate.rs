@@ -1634,7 +1634,6 @@ pub mod internal {
             pr: &PirlsResult,
             lambdas: &Array1<f64>,
             h_eff: &Array2<f64>,
-            ridge_used: f64,
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
             // The effective degrees of freedom (EDF) calculation is one of only two places where
@@ -1653,7 +1652,7 @@ pub mod internal {
           
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
-            let factor = self.get_faer_factor(&rho_like, h_eff, ridge_used);
+            let factor = self.get_faer_factor(&rho_like, h_eff);
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
@@ -2099,7 +2098,7 @@ pub mod internal {
 
                     // Use the edf_from_h_and_rk helper for consistent EDF calculation
                     // between cost and gradient functions
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
@@ -2182,7 +2181,7 @@ pub mod internal {
                     // Diagnostics: effective degrees of freedom via trace identity
                     // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
@@ -2622,8 +2621,8 @@ pub mod internal {
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
 
                     // EDF calculation in transformed basis using shared helper
-                    let factor_g = self.get_faer_factor(p, h_eff, ridge_used);
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
+                    let factor_g = self.get_faer_factor(p, h_eff);
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     // Because φ has been profiled out, the envelope theorem tells us that the
                     // derivative of the profiled objective with respect to ρ is given by the
                     // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
@@ -3409,10 +3408,10 @@ pub mod internal {
         fn half_logh_s_part(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             // ½·λk tr(H_eff⁻¹ S_k)
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, ridge_used) = state
+            let (h_eff, _) = state
                 .effective_hessian(&pr)
                 .expect("effective Hessian");
-            let factor = state.get_faer_factor(rho, &h_eff, ridge_used);
+            let factor = state.get_faer_factor(rho, &h_eff);
             let lambdas = rho.mapv(f64::exp);
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
