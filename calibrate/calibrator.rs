@@ -1309,12 +1309,12 @@ pub fn build_calibrator_design(
     // Scale each penalty block to a common metric before optimization
     // This ensures the REML optimization balances blocks fairly, and lambda values are comparable
     fn scale_penalty_to_unit_mean_eig(s: &Array2<f64>) -> (Array2<f64>, f64) {
-        // Mean nonzero eigenvalue ≈ trace / rank(S)
-        let tr = (0..s.nrows()).map(|i| s[[i, i]]).sum::<f64>().abs();
-        // Crude rank estimate via diagonal > 0, robust enough for diff penalties
-        let r = (0..s.nrows()).filter(|&i| s[[i, i]] > 0.0).count().max(1) as f64;
-        let c = (tr / r).max(1e-12); // Scale factor
-        (s / c, c) // Return scaled matrix and the scaling factor
+        // In constrained coordinates the penalty blocks are full-rank, so the
+        // rank equals the width of the matrix.
+        let p = s.nrows().max(1) as f64;
+        let tr = (0..s.nrows()).map(|i| s[[i, i]]).sum::<f64>();
+        let c = (tr / p).abs().max(1e-12);
+        (s / c, c)
     }
 
     // Scale each block in constrained coordinates
