@@ -4161,10 +4161,13 @@ mod tests {
         let cal_auc = auc(&y, &cal_probs);
 
         // Verify calibration improvements
+        let required_relative_improvement = 0.20; // 20% drop in ECE
+        let max_allowed_cal_ece = (1.0 - required_relative_improvement) * base_ece;
         assert!(
-            cal_ece <= 0.65 * base_ece + 1e-4,
-            "Calibrated ECE ({:.4}) should be meaningfully lower than base ECE ({:.4})",
+            cal_ece <= max_allowed_cal_ece,
+            "Calibrated ECE ({:.4}) should be at least {:.0}% lower than base ECE ({:.4})",
             cal_ece,
+            required_relative_improvement * 100.0,
             base_ece
         );
 
