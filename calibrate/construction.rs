@@ -556,7 +556,7 @@ pub fn build_design_and_penalty_matrices(
         None
     };
 
-    for (pc_idx, _pc_config) in config.pc_configs.iter().enumerate() {
+    for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
         if pc_idx >= layout.interaction_block_idx.len() {
             break;
         }
@@ -586,8 +586,8 @@ pub fn build_design_and_penalty_matrices(
                 let pc_cols = pc_unconstrained_bases_main[pc_idx].ncols();
                 if col_range.len() != pgs_cols * pc_cols {
                     return Err(EstimationError::LayoutError(format!(
-                        "Interaction block {} expects {} columns ({}×{}), but layout provided {}",
-                        block.term_name,
+                        "Interaction block f(PGS,{}) expects {} columns ({}×{}), but layout provided {}",
+                        pc_config.name,
                         pgs_cols * pc_cols,
                         pgs_cols,
                         pc_cols,
