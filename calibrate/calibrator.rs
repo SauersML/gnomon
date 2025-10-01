@@ -197,7 +197,6 @@ pub fn compute_alo_features(
     // Blocked solves: K S = Uᵀ; compute a_ii and var_full within the same block
     let block = 8192usize.min(n.max(1));
     let mut aii = Array1::<f64>::zeros(n);
-    let mut leverage_eta_tilde = Array1::<f64>::zeros(n); // Renamed to avoid shadowing
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
     let z = base.solve_working_response.clone();
@@ -305,9 +304,6 @@ pub fn compute_alo_features(
                 diag_counter += 1;
             }
 
-            // ALO predictor in the same pass (no guard needed here)
-            let denom_alo = denom_raw;
-            leverage_eta_tilde[irow] = (eta_hat[irow] - aii[irow] * z[irow]) / denom_alo;
         }
 
         col_start = col_end;
