@@ -1356,6 +1356,25 @@ pub mod internal {
     /// for the same `rho` vector, which can happen during the line search.
     /// `RefCell` allows us to mutate the cache through a `&self` reference,
     /// making this optimization possible while adhering to the optimizer's API.
+
+    #[derive(Clone)]
+    struct EvalShared {
+        key: Option<Vec<u64>>,
+        pirls_result: Arc<PirlsResult>,
+        h_eff: Arc<Array2<f64>>,
+        ridge_used: f64,
+    }
+
+    impl EvalShared {
+        fn matches(&self, key: &Option<Vec<u64>>) -> bool {
+            match (&self.key, key) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
+    }
+
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
@@ -1375,6 +1394,7 @@ pub mod internal {
         last_grad_norm: RefCell<f64>,
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
+        current_eval_bundle: RefCell<Option<EvalShared>>,
     }
 
     impl<'a> RemlState<'a> {
@@ -1384,23 +1404,102 @@ pub mod internal {
         /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
         /// If not, a small ridge is added to ensure positive definiteness, and that
         /// ridged matrix is returned along with the ridge value used.
-        fn effective_hessian<'p>(&self, pr: &'p PirlsResult) -> (Array2<f64>, f64) {
-            let h = pr.penalized_hessian_transformed.clone();
+        fn effective_hessian<'p>(
+            &self,
+            pr: &'p PirlsResult,
+        ) -> Result<(Array2<f64>, f64), EstimationError> {
+            let base = pr.stabilized_hessian_transformed.clone();
 
-            // Try Cholesky - if it succeeds, matrix is already PD
-            if h.cholesky(Side::Lower).is_ok() {
-                return (h, 0.0); // No ridge needed
+            if base.cholesky(Side::Lower).is_ok() {
+                return Ok((base, 0.0));
             }
 
-            // Add ridge for stabilization
-            let mut h_eff = h.clone();
-            let c = LAML_RIDGE;
-            let p_dim = h_eff.nrows();
-            for i in 0..p_dim {
-                h_eff[[i, i]] += c;
+            let p = base.nrows();
+            let diag_scale = {
+                let denom = (p as f64).max(1.0);
+                let raw = base.diag().iter().map(|v| v.abs()).sum::<f64>() / denom;
+                if raw.is_finite() && raw > 0.0 {
+                    raw
+                } else {
+                    1.0
+                }
+            };
+
+            let min_target = LAML_RIDGE.max(1e-9);
+            let mut ridge = min_target;
+            if let Ok((eigs, _)) = base.eigh(Side::Lower) {
+                if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
+                    if min_eig.is_finite() {
+                        if min_eig < min_target {
+                            ridge = (min_target - min_eig).max(min_target);
+                        } else if min_eig < 0.0 {
+                            ridge = (-min_eig) + min_target;
+                        }
+                    }
+                }
             }
 
-            (h_eff, c)
+            if !ridge.is_finite() || ridge <= 0.0 {
+                ridge = min_target;
+            }
+
+            let mut attempt = 0usize;
+            let mut current = ridge;
+
+            loop {
+                let mut h_eff = base.clone();
+                if current > 0.0 {
+                    for i in 0..p {
+                        h_eff[[i, i]] += current;
+                    }
+                }
+
+                if h_eff.cholesky(Side::Lower).is_ok() {
+                    if current > 0.0 {
+                        log::warn!(
+                            "Added ridge {:.3e} to stabilized Hessian to recover positive definiteness",
+                            current
+                        );
+                    }
+                    return Ok((h_eff, current));
+                }
+
+                attempt += 1;
+                if attempt > 20 {
+                    let fallback = diag_scale.max(1.0) * 1e6;
+                    let mut h_eff = base.clone();
+                    for i in 0..p {
+                        h_eff[[i, i]] += fallback;
+                    }
+                    match h_eff.cholesky(Side::Lower) {
+                        Ok(_) => {
+                            log::error!(
+                                "Extremely large ridge {:.3e} applied to stabilized Hessian after repeated failures",
+                                fallback
+                            );
+                            return Ok((h_eff, fallback));
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "Failed to recover positive definiteness even after applying ridge {:.3e}",
+                                fallback
+                            );
+                            return Err(EstimationError::ModelIsIllConditioned {
+                                condition_number: f64::INFINITY,
+                            });
+                        }
+                    }
+                }
+
+                let scale_factor = 10f64.powi(attempt as i32);
+                current = (current * 10.0)
+                    .max(diag_scale * scale_factor)
+                    .max(min_target * scale_factor);
+
+                if !current.is_finite() || current <= 0.0 {
+                    current = diag_scale.max(1.0);
+                }
+            }
         }
 
         pub(super) fn new(
@@ -1470,6 +1569,7 @@ pub mod internal {
                 last_grad_norm: RefCell::new(f64::INFINITY),
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
+                current_eval_bundle: RefCell::new(None),
             })
         }
 
@@ -1492,6 +1592,33 @@ pub mod internal {
             Some(key)
         }
 
+        fn prepare_eval_bundle_with_key(
+            &self,
+            rho: &Array1<f64>,
+            key: Option<Vec<u64>>,
+        ) -> Result<EvalShared, EstimationError> {
+            let pirls_result = self.execute_pirls_if_needed(rho)?;
+            let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
+            Ok(EvalShared {
+                key,
+                pirls_result,
+                h_eff: Arc::new(h_eff),
+                ridge_used,
+            })
+        }
+
+        fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
+            let key = self.rho_key_sanitized(rho);
+            if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
+                if existing.matches(&key) {
+                    return Ok(existing.clone());
+                }
+            }
+            let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
+            *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
+            Ok(bundle)
+        }
+
         /// Calculate effective degrees of freedom (EDF) using a consistent approach
         /// for both cost and gradient calculations, ensuring identical values.
         ///
@@ -1507,6 +1634,7 @@ pub mod internal {
             pr: &PirlsResult,
             lambdas: &Array1<f64>,
             h_eff: &Array2<f64>,
+            ridge_used: f64,
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
             // The effective degrees of freedom (EDF) calculation is one of only two places where
@@ -1522,10 +1650,10 @@ pub mod internal {
             // constructed for a single link function, so the cost/gradient pathways stay aligned.
             // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
-
+          
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
-            let factor = self.get_faer_factor(&rho_like, h_eff);
+            let factor = self.get_faer_factor(&rho_like, h_eff, ridge_used);
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
@@ -1652,19 +1780,19 @@ pub mod internal {
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
         fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
-            let (h_eff, _) = self.effective_hessian(&pr);
-            let log_det_h = match h_eff.cholesky(Side::Lower) {
-                Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                Err(_) => {
-                    let (eigs, _) = h_eff
-                        .eigh(Side::Lower)
-                        .map_err(EstimationError::EigendecompositionFailed)?;
-                    eigs.iter()
-                        .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
-                        .map(|ev| ev.ln())
-                        .sum()
+            let (h_eff, _) = self.effective_hessian(&pr)?;
+            let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                let min_eig = h_eff
+                    .clone()
+                    .eigh(Side::Lower)
+                    .ok()
+                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                    .unwrap_or(f64::NAN);
+                EstimationError::HessianNotPositiveDefinite {
+                    min_eigenvalue: min_eig,
                 }
-            };
+            })?;
+            let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
             Ok(0.5 * log_det_h)
         }
 
@@ -1804,9 +1932,10 @@ pub mod internal {
                 p.to_vec()
             );
 
-            let pirls_result = match self.execute_pirls_if_needed(p) {
-                Ok(res) => res,
+            let bundle = match self.obtain_eval_bundle(p) {
+                Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                    self.current_eval_bundle.borrow_mut().take();
                     // Inner linear algebra says "too singular" — treat as barrier.
                     log::warn!(
                         "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
@@ -1835,6 +1964,7 @@ pub mod internal {
                     return Ok(f64::INFINITY);
                 }
                 Err(e) => {
+                    self.current_eval_bundle.borrow_mut().take();
                     // Other errors still bubble up
                     // Provide bounds diagnostics here too
                     let at_lower: Vec<usize> = p
@@ -1860,6 +1990,9 @@ pub mod internal {
                     return Err(e);
                 }
             };
+            let pirls_result = bundle.pirls_result.as_ref();
+            let h_eff = bundle.h_eff.as_ref();
+            let ridge_used = bundle.ridge_used;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
@@ -1882,9 +2015,6 @@ pub mod internal {
             }
 
             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
-            // Use our effective_hessian helper to check if the Hessian needs stabilization
-            let (_, ridge_used) = self.effective_hessian(pirls_result.as_ref());
-
             // Only check eigenvalues if we needed to add a ridge
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             if ridge_used > 0.0 {
@@ -1895,7 +2025,8 @@ pub mod internal {
 
                         if min_eig <= 0.0 {
                             log::warn!(
-                                "Penalized Hessian not PD (min eig <= 0). Treating as a fatal singularity."
+                                "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
+                                ridge_used
                             );
                         }
 
@@ -1906,9 +2037,10 @@ pub mod internal {
                             .ok()
                             .unwrap_or(f64::INFINITY);
 
-                            return Err(EstimationError::ModelIsIllConditioned {
-                                condition_number,
-                            });
+                            log::warn!(
+                                "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
+                                condition_number
+                            );
                         }
                     }
                 }
@@ -1962,13 +2094,12 @@ pub mod internal {
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
                     // Work directly in the transformed basis for efficiency and numerical stability
                     // This avoids transforming matrices back to the original basis unnecessarily
-                    let hessian_t = &pirls_result.stabilized_hessian_transformed;
                     // Penalty roots are available in reparam_result if needed
                     let _ = &pirls_result.reparam_result.rs_transformed;
 
                     // Use the edf_from_h_and_rk helper for consistent EDF calculation
                     // between cost and gradient functions
-                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, hessian_t)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
 
                     // Correct φ using penalized deviance: φ = D_p / (n - edf)
@@ -1978,29 +2109,19 @@ pub mod internal {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
 
-                    // log |H| = log |X'X + S_λ| using SINGLE stabilized Hessian from P-IRLS
-                    let log_det_h = match pirls_result
-                        .stabilized_hessian_transformed
-                        .cholesky(Side::Lower)
-                    {
-                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                        Err(_) => {
-                            log::warn!(
-                                "Cholesky failed for stabilized penalized Hessian, using eigenvalue method"
-                            );
-                            let (eigenvalues, _) = pirls_result
-                                .stabilized_hessian_transformed
-                                .eigh(Side::Lower)
-                                .map_err(EstimationError::EigendecompositionFailed)?;
-
-                            let ridge = LAML_RIDGE;
-                            eigenvalues
-                                .iter()
-                                .map(|&ev| (ev + ridge).max(ridge))
-                                .map(|ev| ev.ln())
-                                .sum()
+                    // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
+                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                        let min_eig = h_eff
+                            .clone()
+                            .eigh(Side::Lower)
+                            .ok()
+                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                            .unwrap_or(f64::NAN);
+                        EstimationError::HessianNotPositiveDefinite {
+                            min_eigenvalue: min_eig,
                         }
-                    };
+                    })?;
+                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
                     let log_det_s_plus = pirls_result.reparam_result.log_det;
@@ -2028,33 +2149,21 @@ pub mod internal {
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let log_det_s = pirls_result.reparam_result.log_det;
-                    // Get effective Hessian (stabilized if needed) and ridge used
-                    let (h_eff, _) = self.effective_hessian(&pirls_result);
 
                     // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
                     // that will also be used in the gradient calculation
-                    let log_det_h = match h_eff.cholesky(Side::Lower) {
-                        Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                        Err(_) => {
-                            // Eigenvalue fallback if Cholesky fails
-                            log::warn!(
-                                "Cholesky failed for effective penalized Hessian, using eigenvalue method"
-                            );
-
-                            let (eigenvalues, _) = h_eff
-                                .eigh(Side::Lower)
-                                .map_err(EstimationError::EigendecompositionFailed)?;
-
-                            let ridge = LAML_RIDGE; // constant ridge for numeric safety
-                            let stabilized_log_det: f64 = eigenvalues
-                                .iter()
-                                .map(|&ev| (ev + ridge).max(ridge))
-                                .map(|ev| ev.ln())
-                                .sum();
-
-                            stabilized_log_det
+                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                        let min_eig = h_eff
+                            .clone()
+                            .eigh(Side::Lower)
+                            .ok()
+                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                            .unwrap_or(f64::NAN);
+                        EstimationError::HessianNotPositiveDefinite {
+                            min_eigenvalue: min_eig,
                         }
-                    };
+                    })?;
+                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
@@ -2072,10 +2181,8 @@ pub mod internal {
 
                     // Diagnostics: effective degrees of freedom via trace identity
                     // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
-                    let (h_eff_diag, _) = self.effective_hessian(pirls_result.as_ref());
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let lambdas = p.mapv(f64::exp);
-                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, &h_eff_diag)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
@@ -2402,30 +2509,38 @@ pub mod internal {
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
-            let pirls_result = match self.execute_pirls_if_needed(p) {
-                Ok(res) => res,
+            let bundle = match self.obtain_eval_bundle(p) {
+                Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                    self.current_eval_bundle.borrow_mut().take();
                     // Push toward heavier smoothing: larger rho
                     // Minimizer steps along -grad, so use negative values
                     let grad = p.mapv(|rho| -(rho.abs() + 1.0));
                     return Ok(grad);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.current_eval_bundle.borrow_mut().take();
+                    return Err(e);
+                }
             };
-            self.compute_gradient_with_pirls_result(p, pirls_result.as_ref())
+            self.compute_gradient_with_bundle(p, &bundle)
         }
 
-        /// Helper function that computes gradient using an existing PIRLS result
-        /// This allows reusing the same logic with a stabilized Hessian when needed
-        fn compute_gradient_with_pirls_result(
+        /// Helper function that computes gradient using a shared evaluation bundle
+        /// so cost and gradient reuse the identical stabilized Hessian and PIRLS state.
+        fn compute_gradient_with_bundle(
             &self,
             p: &Array1<f64>,
-            pirls_result: &PirlsResult,
+            bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
             // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
             if p.len() == 0 {
                 return Ok(Array1::zeros(0));
             }
+
+            let pirls_result = bundle.pirls_result.as_ref();
+            let h_eff = bundle.h_eff.as_ref();
+            let ridge_used = bundle.ridge_used;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             let kλ = p.len();
@@ -2453,8 +2568,13 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
-            // CRITICAL: Use the same stabilized Hessian as cost function for consistency
-            let hessian = &pirls_result.stabilized_hessian_transformed;
+            // CRITICAL: Use the same effective Hessian as the cost function for consistency
+            if ridge_used > 0.0 {
+                log::debug!(
+                    "Gradient path added ridge {:.3e} to stabilized Hessian for consistency",
+                    ridge_used
+                );
+            }
 
             // Check for severe indefiniteness in the original Hessian (before stabilization)
             // This suggests a problematic region we should retreat from
@@ -2502,8 +2622,8 @@ pub mod internal {
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
 
                     // EDF calculation in transformed basis using shared helper
-                    let factor_g = self.get_faer_factor(p, hessian);
-                    let edf = self.edf_from_h_and_rk(&pirls_result, &lambdas, hessian)?;
+                    let factor_g = self.get_faer_factor(p, h_eff, ridge_used);
+                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff, ridge_used)?;
                     // Because φ has been profiled out, the envelope theorem tells us that the
                     // derivative of the profiled objective with respect to ρ is given by the
                     // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
@@ -2588,7 +2708,7 @@ pub mod internal {
                     eprintln!("[Sλ] Using stabilized det1 from reparam: {:?}", det1_full);
 
                     // Report current ½·log|H_eff| using the same stabilized path as cost
-                    let (h_eff_m, _) = self.effective_hessian(&pirls_result);
+                    let h_eff_m = h_eff.clone();
                     let half_logh_val = match h_eff_m.cholesky(Side::Lower) {
                         Ok(l) => l.diag().mapv(f64::ln).sum(),
                         Err(_) => match h_eff_m.eigh(Side::Lower) {
@@ -2814,7 +2934,9 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
+        use crate::calibrate::model::{
+            BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
+        };
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
         ///
@@ -3258,19 +3380,15 @@ pub mod internal {
         // effective Hessian and logdet path as compute_cost.
         fn half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> f64 {
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, _) = state.effective_hessian(&pr);
-            // Cholesky if possible, otherwise eigenvalue fallback with ridge — same as cost
-            let log_det_h = match h_eff.cholesky(Side::Lower) {
-                Ok(l) => 2.0 * l.diag().mapv(f64::ln).sum(),
-                Err(_) => {
-                    let (eigs, _) = h_eff.eigh(Side::Lower).expect("eigh for H_eff");
-                    eigs.iter()
-                        .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
-                        .map(|ev| ev.ln())
-                        .sum()
-                }
-            };
-            0.5 * log_det_h
+            let (h_eff, _) = state
+                .effective_hessian(&pr)
+                .expect("effective Hessian");
+            let chol = h_eff
+                .clone()
+                .cholesky(Side::Lower)
+                .expect("effective Hessian should be PD");
+            // ½·log|H| = Σ log diag(L) when H = L Lᵀ.
+            chol.diag().mapv(f64::ln).sum()
         }
 
         fn fd_half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
@@ -3291,8 +3409,10 @@ pub mod internal {
         fn half_logh_s_part(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             // ½·λk tr(H_eff⁻¹ S_k)
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, _) = state.effective_hessian(&pr);
-            let factor = state.get_faer_factor(rho, &h_eff);
+            let (h_eff, ridge_used) = state
+                .effective_hessian(&pr)
+                .expect("effective Hessian");
+            let factor = state.get_faer_factor(rho, &h_eff, ridge_used);
             let lambdas = rho.mapv(f64::exp);
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
@@ -6254,9 +6374,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
 #[test]
 fn test_indefinite_hessian_detection_and_retreat() {
     use crate::calibrate::estimate::internal::RemlState;
-    use crate::calibrate::model::{
-        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
-    };
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig};
     use ndarray::{Array1, Array2};
 
     println!("=== TESTING INDEFINITE HESSIAN DETECTION FUNCTIONALITY ===");
@@ -6427,9 +6545,7 @@ mod test_helpers {
 mod optimizer_progress_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::{
-        BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
-    };
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -6571,9 +6687,7 @@ mod reparam_consistency_tests {
     use super::*;
     use crate::calibrate::construction::build_design_and_penalty_matrices;
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{
-        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
-    };
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig};
     use ndarray::{Array1, Array2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -6728,9 +6842,7 @@ mod reparam_consistency_tests {
 mod gradient_validation_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::{
-        BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
-    };
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
