@@ -711,6 +711,10 @@ pub fn build_calibrator_design(
     );
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred_identity);
+    // Center the predictor on the weighted mean so interaction terms shrink toward c.
+    let pred_centered = features
+        .pred_identity
+        .mapv(|x| x - pred_mean);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
     let (dist_std, dist_ms) = if use_linear_dist {
         // Center only for linear fallback to avoid extreme scaling
@@ -1103,6 +1107,23 @@ pub fn build_calibrator_design(
 
     prune_near_zero_columns(&mut b_se_c, &mut stz_se, "se");
 
+    if !se_linear_fallback && b_se_c.ncols() > 0 {
+        if pred_is_const {
+            eprintln!(
+                "[CAL][WARN] block=se reason=predictor_constant_interaction action=drop_block cols={}",
+                b_se_c.ncols()
+            );
+            b_se_c = Array2::<f64>::zeros((n, 0));
+            stz_se = Array2::<f64>::zeros((stz_se.nrows(), 0));
+        } else {
+            for (row, &pc) in pred_centered.iter().enumerate() {
+                for col in 0..b_se_c.ncols() {
+                    b_se_c[[row, col]] *= pc;
+                }
+            }
+        }
+    }
+
     // For distance, check if we need to use linear fallback
     // Linear fallback when: low variance or mostly zeros (from hinging)
     // Calculate the distance centering offset first
@@ -1202,6 +1223,23 @@ pub fn build_calibrator_design(
     };
 
     prune_near_zero_columns(&mut b_dist_c, &mut stz_dist, "dist");
+
+    if !use_linear_dist && b_dist_c.ncols() > 0 {
+        if pred_is_const {
+            eprintln!(
+                "[CAL][WARN] block=dist reason=predictor_constant_interaction action=drop_block cols={}",
+                b_dist_c.ncols()
+            );
+            b_dist_c = Array2::<f64>::zeros((n, 0));
+            stz_dist = Array2::<f64>::zeros((stz_dist.nrows(), 0));
+        } else {
+            for (row, &pc) in pred_centered.iter().enumerate() {
+                for col in 0..b_dist_c.ncols() {
+                    b_dist_c[[row, col]] *= pc;
+                }
+            }
+        }
+    }
 
     // Copy knots_se for ownership
     let mut knots_se = knots_se.clone(); // Take ownership
@@ -1399,6 +1437,7 @@ pub fn predict_calibrator(
     let (ms, ss) = model.standardize_se;
     let (md, sd) = model.standardize_dist;
     let pred_std = pred.mapv(|x| (x - mp) / sp.max(1e-8_f64));
+    let pred_centered = pred.mapv(|x| x - mp);
     let se_std = se.mapv(|x| (x - ms) / ss.max(1e-8_f64));
 
     // Important: Apply hinge in raw space before standardization,
@@ -1473,13 +1512,19 @@ pub fn predict_calibrator(
     }
     if n_se_cols > 0 {
         let off = se_range.start;
-        x.slice_mut(s![.., off..off + n_se_cols])
-            .assign(&b_se.slice(s![.., ..n_se_cols]));
+        for (row, &pc) in pred_centered.iter().enumerate() {
+            for col in 0..n_se_cols {
+                x[[row, off + col]] = b_se[[row, col]] * pc;
+            }
+        }
     }
     if n_dist_cols > 0 {
         let off = dist_range.start;
-        x.slice_mut(s![.., off..off + n_dist_cols])
-            .assign(&b_dist.slice(s![.., ..n_dist_cols]));
+        for (row, &pc) in pred_centered.iter().enumerate() {
+            for col in 0..n_dist_cols {
+                x[[row, off + col]] = b_dist[[row, col]] * pc;
+            }
+        }
     }
 
     // Linear predictor adds the baseline identity offset
