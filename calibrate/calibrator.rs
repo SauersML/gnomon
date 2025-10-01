@@ -1736,11 +1736,11 @@ pub fn fit_calibrator(
         active_penalty_count,
         link
     );
-    let active_axes = penalties
+    let active_axis_count = penalties
         .iter()
         .filter(|matrix| matrix.iter().any(|&v| v.abs() > 1e-12))
         .count();
-    let smooth_desc = match active_axes {
+    let smooth_desc = match active_axis_count {
         0 => "no calibrator smooths".to_string(),
         1 => "the calibrator smooth".to_string(),
         n => format!("all {} calibrator smooths", n),
