@@ -1694,17 +1694,46 @@ pub fn fit_calibrator(
         )));
     }
 
+    let axis_labels = ["pred", "pred_param", "se", "dist"];
+    let penalty_activity_tol = 1e-12_f64;
+    let mut active_penalties: Vec<Array2<f64>> = Vec::new();
+    let mut active_null_dims: Vec<usize> = Vec::new();
+    let mut active_axes: Vec<usize> = Vec::new();
+    let mut dropped_axes: Vec<&str> = Vec::new();
+
+    for (idx, penalty_matrix) in penalties.iter().enumerate() {
+        let max_abs = penalty_matrix
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        let is_active = max_abs > penalty_activity_tol;
+
+        if is_active {
+            active_axes.push(idx);
+            active_penalties.push(penalty_matrix.clone());
+            let null_dim = penalty_nullspace_dims
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+            active_null_dims.push(null_dim);
+        } else {
+            let axis_name = axis_labels.get(idx).copied().unwrap_or("unknown");
+            dropped_axes.push(axis_name);
+        }
+    }
+
+    let active_penalty_count = active_penalties.len();
+
     let opts = ExternalOptimOptions {
         link,
         max_iter: 75,
         tol: 1e-3,
-        nullspace_dims: penalty_nullspace_dims.to_vec(),
+        nullspace_dims: active_null_dims.clone(),
     };
     eprintln!(
         "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
         x.nrows(),
         x.ncols(),
-        penalties.len(),
+        active_penalty_count,
         link
     );
     let active_axes = penalties
@@ -1716,6 +1745,12 @@ pub fn fit_calibrator(
         1 => "the calibrator smooth".to_string(),
         n => format!("all {} calibrator smooths", n),
     };
+    if !dropped_axes.is_empty() {
+        eprintln!(
+            "[CAL][INFO] treating penalty blocks as unpenalized due to zero wiggle columns: {}",
+            dropped_axes.join(", ")
+        );
+    }
     eprintln!(
         "[CAL] Using same spline family for {} as the base PGS smooth",
         smooth_desc
@@ -1748,7 +1783,14 @@ pub fn fit_calibrator(
     );
     // -----------------------------------------------
 
-    let res = optimize_external_design(y, prior_weights, x, offset, penalties, &opts)?;
+    let res = optimize_external_design(
+        y,
+        prior_weights,
+        x,
+        offset,
+        &active_penalties,
+        &opts,
+    )?;
 
     let ExternalOptimResult {
         beta,
@@ -1762,19 +1804,33 @@ pub fn fit_calibrator(
 
     // Extract lambdas directly from optimizer; do not clamp them.
     // They are exp(ρ) and already nonnegative.
-    if lambdas.len() != penalties.len() {
+    if lambdas.len() != active_penalty_count {
         return Err(EstimationError::InvalidInput(format!(
             "Optimizer returned {} lambdas but {} penalties were supplied",
             lambdas.len(),
-            penalties.len()
+            active_penalty_count
         )));
     }
 
-    let lambdas_arr = [lambdas[0], lambdas[1], lambdas[2], lambdas[3]];
-    let edf_pred = *edf_by_block.get(0).unwrap_or(&0.0);
-    let edf_pred_param = *edf_by_block.get(1).unwrap_or(&0.0);
-    let edf_se = *edf_by_block.get(2).unwrap_or(&0.0);
-    let edf_dist = *edf_by_block.get(3).unwrap_or(&0.0);
+    let mut lambdas_arr = [1.0_f64; 4];
+    let mut edf_full = [0.0_f64; 4];
+    let mut active_mask = [false; 4];
+    for (pos, &axis_idx) in active_axes.iter().enumerate() {
+        if axis_idx >= lambdas_arr.len() {
+            eprintln!(
+                "[CAL][WARN] skipping unexpected penalty axis index {} beyond supported range",
+                axis_idx
+            );
+            continue;
+        }
+        lambdas_arr[axis_idx] = lambdas[pos];
+        edf_full[axis_idx] = *edf_by_block.get(pos).unwrap_or(&0.0);
+        active_mask[axis_idx] = true;
+    }
+    let edf_pred = edf_full[0];
+    let edf_pred_param = edf_full[1];
+    let edf_se = edf_full[2];
+    let edf_dist = edf_full[3];
     // Calculate rho values (log lambdas) for reporting
     let rho_pred = lambdas_arr[0].ln();
     let rho_pred_param = lambdas_arr[1].ln();
@@ -1783,13 +1839,13 @@ pub fn fit_calibrator(
     eprintln!("[CAL] fit: done. Complexity controlled solely by REML-optimized lambdas:");
     eprintln!(
         "[CAL] lambdas: pred={:.3e} (rho={:.2}), pred_param={:.3e} (rho={:.2}), se={:.3e} (rho={:.2}), dist={:.3e} (rho={:.2})",
-        lambdas[0],
+        lambdas_arr[0],
         rho_pred,
-        lambdas[1],
+        lambdas_arr[1],
         rho_pred_param,
-        lambdas[2],
+        lambdas_arr[2],
         rho_se,
-        lambdas[3],
+        lambdas_arr[3],
         rho_dist
     );
     eprintln!(
@@ -1803,25 +1859,37 @@ pub fn fit_calibrator(
     );
     let penalty_freeze_edf_threshold = 1e-3_f64;
     let penalty_freeze_lambda_threshold = 1e8_f64;
-    if edf_pred < penalty_freeze_edf_threshold || lambdas_arr[0] > penalty_freeze_lambda_threshold {
+    if active_mask[0]
+        && (edf_pred < penalty_freeze_edf_threshold
+            || lambdas_arr[0] > penalty_freeze_lambda_threshold)
+    {
         eprintln!(
             "[CAL][WARN] block=pred reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
             edf_pred, lambdas_arr[0]
         );
     }
-    if edf_pred_param < penalty_freeze_edf_threshold || lambdas_arr[1] > penalty_freeze_lambda_threshold {
+    if active_mask[1]
+        && (edf_pred_param < penalty_freeze_edf_threshold
+            || lambdas_arr[1] > penalty_freeze_lambda_threshold)
+    {
         eprintln!(
             "[CAL][WARN] block=pred_param reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
             edf_pred_param, lambdas_arr[1]
         );
     }
-    if edf_se < penalty_freeze_edf_threshold || lambdas_arr[2] > penalty_freeze_lambda_threshold {
+    if active_mask[2]
+        && (edf_se < penalty_freeze_edf_threshold
+            || lambdas_arr[2] > penalty_freeze_lambda_threshold)
+    {
         eprintln!(
             "[CAL][WARN] block=se reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
             edf_se, lambdas_arr[2]
         );
     }
-    if edf_dist < penalty_freeze_edf_threshold || lambdas_arr[3] > penalty_freeze_lambda_threshold {
+    if active_mask[3]
+        && (edf_dist < penalty_freeze_edf_threshold
+            || lambdas_arr[3] > penalty_freeze_lambda_threshold)
+    {
         eprintln!(
             "[CAL][WARN] block=dist reason=penalty_drives_block_to_zero action=proceed edf={:.3e} lambda={:.3e}",
             edf_dist, lambdas_arr[3]
@@ -1852,6 +1920,10 @@ mod tests {
         penalised_ll: f64,
         log_det_s: f64,
         log_det_h: f64,
+    }
+
+    fn dims4(dims: (usize, usize, usize, usize)) -> [usize; 4] {
+        [dims.0, dims.1, dims.2, dims.3]
     }
 
     /// Evaluates the LAML objective at a fixed rho for binomial/logistic regression.
@@ -3511,11 +3583,7 @@ mod tests {
         }
 
         // Fit models with low and high penalties
-        let nullspace_dims_with_ridge = [
-            schema_with_ridge.penalty_nullspace_dims.0,
-            schema_with_ridge.penalty_nullspace_dims.1,
-            schema_with_ridge.penalty_nullspace_dims.2,
-        ];
+        let nullspace_dims_with_ridge = dims4(schema_with_ridge.penalty_nullspace_dims);
         let fit_low = fit_calibrator(
             y.view(),
             w.view(),
@@ -3839,11 +3907,7 @@ mod tests {
             x.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema.penalty_nullspace_dims),
             LinkFunction::Logit,
         );
 
@@ -4736,7 +4800,10 @@ mod tests {
 
         let mut results = Vec::new();
         for &rho_pred in &probe_rhos {
-            let rho = [rho_pred, 0.0, 0.0];
+            let mut rho = vec![0.0; rs_blocks.len()];
+            if !rho.is_empty() {
+                rho[0] = rho_pred;
+            }
             let breakdown =
                 eval_laml_breakdown_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho);
             println!(
@@ -4828,11 +4895,7 @@ mod tests {
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema.penalty_nullspace_dims),
             LinkFunction::Logit,
         )
         .unwrap();
@@ -4841,6 +4904,7 @@ mod tests {
             lambdas_opt[0].ln(),
             lambdas_opt[1].ln(),
             lambdas_opt[2].ln(),
+            lambdas_opt[3].ln(),
         ];
 
         // Evaluate the stabilized LAML objective at the fitted lambdas and at a
@@ -4849,7 +4913,8 @@ mod tests {
         let f_opt =
             eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_opt);
 
-        let rho_identity = [(1e6_f64).ln(), rho_opt[1], rho_opt[2]];
+        let mut rho_identity = rho_opt.clone();
+        rho_identity[0] = (1e6_f64).ln();
         let f_identity =
             eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_identity);
 
@@ -5048,11 +5113,7 @@ mod tests {
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema.penalty_nullspace_dims),
             LinkFunction::Logit,
         );
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
@@ -5484,17 +5545,18 @@ mod tests {
             x_cal.view(),
             offset.view(),
             &rs_blocks,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema.penalty_nullspace_dims),
             LinkFunction::Logit,
         )
         .unwrap();
 
         let (beta, lambdas, _, _, _) = fit_result;
-        let rho_hat = [lambdas[0].ln(), lambdas[1].ln(), lambdas[2].ln()];
+        let rho_hat = [
+            lambdas[0].ln(),
+            lambdas[1].ln(),
+            lambdas[2].ln(),
+            lambdas[3].ln(),
+        ];
 
         // First test: evaluate objective at the optimizer's solution and perturbed points
         let f0 = eval_laml_fixed_rho_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho_hat);
@@ -5635,7 +5697,10 @@ mod tests {
         println!("|---------:|------------:|-------------:|---------:|--------:|-------:|");
 
         for &rho_pred in &probe_rhos {
-            let rho = [rho_pred, 0.0, 0.0];
+            let mut rho = vec![0.0; rs_blocks.len()];
+            if !rho.is_empty() {
+                rho[0] = rho_pred;
+            }
             let breakdown =
                 eval_laml_breakdown_binom(y.view(), w.view(), x_cal.view(), &rs_blocks, &rho);
             println!(
@@ -5728,13 +5793,19 @@ mod tests {
                 schema.penalty_nullspace_dims.0,
                 schema.penalty_nullspace_dims.1,
                 schema.penalty_nullspace_dims.2,
+                schema.penalty_nullspace_dims.3,
             ],
             LinkFunction::Identity,
         )
         .unwrap();
 
         let (beta, lambdas, scale, _, _) = fit_result;
-        let rho_hat = [lambdas[0].ln(), lambdas[1].ln(), lambdas[2].ln()];
+        let rho_hat = [
+            lambdas[0].ln(),
+            lambdas[1].ln(),
+            lambdas[2].ln(),
+            lambdas[3].ln(),
+        ];
 
         // First test: evaluate objective at the optimizer's solution and perturbed points
         let f0 = eval_laml_fixed_rho_gaussian(
@@ -5922,18 +5993,14 @@ mod tests {
                 x_cal.view(),
                 offset.view(),
                 &penalties,
-                &[
-                    schema.penalty_nullspace_dims.0,
-                    schema.penalty_nullspace_dims.1,
-                    schema.penalty_nullspace_dims.2,
-                ],
+                &dims4(schema.penalty_nullspace_dims),
                 LinkFunction::Logit,
             )
             .unwrap();
             let (beta, lambdas, _, _, _) = fit_result;
 
             // Return coefficients and lambdas for comparison
-            (beta, vec![lambdas[0], lambdas[1], lambdas[2]])
+            (beta, vec![lambdas[0], lambdas[1], lambdas[2], lambdas[3]])
         };
 
         // Run the whole process twice with the same seed
