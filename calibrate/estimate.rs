@@ -1404,11 +1404,14 @@ pub mod internal {
         /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
         /// If not, a small ridge is added to ensure positive definiteness, and that
         /// ridged matrix is returned along with the ridge value used.
-        fn effective_hessian<'p>(&self, pr: &'p PirlsResult) -> (Array2<f64>, f64) {
+        fn effective_hessian<'p>(
+            &self,
+            pr: &'p PirlsResult,
+        ) -> Result<(Array2<f64>, f64), EstimationError> {
             let base = pr.stabilized_hessian_transformed.clone();
 
             if base.cholesky(Side::Lower).is_ok() {
-                return (base, 0.0);
+                return Ok((base, 0.0));
             }
 
             let p = base.nrows();
@@ -1458,7 +1461,7 @@ pub mod internal {
                             current
                         );
                     }
-                    return (h_eff, current);
+                    return Ok((h_eff, current));
                 }
 
                 attempt += 1;
@@ -1468,11 +1471,24 @@ pub mod internal {
                     for i in 0..p {
                         h_eff[[i, i]] += fallback;
                     }
-                    log::error!(
-                        "Extremely large ridge {:.3e} applied to stabilized Hessian after repeated failures",
-                        fallback
-                    );
-                    return (h_eff, fallback);
+                    match h_eff.cholesky(Side::Lower) {
+                        Ok(_) => {
+                            log::error!(
+                                "Extremely large ridge {:.3e} applied to stabilized Hessian after repeated failures",
+                                fallback
+                            );
+                            return Ok((h_eff, fallback));
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "Failed to recover positive definiteness even after applying ridge {:.3e}",
+                                fallback
+                            );
+                            return Err(EstimationError::ModelIsIllConditioned {
+                                condition_number: f64::INFINITY,
+                            });
+                        }
+                    }
                 }
 
                 let scale_factor = 10f64.powi(attempt as i32);
@@ -1582,7 +1598,7 @@ pub mod internal {
             key: Option<Vec<u64>>,
         ) -> Result<EvalShared, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(rho)?;
-            let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref());
+            let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
             Ok(EvalShared {
                 key,
                 pirls_result,
@@ -1780,7 +1796,7 @@ pub mod internal {
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
         fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
-            let (h_eff, _) = self.effective_hessian(&pr);
+            let (h_eff, _) = self.effective_hessian(&pr)?;
             let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
                 let min_eig = h_eff
                     .clone()
@@ -3388,7 +3404,9 @@ pub mod internal {
         // effective Hessian and logdet path as compute_cost.
         fn half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> f64 {
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, _) = state.effective_hessian(&pr);
+            let (h_eff, _) = state
+                .effective_hessian(&pr)
+                .expect("effective Hessian");
             let chol = h_eff
                 .clone()
                 .cholesky(Side::Lower)
@@ -3415,7 +3433,9 @@ pub mod internal {
         fn half_logh_s_part(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             // ½·λk tr(H_eff⁻¹ S_k)
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, ridge_used) = state.effective_hessian(&pr);
+            let (h_eff, ridge_used) = state
+                .effective_hessian(&pr)
+                .expect("effective Hessian");
             let factor = state.get_faer_factor(rho, &h_eff, ridge_used);
             let lambdas = rho.mapv(f64::exp);
             let mut g = Array1::zeros(rho.len());
