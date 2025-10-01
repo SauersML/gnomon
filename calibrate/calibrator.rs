@@ -1696,6 +1696,10 @@ pub fn fit_calibrator(
     let mut active_axes: Vec<usize> = Vec::new();
     let mut dropped_axes: Vec<&str> = Vec::new();
 
+    let dims_len = penalty_nullspace_dims.len();
+    let dims_match_total = dims_len == penalties.len();
+    let mut active_dim_index = 0usize;
+
     for (idx, penalty_matrix) in penalties.iter().enumerate() {
         let max_abs = penalty_matrix
             .iter()
@@ -1705,10 +1709,30 @@ pub fn fit_calibrator(
         if is_active {
             active_axes.push(idx);
             active_penalties.push(penalty_matrix.clone());
-            let null_dim = penalty_nullspace_dims
-                .get(idx)
-                .copied()
-                .unwrap_or(0);
+            let null_dim = if dims_match_total {
+                penalty_nullspace_dims
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "Nullspace dimension missing for penalty block {}",
+                            idx
+                        ))
+                    })?
+            } else {
+                let null_dim = penalty_nullspace_dims
+                    .get(active_dim_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "Nullspace dimension list length {} is insufficient for {} active penalties",
+                            dims_len,
+                            active_dim_index + 1
+                        ))
+                    })?;
+                active_dim_index += 1;
+                null_dim
+            };
             active_null_dims.push(null_dim);
         } else {
             let axis_name = axis_labels.get(idx).copied().unwrap_or("unknown");
@@ -1717,6 +1741,14 @@ pub fn fit_calibrator(
     }
 
     let active_penalty_count = active_penalties.len();
+
+    if !dims_match_total && dims_len != active_penalty_count {
+        return Err(EstimationError::InvalidInput(format!(
+            "Nullspace dimension list length {} must match number of active penalties {}",
+            dims_len,
+            active_penalty_count
+        )));
+    }
 
     let opts = ExternalOptimOptions {
         link,
@@ -1764,13 +1796,6 @@ pub fn fit_calibrator(
                 s.ncols()
             )));
         }
-    }
-    if penalty_nullspace_dims.len() != penalties.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "Nullspace dimension list length {} must match number of penalties {}",
-            penalty_nullspace_dims.len(),
-            penalties.len()
-        )));
     }
     eprintln!(
         "[CAL] Shape check passed: X p={}, all penalties are {}×{}",
