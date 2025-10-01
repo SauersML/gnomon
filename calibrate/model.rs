@@ -35,6 +35,18 @@ pub enum LinkFunction {
     Identity,
 }
 
+/// Configuration toggle for tensor-product interaction penalties.
+///
+/// * `Isotropic` matches the historical behavior with a single penalty parameter
+///   using whitened marginal bases.
+/// * `Anisotropic` builds separate penalties for each marginal direction using
+///   the unwhitened bases. This is the new default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InteractionPenaltyKind {
+    Isotropic,
+    Anisotropic,
+}
+
 /// Configuration for a single basis expansion (e.g., for one variable).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasisConfig {
@@ -79,6 +91,7 @@ pub struct ModelConfig {
     pub pc_configs: Vec<PrincipalComponentConfig>,
     // Data-dependent parameters saved from training are crucial for prediction.
     pub pgs_range: (f64, f64),
+    pub interaction_penalty: InteractionPenaltyKind,
 
     /// Sum-to-zero constraint transformations (separate from range transforms)
     /// Maps term names (e.g., "pgs_main") to their sum-to-zero transformation matrices
@@ -116,6 +129,7 @@ impl ModelConfig {
             },
             pc_configs: Vec::new(),
             pgs_range: (0.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -648,18 +662,24 @@ mod internal {
 
         // Stage: Add tensor product interaction effects (only if PCs are present)
         if !config.pc_configs.is_empty() {
-            // Use WHITENED basis for consistency with training
-            let z_range_pgs_pred = config
-                .range_transforms
-                .get("pgs")
-                .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?;
+            // Reconstruct interaction marginals using the same basis choice used during training
+            let pgs_int_basis = match config.interaction_penalty {
+                InteractionPenaltyKind::Isotropic => {
+                    let z_range_pgs_pred = config
+                        .range_transforms
+                        .get("pgs")
+                        .ok_or_else(|| {
+                            ModelError::ConstraintMissing("pgs range transform".to_string())
+                        })?;
 
-            // Check dimensions before matrix multiplication to prevent panic
-            if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
-                return Err(ModelError::InternalStackingError);
-            }
+                    if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
+                        return Err(ModelError::InternalStackingError);
+                    }
 
-            let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs_pred);
+                    pgs_main_basis_unc.dot(z_range_pgs_pred)
+                }
+                InteractionPenaltyKind::Anisotropic => pgs_main_basis_unc.to_owned(),
+            };
 
             for pc_idx in 0..config.pc_configs.len() {
                 let pc_name = &config.pc_configs[pc_idx].name;
@@ -667,17 +687,25 @@ mod internal {
 
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
-                    let z_range_pc_pred = config
-                        .range_transforms
-                        .get(pc_name)
-                        .ok_or_else(|| ModelError::InternalStackingError)?;
+                    let pc_int_basis = match config.interaction_penalty {
+                        InteractionPenaltyKind::Isotropic => {
+                            let z_range_pc_pred = config
+                                .range_transforms
+                                .get(pc_name)
+                                .ok_or_else(|| ModelError::InternalStackingError)?;
 
-                    // Check dimensions before matrix multiplication to prevent panic
-                    if pc_unconstrained_bases_main[pc_idx].ncols() != z_range_pc_pred.nrows() {
-                        return Err(ModelError::InternalStackingError);
-                    }
+                            if pc_unconstrained_bases_main[pc_idx].ncols()
+                                != z_range_pc_pred.nrows()
+                            {
+                                return Err(ModelError::InternalStackingError);
+                            }
 
-                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc_pred);
+                            pc_unconstrained_bases_main[pc_idx].dot(z_range_pc_pred)
+                        }
+                        InteractionPenaltyKind::Anisotropic => {
+                            pc_unconstrained_bases_main[pc_idx].to_owned()
+                        }
+                    };
 
                     let mut tensor_interaction =
                         row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
@@ -828,6 +856,7 @@ mod tests {
                 },
                 pc_configs: vec![],
                 pgs_range: (0.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: {
                     let mut constraints = HashMap::new();
                     constraints.insert("pgs_main".to_string(), z_transform.clone());
@@ -918,6 +947,7 @@ mod tests {
                     range: (-1.0, 1.0),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
@@ -1019,6 +1049,7 @@ mod tests {
                 },
             ],
             pgs_range: (0.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -1101,6 +1132,7 @@ mod tests {
                 range: (-0.5, 0.5),
             }],
             pgs_range: (-1.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
             range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
@@ -1156,6 +1188,7 @@ mod tests {
                     range: (-0.5, 0.5),
                 }],
                 pgs_range: (-1.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
                 knot_vectors, // Use the knot vectors generated by the model-building code
                 range_transforms: range_transforms.clone(), // Use full Option 3 pipeline

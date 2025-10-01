@@ -10,7 +10,7 @@ use std::process;
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
-use gnomon::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
+use gnomon::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, TrainedModel};
 
 use clap::Args;
 use ndarray::{Array1, ArrayView1};
@@ -136,6 +136,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         pgs_basis_config,
         pc_configs,
         pgs_range,
+        interaction_penalty: InteractionPenaltyKind::Anisotropic,
         sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
