@@ -1909,6 +1909,7 @@ pub fn fit_calibrator(
 mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
+    use crate::calibrate::construction::ModelLayout;
     use ndarray::{Array1, Array2, Axis};
     use rand::prelude::*;
     use rand_distr::{Bernoulli, Distribution, Normal, Uniform};

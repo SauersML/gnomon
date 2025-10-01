@@ -2189,6 +2189,8 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
+    use crate::calibrate::basis::create_difference_penalty_matrix;
     use crate::calibrate::construction::{
         build_design_and_penalty_matrices, compute_penalty_square_roots,
     };
@@ -2527,6 +2529,87 @@ mod tests {
         println!(
             "✓ Test passed: Different smoothing parameters correctly produced different reparameterizations."
         );
+    }
+
+    /// The stable reparameterization must correctly detect the null space of
+    /// standard spline penalties. If it treats the entire block as full rank,
+    /// the pseudo-determinant and EDF calculations become invalid.
+    #[test]
+    fn test_stable_reparameterization_preserves_nullspace_rank() {
+        use crate::calibrate::construction::{
+            compute_penalty_square_roots, stable_reparameterization, ModelLayout,
+        };
+
+        // Create a canonical cubic spline penalty (second-order differences)
+        // whose null space has dimension two.
+        let num_basis_functions = 10;
+        let penalty_order = 2;
+        let penalty = create_difference_penalty_matrix(num_basis_functions, penalty_order)
+            .expect("valid difference penalty");
+
+        // Compute the analytical rank from the eigen-spectrum.
+        let (eigenvalues, _) = penalty
+            .eigh(Side::Lower)
+            .expect("eigendecomposition of penalty matrix");
+        let max_eigenvalue = eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc: f64, &val| acc.max(val));
+        let tolerance = if max_eigenvalue > 0.0 {
+            max_eigenvalue * 1e-12
+        } else {
+            1e-12
+        };
+        let expected_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+        // Confirm the canonical null-space dimension (rank = k - order).
+        assert_eq!(expected_rank, num_basis_functions - penalty_order);
+
+        // Construct penalty square roots and verify their rank matches expectations.
+        let rs_list = compute_penalty_square_roots(&[penalty.clone()]).expect("penalty roots");
+        assert_eq!(rs_list[0].nrows(), expected_rank);
+        assert_eq!(rs_list[0].ncols(), num_basis_functions);
+
+        // Run stable reparameterization and confirm the null space dimension is preserved.
+        let layout = ModelLayout::external(num_basis_functions, 1);
+        let lambdas = vec![1.0];
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("stable reparameterization");
+
+        assert_eq!(
+            reparam.e_transformed.nrows(),
+            expected_rank,
+            "Stable reparameterization should preserve the penalty's null space dimension",
+        );
+
+        // Validate the pseudo-determinant uses only the positive eigenvalues.
+        let positive_eigs: Vec<f64> = eigenvalues
+            .iter()
+            .copied()
+            .filter(|&ev| ev > tolerance)
+            .collect();
+        let expected_log_det: f64 = positive_eigs
+            .iter()
+            .map(|&ev| ev.ln())
+            .sum::<f64>();
+        assert_abs_diff_eq!(reparam.log_det, expected_log_det, epsilon = 1e-9);
+
+        // The transformed penalty should expose the same null-space dimension.
+        let (transformed_eigs, _) = reparam
+            .s_transformed
+            .eigh(Side::Lower)
+            .expect("eigendecomposition of transformed penalty");
+        let transformed_max = transformed_eigs
+            .iter()
+            .fold(0.0_f64, |acc: f64, &val| acc.max(val));
+        let transformed_tol = if transformed_max > 0.0 {
+            transformed_max * 1e-12
+        } else {
+            1e-12
+        };
+        let transformed_rank = transformed_eigs
+            .iter()
+            .filter(|&&ev| ev > transformed_tol)
+            .count();
+        assert_eq!(transformed_rank, expected_rank);
     }
 
     /// Helper to set up the inputs required for `fit_model_for_fixed_rho`.
