@@ -1707,8 +1707,18 @@ pub fn fit_calibrator(
         penalties.len(),
         link
     );
+    let active_axes = penalties
+        .iter()
+        .filter(|matrix| matrix.iter().any(|&v| v.abs() > 1e-12))
+        .count();
+    let smooth_desc = match active_axes {
+        0 => "no calibrator smooths".to_string(),
+        1 => "the calibrator smooth".to_string(),
+        n => format!("all {} calibrator smooths", n),
+    };
     eprintln!(
-        "[CAL] Using same spline family for all three calibrator smooths as the base PGS smooth"
+        "[CAL] Using same spline family for {} as the base PGS smooth",
+        smooth_desc
     );
 
     // ---- SHAPE GUARD: X and all S_k must agree (return typed error, do not panic) ----
