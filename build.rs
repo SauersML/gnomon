@@ -17,8 +17,14 @@ struct ForbiddenCommentCollector {
     check_stars_in_doc_comments: bool,
 }
 
-// A custom collector for checking if all alphabetic characters are uppercase
+// A custom collector for checking if comments have an excessive ratio of uppercase characters
 struct CustomUppercaseCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+// A custom collector for checking if comments are primarily composed of dashes
+struct DashHeavyCommentCollector {
     violations: Vec<String>,
     file_path: PathBuf,
 }
@@ -100,7 +106,7 @@ impl ForbiddenCommentCollector {
         error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str(
-            "   Comments containing only uppercase alphabetic characters are not allowed.\n",
+            "   Comments where over 80% of alphabetic characters are uppercase are not allowed.\n",
         );
         error_msg.push_str("   Please remove these patterns before committing.\n");
 
@@ -123,7 +129,7 @@ impl CustomUppercaseCollector {
 
         let file_name = self.file_path.to_str().unwrap_or("?");
         let mut error_msg = format!(
-            "\n❌ ERROR: Found {} comments with all uppercase alphabetic characters in {}:\n",
+            "\n❌ ERROR: Found {} comments with excessive uppercase alphabetic characters in {}:\n",
             self.violations.len(),
             file_name
         );
@@ -132,8 +138,43 @@ impl CustomUppercaseCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ Comments where all alphabetic characters are uppercase are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str(
+            "\n⚠️ Comments where over 80% of alphabetic characters are uppercase are STRICTLY FORBIDDEN in this project.\n",
+        );
         error_msg.push_str("   STRONGLY CONSIDER deleting the comment completely.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl DashHeavyCommentCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} comments composed primarily of dashes in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Comments where over 80% of non-whitespace characters are dashes are STRICTLY FORBIDDEN in this project.\n",
+        );
+        error_msg.push_str("   Remove decorative dash-only comments completely.\n");
 
         Some(error_msg)
     }
@@ -324,9 +365,58 @@ impl Sink for CustomUppercaseCollector {
         // Find all alphabetic characters
         let alpha_chars: Vec<char> = comment_text.chars().filter(|c| c.is_alphabetic()).collect();
 
-        // Check if we have any alphabetic chars and if all are uppercase
-        if !alpha_chars.is_empty() && alpha_chars.iter().all(|c| c.is_uppercase()) {
-            self.violations.push(format!("{line_number}:{line_text}"));
+        if !alpha_chars.is_empty() {
+            let uppercase_count = alpha_chars.iter().filter(|c| c.is_uppercase()).count();
+            let uppercase_ratio = uppercase_count as f64 / alpha_chars.len() as f64;
+
+            if uppercase_ratio > 0.8 {
+                self.violations.push(format!("{line_number}:{line_text}"));
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+impl Sink for DashHeavyCommentCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        if !line_text.trim_start().starts_with("//")
+            && !line_text.contains("/*")
+            && !line_text.starts_with("///")
+        {
+            return Ok(true);
+        }
+
+        let comment_text = if line_text.trim_start().starts_with("///") {
+            line_text.trim_start()[3..].trim()
+        } else if line_text.trim_start().starts_with("//") {
+            line_text.trim_start()[2..].trim()
+        } else if let Some(idx) = line_text.find("/*") {
+            match line_text[idx + 2..].find("*/") {
+                Some(end) => line_text[idx + 2..idx + 2 + end].trim(),
+                None => line_text[idx + 2..].trim(),
+            }
+        } else {
+            return Ok(true);
+        };
+
+        let non_whitespace_chars: Vec<char> = comment_text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        if !non_whitespace_chars.is_empty() {
+            let dash_count = non_whitespace_chars.iter().filter(|c| **c == '-').count();
+            let dash_ratio = dash_count as f64 / non_whitespace_chars.len() as f64;
+
+            if dash_ratio > 0.8 {
+                self.violations.push(format!("{line_number}:{line_text}"));
+            }
         }
 
         Ok(true)
@@ -555,8 +645,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     let forbidden_words_pattern = r"(//|/\*|///).*(?:FIXED|CORRECTED|FIX|FIXES|NEW|CHANGED|CHANGES|CHANGE|MODIFIED|MODIFIES|MODIFY|UPDATED|UPDATES|UPDATE)";
     // 2. Pattern to catch ** in comments (excluding doc comments)
     let stars_pattern = r"(//|/\*).*\*\*";
-    // 3. Pattern to catch comments where all alphabetic characters are uppercase
+    // 3. Pattern to catch comments for uppercase ratio enforcement
     let all_caps_pattern = r"(//|/\*|///).*";
+    // 4. Pattern to catch comments that might be composed primarily of dashes
+    let dash_heavy_pattern = r"(//|/\*|///).*";
 
     // Check for forbidden words
     match RegexMatcher::new_line_matcher(forbidden_words_pattern) {
@@ -627,7 +719,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         }
     }
 
-    // Check for comments where all alphabetic characters are uppercase
+    // Check for comments where the uppercase ratio exceeds the threshold
     match RegexMatcher::new_line_matcher(all_caps_pattern) {
         Ok(all_caps_matcher) => {
             let mut searcher = Searcher::new();
@@ -657,6 +749,38 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         Err(e) => {
             // Record the error but don't return early
             all_violations.push(format!("Error creating uppercase pattern regex: {}", e));
+        }
+    }
+
+    // Check for comments composed primarily of dashes
+    match RegexMatcher::new_line_matcher(dash_heavy_pattern) {
+        Ok(dash_matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.path().starts_with("./target"))
+                .filter(|e| e.file_name() != "build.rs")
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                let mut dash_collector = DashHeavyCommentCollector::new(path);
+                if searcher
+                    .search_path(&dash_matcher, path, &mut dash_collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = dash_collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!("Error creating dash-heavy pattern regex: {}", e));
         }
     }
 

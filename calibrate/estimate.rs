@@ -1508,28 +1508,22 @@ pub mod internal {
             lambdas: &Array1<f64>,
             h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
-            // ---------------------------------------------------------------------------------
-            //  WHY WE CAN SAFELY CACHE FACTORS BY ρ (rho)
-            // ---------------------------------------------------------------------------------
+            // Why caching by ρ is sound:
             // The effective degrees of freedom (EDF) calculation is one of only two places where
             // we ask for a Faer factorization through `get_faer_factor`.  The cache inside that
-            // helper uses **only** the vector of log smoothing parameters (ρ) as the key.  That
-            // can look suspicious at first glance: if we ever passed two *different* Hessians for
-            // the same ρ we could accidentally reuse the wrong factorization.
-            //
-            // However, the surrounding call graph guarantees that every request made from this
-            // method is always for the *same flavour* of Hessian:
+            // helper uses only the vector of log smoothing parameters (ρ) as the key.  At first
+            // glance that can look risky—two different Hessians with the same ρ might appear to be
+            // conflated.  The surrounding call graph prevents that situation:
             //   • Identity / Gaussian models call `edf_from_h_and_rk` with the stabilized Hessian
             //     `pirls_result.stabilized_hessian_transformed`.
             //   • Non-Gaussian (logit / LAML) models call it with the effective / ridged Hessian
             //     returned by `effective_hessian(pr)`.
             // Within a given `RemlState` we never switch between those two flavours—the state is
             // constructed for a single link function, so the cost/gradient pathways stay aligned.
-            //
             // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
-            // practice, and the cache cannot hand back a factorization of a "wrong" matrix.  The
-            // comments here spell this out explicitly so future refactors can revisit the cache key
-            // if we ever loosen those invariants.
+            // practice, and the cache cannot hand back a factorization of an unintended matrix.
+            // Keeping this comment detailed makes it easier to revisit the cache key if we ever
+            // loosen those invariants.
 
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
@@ -1588,26 +1582,20 @@ pub mod internal {
         }
 
         fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
-            // ---------------------------------------------------------------------------------
-            //  CACHING STRATEGY (ρ-ONLY KEY) — EXTENSIVE NOTE FOR FUTURE MAINTAINERS
-            // ---------------------------------------------------------------------------------
-            // The cache deliberately ignores *which* Hessian matrix we are factoring.  Today this
-            // is sound because every caller obeys a single rule:
-            //
+            // Cache strategy: ρ alone is the key.
+            // The cache deliberately ignores which Hessian matrix we are factoring.  Today this is
+            // sound because every caller obeys a single rule:
             //   • Identity/Gaussian REML cost & gradient only ever request factors of the
             //     stabilized Hessian.
             //   • Non-Gaussian (logit/LAML) cost requests factors of the effective/ridged Hessian,
             //     and the gradient path never touches this cache.
-            //
             // Consequently each ρ corresponds to exactly one matrix within the lifetime of a
             // `RemlState`, so returning the cached factorization is correct.
-            //
-            // This design *is* brittle: adding a new code path that calls `get_faer_factor` with a
-            // different H for the same ρ would silently reuse the wrong factor.  If you introduce
-            // such a path, extend the key (e.g., add an enum that records which Hessian variant is
-            // being factored, or hash the diagonal) or split the cache.  Until then we prefer the
-            // cheaper key because it maximizes cache hits across repeated EDF/gradient evaluations
-            // for the same smoothing parameters.
+            // This design is still brittle: adding a new code path that calls `get_faer_factor`
+            // with a different H for the same ρ would silently reuse the wrong factor.  If such a
+            // path ever appears, extend the key (for example by tagging the Hessian variant) or
+            // split the cache.  Until then we prefer the cheaper key because it maximizes cache
+            // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
                 if let Some(f) = self.faer_factor_cache.borrow().get(key) {
@@ -2547,21 +2535,17 @@ pub mod internal {
                         let r_beta = r_k.dot(beta_transformed);
                         let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
-                        // ---
-                        // Component 1: Derivative of the Penalized Deviance
+                        // Component 1: derivative of the penalized deviance.
                         // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
                         // φ is treated as fixed at φ̂ when taking the derivative, so there is no hidden
                         // dφ/dρ contribution.  This matches Wood (2011) and mgcv’s
                         // `REML1 <- oo$D1/(2*scale*gamma)` expression.
-                        // ---
 
                         let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
                         let deviance_grad_term = d1 / (2.0 * scale);
 
-                        // ---
-                        // Component 2: Derivative of the Penalized Hessian Determinant
-                        // R/C Counterpart: `oo$trA1/2`
-                        // ---
+                        // Component 2: derivative of the penalized Hessian determinant.
+                        // R/C counterpart: `oo$trA1/2`.
                         // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
                         let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
                         let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
@@ -2571,21 +2555,17 @@ pub mod internal {
                         let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                         let log_det_h_grad_term = tra1 / 2.0;
 
-                        // ---
-                        // Component 3: Derivative of the Penalty Pseudo-Determinant
-                        // Use the stable derivative from P-IRLS reparameterization
-                        // ---
+                        // Component 3: derivative of the penalty pseudo-determinant.
+                        // Use the stable derivative from the P-IRLS reparameterization.
                         let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
 
-                        // ---
-                        // Final Gradient Assembly for the MINIMIZER
-                        // This calculation now DIRECTLY AND LITERALLY matches the formula for `REML1`
-                        // in `gam.fit3.R`, which is the gradient of the cost function that `newton` MINIMIZES.
-                        // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`
+                        // Final gradient assembly for the minimizer.
+                        // This calculation now matches the formula for `REML1` in `gam.fit3.R`,
+                        // which is the gradient of the cost function that `newton` minimizes.
+                        // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`.
                         // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
                         // the gradient already accounts for the changing scale; adding dφ/dρ here would
                         // double-count the effect and contradict the envelope theorem.
-                        // ---
                         cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
                                          + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
                                          - log_det_s_grad_term; // Corresponds to `- rp$det1/2`

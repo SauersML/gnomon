@@ -1471,9 +1471,8 @@ pub fn build_calibrator_design(
             .collect::<Vec<_>>()
     );
 
-    // No cross-block normalization - keep only the per-block unit-mean-eig scaling
-    // This maintains the scientific meaning of the smoothing parameters
-    // -----------------------------------------------------------------------
+    // No cross-block normalization: keep only the per-block unit-mean-eigenvalue scaling.
+    // This preserves the scientific meaning of the smoothing parameters.
 
     Ok((x, penalties, schema, offset))
 }
@@ -1766,7 +1765,7 @@ pub fn fit_calibrator(
         smooth_desc
     );
 
-    // ---- SHAPE GUARD: X and all S_k must agree (return typed error, do not panic) ----
+    // Shape guard: X and all S_k must agree (return typed error, do not panic).
     let p = x.ncols();
     for (k, s) in penalties.iter().enumerate() {
         if s.nrows() != p || s.ncols() != p {
@@ -1784,7 +1783,7 @@ pub fn fit_calibrator(
         "[CAL] Shape check passed: X p={}, all penalties are {}×{}",
         p, p, p
     );
-    // -----------------------------------------------
+    // End of shape guard: all penalty matrices now match the design width.
 
     let res = optimize_external_design(
         y,
