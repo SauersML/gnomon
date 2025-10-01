@@ -260,7 +260,11 @@ impl TrainedModel {
         )?;
         let beta = internal::flatten_coefficients(&self.coefficients, &self.config)?;
         if x_new.ncols() != beta.len() {
-            return Err(ModelError::InternalStackingError);
+            return Err(ModelError::DimensionMismatch(format!(
+                "prediction rebuild mismatch: design matrix columns ({}) != coefficient length ({})",
+                x_new.ncols(),
+                beta.len()
+            )));
         }
 
         // --- Linear predictor and mean ---
@@ -1225,22 +1229,29 @@ mod tests {
                     },
                 },
                 interaction_effects: {
-                    // Interaction term uses Range × Range dimensions
-                    let r_pgs = range_transforms.get("pgs").unwrap().ncols();
-                    let r_pc1 = range_transforms.get("PC1").unwrap().ncols();
-
                     let mut interactions = HashMap::new();
 
-                    // Calculate the total number of interaction coefficients for Range × Range
-                    let total_interaction_coeffs = r_pgs * r_pc1;
+                    for (pc_idx, pc_cfg) in model_config.pc_configs.iter().enumerate() {
+                        let block_idx = *layout
+                            .interaction_block_idx
+                            .get(pc_idx)
+                            .expect("interaction block index missing");
+                        let block = layout
+                            .penalty_map
+                            .get(block_idx)
+                            .expect("interaction block missing from layout.penalty_map");
+                        let num_cols = block.col_range.end - block.col_range.start;
 
-                    // Create a single flattened vector of coefficients
-                    let interaction_coeffs: Vec<f64> = (1..=total_interaction_coeffs)
-                        .map(|i| i as f64 * 10.0) // Example values
-                        .collect();
+                        let coeffs: Vec<f64> = (1..=num_cols)
+                            .map(|i| i as f64 * 10.0)
+                            .collect();
 
-                    // Insert under the single, correct key
-                    interactions.insert("f(PGS,PC1)".to_string(), interaction_coeffs);
+                        interactions.insert(
+                            format!("f(PGS,{})", pc_cfg.name),
+                            coeffs,
+                        );
+                    }
+
                     interactions
                 },
             },
