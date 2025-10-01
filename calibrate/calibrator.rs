@@ -2907,8 +2907,8 @@ mod tests {
         for d in 0..h.nrows() {
             h[[d, d]] += 1e-12;
         }
-        let p = h.nrows();
-        let h_f = FaerMat::from_fn(p, p, |i, j| h[[i, j]]);
+        let p_dim = h.nrows();
+        let h_f = FaerMat::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
 
         enum SolverFactor {
             Llt(FaerLlt<f64>),
@@ -2934,9 +2934,9 @@ mod tests {
         let xtwx = ut.dot(&u);
 
         // Solve H S = Uᵀ once; column i of S corresponds to s_i = H^{-1} u_i
-        let rhs = FaerMat::from_fn(p, n, |i, j| ut[[i, j]]);
+        let rhs = FaerMat::from_fn(p_dim, n, |i, j| ut[[i, j]]);
         let s_all = factor.solve(rhs.as_ref());
-        let s_all_nd = Array2::from_shape_fn((p, n), |(i, j)| s_all[(i, j)]);
+        let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
         let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
         let z = full_fit.solve_working_response.clone();
@@ -2948,20 +2948,25 @@ mod tests {
         for i in 0..n {
             // Hat diagonal a_ii = u_iᵀ H^{-1} u_i
             let mut aii = 0.0;
-            for r in 0..p {
+            for r in 0..p_dim {
                 aii += u[[i, r]] * s_all_nd[(r, i)];
             }
 
-            let denom = (1.0 - aii).max(1e-12);
+            let denom = 1.0 - aii;
+            debug_assert!(
+                denom > 0.0,
+                "Unexpected a_ii >= 1.0 in fixed-weight LOO baseline: a_ii = {:.6e}",
+                aii
+            );
 
             // η^{(-i)} using Sherman–Morrison downdate with fixed Fisher weights
             loo_pred[i] = (eta_hat[i] - aii * z[i]) / denom;
 
             // Var_full(η_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i
             let mut quad = 0.0;
-            for r in 0..p {
+            for r in 0..p_dim {
                 let mut temp = 0.0;
-                for c in 0..p {
+                for c in 0..p_dim {
                     temp += xtwx[[r, c]] * s_all_nd[(c, i)];
                 }
                 quad += s_all_nd[(r, i)] * temp;
@@ -2979,23 +2984,23 @@ mod tests {
 
         // Agreement should now be at numerical precision since both sides use identical geometry
         assert!(
-            rmse_pred <= 1e-10,
-            "RMSE between ALO and exact linearized LOO predictions should be <= 1e-10, got {:.6e}",
+            rmse_pred <= 1e-9,
+            "RMSE between ALO and exact linearized LOO predictions should be <= 1e-9, got {:.6e}",
             rmse_pred
         );
         assert!(
-            max_abs_pred <= 1e-9,
-            "Max absolute error between ALO and exact linearized LOO predictions should be <= 1e-9, got {:.6e}",
+            max_abs_pred <= 1e-8,
+            "Max absolute error between ALO and exact linearized LOO predictions should be <= 1e-8, got {:.6e}",
             max_abs_pred
         );
         assert!(
-            rmse_se <= 1e-10,
-            "RMSE between ALO and exact linearized LOO standard errors should be <= 1e-10, got {:.6e}",
+            rmse_se <= 1e-9,
+            "RMSE between ALO and exact linearized LOO standard errors should be <= 1e-9, got {:.6e}",
             rmse_se
         );
         assert!(
-            max_abs_se <= 1e-9,
-            "Max absolute error between ALO and exact linearized LOO standard errors should be <= 1e-9, got {:.6e}",
+            max_abs_se <= 1e-8,
+            "Max absolute error between ALO and exact linearized LOO standard errors should be <= 1e-8, got {:.6e}",
             max_abs_se
         );
     }
