@@ -262,8 +262,9 @@ pub fn train_model(
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
                 // Weighted RSS over residuals divided by (n - edf)
-                let fitted = x_matrix.dot(&final_beta_original);
-                let residuals = data.y.clone() - &fitted;
+                let mut fitted = reml_state.offset().to_owned();
+                fitted += &x_matrix.dot(&final_beta_original);
+                let residuals = reml_state.y().to_owned() - &fitted;
                 let weighted_rss: f64 = data
                     .weights
                     .iter()
