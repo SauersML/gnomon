@@ -3,7 +3,6 @@ use crate::calibrate::basis::{
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
-#[cfg(test)]
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 #[cfg(test)]
