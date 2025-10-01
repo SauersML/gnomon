@@ -5,6 +5,8 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 #[cfg(test)]
+use crate::calibrate::construction::ModelLayout;
+#[cfg(test)]
 use crate::calibrate::model::ModelConfig;
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
