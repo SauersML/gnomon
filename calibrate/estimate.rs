@@ -969,8 +969,6 @@ pub fn train_model(
                 standardize_dist: schema.standardize_dist,
                 se_linear_fallback: schema.se_linear_fallback,
                 dist_linear_fallback: schema.dist_linear_fallback,
-                se_center_offset: schema.se_center_offset,
-                dist_center_offset: schema.dist_center_offset,
                 lambda_pred: lambdas_cal[0],
                 lambda_pred_param: lambdas_cal[1],
                 lambda_se: lambdas_cal[2],
