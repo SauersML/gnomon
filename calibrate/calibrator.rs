@@ -2881,7 +2881,7 @@ mod tests {
     }
 
     #[test]
-    fn alo_matches_true_loo_small_n_binomial() {
+    fn alo_matches_exact_linearized_loo_small_n_binomial() {
         // Create a small synthetic dataset
         let n = 150;
         let p = 10;
@@ -2895,105 +2895,112 @@ mod tests {
         // Compute ALO features
         let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
 
-        // Perform true leave-one-out by refitting n times
-        let mut loo_pred = Array1::zeros(n);
-        let mut loo_se = Array1::zeros(n);
+        // Build the exact Sherman–Morrison LOO baseline using the full-fit Fisher geometry
+        let w_full = full_fit.final_weights.clone();
+        let sqrt_w = w_full.mapv(f64::sqrt);
+        let mut u = full_fit.x_transformed.clone();
+        let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
+        u *= &sqrt_w_col;
 
-        for i in 0..n {
-            // Create training data without observation i
-            let mut x_loo = Array2::zeros((n - 1, p));
-            let mut y_loo = Array1::zeros(n - 1);
-            let mut w_loo = Array1::zeros(n - 1);
+        // Start from the penalized Hessian in the transformed basis and add the same tiny ridge
+        let mut h = full_fit.penalized_hessian_transformed.clone();
+        for d in 0..h.nrows() {
+            h[[d, d]] += 1e-12;
+        }
+        let p_dim = h.nrows();
+        let h_f = FaerMat::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
 
-            let mut idx = 0;
-            for j in 0..n {
-                if j != i {
-                    for k in 0..p {
-                        x_loo[[idx, k]] = x[[j, k]];
-                    }
-                    y_loo[idx] = y[j];
-                    w_loo[idx] = w[j];
-                    idx += 1;
+        enum SolverFactor {
+            Llt(FaerLlt<f64>),
+            Ldlt(FaerLdlt<f64>),
+        }
+        impl SolverFactor {
+            fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+                match self {
+                    SolverFactor::Llt(f) => f.solve(rhs),
+                    SolverFactor::Ldlt(f) => f.solve(rhs),
                 }
             }
-
-            // Fit LOO model
-            let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
-
-            // Predict for held-out point using the original coefficient basis
-            let beta_loo = beta_in_original_basis(&loo_fit);
-            let x_i = x.row(i).to_owned();
-            let eta_i = x_i.dot(&beta_loo);
-
-            // Standard error calculation using LLT approach
-            // For weighted regression, SE of prediction at x0 is sqrt(x0' (X'WX)^(-1) x0)
-
-            // Build K = X^T W X at the LOO fit, add tiny ridge
-            let mut k = Array2::<f64>::zeros((p, p));
-            let w_fish_loo = loo_fit.final_weights.clone();
-            for r in 0..(n - 1) {
-                let wi = w_fish_loo[r];
-                if wi == 0.0 {
-                    continue;
-                }
-                let xi = x_loo.row(r);
-                for a in 0..p {
-                    for b in 0..p {
-                        k[[a, b]] += wi * xi[a] * xi[b];
-                    }
-                }
-            }
-            for d in 0..p {
-                k[[d, d]] += 1e-12;
-            } // tiny ridge for stability
-
-            // Use faer LLT to factor and solve
-            let kf = FaerMat::from_fn(p, p, |i, j| k[[i, j]]);
-            let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
-
-            // Solve for c_i = x_i^T K^{-1} x_i
-            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
-            let s = llt.solve(rhs.as_ref());
-            let mut ci = 0.0;
-            for r in 0..p {
-                ci += x_i[r] * s[(r, 0)];
-            }
-
-            // Correct "true" LOO SE: the covariance comes from re-estimating the fit without point i
-            // Building K from the LOO fit captures the re-estimated weights directly; it is not
-            // an explicit 1/(1 - a_ii) inflation of the full-fit covariance
-            // This matches our correct ALO formula: SE = sqrt(phi * ci / (1 - a_ii))
-            loo_pred[i] = eta_i;
-            loo_se[i] = ci.sqrt();
         }
 
-        // Compare ALO predictions with true LOO
+        let factor = if let Ok(f) = FaerLlt::new(h_f.as_ref(), Side::Lower) {
+            SolverFactor::Llt(f)
+        } else {
+            let ldlt = FaerLdlt::new(h_f.as_ref(), Side::Lower).expect("LDLT factorization failed");
+            SolverFactor::Ldlt(ldlt)
+        };
+
+        let ut = u.t();
+        let xtwx = ut.dot(&u);
+
+        // Solve H S = Uᵀ once; column i of S corresponds to s_i = H^{-1} u_i
+        let rhs = FaerMat::from_fn(p_dim, n, |i, j| ut[[i, j]]);
+        let s_all = factor.solve(rhs.as_ref());
+        let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
+
+        let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
+        let z = full_fit.solve_working_response.clone();
+        let phi = 1.0_f64;
+
+        let mut loo_pred = Array1::<f64>::zeros(n);
+        let mut loo_se = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            // Hat diagonal a_ii = u_iᵀ H^{-1} u_i
+            let mut aii = 0.0;
+            for r in 0..p_dim {
+                aii += u[[i, r]] * s_all_nd[(r, i)];
+            }
+
+            let denom = 1.0 - aii;
+            debug_assert!(
+                denom > 0.0,
+                "Unexpected a_ii >= 1.0 in fixed-weight LOO baseline: a_ii = {:.6e}",
+                aii
+            );
+
+            // η^{(-i)} using Sherman–Morrison downdate with fixed Fisher weights
+            loo_pred[i] = (eta_hat[i] - aii * z[i]) / denom;
+
+            // Var_full(η_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i
+            let mut quad = 0.0;
+            for r in 0..p_dim {
+                let mut temp = 0.0;
+                for c in 0..p_dim {
+                    temp += xtwx[[r, c]] * s_all_nd[(c, i)];
+                }
+                quad += s_all_nd[(r, i)] * temp;
+            }
+
+            let wi = w_full[i].max(1e-12);
+            let var_full = phi * (quad / wi);
+            let var_loo = ((var_full - phi * (aii * aii) / wi).max(0.0)) / (denom * denom);
+            loo_se[i] = var_loo.max(0.0).sqrt();
+        }
+
+        // Compare ALO predictions with exact fixed-weight LOO
         let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
             loo_compare(&alo_features.pred, &alo_features.se, &loo_pred, &loo_se);
 
-        // Verify the agreement is within expected tolerance
-        // Relaxed tolerance because true LOO uses prior weights while ALO uses Fisher weights
+        // Agreement should now be at numerical precision since both sides use identical geometry
         assert!(
-            rmse_pred <= 1e-3,
-            "RMSE between ALO and true LOO predictions should be <= 1e-3, got {:.6e}",
+            rmse_pred <= 1e-9,
+            "RMSE between ALO and exact linearized LOO predictions should be <= 1e-9, got {:.6e}",
             rmse_pred
         );
         assert!(
-            max_abs_pred <= 1e-2,
-            "Max absolute error between ALO and LOO predictions should be <= 1e-2, got {:.6e}",
+            max_abs_pred <= 1e-8,
+            "Max absolute error between ALO and exact linearized LOO predictions should be <= 1e-8, got {:.6e}",
             max_abs_pred
         );
-
-        // Standard errors can be slightly less accurate but should still be close
-        // Relaxed tolerance to account for different weighting conventions
         assert!(
-            rmse_se <= 1e-2,
-            "RMSE between ALO and true LOO standard errors should be <= 1e-2, got {:.6e}\nNote: Different weighting (prior vs Fisher) affects SE comparison",
+            rmse_se <= 1e-9,
+            "RMSE between ALO and exact linearized LOO standard errors should be <= 1e-9, got {:.6e}",
             rmse_se
         );
         assert!(
-            max_abs_se <= 1e-2,
-            "Max absolute error between ALO and LOO standard errors should be <= 1e-2, got {:.6e}",
+            max_abs_se <= 1e-8,
+            "Max absolute error between ALO and exact linearized LOO standard errors should be <= 1e-8, got {:.6e}",
             max_abs_se
         );
     }
