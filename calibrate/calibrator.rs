@@ -1736,6 +1736,15 @@ pub fn fit_calibrator(
         active_penalty_count,
         link
     );
+    let active_axes = penalties
+        .iter()
+        .filter(|matrix| matrix.iter().any(|&v| v.abs() > 1e-12))
+        .count();
+    let smooth_desc = match active_axes {
+        0 => "no calibrator smooths".to_string(),
+        1 => "the calibrator smooth".to_string(),
+        n => format!("all {} calibrator smooths", n),
+    };
     if !dropped_axes.is_empty() {
         eprintln!(
             "[CAL][INFO] treating penalty blocks as unpenalized due to zero wiggle columns: {}",
@@ -1743,7 +1752,8 @@ pub fn fit_calibrator(
         );
     }
     eprintln!(
-        "[CAL] Using same spline family for all three calibrator smooths as the base PGS smooth"
+        "[CAL] Using same spline family for {} as the base PGS smooth",
+        smooth_desc
     );
 
     // ---- SHAPE GUARD: X and all S_k must agree (return typed error, do not panic) ----
