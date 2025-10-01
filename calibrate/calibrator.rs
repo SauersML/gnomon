@@ -2960,9 +2960,10 @@ mod tests {
                 ci += x_i[r] * s[(r, 0)];
             }
 
-            // Correct "true" LOO SE: uses inflation by 1/(1-aii) from the full fit
-            // We have the K from the LOO fit, which already includes the 1/(1-aii) inflation effect
-            // This matches our correct ALO formula: SE = sqrt(phi * ci / (1-aii))
+            // Correct "true" LOO SE: the covariance comes from re-estimating the fit without point i
+            // Building K from the LOO fit captures the re-estimated weights directly; it is not
+            // an explicit 1/(1 - a_ii) inflation of the full-fit covariance
+            // This matches our correct ALO formula: SE = sqrt(phi * ci / (1 - a_ii))
             loo_pred[i] = eta_i;
             loo_se[i] = ci.sqrt();
         }
