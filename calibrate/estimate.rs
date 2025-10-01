@@ -1508,6 +1508,29 @@ pub mod internal {
             lambdas: &Array1<f64>,
             h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
+            // ---------------------------------------------------------------------------------
+            //  WHY WE CAN SAFELY CACHE FACTORS BY ρ (rho)
+            // ---------------------------------------------------------------------------------
+            // The effective degrees of freedom (EDF) calculation is one of only two places where
+            // we ask for a Faer factorization through `get_faer_factor`.  The cache inside that
+            // helper uses **only** the vector of log smoothing parameters (ρ) as the key.  That
+            // can look suspicious at first glance: if we ever passed two *different* Hessians for
+            // the same ρ we could accidentally reuse the wrong factorization.
+            //
+            // However, the surrounding call graph guarantees that every request made from this
+            // method is always for the *same flavour* of Hessian:
+            //   • Identity / Gaussian models call `edf_from_h_and_rk` with the stabilized Hessian
+            //     `pirls_result.stabilized_hessian_transformed`.
+            //   • Non-Gaussian (logit / LAML) models call it with the effective / ridged Hessian
+            //     returned by `effective_hessian(pr)`.
+            // Within a given `RemlState` we never switch between those two flavours—the state is
+            // constructed for a single link function, so the cost/gradient pathways stay aligned.
+            //
+            // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
+            // practice, and the cache cannot hand back a factorization of a "wrong" matrix.  The
+            // comments here spell this out explicitly so future refactors can revisit the cache key
+            // if we ever loosen those invariants.
+
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
             let factor = self.get_faer_factor(&rho_like, h_eff);
@@ -1576,6 +1599,26 @@ pub mod internal {
         }
 
         fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
+            // ---------------------------------------------------------------------------------
+            //  CACHING STRATEGY (ρ-ONLY KEY) — EXTENSIVE NOTE FOR FUTURE MAINTAINERS
+            // ---------------------------------------------------------------------------------
+            // The cache deliberately ignores *which* Hessian matrix we are factoring.  Today this
+            // is sound because every caller obeys a single rule:
+            //
+            //   • Identity/Gaussian REML cost & gradient only ever request factors of the
+            //     stabilized Hessian.
+            //   • Non-Gaussian (logit/LAML) cost requests factors of the effective/ridged Hessian,
+            //     and the gradient path never touches this cache.
+            //
+            // Consequently each ρ corresponds to exactly one matrix within the lifetime of a
+            // `RemlState`, so returning the cached factorization is correct.
+            //
+            // This design *is* brittle: adding a new code path that calls `get_faer_factor` with a
+            // different H for the same ρ would silently reuse the wrong factor.  If you introduce
+            // such a path, extend the key (e.g., add an enum that records which Hessian variant is
+            // being factored, or hash the diagonal) or split the cache.  Until then we prefer the
+            // cheaper key because it maximizes cache hits across repeated EDF/gradient evaluations
+            // for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
                 if let Some(f) = self.faer_factor_cache.borrow().get(key) {
