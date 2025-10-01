@@ -1405,12 +1405,10 @@ pub fn stable_reparameterization(
             r, q_current, iteration
         );
 
-        // ---
-        // STEP 5A: REORDER THE EIGENVECTOR MATRIX `u` TO MATCH `mgcv`'s LOGIC
+        // Step 5A: reorder the eigenvector matrix `u` to match mgcv’s logic.
         // `Eigh` returns eigenvalues in ascending order, so the eigenvectors for the range
-        // space (largest eigenvalues) are at the END of `u`. We reorder them to be first.
+        // space (largest eigenvalues) are at the end of `u`. We reorder them to be first.
         // The new basis is `U_reordered = [U_range | U_null]`.
-        // ---
 
         // Guard against r == 0 to avoid empty slicing
         if r == 0 {
@@ -1472,11 +1470,9 @@ pub fn stable_reparameterization(
                 .assign(&b_matrix);
         }
 
-        // ---
-        // Stage: Partitioning logic
+        // Stage: partitioning logic.
         // After transforming with `u_reordered`, the first `r` rows correspond to the range
         // space, and the last `q_current - r` rows correspond to the null space.
-        // ---
         for &i in &gamma {
             if rs_current[i].nrows() == 0 || q_current == 0 {
                 continue;
