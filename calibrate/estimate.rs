@@ -1522,8 +1522,6 @@ pub mod internal {
             // constructed for a single link function, so the cost/gradient pathways stay aligned.
             // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
-            // Keeping this comment detailed makes it easier to revisit the cache key if we ever
-            // loosen those invariants.
 
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
