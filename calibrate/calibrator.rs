@@ -1816,6 +1816,10 @@ pub fn fit_calibrator(
     let mut lambdas_arr = [1.0_f64; 4];
     let mut edf_full = [0.0_f64; 4];
     let mut active_mask = [false; 4];
+    // `optimize_external_design` only returns entries for the active penalty axes.
+    // We map those sparse results back into fixed four-slot arrays here so that
+    // later destructuring like `lambdas_arr[2]` remains safe even when fewer
+    // than four axes are active.
     for (pos, &axis_idx) in active_axes.iter().enumerate() {
         if axis_idx >= lambdas_arr.len() {
             eprintln!(
