@@ -2193,7 +2193,7 @@ mod tests {
         build_design_and_penalty_matrices, compute_penalty_square_roots,
     };
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{BasisConfig, map_coefficients};
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, map_coefficients};
     use ndarray::{Array1, Array2, arr1, arr2};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -2313,6 +2313,7 @@ mod tests {
             },
             pc_configs: vec![],
             pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -2623,6 +2624,7 @@ mod tests {
             },
             pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -2748,6 +2750,7 @@ mod tests {
             }, // Stable basis
             pc_configs: vec![],     // PGS-only model
             pgs_range: (-2.0, 2.0), // Match the data
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -2876,6 +2879,7 @@ mod tests {
             },
             pc_configs: vec![],
             pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),

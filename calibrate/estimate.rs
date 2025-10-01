@@ -2794,7 +2794,7 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
+        use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
         ///
@@ -2898,6 +2898,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3088,6 +3089,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3137,7 +3139,8 @@ pub mod internal {
             use crate::calibrate::construction::build_design_and_penalty_matrices;
             use crate::calibrate::data::TrainingData;
             use crate::calibrate::model::{
-                BasisConfig, LinkFunction, ModelConfig, PrincipalComponentConfig,
+                BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
+                PrincipalComponentConfig,
             };
 
             let mut rng = StdRng::seed_from_u64(seed);
@@ -3174,6 +3177,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3454,6 +3458,7 @@ pub mod internal {
                     },
                 ],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3561,6 +3566,7 @@ pub mod internal {
                     },
                 ],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -3656,6 +3662,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -4308,6 +4315,7 @@ pub mod internal {
                     },
                 ],
                 pgs_range: (-3.0, 3.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -4422,6 +4430,7 @@ pub mod internal {
                     }, // PC2 - same basis size as PC1
                 ],
                 pgs_range: (-2.5, 2.5),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -4630,6 +4639,7 @@ pub mod internal {
                 },
                 pc_configs: vec![],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -4758,6 +4768,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-6.0, 6.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
@@ -4890,6 +4901,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-3.0, 3.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: HashMap::new(),
                 knot_vectors: HashMap::new(),
                 range_transforms: HashMap::new(),
@@ -5072,6 +5084,7 @@ pub mod internal {
                     },
                 ],
                 pgs_range: (-1.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -5189,6 +5202,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (0.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -5262,7 +5276,7 @@ pub mod internal {
         /// Tests that the design matrix is correctly built using pure pre-centering for the interaction terms.
         #[test]
         fn test_pure_precentering_interaction() {
-            use crate::calibrate::model::BasisConfig;
+            use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind};
             use approx::assert_abs_diff_eq;
             // Create a minimal test dataset
             // Using n_samples=150 to avoid over-parameterization
@@ -5301,6 +5315,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (0.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -5443,6 +5458,7 @@ pub mod internal {
                     },
                     pc_configs: vec![],
                     pgs_range: (-2.0, 2.0),
+                    interaction_penalty: InteractionPenaltyKind::Anisotropic,
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
@@ -5582,6 +5598,7 @@ pub mod internal {
                     },
                     pc_configs: vec![],
                     pgs_range: (-1.0, 1.0),
+                    interaction_penalty: InteractionPenaltyKind::Anisotropic,
                     sum_to_zero_constraints: std::collections::HashMap::new(),
                     knot_vectors: std::collections::HashMap::new(),
                     range_transforms: std::collections::HashMap::new(),
@@ -5758,6 +5775,7 @@ pub mod internal {
                     range: (-1.5, 1.5),
                 }],
                 pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -5945,6 +5963,7 @@ pub mod internal {
                 },
                 pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -6064,6 +6083,7 @@ pub mod internal {
                 },
                 pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
                 sum_to_zero_constraints: std::collections::HashMap::new(),
                 knot_vectors: std::collections::HashMap::new(),
                 range_transforms: std::collections::HashMap::new(),
@@ -6143,7 +6163,7 @@ pub mod internal {
 
 #[test]
 fn test_train_model_fails_gracefully_on_perfect_separation() {
-    use crate::calibrate::model::BasisConfig;
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind};
     use std::collections::HashMap;
 
     // Stage: Create a perfectly separated dataset
@@ -6172,6 +6192,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         },
         pc_configs: vec![],
         pgs_range: (-1.0, 1.0),
+        interaction_penalty: InteractionPenaltyKind::Anisotropic,
         sum_to_zero_constraints: HashMap::new(),
         knot_vectors: HashMap::new(),
         range_transforms: HashMap::new(),
@@ -6213,7 +6234,9 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
 #[test]
 fn test_indefinite_hessian_detection_and_retreat() {
     use crate::calibrate::estimate::internal::RemlState;
-    use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
+    };
     use ndarray::{Array1, Array2};
 
     println!("=== TESTING INDEFINITE HESSIAN DETECTION FUNCTIONALITY ===");
@@ -6251,6 +6274,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
             range: (-1.0, 1.0),
         }],
         pgs_range: (-1.0, 1.0),
+        interaction_penalty: InteractionPenaltyKind::Anisotropic,
         sum_to_zero_constraints: std::collections::HashMap::new(),
         knot_vectors: std::collections::HashMap::new(),
         range_transforms: std::collections::HashMap::new(),
@@ -6383,8 +6407,9 @@ mod test_helpers {
 mod optimizer_progress_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::BasisConfig;
-    use crate::calibrate::model::PrincipalComponentConfig;
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
+    };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -6458,6 +6483,7 @@ mod optimizer_progress_tests {
                 range: (-3.0, 3.0),
             }],
             pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
@@ -6525,7 +6551,9 @@ mod reparam_consistency_tests {
     use super::*;
     use crate::calibrate::construction::build_design_and_penalty_matrices;
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
+    };
     use ndarray::{Array1, Array2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -6562,6 +6590,7 @@ mod reparam_consistency_tests {
             },
             pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),
@@ -6679,7 +6708,9 @@ mod reparam_consistency_tests {
 mod gradient_validation_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::{BasisConfig, PrincipalComponentConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
+    };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -6724,6 +6755,7 @@ mod gradient_validation_tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: std::collections::HashMap::new(),
             knot_vectors: std::collections::HashMap::new(),
             range_transforms: std::collections::HashMap::new(),

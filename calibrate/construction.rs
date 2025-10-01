@@ -2,7 +2,7 @@ use crate::calibrate::basis::{self, create_bspline_basis, create_difference_pena
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::calibrate::model::ModelConfig;
+use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, Axis, s};
@@ -34,8 +34,6 @@ pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.
-/// NOTE: Currently unused due to penalty grouping in Option 3 implementation
-/// Function is currently unused but kept for future implementation
 pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     let (a_rows, a_cols) = a.dim();
     let (b_rows, b_cols) = b.dim();
@@ -156,8 +154,8 @@ impl ModelLayout {
         pc_null_basis_ncols: &[usize],
         pc_range_basis_ncols: &[usize],
         pgs_main_basis_ncols: usize,
-        pc_unconstrained_basis_ncols: &[usize],
-        num_pgs_interaction_bases: usize,
+        pc_interaction_basis_ncols: &[usize],
+        pgs_interaction_basis_ncols: usize,
     ) -> Result<Self, EstimationError> {
         let mut penalty_map = Vec::new();
         let mut current_col = 0;
@@ -176,9 +174,9 @@ impl ModelLayout {
             .sum();
         // For tensor product interactions: each PC gets num_pgs_bases * num_pc_bases coefficients
         // Use unconstrained dimensions for interaction calculations
-        let p_interactions: usize = pc_unconstrained_basis_ncols
+        let p_interactions: usize = pc_interaction_basis_ncols
             .iter()
-            .map(|&num_pc_basis_unc| num_pgs_interaction_bases * num_pc_basis_unc)
+            .map(|&num_pc_basis| pgs_interaction_basis_ncols * num_pc_basis)
             .sum();
         let calculated_total_coeffs = 1 + p_pgs_main + p_pc_main + p_interactions;
 
@@ -188,7 +186,7 @@ impl ModelLayout {
         // Reserve capacities to avoid reallocations
         // Estimated number of penalized blocks: one per PC main effect, plus one per interaction (if enabled)
         let estimated_penalized_blocks = config.pc_configs.len()
-            + if num_pgs_interaction_bases > 0 {
+            + if pgs_interaction_basis_ncols > 0 {
                 config.pc_configs.len()
             } else {
                 0
@@ -240,23 +238,35 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Tensor product interaction effects (each gets one penalty since we use whitened marginals)
+        // Tensor product interaction effects (number of penalties depends on configuration)
         let mut interaction_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
-        if num_pgs_interaction_bases > 0 {
-            for (i, &num_pc_basis_unc) in pc_unconstrained_basis_ncols.iter().enumerate() {
-                let num_tensor_coeffs = num_pgs_interaction_bases * num_pc_basis_unc;
+        if pgs_interaction_basis_ncols > 0 {
+            for (i, &num_pc_basis) in pc_interaction_basis_ncols.iter().enumerate() {
+                let num_tensor_coeffs = pgs_interaction_basis_ncols * num_pc_basis;
                 let range = current_col..current_col + num_tensor_coeffs;
+
+                let penalty_indices = match config.interaction_penalty {
+                    InteractionPenaltyKind::Isotropic => {
+                        let indices = vec![penalty_idx_counter];
+                        penalty_idx_counter += 1;
+                        indices
+                    }
+                    InteractionPenaltyKind::Anisotropic => {
+                        let indices = vec![penalty_idx_counter, penalty_idx_counter + 1];
+                        penalty_idx_counter += 2;
+                        indices
+                    }
+                };
 
                 penalty_map.push(PenalizedBlock {
                     term_name: format!("f(PGS,{})", config.pc_configs[i].name),
                     col_range: range.clone(),
-                    penalty_indices: vec![penalty_idx_counter], // Single penalty since both directions are whitened
+                    penalty_indices,
                     term_type: TermType::Interaction,
                 });
 
                 interaction_block_idx.push(penalty_map.len() - 1);
                 current_col += num_tensor_coeffs;
-                penalty_idx_counter += 1; // Increment by 1 for single interaction penalty
             }
         }
 
@@ -400,9 +410,11 @@ pub fn build_design_and_penalty_matrices(
     // Build PGS penalty on FULL basis (not arbitrarily sliced)
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
-    let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
-    let (pgs_main_basis, pgs_z_transform) =
-        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc, Some(data.weights.view()))?;
+    let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]).to_owned();
+    let (pgs_main_basis, pgs_z_transform) = basis::apply_sum_to_zero_constraint(
+        pgs_main_basis_unc.view(),
+        Some(data.weights.view()),
+    )?;
 
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
@@ -471,18 +483,37 @@ pub fn build_design_and_penalty_matrices(
         .iter()
         .map(|opt| opt.as_ref().map_or(0, |b| b.ncols()))
         .collect();
+    let pc_unc_ncols: Vec<usize> =
+        pc_unconstrained_bases_main.iter().map(|b| b.ncols()).collect();
+    let pgs_unc_ncols = pgs_main_basis_unc.ncols();
+
     let pgs_range_ncols = range_transforms
         .get("pgs")
         .map(|rt| rt.ncols())
         .unwrap_or(0);
+    let pc_range_interaction_ncols: Vec<usize> = config
+        .pc_configs
+        .iter()
+        .map(|pc| {
+            range_transforms
+                .get(&pc.name)
+                .map(|rt| rt.ncols())
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let (pc_int_ncols, pgs_int_ncols) = match config.interaction_penalty {
+        InteractionPenaltyKind::Isotropic => (pc_range_interaction_ncols, pgs_range_ncols),
+        InteractionPenaltyKind::Anisotropic => (pc_unc_ncols.clone(), pgs_unc_ncols),
+    };
 
     let layout = ModelLayout::new(
         config,
         &pc_null_ncols,
         &pc_range_ncols,
         pgs_main_basis.ncols(),
-        &pc_range_ncols, // Use range ncols for interactions too
-        pgs_range_ncols, // Use PGS range size for interactions
+        &pc_int_ncols,
+        pgs_int_ncols,
     )?;
 
     // Stage: Create individual penalty matrices—one per PC main and two per interaction
@@ -497,12 +528,44 @@ pub fn build_design_and_penalty_matrices(
 
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
+        if block.term_type != TermType::PcMainEffect {
+            continue;
+        }
+        let col_range = block.col_range.clone();
+        // Main effects have single penalty index. Normalize identity penalty
+        // so each block has unit Frobenius norm regardless of size.
+        let penalty_idx = block.penalty_indices[0];
+        let m = col_range.len() as f64;
+        let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
+        for j in col_range.clone() {
+            s_list[penalty_idx][[j, j]] = alpha;
+        }
+    }
+
+    let s_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
+        Some(create_difference_penalty_matrix(
+            pgs_main_basis_unc.ncols(),
+            config.penalty_order,
+        )?)
+    } else {
+        None
+    };
+    let i_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
+        Some(Array2::<f64>::eye(pgs_main_basis_unc.ncols()))
+    } else {
+        None
+    };
+
+    for (pc_idx, _pc_config) in config.pc_configs.iter().enumerate() {
+        if pc_idx >= layout.interaction_block_idx.len() {
+            break;
+        }
+        let block = &layout.penalty_map[layout.interaction_block_idx[pc_idx]];
         let col_range = block.col_range.clone();
 
-        match block.term_type {
-            TermType::PcMainEffect => {
-                // Main effects have single penalty index. Normalize identity penalty
-                // so each block has unit Frobenius norm regardless of size.
+        match config.interaction_penalty {
+            InteractionPenaltyKind::Isotropic => {
+                debug_assert_eq!(block.penalty_indices.len(), 1);
                 let penalty_idx = block.penalty_indices[0];
                 let m = col_range.len() as f64;
                 let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
@@ -510,24 +573,62 @@ pub fn build_design_and_penalty_matrices(
                     s_list[penalty_idx][[j, j]] = alpha;
                 }
             }
-            TermType::Interaction => {
-                // Interactions now have single penalty index since both marginals are whitened
-                if block.penalty_indices.len() != 1 {
+            InteractionPenaltyKind::Anisotropic => {
+                if block.penalty_indices.len() != 2 {
                     return Err(EstimationError::LayoutError(format!(
-                        "Interaction block {} should have exactly 1 penalty index, found {}",
+                        "Interaction block {} should have exactly 2 penalty indices in anisotropic mode, found {}",
                         block.term_name,
                         block.penalty_indices.len()
                     )));
                 }
 
-                let penalty_idx = block.penalty_indices[0]; // Single penalty for whitened interaction
-
-                // Normalize identity penalty to unit Frobenius norm for this block
-                let m = col_range.len() as f64;
-                let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
-                for j in col_range.clone() {
-                    s_list[penalty_idx][[j, j]] = alpha;
+                let pgs_cols = pgs_main_basis_unc.ncols();
+                let pc_cols = pc_unconstrained_bases_main[pc_idx].ncols();
+                if col_range.len() != pgs_cols * pc_cols {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Interaction block {} expects {} columns ({}×{}), but layout provided {}",
+                        block.term_name,
+                        pgs_cols * pc_cols,
+                        pgs_cols,
+                        pc_cols,
+                        col_range.len()
+                    )));
                 }
+
+                let s_pgs = s_pgs_interaction
+                    .as_ref()
+                    .expect("PGS penalty matrix missing in anisotropic mode");
+                let i_pgs = i_pgs_interaction
+                    .as_ref()
+                    .expect("PGS identity matrix missing in anisotropic mode");
+                let s_pc = create_difference_penalty_matrix(
+                    pc_cols,
+                    config.penalty_order,
+                )?;
+                let i_pc = Array2::<f64>::eye(pc_cols);
+
+                let s_kron_pgs = kronecker_product(s_pgs, &i_pc);
+                let s_kron_pc = kronecker_product(i_pgs, &s_pc);
+
+                let frob = |m: &Array2<f64>| {
+                    m.iter()
+                        .map(|&x| x * x)
+                        .sum::<f64>()
+                        .sqrt()
+                        .max(1e-12)
+                };
+                let nf1 = frob(&s_kron_pgs);
+                let nf2 = frob(&s_kron_pc);
+
+                let penalty_idx_pgs = block.penalty_indices[0];
+                let penalty_idx_pc = block.penalty_indices[1];
+
+                s_list[penalty_idx_pgs]
+                    .slice_mut(s![col_range.clone(), col_range.clone()])
+                    .assign(&(&s_kron_pgs / nf1));
+                s_list[penalty_idx_pc]
+                    .slice_mut(s![col_range.clone(), col_range.clone()])
+                    .assign(&(&s_kron_pc / nf2));
             }
         }
     }
@@ -620,29 +721,52 @@ pub fn build_design_and_penalty_matrices(
         .slice_mut(s![.., pgs_range])
         .assign(&pgs_main_basis);
 
-    // Stage: Populate tensor product interaction effects using Range × Range (fully penalized)
-    if pgs_range_ncols > 0 && !pc_range_bases.is_empty() {
-        // Use WHITENED marginals for interactions to match main effect scaling
-        let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
-            EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
-        })?;
-        let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs); // Use whitened basis for scale consistency
+    // Stage: Populate tensor product interaction effects.
+    if !layout.interaction_block_idx.is_empty() {
+        let pgs_int_basis_iso = if matches!(config.interaction_penalty, InteractionPenaltyKind::Isotropic) {
+            let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
+                EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
+            })?;
+            Some(pgs_main_basis_unc.dot(z_range_pgs))
+        } else {
+            None
+        };
+
         // Precompute sqrt(weights) once for this section
         let w_sqrt = data.weights.mapv(f64::sqrt);
         let w_col = w_sqrt.view().insert_axis(Axis(1));
 
         for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
+            if pc_idx >= layout.interaction_block_idx.len() {
+                break;
+            }
             let pc_name = &pc_config.name;
             // Directly index the corresponding tensor product block
             let tensor_block = &layout.penalty_map[layout.interaction_block_idx[pc_idx]];
 
-            // Use WHITENED PC marginal for scale consistency with main effects
-            let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
-                EstimationError::LayoutError(format!("Missing '{}' in range_transforms", pc_name))
-            })?;
-            let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
-
-            let tensor_interaction = row_wise_tensor_product(&pgs_int_basis, &pc_int_basis);
+            let tensor_interaction = match config.interaction_penalty {
+                InteractionPenaltyKind::Isotropic => {
+                    let pgs_int_basis = pgs_int_basis_iso.as_ref().ok_or_else(|| {
+                        EstimationError::LayoutError(
+                            "PGS interaction basis missing in isotropic mode".to_string(),
+                        )
+                    })?;
+                    let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "Missing '{}' in range_transforms",
+                            pc_name
+                        ))
+                    })?;
+                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
+                    row_wise_tensor_product(pgs_int_basis, &pc_int_basis)
+                }
+                InteractionPenaltyKind::Anisotropic => {
+                    row_wise_tensor_product(
+                        &pgs_main_basis_unc,
+                        &pc_unconstrained_bases_main[pc_idx],
+                    )
+                }
+            };
 
             // Validate dimensions
             let col_range = tensor_block.col_range.clone();
@@ -1677,6 +1801,7 @@ mod tests {
             pgs_basis_config,
             pc_configs,
             pgs_range,
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(),
             knot_vectors: HashMap::new(),
             range_transforms: HashMap::new(),
@@ -1717,11 +1842,11 @@ mod tests {
         let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // With null-space penalization: 2 PC main penalties (null + range) + 1 interaction penalty = 3 total
+        // With null-space penalization: PC null + PC range + two anisotropic interaction penalties
         assert_eq!(
             s_list.len(),
-            3,
-            "Should have exactly 3 penalty matrices: 1 PC null + 1 PC range + 1 interaction (whitened)"
+            4,
+            "Should have exactly 4 penalty matrices: PC null, PC range, and two anisotropic interaction penalties",
         );
 
         let interaction_block = layout
@@ -1730,21 +1855,11 @@ mod tests {
             .find(|b| b.term_type == TermType::Interaction)
             .expect("Interaction block not found in layout");
 
-        // Each interaction block now has 1 penalty index since marginals are whitened
         assert_eq!(
             interaction_block.penalty_indices.len(),
-            1,
-            "Interaction term should have one penalty index (whitened marginals)"
+            2,
+            "Interaction term should have two penalty indices in anisotropic mode",
         );
-
-        let interaction_penalty_idx = interaction_block.penalty_indices[0];
-
-        // Verify penalty matrix structure - single identity (Frobenius-normalized) penalty for whitened interaction
-        let s_interaction = &s_list[interaction_penalty_idx]; // Single interaction penalty
-        let alpha_interaction = {
-            let m = interaction_block.col_range.len() as f64;
-            if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 }
-        };
 
         // Locate explicit PC range and PC null penalty blocks
         let pc_range_block = layout
@@ -1761,30 +1876,76 @@ mod tests {
         let s_pc_range = &s_list[pc_range_block.penalty_indices[0]];
         let s_pc_null = &s_list[pc_null_block.penalty_indices[0]];
 
-        // Check that the interaction penalty is identity on the interaction block
+        // Build expected anisotropic penalties for comparison
+        let (pgs_basis_unc, _) = create_bspline_basis(
+            data.p.view(),
+            config.pgs_range,
+            config.pgs_basis_config.num_knots,
+            config.pgs_basis_config.degree,
+        )
+        .expect("PGS basis construction");
+        let pgs_cols = pgs_basis_unc.ncols() - 1; // drop intercept column
+
+        let pc_config = &config.pc_configs[0];
+        let (pc_basis_unc, _) = create_bspline_basis(
+            data.pcs.column(0).view(),
+            pc_config.range,
+            pc_config.basis_config.num_knots,
+            pc_config.basis_config.degree,
+        )
+        .expect("PC basis construction");
+        let pc_cols = pc_basis_unc.ncols() - 1; // drop intercept column
+
+        let s_pgs =
+            create_difference_penalty_matrix(pgs_cols, config.penalty_order).expect("valid PGS penalty");
+        let s_pc =
+            create_difference_penalty_matrix(pc_cols, config.penalty_order).expect("valid PC penalty");
+        let i_pgs = Array2::<f64>::eye(pgs_cols);
+        let i_pc = Array2::<f64>::eye(pc_cols);
+
+        let expected_pgs = kronecker_product(&s_pgs, &i_pc);
+        let expected_pc = kronecker_product(&i_pgs, &s_pc);
+        let frob = |m: &Array2<f64>| {
+            m.iter()
+                .map(|&x| x * x)
+                .sum::<f64>()
+                .sqrt()
+                .max(1e-12)
+        };
+        let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
+        let expected_pc_norm = &expected_pc / frob(&expected_pc);
+
+        let s_interaction_pgs = &s_list[interaction_block.penalty_indices[0]];
+        let s_interaction_pc = &s_list[interaction_block.penalty_indices[1]];
+
+        // Check interaction penalty blocks match expected anisotropic structure
+        let col_range = interaction_block.col_range.clone();
+        for (row_offset, r) in col_range.clone().enumerate() {
+            for (col_offset, c) in col_range.clone().enumerate() {
+                assert_abs_diff_eq!(
+                    s_interaction_pgs[[r, c]],
+                    expected_pgs_norm[[row_offset, col_offset]],
+                    epsilon = 1e-12
+                );
+                assert_abs_diff_eq!(
+                    s_interaction_pc[[r, c]],
+                    expected_pc_norm[[row_offset, col_offset]],
+                    epsilon = 1e-12
+                );
+            }
+        }
+
+        // Outside the interaction block should remain zero
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
-                if interaction_block.col_range.contains(&r)
-                    && interaction_block.col_range.contains(&c)
-                {
-                    if r == c {
-                        assert_abs_diff_eq!(
-                            s_interaction[[r, c]],
-                            alpha_interaction,
-                            epsilon = 1e-12
-                        );
-                    } else {
-                        assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
-                    }
-                } else {
-                    // Outside interaction block should be zero
-                    assert_abs_diff_eq!(s_interaction[[r, c]], 0.0, epsilon = 1e-12);
+                if !(col_range.contains(&r) && col_range.contains(&c)) {
+                    assert_abs_diff_eq!(s_interaction_pgs[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_interaction_pc[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
 
         // Check that PC main penalty matrix has identity on PC main blocks and zeros elsewhere
-        // Check range block identity structure
         let alpha_pc_range = {
             let m = pc_range_block.col_range.len() as f64;
             if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 }
