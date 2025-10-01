@@ -1347,8 +1347,8 @@ pub mod internal {
         }
     }
 
-    /// Holds the state for the outer REML optimization. Implements `CostFunction`
-    /// and `Gradient` for the `argmin` library.
+    /// Holds the state for the outer REML optimization and supplies cost and
+    /// gradient evaluations to the `wolfe_bfgs` optimizer.
     ///
     /// The `cache` field uses `RefCell` to enable interior mutability. This is a crucial
     /// performance optimization. The `cost_and_grad` closure required by the BFGS
