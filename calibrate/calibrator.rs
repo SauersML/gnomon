@@ -4097,6 +4097,7 @@ mod tests {
             schema.penalty_nullspace_dims.0,
             schema.penalty_nullspace_dims.1,
             schema.penalty_nullspace_dims.2,
+            schema.penalty_nullspace_dims.3,
         ];
         let fit_result = fit_calibrator(
             y.view(),
@@ -6202,6 +6203,7 @@ mod tests {
             schema.penalty_nullspace_dims.0,
             schema.penalty_nullspace_dims.1,
             schema.penalty_nullspace_dims.2,
+            schema.penalty_nullspace_dims.3,
         ];
         let result = fit_calibrator(
             y.view(),
