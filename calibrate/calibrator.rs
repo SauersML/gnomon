@@ -62,11 +62,13 @@ pub struct CalibratorModel {
     pub standardize_se: (f64, f64),
     pub standardize_dist: (f64, f64),
 
-    // Flag for SE linear fallback when SE range is negligible
-    pub se_linear_fallback: bool,
+    // Flag for SE wiggle-only drop when SE range is negligible
+    #[serde(alias = "se_linear_fallback")]
+    pub se_wiggle_only_drop: bool,
 
-    // Flag for distance linear fallback when distance range is negligible
-    pub dist_linear_fallback: bool,
+    // Flag for distance wiggle-only drop when distance range is negligible
+    #[serde(alias = "dist_linear_fallback")]
+    pub dist_wiggle_only_drop: bool,
 
     // Fitted lambdas
     pub lambda_pred: f64,
@@ -98,8 +100,8 @@ pub struct InternalSchema {
     pub standardize_pred: (f64, f64),
     pub standardize_se: (f64, f64),
     pub standardize_dist: (f64, f64),
-    pub se_linear_fallback: bool,
-    pub dist_linear_fallback: bool,
+    pub se_wiggle_only_drop: bool,
+    pub dist_wiggle_only_drop: bool,
     pub penalty_nullspace_dims: (usize, usize, usize, usize),
     pub column_spans: (
         std::ops::Range<usize>,
@@ -590,7 +592,7 @@ pub fn build_calibrator_design(
     }
     fn standardize_with(mean: f64, std: f64, v: &Array1<f64>) -> (Array1<f64>, (f64, f64)) {
         // Ensure we don't divide by zero, use a minimum std value
-        // This is important both for numerical stability and for handling the linear fallback case
+        // This is important both for numerical stability and for handling the wiggle-only drop case
         let s_use = std.max(1e-8_f64);
 
         // Return centered and scaled version along with the standardization parameters
@@ -607,10 +609,10 @@ pub fn build_calibrator_design(
 
     // --- Check SE variability BEFORE standardization ---
     // Detect near-constant SE values that would lead to numerical issues
-    let se_linear_fallback = se_std_raw < 1e-8_f64;
-    if se_linear_fallback {
+    let se_wiggle_only_drop = se_std_raw < 1e-8_f64;
+    if se_wiggle_only_drop {
         eprintln!(
-            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=linear_fallback raw_std={:.3e}",
+            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=wiggle_only_drop raw_std={:.3e}",
             se_std_raw
         );
     }
@@ -626,7 +628,7 @@ pub fn build_calibrator_design(
     // Compute robust statistics for the distance component
     let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw, weight_opt);
 
-    // Advanced heuristic for linear fallback with multiple criteria
+    // Advanced heuristic for wiggle-only drop with multiple criteria
 
     // Stage: Count zeros and compute distribution statistics
     let mut zeros_count = 0;
@@ -683,7 +685,7 @@ pub fn build_calibrator_design(
     let dist_near_constant = dist_std_raw < 1e-8_f64;
     if dist_near_constant {
         eprintln!(
-            "[CAL][WARN] block=dist reason=channel_constant_after_standardization action=linear_fallback_candidate raw_std={:.3e} hinge={} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2}",
+            "[CAL][WARN] block=dist reason=channel_constant_after_standardization action=wiggle_only_drop_candidate raw_std={:.3e} hinge={} zeros_pct={:.1}% pos_pct={:.1}% unique_pos_frac={:.2}",
             dist_std_raw,
             spec.distance_hinge,
             100.0 * zeros_frac,
@@ -692,7 +694,7 @@ pub fn build_calibrator_design(
         );
     }
 
-    let use_linear_dist =
+    let use_wiggle_only_dist =
         // Basic criteria:
         dist_std_raw < 1e-6_f64 ||                  // Low variance
         dist_raw.len() == 0 ||                 // Empty data
@@ -712,8 +714,8 @@ pub fn build_calibrator_design(
         100.0 * zeros_frac,
         100.0 * pos_frac,
         100.0 * unique_frac,
-        if use_linear_dist {
-            "linear fallback"
+        if use_wiggle_only_dist {
+            "wiggle-only drop"
         } else {
             "spline"
         }
@@ -725,8 +727,8 @@ pub fn build_calibrator_design(
         .pred_identity
         .mapv(|x| x - pred_mean);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
-    let (dist_std, dist_ms) = if use_linear_dist {
-        // Center only for linear fallback to avoid extreme scaling
+    let (dist_std, dist_ms) = if use_wiggle_only_dist {
+        // Center only for wiggle-only drop to avoid extreme scaling
         (dist_raw.mapv(|x| x - dist_mean), (dist_mean, 1.0))
     } else {
         standardize_with(dist_mean, dist_std_raw, &dist_raw)
@@ -1088,7 +1090,7 @@ pub fn build_calibrator_design(
         }
     }
 
-    let (mut b_se_c, mut stz_se) = if se_linear_fallback {
+    let (mut b_se_c, mut stz_se) = if se_wiggle_only_drop {
         eprintln!(
             "[CAL][WARN] block=se reason=channel_constant_after_standardization action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
             se_std_raw,
@@ -1126,7 +1128,7 @@ pub fn build_calibrator_design(
 
     prune_near_zero_columns(&mut b_se_c, &mut stz_se, "se");
 
-    if !se_linear_fallback && b_se_c.ncols() > 0 {
+    if !se_wiggle_only_drop && b_se_c.ncols() > 0 {
         if pred_is_const {
             eprintln!(
                 "[CAL][WARN] block=se reason=predictor_constant_interaction action=drop_block cols={}",
@@ -1143,15 +1145,15 @@ pub fn build_calibrator_design(
         }
     }
 
-    // For distance, check if we need to use linear fallback
+    // For distance, check if we need to use wiggle-only drop
     // Linear fallback when: low variance or mostly zeros (from hinging)
     // Calculate the distance centering offset first
-    let dist_all_zero = use_linear_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
+    let dist_all_zero = use_wiggle_only_dist && dist_std.iter().all(|&v| v.abs() < 1e-12);
 
     let dist_expected_raw_cols = knots_dist_generated
         .len()
         .saturating_sub(spec.dist_basis.degree + 1);
-    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _) = if use_linear_dist {
+    let (mut b_dist_c, mut stz_dist, knots_dist, s_dist_raw0, _) = if use_wiggle_only_dist {
         let raw_cols_warn = if dist_all_zero {
             0
         } else {
@@ -1181,7 +1183,7 @@ pub fn build_calibrator_design(
                 if dist_near_constant {
                     "channel_constant_after_standardization"
                 } else {
-                    "linear_fallback_triggered"
+                    "wiggle_only_drop_triggered"
                 },
                 dist_std_raw,
                 100.0 * zeros_frac,
@@ -1247,7 +1249,7 @@ pub fn build_calibrator_design(
 
     prune_near_zero_columns(&mut b_dist_c, &mut stz_dist, "dist");
 
-    if !use_linear_dist && b_dist_c.ncols() > 0 {
+    if !use_wiggle_only_dist && b_dist_c.ncols() > 0 {
         if pred_is_const {
             eprintln!(
                 "[CAL][WARN] block=dist reason=predictor_constant_interaction action=drop_block cols={}",
@@ -1270,7 +1272,7 @@ pub fn build_calibrator_design(
     // Build penalties in raw space, then push through STZ
     let s_pred_raw0 =
         create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
-    let s_se_raw0 = if se_linear_fallback {
+    let s_se_raw0 = if se_wiggle_only_drop {
         Array2::<f64>::zeros((b_se_raw.ncols(), b_se_raw.ncols()))
     } else {
         create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?
@@ -1315,7 +1317,7 @@ pub fn build_calibrator_design(
     let s_se = s_se_raw_sc;
     let s_dist = s_dist_raw_sc;
 
-    if se_linear_fallback {
+    if se_wiggle_only_drop {
         knots_se = Array1::zeros(0);
     }
 
@@ -1444,8 +1446,8 @@ pub fn build_calibrator_design(
         standardize_pred: pred_ms,
         standardize_se: se_ms,
         standardize_dist: dist_ms,
-        se_linear_fallback,
-        dist_linear_fallback: use_linear_dist,
+        se_wiggle_only_drop,
+        dist_wiggle_only_drop: use_wiggle_only_dist,
         penalty_nullspace_dims: (
             pred_null_dim,
             pred_param_null_dim,
@@ -4200,8 +4202,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -4358,8 +4360,8 @@ mod tests {
                 standardize_pred: schema.standardize_pred,
                 standardize_se: schema.standardize_se,
                 standardize_dist: schema.standardize_dist,
-                se_linear_fallback: schema.se_linear_fallback,
-                dist_linear_fallback: schema.dist_linear_fallback,
+                se_wiggle_only_drop: schema.se_wiggle_only_drop,
+                dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
                 lambda_pred: lambdas[0],
                 lambda_pred_param: lambdas[1],
                 lambda_se: lambdas[2],
@@ -4521,8 +4523,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -4682,8 +4684,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5003,8 +5005,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5112,18 +5114,18 @@ mod tests {
     }
 
     #[test]
-    fn linear_fallback_centering_consistency() {
+    fn wiggle_only_drop_centering_consistency() {
         // This test verifies that centering offsets are correctly stored and applied
-        // for linear fallbacks during both training and prediction.
+        // for wiggle-only drops during both training and prediction.
 
-        // Create synthetic data where SE and distance will trigger linear fallback
+        // Create synthetic data where SE and distance will trigger wiggle-only drop
         let n = 100;
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Create features with very small spread for SE to trigger linear fallback
+        // Create features with very small spread for SE to trigger wiggle-only drop
         let pred = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
 
-        // SE with tiny range to trigger linear fallback
+        // SE with tiny range to trigger wiggle-only drop
         let se_base_value = 0.5;
         let se_tiny_range = 1e-9;
         let se = Array1::from_vec(
@@ -5132,7 +5134,7 @@ mod tests {
                 .collect(),
         );
 
-        // Distance with uniform values to trigger linear fallback
+        // Distance with uniform values to trigger wiggle-only drop
         let dist = Array1::from_vec(
             (0..n)
                 .map(|_| {
@@ -5183,14 +5185,14 @@ mod tests {
         // Build design and fit calibrator
         let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
 
-        // Verify that linear fallback is triggered
+        // Verify that wiggle-only drop is triggered
         assert!(
-            schema.se_linear_fallback,
-            "SE linear fallback should be triggered"
+            schema.se_wiggle_only_drop,
+            "SE wiggle-only drop should be triggered"
         );
         assert!(
-            schema.dist_linear_fallback,
-            "Distance linear fallback should be triggered"
+            schema.dist_wiggle_only_drop,
+            "Distance wiggle-only drop should be triggered"
         );
 
         // Wiggle-only fallback drops the blocks entirely, so they contribute no columns
@@ -5242,8 +5244,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
@@ -5353,8 +5355,8 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
-            se_linear_fallback: schema.se_linear_fallback,
-            dist_linear_fallback: schema.dist_linear_fallback,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
             lambda_pred_param: lambdas[1],
             lambda_se: lambdas[2],
