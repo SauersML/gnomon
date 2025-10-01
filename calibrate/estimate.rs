@@ -1536,17 +1536,6 @@ pub mod internal {
             let mp = (p - rank_s).max(0.0);
             let edf = (p - trace_h_inv_s_lambda).clamp(mp, p);
 
-            // Numerically consistent cross-check using the same identity:
-            // EDF_alt = p - tr(H^{-1} S_λ) == EDF. This avoids redundant solves and
-            // keeps the comparison within the same numerical path.
-            let edf_alt = edf;
-            let rel = ((edf - edf_alt).abs()) / (1.0 + edf_alt.abs());
-            debug_assert!(
-                rel <= 1e-12,
-                "EDF identity drifted more than expected: rel={:.3e}",
-                rel
-            );
-
             Ok(edf)
         }
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
