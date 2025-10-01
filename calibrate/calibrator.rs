@@ -1915,6 +1915,9 @@ mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
     use crate::calibrate::construction::ModelLayout;
+    use faer::linalg::solvers::Llt as FaerLlt;
+    use faer::Mat as FaerMat;
+    use faer::Side;
     use ndarray::{Array1, Array2, Axis};
     use rand::prelude::*;
     use rand_distr::{Bernoulli, Distribution, Normal, Uniform};
@@ -3112,6 +3115,222 @@ mod tests {
             max_working_jump > 35.0,
             "Expected at least one working-response jump > 35; observed {:.3e}",
             max_working_jump
+        );
+    }
+
+    #[test]
+    fn alo_matches_true_loo_small_n_binomial_refit() {
+        // This test validates that ALO ≈ true refit LOO for unpenalized logistic regression.
+        // ALO uses fixed Fisher weights from the full fit; true LOO recomputes weights each fold.
+        // Therefore we expect close—but not identical—agreement; tolerances are relaxed.
+
+        let n = 150;
+        let p = 10;
+        let (x, y, _) = generate_synthetic_binary_data(n, p, Some(42));
+        let w = Array1::<f64>::ones(n);
+        let link = LinkFunction::Logit;
+
+        let full_fit = real_unpenalized_fit(&x, &y, &w, link);
+        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+            .expect("compute_alo_features should succeed");
+
+        let mut loo_pred = Array1::<f64>::zeros(n);
+        let mut loo_se = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let mut x_loo = Array2::zeros((n - 1, p));
+            let mut y_loo = Array1::zeros(n - 1);
+            let mut w_loo = Array1::zeros(n - 1);
+
+            let mut idx = 0usize;
+            for j in 0..n {
+                if j == i {
+                    continue;
+                }
+                for k in 0..p {
+                    x_loo[[idx, k]] = x[[j, k]];
+                }
+                y_loo[idx] = y[j];
+                w_loo[idx] = w[j];
+                idx += 1;
+            }
+
+            let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
+
+            let beta_loo = beta_in_original_basis(&loo_fit);
+            let x_i = x.row(i).to_owned();
+            loo_pred[i] = x_i.dot(&beta_loo);
+
+            let mut k = Array2::<f64>::zeros((p, p));
+            let w_fish_loo = loo_fit.final_weights.clone();
+            for r in 0..(n - 1) {
+                let wi = w_fish_loo[r];
+                if wi == 0.0 {
+                    continue;
+                }
+                let xi = x_loo.row(r);
+                for a in 0..p {
+                    let xa = xi[a];
+                    for b in 0..p {
+                        k[[a, b]] += wi * xa * xi[b];
+                    }
+                }
+            }
+            for d in 0..p {
+                k[[d, d]] += 1e-12;
+            }
+
+            let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
+            let llt = FaerLlt::new(kf.as_ref(), Side::Lower)
+                .expect("LLT should succeed for SPD K_LOO");
+            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
+            let solved = llt.solve(rhs.as_ref());
+            let mut ci = 0.0;
+            for r in 0..p {
+                ci += x_i[r] * solved[(r, 0)];
+            }
+            let phi_loo = 1.0_f64; // Logistic dispersion
+            loo_se[i] = (phi_loo * ci).max(0.0).sqrt();
+        }
+
+        let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
+            loo_compare(&alo.pred, &alo.se, &loo_pred, &loo_se);
+
+        println!(
+            "[LOGIT ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}, rmse_se={:.3e}, max_abs_se={:.3e}",
+            rmse_pred, max_abs_pred, rmse_se, max_abs_se
+        );
+
+        assert!(
+            rmse_pred <= 1e-2,
+            "RMSE(η̂) ALO vs true LOO should be ≤ 1e-2, got {:.6e}",
+            rmse_pred
+        );
+        assert!(
+            max_abs_pred <= 8e-2,
+            "Max |Δη̂| ALO vs true LOO should be ≤ 8e-2, got {:.6e}",
+            max_abs_pred
+        );
+        assert!(
+            rmse_se <= 2e-2,
+            "RMSE(SE) ALO vs true LOO should be ≤ 2e-2, got {:.6e}",
+            rmse_se
+        );
+        assert!(
+            max_abs_se <= 8e-2,
+            "Max |ΔSE| ALO vs true LOO should be ≤ 8e-2, got {:.6e}",
+            max_abs_se
+        );
+    }
+
+    #[test]
+    fn alo_matches_true_loo_small_n_gaussian_refit() {
+        // Gaussian identity link: refitted LOO should align extremely closely with ALO.
+        let n = 150;
+        let p = 10;
+        let (x, y, _, _) = generate_synthetic_gaussian_data(n, p, 0.5, Some(4242));
+        let w = Array1::<f64>::ones(n);
+        let link = LinkFunction::Identity;
+
+        let full_fit = real_unpenalized_fit(&x, &y, &w, link);
+        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+            .expect("compute_alo_features should succeed");
+
+        let mut loo_pred = Array1::<f64>::zeros(n);
+        let mut loo_se = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let mut x_loo = Array2::zeros((n - 1, p));
+            let mut y_loo = Array1::zeros(n - 1);
+            let mut w_loo = Array1::zeros(n - 1);
+
+            let mut idx = 0usize;
+            for j in 0..n {
+                if j == i {
+                    continue;
+                }
+                for k in 0..p {
+                    x_loo[[idx, k]] = x[[j, k]];
+                }
+                y_loo[idx] = y[j];
+                w_loo[idx] = w[j];
+                idx += 1;
+            }
+
+            let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
+
+            let beta_loo = beta_in_original_basis(&loo_fit);
+            let x_i = x.row(i).to_owned();
+            loo_pred[i] = x_i.dot(&beta_loo);
+
+            let mut k = Array2::<f64>::zeros((p, p));
+            let w_fish_loo = loo_fit.final_weights.clone();
+            for r in 0..(n - 1) {
+                let wi = w_fish_loo[r];
+                if wi == 0.0 {
+                    continue;
+                }
+                let xi = x_loo.row(r);
+                for a in 0..p {
+                    let xa = xi[a];
+                    for b in 0..p {
+                        k[[a, b]] += wi * xa * xi[b];
+                    }
+                }
+            }
+            for d in 0..p {
+                k[[d, d]] += 1e-12;
+            }
+
+            let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
+            let llt = FaerLlt::new(kf.as_ref(), Side::Lower)
+                .expect("LLT should succeed for SPD K_LOO");
+            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
+            let solved = llt.solve(rhs.as_ref());
+            let mut ci = 0.0;
+            for r in 0..p {
+                ci += x_i[r] * solved[(r, 0)];
+            }
+            let phi_loo = {
+                let mut rss = 0.0;
+                for r in 0..(n - 1) {
+                    let resid = y_loo[r] - loo_fit.final_mu[r];
+                    rss += w_loo[r] * resid * resid;
+                }
+                let dof = ((n - 1) as f64) - loo_fit.edf;
+                let denom = dof.max(1.0);
+                rss / denom
+            };
+            loo_se[i] = (phi_loo * ci).max(0.0).sqrt();
+        }
+
+        let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
+            loo_compare(&alo.pred, &alo.se, &loo_pred, &loo_se);
+
+        println!(
+            "[GAUSS ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}, rmse_se={:.3e}, max_abs_se={:.3e}",
+            rmse_pred, max_abs_pred, rmse_se, max_abs_se
+        );
+
+        assert!(
+            rmse_pred <= 1e-6,
+            "Gaussian RMSE(μ̂) ALO vs true LOO should be ≤ 1e-6, got {:.6e}",
+            rmse_pred
+        );
+        assert!(
+            max_abs_pred <= 1e-5,
+            "Gaussian max |Δμ̂| ALO vs true LOO should be ≤ 1e-5, got {:.6e}",
+            max_abs_pred
+        );
+        assert!(
+            rmse_se <= 5e-3,
+            "Gaussian RMSE(SE) ALO vs true LOO should be ≤ 5e-3, got {:.6e}",
+            rmse_se
+        );
+        assert!(
+            max_abs_se <= 2e-2,
+            "Gaussian max |ΔSE| ALO vs true LOO should be ≤ 2e-2, got {:.6e}",
+            max_abs_se
         );
     }
 
