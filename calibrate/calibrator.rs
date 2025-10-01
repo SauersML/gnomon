@@ -1907,7 +1907,6 @@ pub fn fit_calibrator(
 
 #[cfg(test)]
 mod tests {
-    use crate::calibrate::construction::ModelLayout;
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
     use ndarray::{Array1, Array2, Axis};
