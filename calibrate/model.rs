@@ -525,8 +525,7 @@ impl TrainedModel {
             .get("pgs")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
             .ncols();
-        let pgs_unwhitened_cols =
-            self.config.pgs_basis_config.num_knots + self.config.pgs_basis_config.degree;
+        let pgs_design_cols = layout.pgs_main_cols.len();
 
         for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
             let key = format!("f(PGS,{})", pc_config.name);
@@ -542,16 +541,17 @@ impl TrainedModel {
                         ))
                     })?
                     .ncols();
-                let pc_unwhitened_cols =
-                    pc_config.basis_config.num_knots + pc_config.basis_config.degree;
+                let pc_range_block = &layout.penalty_map[layout.pc_main_block_idx[pc_idx]];
+                let pc_null_cols = layout.pc_null_cols.get(pc_idx).map(|r| r.len()).unwrap_or(0);
+                let pc_design_cols = pc_range_block.col_range.len() + pc_null_cols;
                 let (expected, pgs_dim_dbg, pc_dim_dbg) = match self.config.interaction_penalty {
                     InteractionPenaltyKind::Isotropic => {
                         let expected = pgs_range_cols * pc_range_cols;
                         (expected, pgs_range_cols, pc_range_cols)
                     }
                     InteractionPenaltyKind::Anisotropic => {
-                        let expected = pgs_unwhitened_cols * pc_unwhitened_cols;
-                        (expected, pgs_unwhitened_cols, pc_unwhitened_cols)
+                        let expected = pgs_design_cols * pc_design_cols;
+                        (expected, pgs_design_cols, pc_design_cols)
                     }
                 };
 
