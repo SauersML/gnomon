@@ -9,7 +9,7 @@ use faer::linalg::solvers::{
 };
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
@@ -1276,6 +1276,81 @@ pub struct StablePLSResult {
     pub scale: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlsFallbackReason {
+    IllConditioned,
+    FactorizationFailed,
+}
+
+impl PlsFallbackReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PlsFallbackReason::IllConditioned => "ill_conditioned",
+            PlsFallbackReason::FactorizationFailed => "factorization_failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlsSolverDiagnostics {
+    x_rows: usize,
+    x_cols: usize,
+    eb_rows: usize,
+    eb_cols: usize,
+    e_rows: usize,
+    e_cols: usize,
+    fallback_reason: Option<PlsFallbackReason>,
+}
+
+impl PlsSolverDiagnostics {
+    fn new(
+        x_rows: usize,
+        x_cols: usize,
+        eb_rows: usize,
+        eb_cols: usize,
+        e_rows: usize,
+        e_cols: usize,
+    ) -> Self {
+        Self {
+            x_rows,
+            x_cols,
+            eb_rows,
+            eb_cols,
+            e_rows,
+            e_cols,
+            fallback_reason: None,
+        }
+    }
+
+    fn record_fallback(&mut self, reason: PlsFallbackReason) {
+        if self.fallback_reason.is_none() {
+            self.fallback_reason = Some(reason);
+        }
+    }
+
+    fn emit_qr_summary(&self, edf: f64, scale: f64, rank: usize, p_dim: usize, elapsed: Duration) {
+        let fallback_fragment = match self.fallback_reason {
+            Some(reason) => format!("spd_fallback={}", reason.as_str()),
+            None => "spd_fallback=not_triggered".to_string(),
+        };
+        println!(
+            "[PLS Solver] QR summary: x=({}x{}), eb=({}x{}), e=({}x{}); {}; edf={:.2}, scale={:.4e}, rank={}/{} [{:.2?}]",
+            self.x_rows,
+            self.x_cols,
+            self.eb_rows,
+            self.eb_cols,
+            self.e_rows,
+            self.e_cols,
+            fallback_fragment,
+            edf,
+            scale,
+            rank,
+            p_dim,
+            elapsed
+        );
+    }
+}
+
 /// Robust penalized least squares solver following mgcv's pls_fit1 architecture
 /// This function implements the logic for a SINGLE P-IRLS step in the TRANSFORMED basis
 ///
@@ -1388,6 +1463,15 @@ pub fn solve_penalized_least_squares(
         ));
     }
 
+    let mut diagnostics = PlsSolverDiagnostics::new(
+        x_transformed.nrows(),
+        x_transformed.ncols(),
+        eb.nrows(),
+        eb.ncols(),
+        e_transformed.nrows(),
+        e_transformed.ncols(),
+    );
+
     // FAST PATH (penalized case): Use symmetric solve on H = Xᵀ W X + S_λ
     if e_transformed.nrows() > 0 {
         // Weighted design and RHS via broadcasting
@@ -1420,7 +1504,8 @@ pub fn solve_penalized_least_squares(
         }
         // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
         let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
-        if let Ok(chol) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+        match FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+            Ok(chol) => {
             // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
             let cond_bad = match penalized_hessian.eigh(Side::Lower) {
                 Ok((eigs, _)) => {
@@ -1450,7 +1535,7 @@ pub fn solve_penalized_least_squares(
                 }
             };
             if cond_bad {
-                println!("[PLS Solver] SPD/LLᵀ: condition poor; falling back to QR path");
+                diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
             } else {
                 // Single multi-RHS solve: [ XtWz | Eᵀ ]
                 let rk_rows = e_transformed.nrows();
@@ -1520,20 +1605,13 @@ pub fn solve_penalized_least_squares(
                     p_dim,
                 ));
             }
+            }
+            Err(_) => diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed),
         }
         // If LLᵀ fails, continue into the robust QR path below.
     }
 
     let function_timer = Instant::now();
-    println!(
-        "[PLS Solver] Entering QR path. Matrix dimensions: x=({}x{}), eb=({}x{}), e=({}x{})",
-        x_transformed.nrows(),
-        x_transformed.ncols(),
-        eb.nrows(),
-        eb.ncols(),
-        e_transformed.nrows(),
-        e_transformed.ncols()
-    );
 
     use ndarray::s;
 
@@ -1906,14 +1984,7 @@ pub fn solve_penalized_least_squares(
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
-    println!(
-        "[PLS Solver] QR path completed with edf={:.2}, scale={:.4e}, rank={}/{} [{:.2?}]",
-        edf,
-        scale,
-        rank,
-        x_transformed.ncols(),
-        function_timer.elapsed()
-    );
+    diagnostics.emit_qr_summary(edf, scale, rank, x_transformed.ncols(), function_timer.elapsed());
 
     // Return the result
     Ok((
