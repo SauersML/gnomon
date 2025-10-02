@@ -498,8 +498,28 @@ pub fn build_design_and_penalty_matrices(
         })
         .collect();
 
-    let pc_int_ncols = pc_range_interaction_ncols.clone();
-    let pgs_int_ncols = pgs_range_ncols;
+    let (pgs_int_ncols, pc_int_ncols): (usize, Vec<usize>) =
+        match config.interaction_penalty {
+            InteractionPenaltyKind::Isotropic => {
+                let pc_int_ncols = pc_range_interaction_ncols.clone();
+                (pgs_range_ncols, pc_int_ncols)
+            }
+            InteractionPenaltyKind::Anisotropic => {
+                let pgs_cols = pgs_main_basis_unc.ncols();
+                let pc_cols = pc_unconstrained_bases_main
+                    .iter()
+                    .map(|b| b.ncols())
+                    .collect();
+                (pgs_cols, pc_cols)
+            }
+        };
+
+    if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
+        debug_assert_eq!(pgs_int_ncols, pgs_main_basis_unc.ncols());
+        for (idx, basis) in pc_unconstrained_bases_main.iter().enumerate() {
+            debug_assert_eq!(pc_int_ncols[idx], basis.ncols());
+        }
+    }
 
     let layout = ModelLayout::new(
         config,
@@ -756,20 +776,9 @@ pub fn build_design_and_penalty_matrices(
                     row_wise_tensor_product(pgs_int_basis, &pc_int_basis)
                 }
                 InteractionPenaltyKind::Anisotropic => {
-                    let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
-                        EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
-                    })?;
-                    let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs);
-
-                    let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
-                        EstimationError::LayoutError(format!(
-                            "Missing '{}' in range_transforms",
-                            pc_name
-                        ))
-                    })?;
-                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
-
-                    row_wise_tensor_product(&pgs_int_basis, &pc_int_basis)
+                    let pgs_int_basis = &pgs_main_basis_unc;
+                    let pc_int_basis = &pc_unconstrained_bases_main[pc_idx];
+                    row_wise_tensor_product(pgs_int_basis, pc_int_basis)
                 }
             };
 
