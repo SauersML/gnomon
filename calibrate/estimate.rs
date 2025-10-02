@@ -1181,8 +1181,17 @@ pub fn optimize_external_design(
                 .zip(resid.iter())
                 .map(|(&wi, &ri)| wi * ri * ri)
                 .sum();
+            let penalty = pirls_res.stable_penalty_term;
+            let dp = rss + penalty;
             let n = y_o.len() as f64;
-            rss / (n - pirls_res.edf).max(1.0)
+            let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+            let mp = pirls_res
+                .beta_transformed
+                .len()
+                .saturating_sub(penalty_rank)
+                as f64;
+            let denom = (n - mp).max(1.0);
+            dp / denom
         }
         LinkFunction::Logit => 1.0,
     };
@@ -2155,17 +2164,21 @@ pub mod internal {
                     // Penalty roots are available in reparam_result if needed
                     let _ = &pirls_result.reparam_result.rs_transformed;
 
-                    // Use the edf_from_h_and_rk helper for consistent EDF calculation
-                    // between cost and gradient functions
+                    // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
+                    // following the standard REML identity φ = D_p / (n - M_p).
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+
+                    // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
                     let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
-
-                    // Correct φ using penalized deviance: φ = D_p / (n - edf)
-                    let phi = dp / (n - edf).max(LAML_RIDGE);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
+
+                    let denom = (n - mp).max(LAML_RIDGE);
+                    let phi = dp / denom;
 
                     // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -2183,9 +2196,6 @@ pub mod internal {
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
                     let log_det_s_plus = pirls_result.reparam_result.log_det;
-                    // Correct Mp calculation - nullspace dimension of penalty matrix
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
@@ -2232,7 +2242,7 @@ pub mod internal {
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
                     // to determine M_p robustly, avoiding contamination from dominant penalties.
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
@@ -2670,23 +2680,18 @@ pub mod internal {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
-                    // Calculate scale parameter.  In the Gaussian/REML case we *profile* the
-                    // scale (φ) by plugging in φ̂(ρ) = D_p /(n - EDF); that is exactly what mgcv
-                    // does before evaluating the gradient.
+                    // Calculate scale parameter using the regular REML profiling
+                    // φ = D_p / (n - M_p), where M_p is the penalty nullspace dimension.
                     let rss = pirls_result.deviance;
 
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
 
-                    // EDF calculation in transformed basis using shared helper
                     let factor_g = self.get_faer_factor(p, h_eff);
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
-                    // Because φ has been profiled out, the envelope theorem tells us that the
-                    // derivative of the profiled objective with respect to ρ is given by the
-                    // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
-                    // propagated below—exactly mirroring mgcv’s REML gradient implementation.
-                    let scale = dp / (n - edf).max(LAML_RIDGE);
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+                    let scale = dp / (n - mp).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
@@ -2997,6 +3002,79 @@ pub mod internal {
         };
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        #[test]
+        fn reml_identity_gradient_matches_fd_with_constant_mp_scale() {
+            // Simple Gaussian regression with intercept (unpenalized) and slope (penalized).
+            // The true data follow y = 1 + 2x deterministically so the PIRLS solve is stable.
+            let n = 80usize;
+            let mut design = Array2::<f64>::zeros((n, 2));
+            let mut response = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let x = i as f64 / n as f64;
+                design[[i, 0]] = 1.0;
+                design[[i, 1]] = x;
+                response[i] = 1.0 + 2.0 * x;
+            }
+
+            let weights = Array1::ones(n);
+            let offset = Array1::zeros(n);
+
+            // Penalty: slope is penalized, intercept lives in the nullspace (M_p = 1).
+            let mut s = Array2::<f64>::zeros((2, 2));
+            s[[1, 1]] = 1.0;
+            let s_list = vec![s];
+
+            let layout = ModelLayout::external(2, 1);
+            let config = ModelConfig::external(LinkFunction::Identity, 1e-10, 200);
+
+            let reml_state = internal::RemlState::new_with_offset(
+                response.view(),
+                design.view(),
+                weights.view(),
+                offset.view(),
+                s_list,
+                &layout,
+                &config,
+                Some(vec![1]),
+            )
+            .expect("identity REML state should build");
+
+            let rho_grid = vec![
+                Array1::from(vec![-1.5]),
+                Array1::from(vec![0.0]),
+                Array1::from(vec![1.25]),
+            ];
+
+            for rho in rho_grid.iter() {
+                let g_an = reml_state
+                    .compute_gradient(rho)
+                    .expect("analytic gradient should evaluate");
+                let g_fd = super::compute_fd_gradient(&reml_state, rho)
+                    .expect("fd gradient should evaluate");
+
+                let dot = g_an.dot(&g_fd);
+                let norm_an = g_an.dot(&g_an).sqrt();
+                let norm_fd = g_fd.dot(&g_fd).sqrt();
+                let cosine = dot / (norm_an.max(1e-16) * norm_fd.max(1e-16));
+
+                let diff = &g_an - &g_fd;
+                let rel_l2 = diff.dot(&diff).sqrt() / norm_fd.max(1e-16);
+
+                assert!(
+                    cosine > 0.9999,
+                    "cosine similarity too low at rho={:?}: {:.6}",
+                    rho,
+                    cosine
+                );
+                assert!(
+                    rel_l2 < 5e-4,
+                    "relative L2 too high at rho={:?}: {:.3e}",
+                    rho,
+                    rel_l2
+                );
+            }
+        }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
