@@ -1181,8 +1181,17 @@ pub fn optimize_external_design(
                 .zip(resid.iter())
                 .map(|(&wi, &ri)| wi * ri * ri)
                 .sum();
+            let penalty = pirls_res.stable_penalty_term;
+            let dp = rss + penalty;
             let n = y_o.len() as f64;
-            rss / (n - pirls_res.edf).max(1.0)
+            let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+            let mp = pirls_res
+                .beta_transformed
+                .len()
+                .saturating_sub(penalty_rank)
+                as f64;
+            let denom = (n - mp).max(1.0);
+            dp / denom
         }
         LinkFunction::Logit => 1.0,
     };
@@ -2096,17 +2105,21 @@ pub mod internal {
                     // Penalty roots are available in reparam_result if needed
                     let _ = &pirls_result.reparam_result.rs_transformed;
 
-                    // Use the edf_from_h_and_rk helper for consistent EDF calculation
-                    // between cost and gradient functions
+                    // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
+                    // following the standard REML identity φ = D_p / (n - M_p).
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+
+                    // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
                     let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
-
-                    // Correct φ using penalized deviance: φ = D_p / (n - edf)
-                    let phi = dp / (n - edf).max(LAML_RIDGE);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
+
+                    let denom = (n - mp).max(LAML_RIDGE);
+                    let phi = dp / denom;
 
                     // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -2124,9 +2137,6 @@ pub mod internal {
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
                     let log_det_s_plus = pirls_result.reparam_result.log_det;
-                    // Correct Mp calculation - nullspace dimension of penalty matrix
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
@@ -2173,7 +2183,7 @@ pub mod internal {
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
                     // to determine M_p robustly, avoiding contamination from dominant penalties.
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
@@ -2611,23 +2621,18 @@ pub mod internal {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
-                    // Calculate scale parameter.  In the Gaussian/REML case we *profile* the
-                    // scale (φ) by plugging in φ̂(ρ) = D_p /(n - EDF); that is exactly what mgcv
-                    // does before evaluating the gradient.
+                    // Calculate scale parameter using the regular REML profiling
+                    // φ = D_p / (n - M_p), where M_p is the penalty nullspace dimension.
                     let rss = pirls_result.deviance;
 
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
 
-                    // EDF calculation in transformed basis using shared helper
                     let factor_g = self.get_faer_factor(p, h_eff);
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
-                    // Because φ has been profiled out, the envelope theorem tells us that the
-                    // derivative of the profiled objective with respect to ρ is given by the
-                    // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
-                    // propagated below—exactly mirroring mgcv’s REML gradient implementation.
-                    let scale = dp / (n - edf).max(LAML_RIDGE);
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+                    let scale = dp / (n - mp).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
