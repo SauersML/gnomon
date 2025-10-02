@@ -4724,11 +4724,7 @@ mod tests {
         let (x_cal, penalties, schema, offset) =
             build_calibrator_design(&alo_features, &spec).unwrap();
 
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-        ];
+        let penalty_nullspace_dims = dims4(schema.penalty_nullspace_dims);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -6617,11 +6613,7 @@ mod tests {
 
         // Try to fit calibrator with large penalties
         let w = Array1::<f64>::ones(n);
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-        ];
+        let penalty_nullspace_dims = dims4(schema.penalty_nullspace_dims);
         let result = fit_calibrator(
             y.view(),
             w.view(),
@@ -6631,7 +6623,6 @@ mod tests {
             &penalty_nullspace_dims,
             LinkFunction::Logit,
         );
-
         // The fit should succeed with large lambdas
         assert!(
             result.is_ok(),
