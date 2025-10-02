@@ -6980,11 +6980,7 @@ mod tests {
             x_uniform.view(),
             offset_uniform.view(),
             &penalties_uniform,
-            &[
-                schema_uniform.penalty_nullspace_dims.0,
-                schema_uniform.penalty_nullspace_dims.1,
-                schema_uniform.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema_uniform.penalty_nullspace_dims),
             LinkFunction::Logit,
         )
         .unwrap();
@@ -6999,11 +6995,7 @@ mod tests {
             x_nonuniform.view(),
             offset_nonuniform.view(),
             &penalties_nonuniform,
-            &[
-                schema_nonuniform.penalty_nullspace_dims.0,
-                schema_nonuniform.penalty_nullspace_dims.1,
-                schema_nonuniform.penalty_nullspace_dims.2,
-            ],
+            &dims4(schema_nonuniform.penalty_nullspace_dims),
             LinkFunction::Logit,
         )
         .unwrap();
