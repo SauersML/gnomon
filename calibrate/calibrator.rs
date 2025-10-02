@@ -111,6 +111,29 @@ pub struct InternalSchema {
     pub pred_param_range: std::ops::Range<usize>,
 }
 
+pub(crate) fn active_penalty_nullspace_dims(
+    schema: &InternalSchema,
+    penalties: &[Array2<f64>],
+) -> Vec<usize> {
+    let dims = [
+        schema.penalty_nullspace_dims.0,
+        schema.penalty_nullspace_dims.1,
+        schema.penalty_nullspace_dims.2,
+        schema.penalty_nullspace_dims.3,
+    ];
+    let tol = 1e-12_f64;
+    penalties
+        .iter()
+        .zip(dims.into_iter())
+        .filter_map(|(penalty, dim)| {
+            let max_abs = penalty
+                .iter()
+                .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+            (max_abs > tol).then_some(dim)
+        })
+        .collect()
+}
+
 /// Compute ALO features (η̃/μ̃, SẼ, signed distance) from a single base fit
 pub fn compute_alo_features(
     base: &pirls::PirlsResult,
@@ -3937,12 +3960,7 @@ mod tests {
         // Fit calibrator with the original design from build_calibrator_design
         // Since we've fixed the solver to handle rank-deficient matrices properly,
         // we don't need to manually modify the design matrix or penalties
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-            schema.penalty_nullspace_dims.3,
-        ];
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4017,17 +4035,14 @@ mod tests {
         // Build design
         let (x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
 
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
+
         // Create ExternalOptimOptions
         let opts = crate::calibrate::estimate::ExternalOptimOptions {
             link: LinkFunction::Identity,
             max_iter: 50,
             tol: 1e-3_f64,
-            nullspace_dims: vec![
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            nullspace_dims: penalty_nullspace_dims.clone(),
         };
 
         // Set uniform weights
@@ -4035,12 +4050,6 @@ mod tests {
 
         // Fit the model and check convergence - this indirectly tests the gradient agreement
         // between analytic and finite difference approaches
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-            schema.penalty_nullspace_dims.3,
-        ];
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4136,13 +4145,15 @@ mod tests {
         let w = Array1::<f64>::ones(n);
 
         // Simply verify that the optimizer converges successfully
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
+
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x.view(),
             offset.view(),
             &penalties,
-            &dims4(schema.penalty_nullspace_dims),
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         );
 
@@ -4252,12 +4263,7 @@ mod tests {
         let x_wrong_shape = x.slice(s![..n - 1, ..]).to_owned();
 
         // First verify that correct shape design works
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-            schema.penalty_nullspace_dims.3,
-        ];
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result_correct = fit_calibrator(
             y.view(),
             w.view(),
@@ -4402,12 +4408,7 @@ mod tests {
             build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-            schema.penalty_nullspace_dims.3,
-        ];
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4559,12 +4560,7 @@ mod tests {
             let (x_cal, penalties, schema, offset) =
                 build_calibrator_design(&alo_features, &spec).unwrap();
 
-            let penalty_nullspace_dims = [
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ];
+            let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
 
             let fit_result = fit_calibrator(
                 y.view(),
@@ -4725,7 +4721,7 @@ mod tests {
         let (x_cal, penalties, schema, offset) =
             build_calibrator_design(&alo_features, &spec).unwrap();
 
-        let penalty_nullspace_dims = dims4(schema.penalty_nullspace_dims);
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
@@ -4882,18 +4878,14 @@ mod tests {
             build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -5112,13 +5104,14 @@ mod tests {
 
         let (x_cal, penalties, schema, offset) =
             build_calibrator_design(&alo_features, &spec).unwrap();
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &dims4(schema.penalty_nullspace_dims),
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -5196,18 +5189,14 @@ mod tests {
             build_calibrator_design(&alo_features, &spec).unwrap();
 
         // Fit calibrator
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Identity,
         )
         .unwrap();
@@ -5328,13 +5317,14 @@ mod tests {
         };
 
         let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &dims4(schema.penalty_nullspace_dims),
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         );
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
@@ -5441,18 +5431,14 @@ mod tests {
         );
 
         // Fit calibrator
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             weights.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -5552,18 +5538,14 @@ mod tests {
         // Build design and fit calibrator
         let (x_cal, penalties, schema, offset) =
             build_calibrator_design(&alo_features, &spec).unwrap();
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -5626,6 +5608,11 @@ mod tests {
             );
         }
 
+        let lambda_tolerance = |a: f64, b: f64| {
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() < 1e-12 * scale
+        };
+
         // Check all model components match
         // Check knots
         assert_eq!(
@@ -5639,12 +5626,42 @@ mod tests {
         }
 
         // Check lambdas
-        assert!((original_cal_model.lambda_pred - loaded_cal_model.lambda_pred).abs() < 1e-10);
         assert!(
-            (original_cal_model.lambda_pred_param - loaded_cal_model.lambda_pred_param).abs() < 1e-10
+            lambda_tolerance(
+                original_cal_model.lambda_pred,
+                loaded_cal_model.lambda_pred
+            ),
+            "lambda_pred mismatch: original={} loaded={}",
+            original_cal_model.lambda_pred,
+            loaded_cal_model.lambda_pred
         );
-        assert!((original_cal_model.lambda_se - loaded_cal_model.lambda_se).abs() < 1e-10);
-        assert!((original_cal_model.lambda_dist - loaded_cal_model.lambda_dist).abs() < 1e-10);
+        assert!(
+            lambda_tolerance(
+                original_cal_model.lambda_pred_param,
+                loaded_cal_model.lambda_pred_param
+            ),
+            "lambda_pred_param mismatch: original={} loaded={}",
+            original_cal_model.lambda_pred_param,
+            loaded_cal_model.lambda_pred_param
+        );
+        assert!(
+            lambda_tolerance(
+                original_cal_model.lambda_se,
+                loaded_cal_model.lambda_se
+            ),
+            "lambda_se mismatch: original={} loaded={}",
+            original_cal_model.lambda_se,
+            loaded_cal_model.lambda_se
+        );
+        assert!(
+            lambda_tolerance(
+                original_cal_model.lambda_dist,
+                loaded_cal_model.lambda_dist
+            ),
+            "lambda_dist mismatch: original={} loaded={}",
+            original_cal_model.lambda_dist,
+            loaded_cal_model.lambda_dist
+        );
 
         // Check coefficients
         assert_eq!(
@@ -5748,13 +5765,14 @@ mod tests {
         // Build design and fit calibrator
         let (x_cal, rs_blocks, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::<f64>::ones(n);
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &rs_blocks);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &rs_blocks,
-            &dims4(schema.penalty_nullspace_dims),
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -5992,18 +6010,14 @@ mod tests {
         // Build design and fit calibrator
         let (x_cal, rs_blocks, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::<f64>::ones(n);
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &rs_blocks);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &rs_blocks,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Identity,
         )
         .unwrap();
@@ -6196,13 +6210,14 @@ mod tests {
             let (x_cal, penalties, schema, offset) =
                 build_calibrator_design(features, &spec).unwrap();
             let w = Array1::<f64>::ones(n);
+            let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
             let fit_result = fit_calibrator(
                 y.view(),
                 w.view(),
                 x_cal.view(),
                 offset.view(),
                 &penalties,
-                &dims4(schema.penalty_nullspace_dims),
+                &penalty_nullspace_dims,
                 LinkFunction::Logit,
             )
             .unwrap();
@@ -6357,17 +6372,14 @@ mod tests {
 
         // Time the calibrator fitting
         let fit_start = Instant::now();
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
             w.view(),
             x_cal.view(),
             offset.view(),
             &penalties,
-            &[
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-            ],
+            &penalty_nullspace_dims,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -6488,12 +6500,8 @@ mod tests {
         // Try to fit calibrator with extreme penalties
         // This should either converge with very small EDF or fail gracefully with an error
         // It should not hang indefinitely in the step-halving loop
-        let penalty_nullspace_dims = [
-            schema.penalty_nullspace_dims.0,
-            schema.penalty_nullspace_dims.1,
-            schema.penalty_nullspace_dims.2,
-            schema.penalty_nullspace_dims.3,
-        ];
+        let penalty_nullspace_dims =
+            active_penalty_nullspace_dims(&schema, &extreme_penalties);
         let result = fit_calibrator(
             y.view(),
             w.view(),
@@ -6614,7 +6622,8 @@ mod tests {
 
         // Try to fit calibrator with large penalties
         let w = Array1::<f64>::ones(n);
-        let penalty_nullspace_dims = dims4(schema.penalty_nullspace_dims);
+        let penalty_nullspace_dims =
+            active_penalty_nullspace_dims(&schema, &large_penalties);
         let result = fit_calibrator(
             y.view(),
             w.view(),
@@ -6966,13 +6975,15 @@ mod tests {
         let (x_uniform, penalties_uniform, schema_uniform, offset_uniform) =
             build_calibrator_design(&features, &spec_uniform).unwrap();
 
+        let penalty_nullspace_dims_uniform =
+            active_penalty_nullspace_dims(&schema_uniform, &penalties_uniform);
         let fit_uniform = fit_calibrator(
             y.view(),
             Array1::<f64>::ones(n).view(),
             x_uniform.view(),
             offset_uniform.view(),
             &penalties_uniform,
-            &dims4(schema_uniform.penalty_nullspace_dims),
+            &penalty_nullspace_dims_uniform,
             LinkFunction::Logit,
         )
         .unwrap();
@@ -6981,13 +6992,15 @@ mod tests {
         let (x_nonuniform, penalties_nonuniform, schema_nonuniform, offset_nonuniform) =
             build_calibrator_design(&features, &spec_nonuniform).unwrap();
 
+        let penalty_nullspace_dims_nonuniform =
+            active_penalty_nullspace_dims(&schema_nonuniform, &penalties_nonuniform);
         let fit_nonuniform = fit_calibrator(
             y.view(),
             weights.view(),
             x_nonuniform.view(),
             offset_nonuniform.view(),
             &penalties_nonuniform,
-            &dims4(schema_nonuniform.penalty_nullspace_dims),
+            &penalty_nullspace_dims_nonuniform,
             LinkFunction::Logit,
         )
         .unwrap();

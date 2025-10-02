@@ -25,6 +25,7 @@
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
 // Crate-level imports
+use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
     compute_penalty_square_roots,
@@ -962,12 +963,8 @@ pub fn train_model(
             None
         } else {
             eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
-            let penalty_nullspace_dims = [
-                schema.penalty_nullspace_dims.0,
-                schema.penalty_nullspace_dims.1,
-                schema.penalty_nullspace_dims.2,
-                schema.penalty_nullspace_dims.3,
-            ];
+            let penalty_nullspace_dims =
+                active_penalty_nullspace_dims(&schema, &penalties_cal);
             let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
                 reml_state.y(),
                 reml_state.weights(),
