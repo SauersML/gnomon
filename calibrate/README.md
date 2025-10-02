@@ -1,12 +1,72 @@
 # Calibration crate
 
-The `calibrate/` crate hosts the end-to-end pipeline that fits Gnomon's penalized
-additive model and its optional post-hoc calibrator. The code in this directory
-is responsible for ingesting the tabular training data, constructing spline
-bases and penalties, solving the penalized iteratively reweighted least squares
-(P-IRLS) updates with REML smoothing selection, and (when enabled) training a
-secondary calibrator that sharpens probability calibration or identity-scale
-accuracy.
+The `calibrate/` crate hosts the end-to-end pipeline that fits Gnomon's
+penalized additive model and its optional post-hoc calibrator. The code in this
+directory is responsible for ingesting the tabular training data, constructing
+the spline bases and their penalties, solving the penalized iteratively
+reweighted least squares (P-IRLS) updates with REML/LAML smoothing selection,
+and (when enabled) training a secondary calibrator that sharpens probability
+calibration or identity-scale accuracy.
+
+## Statistical model
+
+The primary estimator is a generalized additive model whose linear predictor is
+
+```
+η(x) = β₀ + f_pgs(PGS) + Σ_j f_j(PC_j) + Σ_j f_{pgs,j}(PGS, PC_j),
+```
+
+where `f_pgs` and each `f_j` are univariate spline smooths and `f_{pgs,j}` are
+tensor-product interactions between the polygenic score and the _j_-th principal
+component. This structure is encoded in [`construction.rs`](construction.rs),
+which wires the marginal and interaction bases into a single design matrix with
+sum-to-zero constraints and ANOVA-style orthogonalization so the additive terms
+are identifiable and interpretable.
+
+Two likelihoods are supported via [`model::LinkFunction`](model.rs): logistic
+(`Logit`) for binary traits and Gaussian identity (`Identity`) for continuous
+phenotypes. For the logistic case the P-IRLS inner loop targets the binomial
+deviance, while the Gaussian case profiles a scale parameter that is later
+stored for prediction-time standard errors.
+
+## Penalties and smoothing selection
+
+Each smooth term is represented with B-spline bases generated in
+[`basis.rs`](basis.rs). Difference penalties of configurable order control the
+wiggliness of the univariate smooths, and tensor-product penalties regularize
+the interactions. These penalties respect the null spaces implied by the ANOVA
+constraints so that intercepts and lower-order components remain unpenalized by
+construction.
+
+Smoothing parameters (`λ`) are learned rather than fixed. [`estimate.rs`](estimate.rs)
+implements a nested optimization in the style of Wood (2011): the inner loop is
+the penalized IRLS solver that returns coefficients for any proposed set of
+`λ`, and the outer loop runs a box-constrained BFGS optimizer on the marginal
+likelihood of those smoothing parameters. Gaussian models maximize the exact
+restricted likelihood (REML), while non-Gaussian models maximize the Laplace
+approximate marginal likelihood (LAML); both objectives include stabilization
+priors and null-space accounting to prevent degeneracy.
+
+## Optimization strategy
+
+The P-IRLS solver iteratively forms working responses and weights, solves the
+penalized normal equations with the `faer` linear algebra backend, and checks
+for hazards such as separation or ill-conditioning. Transformed Hessians, trace
+corrections, and effective degrees of freedom are cached so the outer REML/LAML
+optimizer can evaluate gradients efficiently. The final Hessian, effective
+penalty factors, and fitted scale (when applicable) are preserved inside the
+[`TrainedModel`](model.rs) artifact for downstream uncertainty estimates.
+
+## Optional calibrator layer
+
+When enabled, the pipeline trains a secondary additive model that adjusts the
+base predictions. [`calibrator.rs`](calibrator.rs) derives approximate
+leave-one-out diagnostics from the converged base fit—baseline predictor,
+standard error, and signed distance to the peeled hull—and feeds them into a
+compact spline design whose smoothing parameters are optimized with the same
+REML/LAML machinery. The calibrator honors the original link function, preserves
+identity-scale means, and records its own penalties, coefficients, and scaling
+metadata so predictions can reproduce the post-hoc correction faithfully.
 
 ## What lives where
 
