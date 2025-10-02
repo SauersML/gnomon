@@ -1229,6 +1229,7 @@ pub fn optimize_external_design(
             let penalty = pirls_res.stable_penalty_term;
             let dp = rss + penalty;
             let dp_c = dp.max(DP_FLOOR);
+
             let n = y_o.len() as f64;
             let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
             let mp = pirls_res
@@ -1238,6 +1239,7 @@ pub fn optimize_external_design(
                 as f64;
             let denom = (n - mp).max(1.0);
             dp_c / denom
+
         }
         LinkFunction::Logit => 1.0,
     };
@@ -1324,11 +1326,28 @@ fn compute_fd_gradient(
 ) -> Result<Array1<f64>, EstimationError> {
     let mut fd_grad = Array1::zeros(rho.len());
 
+    let mut log_lines: Vec<String> = Vec::new();
+    match reml_state.last_ridge_used() {
+        Some(ridge) => log_lines.push(format!(
+            "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho = {:?}",
+            rho.to_vec()
+        )),
+        None => log_lines.push(format!(
+            "[FD RIDGE] No cached baseline ridge available for rho = {:?}",
+            rho.to_vec()
+        )),
+    }
+
     for i in 0..rho.len() {
         // Robust central-difference step for nested solvers: overpower evaluation noise
         let h_rel = 1e-4_f64 * (1.0 + rho[i].abs());
         let h_abs = 1e-5_f64; // absolute floor near zero
         let h = h_rel.max(h_abs);
+
+        log_lines.push(format!(
+            "[FD RIDGE] ---- Coordinate {i} (rho = {:+.6e}, h = {:.3e}) ----",
+            rho[i], h
+        ));
 
         // D1 with step h
         let mut rho_p = rho.clone();
@@ -1336,7 +1355,20 @@ fn compute_fd_gradient(
         let mut rho_m = rho.clone();
         rho_m[i] -= 0.5 * h;
         let f_p = reml_state.compute_cost(&rho_p)?;
+        let ridge_p = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+        log_lines.push(format!(
+            "[FD RIDGE]    +0.5h cost = {:+.9e} | ridge = {ridge_p:.3e} | rho = {:?}",
+            f_p,
+            rho_p.to_vec()
+        ));
+
         let f_m = reml_state.compute_cost(&rho_m)?;
+        let ridge_m = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+        log_lines.push(format!(
+            "[FD RIDGE]    -0.5h cost = {:+.9e} | ridge = {ridge_m:.3e} | rho = {:?}",
+            f_m,
+            rho_m.to_vec()
+        ));
         let d1 = (f_p - f_m) / h;
 
         // D2 with step 2h (two-scale guard)
@@ -1346,7 +1378,20 @@ fn compute_fd_gradient(
         let mut rho_m2 = rho.clone();
         rho_m2[i] -= 0.5 * h2;
         let f_p2 = reml_state.compute_cost(&rho_p2)?;
+        let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+        log_lines.push(format!(
+            "[FD RIDGE]    +1.0h cost = {:+.9e} | ridge = {ridge_p2:.3e} | rho = {:?}",
+            f_p2,
+            rho_p2.to_vec()
+        ));
+
         let f_m2 = reml_state.compute_cost(&rho_m2)?;
+        let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+        log_lines.push(format!(
+            "[FD RIDGE]    -1.0h cost = {:+.9e} | ridge = {ridge_m2:.3e} | rho = {:?}",
+            f_m2,
+            rho_m2.to_vec()
+        ));
         let d2 = (f_p2 - f_m2) / h2;
 
         // Prefer the larger-step derivative if the two disagree substantially
@@ -1356,6 +1401,15 @@ fn compute_fd_gradient(
         } else {
             d1
         };
+
+        log_lines.push(format!(
+            "[FD RIDGE]    d1 = {:+.9e}, d2 = {:+.9e}, chosen = {:+.9e}",
+            d1, d2, fd_grad[i]
+        ));
+    }
+
+    if !log_lines.is_empty() {
+        println!("{}", log_lines.join("\n"));
     }
 
     Ok(fd_grad)
@@ -1672,6 +1726,13 @@ pub mod internal {
             let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
             *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
             Ok(bundle)
+        }
+
+        pub(super) fn last_ridge_used(&self) -> Option<f64> {
+            self.current_eval_bundle
+                .borrow()
+                .as_ref()
+                .map(|bundle| bundle.ridge_used)
         }
 
         /// Calculate effective degrees of freedom (EDF) using a consistent approach
@@ -2173,6 +2234,7 @@ pub mod internal {
                         );
                     }
                     let phi = dp_c / denom;
+
 
                     // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -2692,6 +2754,7 @@ pub mod internal {
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
                     let scale = dp_c / (n - mp).max(LAML_RIDGE);
 
+
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
                     //   We'll calculate s_k_beta for all cases, as it's needed for both paths
@@ -3077,6 +3140,7 @@ pub mod internal {
                 y.view(),
                 x.view(),
                 w.view(),
+
                 offset.view(),
                 s_list,
                 &layout,
@@ -3125,6 +3189,7 @@ pub mod internal {
             assert!(cosine > 0.9995, "cosine similarity too low: {cosine:.6}");
             assert!(rel_l2 < 1e-3, "relative L2 too high: {rel_l2:.3e}");
             assert!(rel_dir < 1e-3, "directional secant mismatch: {rel_dir:.3e}");
+
         }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
