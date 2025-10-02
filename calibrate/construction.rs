@@ -2013,12 +2013,11 @@ mod tests {
     #[test]
     fn test_predict_linear_equals_x_beta() {
         // Build training matrices and transforms
-        let (data, config) = create_test_data_for_construction(100, 1);
-        // Capture interaction_orth_alpha from the return tuple
+        let (data, mut config) = create_test_data_for_construction(100, 1);
         let (
             x_training,
             _,
-            _,
+            layout,
             sum_to_zero_constraints,
             knot_vectors,
             range_transforms,
@@ -2028,114 +2027,97 @@ mod tests {
         ) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // Prepare a config carrying all saved transforms
-        let mut cfg = config.clone();
-        cfg.sum_to_zero_constraints = sum_to_zero_constraints.clone();
-        cfg.knot_vectors = knot_vectors.clone();
-        cfg.range_transforms = range_transforms.clone();
-        cfg.pc_null_transforms = pc_null_transforms.clone();
-        cfg.interaction_centering_means = interaction_centering_means.clone();
-        cfg.interaction_orth_alpha = interaction_orth_alpha.clone(); // Add the captured map to the configuration
+        config.sum_to_zero_constraints = sum_to_zero_constraints.clone();
+        config.knot_vectors = knot_vectors.clone();
+        config.range_transforms = range_transforms.clone();
+        config.pc_null_transforms = pc_null_transforms.clone();
+        config.interaction_centering_means = interaction_centering_means.clone();
+        config.interaction_orth_alpha = interaction_orth_alpha.clone();
 
-        // Construct coefficients in the canonical structure
-        use crate::calibrate::model::{MainEffects, MappedCoefficients, TrainedModel};
+        use crate::calibrate::model::{self, MainEffects, MappedCoefficients, TrainedModel};
 
-        // For this config, there is 1 PC (if you built with num_pcs=1 above).
-        // Determine sizes from cfg.range_transforms and sum_to_zero_constraints.
-        let pgs_dim = cfg
-            .sum_to_zero_constraints
-            .get("pgs_main")
-            .expect("missing pgs_main Z")
-            .ncols();
-        let pc_name = cfg.pc_configs[0].name.clone();
-        let r_pc = cfg
-            .range_transforms
-            .get(&pc_name)
-            .expect("missing PC range transform")
-            .ncols();
-        let n_pc = cfg
-            .pc_null_transforms
-            .get(&pc_name)
-            .map(|z| z.ncols())
-            .unwrap_or(0);
-        let r_pgs = cfg
-            .range_transforms
-            .get("pgs")
-            .expect("missing PGS range transform")
-            .ncols();
+        // Populate coefficients deterministically using the layout dimensions.
+        let mut pcs_coeffs = HashMap::new();
+        for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
+            let null_len = layout
+                .pc_null_cols
+                .get(pc_idx)
+                .map(|range| range.len())
+                .unwrap_or(0);
+            let range_len = {
+                let block_idx = layout.pc_main_block_idx[pc_idx];
+                layout.penalty_map[block_idx].col_range.len()
+            };
+            let mut coeffs = Vec::with_capacity(null_len + range_len);
+            for j in 0..null_len {
+                coeffs.push(10.0 + (pc_idx * 10 + j) as f64);
+            }
+            for j in 0..range_len {
+                coeffs.push(20.0 + (pc_idx * 10 + j) as f64);
+            }
+            pcs_coeffs.insert(pc_config.name.clone(), coeffs);
+        }
 
-        let interaction_len = r_pgs * r_pc;
+        let mut pgs_coeffs = Vec::with_capacity(layout.pgs_main_cols.len());
+        for j in 0..layout.pgs_main_cols.len() {
+            pgs_coeffs.push(30.0 + j as f64);
+        }
 
-        // Populate coefficients deterministically
-        let coeffs = MappedCoefficients {
+        let mut interaction_coeffs = HashMap::new();
+        for &block_idx in &layout.interaction_block_idx {
+            let block = &layout.penalty_map[block_idx];
+            let mut coeffs = Vec::with_capacity(block.col_range.len());
+            for j in 0..block.col_range.len() {
+                coeffs.push(100.0 + block_idx as f64 + j as f64);
+            }
+            interaction_coeffs.insert(block.term_name.clone(), coeffs);
+        }
+
+        let mapped_coeffs = MappedCoefficients {
             intercept: 0.123,
             main_effects: MainEffects {
-                pgs: (1..=pgs_dim).map(|i| i as f64).collect(),
-                pcs: {
-                    let mut pcs = HashMap::new();
-                    let mut v: Vec<f64> = Vec::new();
-                    for i in 1..=n_pc {
-                        v.push(10.0 + i as f64);
-                    }
-                    for i in 1..=r_pc {
-                        v.push(20.0 + i as f64);
-                    }
-                    pcs.insert(pc_name.clone(), v);
-                    pcs
-                },
+                pgs: pgs_coeffs,
+                pcs: pcs_coeffs,
             },
-            interaction_effects: {
-                let mut m = HashMap::new();
-                m.insert(
-                    format!("f(PGS,{})", pc_name),
-                    (1..=interaction_len).map(|i| 100.0 + i as f64).collect(),
-                );
-                m
-            },
+            interaction_effects: interaction_coeffs,
         };
 
-        // Manually flatten coefficients using the same canonical order as model::internal::flatten_coefficients
-        let mut flat: Vec<f64> = Vec::new();
-        flat.push(coeffs.intercept);
-        for pc_config in &cfg.pc_configs {
-            let pc = &pc_config.name;
-            flat.extend_from_slice(
-                coeffs
-                    .main_effects
-                    .pcs
-                    .get(pc)
-                    .expect("missing PC main coeffs"),
-            );
-        }
-        flat.extend_from_slice(&coeffs.main_effects.pgs);
-        for pc_config in &cfg.pc_configs {
-            let pc = &pc_config.name;
-            let key = format!("f(PGS,{})", pc);
-            if let Some(v) = coeffs.interaction_effects.get(&key) {
-                flat.extend_from_slice(v);
-            }
-        }
-        let flat = ndarray::Array1::from(flat);
+        // Reconstruct design via the same helper used in predict_linear.
+        let flattened = model::internal_flatten_coefficients(&mapped_coeffs, &config)
+            .expect("failed to flatten coefficients");
+        let x_reconstructed = model::internal_construct_design_matrix(
+            data.p.view(),
+            data.pcs.view(),
+            &config,
+            &mapped_coeffs,
+        )
+        .expect("failed to construct design matrix");
 
-        // Build a trained model with this config and coefficients
+        assert_eq!(x_training.shape(), x_reconstructed.shape());
+        let design_diff = (&x_training - &x_reconstructed)
+            .mapv(|v| v.abs())
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v));
+        assert!(
+            design_diff < 1e-10,
+            "Training and reconstructed designs must match; max |diff| = {}",
+            design_diff
+        );
+
         let model = TrainedModel {
-            config: cfg,
-            coefficients: coeffs.clone(),
-            lambdas: vec![], // not used at prediction
+            config: config.clone(),
+            coefficients: mapped_coeffs.clone(),
+            lambdas: vec![],
             hull: None,
             penalized_hessian: None,
             scale: None,
             calibrator: None,
         };
 
-        // Compute predictions via predict_linear() (which rebuilds X_new internally)
         let preds_via_predict = model
             .predict_linear(data.p.view(), data.pcs.view())
             .expect("predict_linear failed");
-
-        // Compute predictions directly from X_training (should match)
-        let preds_direct = x_training.dot(&flat);
-
-        // Compare
+        let preds_direct = x_training.dot(&flattened);
         let max_diff = (&preds_via_predict - &preds_direct)
             .mapv(|x| x.abs())
             .iter()

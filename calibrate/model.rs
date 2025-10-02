@@ -847,6 +847,24 @@ mod internal {
 }
 
 #[cfg(test)]
+pub(crate) fn internal_construct_design_matrix(
+    p_new: ArrayView1<f64>,
+    pcs_new: ArrayView2<f64>,
+    config: &ModelConfig,
+    coeffs: &MappedCoefficients,
+) -> Result<Array2<f64>, ModelError> {
+    internal::construct_design_matrix(p_new, pcs_new, config, coeffs)
+}
+
+#[cfg(test)]
+pub(crate) fn internal_flatten_coefficients(
+    coeffs: &MappedCoefficients,
+    config: &ModelConfig,
+) -> Result<Array1<f64>, ModelError> {
+    internal::flatten_coefficients(coeffs, config)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     // TrainingData is not used in tests
