@@ -1110,6 +1110,35 @@ pub fn build_calibrator_design(
                     .column_mut(1)
                     .assign(&features.pred_identity);
             }
+
+            if b_pred_c.ncols() > 0 {
+                match apply_weighted_orthogonality_constraint(
+                    b_pred_c.view(),
+                    b_pred_param.view(),
+                    w_for_stz,
+                ) {
+                    Ok((b_reparam, transform)) => {
+                        b_pred_c = b_reparam;
+                        pred_constraint = pred_constraint.dot(&transform);
+                        prune_near_zero_columns(&mut b_pred_c, &mut pred_constraint, "pred");
+                        if b_pred_c.ncols() == 0 {
+                            eprintln!(
+                                "[CAL][WARN] block=pred reason=backbone_overlap_removed action=drop_block cols=0"
+                            );
+                        }
+                    }
+                    Err(BasisError::ConstraintNullspaceNotFound) => {
+                        eprintln!(
+                            "[CAL][WARN] block=pred reason=backbone_overlap_nullspace_failure action=drop_block raw_cols={}"
+                                ,
+                            b_pred_raw.ncols()
+                        );
+                        b_pred_c = Array2::<f64>::zeros((n, 0));
+                        pred_constraint = Array2::<f64>::zeros((b_pred_raw.ncols(), 0));
+                    }
+                    Err(err) => return Err(EstimationError::BasisError(err)),
+                }
+            }
         }
     }
 
@@ -1424,7 +1453,7 @@ pub fn build_calibrator_design(
         spec.pred_basis.degree, m_pred_int, m_se_int, m_dist_int, spec.penalty_order_pred
     );
     eprintln!(
-        "[CAL] pred block orthogonalized against polynomial nullspace; cols={}",
+        "[CAL] pred block orthogonalized against polynomial nullspace and backbone; cols={}",
         b_pred_c.ncols()
     );
     if b_pred_c.ncols() == 0
