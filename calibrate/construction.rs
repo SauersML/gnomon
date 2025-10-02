@@ -515,9 +515,9 @@ pub fn build_design_and_penalty_matrices(
         };
 
     if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
-        debug_assert_eq!(pgs_int_ncols, pgs_main_basis_unc.ncols());
+        assert_eq!(pgs_int_ncols, pgs_main_basis_unc.ncols());
         for (idx, basis) in pc_unconstrained_bases_main.iter().enumerate() {
-            debug_assert_eq!(pc_int_ncols[idx], basis.ncols());
+            assert_eq!(pc_int_ncols[idx], basis.ncols());
         }
     }
 
@@ -580,7 +580,7 @@ pub fn build_design_and_penalty_matrices(
 
         match config.interaction_penalty {
             InteractionPenaltyKind::Isotropic => {
-                debug_assert_eq!(block.penalty_indices.len(), 1);
+                assert_eq!(block.penalty_indices.len(), 1);
                 let penalty_idx = block.penalty_indices[0];
                 let m = col_range.len() as f64;
                 let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };

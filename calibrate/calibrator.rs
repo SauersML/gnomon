@@ -361,7 +361,7 @@ pub fn compute_alo_features(
     for i in 0..n {
         // Compute denominator without guard for accurate ALO prediction
         let denom = 1.0 - aii[i];
-        debug_assert!(denom > 0.0, "Unexpected a_ii >= 1.0 in ALO");
+        assert!(denom > 0.0, "Unexpected a_ii >= 1.0 in ALO");
 
         // CORRECT ALO predictor formula using the Sherman-Morrison identity:
         //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
@@ -1511,7 +1511,7 @@ pub fn build_calibrator_design(
     };
 
     // Early self-check to ensure built penalties match X width
-    debug_assert!(
+    assert!(
         penalties
             .iter()
             .all(|s| s.nrows() == x.ncols() && s.ncols() == x.ncols()),
@@ -3009,7 +3009,7 @@ mod tests {
             }
 
             let denom = 1.0 - aii;
-            debug_assert!(
+            assert!(
                 denom > 0.0,
                 "Unexpected a_ii >= 1.0 in fixed-weight LOO baseline: a_ii = {:.6e}",
                 aii
