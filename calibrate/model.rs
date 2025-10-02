@@ -772,25 +772,29 @@ mod internal {
                     tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
 
                     // Align the number of interaction columns with the stored coefficients if available.
-                    let expected_cols = coeffs
-                        .interaction_effects
-                        .get(&tensor_key)
-                        .map(|c| c.len())
-                        .unwrap_or_else(|| tensor_interaction.ncols());
+                    let constructed_cols = tensor_interaction.ncols();
+                    if let Some(stored) = coeffs.interaction_effects.get(&tensor_key) {
+                        let stored_cols = stored.len();
+                        let expected_product = pgs_int_basis.ncols() * pc_int_basis.ncols();
+                        if stored_cols != expected_product {
+                            return Err(ModelError::DimensionMismatch(format!(
+                                "Stored interaction coefficient count for {tensor_key} is {stored_cols}, but the marginal bases imply {expected_product} columns ({}×{}). Common causes: knot vector length/degree drift or stale range/orthogonalization transforms.",
+                                pgs_int_basis.ncols(),
+                                pc_int_basis.ncols(),
+                            )));
+                        }
 
-                    if expected_cols > tensor_interaction.ncols() {
-                        return Err(ModelError::DimensionMismatch(format!(
-                            "Stored interaction coefficient count ({}) exceeds constructed columns ({}) for {}",
-                            expected_cols,
-                            tensor_interaction.ncols(),
-                            tensor_key
-                        )));
+                        if stored_cols != constructed_cols {
+                            return Err(ModelError::DimensionMismatch(format!(
+                                "Interaction columns mismatch for {tensor_key}: constructed {constructed_cols} ({}×{}) vs stored {stored_cols}. Compare knot_vectors['pgs'], knot_vectors['{pc_name}'], degree, range_transforms, sum_to_zero constraints, pc_null_transforms, and interaction_orth_alpha shapes.",
+                                pgs_int_basis.ncols(),
+                                pc_int_basis.ncols(),
+                                pc_name = pc_name.as_str(),
+                            )));
+                        }
                     }
 
-                    for col in tensor_interaction
-                        .slice(s![.., ..expected_cols])
-                        .axis_iter(Axis(1))
-                    {
+                    for col in tensor_interaction.axis_iter(Axis(1)) {
                         owned_cols.push(col.to_owned());
                     }
                 }
