@@ -2943,6 +2943,79 @@ pub mod internal {
         };
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        #[test]
+        fn reml_identity_gradient_matches_fd_with_constant_mp_scale() {
+            // Simple Gaussian regression with intercept (unpenalized) and slope (penalized).
+            // The true data follow y = 1 + 2x deterministically so the PIRLS solve is stable.
+            let n = 80usize;
+            let mut design = Array2::<f64>::zeros((n, 2));
+            let mut response = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let x = i as f64 / n as f64;
+                design[[i, 0]] = 1.0;
+                design[[i, 1]] = x;
+                response[i] = 1.0 + 2.0 * x;
+            }
+
+            let weights = Array1::ones(n);
+            let offset = Array1::zeros(n);
+
+            // Penalty: slope is penalized, intercept lives in the nullspace (M_p = 1).
+            let mut s = Array2::<f64>::zeros((2, 2));
+            s[[1, 1]] = 1.0;
+            let s_list = vec![s];
+
+            let layout = ModelLayout::external(2, 1);
+            let config = ModelConfig::external(LinkFunction::Identity, 1e-10, 200);
+
+            let reml_state = internal::RemlState::new_with_offset(
+                response.view(),
+                design.view(),
+                weights.view(),
+                offset.view(),
+                s_list,
+                &layout,
+                &config,
+                Some(vec![1]),
+            )
+            .expect("identity REML state should build");
+
+            let rho_grid = vec![
+                Array1::from(vec![-1.5]),
+                Array1::from(vec![0.0]),
+                Array1::from(vec![1.25]),
+            ];
+
+            for rho in rho_grid.iter() {
+                let g_an = reml_state
+                    .compute_gradient(rho)
+                    .expect("analytic gradient should evaluate");
+                let g_fd = super::compute_fd_gradient(&reml_state, rho)
+                    .expect("fd gradient should evaluate");
+
+                let dot = g_an.dot(&g_fd);
+                let norm_an = g_an.dot(&g_an).sqrt();
+                let norm_fd = g_fd.dot(&g_fd).sqrt();
+                let cosine = dot / (norm_an.max(1e-16) * norm_fd.max(1e-16));
+
+                let diff = &g_an - &g_fd;
+                let rel_l2 = diff.dot(&diff).sqrt() / norm_fd.max(1e-16);
+
+                assert!(
+                    cosine > 0.9999,
+                    "cosine similarity too low at rho={:?}: {:.6}",
+                    rho,
+                    cosine
+                );
+                assert!(
+                    rel_l2 < 5e-4,
+                    "relative L2 too high at rho={:?}: {:.3e}",
+                    rho,
+                    rel_l2
+                );
+            }
+        }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
