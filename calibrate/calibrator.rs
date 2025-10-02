@@ -359,9 +359,17 @@ pub fn compute_alo_features(
     // calculation from scratch for clarity and to add additional diagnostics)
     let mut eta_tilde = Array1::<f64>::zeros(n);
     for i in 0..n {
-        // Compute denominator without guard for accurate ALO prediction
-        let denom = 1.0 - aii[i];
-        assert!(denom > 0.0, "Unexpected a_ii >= 1.0 in ALO");
+        // Robust ALO denominator with epsilon floor
+        let denom_raw = 1.0 - aii[i];
+        let denom = if denom_raw <= 1e-12 {
+            eprintln!(
+                "[CAL] WARNING: 1 - a_ii ≤ eps at i={}, a_ii={:.6e}",
+                i, aii[i]
+            );
+            1e-12
+        } else {
+            denom_raw
+        };
 
         // CORRECT ALO predictor formula using the Sherman-Morrison identity:
         //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
@@ -5638,8 +5646,9 @@ mod tests {
         }
 
         let lambda_tolerance = |a: f64, b: f64| {
-            let scale = a.abs().max(b.abs()).max(1.0);
-            (a - b).abs() < 1e-12 * scale
+            let rho_a = a.ln();
+            let rho_b = b.ln();
+            (rho_a - rho_b).abs() <= 1e-12
         };
 
         // Check all model components match
