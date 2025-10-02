@@ -1579,8 +1579,9 @@ pub fn predict_calibrator(
             .assign(&b_pred.slice(s![.., ..n_pred_cols]));
     }
     if n_pred_param_cols > 0 {
+        let pred_param_block = b_pred_param.slice(s![.., ..n_pred_param_cols]);
         x.slice_mut(s![.., pred_param_range.start..pred_param_range.end])
-            .assign(&b_pred_param.slice(s![.., ..n_pred_param_cols]));
+            .assign(&pred_param_block);
     }
     if n_se_cols > 0 {
         let off = se_range.start;

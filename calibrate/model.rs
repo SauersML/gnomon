@@ -682,7 +682,18 @@ mod internal {
 
                     pgs_main_basis_unc.dot(z_range_pgs_pred)
                 }
-                InteractionPenaltyKind::Anisotropic => pgs_main_basis_unc.to_owned(),
+                InteractionPenaltyKind::Anisotropic => {
+                    let z_range_pgs_pred = config
+                        .range_transforms
+                        .get("pgs")
+                        .ok_or_else(|| ModelError::InternalStackingError)?;
+
+                    if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
+                        return Err(ModelError::InternalStackingError);
+                    }
+
+                    pgs_main_basis_unc.dot(z_range_pgs_pred)
+                }
             };
 
             for pc_idx in 0..config.pc_configs.len() {
@@ -692,7 +703,7 @@ mod internal {
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
                     let pc_int_basis = match config.interaction_penalty {
-                        InteractionPenaltyKind::Isotropic => {
+                        InteractionPenaltyKind::Isotropic | InteractionPenaltyKind::Anisotropic => {
                             let z_range_pc_pred = config
                                 .range_transforms
                                 .get(pc_name)
@@ -705,9 +716,6 @@ mod internal {
                             }
 
                             pc_unconstrained_bases_main[pc_idx].dot(z_range_pc_pred)
-                        }
-                        InteractionPenaltyKind::Anisotropic => {
-                            pc_unconstrained_bases_main[pc_idx].to_owned()
                         }
                     };
 
@@ -763,8 +771,26 @@ mod internal {
                     }
                     tensor_interaction = &tensor_interaction - &m_matrix.dot(alpha);
 
-                    // Add all columns from this tensor product to the design matrix (no extra centering)
-                    for col in tensor_interaction.axis_iter(Axis(1)) {
+                    // Align the number of interaction columns with the stored coefficients if available.
+                    let expected_cols = coeffs
+                        .interaction_effects
+                        .get(&tensor_key)
+                        .map(|c| c.len())
+                        .unwrap_or_else(|| tensor_interaction.ncols());
+
+                    if expected_cols > tensor_interaction.ncols() {
+                        return Err(ModelError::DimensionMismatch(format!(
+                            "Stored interaction coefficient count ({}) exceeds constructed columns ({}) for {}",
+                            expected_cols,
+                            tensor_interaction.ncols(),
+                            tensor_key
+                        )));
+                    }
+
+                    for col in tensor_interaction
+                        .slice(s![.., ..expected_cols])
+                        .axis_iter(Axis(1))
+                    {
                         owned_cols.push(col.to_owned());
                     }
                 }

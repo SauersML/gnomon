@@ -483,10 +483,6 @@ pub fn build_design_and_penalty_matrices(
         .iter()
         .map(|opt| opt.as_ref().map_or(0, |b| b.ncols()))
         .collect();
-    let pc_unc_ncols: Vec<usize> =
-        pc_unconstrained_bases_main.iter().map(|b| b.ncols()).collect();
-    let pgs_unc_ncols = pgs_main_basis_unc.ncols();
-
     let pgs_range_ncols = range_transforms
         .get("pgs")
         .map(|rt| rt.ncols())
@@ -502,10 +498,8 @@ pub fn build_design_and_penalty_matrices(
         })
         .collect();
 
-    let (pc_int_ncols, pgs_int_ncols) = match config.interaction_penalty {
-        InteractionPenaltyKind::Isotropic => (pc_range_interaction_ncols, pgs_range_ncols),
-        InteractionPenaltyKind::Anisotropic => (pc_unc_ncols.clone(), pgs_unc_ncols),
-    };
+    let pc_int_ncols = pc_range_interaction_ncols.clone();
+    let pgs_int_ncols = pgs_range_ncols;
 
     let layout = ModelLayout::new(
         config,
@@ -542,16 +536,17 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
-    let s_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
-        Some(create_difference_penalty_matrix(
-            pgs_main_basis_unc.ncols(),
-            config.penalty_order,
-        )?)
+    let s_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic)
+        && pgs_int_ncols > 0
+    {
+        Some(create_difference_penalty_matrix(pgs_int_ncols, config.penalty_order)?)
     } else {
         None
     };
-    let i_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
-        Some(Array2::<f64>::eye(pgs_main_basis_unc.ncols()))
+    let i_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic)
+        && pgs_int_ncols > 0
+    {
+        Some(Array2::<f64>::eye(pgs_int_ncols))
     } else {
         None
     };
@@ -582,8 +577,8 @@ pub fn build_design_and_penalty_matrices(
                     )));
                 }
 
-                let pgs_cols = pgs_main_basis_unc.ncols();
-                let pc_cols = pc_unconstrained_bases_main[pc_idx].ncols();
+                let pgs_cols = pgs_int_ncols;
+                let pc_cols = pc_int_ncols[pc_idx];
                 if col_range.len() != pgs_cols * pc_cols {
                     return Err(EstimationError::LayoutError(format!(
                         "Interaction block f(PGS,{}) expects {} columns ({}×{}), but layout provided {}",
@@ -761,10 +756,20 @@ pub fn build_design_and_penalty_matrices(
                     row_wise_tensor_product(pgs_int_basis, &pc_int_basis)
                 }
                 InteractionPenaltyKind::Anisotropic => {
-                    row_wise_tensor_product(
-                        &pgs_main_basis_unc,
-                        &pc_unconstrained_bases_main[pc_idx],
-                    )
+                    let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
+                        EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
+                    })?;
+                    let pgs_int_basis = pgs_main_basis_unc.dot(z_range_pgs);
+
+                    let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "Missing '{}' in range_transforms",
+                            pc_name
+                        ))
+                    })?;
+                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
+
+                    row_wise_tensor_product(&pgs_int_basis, &pc_int_basis)
                 }
             };
 
