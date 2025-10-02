@@ -141,3 +141,7 @@ linear predictor. Logistic models return calibrated probabilities; identity
 models add the calibrator's correction in linear space. Distance-to-hull checks
 run in the same order as training, ensuring extrapolation handling remains
 consistent.
+
+
+## TODO
+Add a Royston–Parmar flexible parametric survival mode that treats attained age as the analysis time. The baseline risk will be represented as a smooth, penalized function of the log cumulative hazard over age; PGS and PCs act as multiplicative shifts on that baseline (proportional hazards by default, with PGS×age). The statistical hypothesis this encodes is that risk accumulates smoothly with age and genetic structure modulating that accumulation. The payoff is calibrated, horizon-agnostic absolute risk—probability of first diagnosis between current age and a chosen horizon—from a single model that uses all person-time, handles left truncation and right censoring natively, avoids ad hoc binning or per-horizon refits, and exhibits stable, regularized behavior at the tails of the age range. Extend the training schema to include ages and event, fit via the existing penalized P-IRLS/REML machinery, and include a scoring API that accepts current age, risk horizon, PGS, and PCs and returns absolute risk. Incorperate with the post-hoc calibrator.
