@@ -448,8 +448,10 @@ impl TrainedModel {
                 .config
                 .range_transforms
                 .get(&pc.name)
-                .map(|rt| rt.ncols())
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    ModelError::ConstraintMissing(format!("range transform for {}", pc.name))
+                })?
+                .ncols();
             pc_range_ncols.push(range_cols);
             pc_int_ncols.push(range_cols);
 
@@ -457,8 +459,13 @@ impl TrainedModel {
                 .config
                 .pc_null_transforms
                 .get(&pc.name)
-                .map(|z| z.ncols())
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    ModelError::ConstraintMissing(format!(
+                        "pc_null_transform for {}",
+                        pc.name
+                    ))
+                })?
+                .ncols();
             pc_null_ncols.push(null_cols);
         }
 
@@ -467,8 +474,8 @@ impl TrainedModel {
             .config
             .range_transforms
             .get("pgs")
-            .map(|rt| rt.ncols())
-            .unwrap_or(0);
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
+            .ncols();
 
         ModelLayout::new(
             &self.config,
@@ -483,11 +490,14 @@ impl TrainedModel {
 
     fn assert_layout_consistency_from_config(&self) -> Result<(), ModelError> {
         let layout = self.rebuild_layout_from_config()?;
-        self.assert_layout_consistency_with_layout(&layout);
+        self.assert_layout_consistency_with_layout(&layout)?;
         Ok(())
     }
 
-    pub(crate) fn assert_layout_consistency_with_layout(&self, layout: &ModelLayout) {
+    pub(crate) fn assert_layout_consistency_with_layout(
+        &self,
+        layout: &ModelLayout,
+    ) -> Result<(), ModelError> {
         assert_eq!(
             self.lambdas.len(),
             layout.num_penalties,
@@ -500,8 +510,8 @@ impl TrainedModel {
             .config
             .range_transforms
             .get("pgs")
-            .map(|rt| rt.ncols())
-            .unwrap_or(0);
+            .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
+            .ncols();
 
         for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
             let key = format!("f(PGS,{})", pc_config.name);
@@ -510,8 +520,13 @@ impl TrainedModel {
                     .config
                     .range_transforms
                     .get(&pc_config.name)
-                    .map(|rt| rt.ncols())
-                    .unwrap_or(0);
+                    .ok_or_else(|| {
+                        ModelError::ConstraintMissing(format!(
+                            "range transform for {}",
+                            pc_config.name
+                        ))
+                    })?
+                    .ncols();
                 let expected = pgs_w * pc_w;
 
                 assert_eq!(
@@ -540,6 +555,17 @@ impl TrainedModel {
                 }
             }
         }
+
+        let flattened_coeffs = internal::flatten_coefficients(&self.coefficients, &self.config)?;
+        if flattened_coeffs.len() != layout.total_coeffs {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Flattened coefficient length ({}) does not match layout.total_coeffs ({}). Likely causes: knot vectors/degree drift, transform set drift (range/null/orth), or penalty mode change (isotropic/anisotropic).",
+                flattened_coeffs.len(),
+                layout.total_coeffs
+            )));
+        }
+
+        Ok(())
     }
 }
 

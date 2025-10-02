@@ -344,7 +344,9 @@ pub fn train_model(
             calibrator: None,
         };
 
-        trained_model.assert_layout_consistency_with_layout(&layout);
+        trained_model
+            .assert_layout_consistency_with_layout(&layout)
+            .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
 
         return Ok(trained_model);
     }
@@ -1100,7 +1102,9 @@ pub fn train_model(
         calibrator: calibrator_opt,
     };
 
-    trained_model.assert_layout_consistency_with_layout(&layout);
+    trained_model
+        .assert_layout_consistency_with_layout(&layout)
+        .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
 
     Ok(trained_model)
 }
