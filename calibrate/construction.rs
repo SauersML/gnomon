@@ -2231,15 +2231,6 @@ mod tests {
             build_design_and_penalty_matrices(&data, &config)
                 .expect("anisotropic interaction construction should not panic");
 
-        let _ = (
-            stz_unused,
-            knots_unused,
-            range_unused,
-            pc_null_unused,
-            centers_unused,
-            alpha_unused,
-        );
-
         // There is exactly one interaction block (for PC1)
         assert_eq!(
             layout.interaction_block_idx.len(),
@@ -2294,16 +2285,6 @@ mod tests {
         let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("isotropic interaction construction should not panic");
-
-        let _ = (
-            x_unused,
-            stz_unused,
-            knots_unused,
-            range_unused,
-            pc_null_unused,
-            centers_unused,
-            alpha_unused,
-        );
 
         assert_eq!(
             layout.interaction_block_idx.len(),
