@@ -106,6 +106,8 @@ pub struct ModelLayout {
     /// Direct indices to avoid string lookups in hot paths
     pub pc_main_block_idx: Vec<usize>,
     pub interaction_block_idx: Vec<usize>,
+    /// Marginal widths used when constructing each interaction block (pgs, pc)
+    pub interaction_factor_widths: Vec<(usize, usize)>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
 }
@@ -143,6 +145,7 @@ impl ModelLayout {
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
+            interaction_factor_widths: vec![],
             total_coeffs,
             num_penalties,
         }
@@ -240,6 +243,8 @@ impl ModelLayout {
 
         // Tensor product interaction effects (number of penalties depends on configuration)
         let mut interaction_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
+        let mut interaction_factor_widths: Vec<(usize, usize)> =
+            Vec::with_capacity(config.pc_configs.len());
         if pgs_interaction_basis_ncols > 0 {
             for (i, &num_pc_basis) in pc_interaction_basis_ncols.iter().enumerate() {
                 let num_tensor_coeffs = pgs_interaction_basis_ncols * num_pc_basis;
@@ -266,6 +271,7 @@ impl ModelLayout {
                 });
 
                 interaction_block_idx.push(penalty_map.len() - 1);
+                interaction_factor_widths.push((pgs_interaction_basis_ncols, num_pc_basis));
                 current_col += num_tensor_coeffs;
             }
         }
@@ -296,6 +302,14 @@ impl ModelLayout {
             )));
         }
 
+        if interaction_block_idx.len() != interaction_factor_widths.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "Interaction layout vectors misaligned: interaction_block_idx.len()={} vs interaction_factor_widths.len()={}",
+                interaction_block_idx.len(),
+                interaction_factor_widths.len()
+            )));
+        }
+
         Ok(ModelLayout {
             intercept_col,
             pgs_main_cols,
@@ -304,6 +318,7 @@ impl ModelLayout {
             penalty_map,
             pc_main_block_idx,
             interaction_block_idx,
+            interaction_factor_widths,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
         })

@@ -2497,6 +2497,7 @@ mod tests {
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
+            interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };
@@ -2689,6 +2690,7 @@ mod tests {
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
+            interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };
@@ -3555,6 +3557,7 @@ mod tests {
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
+            interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
         };

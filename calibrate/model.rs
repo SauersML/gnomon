@@ -519,41 +519,18 @@ impl TrainedModel {
             layout.num_penalties
         );
 
-        let pgs_range_cols = self
-            .config
-            .range_transforms
-            .get("pgs")
-            .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
-            .ncols();
-        let pgs_unwhitened_cols =
-            self.config.pgs_basis_config.num_knots + self.config.pgs_basis_config.degree;
-
         for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
             let key = format!("f(PGS,{})", pc_config.name);
             if let Some(stored) = self.coefficients.interaction_effects.get(&key) {
-                let pc_range_cols = self
-                    .config
-                    .range_transforms
-                    .get(&pc_config.name)
-                    .ok_or_else(|| {
-                        ModelError::ConstraintMissing(format!(
-                            "range transform for {}",
-                            pc_config.name
-                        ))
-                    })?
-                    .ncols();
-                let pc_unwhitened_cols =
-                    pc_config.basis_config.num_knots + pc_config.basis_config.degree;
-                let (expected, pgs_dim_dbg, pc_dim_dbg) = match self.config.interaction_penalty {
-                    InteractionPenaltyKind::Isotropic => {
-                        let expected = pgs_range_cols * pc_range_cols;
-                        (expected, pgs_range_cols, pc_range_cols)
-                    }
-                    InteractionPenaltyKind::Anisotropic => {
-                        let expected = pgs_unwhitened_cols * pc_unwhitened_cols;
-                        (expected, pgs_unwhitened_cols, pc_unwhitened_cols)
-                    }
-                };
+                if pc_idx >= layout.interaction_factor_widths.len() {
+                    return Err(ModelError::DimensionMismatch(format!(
+                        "Layout missing interaction factor widths for {} (index {})",
+                        pc_config.name, pc_idx
+                    )));
+                }
+
+                let (pgs_dim_dbg, pc_dim_dbg) = layout.interaction_factor_widths[pc_idx];
+                let expected = pgs_dim_dbg * pc_dim_dbg;
 
                 assert_eq!(
                     stored.len(),
