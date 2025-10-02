@@ -334,7 +334,7 @@ pub fn train_model(
             }
         };
 
-        return Ok(TrainedModel {
+        let trained_model = TrainedModel {
             config: config_with_constraints,
             coefficients: mapped_coefficients,
             lambdas: vec![],
@@ -342,7 +342,11 @@ pub fn train_model(
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
             calibrator: None,
-        });
+        };
+
+        trained_model.assert_layout_consistency_with_layout(&layout);
+
+        return Ok(trained_model);
     }
 
     // Multi-start seeding with asymmetric perturbations to break symmetry
@@ -1086,7 +1090,7 @@ pub fn train_model(
         }
     };
 
-    Ok(TrainedModel {
+    let trained_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: final_lambda.to_vec(),
@@ -1094,7 +1098,11 @@ pub fn train_model(
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
         calibrator: calibrator_opt,
-    })
+    };
+
+    trained_model.assert_layout_consistency_with_layout(&layout);
+
+    Ok(trained_model)
 }
 
 // ===== External optimizer facade for arbitrary designs (e.g., calibrator) =====

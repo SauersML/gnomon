@@ -433,8 +433,113 @@ impl TrainedModel {
     /// Loads a trained model from a TOML file.
     pub fn load(path: &str) -> Result<Self, ModelError> {
         let toml_string = fs::read_to_string(path)?;
-        let model = toml::from_str(&toml_string)?;
+        let model: TrainedModel = toml::from_str(&toml_string)?;
+        model.assert_layout_consistency_from_config()?;
         Ok(model)
+    }
+
+    fn rebuild_layout_from_config(&self) -> Result<ModelLayout, ModelError> {
+        let mut pc_null_ncols = Vec::with_capacity(self.config.pc_configs.len());
+        let mut pc_range_ncols = Vec::with_capacity(self.config.pc_configs.len());
+        let mut pc_int_ncols = Vec::with_capacity(self.config.pc_configs.len());
+
+        for pc in &self.config.pc_configs {
+            let range_cols = self
+                .config
+                .range_transforms
+                .get(&pc.name)
+                .map(|rt| rt.ncols())
+                .unwrap_or(0);
+            pc_range_ncols.push(range_cols);
+            pc_int_ncols.push(range_cols);
+
+            let null_cols = self
+                .config
+                .pc_null_transforms
+                .get(&pc.name)
+                .map(|z| z.ncols())
+                .unwrap_or(0);
+            pc_null_ncols.push(null_cols);
+        }
+
+        let pgs_main_cols = self.coefficients.main_effects.pgs.len();
+        let pgs_int_cols = self
+            .config
+            .range_transforms
+            .get("pgs")
+            .map(|rt| rt.ncols())
+            .unwrap_or(0);
+
+        ModelLayout::new(
+            &self.config,
+            &pc_null_ncols,
+            &pc_range_ncols,
+            pgs_main_cols,
+            &pc_int_ncols,
+            pgs_int_cols,
+        )
+        .map_err(ModelError::EstimationError)
+    }
+
+    fn assert_layout_consistency_from_config(&self) -> Result<(), ModelError> {
+        let layout = self.rebuild_layout_from_config()?;
+        self.assert_layout_consistency_with_layout(&layout);
+        Ok(())
+    }
+
+    pub(crate) fn assert_layout_consistency_with_layout(&self, layout: &ModelLayout) {
+        assert_eq!(
+            self.lambdas.len(),
+            layout.num_penalties,
+            "Mismatch: saved lambdas vs penalties (saved {}, expected {})",
+            self.lambdas.len(),
+            layout.num_penalties
+        );
+
+        let pgs_w = self
+            .config
+            .range_transforms
+            .get("pgs")
+            .map(|rt| rt.ncols())
+            .unwrap_or(0);
+
+        for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
+            let key = format!("f(PGS,{})", pc_config.name);
+            if let Some(stored) = self.coefficients.interaction_effects.get(&key) {
+                let pc_w = self
+                    .config
+                    .range_transforms
+                    .get(&pc_config.name)
+                    .map(|rt| rt.ncols())
+                    .unwrap_or(0);
+                let expected = pgs_w * pc_w;
+
+                assert_eq!(
+                    stored.len(),
+                    expected,
+                    "Mismatch: stored vs rebuilt interaction width for {key} (stored {}, expected {} = {}×{})",
+                    stored.len(),
+                    expected,
+                    pgs_w,
+                    pc_w
+                );
+
+                if pc_idx < layout.interaction_block_idx.len() {
+                    let layout_cols = layout.penalty_map[layout.interaction_block_idx[pc_idx]]
+                        .col_range
+                        .len();
+                    assert_eq!(
+                        layout_cols,
+                        expected,
+                        "Mismatch: layout vs rebuilt interaction width for {key} (layout {}, expected {} = {}×{})",
+                        layout_cols,
+                        expected,
+                        pgs_w,
+                        pc_w
+                    );
+                }
+            }
+        }
     }
 }
 
