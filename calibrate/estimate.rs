@@ -61,12 +61,18 @@ use std::sync::Arc;
 use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;
-// Use a unified, tighter rho bound corresponding to lambda in [1e-6, 1e6]
-// ln(1e6) ≈ 13.815510557964274
-// Global bound for rho mapping and diagnostics
-// Increased to allow more headroom (λ up to ~4.85e8) so interior optima
-// are less likely to be flagged as near-bound purely due to tight box constraints.
-const RHO_BOUND: f64 = 20.0;
+/// Smallest penalized deviance value we allow when profiling the Gaussian scale.
+/// Prevents logarithms and divisions by nearly-zero D_p from destabilizing the
+/// REML objective and its gradient in near-perfect-fit regimes.
+const DP_FLOOR: f64 = 1e-12;
+// Use a unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
+// Allow additional headroom so the optimizer rarely collides with the hard box even
+// when the likelihood prefers effectively infinite smoothing.
+const RHO_BOUND: f64 = 30.0;
+// Soft interior prior that nudges rho away from the hard walls without meaningfully
+// affecting the optimum when the data are informative.
+const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
+const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
 const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
 const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
 
@@ -91,6 +97,28 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
 
 fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
     z.mapv(|v| RHO_BOUND * v.tanh())
+}
+
+fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+    let len = rho.len();
+    if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+        return (0.0, Array1::zeros(len));
+    }
+
+    let inv_bound = 1.0 / RHO_BOUND;
+    let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+    let mut grad = Array1::zeros(len);
+    let mut cost = 0.0;
+    for (idx, &ri) in rho.iter().enumerate() {
+        let scaled = sharp * ri * inv_bound;
+        cost += scaled.cosh().ln();
+        grad[idx] = sharp * inv_bound * scaled.tanh();
+    }
+    if RHO_SOFT_PRIOR_WEIGHT != 1.0 {
+        grad.mapv_inplace(|g| g * RHO_SOFT_PRIOR_WEIGHT);
+        cost *= RHO_SOFT_PRIOR_WEIGHT;
+    }
+    (cost, grad)
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -812,6 +840,23 @@ pub fn train_model(
         }
     };
 
+    if let LinkFunction::Identity = config.link_function {
+        let dp = final_fit.deviance + final_fit.stable_penalty_term;
+        let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
+        let mp = layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+        let denom = (reml_state.y().len() as f64 - mp).max(LAML_RIDGE);
+        let phi = dp.max(DP_FLOOR) / denom;
+        let rho_near_bounds = final_lambda
+            .iter()
+            .any(|&lambda| lambda.ln().abs() >= (RHO_BOUND - 1.0));
+        if !phi.is_finite() || phi <= DP_FLOOR || (final_fit.edf <= 1e-6 && rho_near_bounds) {
+            let condition_number = calculate_condition_number(&penalized_hessian_orig)
+                .ok()
+                .unwrap_or(f64::INFINITY);
+            return Err(EstimationError::ModelIsIllConditioned { condition_number });
+        }
+    }
+
     // Now, map the coefficients from the original basis for user output.
     let mapped_coefficients =
         crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
@@ -1181,8 +1226,18 @@ pub fn optimize_external_design(
                 .zip(resid.iter())
                 .map(|(&wi, &ri)| wi * ri * ri)
                 .sum();
+            let penalty = pirls_res.stable_penalty_term;
+            let dp = rss + penalty;
+            let dp_c = dp.max(DP_FLOOR);
             let n = y_o.len() as f64;
-            rss / (n - pirls_res.edf).max(1.0)
+            let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+            let mp = pirls_res
+                .beta_transformed
+                .len()
+                .saturating_sub(penalty_rank)
+                as f64;
+            let denom = (n - mp).max(1.0);
+            dp_c / denom
         }
         LinkFunction::Logit => 1.0,
     };
@@ -2096,17 +2151,28 @@ pub mod internal {
                     // Penalty roots are available in reparam_result if needed
                     let _ = &pirls_result.reparam_result.rs_transformed;
 
-                    // Use the edf_from_h_and_rk helper for consistent EDF calculation
-                    // between cost and gradient functions
+                    // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
+                    // following the standard REML identity φ = D_p / (n - M_p).
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+
+                    // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
                     let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
-
-                    // Correct φ using penalized deviance: φ = D_p / (n - edf)
-                    let phi = dp / (n - edf).max(LAML_RIDGE);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
                     }
+
+                    let denom = (n - mp).max(LAML_RIDGE);
+                    let dp_c = dp.max(DP_FLOOR);
+                    if dp < DP_FLOOR {
+                        log::warn!(
+                            "Penalized deviance {:.3e} fell below DP_FLOOR; clamping to maintain REML stability.",
+                            dp
+                        );
+                    }
+                    let phi = dp_c / denom;
 
                     // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -2124,19 +2190,18 @@ pub mod internal {
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
                     let log_det_s_plus = pirls_result.reparam_result.log_det;
-                    // Correct Mp calculation - nullspace dimension of penalty matrix
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
                     // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + ((n-M_p)/2) log(2πφ)
-                    let reml = dp / (2.0 * phi)
+                    let reml = dp_c / (2.0 * phi)
                         + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
+                    let (prior_cost, _) = rho_soft_prior(p);
+
                     // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
-                    Ok(reml)
+                    Ok(reml + prior_cost)
                 }
                 _ => {
                     // For non-Gaussian GLMs, use the LAML approximation
@@ -2173,7 +2238,7 @@ pub mod internal {
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
                     // to determine M_p robustly, avoiding contamination from dominant penalties.
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = (self.layout.total_coeffs - penalty_rank) as f64;
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
@@ -2247,7 +2312,9 @@ pub mod internal {
                         laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
                     );
 
-                    Ok(-laml)
+                    let (prior_cost, _) = rho_soft_prior(p);
+
+                    Ok(-laml + prior_cost)
                 }
             }
         }
@@ -2611,23 +2678,19 @@ pub mod internal {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
-                    // Calculate scale parameter.  In the Gaussian/REML case we *profile* the
-                    // scale (φ) by plugging in φ̂(ρ) = D_p /(n - EDF); that is exactly what mgcv
-                    // does before evaluating the gradient.
+                    // Calculate scale parameter using the regular REML profiling
+                    // φ = D_p / (n - M_p), where M_p is the penalty nullspace dimension.
                     let rss = pirls_result.deviance;
 
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
+                    let dp_c = dp.max(DP_FLOOR);
 
-                    // EDF calculation in transformed basis using shared helper
                     let factor_g = self.get_faer_factor(p, h_eff);
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
-                    // Because φ has been profiled out, the envelope theorem tells us that the
-                    // derivative of the profiled objective with respect to ρ is given by the
-                    // *partial* derivative holding φ fixed at φ̂.  Therefore no dφ/dρ term is
-                    // propagated below—exactly mirroring mgcv’s REML gradient implementation.
-                    let scale = dp / (n - edf).max(LAML_RIDGE);
+                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+                    let scale = dp_c / (n - mp).max(LAML_RIDGE);
 
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
@@ -2659,7 +2722,11 @@ pub mod internal {
                         // `REML1 <- oo$D1/(2*scale*gamma)` expression.
 
                         let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
-                        let deviance_grad_term = d1 / (2.0 * scale);
+                        let deviance_grad_term = if dp <= DP_FLOOR {
+                            0.0
+                        } else {
+                            d1 / (2.0 * scale)
+                        };
 
                         // Component 2: derivative of the penalized Hessian determinant.
                         // R/C counterpart: `oo$trA1/2`.
@@ -2771,6 +2838,9 @@ pub mod internal {
                     println!("LAML gradient computation finished.");
                 }
             }
+
+            let (_, prior_grad) = rho_soft_prior(p);
+            cost_gradient += &prior_grad;
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
             // The cost_gradient variable as computed above is already -∇V(ρ),
@@ -2938,6 +3008,124 @@ pub mod internal {
         };
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::f64::consts::PI;
+
+        fn make_identity_gradient_fixture(
+        ) -> (
+            Array1<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Array1<f64>,
+            Vec<Array2<f64>>,
+        ) {
+            let n = 120usize;
+            let p = 8usize;
+
+            let mut x = Array2::<f64>::zeros((n, p));
+            for i in 0..n {
+                let t = (i as f64 + 0.5) / n as f64;
+                x[[i, 0]] = 1.0;
+                x[[i, 1]] = (2.0 * PI * t).sin();
+                x[[i, 2]] = (2.0 * PI * t).cos();
+                x[[i, 3]] = (4.0 * PI * t).sin();
+                x[[i, 4]] = (4.0 * PI * t).cos();
+                x[[i, 5]] = t;
+                x[[i, 6]] = t * t;
+                x[[i, 7]] = t * t * t;
+            }
+
+            let beta_true = Array1::from(vec![
+                0.8_f64,
+                0.5_f64,
+                -0.3_f64,
+                0.2_f64,
+                -0.1_f64,
+                1.0_f64,
+                -0.4_f64,
+                0.25_f64,
+            ]);
+            let y = x.dot(&beta_true);
+            let w = Array1::from_elem(n, 1.0);
+            let offset = Array1::zeros(n);
+
+            let mut s1 = Array2::<f64>::zeros((p, p));
+            for j in 1..p {
+                s1[[j, j]] = if j <= 5 { 2.0 } else { 0.5 };
+            }
+
+            let mut d = Array2::<f64>::zeros((p.saturating_sub(2), p));
+            for r in 0..d.nrows() {
+                d[[r, r]] = 1.0;
+                d[[r, r + 1]] = -2.0;
+                d[[r, r + 2]] = 1.0;
+            }
+            let s2 = d.t().dot(&d);
+
+            (y, w, x, offset, vec![s1, s2])
+        }
+
+        #[test]
+        fn reml_identity_cost_and_gradient_remain_consistent() {
+            let (y, w, x, offset, s_list) = make_identity_gradient_fixture();
+            let p = x.ncols();
+            let k = s_list.len();
+
+            let layout = ModelLayout::external(p, k);
+            let config = ModelConfig::external(LinkFunction::Identity, 1e-10, 200);
+
+            let state = internal::RemlState::new_with_offset(
+                y.view(),
+                x.view(),
+                w.view(),
+                offset.view(),
+                s_list,
+                &layout,
+                &config,
+                None,
+            )
+            .expect("RemlState should be constructed");
+
+            let rho = Array1::from(vec![0.30_f64, -0.45_f64]);
+
+            let g_analytic = state
+                .compute_gradient(&rho)
+                .expect("analytic gradient should evaluate");
+            let g_fd = compute_fd_gradient(&state, &rho)
+                .expect("finite-difference gradient should evaluate");
+
+            let dot = g_analytic.dot(&g_fd);
+            let norm_an = g_analytic.dot(&g_analytic).sqrt();
+            let norm_fd = g_fd.dot(&g_fd).sqrt();
+            let cosine = dot / (norm_an.max(1e-16) * norm_fd.max(1e-16));
+
+            let diff = &g_analytic - &g_fd;
+            let rel_l2 = diff.dot(&diff).sqrt() / norm_fd.max(1e-16);
+
+            let mut direction = Array1::from(vec![0.7_f64, -0.3_f64]);
+            let dir_norm: f64 = direction.dot(&direction).sqrt();
+            direction.mapv_inplace(|v| v / dir_norm.max(1e-16));
+
+            let eps = 1e-4;
+            let rho_plus = &rho + &(eps * &direction);
+            let rho_minus = &rho - &(eps * &direction);
+            let cost_plus = state
+                .compute_cost(&rho_plus)
+                .expect("cost at rho+ should evaluate");
+            let cost_minus = state
+                .compute_cost(&rho_minus)
+                .expect("cost at rho- should evaluate");
+            let secant = (cost_plus - cost_minus) / (2.0 * eps);
+            let g_dot_v = g_analytic.dot(&direction);
+            let rel_dir = (g_dot_v - secant).abs()
+                / g_dot_v
+                    .abs()
+                    .max(secant.abs())
+                    .max(1e-10);
+
+            assert!(cosine > 0.9995, "cosine similarity too low: {cosine:.6}");
+            assert!(rel_l2 < 1e-3, "relative L2 too high: {rel_l2:.3e}");
+            assert!(rel_dir < 1e-3, "directional secant mismatch: {rel_dir:.3e}");
+        }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
