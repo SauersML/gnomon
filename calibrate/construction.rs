@@ -2212,17 +2212,7 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Anisotropic);
 
-        let (
-            x,
-            s_list,
-            layout,
-            stz_unused,
-            knots_unused,
-            range_unused,
-            pc_null_unused,
-            centers_unused,
-            alpha_unused,
-        ) =
+        let (x, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("anisotropic interaction construction should not panic");
 
@@ -2286,17 +2276,7 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Isotropic);
 
-        let (
-            x_unused,
-            s_list,
-            layout,
-            stz_unused,
-            knots_unused,
-            range_unused,
-            pc_null_unused,
-            centers_unused,
-            alpha_unused,
-        ) =
+        let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("isotropic interaction construction should not panic");
 

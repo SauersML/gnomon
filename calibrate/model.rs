@@ -453,7 +453,14 @@ impl TrainedModel {
                 })?
                 .ncols();
             pc_range_ncols.push(range_cols);
-            pc_int_ncols.push(range_cols);
+
+            let interaction_cols = match self.config.interaction_penalty {
+                InteractionPenaltyKind::Isotropic => range_cols,
+                InteractionPenaltyKind::Anisotropic => {
+                    pc.basis_config.num_knots + pc.basis_config.degree
+                }
+            };
+            pc_int_ncols.push(interaction_cols);
 
             let null_cols = self
                 .config
@@ -470,12 +477,18 @@ impl TrainedModel {
         }
 
         let pgs_main_cols = self.coefficients.main_effects.pgs.len();
-        let pgs_int_cols = self
+        let pgs_range_cols = self
             .config
             .range_transforms
             .get("pgs")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
             .ncols();
+        let pgs_int_cols = match self.config.interaction_penalty {
+            InteractionPenaltyKind::Isotropic => pgs_range_cols,
+            InteractionPenaltyKind::Anisotropic => {
+                self.config.pgs_basis_config.num_knots + self.config.pgs_basis_config.degree
+            }
+        };
 
         ModelLayout::new(
             &self.config,
@@ -506,17 +519,19 @@ impl TrainedModel {
             layout.num_penalties
         );
 
-        let pgs_w = self
+        let pgs_range_cols = self
             .config
             .range_transforms
             .get("pgs")
             .ok_or_else(|| ModelError::ConstraintMissing("pgs range transform".to_string()))?
             .ncols();
+        let pgs_unwhitened_cols =
+            self.config.pgs_basis_config.num_knots + self.config.pgs_basis_config.degree;
 
         for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
             let key = format!("f(PGS,{})", pc_config.name);
             if let Some(stored) = self.coefficients.interaction_effects.get(&key) {
-                let pc_w = self
+                let pc_range_cols = self
                     .config
                     .range_transforms
                     .get(&pc_config.name)
@@ -527,7 +542,18 @@ impl TrainedModel {
                         ))
                     })?
                     .ncols();
-                let expected = pgs_w * pc_w;
+                let pc_unwhitened_cols =
+                    pc_config.basis_config.num_knots + pc_config.basis_config.degree;
+                let (expected, pgs_dim_dbg, pc_dim_dbg) = match self.config.interaction_penalty {
+                    InteractionPenaltyKind::Isotropic => {
+                        let expected = pgs_range_cols * pc_range_cols;
+                        (expected, pgs_range_cols, pc_range_cols)
+                    }
+                    InteractionPenaltyKind::Anisotropic => {
+                        let expected = pgs_unwhitened_cols * pc_unwhitened_cols;
+                        (expected, pgs_unwhitened_cols, pc_unwhitened_cols)
+                    }
+                };
 
                 assert_eq!(
                     stored.len(),
@@ -535,8 +561,8 @@ impl TrainedModel {
                     "Mismatch: stored vs rebuilt interaction width for {key} (stored {}, expected {} = {}×{})",
                     stored.len(),
                     expected,
-                    pgs_w,
-                    pc_w
+                    pgs_dim_dbg,
+                    pc_dim_dbg
                 );
 
                 if pc_idx < layout.interaction_block_idx.len() {
@@ -549,8 +575,8 @@ impl TrainedModel {
                         "Mismatch: layout vs rebuilt interaction width for {key} (layout {}, expected {} = {}×{})",
                         layout_cols,
                         expected,
-                        pgs_w,
-                        pc_w
+                        pgs_dim_dbg,
+                        pc_dim_dbg
                     );
                 }
             }
@@ -813,18 +839,7 @@ mod internal {
 
                     pgs_main_basis_unc.dot(z_range_pgs_pred)
                 }
-                InteractionPenaltyKind::Anisotropic => {
-                    let z_range_pgs_pred = config
-                        .range_transforms
-                        .get("pgs")
-                        .ok_or_else(|| ModelError::InternalStackingError)?;
-
-                    if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
-                        return Err(ModelError::InternalStackingError);
-                    }
-
-                    pgs_main_basis_unc.dot(z_range_pgs_pred)
-                }
+                InteractionPenaltyKind::Anisotropic => pgs_main_basis_unc.to_owned(),
             };
 
             for pc_idx in 0..config.pc_configs.len() {
@@ -834,7 +849,7 @@ mod internal {
                 // Only build the interaction if the trained model contains coefficients for it
                 if coeffs.interaction_effects.contains_key(&tensor_key) {
                     let pc_int_basis = match config.interaction_penalty {
-                        InteractionPenaltyKind::Isotropic | InteractionPenaltyKind::Anisotropic => {
+                        InteractionPenaltyKind::Isotropic => {
                             let z_range_pc_pred = config
                                 .range_transforms
                                 .get(pc_name)
@@ -847,6 +862,9 @@ mod internal {
                             }
 
                             pc_unconstrained_bases_main[pc_idx].dot(z_range_pc_pred)
+                        }
+                        InteractionPenaltyKind::Anisotropic => {
+                            pc_unconstrained_bases_main[pc_idx].to_owned()
                         }
                     };
 

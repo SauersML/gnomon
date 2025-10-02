@@ -5871,8 +5871,11 @@ mod tests {
             s_lambda = &s_lambda + &Rj.mapv(|v| lam * v);
         }
 
-        // Compute working response and weights at the fitted beta
-        let eta = x_cal.dot(&beta);
+        // Compute working response and weights at the fitted beta.
+        // IMPORTANT: the optimizer solved for eta = offset + X * beta.
+        // Rebuild the same eta here so the KKT check matches the solved system.
+        let mut eta = x_cal.dot(&beta);
+        eta += &offset;
         let mu = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
         // Compute working weights and response
@@ -5885,7 +5888,7 @@ mod tests {
             z[i] = eta[i] + (y[i] - p_i) / vi.max(1e-12);
         }
 
-        // KKT residual: r_beta = X^T W(z - X beta) - S_lambda * beta
+        // KKT residual: r_beta = X^T W (z - eta) - S_lambda * beta, using the optimizer's eta.
         let mut xtwz_minus_xtwxb = Array1::<f64>::zeros(beta.len());
         for i in 0..n {
             let wi = w_work[i];
@@ -5904,14 +5907,34 @@ mod tests {
         let s_beta = s_lambda.dot(&beta);
         let residual = &xtwz_minus_xtwxb - &s_beta;
 
-        // Compute L2 norm of the residual
-        let res_norm: f64 = residual.iter().map(|&r| r * r).sum::<f64>().sqrt();
+        // Use a relative scale for the stopping check to avoid spurious failures from
+        // benign floating-point noise.
+        let l2 = |v: &Array1<f64>| v.iter().map(|&t| t * t).sum::<f64>().sqrt();
 
-        // The residual should be very small if PIRLS converged correctly
+        // Recompute X^T W z to build a natural scaling term.
+        let mut xtwz = Array1::<f64>::zeros(beta.len());
+        for i in 0..n {
+            let wi = w_work[i];
+            if wi < 1e-12 {
+                continue;
+            }
+
+            let xi = x_cal.row(i);
+            for j in 0..beta.len() {
+                xtwz[j] += wi * xi[j] * z[i];
+            }
+        }
+
+        let scale = l2(&xtwz) + l2(&s_beta) + 1.0;
+        let res_rel = l2(&residual) / scale;
+
+        // The residual should be tiny if PIRLS converged correctly.
         assert!(
-            res_norm < 1e-4,
-            "Inner KKT residual norm should be small, got {:.6e}",
-            res_norm
+            res_rel < 1e-6,
+            "Inner KKT residual too large: ||r||_2={:.6e}, scale={:.6e}, rel={:.6e}",
+            l2(&residual),
+            scale,
+            res_rel
         );
     }
 
@@ -6184,8 +6207,9 @@ mod tests {
         }
 
         // For Gaussian regression, the KKT residual is simpler:
-        // r_beta = X^T W(y - X beta) - S_lambda * beta
-        let eta = x_cal.dot(&beta);
+        // r_beta = X^T W (y - eta) - S_lambda * beta with eta = offset + X beta.
+        let mut eta = x_cal.dot(&beta);
+        eta += &offset;
         let mut xtw_resid = Array1::<f64>::zeros(beta.len());
 
         for i in 0..n {
@@ -6202,20 +6226,35 @@ mod tests {
             }
         }
 
-        // Scale by 1/scale for Gaussian
-        xtw_resid.mapv_inplace(|v| v / scale);
-
         let s_beta = s_lambda.dot(&beta);
         let residual = &xtw_resid - &s_beta;
 
-        // Compute L2 norm of the residual
-        let res_norm: f64 = residual.iter().map(|&r| r * r).sum::<f64>().sqrt();
+        // Build a scale-aware norm so the check is stable across platforms.
+        let l2 = |v: &Array1<f64>| v.iter().map(|&t| t * t).sum::<f64>().sqrt();
 
-        // The residual should be very small if the linear system was solved correctly
+        // Compute a natural scaling term: ||X^T W y|| + ||S_lambda beta|| + 1.
+        let mut xtwy = Array1::<f64>::zeros(beta.len());
+        for i in 0..n {
+            let wi = w[i];
+            if wi < 1e-12 {
+                continue;
+            }
+
+            let xi = x_cal.row(i);
+            for j in 0..beta.len() {
+                xtwy[j] += wi * xi[j] * y[i];
+            }
+        }
+        let scale_term = l2(&xtwy) + l2(&s_beta) + 1.0;
+        let res_rel = l2(&residual) / scale_term;
+
+        // The residual should be tiny if the linear system was solved correctly.
         assert!(
-            res_norm < 1e-4,
-            "Inner KKT residual norm should be small, got {:.6e}",
-            res_norm
+            res_rel < 1e-8,
+            "Inner KKT residual too large: ||r||_2={:.6e}, scale={:.6e}, rel={:.6e}",
+            l2(&residual),
+            scale_term,
+            res_rel
         );
     }
 
