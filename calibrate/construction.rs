@@ -2137,4 +2137,175 @@ mod tests {
             max_diff
         );
     }
+
+    fn linspace(n: usize) -> Array1<f64> {
+        if n <= 1 {
+            return Array1::zeros(n);
+        }
+        let step = 1.0 / ((n - 1) as f64);
+        Array1::from_iter((0..n).map(|i| i as f64 * step))
+    }
+
+    fn make_toy_data(n: usize) -> TrainingData {
+        // Minimal, deterministic data
+        let y = Array1::zeros(n);
+        let p = linspace(n); // PGS
+        let pc1 = linspace(n); // 1 PC
+        let pcs = {
+            let mut m = Array2::zeros((n, 1));
+            for i in 0..n {
+                m[[i, 0]] = pc1[i];
+            }
+            m
+        };
+        let weights = Array1::ones(n);
+
+        TrainingData { y, p, pcs, weights }
+    }
+
+    fn frob_norm(a: &Array2<f64>) -> f64 {
+        a.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+
+    fn base_cfg() -> (BasisConfig, BasisConfig, usize) {
+        // Choose cubic (degree=3) with 1 internal knot:
+        // unconstrained main width = num_knots + degree = 1 + 3 = 4
+        // order-2 penalty => nullspace dim = 2, whitened width = 2
+        let basis = BasisConfig { degree: 3, num_knots: 1 };
+        let penalty_order = 2;
+        (basis.clone(), basis, penalty_order)
+    }
+
+    fn cfg_with_interaction(kind: InteractionPenaltyKind) -> ModelConfig {
+        let (pgs_basis, pc_basis, penalty_order) = base_cfg();
+        // Ranges match the toy data [0,1]
+        let pc1 = crate::calibrate::model::PrincipalComponentConfig {
+            name: "PC1".to_string(),
+            range: (0.0, 1.0),
+            basis_config: pc_basis,
+        };
+        ModelConfig {
+            link_function: LinkFunction::Identity,
+            penalty_order,
+            convergence_tolerance: 1e-6,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 100,
+            pgs_basis_config: pgs_basis,
+            pc_configs: vec![pc1],
+            pgs_range: (0.0, 1.0),
+            interaction_penalty: kind,
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn regression_anisotropic_interaction_uses_unconstrained_width() {
+        // This was the panic case before the fix: m_main = 4, order = 2.
+        // Old code passed whitened rank (=2) into a 2nd-diff penalty => panic.
+        let n = 40;
+        let data = make_toy_data(n);
+        let config = cfg_with_interaction(InteractionPenaltyKind::Anisotropic);
+
+        let (x, s_list, layout, _stz, _knots, _range, _pc_null, _centers, _alpha) =
+            build_design_and_penalty_matrices(&data, &config)
+                .expect("anisotropic interaction construction should not panic");
+
+        // There is exactly one interaction block (for PC1)
+        assert_eq!(
+            layout.interaction_block_idx.len(),
+            1,
+            "expected exactly one interaction block"
+        );
+        let ib = layout.interaction_block_idx[0];
+        let block = &layout.penalty_map[ib];
+
+        // Anisotropic => two penalties for the interaction
+        assert_eq!(
+            block.penalty_indices.len(),
+            2,
+            "anisotropic interaction must have two penalty indices"
+        );
+
+        // With degree=3, num_knots=1 => unconstrained main width = 4 on both margins.
+        // Anisotropic interaction uses *unconstrained* widths => 4 x 4 = 16 columns.
+        let expected_cols = 4 * 4;
+        assert_eq!(
+            block.col_range.len(),
+            expected_cols,
+            "anisotropic tensor block should be 16-wide (4x4) for this setup"
+        );
+
+        // Penalty sub-blocks should be present and each normalized to unit Frobenius norm
+        for &pi in &block.penalty_indices {
+            let sub = s_list[pi]
+                .slice(s![block.col_range.clone(), block.col_range.clone()])
+                .to_owned();
+            let fnorm = frob_norm(&sub);
+            assert!(
+                (fnorm - 1.0).abs() < 1e-8,
+                "anisotropic penalty sub-block not unit-normalized; got {:.6e}",
+                fnorm
+            );
+        }
+
+        // Sanity: design has those columns too
+        assert!(
+            x.ncols() >= block.col_range.end,
+            "design does not contain expected interaction columns"
+        );
+    }
+
+    #[test]
+    fn isotropic_interaction_still_uses_whitened_width() {
+        let n = 40;
+        let data = make_toy_data(n);
+        let config = cfg_with_interaction(InteractionPenaltyKind::Isotropic);
+
+        let (_x, s_list, layout, _stz, _knots, _range, _pc_null, _centers, _alpha) =
+            build_design_and_penalty_matrices(&data, &config)
+                .expect("isotropic interaction construction should not panic");
+
+        assert_eq!(
+            layout.interaction_block_idx.len(),
+            1,
+            "expected exactly one interaction block"
+        );
+        let ib = layout.interaction_block_idx[0];
+        let block = &layout.penalty_map[ib];
+
+        // Isotropic => a single penalty for the interaction
+        assert_eq!(
+            block.penalty_indices.len(),
+            1,
+            "isotropic interaction must have exactly one penalty index"
+        );
+
+        // With degree=3, num_knots=1 => unconstrained main width = 4; order-2 nullspace dim = 2
+        // Whitened range width = 4 - 2 = 2 on each margin => tensor is 2 x 2 = 4 columns.
+        let expected_cols = 2 * 2;
+        assert_eq!(
+            block.col_range.len(),
+            expected_cols,
+            "isotropic tensor block should be 4-wide (2x2) for this setup"
+        );
+
+        // The single isotropic penalty sub-block is identity-like and normalized to unit Frobenius norm
+        let pi = block.penalty_indices[0];
+        let sub = s_list[pi]
+            .slice(s![block.col_range.clone(), block.col_range.clone()])
+            .to_owned();
+        let fnorm = frob_norm(&sub);
+        assert!(
+            (fnorm - 1.0).abs() < 1e-8,
+            "isotropic penalty sub-block not unit-normalized; got {:.6e}",
+            fnorm
+        );
+    }
 }
+
