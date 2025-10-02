@@ -2212,9 +2212,28 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Anisotropic);
 
-        let (x, s_list, layout, _stz, _knots, _range, _pc_null, _centers, _alpha) =
+        let (
+            x,
+            s_list,
+            layout,
+            stz_unused,
+            knots_unused,
+            range_unused,
+            pc_null_unused,
+            centers_unused,
+            alpha_unused,
+        ) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("anisotropic interaction construction should not panic");
+
+        let _ = (
+            stz_unused,
+            knots_unused,
+            range_unused,
+            pc_null_unused,
+            centers_unused,
+            alpha_unused,
+        );
 
         // There is exactly one interaction block (for PC1)
         assert_eq!(
@@ -2267,9 +2286,29 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Isotropic);
 
-        let (_x, s_list, layout, _stz, _knots, _range, _pc_null, _centers, _alpha) =
+        let (
+            x_unused,
+            s_list,
+            layout,
+            stz_unused,
+            knots_unused,
+            range_unused,
+            pc_null_unused,
+            centers_unused,
+            alpha_unused,
+        ) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("isotropic interaction construction should not panic");
+
+        let _ = (
+            x_unused,
+            stz_unused,
+            knots_unused,
+            range_unused,
+            pc_null_unused,
+            centers_unused,
+            alpha_unused,
+        );
 
         assert_eq!(
             layout.interaction_block_idx.len(),

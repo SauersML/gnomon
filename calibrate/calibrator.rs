@@ -4023,14 +4023,23 @@ mod tests {
 
     #[test]
     fn external_opt_cost_grad_agree_fd() {
-        // Create synthetic data
+        // Create synthetic data with genuine nonlinear signal so EDFs stay well away from zero
         let n = 100;
-        let (_, y, _, _) = generate_synthetic_gaussian_data(n, 5, 0.5, Some(42));
-
-        // Create calibrator features
         let pred = Array1::from_vec((0..n).map(|i| i as f64 / (n as f64) * 2.0 - 1.0).collect());
-        let se = Array1::from_elem(n, 0.5);
-        let dist = Array1::zeros(n);
+        let y = Array1::from_shape_fn(n, |i| {
+            let t = pred[i];
+            t + 0.6 * (3.0 * t).sin()
+        });
+
+        // Create calibrator features with variability in all channels
+        let se = Array1::from_shape_fn(n, |i| {
+            let phase = 2.0 * PI * (i as f64) / (n as f64);
+            0.6 + 0.2 * phase.sin()
+        });
+        let dist = Array1::from_shape_fn(n, |i| {
+            let phase = 2.0 * PI * (i as f64) / (n as f64);
+            0.3 * phase.cos()
+        });
 
         let features = CalibratorFeatures {
             pred: pred.clone(),
@@ -4114,19 +4123,26 @@ mod tests {
             assert!(b.is_finite(), "Coefficients should be finite");
         }
 
-        // EDF values should be reasonable
+        // EDF values must stay safely away from zero in this signal-rich setup
         assert!(
-            edf_pred >= 1.0,
-            "EDF for pred smooth should be at least 1.0"
+            edf_pred.is_finite() && edf_pred > 1.0,
+            "EDF for pred smooth should be comfortably above 1.0; got {}",
+            edf_pred
         );
-        assert!(edf_se >= 0.0, "EDF for SE smooth should be non-negative");
         assert!(
-            edf_dist >= 0.0,
-            "EDF for distance smooth should be non-negative"
+            edf_se.is_finite() && edf_se > 0.5,
+            "EDF for SE smooth should be well above zero; got {}",
+            edf_se
+        );
+        assert!(
+            edf_dist.is_finite() && edf_dist > 0.5,
+            "EDF for distance smooth should be well above zero; got {}",
+            edf_dist
         );
 
         // Scale should be positive (for Gaussian model)
         assert!(scale > 0.0, "Scale parameter should be positive");
+
     }
 
     #[test]
