@@ -3,18 +3,16 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process;
+use std::collections::HashSet;
+use ndarray::{Array1, ArrayView1};
+use clap::{Parser, Subcommand, Args};
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, TrainedModel};
-
-use clap::Args;
-use ndarray::{Array1, ArrayView1};
-use std::collections::HashSet;
 
 #[derive(Args)]
 pub struct TrainArgs {
