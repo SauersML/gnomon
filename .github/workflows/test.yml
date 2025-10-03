@@ -50,7 +50,6 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Install Rust nightly
-        if: steps.rust_changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Prepare cache metadata
@@ -115,7 +114,7 @@ jobs:
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
           echo "---"
-          cargo asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
+          cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
 
       - name: Cache getdoc binary
         id: getdoc_cache
@@ -166,10 +165,10 @@ jobs:
             echo "deps_hash=${{ steps.cache_meta.outputs.deps_hash }}"
             echo ""
             echo "--- rustc ---"
-            (rustc -Vv || true)
+            (rustc +nightly -Vv || true)
             echo ""
             echo "--- cargo ---"
-            (cargo -Vv || true)
+            (cargo +nightly -Vv || true)
             echo ""
             echo "--- host uname ---"
             (uname -a || true)
