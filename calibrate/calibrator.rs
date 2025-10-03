@@ -3804,7 +3804,7 @@ mod tests {
         // Build designs for both specs
         let (_, penalties_no_ridge, _, _) =
             build_calibrator_design(&features, &spec_no_ridge).unwrap();
-        let (x_with_ridge, penalties_with_ridge, _schema_with_ridge, offset_with_ridge) =
+        let (x_with_ridge, penalties_with_ridge, _, offset_with_ridge) =
             build_calibrator_design(&features, &spec_with_ridge).unwrap();
 
         // Verify the penalties have the expected structure
