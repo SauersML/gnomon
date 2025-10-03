@@ -1506,105 +1506,105 @@ pub fn solve_penalized_least_squares(
         let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
         match FaerLlt::new(h_faer.as_ref(), Side::Lower) {
             Ok(chol) => {
-            // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
-            let cond_bad = match penalized_hessian.eigh(Side::Lower) {
-                Ok((eigs, _)) => {
-                    let mut min_ev = f64::INFINITY;
-                    let mut max_ev = 0.0f64;
-                    for &ev in eigs.iter() {
-                        if ev.is_finite() {
-                            if ev > max_ev {
-                                max_ev = ev;
-                            }
-                            if ev < min_ev {
-                                min_ev = ev;
+                // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
+                let cond_bad = match penalized_hessian.eigh(Side::Lower) {
+                    Ok((eigs, _)) => {
+                        let mut min_ev = f64::INFINITY;
+                        let mut max_ev = 0.0f64;
+                        for &ev in eigs.iter() {
+                            if ev.is_finite() {
+                                if ev > max_ev {
+                                    max_ev = ev;
+                                }
+                                if ev < min_ev {
+                                    min_ev = ev;
+                                }
                             }
                         }
+                        // Treat non-positive or extremely small min eigenvalues as bad conditioning
+                        if !(min_ev.is_finite()) || min_ev <= 0.0 {
+                            true
+                        } else {
+                            let cond = max_ev / min_ev.max(std::f64::MIN_POSITIVE);
+                            cond > 1e8
+                        }
                     }
-                    // Treat non-positive or extremely small min eigenvalues as bad conditioning
-                    if !(min_ev.is_finite()) || min_ev <= 0.0 {
-                        true
-                    } else {
-                        let cond = max_ev / min_ev.max(std::f64::MIN_POSITIVE);
-                        cond > 1e8
+                    Err(_) => {
+                        // If we can't estimate, be conservative and proceed with SPD path
+                        false
                     }
-                }
-                Err(_) => {
-                    // If we can't estimate, be conservative and proceed with SPD path
-                    false
-                }
-            };
-            if cond_bad {
-                diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
-            } else {
-                // Single multi-RHS solve: [ XtWz | Eᵀ ]
-                let rk_rows = e_transformed.nrows();
-                let nrhs = 1 + rk_rows;
-                let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
-                    if j == 0 {
-                        xtwz[i]
-                    } else {
-                        e_transformed[(j - 1, i)]
-                    }
-                });
-                let sol = chol.solve(rhs.as_ref());
-
-                // β̂ from first column
-                let mut beta_transformed = Array1::zeros(p_dim);
-                for i in 0..p_dim {
-                    beta_transformed[i] = sol[(i, 0)];
-                }
-                if !beta_transformed.iter().all(|v| v.is_finite()) {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
+                };
+                if cond_bad {
+                    diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
+                } else {
+                    // Single multi-RHS solve: [ XtWz | Eᵀ ]
+                    let rk_rows = e_transformed.nrows();
+                    let nrhs = 1 + rk_rows;
+                    let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
+                        if j == 0 {
+                            xtwz[i]
+                        } else {
+                            e_transformed[(j - 1, i)]
+                        }
                     });
-                }
+                    let sol = chol.solve(rhs.as_ref());
 
-                // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
-                let mut frob = 0.0f64;
-                for j in 0..rk_rows {
+                    // β̂ from first column
+                    let mut beta_transformed = Array1::zeros(p_dim);
                     for i in 0..p_dim {
-                        frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                        beta_transformed[i] = sol[(i, 0)];
                     }
-                }
-                let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
-                let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
-                if !edf.is_finite() {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
+                    if !beta_transformed.iter().all(|v| v.is_finite()) {
+                        return Err(EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        });
+                    }
 
-                // Scale parameter
-                let scale = calculate_scale(
-                    &beta_transformed,
-                    x_transformed,
-                    y,
-                    weights,
-                    edf,
-                    link_function,
-                );
-                if !scale.is_finite() {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
+                    // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
+                    let mut frob = 0.0f64;
+                    for j in 0..rk_rows {
+                        for i in 0..p_dim {
+                            frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                        }
+                    }
+                    let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
+                    let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
+                    if !edf.is_finite() {
+                        return Err(EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        });
+                    }
 
-                println!(
-                    "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
-                    edf, scale
-                );
-
-                return Ok((
-                    StablePLSResult {
-                        beta: beta_transformed,
-                        penalized_hessian,
+                    // Scale parameter
+                    let scale = calculate_scale(
+                        &beta_transformed,
+                        x_transformed,
+                        y,
+                        weights,
                         edf,
-                        scale,
-                    },
-                    p_dim,
-                ));
-            }
+                        link_function,
+                    );
+                    if !scale.is_finite() {
+                        return Err(EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        });
+                    }
+
+                    println!(
+                        "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
+                        edf, scale
+                    );
+
+                    return Ok((
+                        StablePLSResult {
+                            beta: beta_transformed,
+                            penalized_hessian,
+                            edf,
+                            scale,
+                        },
+                        p_dim,
+                    ));
+                }
             }
             Err(_) => diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed),
         }
@@ -1984,7 +1984,13 @@ pub fn solve_penalized_least_squares(
     // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
     // - Calculating effective degrees of freedom (model complexity measure)
     // - Estimating the scale parameter (variance component for Gaussian models)
-    diagnostics.emit_qr_summary(edf, scale, rank, x_transformed.ncols(), function_timer.elapsed());
+    diagnostics.emit_qr_summary(
+        edf,
+        scale,
+        rank,
+        x_transformed.ncols(),
+        function_timer.elapsed(),
+    );
 
     // Return the result
     Ok((
@@ -2260,13 +2266,13 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_abs_diff_eq;
     use crate::calibrate::basis::create_difference_penalty_matrix;
     use crate::calibrate::construction::{
         build_design_and_penalty_matrices, compute_penalty_square_roots,
     };
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, map_coefficients};
+    use approx::assert_abs_diff_eq;
     use ndarray::{Array1, Array2, arr1, arr2};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -2368,6 +2374,7 @@ mod tests {
         let data = TrainingData {
             y,
             p,
+            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
             pcs: Array2::zeros((n_samples, 0)),
             weights: Array1::from_elem(n_samples, 1.0),
         };
@@ -2562,6 +2569,7 @@ mod tests {
         // Create a model layout
         let layout = ModelLayout {
             intercept_col: 0,
+            sex_col: None,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             pc_null_block_idx: vec![],
@@ -2609,7 +2617,7 @@ mod tests {
     #[test]
     fn test_stable_reparameterization_preserves_nullspace_rank() {
         use crate::calibrate::construction::{
-            compute_penalty_square_roots, stable_reparameterization, ModelLayout,
+            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
         };
 
         // Create a canonical cubic spline penalty (second-order differences)
@@ -2643,8 +2651,8 @@ mod tests {
         // Run stable reparameterization and confirm the null space dimension is preserved.
         let layout = ModelLayout::external(num_basis_functions, 1);
         let lambdas = vec![1.0];
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("stable reparameterization");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout)
+            .expect("stable reparameterization");
 
         assert_eq!(
             reparam.e_transformed.nrows(),
@@ -2658,10 +2666,7 @@ mod tests {
             .copied()
             .filter(|&ev| ev > tolerance)
             .collect();
-        let expected_log_det: f64 = positive_eigs
-            .iter()
-            .map(|&ev| ev.ln())
-            .sum::<f64>();
+        let expected_log_det: f64 = positive_eigs.iter().map(|&ev| ev.ln()).sum::<f64>();
         assert_abs_diff_eq!(reparam.log_det, expected_log_det, epsilon = 1e-9);
 
         // The transformed penalty should expose the same null-space dimension.
@@ -2755,6 +2760,7 @@ mod tests {
         // Create a model layout
         let layout = ModelLayout {
             intercept_col: 0,
+            sex_col: None,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             pc_null_block_idx: vec![],
@@ -2888,6 +2894,7 @@ mod tests {
         let data = TrainingData {
             y,
             p,
+            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
             pcs: Array2::zeros((n_samples, 0)),
             weights: Array1::from_elem(n_samples, 1.0),
         };
@@ -3017,6 +3024,7 @@ mod tests {
         let data = TrainingData {
             y,
             p,
+            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
             pcs: Array2::zeros((n_samples, 0)),
             weights: Array1::from_elem(n_samples, 1.0),
         };
@@ -3622,6 +3630,7 @@ mod tests {
 
         let layout = ModelLayout {
             intercept_col: 0,
+            sex_col: None,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             pc_null_block_idx: vec![],

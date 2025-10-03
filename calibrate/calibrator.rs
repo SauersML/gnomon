@@ -319,7 +319,6 @@ pub fn compute_alo_features(
                 );
                 diag_counter += 1;
             }
-
         }
 
         col_start = col_end;
@@ -752,9 +751,7 @@ pub fn build_calibrator_design(
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred_identity);
     // Center the predictor on the weighted mean so interaction terms shrink toward c.
-    let pred_centered = features
-        .pred_identity
-        .mapv(|x| x - pred_mean);
+    let pred_centered = features.pred_identity.mapv(|x| x - pred_mean);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
     let (dist_std, dist_ms) = if use_wiggle_only_dist {
         // Center only for wiggle-only drop to avoid extreme scaling
@@ -1112,9 +1109,7 @@ pub fn build_calibrator_design(
             b_pred_param = Array2::<f64>::zeros((n, param_dim));
             b_pred_param.column_mut(0).fill(1.0);
             if param_dim > 1 {
-                b_pred_param
-                    .column_mut(1)
-                    .assign(&features.pred_identity);
+                b_pred_param.column_mut(1).assign(&features.pred_identity);
             }
 
             if b_pred_c.ncols() > 0 {
@@ -1135,8 +1130,7 @@ pub fn build_calibrator_design(
                     }
                     Err(BasisError::ConstraintNullspaceNotFound) => {
                         eprintln!(
-                            "[CAL][WARN] block=pred reason=backbone_overlap_nullspace_failure action=drop_block raw_cols={}"
-                                ,
+                            "[CAL][WARN] block=pred reason=backbone_overlap_nullspace_failure action=drop_block raw_cols={}",
                             b_pred_raw.ncols()
                         );
                         b_pred_c = Array2::<f64>::zeros((n, 0));
@@ -1391,8 +1385,11 @@ pub fn build_calibrator_design(
             .assign(&b_pred_c);
     }
     if b_pred_param.ncols() > 0 {
-        x.slice_mut(s![.., pred_param_off..pred_param_off + b_pred_param.ncols()])
-            .assign(&b_pred_param);
+        x.slice_mut(s![
+            ..,
+            pred_param_off..pred_param_off + b_pred_param.ncols()
+        ])
+        .assign(&b_pred_param);
     }
     let se_off = pred_param_off + b_pred_param.ncols();
     if b_se_c.ncols() > 0 {
@@ -1720,7 +1717,13 @@ pub fn fit_calibrator(
     penalty_nullspace_dims: &[usize],
     link: LinkFunction,
 ) -> Result<
-    (Array1<f64>, [f64; 4], f64, (f64, f64, f64, f64), (usize, f64)),
+    (
+        Array1<f64>,
+        [f64; 4],
+        f64,
+        (f64, f64, f64, f64),
+        (usize, f64),
+    ),
     EstimationError,
 > {
     // Row-shape sanity checks
@@ -1755,15 +1758,12 @@ pub fn fit_calibrator(
             active_axes.push(idx);
             active_penalties.push(penalty_matrix.clone());
             let null_dim = if dims_match_total {
-                penalty_nullspace_dims
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "Nullspace dimension missing for penalty block {}",
-                            idx
-                        ))
-                    })?
+                penalty_nullspace_dims.get(idx).copied().ok_or_else(|| {
+                    EstimationError::InvalidInput(format!(
+                        "Nullspace dimension missing for penalty block {}",
+                        idx
+                    ))
+                })?
             } else {
                 let null_dim = penalty_nullspace_dims
                     .get(active_dim_index)
@@ -1790,8 +1790,7 @@ pub fn fit_calibrator(
     if !dims_match_total && dims_len != active_penalty_count {
         return Err(EstimationError::InvalidInput(format!(
             "Nullspace dimension list length {} must match number of active penalties {}",
-            dims_len,
-            active_penalty_count
+            dims_len, active_penalty_count
         )));
     }
 
@@ -1844,14 +1843,7 @@ pub fn fit_calibrator(
     );
     // End of shape guard: all penalty matrices now match the design width.
 
-    let res = optimize_external_design(
-        y,
-        prior_weights,
-        x,
-        offset,
-        &active_penalties,
-        &opts,
-    )?;
+    let res = optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)?;
 
     let ExternalOptimResult {
         beta,
@@ -1915,12 +1907,7 @@ pub fn fit_calibrator(
     );
     eprintln!(
         "[CAL] edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}, scale={:.3e}",
-        edf_pred,
-        edf_pred_param,
-        edf_se,
-        edf_dist,
-        res.edf_total,
-        res.scale
+        edf_pred, edf_pred_param, edf_se, edf_dist, res.edf_total, res.scale
     );
     let penalty_freeze_edf_threshold = 1e-3_f64;
     let penalty_freeze_lambda_threshold = 1e8_f64;
@@ -1973,12 +1960,12 @@ pub fn fit_calibrator(
 mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
-    use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
+    use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
     use crate::calibrate::estimate::evaluate_external_gradients;
     use crate::calibrate::model::ModelConfig;
-    use faer::linalg::solvers::Llt as FaerLlt;
     use faer::Mat as FaerMat;
     use faer::Side;
+    use faer::linalg::solvers::Llt as FaerLlt;
     use ndarray::{Array1, Array2, Axis};
     use rand::prelude::*;
     use rand_distr::{Bernoulli, Distribution, Normal, Uniform};
@@ -3238,8 +3225,8 @@ mod tests {
             }
 
             let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
-            let llt = FaerLlt::new(kf.as_ref(), Side::Lower)
-                .expect("LLT should succeed for SPD K_LOO");
+            let llt =
+                FaerLlt::new(kf.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
             let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
@@ -3340,8 +3327,8 @@ mod tests {
             }
 
             let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
-            let llt = FaerLlt::new(kf.as_ref(), Side::Lower)
-                .expect("LLT should succeed for SPD K_LOO");
+            let llt =
+                FaerLlt::new(kf.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
             let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
@@ -4159,7 +4146,6 @@ mod tests {
             "Relative gradient mismatch should be tiny; got {:.3e}",
             rel_norm
         );
-
     }
 
     #[test]
@@ -5281,8 +5267,7 @@ mod tests {
             prior_weights: None,
         };
 
-        let (x_cal, penalties, schema, offset) =
-            build_calibrator_design(&features, &spec).unwrap();
+        let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
         let w = Array1::<f64>::ones(n);
         let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
@@ -5774,10 +5759,7 @@ mod tests {
 
         // Check lambdas
         assert!(
-            lambda_tolerance(
-                original_cal_model.lambda_pred,
-                loaded_cal_model.lambda_pred
-            ),
+            lambda_tolerance(original_cal_model.lambda_pred, loaded_cal_model.lambda_pred),
             "lambda_pred mismatch: original={} loaded={}",
             original_cal_model.lambda_pred,
             loaded_cal_model.lambda_pred
@@ -5792,19 +5774,13 @@ mod tests {
             loaded_cal_model.lambda_pred_param
         );
         assert!(
-            lambda_tolerance(
-                original_cal_model.lambda_se,
-                loaded_cal_model.lambda_se
-            ),
+            lambda_tolerance(original_cal_model.lambda_se, loaded_cal_model.lambda_se),
             "lambda_se mismatch: original={} loaded={}",
             original_cal_model.lambda_se,
             loaded_cal_model.lambda_se
         );
         assert!(
-            lambda_tolerance(
-                original_cal_model.lambda_dist,
-                loaded_cal_model.lambda_dist
-            ),
+            lambda_tolerance(original_cal_model.lambda_dist, loaded_cal_model.lambda_dist),
             "lambda_dist mismatch: original={} loaded={}",
             original_cal_model.lambda_dist,
             loaded_cal_model.lambda_dist
@@ -6686,8 +6662,7 @@ mod tests {
         // Try to fit calibrator with extreme penalties
         // This should either converge with very small EDF or fail gracefully with an error
         // It should not hang indefinitely in the step-halving loop
-        let penalty_nullspace_dims =
-            active_penalty_nullspace_dims(&schema, &extreme_penalties);
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &extreme_penalties);
         let result = fit_calibrator(
             y.view(),
             w.view(),
@@ -6808,8 +6783,7 @@ mod tests {
 
         // Try to fit calibrator with large penalties
         let w = Array1::<f64>::ones(n);
-        let penalty_nullspace_dims =
-            active_penalty_nullspace_dims(&schema, &large_penalties);
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &large_penalties);
         let result = fit_calibrator(
             y.view(),
             w.view(),
