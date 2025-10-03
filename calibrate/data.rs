@@ -21,8 +21,6 @@ use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
 
-// --- Public Data Structures ---
-
 /// A container for validated data ready for model training.
 #[derive(Debug)]
 pub struct TrainingData {
