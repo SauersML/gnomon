@@ -249,8 +249,20 @@ jobs:
           path: .
       - name: Restore expected artifact layout
         run: |
-          rm -rf target
-          mv build-output/target target
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
       - uses: actions/setup-python@v4
@@ -277,8 +289,20 @@ jobs:
           path: .
       - name: Restore expected artifact layout
         run: |
-          rm -rf target
-          mv build-output/target target
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
       - uses: actions/setup-python@v4
@@ -310,8 +334,20 @@ jobs:
           path: .
       - name: Restore expected artifact layout
         run: |
-          rm -rf target
-          mv build-output/target target
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
       - uses: actions/setup-python@v4
@@ -338,8 +374,20 @@ jobs:
           path: .
       - name: Restore expected artifact layout
         run: |
-          rm -rf target
-          mv build-output/target target
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
 
