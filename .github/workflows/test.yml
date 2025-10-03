@@ -232,6 +232,12 @@ jobs:
         with:
           name: build-output
           path: .
+      - name: Restore expected artifact layout
+        run: |
+          rm -rf target
+          mv build-output/target target
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -253,6 +259,12 @@ jobs:
         with:
           name: build-output
           path: .
+      - name: Restore expected artifact layout
+        run: |
+          rm -rf target
+          mv build-output/target target
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -279,6 +291,12 @@ jobs:
         with:
           name: build-output
           path: .
+      - name: Restore expected artifact layout
+        run: |
+          rm -rf target
+          mv build-output/target target
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
       - uses: actions/setup-python@v4
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -300,6 +318,12 @@ jobs:
         with:
           name: build-output
           path: .
+      - name: Restore expected artifact layout
+        run: |
+          rm -rf target
+          mv build-output/target target
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
 
       - name: Make profiling binary executable
         run: chmod +x target/profiling/gnomon
