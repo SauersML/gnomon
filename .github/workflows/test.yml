@@ -138,14 +138,7 @@ jobs:
           cargo +nightly build --profile profiling --features no-inline-profiling
       # ----------------------------------------------------------------------------------------
 
-      - name: Save Cargo build cache (CI speed only)
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
-
-      # -------------------- EXPORT: TAR EVERYTHING NEEDED FOR INSTANT LOCAL BUILDS --------------------
+      # -------------------- EXPORT: GATHER ONLY ESSENTIAL METADATA --------------------
       - name: Compute safe artifact names (always)
         id: naming
         if: always()
@@ -179,111 +172,6 @@ jobs:
             (uname -a || true)
           } > export/build-meta.txt
 
-      - name: Pack Cargo deps (~/.cargo/registry + ~/.cargo/git) (always)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p export
-          if [[ -d "$HOME/.cargo" ]]; then
-            tar --exclude="$HOME/.cargo/credentials" \
-                -C "$HOME" -cf "export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar" \
-                -h .cargo/registry .cargo/git 2>/dev/null || true
-          fi
-          ls -al export || true
-
-      - name: Pack target/debug subtree (always)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p export
-          if [[ -d target/debug ]]; then
-            TAR="export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            if [[ -f target/.rustc_info.json ]]; then
-              tar -cf "$TAR" target/debug target/.rustc_info.json
-            else
-              tar -cf "$TAR" target/debug
-            fi
-          fi
-
-      - name: Pack target/release subtree (always)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p export
-          if [[ -d target/release ]]; then
-            TAR="export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            if [[ -f target/.rustc_info.json ]]; then
-              tar -cf "$TAR" target/release target/.rustc_info.json
-            else
-              tar -cf "$TAR" target/release
-            fi
-          fi
-
-      - name: Pack target/profiling subtree (always)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p export
-          if [[ -d target/profiling ]]; then
-            TAR="export/target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            tar -cf "$TAR" target/profiling
-          fi
-
-      - name: Pack FULL target tree (always)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p export
-          if [[ -d target ]]; then
-            TAR="export/target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar"
-            tar -cf "$TAR" target
-          fi
-
-      - name: Upload artifact – cargo deps (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}
-          path: export/cargo-deps-${{ steps.cache_meta.outputs.deps_hash }}.tar
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload artifact – target debug (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-debug-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload artifact – target release (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-release-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload artifact – target profiling (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-profiling-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload artifact – target FULL tree (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}
-          path: export/target-all-${{ steps.naming.outputs.safe_ref }}-W${{ steps.cache_meta.outputs.week }}.tar
-          if-no-files-found: ignore
-          retention-days: 14
-
       - name: Upload artifact – build metadata (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -291,6 +179,37 @@ jobs:
           name: build-meta-${{ steps.naming.outputs.safe_ref }}-${{ steps.naming.outputs.short_sha }}
           path: export/build-meta.txt
           retention-days: 30
+
+      - name: Prepare trimmed build artifact (always)
+        if: always()
+        shell: bash
+        run: |
+          rm -rf build-output
+          mkdir -p build-output
+          if [[ -d target/release ]]; then
+            mkdir -p build-output/target/release
+            rsync -a \
+              --exclude 'build' \
+              --exclude 'incremental' \
+              --exclude '*.d' \
+              --exclude '*.rlib' \
+              --exclude '*.rmeta' \
+              target/release/ build-output/target/release/
+          fi
+          if [[ -d target/profiling ]]; then
+            mkdir -p build-output/target/profiling
+            rsync -a target/profiling/ build-output/target/profiling/
+          fi
+          if [[ -f report.md ]]; then
+            cp report.md build-output/
+          fi
+          rm -rf target/debug target/.fingerprint target/incremental
+
+      - name: Cleanup workspace leftovers (always)
+        if: always()
+        run: |
+          rm -rf export
+          du -sh build-output || true
 
       - name: Fail job if unit tests failed
         if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
@@ -300,9 +219,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          path: |
-            target
-            report.md
+          path: build-output
           retention-days: 1
           if-no-files-found: ignore
 
