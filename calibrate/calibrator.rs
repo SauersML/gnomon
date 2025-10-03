@@ -5197,25 +5197,60 @@ mod tests {
 
     #[test]
     fn se_smooth_learns_heteroscedastic_shrinkage() {
-        // Create heteroscedastic Gaussian data
-        let n = 300;
-        let p = 3;
-        let hetero_factor = 1.5; // Strong heteroscedasticity
-        let (x, y, mu_true, _) = generate_synthetic_gaussian_data(n, p, hetero_factor, Some(42));
+        let n = 4000;
+        let beta_true = 1.0;
+        let sigma_y = 0.2;
+        let sigma_eps0 = 0.2;
+        let kappa = 20.0;
 
-        // Train a simple model that estimates just the mean
-        let w = Array1::<f64>::ones(n);
-        let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Identity);
+        let mut rng = StdRng::seed_from_u64(42);
+        let normal = Normal::new(0.0, 1.0).unwrap();
 
-        // Base predictions
-        let base_preds = base_fit.solve_mu.clone();
+        let mut g = Array1::<f64>::zeros(n);
+        for value in g.iter_mut() {
+            *value = normal.sample(&mut rng);
+        }
 
-        // Generate ALO features
-        let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Identity)
-                .unwrap();
+        let se_low = 0.1;
+        let se_high = 2.5;
+        let mut se_raw = Array1::<f64>::zeros(n);
+        for (idx, value) in se_raw.iter_mut().enumerate() {
+            let base = if idx < n / 2 { se_low } else { se_high };
+            let jitter = 0.02 * normal.sample(&mut rng);
+            *value = (base + jitter).max(0.05);
+        }
 
-        // Create calibrator spec
+        let mut y = Array1::<f64>::zeros(n);
+        let mut mu_true = Array1::<f64>::zeros(n);
+        let mut pred_proxy = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let noise_scale = sigma_eps0 * (1.0 + kappa * se_raw[i] * se_raw[i]).sqrt();
+            let proxy_noise = normal.sample(&mut rng) * noise_scale;
+            let y_noise = normal.sample(&mut rng) * sigma_y;
+
+            mu_true[i] = beta_true * g[i];
+            pred_proxy[i] = g[i] + proxy_noise;
+            y[i] = mu_true[i] + y_noise;
+        }
+
+        let pred_mean = pred_proxy.sum() / (n as f64);
+        let mut pred_var = 0.0;
+        for &v in pred_proxy.iter() {
+            let d = v - pred_mean;
+            pred_var += d * d;
+        }
+        pred_var /= n as f64;
+        let pred_std = pred_var.sqrt().max(1e-8_f64);
+        let pred_standardized = pred_proxy.mapv(|v| (v - pred_mean) / pred_std);
+
+        let dist = Array1::<f64>::zeros(n);
+        let features = CalibratorFeatures {
+            pred: pred_standardized.clone(),
+            se: se_raw.clone(),
+            dist: dist.clone(),
+            pred_identity: pred_standardized.clone(),
+        };
+
         let spec = CalibratorSpec {
             link: LinkFunction::Identity,
             pred_basis: BasisConfig {
@@ -5224,24 +5259,22 @@ mod tests {
             },
             se_basis: BasisConfig {
                 degree: 3,
-                num_knots: 5,
+                num_knots: 8,
             },
             dist_basis: BasisConfig {
                 degree: 3,
                 num_knots: 5,
             },
             penalty_order_pred: 2,
-            penalty_order_se: 2,
+            penalty_order_se: 1,
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
         };
 
-        // Build design
         let (x_cal, penalties, schema, offset) =
-            build_calibrator_design(&alo_features, &spec).unwrap();
-
-        // Fit calibrator
+            build_calibrator_design(&features, &spec).unwrap();
+        let w = Array1::<f64>::ones(n);
         let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let fit_result = fit_calibrator(
             y.view(),
@@ -5255,13 +5288,12 @@ mod tests {
         .unwrap();
         let (beta, lambdas, scale, (edf_pred, _, edf_se, edf_dist), (iters, grad_norm)) =
             fit_result;
-        // Use the values to print calibration metrics
+
         eprintln!(
             "Calibrator fit results - edf_pred: {:.2}, edf_se: {:.2}, edf_dist: {:.2}, iters: {}, convergence: {:.4e}",
             edf_pred, edf_se, edf_dist, iters, grad_norm
         );
 
-        // Create a CalibratorModel
         let cal_model = CalibratorModel {
             spec: spec.clone(),
             knots_pred: schema.knots_pred,
@@ -5286,42 +5318,94 @@ mod tests {
             scale: Some(scale),
         };
 
-        // Get calibrated predictions
         let cal_preds = predict_calibrator(
             &cal_model,
-            alo_features.pred_identity.view(),
-            alo_features.se.view(),
-            alo_features.dist.view(),
+            features.pred_identity.view(),
+            features.se.view(),
+            features.dist.view(),
         )
-        .unwrap(); // Safe to unwrap in tests
+        .unwrap();
 
-        // Calculate MSE before and after calibration
         let mut base_mse = 0.0;
         let mut cal_mse = 0.0;
-
         for i in 0..n {
-            let base_err = base_preds[i] - mu_true[i];
+            let base_err = pred_standardized[i] - mu_true[i];
             let cal_err = cal_preds[i] - mu_true[i];
-
             base_mse += base_err * base_err;
             cal_mse += cal_err * cal_err;
         }
-
         base_mse /= n as f64;
         cal_mse /= n as f64;
 
-        // The SE smooth should have substantial EDF to capture heteroscedasticity
         assert!(
-            edf_se > 0.5,
-            "EDF for SE smooth should be > 0.5 for heteroscedastic data, got {:.2}",
+            edf_se > 1.0,
+            "EDF for SE smooth should be > 1.0 when slope depends on SE, got {:.2}",
             edf_se
         );
 
-        // Calibrator should generally improve MSE for heteroscedastic data
-        // Since this is a synthetic test and REML will optimize by-design, use a lenient bound
+        let mut se_sorted = se_raw.to_vec();
+        se_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx_low = ((0.10 * (n as f64)).floor() as usize).min(n - 1);
+        let idx_high = ((0.90 * (n as f64)).floor() as usize).min(n - 1);
+        let se_low_q = se_sorted[idx_low];
+        let se_high_q = se_sorted[idx_high];
+
+        let delta = 0.75;
+        let pred_neg = Array1::from_vec(vec![-delta]);
+        let pred_pos = Array1::from_vec(vec![delta]);
+        let dist_eval = Array1::<f64>::zeros(1);
+
+        let se_low_vec = Array1::from_vec(vec![se_low_q]);
+        let se_high_vec = Array1::from_vec(vec![se_high_q]);
+
+        let pred_low_minus = predict_calibrator(
+            &cal_model,
+            pred_neg.view(),
+            se_low_vec.view(),
+            dist_eval.view(),
+        )
+        .unwrap();
+        let pred_low_plus = predict_calibrator(
+            &cal_model,
+            pred_pos.view(),
+            se_low_vec.view(),
+            dist_eval.view(),
+        )
+        .unwrap();
+        let slope_low = (pred_low_plus[0] - pred_low_minus[0]) / (2.0 * delta);
+
+        let pred_high_minus = predict_calibrator(
+            &cal_model,
+            pred_neg.view(),
+            se_high_vec.view(),
+            dist_eval.view(),
+        )
+        .unwrap();
+        let pred_high_plus = predict_calibrator(
+            &cal_model,
+            pred_pos.view(),
+            se_high_vec.view(),
+            dist_eval.view(),
+        )
+        .unwrap();
+        let slope_high = (pred_high_plus[0] - pred_high_minus[0]) / (2.0 * delta);
+
         assert!(
-            cal_mse < 1.2 * base_mse,
-            "Calibrated MSE ({:.4}) should not be significantly worse than base MSE ({:.4})",
+            slope_low > 0.0 && slope_high > 0.0,
+            "Calibrator slopes should be positive, got low={:.3}, high={:.3}",
+            slope_low,
+            slope_high
+        );
+        assert!(
+            slope_high < 0.8 * slope_low,
+            "High-SE slope ({:.3}) should be attenuated relative to low-SE slope ({:.3})",
+            slope_high,
+            slope_low
+        );
+
+        assert!(
+            cal_mse < base_mse,
+            "Calibrated MSE ({:.4}) should improve over baseline ({:.4})",
             cal_mse,
             base_mse
         );
