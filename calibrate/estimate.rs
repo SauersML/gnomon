@@ -3250,10 +3250,10 @@ pub mod internal {
 
             // Define a known function that the model should learn
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let term1 = (pgs_val * 0.5).sin() * 0.4;
-                let term2 = 0.4 * pc_val.powi(2);
-                let term3 = 0.15 * (pgs_val * pc_val).tanh();
-                0.3 + term1 + term2 + term3
+                let term1 = (pgs_val * 0.25).sin() * 1.0;
+                let term2 = 1.0 * pc_val.powi(2);
+                let term3 = 0.30 * (pgs_val * pc_val).tanh();
+                0.0 + term1 + term2 + term3
             };
 
             // Generate binary outcomes based on the true model
@@ -3428,10 +3428,10 @@ pub mod internal {
 
             // Define the same known function
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
-                let term1 = (pgs_val * 0.5).sin() * 0.4;
-                let term2 = 0.4 * pc_val.powi(2);
-                let term3 = 0.15 * (pgs_val * pc_val).tanh();
-                0.3 + term1 + term2 + term3
+                let term1 = (pgs_val * 0.25).sin() * 1.0;
+                let term2 = 1.0 * pc_val.powi(2);
+                let term3 = 0.30 * (pgs_val * pc_val).tanh();
+                0.0 + term1 + term2 + term3
             };
 
             // Generate binary outcomes and true probabilities
