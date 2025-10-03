@@ -4,8 +4,6 @@ use crate::calibrate::basis::{
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
-#[cfg(test)]
-use crate::calibrate::model::ModelConfig;
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
 
@@ -1975,7 +1973,8 @@ pub fn fit_calibrator(
 mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
-    use crate::calibrate::construction::ModelLayout;
+    use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
+    use crate::calibrate::model::ModelConfig;
     use faer::linalg::solvers::Llt as FaerLlt;
     use faer::Mat as FaerMat;
     use faer::Side;
@@ -1991,10 +1990,6 @@ mod tests {
         penalised_ll: f64,
         log_det_s: f64,
         log_det_h: f64,
-    }
-
-    fn dims4(dims: (usize, usize, usize, usize)) -> [usize; 4] {
-        [dims.0, dims.1, dims.2, dims.3]
     }
 
     /// Evaluates the LAML objective at a fixed rho for binomial/logistic regression.
@@ -3809,7 +3804,7 @@ mod tests {
         // Build designs for both specs
         let (_, penalties_no_ridge, _, _) =
             build_calibrator_design(&features, &spec_no_ridge).unwrap();
-        let (x_with_ridge, penalties_with_ridge, schema_with_ridge, offset_with_ridge) =
+        let (x_with_ridge, penalties_with_ridge, _schema_with_ridge, offset_with_ridge) =
             build_calibrator_design(&features, &spec_with_ridge).unwrap();
 
         // Verify the penalties have the expected structure
@@ -3856,53 +3851,42 @@ mod tests {
             "Penalty with nullspace ridge should be positive definite"
         );
 
-        // Fit models with different lambda values
+        // Prepare fixed-ρ PIRLS inputs so we can compare explicit smoothing levels without REML
         let w = Array1::<f64>::ones(n);
+        let layout = ModelLayout::external(x_with_ridge.ncols(), penalties_with_ridge.len());
+        let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75);
+        let penalty_roots =
+            compute_penalty_square_roots(&penalties_with_ridge).expect("penalty roots");
 
-        // Test that as lambda increases, the smooth contribution goes to zero
-        // Do this by directly manipulating the penalty matrices with artificial lambdas
-        let low_rho: f64 = -15.0; // Small lambda
-        let high_rho: f64 = 15.0; // Large lambda
+        let rho_low = Array1::from_elem(penalties_with_ridge.len(), -15.0);
+        let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
 
-        // Create penalties with explicit lambda values
-        let mut low_penalties = penalties_with_ridge.clone();
-        let mut high_penalties = penalties_with_ridge.clone();
-
-        // Multiply all penalties by exp(rho)
-        for p in low_penalties.iter_mut() {
-            *p = p.mapv(|v| v * low_rho.exp());
-        }
-
-        for p in high_penalties.iter_mut() {
-            *p = p.mapv(|v| v * high_rho.exp());
-        }
-
-        // Fit models with low and high penalties
-        let nullspace_dims_with_ridge = dims4(schema_with_ridge.penalty_nullspace_dims);
-        let fit_low = fit_calibrator(
-            y.view(),
-            w.view(),
+        let fit_low = pirls::fit_model_for_fixed_rho(
+            rho_low.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),
-            &low_penalties,
-            &nullspace_dims_with_ridge,
-            LinkFunction::Identity,
-        )
-        .unwrap();
-        let fit_high = fit_calibrator(
             y.view(),
             w.view(),
+            &penalty_roots,
+            &layout,
+            &cfg,
+        )
+        .expect("fixed-rho PIRLS (low)");
+        let fit_high = pirls::fit_model_for_fixed_rho(
+            rho_high.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),
-            &high_penalties,
-            &nullspace_dims_with_ridge,
-            LinkFunction::Identity,
+            y.view(),
+            w.view(),
+            &penalty_roots,
+            &layout,
+            &cfg,
         )
-        .unwrap();
+        .expect("fixed-rho PIRLS (high)");
 
-        // Extract coefficients
-        let (beta_low, _, _, _, _) = fit_low;
-        let (beta_high, _, _, _, _) = fit_high;
+        // Extract coefficients in the original basis
+        let beta_low = beta_in_original_basis(&fit_low);
+        let beta_high = beta_in_original_basis(&fit_high);
 
         // Calculate L2 norm of smooth coefficients (no unpenalized intercept present)
         let mut norm_low = 0.0;
