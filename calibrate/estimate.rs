@@ -4016,7 +4016,7 @@ pub mod internal {
         #[test]
         fn test_model_realworld_metrics() {
             // --- Data generation (additive truth) ---
-            let n_samples = 500;
+            let n_samples = 800;
             let mut rng = StdRng::seed_from_u64(42);
 
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
@@ -4027,9 +4027,10 @@ pub mod internal {
                 .unwrap();
 
             let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = (pgs_val * 0.8).sin() * 0.5;
-                let pc_effect = 0.4 * pc_val.powi(2);
-                0.2 + pgs_effect + pc_effect
+                let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
+                let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
+                let interaction = 0.4 * (pgs_val * pc_val).tanh();
+                -0.1 + pgs_effect + pc_effect + interaction
             };
 
             // Outcomes
@@ -4037,7 +4038,7 @@ pub mod internal {
                 .map(|i| {
                     let logit = true_logit(p[i], pcs[[i, 0]]);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
-                    let prob = prob.clamp(1e-6, 1.0 - 1e-6);
+                    let prob = prob.clamp(1e-4, 1.0 - 1e-4);
                     if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
                 })
                 .collect();
@@ -4051,13 +4052,13 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 30,
                 pgs_basis_config: BasisConfig {
-                    num_knots: 8,
+                    num_knots: 5,
                     degree: 3,
                 },
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
                     basis_config: BasisConfig {
-                        num_knots: 8,
+                        num_knots: 5,
                         degree: 3,
                     },
                     range: (-1.5, 1.5),
