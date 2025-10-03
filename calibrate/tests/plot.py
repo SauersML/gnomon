@@ -731,12 +731,16 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
         ici = ici_isotonic(y_true, p)
         
         # Plot with error bars
+        lower = (dfb['acc'] - dfb['lo']).clip(lower=0).to_numpy()
+        upper = (dfb['hi'] - dfb['acc']).clip(lower=0).to_numpy()
+        yerr = np.vstack([lower, upper])
+        
         ax3.errorbar(
-            dfb['conf'], dfb['acc'], 
-            yerr=[dfb['acc']-dfb['lo'], dfb['hi']-dfb['acc']],
-            fmt='o-', capsize=3, lw=1.5, 
-            label=f"{name} (ECE={ece_mean:.3f}, ICI={ici:.3f})", 
-            color=colors[name], 
+            dfb['conf'].to_numpy(), dfb['acc'].to_numpy(),
+            yerr=yerr,
+            fmt='o-', capsize=3, lw=1.5,
+            label=f"{name} (ECE={ece_mean:.3f}, ICI={ici:.3f})",
+            color=colors[name],
             zorder=zord[name]
         )
     
