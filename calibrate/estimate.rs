@@ -969,8 +969,7 @@ pub fn train_model(
             None
         } else {
             eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
-            let penalty_nullspace_dims =
-                active_penalty_nullspace_dims(&schema, &penalties_cal);
+            let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties_cal);
             let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
                 reml_state.y(),
                 reml_state.weights(),
@@ -1244,11 +1243,9 @@ pub fn optimize_external_design(
             let mp = pirls_res
                 .beta_transformed
                 .len()
-                .saturating_sub(penalty_rank)
-                as f64;
+                .saturating_sub(penalty_rank) as f64;
             let denom = (n - mp).max(1.0);
             dp_c / denom
-
         }
         LinkFunction::Logit => 1.0,
     };
@@ -1836,7 +1833,7 @@ pub mod internal {
             // constructed for a single link function, so the cost/gradient pathways stay aligned.
             // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
-          
+
             // Factor the effective Hessian once
             let rho_like = lambdas.mapv(|lam| lam.ln());
             let factor = self.get_faer_factor(&rho_like, h_eff);
@@ -2305,7 +2302,6 @@ pub mod internal {
                         );
                     }
                     let phi = dp_c / denom;
-
 
                     // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -2825,7 +2821,6 @@ pub mod internal {
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
                     let scale = dp_c / (n - mp).max(LAML_RIDGE);
 
-
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
                     //   We'll calculate s_k_beta for all cases, as it's needed for both paths
@@ -3144,8 +3139,7 @@ pub mod internal {
         use rand::{Rng, SeedableRng, rngs::StdRng};
         use std::f64::consts::PI;
 
-        fn make_identity_gradient_fixture(
-        ) -> (
+        fn make_identity_gradient_fixture() -> (
             Array1<f64>,
             Array1<f64>,
             Array2<f64>,
@@ -3169,14 +3163,7 @@ pub mod internal {
             }
 
             let beta_true = Array1::from(vec![
-                0.8_f64,
-                0.5_f64,
-                -0.3_f64,
-                0.2_f64,
-                -0.1_f64,
-                1.0_f64,
-                -0.4_f64,
-                0.25_f64,
+                0.8_f64, 0.5_f64, -0.3_f64, 0.2_f64, -0.1_f64, 1.0_f64, -0.4_f64, 0.25_f64,
             ]);
             let y = x.dot(&beta_true);
             let w = Array1::from_elem(n, 1.0);
@@ -3211,7 +3198,6 @@ pub mod internal {
                 y.view(),
                 x.view(),
                 w.view(),
-
                 offset.view(),
                 s_list,
                 &layout,
@@ -3251,16 +3237,11 @@ pub mod internal {
                 .expect("cost at rho- should evaluate");
             let secant = (cost_plus - cost_minus) / (2.0 * eps);
             let g_dot_v = g_analytic.dot(&direction);
-            let rel_dir = (g_dot_v - secant).abs()
-                / g_dot_v
-                    .abs()
-                    .max(secant.abs())
-                    .max(1e-10);
+            let rel_dir = (g_dot_v - secant).abs() / g_dot_v.abs().max(secant.abs()).max(1e-10);
 
             assert!(cosine > 0.9995, "cosine similarity too low: {cosine:.6}");
             assert!(rel_l2 < 1e-3, "relative L2 too high: {rel_l2:.3e}");
             assert!(rel_dir < 1e-3, "directional secant mismatch: {rel_dir:.3e}");
-
         }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
@@ -3339,6 +3320,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -3415,8 +3397,9 @@ pub mod internal {
                         // Model's prediction at (pgs_val, pc_val)
                         let pred_pgs = Array1::from_elem(1, pgs_val);
                         let pred_pc = Array2::from_shape_vec((1, 1), vec![pc_val]).unwrap();
+                        let pred_sex = Array1::zeros(1);
                         let pred_prob = model_for_pd
-                            .predict(pred_pgs.view(), pred_pc.view())
+                            .predict(pred_pgs.view(), pred_sex.view(), pred_pc.view())
                             .unwrap()[0];
                         pred_sum += pred_prob;
 
@@ -3435,7 +3418,7 @@ pub mod internal {
 
             // Also compute training-set metrics vs. labels for additional context
             let train_preds = model_for_pd
-                .predict(p.view(), data.pcs.view())
+                .predict(p.view(), data.sex.view(), data.pcs.view())
                 .expect("predict on training set");
             let train_corr = correlation_coefficient(&train_preds, &data.y);
             let (cal_int, cal_slope) = calibration_intercept_slope(&train_preds, &data.y);
@@ -3521,6 +3504,7 @@ pub mod internal {
                 y: y.slice(ndarray::s![..n_train]).to_owned(),
                 p: p.slice(ndarray::s![..n_train]).to_owned(),
                 pcs: pcs.slice(ndarray::s![..n_train, ..]).to_owned(),
+                sex: Array1::zeros(n_train),
                 weights: Array1::<f64>::ones(n_train),
             };
 
@@ -3528,6 +3512,7 @@ pub mod internal {
                 y: y.slice(ndarray::s![n_train..]).to_owned(),
                 p: p.slice(ndarray::s![n_train..]).to_owned(),
                 pcs: pcs.slice(ndarray::s![n_train.., ..]).to_owned(),
+                sex: Array1::zeros(y.len() - n_train),
                 weights: Array1::<f64>::ones(y.len() - n_train),
             };
 
@@ -3568,7 +3553,11 @@ pub mod internal {
 
             // Make predictions on test data
             let test_predictions = trained_model
-                .predict(test_data.p.view(), test_data.pcs.view())
+                .predict(
+                    test_data.p.view(),
+                    test_data.sex.view(),
+                    test_data.pcs.view(),
+                )
                 .expect("Prediction on test data failed");
 
             // Calculate AUC for model and oracle on test data
@@ -3619,6 +3608,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(n),
                 weights: Array1::<f64>::ones(n),
             };
 
@@ -3659,6 +3649,7 @@ pub mod internal {
                 y,
                 p: _,
                 pcs: _,
+                sex: _,
                 weights,
             } = data;
             let y_static: &'static mut Array1<f64> = Box::leak(Box::new(y));
@@ -3703,9 +3694,7 @@ pub mod internal {
         // effective Hessian and logdet path as compute_cost.
         fn half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> f64 {
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, _) = state
-                .effective_hessian(&pr)
-                .expect("effective Hessian");
+            let (h_eff, _) = state.effective_hessian(&pr).expect("effective Hessian");
             let chol = h_eff
                 .clone()
                 .cholesky(Side::Lower)
@@ -3732,9 +3721,7 @@ pub mod internal {
         fn half_logh_s_part(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             // ½·λk tr(H_eff⁻¹ S_k)
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
-            let (h_eff, _) = state
-                .effective_hessian(&pr)
-                .expect("effective Hessian");
+            let (h_eff, _) = state.effective_hessian(&pr).expect("effective Hessian");
             let factor = state.get_faer_factor(rho, &h_eff);
             let lambdas = rho.mapv(f64::exp);
             let mut g = Array1::zeros(rho.len());
@@ -3887,6 +3874,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(n_samples),
                 weights: Array1::<f64>::ones(n_samples),
             };
 
@@ -3995,6 +3983,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(n_samples),
                 weights: Array1::<f64>::ones(n_samples),
             };
 
@@ -4153,6 +4142,7 @@ pub mod internal {
             let mut rho_boundary_hits: usize = 0;
             let mut total_folds_evaluated: usize = 0;
             let mut proj_rates = Vec::new();
+            let sex = Array1::zeros(n_samples);
 
             println!(
                 "[CV] Starting real-world metrics evaluation: n_samples={}, k_folds={}, repeats={}",
@@ -4203,11 +4193,13 @@ pub mod internal {
                         y: take(&y, &train_idx),
                         p: take(&p, &train_idx),
                         pcs: take_pcs(&pcs, &train_idx),
+                        sex: take(&sex, &train_idx),
                         weights: Array1::<f64>::ones(train_idx.len()),
                     };
 
                     let data_val_p = take(&p, &val_idx);
                     let data_val_pcs = take_pcs(&pcs, &val_idx);
+                    let data_val_sex = take(&sex, &val_idx);
                     let data_val_y = take(&y, &val_idx);
 
                     // Train
@@ -4298,7 +4290,7 @@ pub mod internal {
 
                     // Predict on validation
                     let preds = trained
-                        .predict(data_val_p.view(), data_val_pcs.view())
+                        .predict(data_val_p.view(), data_val_sex.view(), data_val_pcs.view())
                         .expect("predict val");
 
                     // Metrics
@@ -4739,6 +4731,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
             let config = ModelConfig {
@@ -4796,7 +4789,7 @@ pub mod internal {
             let model = model_result.unwrap_or_else(|e| panic!("Model training failed: {:?}", e));
 
             // Get predictions on training data
-            let predictions = model.predict(data.p.view(), data.pcs.view())?;
+            let predictions = model.predict(data.p.view(), data.sex.view(), data.pcs.view())?;
 
             // Calculate correlation between predicted probabilities and true probabilities
             let true_probabilities = true_logits.mapv(|l| 1.0 / (1.0 + (-l).exp()));
@@ -4860,6 +4853,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -5086,6 +5080,7 @@ pub mod internal {
                 y: y.clone(),
                 p: p.clone(),
                 pcs: Array2::zeros((n_samples, 0)), // No PCs for this simple test
+                sex: Array1::zeros(n_samples),
                 weights: Array1::<f64>::ones(n_samples),
             };
 
@@ -5123,7 +5118,7 @@ pub mod internal {
             // --- Evaluate the model ---
             // Get model predictions on the training data
             let predictions = trained_model
-                .predict(data.p.view(), data.pcs.view())
+                .predict(data.p.view(), data.sex.view(), data.pcs.view())
                 .unwrap();
 
             // --- Dynamic assertions against the oracle ---
@@ -5209,6 +5204,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -5341,6 +5337,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -5465,6 +5462,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -5642,6 +5640,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -5755,6 +5754,7 @@ pub mod internal {
                 y,
                 p,
                 pcs,
+                sex: Array1::zeros(n_samples),
                 weights: Array1::<f64>::ones(n_samples),
             };
 
@@ -5905,6 +5905,7 @@ pub mod internal {
                     y,
                     p: p.clone(),
                     pcs,
+                    sex: Array1::zeros(p.len()),
                     weights: Array1::<f64>::ones(p.len()),
                 };
 
@@ -6045,6 +6046,7 @@ pub mod internal {
                     y,
                     p: p.clone(),
                     pcs,
+                    sex: Array1::zeros(p.len()),
                     weights: Array1::<f64>::ones(p.len()),
                 };
 
@@ -6268,6 +6270,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -6410,6 +6413,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -6530,6 +6534,7 @@ pub mod internal {
                 y,
                 p: p.clone(),
                 pcs,
+                sex: Array1::zeros(p.len()),
                 weights: Array1::<f64>::ones(p.len()),
             };
 
@@ -6639,6 +6644,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         y,
         p,
         pcs,
+        sex: Array1::zeros(n_samples),
         weights: Array1::<f64>::ones(n_samples),
     };
 
@@ -6712,6 +6718,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         y,
         p,
         pcs,
+        sex: Array1::zeros(n_samples),
         weights: Array1::<f64>::ones(n_samples),
     };
 
@@ -6919,6 +6926,7 @@ mod optimizer_progress_tests {
             y,
             p,
             pcs,
+            sex: Array1::<f64>::zeros(n_samples),
             weights: Array1::<f64>::ones(n_samples),
         };
 
@@ -7032,6 +7040,7 @@ mod reparam_consistency_tests {
             y,
             p: p.clone(),
             pcs,
+            sex: Array1::zeros(n),
             weights: Array1::<f64>::ones(n),
         };
 
@@ -7188,6 +7197,7 @@ mod gradient_validation_tests {
             y,
             p: p.clone(),
             pcs,
+            sex: Array1::zeros(n),
             weights: Array1::<f64>::ones(n),
         };
 

@@ -3,11 +3,11 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
+use clap::{Args, Parser, Subcommand};
+use ndarray::{Array1, ArrayView1};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process;
-use std::collections::HashSet;
-use ndarray::{Array1, ArrayView1};
-use clap::{Parser, Subcommand, Args};
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
@@ -187,7 +187,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Make detailed predictions
     println!("Generating predictions with diagnostics...");
     let (eta, mean, signed_dist, se_eta_opt) =
-        model.predict_detailed(data.p.view(), data.pcs.view())?;
+        model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
 
     // Check if calibrator is available
     let calibrated_mean_opt = if args.no_calibration {
@@ -196,7 +196,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else if model.calibrator.is_some() {
         println!("Calibrator detected. Generating calibrated predictions.");
         // Get calibrated predictions but don't error if calibrator is missing
-        match model.predict_calibrated(data.p.view(), data.pcs.view()) {
+        match model.predict_calibrated(data.p.view(), data.sex.view(), data.pcs.view()) {
             Ok(calibrated) => Some(calibrated),
             Err(_) => None,
         }

@@ -97,6 +97,7 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 #[derive(Clone)]
 pub struct ModelLayout {
     pub intercept_col: usize,
+    pub sex_col: Option<usize>,
     pub pgs_main_cols: Range<usize>,
     /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
     pub pc_null_cols: Vec<Range<usize>>,
@@ -139,6 +140,7 @@ impl ModelLayout {
     pub fn external(total_coeffs: usize, num_penalties: usize) -> Self {
         ModelLayout {
             intercept_col: 0,
+            sex_col: None,
             pgs_main_cols: 0..0,
             pc_null_cols: vec![],
             pc_null_block_idx: vec![],
@@ -169,7 +171,7 @@ impl ModelLayout {
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
-        let p_pgs_main = pgs_main_basis_ncols;
+        let pgs_main = pgs_main_basis_ncols;
         let p_pc_main: usize = pc_null_basis_ncols
             .iter()
             .zip(pc_range_basis_ncols.iter())
@@ -181,9 +183,12 @@ impl ModelLayout {
             .iter()
             .map(|&num_pc_basis| pgs_interaction_basis_ncols * num_pc_basis)
             .sum();
-        let calculated_total_coeffs = 1 + p_pgs_main + p_pc_main + p_interactions;
+        let calculated_total_coeffs = 1 + 1 + pgs_main + p_pc_main + p_interactions;
 
         let intercept_col = current_col;
+        current_col += 1;
+
+        let sex_col = Some(current_col);
         current_col += 1;
 
         // Reserve capacities to avoid reallocations
@@ -312,6 +317,7 @@ impl ModelLayout {
 
         Ok(ModelLayout {
             intercept_col,
+            sex_col,
             pgs_main_cols,
             pc_null_cols,
             pc_null_block_idx,
@@ -362,7 +368,9 @@ pub fn build_design_and_penalty_matrices(
         interaction_coeffs += (pgs_basis_coeffs - 1) * (pc_basis_coeffs - 1);
     }
 
-    let num_coeffs = intercept_coeffs + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
+    let sex_coeffs = 1;
+    let num_coeffs =
+        intercept_coeffs + sex_coeffs + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
 
     if num_coeffs > n_samples {
         // FAIL FAST before any expensive calculations
@@ -426,10 +434,8 @@ pub fn build_design_and_penalty_matrices(
 
     // For PGS main effects: use non-intercept columns and apply sum-to-zero constraint
     let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]).to_owned();
-    let (pgs_main_basis, pgs_z_transform) = basis::apply_sum_to_zero_constraint(
-        pgs_main_basis_unc.view(),
-        Some(data.weights.view()),
-    )?;
+    let (pgs_main_basis, pgs_z_transform) =
+        basis::apply_sum_to_zero_constraint(pgs_main_basis_unc.view(), Some(data.weights.view()))?;
 
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
@@ -513,23 +519,25 @@ pub fn build_design_and_penalty_matrices(
         })
         .collect();
 
-    let (pgs_int_ncols, pc_int_ncols): (usize, Vec<usize>) =
-        match config.interaction_penalty {
-            InteractionPenaltyKind::Isotropic => {
-                let pc_int_ncols = pc_range_interaction_ncols.clone();
-                (pgs_range_ncols, pc_int_ncols)
-            }
-            InteractionPenaltyKind::Anisotropic => {
-                let pgs_cols = pgs_main_basis_unc.ncols();
-                let pc_cols = pc_unconstrained_bases_main
-                    .iter()
-                    .map(|b| b.ncols())
-                    .collect();
-                (pgs_cols, pc_cols)
-            }
-        };
+    let (pgs_int_ncols, pc_int_ncols): (usize, Vec<usize>) = match config.interaction_penalty {
+        InteractionPenaltyKind::Isotropic => {
+            let pc_int_ncols = pc_range_interaction_ncols.clone();
+            (pgs_range_ncols, pc_int_ncols)
+        }
+        InteractionPenaltyKind::Anisotropic => {
+            let pgs_cols = pgs_main_basis_unc.ncols();
+            let pc_cols = pc_unconstrained_bases_main
+                .iter()
+                .map(|b| b.ncols())
+                .collect();
+            (pgs_cols, pc_cols)
+        }
+    };
 
-    if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic) {
+    if matches!(
+        config.interaction_penalty,
+        InteractionPenaltyKind::Anisotropic
+    ) {
         assert_eq!(pgs_int_ncols, pgs_main_basis_unc.ncols());
         for (idx, basis) in pc_unconstrained_bases_main.iter().enumerate() {
             assert_eq!(pc_int_ncols[idx], basis.ncols());
@@ -571,15 +579,22 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
-    let s_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic)
-        && pgs_int_ncols > 0
+    let s_pgs_interaction = if matches!(
+        config.interaction_penalty,
+        InteractionPenaltyKind::Anisotropic
+    ) && pgs_int_ncols > 0
     {
-        Some(create_difference_penalty_matrix(pgs_int_ncols, config.penalty_order)?)
+        Some(create_difference_penalty_matrix(
+            pgs_int_ncols,
+            config.penalty_order,
+        )?)
     } else {
         None
     };
-    let i_pgs_interaction = if matches!(config.interaction_penalty, InteractionPenaltyKind::Anisotropic)
-        && pgs_int_ncols > 0
+    let i_pgs_interaction = if matches!(
+        config.interaction_penalty,
+        InteractionPenaltyKind::Anisotropic
+    ) && pgs_int_ncols > 0
     {
         Some(Array2::<f64>::eye(pgs_int_ncols))
     } else {
@@ -631,22 +646,14 @@ pub fn build_design_and_penalty_matrices(
                 let i_pgs = i_pgs_interaction
                     .as_ref()
                     .expect("PGS identity matrix missing in anisotropic mode");
-                let s_pc = create_difference_penalty_matrix(
-                    pc_cols,
-                    config.penalty_order,
-                )?;
+                let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)?;
                 let i_pc = Array2::<f64>::eye(pc_cols);
 
                 let s_kron_pgs = kronecker_product(s_pgs, &i_pc);
                 let s_kron_pc = kronecker_product(i_pgs, &s_pc);
 
-                let frob = |m: &Array2<f64>| {
-                    m.iter()
-                        .map(|&x| x * x)
-                        .sum::<f64>()
-                        .sqrt()
-                        .max(1e-12)
-                };
+                let frob =
+                    |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
                 let nf1 = frob(&s_kron_pgs);
                 let nf2 = frob(&s_kron_pc);
 
@@ -671,6 +678,17 @@ pub fn build_design_and_penalty_matrices(
 
     // Stage: Populate the intercept column first
     x_matrix.column_mut(layout.intercept_col).fill(1.0);
+
+    if let Some(sex_col) = layout.sex_col {
+        if data.sex.len() != n_samples {
+            return Err(EstimationError::InvalidInput(format!(
+                "Sex column length {} does not match number of samples {}",
+                data.sex.len(),
+                n_samples
+            )));
+        }
+        x_matrix.column_mut(sex_col).assign(&data.sex);
+    }
 
     // Stage: Fill main PC effects (null-space first, then penalized range)
     for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
@@ -753,7 +771,10 @@ pub fn build_design_and_penalty_matrices(
 
     // Stage: Populate tensor product interaction effects.
     if !layout.interaction_block_idx.is_empty() {
-        let pgs_int_basis_iso = if matches!(config.interaction_penalty, InteractionPenaltyKind::Isotropic) {
+        let pgs_int_basis_iso = if matches!(
+            config.interaction_penalty,
+            InteractionPenaltyKind::Isotropic
+        ) {
             let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
                 EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
             })?;
@@ -1791,7 +1812,14 @@ mod tests {
             .collect();
 
         let weights = Array1::<f64>::ones(n_samples);
-        let data = TrainingData { y, p, pcs, weights };
+        let sex = Array1::<f64>::zeros(n_samples);
+        let data = TrainingData {
+            y,
+            p,
+            pcs,
+            sex,
+            weights,
+        };
 
         // Create config with known parameters - need to provide all required fields
         let pgs_basis_config = BasisConfig {
@@ -1921,22 +1949,16 @@ mod tests {
         .expect("PC basis construction");
         let pc_cols = pc_basis_unc.ncols() - 1; // drop intercept column
 
-        let s_pgs =
-            create_difference_penalty_matrix(pgs_cols, config.penalty_order).expect("valid PGS penalty");
-        let s_pc =
-            create_difference_penalty_matrix(pc_cols, config.penalty_order).expect("valid PC penalty");
+        let s_pgs = create_difference_penalty_matrix(pgs_cols, config.penalty_order)
+            .expect("valid PGS penalty");
+        let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)
+            .expect("valid PC penalty");
         let i_pgs = Array2::<f64>::eye(pgs_cols);
         let i_pc = Array2::<f64>::eye(pc_cols);
 
         let expected_pgs = kronecker_product(&s_pgs, &i_pc);
         let expected_pc = kronecker_product(&i_pgs, &s_pc);
-        let frob = |m: &Array2<f64>| {
-            m.iter()
-                .map(|&x| x * x)
-                .sum::<f64>()
-                .sqrt()
-                .max(1e-12)
-        };
+        let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
         let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
         let expected_pc_norm = &expected_pc / frob(&expected_pc);
 
@@ -2100,6 +2122,7 @@ mod tests {
         let mapped_coeffs = MappedCoefficients {
             intercept: 0.123,
             main_effects: MainEffects {
+                sex: -0.75,
                 pgs: pgs_coeffs,
                 pcs: pcs_coeffs,
             },
@@ -2111,6 +2134,7 @@ mod tests {
             .expect("failed to flatten coefficients");
         let x_reconstructed = model::internal_construct_design_matrix(
             data.p.view(),
+            data.sex.view(),
             data.pcs.view(),
             &config,
             &mapped_coeffs,
@@ -2139,7 +2163,7 @@ mod tests {
         };
 
         let preds_via_predict = model
-            .predict_linear(data.p.view(), data.pcs.view())
+            .predict_linear(data.p.view(), data.sex.view(), data.pcs.view())
             .expect("predict_linear failed");
         let preds_direct = x_training.dot(&flattened);
         let max_diff = (&preds_via_predict - &preds_direct)
@@ -2174,8 +2198,15 @@ mod tests {
             m
         };
         let weights = Array1::ones(n);
+        let sex = Array1::zeros(n);
 
-        TrainingData { y, p, pcs, weights }
+        TrainingData {
+            y,
+            p,
+            pcs,
+            sex,
+            weights,
+        }
     }
 
     fn frob_norm(a: &Array2<f64>) -> f64 {
@@ -2186,7 +2217,10 @@ mod tests {
         // Choose cubic (degree=3) with 1 internal knot:
         // unconstrained main width = num_knots + degree = 1 + 3 = 4
         // order-2 penalty => nullspace dim = 2, whitened width = 2
-        let basis = BasisConfig { degree: 3, num_knots: 1 };
+        let basis = BasisConfig {
+            degree: 3,
+            num_knots: 1,
+        };
         let penalty_order = 2;
         (basis.clone(), basis, penalty_order)
     }
@@ -2323,4 +2357,3 @@ mod tests {
         );
     }
 }
-
