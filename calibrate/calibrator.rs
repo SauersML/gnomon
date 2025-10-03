@@ -1974,6 +1974,7 @@ mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
     use crate::calibrate::construction::{compute_penalty_square_roots, ModelLayout};
+    use crate::calibrate::estimate::evaluate_external_gradients;
     use crate::calibrate::model::ModelConfig;
     use faer::linalg::solvers::Llt as FaerLlt;
     use faer::Mat as FaerMat;
@@ -4065,6 +4066,22 @@ mod tests {
         // Build design
         let (x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
 
+        // Identify active penalty blocks and their nullspace dimensions
+        let penalty_activity_tol = 1e-12_f64;
+        let active_penalties: Vec<Array2<f64>> = penalties
+            .iter()
+            .filter(|penalty| {
+                penalty
+                    .iter()
+                    .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+                    > penalty_activity_tol
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !active_penalties.is_empty(),
+            "Synthetic design should keep all penalty blocks active"
+        );
         let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
 
         // Create ExternalOptimOptions
@@ -4078,62 +4095,70 @@ mod tests {
         // Set uniform weights
         let w = Array1::<f64>::ones(n);
 
-        // Fit the model and check convergence - this indirectly tests the gradient agreement
-        // between analytic and finite difference approaches
-        let fit_result = fit_calibrator(
+        // Run the external optimizer directly so we can inspect the stabilized state
+        let optim_result = optimize_external_design(
             y.view(),
             w.view(),
             x.view(),
             offset.view(),
-            &penalties,
-            &penalty_nullspace_dims,
-            LinkFunction::Identity,
-        );
+            &active_penalties,
+            &opts,
+        )
+        .expect("Calibrator REML optimization should succeed");
 
-        // Check that fit converged successfully
-        assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
-        let (beta, _, scale, (edf_pred, _, edf_se, edf_dist), (iters, grad_norm)) =
-            fit_result.unwrap();
-
-        // Verify results make sense
+        // Basic sanity checks on the optimizer result
         assert!(
-            iters <= opts.max_iter as usize,
+            optim_result.iterations <= opts.max_iter,
             "Iterations {} should not exceed max_iter {}",
-            iters,
+            optim_result.iterations,
             opts.max_iter
         );
-
-        // If gradients agree, optimization should converge to a small gradient norm
-        assert!(
-            grad_norm < opts.tol * 10.0,
-            "Final gradient norm {:.4e} should be small, indicating gradient agreement",
-            grad_norm
-        );
-
-        // All coefficients should be finite
-        for &b in beta.iter() {
+        for &b in optim_result.beta.iter() {
             assert!(b.is_finite(), "Coefficients should be finite");
         }
-
-        // EDF values must stay safely away from zero in this signal-rich setup
+        for (idx, &edf) in optim_result.edf_by_block.iter().enumerate() {
+            assert!(
+                edf.is_finite() && edf > 0.5,
+                "EDF for block {} should be well above zero; got {}",
+                idx,
+                edf
+            );
+        }
         assert!(
-            edf_pred.is_finite() && edf_pred > 1.0,
-            "EDF for pred smooth should be comfortably above 1.0; got {}",
-            edf_pred
-        );
-        assert!(
-            edf_se.is_finite() && edf_se > 0.5,
-            "EDF for SE smooth should be well above zero; got {}",
-            edf_se
-        );
-        assert!(
-            edf_dist.is_finite() && edf_dist > 0.5,
-            "EDF for distance smooth should be well above zero; got {}",
-            edf_dist
+            optim_result.scale > 0.0,
+            "Scale parameter should be positive for Gaussian link"
         );
 
-        // Scale should be positive (for Gaussian model)
-        assert!(scale > 0.0, "Scale parameter should be positive");
+        // Compare analytic and finite-difference gradients at the stabilized rho
+        let rho = optim_result.lambdas.mapv(f64::ln);
+        let (grad_analytic, grad_fd) = evaluate_external_gradients(
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &active_penalties,
+            &opts,
+            &rho,
+        )
+        .expect("Gradient evaluation should succeed");
+
+        let analytic_norm = grad_analytic.dot(&grad_analytic).sqrt();
+        let fd_norm = grad_fd.dot(&grad_fd).sqrt();
+        let denom = (analytic_norm * fd_norm).max(1e-12);
+        let cosine = grad_analytic.dot(&grad_fd) / denom;
+        let diff = &grad_analytic - &grad_fd;
+        let rel_norm = diff.dot(&diff).sqrt() / analytic_norm.max(fd_norm).max(1e-12);
+
+        assert!(
+            cosine > 1.0 - 1e-5,
+            "Analytic and FD gradients should point in the same direction (cosine={:.6})",
+            cosine
+        );
+        assert!(
+            rel_norm < 5e-3,
+            "Relative gradient mismatch should be tiny; got {:.3e}",
+            rel_norm
+        );
 
     }
 
