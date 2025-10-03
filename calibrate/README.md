@@ -143,7 +143,9 @@ run in the same order as training, ensuring extrapolation handling remains
 consistent.
 
 ## TODO
-Sex main effect unpenalized. PGS×sex smooth with double penalty. Use orthogonalization to handle it properly. Use existing REML/LAML. 
+Sex main effect unpenalized. PGS×sex smooth with double penalty. Use orthogonalization to handle it properly. Use existing REML/LAML.
+Similar to other penalties, PGS×sex should be penalized on both the linear and wiggle parts, amount learned via REML/LAML. We can do a varying-coefficient for the interaction.
+We can do a null-space penalty (“double penalty”) so both wiggle (curvature) and tilt (linear) shrink, like select=TRUE in mgcv. We do not have to separate the null space from the smooth and construct the smooth without its null-space basis; we can just do a one-block with a null-space penalty (i.e., penalize both tilt and wiggle).
 
 ## TODO
 Add a Royston–Parmar flexible parametric survival mode that treats attained age as the analysis time. The baseline risk will be represented as a smooth, penalized function of the log cumulative hazard over age; PGS and PCs act as multiplicative shifts on that baseline (proportional hazards by default, with PGS×age). The statistical hypothesis this encodes is that risk accumulates smoothly with age and genetic structure modulating that accumulation. The payoff is calibrated, horizon-agnostic absolute risk—probability of first diagnosis between current age and a chosen horizon—from a single model that uses all person-time, handles left truncation and right censoring natively, avoids ad hoc binning or per-horizon refits, and exhibits stable, regularized behavior at the tails of the age range. Extend the training schema to include ages and event, fit via the existing penalized P-IRLS/REML machinery, and include a scoring API that accepts current age, risk horizon, PGS, and PCs and returns absolute risk. Incorperate with the post-hoc calibrator.
