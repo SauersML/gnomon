@@ -13,12 +13,22 @@ use thiserror::Error;
 // Enabled by default. Wire this to a CLI flag like `--no-calibrate` by
 // calling `model::set_calibrator_enabled(false)` before training/prediction.
 use std::sync::atomic::{AtomicBool, Ordering};
-static CALIBRATOR_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Default state for the post-process calibrator toggle. Calibration should be enabled unless
+/// a caller explicitly opts out.
+const CALIBRATOR_ENABLED_DEFAULT: bool = true;
+static CALIBRATOR_ENABLED: AtomicBool = AtomicBool::new(CALIBRATOR_ENABLED_DEFAULT);
 pub fn set_calibrator_enabled(enabled: bool) {
     CALIBRATOR_ENABLED.store(enabled, Ordering::SeqCst);
 }
 pub fn calibrator_enabled() -> bool {
     CALIBRATOR_ENABLED.load(Ordering::SeqCst)
+}
+
+/// Reset the calibrator toggle back to its default state. Useful for CLI entry points so each
+/// invocation starts with calibration enabled by default.
+pub fn reset_calibrator_flag() {
+    set_calibrator_enabled(CALIBRATOR_ENABLED_DEFAULT);
 }
 
 // --- Public Data Structures ---

@@ -60,6 +60,10 @@ pub struct TrainArgs {
     /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
     #[arg(long, default_value = "1e-3")]
     pub reml_convergence_tolerance: f64,
+
+    /// Disable the optional post-process calibration layer (enabled by default)
+    #[arg(long)]
+    pub no_calibration: bool,
 }
 
 #[derive(Args)]
@@ -70,10 +74,21 @@ pub struct InferArgs {
     /// Path to trained model file (.toml)
     #[arg(long)]
     pub model: String,
+
+    /// Disable applying the post-process calibration layer (enabled by default)
+    #[arg(long)]
+    pub no_calibration: bool,
 }
 
 pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading training data from: {}", args.training_data);
+
+    gnomon::calibrate::model::set_calibrator_enabled(!args.no_calibration);
+    if args.no_calibration {
+        println!("Post-process calibration disabled via --no-calibration flag.");
+    } else {
+        println!("Post-process calibration enabled (default).");
+    }
 
     // Load training data
     let data = load_training_data(&args.training_data, args.num_pcs)?;
@@ -177,7 +192,10 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
         model.predict_detailed(data.p.view(), data.pcs.view())?;
 
     // Check if calibrator is available
-    let calibrated_mean_opt = if model.calibrator.is_some() {
+    let calibrated_mean_opt = if args.no_calibration {
+        println!("Skipping calibration via --no-calibration flag.");
+        None
+    } else if model.calibrator.is_some() {
         println!("Calibrator detected. Generating calibrated predictions.");
         // Get calibrated predictions but don't error if calibrator is missing
         match model.predict_calibrated(data.p.view(), data.pcs.view()) {
@@ -384,6 +402,9 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Ensure each invocation starts with calibration enabled unless explicitly disabled.
+    gnomon::calibrate::model::reset_calibrator_flag();
 
     let result = match cli.command {
         Commands::Score {
