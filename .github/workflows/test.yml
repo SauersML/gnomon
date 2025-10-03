@@ -279,15 +279,41 @@ jobs:
 
   python_test_simulation:
     needs: build_and_test
-    if: needs.build_and_test.outputs.artifact_available == 'true'
+    if: needs.build_and_test.outputs.artifact_available == 'true' || needs.build_and_test.outputs.rust_changes == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Report absence of Rust source changes
+        if: needs.build_and_test.outputs.artifact_available != 'true'
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eo pipefail
+          echo "No Rust source changes detected in this run; skipping python_test_simulation."
+          echo "Rust-sensitive files that remained unchanged:"
+          printf '  - Cargo.toml\n  - Cargo.lock\n  - all *.rs files\n'
+          if [ -n "${BASE_SHA:-}" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
+            echo "Changed files in this run:"
+            CHANGED=$(git diff --name-only "${BASE_SHA}" "$GITHUB_SHA" || true)
+            if [ -n "$CHANGED" ]; then
+              printf '%s\n' "$CHANGED" | sed 's/^/  - /'
+            else
+              echo "  (no files changed)"
+            fi
+          else
+            echo "Changed files in this run: (base commit unavailable)"
+          fi
+          exit 0
       - uses: actions/download-artifact@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
         with:
           name: build-output
           path: .
       - name: Restore expected artifact layout
+        if: needs.build_and_test.outputs.artifact_available == 'true'
         run: |
           if [ -d build-output/target ]; then
             rm -rf target
@@ -306,18 +332,23 @@ jobs:
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
       - uses: actions/setup-python@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-simulation-${{ hashFiles('test/sim_test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-simulation-
       - run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+        if: needs.build_and_test.outputs.artifact_available == 'true'
       - run: chmod +x target/release/gnomon
+        if: needs.build_and_test.outputs.artifact_available == 'true'
       - id: sim_test
+        if: needs.build_and_test.outputs.artifact_available == 'true'
         run: python -u test/sim_test.py
-      - if: failure()
+      - if: needs.build_and_test.outputs.artifact_available == 'true' && failure()
         run: |
           echo "The simulation test failed. Checking for OOM errors in kernel logs..."
           sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found."
