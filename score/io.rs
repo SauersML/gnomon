@@ -21,9 +21,11 @@ use log::{debug, warn};
 use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 
@@ -33,6 +35,36 @@ const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_CACHE_CAPACITY: usize = 8;
+
+static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
+
+fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
+    RUNTIME_MANAGER
+        .get_or_try_init(|| {
+            Runtime::new()
+                .map(Arc::new)
+                .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))
+        })
+        .map(Arc::clone)
+}
+
+/// A trait that abstracts sequential, line-oriented access to text data such as
+/// `.bim` and `.fam` files, regardless of the underlying storage medium.
+pub trait TextSource: Send {
+    fn len(&self) -> Option<u64> {
+        None
+    }
+
+    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError>;
+}
+
+fn augment_pipeline_error(err: PipelineError, context: &str) -> PipelineError {
+    match err {
+        PipelineError::Io(msg) => PipelineError::Io(format!("{context}: {msg}")),
+        PipelineError::Producer(msg) => PipelineError::Producer(format!("{context}: {msg}")),
+        PipelineError::Compute(msg) => PipelineError::Compute(format!("{context}: {msg}")),
+    }
+}
 
 /// A trait that abstracts byte-range access for `.bed` data, regardless of the
 /// underlying storage mechanism.
@@ -94,6 +126,24 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
     }
 }
 
+pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
+    if is_gcs_path(path) {
+        let uri = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        let remote = RemoteByteRangeSource::new(&bucket, &object)?;
+        Ok(Box::new(RemoteTextSource::new(
+            format!("gs://{bucket}/{object}"),
+            Arc::new(remote),
+        )))
+    } else {
+        let file = File::open(path)
+            .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
+        Ok(Box::new(LocalTextSource::new(path, file)?))
+    }
+}
+
 fn is_gcs_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("gs://"))
@@ -144,8 +194,172 @@ impl ByteRangeSource for MmapByteRangeSource {
     }
 }
 
+struct LocalTextSource {
+    reader: BufReader<File>,
+    line: Vec<u8>,
+    line_active: bool,
+    len: u64,
+    path_display: String,
+}
+
+impl LocalTextSource {
+    fn new(path: &Path, file: File) -> Result<Self, PipelineError> {
+        let len = file
+            .metadata()
+            .map_err(|e| PipelineError::Io(format!("Metadata for {}: {e}", path.display())))?
+            .len();
+        Ok(Self {
+            reader: BufReader::new(file),
+            line: Vec::with_capacity(1024),
+            line_active: false,
+            len,
+            path_display: path.display().to_string(),
+        })
+    }
+}
+
+impl TextSource for LocalTextSource {
+    fn len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+
+    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+        if self.line_active {
+            self.line.clear();
+            self.line_active = false;
+        }
+
+        let bytes_read = self
+            .reader
+            .read_until(b'\n', &mut self.line)
+            .map_err(|e| PipelineError::Io(format!(
+                "Error reading {}: {e}",
+                self.path_display
+            )))?;
+
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        if self.line.last() == Some(&b'\n') {
+            self.line.pop();
+        }
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+
+        self.line_active = true;
+        Ok(Some(&self.line))
+    }
+}
+
+struct RemoteTextSource {
+    path_display: String,
+    source: Arc<RemoteByteRangeSource>,
+    offset: u64,
+    len: u64,
+    buffer: Vec<u8>,
+    cursor: usize,
+    valid: usize,
+    carry: Vec<u8>,
+    carry_active: bool,
+}
+
+impl RemoteTextSource {
+    fn new(path_display: String, source: Arc<RemoteByteRangeSource>) -> Self {
+        let len = source.len();
+        Self {
+            path_display,
+            source,
+            offset: 0,
+            len,
+            buffer: Vec::with_capacity(REMOTE_BLOCK_SIZE),
+            cursor: 0,
+            valid: 0,
+            carry: Vec::new(),
+            carry_active: false,
+        }
+    }
+
+    fn fill_buffer(&mut self) -> Result<bool, PipelineError> {
+        if self.offset >= self.len {
+            return Ok(false);
+        }
+
+        let remaining = self.len - self.offset;
+        let to_read = remaining.min(REMOTE_BLOCK_SIZE as u64) as usize;
+        if self.buffer.len() < to_read {
+            self.buffer.resize(to_read, 0);
+        }
+
+        self.source
+            .read_at(self.offset, &mut self.buffer[..to_read])
+            .map_err(|e| augment_pipeline_error(e, &self.path_display))?;
+        self.offset += to_read as u64;
+        self.cursor = 0;
+        self.valid = to_read;
+        Ok(true)
+    }
+}
+
+impl TextSource for RemoteTextSource {
+    fn len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+
+    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+        if self.carry_active {
+            self.carry.clear();
+            self.carry_active = false;
+        }
+
+        loop {
+            if self.cursor >= self.valid {
+                if !self.fill_buffer()? {
+                    if self.carry.is_empty() {
+                        return Ok(None);
+                    }
+                    if self.carry.last() == Some(&b'\r') {
+                        self.carry.pop();
+                    }
+                    self.carry_active = true;
+                    return Ok(Some(&self.carry));
+                }
+            }
+
+            if let Some(rel_pos) = self.buffer[self.cursor..self.valid]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                let line_end = self.cursor + rel_pos;
+                if self.carry.is_empty() {
+                    let mut slice = &self.buffer[self.cursor..line_end];
+                    if slice.last() == Some(&b'\r') {
+                        slice = &slice[..slice.len() - 1];
+                    }
+                    self.cursor = line_end + 1;
+                    return Ok(Some(slice));
+                } else {
+                    self.carry
+                        .extend_from_slice(&self.buffer[self.cursor..line_end]);
+                    if self.carry.last() == Some(&b'\r') {
+                        self.carry.pop();
+                    }
+                    self.cursor = line_end + 1;
+                    self.carry_active = true;
+                    return Ok(Some(&self.carry));
+                }
+            } else {
+                self.carry
+                    .extend_from_slice(&self.buffer[self.cursor..self.valid]);
+                self.cursor = self.valid;
+            }
+        }
+    }
+}
+
 struct RemoteByteRangeSource {
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     storage: Storage,
     bucket_path: String,
     object: String,
@@ -155,11 +369,10 @@ struct RemoteByteRangeSource {
 
 impl RemoteByteRangeSource {
     fn new(bucket: &str, object: &str) -> Result<Self, PipelineError> {
-        let runtime = Runtime::new()
-            .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))?;
-        let storage = runtime.block_on(Storage::builder().build()).map_err(|e| {
-            PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
-        })?;
+        let runtime = get_shared_runtime()?;
+        let storage = runtime
+            .block_on(Storage::builder().build())
+            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage client: {e}")))?;
         let control = runtime
             .block_on(StorageControl::builder().build())
             .map_err(|e| {
@@ -232,7 +445,8 @@ impl RemoteByteRangeSource {
         let bucket_for_log = bucket_path.clone();
         let object_for_log = object.clone();
         let storage = self.storage.clone();
-        let mut data = self.runtime.block_on(async move {
+        let runtime = Arc::clone(&self.runtime);
+        let mut data = runtime.block_on(async move {
             let mut response = storage
                 .read_object(bucket_path.clone(), object.clone())
                 .set_read_range(ReadRange::segment(start, length as u64))

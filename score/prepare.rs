@@ -8,6 +8,8 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
+use crate::io::{open_text_source, TextSource};
+use crate::pipeline::PipelineError;
 use crate::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo,
@@ -20,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Lines};
+use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
@@ -40,6 +42,13 @@ type VariantKey = (u8, u32);
 // These temporary structs hold string data borrowed from an arena, avoiding
 // allocations in the hot path. Their lifetime `'arena` is tied to the `Bump`
 // arena created at the start of `prepare_for_computation`.
+
+#[derive(Clone)]
+struct FilesetPaths {
+    bed: PathBuf,
+    bim: PathBuf,
+    fam: PathBuf,
+}
 
 /// A parsed record from a `.bim` file, holding borrowed string slices.
 #[derive(Debug, Copy, Clone)]
@@ -128,8 +137,8 @@ struct KWayMergeIterator<'arena> {
 
 /// An iterator that streams over one or more `.bim` files.
 struct BimIterator<'a, 'arena> {
-    fileset_prefixes: std::slice::Iter<'a, PathBuf>,
-    current_reader: Option<Lines<BufReader<File>>>,
+    filesets: std::slice::Iter<'a, FilesetPaths>,
+    current_reader: Option<Box<dyn TextSource + 'a>>,
     global_offset: u64,
     local_line_num: u64,
     current_path: PathBuf,
@@ -137,8 +146,7 @@ struct BimIterator<'a, 'arena> {
     boundaries: Vec<FilesetBoundary>,
     // A reference to the memory arena.
     bump: &'arena Bump,
-    // A temporary buffer for reading lines.
-    line_string_buffer: String,
+    total_variants: u64,
 }
 
 /// Enum to represent the outcome of reconciling one score file line.
@@ -190,6 +198,7 @@ pub enum PrepError {
     Parse(String),
     Header(String),
     InconsistentKeepId(String),
+    PipelineIo { path: PathBuf, message: String },
     /// An error indicating that no variants from the score files could be matched
     /// to variants in the genotype data.
     NoOverlappingVariants(MergeDiagnosticInfo),
@@ -203,14 +212,13 @@ pub fn prepare_for_computation(
 ) -> Result<PreparationResult, PrepError> {
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
-    let fam_path = fileset_prefixes[0].with_extension("fam");
-    let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fam_path)?;
+    let fileset_paths = build_fileset_paths(fileset_prefixes)?;
+    let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fileset_paths)?;
     let total_people_in_fam = all_person_iids.len();
 
     let (person_subset, final_person_iids) =
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
     let num_people_to_score = final_person_iids.len();
-    let total_variants_in_bim = count_total_variants(fileset_prefixes)?;
 
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
@@ -234,7 +242,7 @@ pub fn prepare_for_computation(
     let mut seen_invalid_score_chrs: AHashSet<String> = AHashSet::new();
 
     // Create the iterators, giving them a reference to the arena.
-    let mut bim_iterator = BimIterator::new(fileset_prefixes, &bump)?;
+    let mut bim_iterator = BimIterator::new(&fileset_paths, &bump)?;
     let mut score_iterator =
         KWayMergeIterator::new(sorted_score_files, &score_name_to_col_index, &bump)?;
 
@@ -398,6 +406,29 @@ pub fn prepare_for_computation(
             }
         }
     }
+    while let Some(result) = bim_iter.next() {
+        match result {
+            Ok(record) => {
+                diagnostics.add_bim_key(record.key);
+                diagnostics.total_bim_variants_processed += 1;
+            }
+            Err(PrepError::Parse(msg)) => {
+                if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                    && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                {
+                    eprintln!(
+                        "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    drop(bim_iter);
+    drop(score_iter);
+
+    let total_variants_in_bim = bim_iterator.total_variants();
     eprintln!(
         "> TIMING: Stage 3 (Data Collection) took {:.2?}",
         overall_start_time.elapsed()
@@ -518,8 +549,8 @@ pub fn prepare_for_computation(
         person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
     }
 
-    let pipeline_kind = if fileset_prefixes.len() <= 1 {
-        PipelineKind::SingleFile(fileset_prefixes[0].with_extension("bed"))
+    let pipeline_kind = if fileset_paths.len() <= 1 {
+        PipelineKind::SingleFile(fileset_paths[0].bed.clone())
     } else {
         PipelineKind::MultiFile(bim_iterator.boundaries)
     };
@@ -550,6 +581,49 @@ pub fn prepare_for_computation(
 //                             Private implementation helpers
 // ========================================================================================
 
+fn build_fileset_paths(prefixes: &[PathBuf]) -> Result<Vec<FilesetPaths>, PrepError> {
+    prefixes
+        .iter()
+        .map(|prefix| {
+            let bed = apply_extension(prefix, "bed")?;
+            let bim = apply_extension(prefix, "bim")?;
+            let fam = apply_extension(prefix, "fam")?;
+            Ok(FilesetPaths { bed, bim, fam })
+        })
+        .collect()
+}
+
+fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {
+    if let Some(path_str) = path.to_str() {
+        if path_str.starts_with("gs://") {
+            let mut new_path = path_str.to_string();
+            if let Some(dot_pos) = new_path.rfind('.') {
+                let slash_pos = new_path.rfind('/');
+                if slash_pos.map_or(true, |idx| idx < dot_pos) {
+                    new_path.truncate(dot_pos);
+                    new_path.push('.');
+                    new_path.push_str(extension);
+                    return Ok(PathBuf::from(new_path));
+                }
+            }
+            new_path.push('.');
+            new_path.push_str(extension);
+            Ok(PathBuf::from(new_path))
+        } else {
+            Ok(path.with_extension(extension))
+        }
+    } else {
+        Err(PrepError::Parse("Invalid UTF-8 in path".to_string()))
+    }
+}
+
+fn map_pipeline_error(err: PipelineError, path: PathBuf) -> PrepError {
+    PrepError::PipelineIo {
+        path,
+        message: err.to_string(),
+    }
+}
+
 /// Extracts the malformed chromosome name from a `PrepError::Parse` message.
 fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
     if let Some(rest) = msg.strip_prefix("Invalid chromosome format '")
@@ -558,22 +632,6 @@ fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
         return Some(&rest[..end_pos]);
     }
     None
-}
-
-fn count_lines(path: &Path) -> io::Result<u64> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader.lines().count() as u64)
-}
-
-fn count_total_variants(fileset_prefixes: &[PathBuf]) -> Result<u64, PrepError> {
-    fileset_prefixes
-        .par_iter()
-        .map(|prefix| {
-            let bim_path = prefix.with_extension("bim");
-            count_lines(&bim_path).map_err(|e| PrepError::Io(e, bim_path.clone()))
-        })
-        .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
 fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
@@ -619,16 +677,16 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
 }
 
 impl<'a, 'arena> BimIterator<'a, 'arena> {
-    fn new(fileset_prefixes: &'a [PathBuf], bump: &'arena Bump) -> Result<Self, PrepError> {
+    fn new(filesets: &'a [FilesetPaths], bump: &'arena Bump) -> Result<Self, PrepError> {
         let mut iter = Self {
-            fileset_prefixes: fileset_prefixes.iter(),
+            filesets: filesets.iter(),
             current_reader: None,
             global_offset: 0,
             local_line_num: 0,
             current_path: PathBuf::new(),
-            boundaries: Vec::with_capacity(fileset_prefixes.len()),
+            boundaries: Vec::with_capacity(filesets.len()),
             bump,
-            line_string_buffer: String::new(),
+            total_variants: 0,
         };
         iter.next_file()?;
         Ok(iter)
@@ -638,21 +696,28 @@ impl<'a, 'arena> BimIterator<'a, 'arena> {
         self.global_offset += self.local_line_num;
         self.local_line_num = 0;
 
-        if let Some(prefix) = self.fileset_prefixes.next() {
+        if let Some(fileset) = self.filesets.next() {
             self.boundaries.push(FilesetBoundary {
-                bed_path: prefix.with_extension("bed"),
+                bed_path: fileset.bed.clone(),
+                bim_path: fileset.bim.clone(),
+                fam_path: fileset.fam.clone(),
                 starting_global_index: self.global_offset,
             });
 
-            let bim_path = prefix.with_extension("bim");
-            self.current_path = bim_path.clone();
-            let file = File::open(&bim_path).map_err(|e| PrepError::Io(e, bim_path))?;
-            self.current_reader = Some(BufReader::new(file).lines());
+            self.current_path = fileset.bim.clone();
+            let reader = open_text_source(&fileset.bim)
+                .map_err(|e| map_pipeline_error(e, fileset.bim.clone()))?;
+            self.current_reader = Some(reader);
             Ok(true)
         } else {
             self.current_reader = None;
+            self.total_variants = self.global_offset;
             Ok(false)
         }
+    }
+
+    fn total_variants(&self) -> u64 {
+        self.total_variants
     }
 }
 
@@ -661,48 +726,60 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.current_reader.as_mut() {
-                Some(reader) => match reader.next() {
-                    Some(Ok(line)) => {
-                        self.local_line_num += 1;
-                        self.line_string_buffer.clear();
-                        self.line_string_buffer.push_str(&line);
-                        let line_in_arena = self.bump.alloc_str(&self.line_string_buffer);
-
-                        let mut parts = line_in_arena.split_whitespace();
-                        let chr = parts.next();
-                        parts.next(); // Skip variant ID from BIM file
-                        parts.next(); // Skip genetic distance in centiMorgans
-                        let pos = parts.next();
-                        let a1 = parts.next();
-                        let a2 = parts.next();
-
-                        if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
-                            (chr, pos, a1, a2)
-                        {
-                            match parse_key(chr_str, pos_str) {
-                                Ok(key) => {
-                                    return Some(Ok(KeyedBimRecord {
-                                        key,
-                                        bim_row_index: BimRowIndex(
-                                            self.global_offset + self.local_line_num - 1,
-                                        ),
-                                        allele1: a1,
-                                        allele2: a2,
-                                    }));
-                                }
-                                Err(e) => return Some(Err(e)),
-                            }
-                        }
-                    }
-                    Some(Err(e)) => return Some(Err(PrepError::Io(e, self.current_path.clone()))),
-                    None => {
-                        if let Ok(false) = self.next_file() {
-                            return None;
-                        }
-                    }
-                },
+            let reader = match self.current_reader.as_mut() {
+                Some(reader) => reader,
                 None => return None,
+            };
+
+            match reader.next_line() {
+                Ok(Some(line_bytes)) => {
+                    self.local_line_num += 1;
+                    self.total_variants = self.global_offset + self.local_line_num;
+                    let line_str = match std::str::from_utf8(line_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(Err(PrepError::Parse(format!(
+                                "Invalid UTF-8 in BIM file '{}': {e}",
+                                self.current_path.display()
+                            ))))
+                        }
+                    };
+
+                    let line_in_arena = self.bump.alloc_str(line_str);
+                    let mut parts = line_in_arena.split_whitespace();
+                    let chr = parts.next();
+                    parts.next();
+                    parts.next();
+                    let pos = parts.next();
+                    let a1 = parts.next();
+                    let a2 = parts.next();
+
+                    if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
+                        (chr, pos, a1, a2)
+                    {
+                        match parse_key(chr_str, pos_str) {
+                            Ok(key) => {
+                                return Some(Ok(KeyedBimRecord {
+                                    key,
+                                    bim_row_index: BimRowIndex(
+                                        self.global_offset + self.local_line_num - 1,
+                                    ),
+                                    allele1: a1,
+                                    allele2: a2,
+                                }));
+                            }
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if let Ok(false) = self.next_file() {
+                        return None;
+                    }
+                }
+                Err(err) => {
+                    return Some(Err(map_pipeline_error(err, self.current_path.clone())));
+                }
             }
         }
     }
@@ -971,24 +1048,85 @@ fn resolve_person_subset(
 }
 
 fn parse_fam_and_build_lookup(
-    fam_path: &Path,
+    fileset_paths: &[FilesetPaths],
 ) -> Result<(Vec<String>, AHashMap<String, u32>), PrepError> {
-    let file = File::open(fam_path).map_err(|e| PrepError::Io(e, fam_path.to_path_buf()))?;
-    let reader = BufReader::new(file);
-    let mut person_iids = Vec::new();
     let mut iid_to_idx = AHashMap::new();
+    let mut canonical_iids: Option<Vec<String>> = None;
+    let mut canonical_path: Option<PathBuf> = None;
+    let mut seen_paths: AHashSet<PathBuf> = AHashSet::new();
 
-    for (i, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(|e| PrepError::Io(e, fam_path.to_path_buf()))?;
-        let iid = line
+    for fileset in fileset_paths {
+        if !seen_paths.insert(fileset.fam.clone()) {
+            continue;
+        }
+
+        let iids = read_fam_file(&fileset.fam)?;
+        if let Some(existing) = &canonical_iids {
+            if *existing != iids {
+                let canonical = canonical_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(PrepError::PipelineIo {
+                    path: fileset.fam.clone(),
+                    message: format!(
+                        "FAM file '{}' does not match canonical FAM '{}'.",
+                        fileset.fam.display(),
+                        canonical
+                    ),
+                });
+            }
+        } else {
+            for (idx, iid) in iids.iter().enumerate() {
+                iid_to_idx.insert(iid.clone(), idx as u32);
+            }
+            canonical_path = Some(fileset.fam.clone());
+            canonical_iids = Some(iids);
+        }
+    }
+
+    let person_iids = canonical_iids.ok_or_else(|| {
+        PrepError::Parse("No individuals found in provided .fam files.".to_string())
+    })?;
+    Ok((person_iids, iid_to_idx))
+}
+
+fn read_fam_file(path: &Path) -> Result<Vec<String>, PrepError> {
+    let mut source = open_text_source(path)
+        .map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
+    let mut iids = Vec::new();
+    let mut line_number = 0usize;
+
+    while let Some(line) = source
+        .next_line()
+        .map_err(|e| map_pipeline_error(e, path.to_path_buf()))?
+    {
+        line_number += 1;
+        if line.is_empty() {
+            continue;
+        }
+        let line_str = std::str::from_utf8(line).map_err(|e| {
+            PrepError::Parse(format!(
+                "Invalid UTF-8 in .fam file '{}' on line {}: {e}",
+                path.display(),
+                line_number
+            ))
+        })?;
+        let iid = line_str
             .split_whitespace()
             .nth(1)
-            .ok_or_else(|| PrepError::Parse(format!("Missing IID in .fam file on line {}", i + 1)))?
+            .ok_or_else(|| {
+                PrepError::Parse(format!(
+                    "Missing IID in .fam file '{}' on line {}",
+                    path.display(),
+                    line_number
+                ))
+            })?
             .to_string();
-        person_iids.push(iid.clone());
-        iid_to_idx.insert(iid, i as u32);
+        iids.push(iid);
     }
-    Ok((person_iids, iid_to_idx))
+
+    Ok(iids)
 }
 
 fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
@@ -1077,6 +1215,9 @@ impl Display for PrepError {
             PrepError::Parse(s) => write!(f, "Parse Error: {s}"),
             PrepError::Header(s) => write!(f, "Invalid Header: {s}"),
             PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {s}"),
+            PrepError::PipelineIo { path, message } => {
+                write!(f, "I/O Error for file {}: {}", path.display(), message)
+            }
             PrepError::NoOverlappingVariants(diag) => {
                 writeln!(
                     f,

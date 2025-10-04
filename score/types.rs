@@ -19,6 +19,8 @@ pub struct WorkItem {
 #[derive(Debug, Clone)]
 pub struct FilesetBoundary {
     pub bed_path: PathBuf,
+    pub bim_path: PathBuf,
+    pub fam_path: PathBuf,
     pub starting_global_index: u64,
 }
 
