@@ -837,6 +837,74 @@ mod internal {
             owned_cols.push(col.to_owned());
         }
 
+        // Stage: Add the sex×PGS varying-coefficient interaction if present
+        let sex_pgs_key = "f(PGS,sex)";
+        if let Some(sex_pgs_coeffs) = coeffs.interaction_effects.get(sex_pgs_key) {
+            let mut sex_pgs_basis = pgs_main_basis.to_owned();
+            for (mut row, &sex_value) in sex_pgs_basis.axis_iter_mut(Axis(0)).zip(sex_new.iter()) {
+                row *= sex_value;
+            }
+
+            let alpha = config
+                .interaction_orth_alpha
+                .get(sex_pgs_key)
+                .ok_or_else(|| {
+                    ModelError::ConstraintMissing(format!(
+                        "interaction_orth_alpha for {}",
+                        sex_pgs_key
+                    ))
+                })?;
+
+            let intercept = Array1::<f64>::ones(n_samples);
+            let sex_col = sex_new.to_owned();
+            let m_cols = 1 + 1 + pgs_main_basis.ncols();
+            if alpha.nrows() != m_cols {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "Orth map stored with unexpected row count for {}: got {}, expected {}",
+                    sex_pgs_key,
+                    alpha.nrows(),
+                    m_cols
+                )));
+            }
+            if alpha.ncols() != sex_pgs_basis.ncols() {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "Orth map stored with unexpected column count for {}: got {}, expected {}",
+                    sex_pgs_key,
+                    alpha.ncols(),
+                    sex_pgs_basis.ncols()
+                )));
+            }
+
+            let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
+            let mut offset = 0;
+            m_matrix
+                .slice_mut(s![.., offset..offset + 1])
+                .assign(&intercept);
+            offset += 1;
+            m_matrix
+                .slice_mut(s![.., offset..offset + 1])
+                .assign(&sex_col.view().insert_axis(Axis(1)));
+            offset += 1;
+            m_matrix
+                .slice_mut(s![.., offset..offset + pgs_main_basis.ncols()])
+                .assign(&pgs_main_basis);
+
+            let sex_pgs_orth = &sex_pgs_basis - &m_matrix.dot(alpha);
+
+            if sex_pgs_coeffs.len() != sex_pgs_orth.ncols() {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "Stored interaction coefficient count for {} is {}, but constructed design has {} columns.",
+                    sex_pgs_key,
+                    sex_pgs_coeffs.len(),
+                    sex_pgs_orth.ncols()
+                )));
+            }
+
+            for col in sex_pgs_orth.axis_iter(Axis(1)) {
+                owned_cols.push(col.to_owned());
+            }
+        }
+
         // Stage: Add tensor product interaction effects (only if PCs are present)
         if !config.pc_configs.is_empty() {
             // Reconstruct interaction marginals using the same basis choice used during training
@@ -1020,6 +1088,12 @@ mod internal {
 
         // Stage: Main PGS effects (for basis functions m > 0)
         flattened.extend_from_slice(&coeffs.main_effects.pgs);
+
+        // Stage: Sex×PGS varying-coefficient interaction (if present)
+        let sex_pgs_key = "f(PGS,sex)";
+        if let Some(sex_pgs_coeffs) = coeffs.interaction_effects.get(sex_pgs_key) {
+            flattened.extend_from_slice(sex_pgs_coeffs);
+        }
 
         // Stage: Tensor product interaction effects (ordered by PC)
         for pc_config in &config.pc_configs {
@@ -1258,6 +1332,8 @@ mod tests {
             interaction_effects: {
                 let mut interactions = HashMap::new();
 
+                interactions.insert("f(PGS,sex)".to_string(), vec![16.0, 17.0]);
+
                 // Unified tensor product interactions - flattened coefficient vectors
                 // For tensor products, coefficients are flattened in the order: pgs_basis × pc_basis
                 interactions.insert("f(PGS,PC1)".to_string(), vec![8.0, 9.0, 12.0, 13.0]);
@@ -1325,6 +1401,7 @@ mod tests {
             4.0, 5.0, // PC1 main effects
             6.0, 7.0, // PC2 main effects
             2.0, 3.0, // PGS main effects
+            16.0, 17.0, // f(PGS,sex) varying coefficient
             8.0, 9.0, 12.0, 13.0, // f(PGS,PC1) tensor product interaction
             10.0, 11.0, 14.0, 15.0, // f(PGS,PC2) tensor product interaction
         ];
@@ -1481,6 +1558,16 @@ mod tests {
                 interaction_effects: {
                     let mut interactions = HashMap::new();
 
+                    if let Some(block_idx) = layout.sex_pgs_block_idx {
+                        let block = layout
+                            .penalty_map
+                            .get(block_idx)
+                            .expect("sex×PGS block missing from layout.penalty_map");
+                        let num_cols = block.col_range.end - block.col_range.start;
+                        let coeffs: Vec<f64> = (1..=num_cols).map(|i| i as f64 * 5.0).collect();
+                        interactions.insert("f(PGS,sex)".to_string(), coeffs);
+                    }
+
                     for (pc_idx, pc_cfg) in model_config.pc_configs.iter().enumerate() {
                         let block_idx = *layout
                             .interaction_block_idx
@@ -1627,6 +1714,22 @@ mod tests {
             panic!("Missing {} interaction effect", key_interaction);
         }
 
+        // Check for sex×PGS interaction effect if present
+        let key_sex = "f(PGS,sex)";
+        if let Some(interaction_orig) = original_model.coefficients.interaction_effects.get(key_sex)
+        {
+            let interaction_loaded = loaded_model
+                .coefficients
+                .interaction_effects
+                .get(key_sex)
+                .expect("Missing f(PGS,sex) interaction effect");
+            assert_eq!(
+                interaction_loaded, interaction_orig,
+                "Mismatch in {}",
+                key_sex
+            );
+        }
+
         // Stage: Check lambdas
         assert_eq!(loaded_model.lambdas, original_model.lambdas);
 
@@ -1707,6 +1810,11 @@ pub fn map_coefficients(
     }
 
     // Build interaction effects deterministically by layout.interaction_block_idx order.
+    if let Some(block_idx) = layout.sex_pgs_block_idx {
+        let block = &layout.penalty_map[block_idx];
+        let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();
+        interaction_effects.insert(block.term_name.to_string(), coeffs);
+    }
     for &blk_idx in &layout.interaction_block_idx {
         let block = &layout.penalty_map[blk_idx];
         let coeffs = beta.slice(s![block.col_range.clone()]).to_vec();

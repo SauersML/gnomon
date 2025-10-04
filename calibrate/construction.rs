@@ -99,6 +99,8 @@ pub struct ModelLayout {
     pub intercept_col: usize,
     pub sex_col: Option<usize>,
     pub pgs_main_cols: Range<usize>,
+    /// Columns for the sex×PGS varying-coefficient interaction (if present)
+    pub sex_pgs_cols: Option<Range<usize>>,
     /// Unpenalized PC null-space columns (aligned with config.pc_configs order)
     pub pc_null_cols: Vec<Range<usize>>,
     /// Penalty-map indices for each PC's explicit null-space block, if present (aligned with config.pc_configs)
@@ -107,6 +109,8 @@ pub struct ModelLayout {
     /// Direct indices to avoid string lookups in hot paths
     pub pc_main_block_idx: Vec<usize>,
     pub interaction_block_idx: Vec<usize>,
+    /// Penalty-map index for the sex×PGS interaction block (if present)
+    pub sex_pgs_block_idx: Option<usize>,
     /// Marginal widths used when constructing each interaction block (pgs, pc)
     pub interaction_factor_widths: Vec<(usize, usize)>,
     pub total_coeffs: usize,
@@ -118,6 +122,7 @@ pub struct ModelLayout {
 pub enum TermType {
     PcMainEffect,
     Interaction,
+    SexPgsInteraction,
 }
 
 /// Information about a single penalized block of coefficients.
@@ -142,11 +147,13 @@ impl ModelLayout {
             intercept_col: 0,
             sex_col: None,
             pgs_main_cols: 0..0,
+            sex_pgs_cols: None,
             pc_null_cols: vec![],
             pc_null_block_idx: vec![],
             penalty_map: vec![],
             pc_main_block_idx: vec![],
             interaction_block_idx: vec![],
+            sex_pgs_block_idx: None,
             interaction_factor_widths: vec![],
             total_coeffs,
             num_penalties,
@@ -169,10 +176,17 @@ impl ModelLayout {
         let mut pc_null_cols: Vec<Range<usize>> = Vec::with_capacity(config.pc_configs.len());
         let mut pc_main_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
         let mut pc_null_block_idx: Vec<Option<usize>> = Vec::with_capacity(config.pc_configs.len());
+        let mut sex_pgs_cols: Option<Range<usize>> = None;
+        let mut sex_pgs_block_idx: Option<usize> = None;
 
         // Calculate total coefficients first to ensure consistency
         // Formula: total_coeffs = 1 (intercept) + p_pgs_main + p_pc_main + p_interactions
         let p_pgs_main = pgs_main_basis_ncols;
+        let sex_pgs_interaction_basis_ncols = if sex_main_basis_ncols > 0 {
+            pgs_main_basis_ncols
+        } else {
+            0
+        };
         let p_pc_main: usize = pc_null_basis_ncols
             .iter()
             .zip(pc_range_basis_ncols.iter())
@@ -184,8 +198,12 @@ impl ModelLayout {
             .iter()
             .map(|&num_pc_basis| pgs_interaction_basis_ncols * num_pc_basis)
             .sum();
-        let calculated_total_coeffs =
-            1 + sex_main_basis_ncols + p_pgs_main + p_pc_main + p_interactions;
+        let calculated_total_coeffs = 1
+            + sex_main_basis_ncols
+            + p_pgs_main
+            + sex_pgs_interaction_basis_ncols
+            + p_pc_main
+            + p_interactions;
 
         let intercept_col = current_col;
         current_col += 1;
@@ -203,6 +221,11 @@ impl ModelLayout {
         let estimated_penalized_blocks = config.pc_configs.len()
             + if pgs_interaction_basis_ncols > 0 {
                 config.pc_configs.len()
+            } else {
+                0
+            }
+            + if sex_pgs_interaction_basis_ncols > 0 {
+                1
             } else {
                 0
             };
@@ -252,6 +275,21 @@ impl ModelLayout {
         // The PGS main effect is unpenalized intentionally.
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
+
+        // Sex×PGS varying-coefficient interaction (single block with double penalty)
+        if sex_pgs_interaction_basis_ncols > 0 {
+            let range = current_col..current_col + sex_pgs_interaction_basis_ncols;
+            penalty_map.push(PenalizedBlock {
+                term_name: "f(PGS,sex)".to_string(),
+                col_range: range.clone(),
+                penalty_indices: vec![penalty_idx_counter, penalty_idx_counter + 1],
+                term_type: TermType::SexPgsInteraction,
+            });
+            sex_pgs_cols = Some(range.clone());
+            sex_pgs_block_idx = Some(penalty_map.len() - 1);
+            current_col += sex_pgs_interaction_basis_ncols;
+            penalty_idx_counter += 2;
+        }
 
         // Tensor product interaction effects (number of penalties depends on configuration)
         let mut interaction_block_idx: Vec<usize> = Vec::with_capacity(config.pc_configs.len());
@@ -326,11 +364,13 @@ impl ModelLayout {
             intercept_col,
             sex_col,
             pgs_main_cols,
+            sex_pgs_cols,
             pc_null_cols,
             pc_null_block_idx,
             penalty_map,
             pc_main_block_idx,
             interaction_block_idx,
+            sex_pgs_block_idx,
             interaction_factor_widths,
             total_coeffs: current_col,
             num_penalties: penalty_idx_counter,
@@ -424,8 +464,8 @@ pub fn build_design_and_penalty_matrices(
     knot_vectors.reserve(n_pcs + 1);
     range_transforms.reserve(n_pcs + 1);
     pc_null_transforms.reserve(n_pcs);
-    interaction_centering_means.reserve(n_pcs);
-    interaction_orth_alpha.reserve(n_pcs);
+    interaction_centering_means.reserve(n_pcs + 1);
+    interaction_orth_alpha.reserve(n_pcs + 1);
 
     // Stage: Generate the PGS basis and apply the sum-to-zero constraint
     let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
@@ -448,7 +488,7 @@ pub fn build_design_and_penalty_matrices(
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (_, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
+    let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
@@ -574,6 +614,17 @@ pub fn build_design_and_penalty_matrices(
         s_list.push(Array2::zeros((p, p)));
     }
 
+    // Precompute double-penalty components for the sex×PGS interaction
+    let s_sex_pgs_wiggle = pgs_z_transform.t().dot(&s_pgs_main.dot(&pgs_z_transform));
+    let s_sex_pgs_null = if z_null_pgs.ncols() > 0 {
+        let null_penalty_unc = z_null_pgs.dot(&z_null_pgs.t());
+        pgs_z_transform
+            .t()
+            .dot(&null_penalty_unc.dot(&pgs_z_transform))
+    } else {
+        Array2::<f64>::zeros((pgs_z_transform.ncols(), pgs_z_transform.ncols()))
+    };
+
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
         if block.term_type != TermType::PcMainEffect {
@@ -588,6 +639,21 @@ pub fn build_design_and_penalty_matrices(
         for j in col_range.clone() {
             s_list[penalty_idx][[j, j]] = alpha;
         }
+    }
+
+    if let Some(block_idx) = layout.sex_pgs_block_idx {
+        let block = &layout.penalty_map[block_idx];
+        let col_range = block.col_range.clone();
+        let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
+        let penalty_idx_wiggle = block.penalty_indices[0];
+        let penalty_idx_null = block.penalty_indices[1];
+
+        s_list[penalty_idx_wiggle]
+            .slice_mut(s![col_range.clone(), col_range.clone()])
+            .assign(&(&s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle)));
+        s_list[penalty_idx_null]
+            .slice_mut(s![col_range.clone(), col_range.clone()])
+            .assign(&(&s_sex_pgs_null / frob(&s_sex_pgs_null)));
     }
 
     let s_pgs_interaction = if matches!(
@@ -781,6 +847,88 @@ pub fn build_design_and_penalty_matrices(
         .slice_mut(s![.., pgs_range])
         .assign(&pgs_main_basis);
 
+    // Precompute sqrt(weights) once for interaction orthogonalization
+    let w_sqrt = data.weights.mapv(f64::sqrt);
+    let w_col = w_sqrt.view().insert_axis(Axis(1));
+
+    // Stage: Add sex×PGS varying-coefficient interaction
+    if let Some(block_idx) = layout.sex_pgs_block_idx {
+        let block = &layout.penalty_map[block_idx];
+        let col_range = block.col_range.clone();
+        if pgs_main_basis.ncols() != col_range.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "Sex×PGS interaction expects {} columns but layout provides {}",
+                pgs_main_basis.ncols(),
+                col_range.len()
+            )));
+        }
+
+        let mut sex_pgs_basis = pgs_main_basis.to_owned();
+        for (mut row, &sex_value) in sex_pgs_basis.axis_iter_mut(Axis(0)).zip(data.sex.iter()) {
+            row *= sex_value;
+        }
+
+        let intercept = x_matrix
+            .slice(s![.., layout.intercept_col..layout.intercept_col + 1])
+            .to_owned();
+        let sex_main = layout.sex_col.ok_or_else(|| {
+            EstimationError::LayoutError(
+                "Layout is missing the sex main-effect column required for the sex×PGS interaction"
+                    .to_string(),
+            )
+        })?;
+        let sex_main_cols = x_matrix.slice(s![.., sex_main..sex_main + 1]).to_owned();
+        let pgs_main = pgs_main_basis.to_owned();
+
+        let m_cols = 1 + sex_main_cols.ncols() + pgs_main.ncols();
+        let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
+        let mut offset = 0;
+        m_matrix
+            .slice_mut(s![.., offset..offset + 1])
+            .assign(&intercept);
+        offset += 1;
+        m_matrix
+            .slice_mut(s![.., offset..offset + sex_main_cols.ncols()])
+            .assign(&sex_main_cols);
+        offset += sex_main_cols.ncols();
+        m_matrix
+            .slice_mut(s![.., offset..offset + pgs_main.ncols()])
+            .assign(&pgs_main);
+
+        let mw = &m_matrix * &w_col;
+        let tw = &sex_pgs_basis * &w_col;
+        let gram = mw.t().dot(&mw);
+        let rhs = mw.t().dot(&tw);
+        let (u_opt, s, vt_opt) = gram
+            .svd(true, true)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let (u, vt) = match (u_opt, vt_opt) {
+            (Some(u), Some(vt)) => (u, vt),
+            _ => {
+                return Err(EstimationError::LayoutError(
+                    "SVD did not return U/VT for sex×PGS orthogonalization".to_string(),
+                ));
+            }
+        };
+        let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let tol = smax * 1e-12;
+        let mut s_inv = Array2::zeros((s.len(), s.len()));
+        for i in 0..s.len() {
+            if s[i] > tol {
+                s_inv[[i, i]] = 1.0 / s[i];
+            }
+        }
+        let gram_pinv = vt.t().dot(&s_inv).dot(&u.t());
+        let alpha = gram_pinv.dot(&rhs);
+        let sex_pgs_orth = &sex_pgs_basis - &m_matrix.dot(&alpha);
+
+        let interaction_key = "f(PGS,sex)".to_string();
+        interaction_orth_alpha.insert(interaction_key.clone(), alpha);
+        interaction_centering_means
+            .insert(interaction_key.clone(), Array1::zeros(sex_pgs_orth.ncols()));
+        x_matrix.slice_mut(s![.., col_range]).assign(&sex_pgs_orth);
+    }
+
     // Stage: Populate tensor product interaction effects.
     if !layout.interaction_block_idx.is_empty() {
         let pgs_int_basis_iso = if matches!(
@@ -794,10 +942,6 @@ pub fn build_design_and_penalty_matrices(
         } else {
             None
         };
-
-        // Precompute sqrt(weights) once for this section
-        let w_sqrt = data.weights.mapv(f64::sqrt);
-        let w_col = w_sqrt.view().insert_axis(Axis(1));
 
         for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
             if pc_idx >= layout.interaction_block_idx.len() {
@@ -1920,11 +2064,12 @@ mod tests {
         let (_, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
-        // With null-space penalization: PC null + PC range + two anisotropic interaction penalties
+        // With null-space penalization and the sex×PGS varying coefficient:
+        // PC null + PC range + two anisotropic interaction penalties + two sex×PGS penalties
         assert_eq!(
             s_list.len(),
-            4,
-            "Should have exactly 4 penalty matrices: PC null, PC range, and two anisotropic interaction penalties",
+            6,
+            "Should have exactly 6 penalty matrices: PC null, PC range, two anisotropic interaction penalties, and two sex×PGS penalties",
         );
 
         let interaction_block = layout
@@ -1937,6 +2082,18 @@ mod tests {
             interaction_block.penalty_indices.len(),
             2,
             "Interaction term should have two penalty indices in anisotropic mode",
+        );
+
+        let sex_pgs_block = layout
+            .penalty_map
+            .iter()
+            .find(|b| b.term_type == TermType::SexPgsInteraction)
+            .expect("Sex×PGS block not found in layout");
+
+        assert_eq!(
+            sex_pgs_block.penalty_indices.len(),
+            2,
+            "Sex×PGS interaction should have a double penalty",
         );
 
         // Locate explicit PC range and PC null penalty blocks
@@ -2017,6 +2174,64 @@ mod tests {
             }
         }
 
+        // Validate sex×PGS penalty structure (double penalty)
+        let (pgs_basis_unc, _) = create_bspline_basis(
+            data.p.view(),
+            config.pgs_range,
+            config.pgs_basis_config.num_knots,
+            config.pgs_basis_config.degree,
+        )
+        .expect("PGS basis construction");
+        let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);
+        let (_, z_transform) = basis::apply_sum_to_zero_constraint(
+            pgs_main_basis_unc.view(),
+            Some(data.weights.view()),
+        )
+        .expect("sum-to-zero transform");
+        let s_pgs =
+            create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)
+                .expect("PGS penalty");
+        let (z_null, _) = basis::null_range_whiten(&s_pgs).expect("null-range split");
+        let s_sex_pgs_wiggle = z_transform.t().dot(&s_pgs.dot(&z_transform));
+        let s_sex_pgs_null = if z_null.ncols() > 0 {
+            let null_penalty = z_null.dot(&z_null.t());
+            z_transform.t().dot(&null_penalty.dot(&z_transform))
+        } else {
+            Array2::<f64>::zeros((z_transform.ncols(), z_transform.ncols()))
+        };
+
+        let s_sex_pgs_wiggle_block = &s_list[sex_pgs_block.penalty_indices[0]];
+        let s_sex_pgs_null_block = &s_list[sex_pgs_block.penalty_indices[1]];
+        let sex_range = sex_pgs_block.col_range.clone();
+
+        let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
+        let expected_wiggle = &s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle);
+        let expected_null = &s_sex_pgs_null / frob(&s_sex_pgs_null);
+
+        for (row_offset, r) in sex_range.clone().enumerate() {
+            for (col_offset, c) in sex_range.clone().enumerate() {
+                assert_abs_diff_eq!(
+                    s_sex_pgs_wiggle_block[[r, c]],
+                    expected_wiggle[[row_offset, col_offset]],
+                    epsilon = 1e-12
+                );
+                assert_abs_diff_eq!(
+                    s_sex_pgs_null_block[[r, c]],
+                    expected_null[[row_offset, col_offset]],
+                    epsilon = 1e-12
+                );
+            }
+        }
+
+        for r in 0..layout.total_coeffs {
+            for c in 0..layout.total_coeffs {
+                if !(sex_range.contains(&r) && sex_range.contains(&c)) {
+                    assert_abs_diff_eq!(s_sex_pgs_wiggle_block[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_sex_pgs_null_block[[r, c]], 0.0, epsilon = 1e-12);
+                }
+            }
+        }
+
         // Check that PC main penalty matrix has identity on PC main blocks and zeros elsewhere
         let alpha_pc_range = {
             let m = pc_range_block.col_range.len() as f64;
@@ -2065,19 +2280,19 @@ mod tests {
 
         let pgs_main_coeffs =
             config.pgs_basis_config.num_knots + config.pgs_basis_config.degree - 1;
-        let expected_total_coeffs = 1 + 1 + pgs_main_coeffs; // Intercept + Sex + PGS main effect
+        let expected_total_coeffs = 1 + 1 + pgs_main_coeffs + pgs_main_coeffs; // Intercept + Sex + PGS main + Sex×PGS
 
         assert_eq!(layout.total_coeffs, expected_total_coeffs);
         assert!(
             layout
                 .penalty_map
                 .iter()
-                .all(|b| b.term_type != TermType::Interaction),
-            "No interaction terms should exist in a PGS-only model."
+                .any(|b| b.term_type == TermType::SexPgsInteraction),
+            "Sex×PGS interaction block should exist in a PGS-only model."
         );
         assert_eq!(
-            layout.num_penalties, 0,
-            "PGS-only model should have no penalties."
+            layout.num_penalties, 2,
+            "PGS-only model should have the double penalty for the sex×PGS interaction."
         );
     }
 
@@ -2135,6 +2350,14 @@ mod tests {
         }
 
         let mut interaction_coeffs = HashMap::new();
+        if let Some(block_idx) = layout.sex_pgs_block_idx {
+            let block = &layout.penalty_map[block_idx];
+            let mut coeffs = Vec::with_capacity(block.col_range.len());
+            for j in 0..block.col_range.len() {
+                coeffs.push(60.0 + j as f64);
+            }
+            interaction_coeffs.insert(block.term_name.clone(), coeffs);
+        }
         for &block_idx in &layout.interaction_block_idx {
             let block = &layout.penalty_map[block_idx];
             let mut coeffs = Vec::with_capacity(block.col_range.len());
