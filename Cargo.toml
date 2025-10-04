@@ -37,6 +37,7 @@ natord = "1.0.9"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 dwldutil = "2.0.4"
 indicatif = "0.17"
+google-cloud-storage = "1.0.0"
 flate2 = "1.1.2"
 ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.219", features = ["derive"] }

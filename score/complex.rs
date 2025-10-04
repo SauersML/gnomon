@@ -1,11 +1,10 @@
+use crate::io::BedSource;
 use crate::pipeline::{PipelineError, ScopeGuard};
-use crate::types::{BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ScoreInfo};
+use crate::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
 use ahash::AHashSet;
 use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,44 +17,31 @@ use std::time::Duration;
 /// either a single memory map or a collection of them, avoiding the massive
 /// performance penalty of re-opening and re-mapping files inside a parallel loop.
 pub enum ComplexVariantResolver {
-    SingleFile(Arc<Mmap>),
+    SingleFile(BedSource),
     MultiFile {
-        // A vector of all memory maps for the multi-file case.
-        mmaps: Vec<Mmap>,
-        // A copy of the boundaries to map a global index to the correct mmap.
+        sources: Vec<BedSource>,
         boundaries: Vec<FilesetBoundary>,
     },
 }
 
 impl ComplexVariantResolver {
-    /// Creates a new resolver based on the pipeline strategy.
-    pub fn new(prep_result: &PreparationResult) -> Result<Self, PipelineError> {
-        match &prep_result.pipeline_kind {
-            PipelineKind::SingleFile(bed_path) => {
-                let file = File::open(bed_path).map_err(|e| {
-                    PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e))
-                })?;
-                let mmap = Arc::new(unsafe {
-                    Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))?
-                });
-                Ok(Self::SingleFile(mmap))
-            }
-            PipelineKind::MultiFile(boundaries) => {
-                let mmaps = boundaries
-                    .iter()
-                    .map(|b| {
-                        let file = File::open(&b.bed_path).map_err(|e| {
-                            PipelineError::Io(format!("Opening {}: {}", b.bed_path.display(), e))
-                        })?;
-                        unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string())) }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Self::MultiFile {
-                    mmaps,
-                    boundaries: boundaries.clone(),
-                })
-            }
+    pub fn from_single_source(source: BedSource) -> Self {
+        Self::SingleFile(source)
+    }
+
+    pub fn from_multi_sources(
+        sources: Vec<BedSource>,
+        boundaries: Vec<FilesetBoundary>,
+    ) -> Result<Self, PipelineError> {
+        if sources.len() != boundaries.len() {
+            return Err(PipelineError::Io(
+                "Mismatched number of byte sources and fileset boundaries".to_string(),
+            ));
         }
+        Ok(Self::MultiFile {
+            sources,
+            boundaries,
+        })
     }
 
     /// Fetches a packed genotype for a given person and global variant index.
@@ -66,31 +52,37 @@ impl ComplexVariantResolver {
         bytes_per_variant: u64,
         bim_row_index: BimRowIndex,
         fam_index: u32,
-    ) -> u8 {
-        let (mmap, local_bim_index) = match self {
-            ComplexVariantResolver::SingleFile(mmap) => (mmap.as_ref(), bim_row_index.0),
-            ComplexVariantResolver::MultiFile { mmaps, boundaries } => {
-                // Find which fileset contains this global index using a fast binary search.
+    ) -> Result<u8, PipelineError> {
+        let (source, local_bim_index) = match self {
+            ComplexVariantResolver::SingleFile(source) => (source, bim_row_index.0),
+            ComplexVariantResolver::MultiFile {
+                sources,
+                boundaries,
+            } => {
                 let fileset_idx =
                     boundaries.partition_point(|b| b.starting_global_index <= bim_row_index.0) - 1;
                 let boundary = &boundaries[fileset_idx];
                 let local_index = bim_row_index.0 - boundary.starting_global_index;
-                // This unsafe is acceptable because the number of mmaps is tied to the
-                // number of boundaries, and the index is derived from it.
-                (unsafe { mmaps.get_unchecked(fileset_idx) }, local_index)
+                (&sources[fileset_idx], local_index)
             }
         };
 
         // The +3 skips the PLINK .bed file magic number (0x6c, 0x1b, 0x01).
         let variant_start_offset = 3 + local_bim_index * bytes_per_variant;
         let person_byte_offset = fam_index as u64 / 4;
-        let final_byte_offset = (variant_start_offset + person_byte_offset) as usize;
+        let final_byte_offset = variant_start_offset + person_byte_offset;
 
         let bit_offset_in_byte = (fam_index % 4) * 2;
 
-        // This indexing is safe because the preparation phase guarantees all indices are valid.
-        let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset) };
-        (packed_byte >> bit_offset_in_byte) & 0b11
+        let packed_byte = if let Some(mmap) = source.mmap() {
+            // This indexing is safe because the preparation phase guarantees all indices are valid.
+            unsafe { *mmap.get_unchecked(final_byte_offset as usize) }
+        } else {
+            let mut byte = [0u8; 1];
+            source.read_at(final_byte_offset, &mut byte)?;
+            byte[0]
+        };
+        Ok((packed_byte >> bit_offset_in_byte) & 0b11)
     }
 }
 
@@ -454,6 +446,11 @@ struct FatalAmbiguityData {
     conflicts: Vec<ConflictSource>,
 }
 
+enum FatalError {
+    Ambiguity(FatalAmbiguityData),
+    Io(String),
+}
+
 // The "slow path" resolver for complex variants.
 ///
 /// This function runs *after* the main high-performance pipeline is complete. It
@@ -474,7 +471,7 @@ pub fn resolve_complex_variants(
     eprintln!("> Resolving {num_rules} complex variant rules...");
 
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
-    let fatal_error_storage = Mutex::new(None::<FatalAmbiguityData>);
+    let fatal_error_storage = Mutex::new(None::<FatalError>);
 
     let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
     let progress_style = ProgressStyle::with_template(
@@ -530,18 +527,29 @@ pub fn resolve_complex_variants(
                         let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
 
                         for group_rule in &prep_result.complex_rules {
-                            let valid_interpretations: Vec<_> = group_rule
-                                .possible_contexts
-                                .iter()
-                                .filter_map(|context| {
-                                    let packed_geno = resolver.get_packed_genotype(
-                                        prep_result.bytes_per_variant,
-                                        context.0,
-                                        original_fam_idx,
-                                    );
-                                    (packed_geno != 0b01).then_some((packed_geno, context))
-                                })
-                                .collect();
+                            let mut valid_interpretations = Vec::new();
+                            for context in &group_rule.possible_contexts {
+                                let packed_geno = match resolver.get_packed_genotype(
+                                    prep_result.bytes_per_variant,
+                                    context.0,
+                                    original_fam_idx,
+                                ) {
+                                    Ok(bits) => bits,
+                                    Err(err) => {
+                                        if fatal_error_occurred
+                                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                            .is_ok()
+                                        {
+                                            *fatal_error_storage.lock().unwrap() =
+                                                Some(FatalError::Io(err.to_string()));
+                                        }
+                                        return Err(());
+                                    }
+                                };
+                                if packed_geno != 0b01 {
+                                    valid_interpretations.push((packed_geno, context));
+                                }
+                            }
 
                             match valid_interpretations.len() {
                                 0 => {
@@ -626,7 +634,8 @@ pub fn resolve_complex_variants(
                                             };
 
                                             if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                                *fatal_error_storage.lock().unwrap() = Some(data);
+                                                *fatal_error_storage.lock().unwrap() =
+                                                    Some(FatalError::Ambiguity(data));
                                             }
                                             return Err(());
                                         }
@@ -697,8 +706,13 @@ pub fn resolve_complex_variants(
     }
 
     if fatal_error_occurred.load(Ordering::Relaxed) {
-        if let Some(data) = fatal_error_storage.lock().unwrap().take() {
-            return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
+        if let Some(error) = fatal_error_storage.lock().unwrap().take() {
+            return match error {
+                FatalError::Ambiguity(data) => {
+                    Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)))
+                }
+                FatalError::Io(message) => Err(PipelineError::Io(message)),
+            };
         }
         return Err(PipelineError::Compute(
             "A fatal, unspecified error occurred in a parallel task.".to_string(),

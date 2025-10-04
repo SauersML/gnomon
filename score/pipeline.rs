@@ -9,11 +9,9 @@ use crate::types::{
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::Mmap;
 use num_cpus;
 use rayon::prelude::*;
 use std::error::Error;
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,12 +159,8 @@ fn run_single_file_pipeline(
     bed_path: &Path,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
-    let bed_file = File::open(bed_path)
-        .map_err(|e| PipelineError::Io(format!("Opening {}: {}", bed_path.display(), e)))?;
-    let mmap =
-        Arc::new(unsafe { Mmap::map(&bed_file).map_err(|e| PipelineError::Io(e.to_string()))? });
-    mmap.advise(memmap2::Advice::Sequential)
-        .map_err(|e| PipelineError::Io(e.to_string()))?;
+    let bed_source = io::open_bed_source(bed_path)?;
+    let shared_source = bed_source.byte_source();
 
     let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(SPARSE_CHANNEL_BOUND);
     let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(DENSE_CHANNEL_BOUND);
@@ -253,7 +247,7 @@ fn run_single_file_pipeline(
         });
 
         let producer_logic = {
-            let mmap = Arc::clone(&mmap);
+            let source = Arc::clone(&shared_source);
             let prep_result = Arc::clone(&context.prep_result);
             let buffer_pool = Arc::clone(&buffer_pool);
             let producer_thread_count = Arc::clone(&variants_processed_count);
@@ -263,7 +257,7 @@ fn run_single_file_pipeline(
                     let global_path = decide::decide_path_without_freq(&run_ctx);
                     let path_decider = |_: &[u8]| global_path;
                     io::producer_thread(
-                        mmap,
+                        Arc::clone(&source),
                         prep_result,
                         sparse_tx,
                         dense_tx,
@@ -283,7 +277,7 @@ fn run_single_file_pipeline(
                         decide::decide_path_with_freq(&variant_ctx)
                     };
                     io::producer_thread(
-                        mmap,
+                        Arc::clone(&source),
                         prep_result,
                         sparse_tx,
                         dense_tx,
@@ -337,7 +331,7 @@ fn run_single_file_pipeline(
                 prep_result.complex_rules.len()
             );
             // The resolver is created once with the single mmap.
-            let resolver = ComplexVariantResolver::SingleFile(Arc::clone(&mmap));
+            let resolver = ComplexVariantResolver::from_single_source(bed_source.clone());
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
         pb.finish_with_message("Computation complete.");
@@ -351,6 +345,12 @@ fn run_multi_file_pipeline(
     context: &PipelineContext,
     boundaries: &[FilesetBoundary],
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    let bed_sources: Vec<io::BedSource> = boundaries
+        .iter()
+        .map(|b| io::open_bed_source(&b.bed_path))
+        .collect::<Result<_, _>>()?;
+    let shared_sources = Arc::new(bed_sources);
+
     // --- 1. Setup: No mmap here. Producer manages its own. ---
     let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(SPARSE_CHANNEL_BOUND);
     let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(DENSE_CHANNEL_BOUND);
@@ -437,6 +437,7 @@ fn run_multi_file_pipeline(
         });
 
         let producer_logic = {
+            let sources = Arc::clone(&shared_sources);
             let prep_result = Arc::clone(&context.prep_result);
             let buffer_pool = Arc::clone(&buffer_pool);
             let producer_thread_count = Arc::clone(&variants_processed_count);
@@ -448,6 +449,7 @@ fn run_multi_file_pipeline(
                     io::multi_file_producer_thread(
                         prep_result,
                         boundaries,
+                        sources.as_ref(),
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
@@ -468,6 +470,7 @@ fn run_multi_file_pipeline(
                     io::multi_file_producer_thread(
                         prep_result,
                         boundaries,
+                        sources.as_ref(),
                         sparse_tx,
                         dense_tx,
                         buffer_pool,
@@ -520,8 +523,11 @@ fn run_multi_file_pipeline(
                 "> Resolving {} unique complex variant rule(s)...",
                 prep_result.complex_rules.len()
             );
-            // The resolver is created once with all necessary mmaps.
-            let resolver = ComplexVariantResolver::new(prep_result)?;
+            // The resolver is created once with the shared byte sources.
+            let resolver = ComplexVariantResolver::from_multi_sources(
+                shared_sources.as_ref().clone(),
+                boundaries.to_vec(),
+            )?;
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
         pb.finish_with_message("Computation complete.");
