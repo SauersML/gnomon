@@ -39,13 +39,23 @@ const REMOTE_CACHE_CAPACITY: usize = 8;
 static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
 
 fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
-    RUNTIME_MANAGER
-        .get_or_try_init(|| {
-            Runtime::new()
-                .map(Arc::new)
-                .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))
-        })
-        .map(Arc::clone)
+    if let Some(runtime) = RUNTIME_MANAGER.get() {
+        return Ok(Arc::clone(runtime));
+    }
+
+    let runtime = Runtime::new()
+        .map(Arc::new)
+        .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))?;
+
+    if RUNTIME_MANAGER.set(Arc::clone(&runtime)).is_err() {
+        // Another thread initialized the runtime between our `get` and `set`.
+        // Return the previously stored runtime to avoid constructing duplicates.
+        if let Some(existing) = RUNTIME_MANAGER.get() {
+            return Ok(Arc::clone(existing));
+        }
+    }
+
+    Ok(runtime)
 }
 
 /// A trait that abstracts sequential, line-oriented access to text data such as

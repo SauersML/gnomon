@@ -877,13 +877,9 @@ mod internal {
 
             let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
             let mut offset = 0;
-            m_matrix
-                .slice_mut(s![.., offset..offset + 1])
-                .assign(&intercept);
+            m_matrix.column_mut(offset).assign(&intercept);
             offset += 1;
-            m_matrix
-                .slice_mut(s![.., offset..offset + 1])
-                .assign(&sex_col.view().insert_axis(Axis(1)));
+            m_matrix.column_mut(offset).assign(&sex_col);
             offset += 1;
             m_matrix
                 .slice_mut(s![.., offset..offset + pgs_main_basis.ncols()])
