@@ -19,7 +19,7 @@ import numpy as np
 CI_WORKDIR = Path("./ci_workdir")
 GNOMON_BINARY = Path("./target/release/gnomon")
 PLINK2_BINARY = CI_WORKDIR / "plink2"
-PYLINK_SCRIPT = Path("test/pylink.py").resolve()
+PYLINK_SCRIPT = (Path(__file__).resolve().parent / "pylink.py").resolve()
 
 # Constants for the Disagreement Bisection Algorithm
 DISCOVERY_PGS_ID = "PGS004696"

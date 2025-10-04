@@ -579,7 +579,7 @@ def run_and_validate_tools(runtimes):
     PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
     PLINK2_BINARY_PATH = WORKDIR / "plink2"
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
-    PYLINK_SCRIPT_PATH = Path("test/pylink.py").resolve()
+    PYLINK_SCRIPT_PATH = (Path(__file__).resolve().parent / "pylink.py").resolve()
     overall_success = True
 
     def _print_header(title: str, char: str = "-"):
