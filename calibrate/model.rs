@@ -1151,7 +1151,9 @@ mod tests {
         let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
 
         // Stage: Calculate the final expected linear predictor as intercept + constrained_basis * coeffs
-        let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
+        let mut expected_values = pgs_main_basis_con.dot(&coeffs);
+        expected_values += &sex_points.mapv(|v| v * model.coefficients.main_effects.sex);
+        expected_values += model.coefficients.intercept;
 
         // Get the model's prediction using the actual `predict` method
         let predictions = model
@@ -1390,8 +1392,10 @@ mod tests {
         };
 
         // Create a dummy dataset for generating the correct model structure
-        // Using n_samples=100 to avoid over-parameterization
-        let n_samples = 100;
+        // Choose a sample size that comfortably exceeds the total number of coefficients in this
+        // configuration (currently 101) so that the design matrix construction succeeds even as
+        // new unpenalized effects such as sex are introduced.
+        let n_samples = 150;
         let dummy_data = TrainingData {
             y: Array1::linspace(0.0, 1.0, n_samples),
             p: Array1::linspace(-1.0, 1.0, n_samples),
