@@ -4070,6 +4070,18 @@ pub mod internal {
             println!("✓ Relative smoothness test skipped!");
         }
 
+        #[derive(Debug)]
+        struct CheckResult {
+            description: String,
+            passed: bool,
+        }
+
+        impl CheckResult {
+            fn new(description: String, passed: bool) -> Self {
+                Self { description, passed }
+            }
+        }
+
         /// Real-world evaluation: discrimination, calibration, complexity, and stability via CV.
         #[test]
         fn test_model_realworld_metrics() {
@@ -4156,6 +4168,8 @@ pub mod internal {
             let mut rho_by_penalty: Vec<Vec<f64>> = Vec::new();
             let mut near_bound_counts: Vec<usize> = Vec::new();
             let mut pos_bound_counts: Vec<usize> = Vec::new();
+
+            let mut check_results: Vec<CheckResult> = Vec::new();
 
             fn compute_median(values: &[f64]) -> Option<f64> {
                 if values.is_empty() {
@@ -4288,12 +4302,24 @@ pub mod internal {
                             }
                         }
                         for (idx, label) in labels.iter().enumerate() {
-                            assert!(
-                                !label.is_empty(),
-                                "Penalty label not set for index {} (total {})",
-                                idx,
-                                layout.num_penalties
-                            );
+                            let label_set = !label.is_empty();
+                            check_results.push(CheckResult::new(
+                                if label_set {
+                                    format!(
+                                        "Penalty label assigned for index {} of {} -> '{}'",
+                                        idx,
+                                        layout.num_penalties,
+                                        label
+                                    )
+                                } else {
+                                    format!(
+                                        "Penalty label not set for index {} (total {})",
+                                        idx,
+                                        layout.num_penalties
+                                    )
+                                },
+                                label_set,
+                            ));
                         }
                         penalty_labels = Some(labels);
                         penalty_types = Some(types);
@@ -4302,11 +4328,23 @@ pub mod internal {
                         pos_bound_counts = vec![0; layout.num_penalties];
                     }
 
-                    assert_eq!(
-                        rho_values.len(),
-                        rho_by_penalty.len(),
-                        "Mismatch between rho values and penalty bookkeeping"
-                    );
+                    let rho_len_match = rho_values.len() == rho_by_penalty.len();
+                    check_results.push(CheckResult::new(
+                        if rho_len_match {
+                            format!(
+                                "Rho values count ({}) matches penalty bookkeeping ({})",
+                                rho_values.len(),
+                                rho_by_penalty.len()
+                            )
+                        } else {
+                            format!(
+                                "Mismatch between rho values ({}) and penalty bookkeeping ({})",
+                                rho_values.len(),
+                                rho_by_penalty.len()
+                            )
+                        },
+                        rho_len_match,
+                    ));
 
                     let labels_ref = penalty_labels.as_ref().unwrap();
                     let types_ref = penalty_types.as_ref().unwrap();
@@ -4392,11 +4430,21 @@ pub mod internal {
                         proj_rates.push(0.0);
                         0.0
                     };
-                    assert!(
-                        proj_rate <= 0.20,
-                        "Mean projection rate must be <= 20% (got {:.2}%)",
-                        100.0 * proj_rate
-                    );
+                    let proj_rate_ok = proj_rate <= 0.20;
+                    check_results.push(CheckResult::new(
+                        if proj_rate_ok {
+                            format!(
+                                "Mean projection rate {:.2}% within ≤20% threshold",
+                                100.0 * proj_rate
+                            )
+                        } else {
+                            format!(
+                                "Mean projection rate exceeds 20% threshold: {:.2}%",
+                                100.0 * proj_rate
+                            )
+                        },
+                        proj_rate_ok,
+                    ));
 
                     // Predict on validation
                     let preds = trained
@@ -4507,60 +4555,157 @@ pub mod internal {
                     };
 
                     if is_sex_related(label, &types[idx]) {
-                        assert!(
-                            pos_rate >= 0.8,
-                            "Sex-related penalty '{}' failed to hit +bound in ≥80% of folds (rate {:.1}%)",
-                            label,
-                            100.0 * pos_rate
-                        );
+                        let pos_bound_ok = pos_rate >= 0.8;
+                        check_results.push(CheckResult::new(
+                            if pos_bound_ok {
+                                format!(
+                                    "Sex-related penalty '{}' hit +bound in {:.1}% of folds (≥80% expected)",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            } else {
+                                format!(
+                                    "Sex-related penalty '{}' failed to hit +bound in ≥80% of folds (rate {:.1}%)",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            },
+                            pos_bound_ok,
+                        ));
                     } else {
                         if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
                             pgs_pc1_near_rates.push(near_rate);
                             continue;
                         }
-                        assert!(
-                            near_rate <= 0.50,
-                            "Penalty '{}' hit rho bounds too often ({:.1}%)",
-                            label,
-                            100.0 * near_rate
-                        );
+                        let near_rate_ok = near_rate <= 0.50;
+                        check_results.push(CheckResult::new(
+                            if near_rate_ok {
+                                format!(
+                                    "Penalty '{}' near-bound rate {:.1}% within ≤50% threshold",
+                                    label,
+                                    100.0 * near_rate
+                                )
+                            } else {
+                                format!(
+                                    "Penalty '{}' hit rho bounds too often ({:.1}%)",
+                                    label,
+                                    100.0 * near_rate
+                                )
+                            },
+                            near_rate_ok,
+                        ));
                     }
                 }
 
-                assert_eq!(
-                    pgs_pc1_near_rates.len(),
-                    2,
-                    "Expected two penalties for f(PGS,PC1), but found {}",
-                    pgs_pc1_near_rates.len()
-                );
-                assert!(
-                    pgs_pc1_near_rates.iter().any(|&rate| rate <= 0.50),
-                    "Both f(PGS,PC1)[1] and f(PGS,PC1)[2] hit rho bounds in >50% of folds: rates = {:.1}% and {:.1}%",
-                    100.0 * pgs_pc1_near_rates[0],
-                    100.0 * pgs_pc1_near_rates[1]
-                );
+                let pgs_near_len_ok = pgs_pc1_near_rates.len() == 2;
+                check_results.push(CheckResult::new(
+                    if pgs_near_len_ok {
+                        "Observed two penalties for f(PGS,PC1)".to_string()
+                    } else {
+                        format!(
+                            "Expected two penalties for f(PGS,PC1), but found {}",
+                            pgs_pc1_near_rates.len()
+                        )
+                    },
+                    pgs_near_len_ok,
+                ));
+                let rates_percent: Vec<String> = pgs_pc1_near_rates
+                    .iter()
+                    .map(|rate| format!("{:.1}%", 100.0 * rate))
+                    .collect();
+                let pgs_near_rate_ok = pgs_pc1_near_rates.iter().any(|&rate| rate <= 0.50);
+                check_results.push(CheckResult::new(
+                    if pgs_near_rate_ok {
+                        format!(
+                            "At least one f(PGS,PC1) penalty within ≤50% near-bound rate (rates: [{}])",
+                            rates_percent.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "Both f(PGS,PC1) penalties exceeded 50% near-bound rate (rates: [{}])",
+                            rates_percent.join(", ")
+                        )
+                    },
+                    pgs_near_rate_ok,
+                ));
             }
 
             // Assertions per spec
-            assert!(auc_m >= 0.60, "AUC mean too low: {:.3}", auc_m);
-            assert!(auc_sd <= 0.06, "AUC SD too high: {:.3}", auc_sd);
-            assert!(pr_m > 0.5, "PR-AUC mean should be > 0.5: {:.3}", pr_m);
+            let auc_mean_ok = auc_m >= 0.60;
+            check_results.push(CheckResult::new(
+                if auc_mean_ok {
+                    format!("AUC mean {:.3} ≥ 0.60", auc_m)
+                } else {
+                    format!("AUC mean too low: {:.3}", auc_m)
+                },
+                auc_mean_ok,
+            ));
+            let auc_sd_ok = auc_sd <= 0.06;
+            check_results.push(CheckResult::new(
+                if auc_sd_ok {
+                    format!("AUC SD {:.3} ≤ 0.06", auc_sd)
+                } else {
+                    format!("AUC SD too high: {:.3}", auc_sd)
+                },
+                auc_sd_ok,
+            ));
+            let pr_mean_ok = pr_m > 0.5;
+            check_results.push(CheckResult::new(
+                if pr_mean_ok {
+                    format!("PR-AUC mean {:.3} > 0.5", pr_m)
+                } else {
+                    format!("PR-AUC mean should be > 0.5: {:.3}", pr_m)
+                },
+                pr_mean_ok,
+            ));
 
-            assert!(ll_m <= 0.70, "Log-loss mean too high: {:.3}", ll_m);
-            assert!(br_m <= 0.25, "Brier mean too high: {:.3}", br_m);
+            let ll_mean_ok = ll_m <= 0.70;
+            check_results.push(CheckResult::new(
+                if ll_mean_ok {
+                    format!("Log-loss mean {:.3} ≤ 0.70", ll_m)
+                } else {
+                    format!("Log-loss mean too high: {:.3}", ll_m)
+                },
+                ll_mean_ok,
+            ));
+            let brier_mean_ok = br_m <= 0.25;
+            check_results.push(CheckResult::new(
+                if brier_mean_ok {
+                    format!("Brier mean {:.3} ≤ 0.25", br_m)
+                } else {
+                    format!("Brier mean too high: {:.3}", br_m)
+                },
+                brier_mean_ok,
+            ));
 
-            assert!(
-                (slope_m >= 0.80) && (slope_m <= 1.20),
-                "Calibration slope out of range: {:.3}",
-                slope_m
-            );
-            assert!(
-                (cint_m >= -0.20) && (cint_m <= 0.20),
-                "Calibration intercept out of range: {:.3}",
-                cint_m
-            );
+            let slope_ok = (slope_m >= 0.80) && (slope_m <= 1.20);
+            check_results.push(CheckResult::new(
+                if slope_ok {
+                    format!("Calibration slope {:.3} within [0.80, 1.20]", slope_m)
+                } else {
+                    format!("Calibration slope out of range: {:.3}", slope_m)
+                },
+                slope_ok,
+            ));
+            let intercept_ok = (cint_m >= -0.20) && (cint_m <= 0.20);
+            check_results.push(CheckResult::new(
+                if intercept_ok {
+                    format!("Calibration intercept {:.3} within [-0.20, 0.20]", cint_m)
+                } else {
+                    format!("Calibration intercept out of range: {:.3}", cint_m)
+                },
+                intercept_ok,
+            ));
             const ECE_THRESHOLD: f64 = 0.15;
-            assert!(ece_m <= ECE_THRESHOLD, "ECE too high: {:.3}", ece_m);
+            let ece_ok = ece_m <= ECE_THRESHOLD;
+            check_results.push(CheckResult::new(
+                if ece_ok {
+                    format!("ECE {:.3} ≤ {:.2}", ece_m, ECE_THRESHOLD)
+                } else {
+                    format!("ECE too high: {:.3} (threshold {:.2})", ece_m, ECE_THRESHOLD)
+                },
+                ece_ok,
+            ));
 
             // Allow occasional boundary solutions for non-sex terms; fail only if frequent across folds
             let rho_boundary_rate = if total_folds_evaluated > 0 {
@@ -4575,22 +4720,70 @@ pub mod internal {
                 total_folds_evaluated
             );
             // Allow up to 50% of folds to land near bounds; treat more as suspicious
-            assert!(
-                rho_boundary_rate <= 0.50,
-                "Rho at or near bounds across too many folds: {:.1}%",
-                100.0 * rho_boundary_rate
-            );
-            assert!(
-                edf_m >= 10.0 && edf_m <= 80.0,
-                "EDF mean out of range: {:.2}",
-                edf_m
-            );
-            assert!(edf_sd <= 10.0, "EDF SD too high: {:.2}", edf_sd);
-            assert!(
-                proj_m <= 0.20,
-                "Mean projection rate (PHC) exceeds 20%: {:.2}%",
-                100.0 * proj_m
-            );
+            let rho_boundary_ok = rho_boundary_rate <= 0.50;
+            check_results.push(CheckResult::new(
+                if rho_boundary_ok {
+                    format!(
+                        "Rho near-bound rate {:.1}% within ≤50% threshold",
+                        100.0 * rho_boundary_rate
+                    )
+                } else {
+                    format!(
+                        "Rho at or near bounds across too many folds: {:.1}%",
+                        100.0 * rho_boundary_rate
+                    )
+                },
+                rho_boundary_ok,
+            ));
+            let edf_mean_ok = edf_m >= 10.0 && edf_m <= 80.0;
+            check_results.push(CheckResult::new(
+                if edf_mean_ok {
+                    format!("EDF mean {:.2} within [10, 80]", edf_m)
+                } else {
+                    format!("EDF mean out of range: {:.2}", edf_m)
+                },
+                edf_mean_ok,
+            ));
+            let edf_sd_ok = edf_sd <= 10.0;
+            check_results.push(CheckResult::new(
+                if edf_sd_ok {
+                    format!("EDF SD {:.2} ≤ 10.0", edf_sd)
+                } else {
+                    format!("EDF SD too high: {:.2}", edf_sd)
+                },
+                edf_sd_ok,
+            ));
+            let proj_mean_ok = proj_m <= 0.20;
+            check_results.push(CheckResult::new(
+                if proj_mean_ok {
+                    format!(
+                        "Mean PHC projection rate {:.2}% within ≤20% threshold",
+                        100.0 * proj_m
+                    )
+                } else {
+                    format!(
+                        "Mean projection rate (PHC) exceeds 20%: {:.2}%",
+                        100.0 * proj_m
+                    )
+                },
+                proj_mean_ok,
+            ));
+        }
+
+            println!("=== test_model_realworld_metrics Check Summary ===");
+            let failed_checks: Vec<&CheckResult> =
+                check_results.iter().filter(|r| !r.passed).collect();
+            for result in &check_results {
+                let status = if result.passed { "PASS" } else { "FAIL" };
+                println!("[{}] {}", status, result.description);
+            }
+            if !failed_checks.is_empty() {
+                panic!(
+                    "test_model_realworld_metrics: {} checks failed",
+                    failed_checks.len()
+                );
+            }
+
         }
 
         /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
