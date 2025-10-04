@@ -869,7 +869,7 @@ pub fn build_design_and_penalty_matrices(
         }
 
         let intercept = x_matrix
-            .slice(s![.., layout.intercept_col..layout.intercept_col + 1])
+            .column(layout.intercept_col)
             .to_owned();
         let sex_main = layout.sex_col.ok_or_else(|| {
             EstimationError::LayoutError(
@@ -883,9 +883,7 @@ pub fn build_design_and_penalty_matrices(
         let m_cols = 1 + sex_main_cols.ncols() + pgs_main.ncols();
         let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
         let mut offset = 0;
-        m_matrix
-            .slice_mut(s![.., offset..offset + 1])
-            .assign(&intercept);
+        m_matrix.column_mut(offset).assign(&intercept);
         offset += 1;
         m_matrix
             .slice_mut(s![.., offset..offset + sex_main_cols.ncols()])
@@ -996,7 +994,7 @@ pub fn build_design_and_penalty_matrices(
             // Build main-effect matrix M = [Intercept | Sex | PGS_main | PC_main_for_this_pc (null + range)]
             // Extract intercept, sex, and PGS main
             let intercept = x_matrix
-                .slice(s![.., layout.intercept_col..layout.intercept_col + 1])
+                .column(layout.intercept_col)
                 .to_owned();
             let sex_main = layout
                 .sex_col
@@ -1025,9 +1023,7 @@ pub fn build_design_and_penalty_matrices(
             let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
             let mut offset = 0;
             // Intercept
-            m_matrix
-                .slice_mut(s![.., offset..offset + 1])
-                .assign(&intercept);
+            m_matrix.column_mut(offset).assign(&intercept);
             offset += 1;
             // Sex main effect (if present)
             if let Some(sex_col) = sex_main.as_ref() {

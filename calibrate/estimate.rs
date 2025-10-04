@@ -6601,7 +6601,9 @@ pub mod internal {
                 let analytical_grad = reml_state.compute_gradient(&rho).unwrap()[0];
 
                 // Calculate numerical gradient using central difference
-                let h = 1e-6; // Small step size for numerical approximation
+                // Use a relative step to avoid catastrophic cancellation when the
+                // cost surface is very flat (e.g., at large |rho|).
+                let h = 1e-3 * (1.0 + rho_val.abs());
                 let mut rho_plus = rho.clone();
                 let mut rho_minus = rho.clone();
                 rho_plus[0] += h;
