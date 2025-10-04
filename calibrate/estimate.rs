@@ -4210,8 +4210,14 @@ pub mod internal {
                     let val_idx: Vec<usize> = idx[start..end].to_vec();
                     let train_idx: Vec<usize> = idx
                         .iter()
-                        .cloned()
-                        .filter(|i| *i < start || *i >= end)
+                        .enumerate()
+                        .filter_map(|(pos, &sample)| {
+                            if pos >= start && pos < end {
+                                None
+                            } else {
+                                Some(sample)
+                            }
+                        })
                         .collect();
 
                     // Build train data
