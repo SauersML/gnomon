@@ -164,6 +164,9 @@ pub struct MappedCoefficients {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainEffects {
+    /// Coefficient for the main effect of sex (binary indicator).
+    #[serde(default)]
+    pub sex: f64,
     /// Coefficients for the main effect of PGS (for basis functions m > 0).
     pub pgs: Vec<f64>,
     /// Coefficients for the main effects of each PC, keyed by PC name.
@@ -234,6 +237,7 @@ impl TrainedModel {
     pub fn predict_detailed(
         &self,
         p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<
         (
@@ -264,6 +268,7 @@ impl TrainedModel {
         // --- Build design and coefficients ---
         let x_new = internal::construct_design_matrix(
             p_corr.view(),
+            sex_new,
             pcs_corr.view(),
             &self.config,
             &self.coefficients,
@@ -343,10 +348,11 @@ impl TrainedModel {
     pub fn predict(
         &self,
         p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         // Restore original behavior via detailed path: PHC -> design rebuild -> inverse link
-        let (_, mean, _, _) = self.predict_detailed(p_new, pcs_new)?;
+        let (_, mean, _, _) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         Ok(mean)
     }
 
@@ -355,17 +361,18 @@ impl TrainedModel {
     pub fn predict_calibrated(
         &self,
         p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         // Stage: Compute baseline predictions
-        let baseline = self.predict(p_new, pcs_new)?;
+        let baseline = self.predict(p_new, sex_new, pcs_new)?;
         // Stage: If no calibrator is present, error loudly (no silent fallback)
         if self.calibrator.is_none() {
             return Err(ModelError::CalibratorMissing);
         }
 
         // Stage: Retrieve eta, signed distance, and se(eta) via the detailed path
-        let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, pcs_new)?;
+        let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
         let pred_in = match self.config.link_function {
             LinkFunction::Logit => eta.clone(),
@@ -390,6 +397,7 @@ impl TrainedModel {
     pub fn predict_linear(
         &self,
         p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         if pcs_new.ncols() != self.config.pc_configs.len() {
@@ -419,6 +427,7 @@ impl TrainedModel {
 
         let x_new = internal::construct_design_matrix(
             p_corr.view(),
+            sex_new,
             pcs_corr.view(),
             &self.config,
             &self.coefficients,
@@ -477,10 +486,7 @@ impl TrainedModel {
                 .pc_null_transforms
                 .get(&pc.name)
                 .ok_or_else(|| {
-                    ModelError::ConstraintMissing(format!(
-                        "pc_null_transform for {}",
-                        pc.name
-                    ))
+                    ModelError::ConstraintMissing(format!("pc_null_transform for {}", pc.name))
                 })?
                 .ncols();
             pc_null_ncols.push(null_cols);
@@ -500,10 +506,13 @@ impl TrainedModel {
             }
         };
 
+        let sex_main_cols = 1;
+
         ModelLayout::new(
             &self.config,
             &pc_null_ncols,
             &pc_range_ncols,
+            sex_main_cols,
             pgs_main_cols,
             &pc_int_ncols,
             pgs_int_cols,
@@ -528,6 +537,19 @@ impl TrainedModel {
             self.lambdas.len(),
             layout.num_penalties
         );
+
+        if let Some(sex_col) = layout.sex_col {
+            if sex_col >= layout.total_coeffs {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "Sex column index {} exceeds total coefficients {}",
+                    sex_col, layout.total_coeffs
+                )));
+            }
+        } else {
+            return Err(ModelError::DimensionMismatch(
+                "Layout is missing a sex column for the main effect".to_string(),
+            ));
+        }
 
         for (pc_idx, pc_config) in self.config.pc_configs.iter().enumerate() {
             let key = format!("f(PGS,{})", pc_config.name);
@@ -557,13 +579,9 @@ impl TrainedModel {
                         .col_range
                         .len();
                     assert_eq!(
-                        layout_cols,
-                        expected,
+                        layout_cols, expected,
                         "Mismatch: layout vs rebuilt interaction width for {key} (layout {}, expected {} = {}×{})",
-                        layout_cols,
-                        expected,
-                        pgs_dim_dbg,
-                        pc_dim_dbg
+                        layout_cols, expected, pgs_dim_dbg, pc_dim_dbg
                     );
                 }
             }
@@ -650,6 +668,7 @@ mod internal {
     /// This order is the implicit contract that allows the flattened coefficients to work correctly.
     pub(super) fn construct_design_matrix(
         p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
         config: &ModelConfig,
         coeffs: &MappedCoefficients,
@@ -660,6 +679,13 @@ mod internal {
                 "Sample count mismatch: p_new has {} samples but pcs_new has {} rows",
                 p_new.len(),
                 pcs_new.nrows()
+            )));
+        }
+        if sex_new.len() != p_new.len() {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Sample count mismatch: p_new has {} samples but sex_new has {}",
+                p_new.len(),
+                sex_new.len()
             )));
         }
         // Stage: Generate the PGS basis using the saved knot vector if available
@@ -791,6 +817,9 @@ mod internal {
         // Stage: Populate the intercept column
         owned_cols.push(Array1::<f64>::ones(n_samples));
 
+        // Stage: Add sex main effect column
+        owned_cols.push(sex_new.to_owned());
+
         // Stage: Add main PC effects per PC—null first (if any), then range
         for pc_idx in 0..config.pc_configs.len() {
             if let Some(ref null_basis) = pc_null_bases[pc_idx] {
@@ -813,12 +842,9 @@ mod internal {
             // Reconstruct interaction marginals using the same basis choice used during training
             let pgs_int_basis = match config.interaction_penalty {
                 InteractionPenaltyKind::Isotropic => {
-                    let z_range_pgs_pred = config
-                        .range_transforms
-                        .get("pgs")
-                        .ok_or_else(|| {
-                            ModelError::ConstraintMissing("pgs range transform".to_string())
-                        })?;
+                    let z_range_pgs_pred = config.range_transforms.get("pgs").ok_or_else(|| {
+                        ModelError::ConstraintMissing("pgs range transform".to_string())
+                    })?;
 
                     if pgs_main_basis_unc.ncols() != z_range_pgs_pred.nrows() {
                         return Err(ModelError::InternalStackingError);
@@ -870,11 +896,33 @@ mod internal {
                                 ))
                             })?;
 
-                    // Build M = [Intercept | PGS_main | PC_main_for_this_pc (null + range)]
-                    let intercept = Array1::<f64>::ones(n_samples).insert_axis(Axis(1));
-                    // PGS_main is `pgs_main_basis` from above; append PC null (if any) then PC range
-                    let mut m_cols: Vec<Array1<f64>> =
-                        intercept.axis_iter(Axis(1)).map(|c| c.to_owned()).collect();
+                    // Build M = [Intercept | Sex? | PGS_main | PC_main_for_this_pc (null + range)]
+                    let intercept = Array1::<f64>::ones(n_samples);
+                    let sex_col = sex_new.to_owned();
+                    let pc_null_cols = pc_null_bases
+                        .get(pc_idx)
+                        .and_then(|opt| opt.as_ref().map(|arr| arr.ncols()))
+                        .unwrap_or(0);
+                    let pc_range_cols = pc_range_bases[pc_idx].ncols();
+                    let base_cols_without_sex =
+                        1 + pgs_main_basis.ncols() + pc_null_cols + pc_range_cols;
+                    let base_cols_with_sex = base_cols_without_sex + 1;
+
+                    let include_sex = match alpha.nrows() {
+                        n if n == base_cols_with_sex => true,
+                        n if n == base_cols_without_sex => false,
+                        n => {
+                            return Err(ModelError::DimensionMismatch(format!(
+                                "Orth map stored with unexpected row count for {tensor_key}: got {n}, expected {base_cols_without_sex} (without sex) or {base_cols_with_sex} (with sex)",
+                            )));
+                        }
+                    };
+
+                    let mut m_cols: Vec<Array1<f64>> = Vec::new();
+                    m_cols.push(intercept);
+                    if include_sex {
+                        m_cols.push(sex_col);
+                    }
                     m_cols.extend(pgs_main_basis.axis_iter(Axis(1)).map(|c| c.to_owned()));
                     if let Some(ref pc_null) = pc_null_bases[pc_idx] {
                         m_cols.extend(pc_null.axis_iter(Axis(1)).map(|c| c.to_owned()));
@@ -956,6 +1004,9 @@ mod internal {
         // Stage: Intercept
         flattened.push(coeffs.intercept);
 
+        // Stage: Sex main effect
+        flattened.push(coeffs.main_effects.sex);
+
         // Stage: Main PC effects (ordered by pc_configs for determinism)
         for pc_config in &config.pc_configs {
             let pc_name = &pc_config.name;
@@ -985,11 +1036,12 @@ mod internal {
 #[cfg(test)]
 pub(crate) fn internal_construct_design_matrix(
     p_new: ArrayView1<f64>,
+    sex_new: ArrayView1<f64>,
     pcs_new: ArrayView2<f64>,
     config: &ModelConfig,
     coeffs: &MappedCoefficients,
 ) -> Result<Array2<f64>, ModelError> {
-    internal::construct_design_matrix(p_new, pcs_new, config, coeffs)
+    internal::construct_design_matrix(p_new, sex_new, pcs_new, config, coeffs)
 }
 
 #[cfg(test)]
@@ -1063,6 +1115,7 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
                 main_effects: MainEffects {
+                    sex: 0.5,
                     // There is only 1 coefficient after constraint for this simple case
                     pgs: vec![2.0],
                     pcs: HashMap::new(),
@@ -1078,6 +1131,7 @@ mod tests {
 
         // --- Define Test Points ---
         let test_points = array![0.25, 0.75];
+        let sex_points = array![0.0, 1.0];
         let empty_pcs = Array2::<f64>::zeros((2, 0));
 
         // --- Calculate the expected result CORRECTLY ---
@@ -1100,7 +1154,9 @@ mod tests {
         let expected_values = model.coefficients.intercept + pgs_main_basis_con.dot(&coeffs);
 
         // Get the model's prediction using the actual `predict` method
-        let predictions = model.predict(test_points.view(), empty_pcs.view()).unwrap();
+        let predictions = model
+            .predict(test_points.view(), sex_points.view(), empty_pcs.view())
+            .unwrap();
 
         // Verify the results match our correctly calculated ground truth
         assert_eq!(predictions.len(), 2);
@@ -1146,6 +1202,7 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.0,
                 main_effects: MainEffects {
+                    sex: 0.0,
                     pgs: vec![],
                     pcs: HashMap::new(),
                 },
@@ -1160,9 +1217,10 @@ mod tests {
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
         let pgs = Array1::linspace(0.0, 1.0, 5);
+        let sex = Array1::zeros(5);
         let pcs = Array2::zeros((5, 2)); // 2 PC columns, but model expects 1
 
-        let result = model.predict(pgs.view(), pcs.view());
+        let result = model.predict(pgs.view(), sex.view(), pcs.view());
 
         // Verify we get the expected error
         assert!(
@@ -1186,6 +1244,7 @@ mod tests {
         let coeffs = MappedCoefficients {
             intercept: 1.0,
             main_effects: MainEffects {
+                sex: 0.5,
                 pgs: vec![2.0, 3.0], // 2 PGS main effect coefficients
                 pcs: {
                     let mut pc_map = HashMap::new();
@@ -1260,6 +1319,7 @@ mod tests {
         // Define expected order based on the canonical ordering rules
         let expected = vec![
             1.0, // Intercept
+            0.5, // Sex main effect
             4.0, 5.0, // PC1 main effects
             6.0, 7.0, // PC2 main effects
             2.0, 3.0, // PGS main effects
@@ -1335,6 +1395,7 @@ mod tests {
         let dummy_data = TrainingData {
             y: Array1::linspace(0.0, 1.0, n_samples),
             p: Array1::linspace(-1.0, 1.0, n_samples),
+            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
             pcs: Array2::from_shape_vec(
                 (n_samples, 1),
                 Array1::linspace(-0.5, 0.5, n_samples).to_vec(),
@@ -1387,6 +1448,7 @@ mod tests {
             coefficients: MappedCoefficients {
                 intercept: 0.5,
                 main_effects: MainEffects {
+                    sex: 0.75,
                     // The number of PGS main effect coefficients must match dimensions after constraint
                     // This size is derived from the layout object which reflects the actual model structure
                     pgs: {
@@ -1426,14 +1488,9 @@ mod tests {
                             .expect("interaction block missing from layout.penalty_map");
                         let num_cols = block.col_range.end - block.col_range.start;
 
-                        let coeffs: Vec<f64> = (1..=num_cols)
-                            .map(|i| i as f64 * 10.0)
-                            .collect();
+                        let coeffs: Vec<f64> = (1..=num_cols).map(|i| i as f64 * 10.0).collect();
 
-                        interactions.insert(
-                            format!("f(PGS,{})", pc_cfg.name),
-                            coeffs,
-                        );
+                        interactions.insert(format!("f(PGS,{})", pc_cfg.name), coeffs);
                     }
 
                     interactions
@@ -1575,12 +1632,14 @@ mod tests {
             (i as f64 - 1.0) * 0.25 // Values: -0.25, 0, 0.25
         });
 
+        let test_sex = Array1::zeros(test_pgs.len());
+
         let predictions_orig = original_model
-            .predict(test_pgs.view(), test_pcs.view())
+            .predict(test_pgs.view(), test_sex.view(), test_pcs.view())
             .expect("Prediction with original model failed");
 
         let predictions_loaded = loaded_model
-            .predict(test_pgs.view(), test_pcs.view())
+            .predict(test_pgs.view(), test_sex.view(), test_pcs.view())
             .expect("Prediction with loaded model failed");
 
         // Verify that predictions are identical
@@ -1604,6 +1663,8 @@ pub fn map_coefficients(
     let mut pcs = HashMap::new();
     let mut pgs = vec![];
     let mut interaction_effects = HashMap::new();
+
+    let sex = layout.sex_col.map(|col| beta[col]).unwrap_or(0.0);
 
     // Extract the unpenalized PGS main effect coefficients
     if !layout.pgs_main_cols.is_empty() {
@@ -1650,7 +1711,7 @@ pub fn map_coefficients(
 
     Ok(MappedCoefficients {
         intercept,
-        main_effects: MainEffects { pgs, pcs },
+        main_effects: MainEffects { sex, pgs, pcs },
         interaction_effects,
     })
 }

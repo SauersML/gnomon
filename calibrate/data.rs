@@ -28,6 +28,8 @@ pub struct TrainingData {
     pub y: Array1<f64>,
     /// The Polygenic Score vector (`P`), from the 'score' column.
     pub p: Array1<f64>,
+    /// Binary sex indicator (e.g., 0 for female, 1 for male).
+    pub sex: Array1<f64>,
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
@@ -40,6 +42,8 @@ pub struct TrainingData {
 pub struct PredictionData {
     /// The Polygenic Score vector (`P`), from the 'score' column.
     pub p: Array1<f64>,
+    /// Binary sex indicator (e.g., 0 for female, 1 for male).
+    pub sex: Array1<f64>,
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
@@ -90,16 +94,28 @@ pub enum DataError {
 /// Loads and validates data specifically for model training.
 pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, DataError> {
     // Do not require an explicit 'weights' column. If missing, default to 1.0.
-    let (p, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, false)?;
+    let (p, sex, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, false)?;
     // This unwrap is safe because we passed `include_phenotype: true`.
     let y = y_opt.unwrap();
-    Ok(TrainingData { y, p, pcs, weights })
+    Ok(TrainingData {
+        y,
+        p,
+        sex,
+        pcs,
+        weights,
+    })
 }
 
 /// Loads and validates data specifically for prediction.
 pub fn load_prediction_data(path: &str, num_pcs: usize) -> Result<PredictionData, DataError> {
-    let (p, pcs, _, _, sample_ids) = internal::load_data_with_ids(path, num_pcs, false, false)?;
-    Ok(PredictionData { p, pcs, sample_ids })
+    let (p, sex, pcs, _, _, sample_ids) =
+        internal::load_data_with_ids(path, num_pcs, false, false)?;
+    Ok(PredictionData {
+        p,
+        sex,
+        pcs,
+        sample_ids,
+    })
 }
 
 /// Internal module for shared data loading logic.
@@ -115,7 +131,16 @@ mod internal {
         num_pcs: usize,
         include_phenotype: bool,
         require_weights: bool,
-    ) -> Result<(Array1<f64>, Array2<f64>, Option<Array1<f64>>, Array1<f64>), DataError> {
+    ) -> Result<
+        (
+            Array1<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Option<Array1<f64>>,
+            Array1<f64>,
+        ),
+        DataError,
+    > {
         // Small helper: validate that an array contains only finite values
         fn validate_is_finite(arr: &Array1<f64>, column_name: &str) -> Result<(), DataError> {
             if arr.iter().any(|&v| !v.is_finite()) {
@@ -126,11 +151,12 @@ mod internal {
 
         // --- Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
-        let mut required_cols: Vec<String> = Vec::with_capacity(2 + num_pcs);
+        let mut required_cols: Vec<String> = Vec::with_capacity(3 + num_pcs);
         if include_phenotype {
             required_cols.push("phenotype".to_string());
         }
         required_cols.push("score".to_string());
+        required_cols.push("sex".to_string());
         required_cols.extend_from_slice(&pc_names);
 
         // --- Read and validate the DataFrame using Polars ---
@@ -243,6 +269,34 @@ mod internal {
         // Now convert to ndarray
         let pgs = score_casted.rechunk().f64()?.to_ndarray()?.to_owned();
         validate_is_finite(&pgs, "score")?;
+
+        // Process sex column
+        let sex_series = df.column("sex")?;
+        if sex_series.null_count() > 0 {
+            return Err(DataError::MissingValuesFound("sex".to_string()));
+        }
+
+        let sex_casted = match sex_series.cast(&DataType::Float64) {
+            Ok(casted) => casted,
+            Err(_) => {
+                return Err(DataError::ColumnWrongType {
+                    column_name: "sex".to_string(),
+                    expected_type: "f64 (numeric)",
+                    found_type: format!("{:?}", sex_series.dtype()),
+                });
+            }
+        };
+
+        if sex_casted.null_count() > 0 {
+            return Err(DataError::ColumnWrongType {
+                column_name: "sex".to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", sex_series.dtype()),
+            });
+        }
+
+        let sex = sex_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+        validate_is_finite(&sex, "sex")?;
 
         // Process PC columns efficiently
         let mut pc_arrays = Vec::with_capacity(num_pcs);
@@ -388,7 +442,7 @@ mod internal {
         println!(
             "Data validation successful: all required columns have numeric data with no missing values."
         );
-        Ok((pgs, pcs, phenotype_opt, weights))
+        Ok((pgs, sex, pcs, phenotype_opt, weights))
     }
 
     /// Variant of `load_data` that also extracts or synthesizes sample IDs.
@@ -400,6 +454,7 @@ mod internal {
     ) -> Result<
         (
             Array1<f64>,
+            Array1<f64>,
             Array2<f64>,
             Option<Array1<f64>>,
             Array1<f64>,
@@ -408,7 +463,7 @@ mod internal {
         DataError,
     > {
         // Load using the existing path
-        let (p, pcs, y_opt, w) = load_data(path, num_pcs, include_phenotype, require_weights)?;
+        let (p, sex, pcs, y_opt, w) = load_data(path, num_pcs, include_phenotype, require_weights)?;
 
         // Reload a lightweight frame to try to get sample_id without duplicating conversions
         let df = CsvReader::new(File::open(Path::new(path))?)
@@ -447,7 +502,7 @@ mod internal {
             (1..=n).map(|i| i.to_string()).collect()
         };
 
-        Ok((p, pcs, y_opt, w, sample_ids))
+        Ok((p, sex, pcs, y_opt, w, sample_ids))
     }
 }
 
@@ -469,8 +524,8 @@ mod tests {
 
     #[test]
     fn test_non_finite_values_rejected_in_score() {
-        let header = "phenotype\tscore\tPC1";
-        let data_row = "1.0\tNaN\t0.1"; // NaN should be parsed as f64::NAN
+        let header = "phenotype\tscore\tsex\tPC1";
+        let data_row = "1.0\tNaN\t0\t0.1"; // NaN should be parsed as f64::NAN
         let content = generate_csv_content(header, data_row, 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
@@ -482,8 +537,8 @@ mod tests {
 
     #[test]
     fn test_non_finite_values_rejected_in_pc() {
-        let header = "phenotype\tscore\tPC1";
-        let data_row = "1.0\t2.0\tNaN"; // NaN in PC1
+        let header = "phenotype\tscore\tsex\tPC1";
+        let data_row = "1.0\t2.0\t0\tNaN"; // NaN in PC1
         let content = generate_csv_content(header, data_row, 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 1).unwrap_err();
@@ -502,13 +557,13 @@ mod tests {
         format!("{}\n{}", header, data_rows)
     }
 
-    const TEST_HEADER: &str = "phenotype\tscore\tPC1\tPC2\textra_col";
-    const TEST_DATA_ROW: &str = "1.0\t1.5\t0.1\t0.2\t1.0";
+    const TEST_HEADER: &str = "phenotype\tscore\tsex\tPC1\tPC2\textra_col";
+    const TEST_DATA_ROW: &str = "1.0\t1.5\t0\t0.1\t0.2\t1.0";
 
     #[test]
     fn test_load_training_data_success() {
         // Create test data that includes required columns including weights
-        let header = "phenotype\tscore\tPC1\tPC2\tweights";
+        let header = "phenotype\tscore\tsex\tPC1\tPC2\tweights";
 
         // Generate varied test data with different values in each row
         let mut rows = Vec::with_capacity(31);
@@ -516,9 +571,10 @@ mod tests {
 
         for i in 0..30 {
             let row = format!(
-                "{:.2}\t{:.2}\t{:.3}\t{:.3}\t{:.1}",
+                "{:.2}\t{:.2}\t{}\t{:.3}\t{:.3}\t{:.1}",
                 i as f64 / 10.0,
                 (i as f64 + 5.0) / 10.0,
+                i % 2,
                 (i as f64 - 2.0) / 20.0,
                 (i as f64 + 3.0) / 15.0,
                 1.0 // Add weight of 1.0 for each row
@@ -533,23 +589,27 @@ mod tests {
         // Test dimensions
         assert_eq!(data.y.len(), 30);
         assert_eq!(data.p.len(), 30);
+        assert_eq!(data.sex.len(), 30);
         assert_eq!(data.pcs.shape(), &[30, 2]);
 
         // Test specific values in the first row
         assert_abs_diff_eq!(data.y[0], 0.00, epsilon = 1e-6);
         assert_abs_diff_eq!(data.p[0], 0.50, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.sex[0], 0.0, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 0]], -0.100, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 1]], 0.200, epsilon = 1e-6);
 
         // Test specific values in a middle row
         assert_abs_diff_eq!(data.y[15], 1.50, epsilon = 1e-6);
         assert_abs_diff_eq!(data.p[15], 2.00, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.sex[15], (15 % 2) as f64, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[15, 0]], 0.650, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[15, 1]], 1.200, epsilon = 1e-6);
 
         // Test specific values in the last row
         assert_abs_diff_eq!(data.y[29], 2.90, epsilon = 1e-6);
         assert_abs_diff_eq!(data.p[29], 3.40, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.sex[29], (29 % 2) as f64, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[29, 0]], 1.350, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[29, 1]], 2.133, epsilon = 1e-6);
     }
@@ -557,7 +617,7 @@ mod tests {
     #[test]
     fn test_pcs_matrix_structure_with_custom_data() {
         // Create test data with different values for each row including weights
-        let custom_header = "phenotype\tscore\tPC1\tPC2\tweights";
+        let custom_header = "phenotype\tscore\tsex\tPC1\tPC2\tweights";
 
         // Generate 20 rows with a clear pattern to meet the minimum row requirement
         let mut custom_rows = Vec::with_capacity(21);
@@ -565,9 +625,10 @@ mod tests {
 
         for i in 0..20 {
             let row = format!(
-                "{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}",
+                "{:.1}\t{:.1}\t{}\t{:.1}\t{:.1}\t{:.1}",
                 i as f64 / 10.0,
                 (i as f64 + 1.0) / 10.0,
+                (i % 2),
                 (i as f64 + 2.0) / 10.0,
                 (i as f64 + 3.0) / 10.0,
                 1.0 // Add weight of 1.0 for each row
@@ -580,9 +641,12 @@ mod tests {
         let data = load_training_data(file.path().to_str().unwrap(), 2).unwrap();
 
         // Verify dimensions
+        assert_eq!(data.sex.len(), 20);
         assert_eq!(data.pcs.shape(), &[20, 2]);
 
         // Verify the matrix contents for a few key elements
+        assert_abs_diff_eq!(data.sex[0], 0.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.sex[1], 1.0, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 0]], 0.2, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 1]], 0.3, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[10, 0]], 1.2, epsilon = 1e-6);
@@ -594,21 +658,23 @@ mod tests {
     #[test]
     fn test_load_prediction_data_success() {
         // Create test data that includes required columns including weights
-        let header = "score\tPC1\tweights";
-        let data_row = "1.5\t0.1\t1.0"; // Added dummy weight
+        let header = "score\tsex\tPC1\tweights";
+        let data_row = "1.5\t1\t0.1\t1.0"; // Added dummy weight
         let content = generate_csv_content(header, data_row, 30);
         let file = create_test_csv(&content).unwrap();
         let data = load_prediction_data(file.path().to_str().unwrap(), 1).unwrap();
 
         assert_eq!(data.p.len(), 30);
+        assert_eq!(data.sex.len(), 30);
         assert_eq!(data.pcs.shape(), &[30, 1]);
         assert_abs_diff_eq!(data.p[0], 1.5, epsilon = 1e-6);
+        assert_abs_diff_eq!(data.sex[0], 1.0, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 0]], 0.1, epsilon = 1e-6);
     }
 
     #[test]
     fn test_error_column_not_found() {
-        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\t1.5\t0.1", 30);
+        let content = generate_csv_content("phenotype\tscore\tsex\tPC1", "1.0\t1.5\t0\t0.1", 30);
         let file = create_test_csv(&content).unwrap();
         let err = load_training_data(file.path().to_str().unwrap(), 2).unwrap_err();
         match err {
@@ -620,7 +686,7 @@ mod tests {
     #[test]
     fn test_error_missing_values() {
         // Create test data with missing values in the score column
-        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\t\t0.1", 30);
+        let content = generate_csv_content("phenotype\tscore\tsex\tPC1", "1.0\t\t0\t0.1", 30);
         let file = create_test_csv(&content).unwrap();
 
         // Call the function that should detect the error
@@ -641,7 +707,11 @@ mod tests {
     #[test]
     fn test_error_wrong_type() {
         // Create test data with a non-numeric value in the score column
-        let content = generate_csv_content("phenotype\tscore\tPC1", "1.0\tnot_a_number\t0.1", 30);
+        let content = generate_csv_content(
+            "phenotype\tscore\tsex\tPC1",
+            "1.0\tnot_a_number\t0\t0.1",
+            30,
+        );
         let file = create_test_csv(&content).unwrap();
 
         // Call the function that should detect the error
