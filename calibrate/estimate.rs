@@ -166,11 +166,12 @@ pub enum EstimationError {
     #[error(
         "Model is over-parameterized: {num_coeffs} coefficients for {num_samples} samples.\n\n\
         Coefficient Breakdown:\n\
-          - Intercept:           {intercept_coeffs}\n\
-          - Sex Main Effect:    {sex_main_coeffs}\n\
-          - PGS Main Effects:    {pgs_main_coeffs}\n\
-          - PC Main Effects:     {pc_main_coeffs}\n\
-          - Interaction Effects: {interaction_coeffs}"
+          - Intercept:               {intercept_coeffs}\n\
+          - Sex Main Effect:         {sex_main_coeffs}\n\
+          - PGS Main Effects:        {pgs_main_coeffs}\n\
+          - Sex×PGS Interaction:     {sex_pgs_interaction_coeffs}\n\
+          - PC Main Effects:         {pc_main_coeffs}\n\
+          - PC×PGS Interaction:      {interaction_coeffs}"
     )]
     ModelOverparameterized {
         num_coeffs: usize,
@@ -179,6 +180,7 @@ pub enum EstimationError {
         sex_main_coeffs: usize,
         pgs_main_coeffs: usize,
         pc_main_coeffs: usize,
+        sex_pgs_interaction_coeffs: usize,
         interaction_coeffs: usize,
     },
 
