@@ -472,6 +472,7 @@ pub fn producer_thread<F>(
     }
 }
 
+
 /// The producer for the multi-file pipeline. It seamlessly switches between memory-mapped
 /// files as it iterates through the globally-indexed list of required variants.
 pub fn multi_file_producer_thread<F>(
@@ -576,5 +577,72 @@ pub fn multi_file_producer_thread<F>(
 
     if local_variants_processed > 0 {
         variants_processed_count.fetch_add(local_variants_processed, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PUBLIC_BUCKET: &str = "genomics-public-data";
+    const PUBLIC_REFERENCE_OBJECT: &str =
+        "references/hg38/v0/Homo_sapiens_assembly38.fasta";
+
+    fn ensure_remote_source() -> Result<RemoteByteRangeSource, PipelineError> {
+        RemoteByteRangeSource::new(PUBLIC_BUCKET, PUBLIC_REFERENCE_OBJECT)
+    }
+
+    #[test]
+    fn remote_reference_exposes_length_and_initial_bytes() -> Result<(), PipelineError> {
+        let source = ensure_remote_source()?;
+        assert!(source.len() > 0, "Remote reference must report a non-zero length");
+
+        let mut buffer = vec![0u8; 4096];
+        source.read_at(0, &mut buffer)?;
+        assert!(
+            buffer.iter().any(|&byte| byte != 0),
+            "Expected streamed data to contain non-zero bytes"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_reference_streams_across_multiple_blocks() -> Result<(), PipelineError> {
+        let source = ensure_remote_source()?;
+        let read_len = REMOTE_BLOCK_SIZE + 1024;
+        let mut buffer = vec![0u8; read_len];
+        source.read_at(0, &mut buffer)?;
+        assert!(
+            buffer.iter().any(|&byte| byte != 0),
+            "Expected streamed range to contain remote data"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_reference_supports_boundary_reads() -> Result<(), PipelineError> {
+        let source = ensure_remote_source()?;
+        let len = source.len();
+        assert!(len > REMOTE_BLOCK_SIZE as u64);
+
+        let offset = REMOTE_BLOCK_SIZE as u64 - 256;
+        let mut buffer = vec![0u8; 1024];
+        source.read_at(offset, &mut buffer)?;
+        assert!(
+            buffer.iter().any(|&byte| byte != 0),
+            "Expected boundary read to yield streamed data"
+        );
+
+        let tail_offset = len.saturating_sub(512);
+        let mut tail_buffer = vec![0u8; (len - tail_offset) as usize];
+        source.read_at(tail_offset, &mut tail_buffer)?;
+        assert!(
+            tail_buffer.iter().any(|&byte| byte != 0),
+            "Expected trailing read to yield streamed data"
+        );
+
+        Ok(())
     }
 }
