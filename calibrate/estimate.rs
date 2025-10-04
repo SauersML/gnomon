@@ -3136,6 +3136,7 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::calibrate::construction::TermType;
         use crate::calibrate::model::{
             BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
         };
@@ -4147,9 +4148,34 @@ pub mod internal {
             let mut total_edfs = Vec::new();
             let mut min_eigs = Vec::new();
             // Track how often folds pick rho near the search bounds
-            let mut rho_boundary_hits: usize = 0;
+            let mut non_sex_rho_boundary_hits: usize = 0;
             let mut total_folds_evaluated: usize = 0;
             let mut proj_rates = Vec::new();
+            let mut penalty_labels: Option<Vec<String>> = None;
+            let mut penalty_types: Option<Vec<TermType>> = None;
+            let mut rho_by_penalty: Vec<Vec<f64>> = Vec::new();
+            let mut near_bound_counts: Vec<usize> = Vec::new();
+            let mut pos_bound_counts: Vec<usize> = Vec::new();
+
+            fn compute_median(values: &[f64]) -> Option<f64> {
+                if values.is_empty() {
+                    return None;
+                }
+                let mut sorted = values.to_vec();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mid = sorted.len() / 2;
+                let median = if sorted.len() % 2 == 0 {
+                    (sorted[mid - 1] + sorted[mid]) / 2.0
+                } else {
+                    sorted[mid]
+                };
+                Some(median)
+            }
+
+            fn is_sex_related(label: &str, term_type: &TermType) -> bool {
+                matches!(term_type, TermType::SexPgsInteraction)
+                    || label.to_ascii_lowercase().contains("sex")
+            }
 
             println!(
                 "[CV] Starting real-world metrics evaluation: n_samples={}, k_folds={}, repeats={}",
@@ -4211,10 +4237,15 @@ pub mod internal {
 
                     // Train
                     let trained = train_model(&data_train, &base_config).expect("training failed");
+                    let rho_values: Vec<f64> = trained
+                        .lambdas
+                        .iter()
+                        .map(|&l| l.ln().clamp(-RHO_BOUND, RHO_BOUND))
+                        .collect();
                     println!(
                         "[CV]   Trained: lambdas={:?} (rho={:?}), hull={} facets",
                         trained.lambdas,
-                        trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>(),
+                        rho_values,
                         trained.hull.as_ref().map(|h| h.facets.len()).unwrap_or(0)
                     );
 
@@ -4222,14 +4253,89 @@ pub mod internal {
                     let (x_tr, s_list, layout, _, _, _, _, _, _) =
                         build_design_and_penalty_matrices(&data_train, &trained.config)
                             .expect("layout");
-                    let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
-                    let rho = Array1::from(
-                        trained
-                            .lambdas
-                            .iter()
-                            .map(|&l| l.ln().clamp(-RHO_BOUND, RHO_BOUND))
-                            .collect::<Vec<_>>(),
+
+                    if penalty_labels.is_none() {
+                        let mut labels = vec![String::new(); layout.num_penalties];
+                        let mut types = vec![TermType::PcMainEffect; layout.num_penalties];
+                        for block in &layout.penalty_map {
+                            for (component_idx, &pen_idx) in block.penalty_indices.iter().enumerate()
+                            {
+                                let label = if block.penalty_indices.len() > 1 {
+                                    match block.term_type {
+                                        TermType::SexPgsInteraction => match component_idx {
+                                            0 => "f(PGS,sex)[PGS]".to_string(),
+                                            1 => "f(PGS,sex)[sex]".to_string(),
+                                            _ => format!("{}[{}]", block.term_name, component_idx + 1),
+                                        },
+                                        _ => format!("{}[{}]", block.term_name, component_idx + 1),
+                                    }
+                                } else {
+                                    block.term_name.clone()
+                                };
+                                labels[pen_idx] = label;
+                                types[pen_idx] = block.term_type.clone();
+                            }
+                        }
+                        for (idx, label) in labels.iter().enumerate() {
+                            assert!(
+                                !label.is_empty(),
+                                "Penalty label not set for index {} (total {})",
+                                idx,
+                                layout.num_penalties
+                            );
+                        }
+                        penalty_labels = Some(labels);
+                        penalty_types = Some(types);
+                        rho_by_penalty = vec![Vec::new(); layout.num_penalties];
+                        near_bound_counts = vec![0; layout.num_penalties];
+                        pos_bound_counts = vec![0; layout.num_penalties];
+                    }
+
+                    assert_eq!(
+                        rho_values.len(),
+                        rho_by_penalty.len(),
+                        "Mismatch between rho values and penalty bookkeeping"
                     );
+
+                    let labels_ref = penalty_labels.as_ref().unwrap();
+                    let types_ref = penalty_types.as_ref().unwrap();
+                    let mut sex_bound_details = Vec::new();
+                    let mut other_bound_details = Vec::new();
+
+                    for (idx, &rho_val) in rho_values.iter().enumerate() {
+                        rho_by_penalty[idx].push(rho_val);
+                        if rho_val.abs() >= (RHO_BOUND - 1.0) {
+                            near_bound_counts[idx] += 1;
+                            if rho_val >= RHO_BOUND - 1.0 {
+                                pos_bound_counts[idx] += 1;
+                            }
+                            if is_sex_related(&labels_ref[idx], &types_ref[idx]) {
+                                sex_bound_details
+                                    .push(format!("{} (rho={:.2})", labels_ref[idx], rho_val));
+                            } else {
+                                other_bound_details
+                                    .push(format!("{} (rho={:.2})", labels_ref[idx], rho_val));
+                            }
+                        }
+                    }
+
+                    if !other_bound_details.is_empty() {
+                        non_sex_rho_boundary_hits += 1;
+                        println!(
+                            "[CV]   WARNING: rho near bounds (non-sex terms): {:?}",
+                            other_bound_details
+                        );
+                    }
+                    if !sex_bound_details.is_empty() {
+                        println!(
+                            "[CV]   INFO: sex-related penalties near +bound: {:?}",
+                            sex_bound_details
+                        );
+                    }
+                    total_folds_evaluated += 1;
+
+                    let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
+                    let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
                     let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
                         rho.view(),
@@ -4253,20 +4359,6 @@ pub mod internal {
                     let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
                     min_eigs.push(min_eig);
                     println!("[CV]   Penalized Hessian min-eig={:.3e}", min_eig);
-
-                    // Rho bounds sanity: count boundary hits instead of failing on a single fold
-                    let near_bounds = !trained
-                        .lambdas
-                        .iter()
-                        .all(|&l| l.ln().abs() < (RHO_BOUND - 1.0));
-                    if near_bounds {
-                        rho_boundary_hits += 1;
-                        println!(
-                            "[CV]   WARNING: rho near bounds: {:?}",
-                            trained.lambdas.iter().map(|&l| l.ln()).collect::<Vec<_>>()
-                        );
-                    }
-                    total_folds_evaluated += 1;
 
                     // PHC projection stats on validation
                     let proj_rate = if let Some(hull) = &trained.hull {
@@ -4363,6 +4455,62 @@ pub mod internal {
             );
             println!("[CV]  PHC: mean projection rate={:.2}%", 100.0 * proj_m);
 
+            if let (Some(labels), Some(types)) = (penalty_labels.as_ref(), penalty_types.as_ref()) {
+                println!("=== Rho summary by penalty ===");
+                for (idx, label) in labels.iter().enumerate() {
+                    if rho_by_penalty[idx].is_empty() {
+                        println!(" - {}: no folds evaluated", label);
+                        continue;
+                    }
+                    let median_str = compute_median(&rho_by_penalty[idx])
+                        .map(|m| format!("{:.2}", m))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let pos_rate = if total_folds_evaluated > 0 {
+                        pos_bound_counts[idx] as f64 / total_folds_evaluated as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        " - {}: median rho={}, +bound rate={:.1}%",
+                        label,
+                        median_str,
+                        100.0 * pos_rate
+                    );
+                }
+
+                for (idx, label) in labels.iter().enumerate() {
+                    if rho_by_penalty[idx].is_empty() {
+                        continue;
+                    }
+                    let near_rate = if total_folds_evaluated > 0 {
+                        near_bound_counts[idx] as f64 / total_folds_evaluated as f64
+                    } else {
+                        0.0
+                    };
+                    let pos_rate = if total_folds_evaluated > 0 {
+                        pos_bound_counts[idx] as f64 / total_folds_evaluated as f64
+                    } else {
+                        0.0
+                    };
+
+                    if is_sex_related(label, &types[idx]) {
+                        assert!(
+                            pos_rate >= 0.8,
+                            "Sex-related penalty '{}' failed to hit +bound in ≥80% of folds (rate {:.1}%)",
+                            label,
+                            100.0 * pos_rate
+                        );
+                    } else {
+                        assert!(
+                            near_rate <= 0.50,
+                            "Penalty '{}' hit rho bounds too often ({:.1}%)",
+                            label,
+                            100.0 * near_rate
+                        );
+                    }
+                }
+            }
+
             // Assertions per spec
             assert!(auc_m >= 0.60, "AUC mean too low: {:.3}", auc_m);
             assert!(auc_sd <= 0.06, "AUC SD too high: {:.3}", auc_sd);
@@ -4384,16 +4532,16 @@ pub mod internal {
             );
             assert!(ece_m <= 0.15, "ECE too high: {:.3}", ece_m);
 
-            // Allow occasional boundary solutions; fail only if frequent across folds
+            // Allow occasional boundary solutions for non-sex terms; fail only if frequent across folds
             let rho_boundary_rate = if total_folds_evaluated > 0 {
-                rho_boundary_hits as f64 / total_folds_evaluated as f64
+                non_sex_rho_boundary_hits as f64 / total_folds_evaluated as f64
             } else {
                 0.0
             };
             println!(
-                "[CV]  Rho near-bounds rate: {:.1}% ({} of {})",
+                "[CV]  Non-sex rho near-bounds rate: {:.1}% ({} of {})",
                 100.0 * rho_boundary_rate,
-                rho_boundary_hits,
+                non_sex_rho_boundary_hits,
                 total_folds_evaluated
             );
             // Allow up to 50% of folds to land near bounds; treat more as suspicious
