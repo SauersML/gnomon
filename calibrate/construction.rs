@@ -216,6 +216,12 @@ impl ModelLayout {
             None
         };
 
+        if sex_main_basis_ncols > 1 {
+            return Err(EstimationError::LayoutError(
+                "sex_main_basis_ncols must be 1 with current layout encoding".into(),
+            ));
+        }
+
         // Reserve capacities to avoid reallocations
         // Estimated number of penalized blocks: one per PC main effect, plus one per interaction (if enabled)
         let estimated_penalized_blocks = config.pc_configs.len()
