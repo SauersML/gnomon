@@ -37,16 +37,26 @@ const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_CACHE_CAPACITY: usize = 8;
 
-static RUNTIME_MANAGER: OnceLock<Result<Arc<Runtime>, PipelineError>> = OnceLock::new();
+static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
 
 fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
-    RUNTIME_MANAGER
-        .get_or_init(|| {
-            Runtime::new()
-                .map(Arc::new)
-                .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))
-        })
-        .clone()
+    if let Some(runtime) = RUNTIME_MANAGER.get() {
+        return Ok(Arc::clone(runtime));
+    }
+
+    let runtime = Arc::new(Runtime::new().map_err(|e| {
+        PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}"))
+    })?);
+
+    match RUNTIME_MANAGER.set(Arc::clone(&runtime)) {
+        Ok(()) => Ok(runtime),
+        Err(_) => Ok(
+            RUNTIME_MANAGER
+                .get()
+                .cloned()
+                .expect("Tokio runtime should be initialized"),
+        ),
+    }
 }
 
 /// A trait that abstracts sequential, line-oriented access to text data such as
