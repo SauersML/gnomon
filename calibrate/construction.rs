@@ -494,7 +494,7 @@ pub fn build_design_and_penalty_matrices(
     range_transforms.insert("pgs".to_string(), z_range_pgs);
 
     // Save the PGS sum-to-zero constraint transformation
-    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform);
+    sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
 
     // Stage: Generate range-only bases for PCs (functional ANOVA decomposition)
     let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
