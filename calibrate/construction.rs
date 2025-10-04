@@ -422,8 +422,18 @@ pub fn build_design_and_penalty_matrices(
         interaction_coeffs += (pgs_basis_coeffs - 1) * (pc_basis_coeffs - 1);
     }
 
-    let num_coeffs =
-        intercept_coeffs + sex_main_coeffs + pgs_main_coeffs + pc_main_coeffs + interaction_coeffs;
+    let sex_pgs_interaction_coeffs = if sex_main_coeffs > 0 {
+        pgs_main_coeffs
+    } else {
+        0
+    };
+
+    let num_coeffs = intercept_coeffs
+        + sex_main_coeffs
+        + pgs_main_coeffs
+        + sex_pgs_interaction_coeffs
+        + pc_main_coeffs
+        + interaction_coeffs;
 
     if num_coeffs > n_samples {
         // FAIL FAST before any expensive calculations
@@ -439,6 +449,7 @@ pub fn build_design_and_penalty_matrices(
             sex_main_coeffs,
             pgs_main_coeffs,
             pc_main_coeffs,
+            sex_pgs_interaction_coeffs,
             interaction_coeffs,
         });
     }
