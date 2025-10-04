@@ -10,7 +10,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'score/**'
-      - 'test/**'
+      - 'score/tests/**'
       - 'calibrate/**'
   pull_request:
     branches: [main]
@@ -19,7 +19,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'score/**'
-      - 'test/**'
+      - 'score/tests/**'
       - 'calibrate/**'
 
 env:
@@ -269,12 +269,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-integration-${{ hashFiles('test/test.py') }}
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('score/tests/test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-integration-
       - run: pip install pandas numpy requests psutil tabulate polars pyarrow
       - run: chmod +x target/release/gnomon
-      - run: python -u test/test.py
+      - run: python -u score/tests/test.py
 
   python_test_simulation:
     needs: build_and_test
@@ -337,7 +337,7 @@ jobs:
         if: needs.build_and_test.outputs.artifact_available == 'true'
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('test/sim_test.py') }}
+          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('score/tests/sim_test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-simulation-
       - run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
@@ -346,7 +346,7 @@ jobs:
         if: needs.build_and_test.outputs.artifact_available == 'true'
       - id: sim_test
         if: needs.build_and_test.outputs.artifact_available == 'true'
-        run: python -u test/sim_test.py
+        run: python -u score/tests/sim_test.py
       - if: needs.build_and_test.outputs.artifact_available == 'true' && failure()
         run: |
           echo "The simulation test failed. Checking for OOM errors in kernel logs..."
@@ -385,12 +385,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('test/bench.py') }}
+          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('score/tests/bench.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-benchmark-
       - run: pip install pandas numpy requests psutil tabulate polars pyarrow
       - run: chmod +x target/release/gnomon
-      - run: python -u test/bench.py
+      - run: python -u score/tests/bench.py
 
   performance_reports:
     needs: build_and_test
@@ -469,7 +469,7 @@ jobs:
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
           
       - name: Run Profiling Harness
-        run: python test/perf.py
+        run: python score/tests/perf.py
           
       - name: Grant Cache Permissions
         if: always()
