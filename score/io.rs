@@ -15,6 +15,7 @@ use crate::pipeline::PipelineError;
 use crate::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
+use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
@@ -43,19 +44,19 @@ fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
         return Ok(Arc::clone(runtime));
     }
 
-    let runtime = Runtime::new()
-        .map(Arc::new)
-        .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))?;
+    let runtime = Arc::new(Runtime::new().map_err(|e| {
+        PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}"))
+    })?);
 
-    if RUNTIME_MANAGER.set(Arc::clone(&runtime)).is_err() {
-        // Another thread initialized the runtime between our `get` and `set`.
-        // Return the previously stored runtime to avoid constructing duplicates.
-        if let Some(existing) = RUNTIME_MANAGER.get() {
-            return Ok(Arc::clone(existing));
-        }
+    match RUNTIME_MANAGER.set(Arc::clone(&runtime)) {
+        Ok(()) => Ok(runtime),
+        Err(_) => Ok(
+            RUNTIME_MANAGER
+                .get()
+                .cloned()
+                .expect("Tokio runtime should be initialized"),
+        ),
     }
-
-    Ok(runtime)
 }
 
 /// A trait that abstracts sequential, line-oriented access to text data such as
@@ -242,10 +243,7 @@ impl TextSource for LocalTextSource {
         let bytes_read = self
             .reader
             .read_until(b'\n', &mut self.line)
-            .map_err(|e| PipelineError::Io(format!(
-                "Error reading {}: {e}",
-                self.path_display
-            )))?;
+            .map_err(|e| PipelineError::Io(format!("Error reading {}: {e}", self.path_display)))?;
 
         if bytes_read == 0 {
             return Ok(None);
@@ -380,30 +378,38 @@ struct RemoteByteRangeSource {
 impl RemoteByteRangeSource {
     fn new(bucket: &str, object: &str) -> Result<Self, PipelineError> {
         let runtime = get_shared_runtime()?;
-        let storage = runtime
-            .block_on(Storage::builder().build())
-            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage client: {e}")))?;
-        let control = runtime
-            .block_on(StorageControl::builder().build())
-            .map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to create Cloud Storage control client: {e}"
-                ))
-            })?;
+        let (mut storage, control) = Self::create_clients(&runtime, None)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
-        let metadata = runtime
-            .block_on(
-                control
-                    .get_object()
-                    .set_bucket(bucket_path.clone())
-                    .set_object(object.to_string())
-                    .send(),
-            )
-            .map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to fetch metadata for gs://{bucket}/{object}: {e}"
-                ))
-            })?;
+        let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object) {
+            Ok(metadata) => metadata,
+            Err(err) if Self::is_authentication_error(&err) => {
+                let err_msg = err.to_string();
+                debug!(
+                    "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
+                );
+                let (fallback_storage, fallback_control) = Self::create_clients(
+                    &runtime,
+                    Some(AnonymousCredentials::new().build()),
+                )
+                .map_err(|client_err| {
+                    PipelineError::Io(format!(
+                        "Failed to initialize Cloud Storage clients with anonymous credentials after authentication failure: {client_err} (initial error: {err_msg})"
+                    ))
+                })?;
+                storage = fallback_storage;
+                Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object)
+                    .map_err(|retry_err| {
+                        PipelineError::Io(format!(
+                            "Failed to fetch metadata for gs://{bucket}/{object} with anonymous credentials: {retry_err} (initial error: {err_msg})"
+                        ))
+                    })?
+            }
+            Err(err) => {
+                return Err(PipelineError::Io(format!(
+                    "Failed to fetch metadata for gs://{bucket}/{object}: {err}"
+                )));
+            }
+        };
         if metadata.size < 0 {
             return Err(PipelineError::Io(format!(
                 "Remote object gs://{bucket}/{object} reported negative size"
@@ -422,6 +428,51 @@ impl RemoteByteRangeSource {
             len,
             cache: Mutex::new(RemoteCache::new(REMOTE_CACHE_CAPACITY)),
         })
+    }
+
+    fn create_clients(
+        runtime: &Arc<Runtime>,
+        credentials: Option<Credentials>,
+    ) -> Result<(Storage, StorageControl), PipelineError> {
+        let storage_builder = match credentials.clone() {
+            Some(creds) => Storage::builder().with_credentials(creds),
+            None => Storage::builder(),
+        };
+        let storage = runtime.block_on(storage_builder.build()).map_err(|e| {
+            PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
+        })?;
+
+        let control_builder = match credentials {
+            Some(creds) => StorageControl::builder().with_credentials(creds),
+            None => StorageControl::builder(),
+        };
+        let control = runtime.block_on(control_builder.build()).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to create Cloud Storage control client: {e}"
+            ))
+        })?;
+
+        Ok((storage, control))
+    }
+
+    fn fetch_object_metadata(
+        runtime: &Arc<Runtime>,
+        control: &StorageControl,
+        bucket_path: &str,
+        object: &str,
+    ) -> Result<google_cloud_storage::model::Object, google_cloud_storage::Error> {
+        runtime.block_on(
+            control
+                .get_object()
+                .set_bucket(bucket_path.to_string())
+                .set_object(object.to_string())
+                .send(),
+        )
+    }
+
+    fn is_authentication_error(error: &google_cloud_storage::Error) -> bool {
+        let message = error.to_string();
+        message.contains("cannot create the authentication headers")
     }
 
     fn block_length(&self, start: u64) -> usize {
@@ -696,7 +747,6 @@ pub fn producer_thread<F>(
     }
 }
 
-
 /// The producer for the multi-file pipeline. It seamlessly switches between memory-mapped
 /// files as it iterates through the globally-indexed list of required variants.
 pub fn multi_file_producer_thread<F>(
@@ -809,8 +859,7 @@ mod tests {
     use super::*;
 
     const PUBLIC_BUCKET: &str = "genomics-public-data";
-    const PUBLIC_REFERENCE_OBJECT: &str =
-        "references/hg38/v0/Homo_sapiens_assembly38.fasta";
+    const PUBLIC_REFERENCE_OBJECT: &str = "references/hg38/v0/Homo_sapiens_assembly38.fasta";
 
     fn ensure_remote_source() -> Result<RemoteByteRangeSource, PipelineError> {
         RemoteByteRangeSource::new(PUBLIC_BUCKET, PUBLIC_REFERENCE_OBJECT)
@@ -819,7 +868,10 @@ mod tests {
     #[test]
     fn remote_reference_exposes_length_and_initial_bytes() -> Result<(), PipelineError> {
         let source = ensure_remote_source()?;
-        assert!(source.len() > 0, "Remote reference must report a non-zero length");
+        assert!(
+            source.len() > 0,
+            "Remote reference must report a non-zero length"
+        );
 
         let mut buffer = vec![0u8; 4096];
         source.read_at(0, &mut buffer)?;
