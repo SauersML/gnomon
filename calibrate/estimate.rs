@@ -4168,8 +4168,6 @@ pub mod internal {
             let mut eces = Vec::new();
             let mut total_edfs = Vec::new();
             let mut min_eigs = Vec::new();
-            // Track how often folds pick rho near the search bounds
-            let mut non_sex_rho_boundary_hits: usize = 0;
             let mut total_folds_evaluated: usize = 0;
             let mut proj_rates = Vec::new();
             let mut penalty_labels: Option<Vec<String>> = None;
@@ -4390,13 +4388,6 @@ pub mod internal {
                         }
                     }
 
-                    if !other_bound_details.is_empty() {
-                        non_sex_rho_boundary_hits += 1;
-                        println!(
-                            "[CV]   WARNING: rho near bounds (non-sex terms): {:?}",
-                            other_bound_details
-                        );
-                    }
                     if !sex_bound_details.is_empty() {
                         println!(
                             "[CV]   INFO: sex-related penalties near +bound: {:?}",
