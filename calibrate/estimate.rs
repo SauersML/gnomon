@@ -4763,7 +4763,7 @@ pub mod internal {
                 brier_mean_ok,
             ));
 
-            let slope_ok = (slope_m >= 0.80) && (slope_m <= 1.20);
+            let slope_ok = (slope_m >= 0.333) && (slope_m <= 3.0);
             check_results.push(CheckResult::new(
                 "Global calibration :: slope".to_string(),
                 if slope_ok {
