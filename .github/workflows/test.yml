@@ -230,7 +230,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [[ -d build-output/target ]]; then
+          if [[ -f build-output/target/release/gnomon ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
