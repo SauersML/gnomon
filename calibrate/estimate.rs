@@ -4072,13 +4072,25 @@ pub mod internal {
 
         #[derive(Debug)]
         struct CheckResult {
+            term: String,
+            metric: String,
             description: String,
             passed: bool,
         }
 
         impl CheckResult {
-            fn new(description: String, passed: bool) -> Self {
-                Self { description, passed }
+            fn new(
+                term: impl Into<String>,
+                metric: impl Into<String>,
+                description: String,
+                passed: bool,
+            ) -> Self {
+                Self {
+                    term: term.into(),
+                    metric: metric.into(),
+                    description,
+                    passed,
+                }
             }
         }
 
@@ -4303,19 +4315,23 @@ pub mod internal {
                         }
                         for (idx, label) in labels.iter().enumerate() {
                             let label_set = !label.is_empty();
+                            let term_label = if label_set {
+                                format!("penalty_index_{} ({})", idx, label)
+                            } else {
+                                format!("penalty_index_{} (unassigned)", idx)
+                            };
                             check_results.push(CheckResult::new(
+                                term_label,
+                                "penalty_label_initialization",
                                 if label_set {
                                     format!(
                                         "Penalty label assigned for index {} of {} -> '{}'",
-                                        idx,
-                                        layout.num_penalties,
-                                        label
+                                        idx, layout.num_penalties, label
                                     )
                                 } else {
                                     format!(
                                         "Penalty label not set for index {} (total {})",
-                                        idx,
-                                        layout.num_penalties
+                                        idx, layout.num_penalties
                                     )
                                 },
                                 label_set,
@@ -4330,6 +4346,8 @@ pub mod internal {
 
                     let rho_len_match = rho_values.len() == rho_by_penalty.len();
                     check_results.push(CheckResult::new(
+                        "global::rho_vector",
+                        "rho_length_consistency",
                         if rho_len_match {
                             format!(
                                 "Rho values count ({}) matches penalty bookkeeping ({})",
@@ -4431,16 +4449,24 @@ pub mod internal {
                         0.0
                     };
                     let proj_rate_ok = proj_rate <= 0.20;
+                    let fold_term =
+                        format!("repeat {} fold {} PHC projection", rep_idx + 1, fold + 1);
                     check_results.push(CheckResult::new(
+                        fold_term,
+                        "projection_rate_fold",
                         if proj_rate_ok {
                             format!(
-                                "Mean projection rate {:.2}% within ≤20% threshold",
-                                100.0 * proj_rate
+                                "PHC projection rate {:.2}% within ≤20% threshold (repeat {}, fold {})",
+                                100.0 * proj_rate,
+                                rep_idx + 1,
+                                fold + 1
                             )
                         } else {
                             format!(
-                                "Mean projection rate exceeds 20% threshold: {:.2}%",
-                                100.0 * proj_rate
+                                "PHC projection rate exceeds 20% threshold: {:.2}% (repeat {}, fold {})",
+                                100.0 * proj_rate,
+                                rep_idx + 1,
+                                fold + 1
                             )
                         },
                         proj_rate_ok,
@@ -4553,10 +4579,13 @@ pub mod internal {
                     } else {
                         0.0
                     };
+                    let term_name = format!("penalty: {}", label);
 
                     if is_sex_related(label, &types[idx]) {
                         let pos_bound_ok = pos_rate >= 0.8;
                         check_results.push(CheckResult::new(
+                            term_name.clone(),
+                            "sex_penalty_positive_bound_rate",
                             if pos_bound_ok {
                                 format!(
                                     "Sex-related penalty '{}' hit +bound in {:.1}% of folds (≥80% expected)",
@@ -4580,6 +4609,8 @@ pub mod internal {
                     ) {
                         let pos_rate_ok = pos_rate <= 0.50;
                         check_results.push(CheckResult::new(
+                            term_name.clone(),
+                            "null_space_positive_bound_rate",
                             if pos_rate_ok {
                                 format!(
                                     "Null-space penalty '{}' +bound rate {:.1}% within ≤50% threshold",
@@ -4598,6 +4629,8 @@ pub mod internal {
                     } else {
                         let near_rate_ok = near_rate <= 0.50;
                         check_results.push(CheckResult::new(
+                            term_name.clone(),
+                            "rho_near_bound_rate",
                             if near_rate_ok {
                                 format!(
                                     "Penalty '{}' near-bound rate {:.1}% within ≤50% threshold",
@@ -4618,6 +4651,8 @@ pub mod internal {
 
                 let pgs_near_len_ok = pgs_pc1_near_rates.len() == 2;
                 check_results.push(CheckResult::new(
+                    "penalty_group: f(PGS,PC1)",
+                    "component_count",
                     if pgs_near_len_ok {
                         "Observed two penalties for f(PGS,PC1)".to_string()
                     } else {
@@ -4634,6 +4669,8 @@ pub mod internal {
                     .collect();
                 let pgs_near_rate_ok = pgs_pc1_near_rates.iter().any(|&rate| rate <= 0.50);
                 check_results.push(CheckResult::new(
+                    "penalty_group: f(PGS,PC1)",
+                    "near_bound_rate_by_component",
                     if pgs_near_rate_ok {
                         format!(
                             "At least one f(PGS,PC1) penalty within ≤50% near-bound rate (rates: [{}])",
@@ -4652,6 +4689,8 @@ pub mod internal {
             // Assertions per spec
             let auc_mean_ok = auc_m >= 0.60;
             check_results.push(CheckResult::new(
+                "global::performance",
+                "auc_mean",
                 if auc_mean_ok {
                     format!("AUC mean {:.3} ≥ 0.60", auc_m)
                 } else {
@@ -4661,6 +4700,8 @@ pub mod internal {
             ));
             let auc_sd_ok = auc_sd <= 0.06;
             check_results.push(CheckResult::new(
+                "global::performance",
+                "auc_sd",
                 if auc_sd_ok {
                     format!("AUC SD {:.3} ≤ 0.06", auc_sd)
                 } else {
@@ -4670,6 +4711,8 @@ pub mod internal {
             ));
             let pr_mean_ok = pr_m > 0.5;
             check_results.push(CheckResult::new(
+                "global::performance",
+                "pr_auc_mean",
                 if pr_mean_ok {
                     format!("PR-AUC mean {:.3} > 0.5", pr_m)
                 } else {
@@ -4680,6 +4723,8 @@ pub mod internal {
 
             let ll_mean_ok = ll_m <= 0.70;
             check_results.push(CheckResult::new(
+                "global::performance",
+                "log_loss_mean",
                 if ll_mean_ok {
                     format!("Log-loss mean {:.3} ≤ 0.70", ll_m)
                 } else {
@@ -4689,6 +4734,8 @@ pub mod internal {
             ));
             let brier_mean_ok = br_m <= 0.25;
             check_results.push(CheckResult::new(
+                "global::performance",
+                "brier_mean",
                 if brier_mean_ok {
                     format!("Brier mean {:.3} ≤ 0.25", br_m)
                 } else {
@@ -4699,6 +4746,8 @@ pub mod internal {
 
             let slope_ok = (slope_m >= 0.80) && (slope_m <= 1.20);
             check_results.push(CheckResult::new(
+                "global::calibration",
+                "slope",
                 if slope_ok {
                     format!("Calibration slope {:.3} within [0.80, 1.20]", slope_m)
                 } else {
@@ -4708,6 +4757,8 @@ pub mod internal {
             ));
             let intercept_ok = (cint_m >= -0.20) && (cint_m <= 0.20);
             check_results.push(CheckResult::new(
+                "global::calibration",
+                "intercept",
                 if intercept_ok {
                     format!("Calibration intercept {:.3} within [-0.20, 0.20]", cint_m)
                 } else {
@@ -4718,10 +4769,15 @@ pub mod internal {
             const ECE_THRESHOLD: f64 = 0.15;
             let ece_ok = ece_m <= ECE_THRESHOLD;
             check_results.push(CheckResult::new(
+                "global::calibration",
+                "ece10",
                 if ece_ok {
                     format!("ECE {:.3} ≤ {:.2}", ece_m, ECE_THRESHOLD)
                 } else {
-                    format!("ECE too high: {:.3} (threshold {:.2})", ece_m, ECE_THRESHOLD)
+                    format!(
+                        "ECE too high: {:.3} (threshold {:.2})",
+                        ece_m, ECE_THRESHOLD
+                    )
                 },
                 ece_ok,
             ));
@@ -4741,6 +4797,8 @@ pub mod internal {
             // Allow up to 50% of folds to land near bounds; treat more as suspicious
             let rho_boundary_ok = rho_boundary_rate <= 0.50;
             check_results.push(CheckResult::new(
+                "global::penalty_behavior",
+                "rho_near_bound_rate_non_sex",
                 if rho_boundary_ok {
                     format!(
                         "Rho near-bound rate {:.1}% within ≤50% threshold",
@@ -4756,6 +4814,8 @@ pub mod internal {
             ));
             let edf_mean_ok = edf_m >= 10.0 && edf_m <= 80.0;
             check_results.push(CheckResult::new(
+                "global::complexity",
+                "edf_mean",
                 if edf_mean_ok {
                     format!("EDF mean {:.2} within [10, 80]", edf_m)
                 } else {
@@ -4765,6 +4825,8 @@ pub mod internal {
             ));
             let edf_sd_ok = edf_sd <= 10.0;
             check_results.push(CheckResult::new(
+                "global::complexity",
+                "edf_sd",
                 if edf_sd_ok {
                     format!("EDF SD {:.2} ≤ 10.0", edf_sd)
                 } else {
@@ -4774,6 +4836,8 @@ pub mod internal {
             ));
             let proj_mean_ok = proj_m <= 0.20;
             check_results.push(CheckResult::new(
+                "global::phc_projection",
+                "projection_rate_mean",
                 if proj_mean_ok {
                     format!(
                         "Mean PHC projection rate {:.2}% within ≤20% threshold",
@@ -4793,7 +4857,10 @@ pub mod internal {
                 check_results.iter().filter(|r| !r.passed).collect();
             for result in &check_results {
                 let status = if result.passed { "PASS" } else { "FAIL" };
-                println!("[{}] {}", status, result.description);
+                println!(
+                    "[{}] term='{}' metric='{}' {}",
+                    status, result.term, result.metric, result.description
+                );
             }
             if !failed_checks.is_empty() {
                 panic!(
