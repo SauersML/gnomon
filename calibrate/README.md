@@ -13,15 +13,17 @@ calibration or identity-scale accuracy.
 The primary estimator is a generalized additive model whose linear predictor is
 
 ```
-η(x) = β₀ + f_pgs(PGS) + Σ_j f_j(PC_j) + Σ_j f_{pgs,j}(PGS, PC_j),
+η(x) = β₀ + f_{pgs}(PGS) + γ_{sex}·sex + Σ_j f_j(PC_j) + Σ_j f_{pgs,j}(PGS, PC_j) + f_{pgs,sex}(PGS, sex),
 ```
 
-where `f_pgs` and each `f_j` are univariate spline smooths and `f_{pgs,j}` are
-tensor-product interactions between the polygenic score and the _j_-th principal
-component. This structure is encoded in [`construction.rs`](construction.rs),
-which wires the marginal and interaction bases into a single design matrix with
-sum-to-zero constraints and ANOVA-style orthogonalization so the additive terms
-are identifiable and interpretable.
+where `f_{pgs}` and each `f_j` are univariate spline smooths, `γ_{sex}` is an
+unpenalized linear main effect for the binary sex covariate, `f_{pgs,j}` are
+tensor-product interactions between the polygenic score and the _j_-th
+principal component, and `f_{pgs,sex}` is a varying-coefficient term that lets
+the polygenic score effect differ by sex. This structure is encoded in
+[`construction.rs`](construction.rs), which wires the marginal and interaction
+bases into a single design matrix with sum-to-zero constraints and ANOVA-style
+orthogonalization so the additive terms are identifiable and interpretable.
 
 Two likelihoods are supported via [`model::LinkFunction`](model.rs): logistic
 (`Logit`) for binary traits and Gaussian identity (`Identity`) for continuous
@@ -33,9 +35,11 @@ stored for prediction-time standard errors.
 
 Each smooth term is represented with B-spline bases generated in
 [`basis.rs`](basis.rs). Difference penalties of configurable order control the
-wiggliness of the univariate smooths, and tensor-product penalties regularize
-the interactions. These penalties respect the null spaces implied by the ANOVA
-constraints so that intercepts and lower-order components remain unpenalized by
+wiggliness of the univariate smooths, tensor-product penalties regularize the
+interactions with PCs, and a double-penalty construction (null-space plus
+wiggle penalty) tempers the sex×PGS varying coefficient. These penalties
+respect the null spaces implied by the ANOVA constraints so that intercepts,
+sex main effects, and other lower-order components remain unpenalized by
 construction.
 
 Smoothing parameters (`λ`) are learned rather than fixed. [`estimate.rs`](estimate.rs)
@@ -71,9 +75,11 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
 ## What lives where
 
 - [`data.rs`](data.rs) reads TSV inputs with Polars, enforces the strict schema
-  (`phenotype`, `score`, `PC*`, `weights`), and produces the `TrainingData`
-  bundle consumed by the optimizer. The same module also validates prediction
-  inputs and generates stable sample identifiers.
+  (`phenotype`, `score`, `sex`, `PC*`, optional `weights`, optional
+  `sample_id`), and produces the `TrainingData` bundle consumed by the
+  optimizer. The same module also validates prediction inputs, defaults missing
+  weights to 1.0, and generates stable sample identifiers when none are
+  provided.
 - [`basis.rs`](basis.rs) builds B-spline bases, applies sum-to-zero constraints,
   and constructs difference penalties that ultimately drive smoothness control
   for both the primary model and the calibrator.
@@ -103,14 +109,17 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
 ## Training flow at a glance
 
 1. **Load and validate data** – Callers invoke `data::load_training_data`, which
-   reads the TSV file lazily with Polars, verifies column types, enforces the
-   minimum-row requirement, and returns `TrainingData` containing the phenotype,
-   scores, PCs, and sample weights.
+   reads the TSV file with Polars, verifies column types (including the
+   binary `sex` column), enforces the minimum-row requirement, and returns
+   `TrainingData` containing the phenotype, score, sex indicator, principal
+   components, and a weight vector (defaulting to ones when the file omits
+   `weights`).
 2. **Construct the base GAM** – `estimate::train_model` delegates to
    `construction::build_design_and_penalty_matrices`. This step selects knot
    vectors via `basis`, assembles the block-structured design matrix `X`, and
    pairs each block with its penalty matrices. The resulting `ModelLayout`
-   tracks intercept, PC main effects, tensor-product interactions, and
+   tracks the intercept, sex main effect, PGS smooth, PC main effects,
+   tensor-product interactions, the sex×PGS varying coefficient, and their
    null-space bases.
 3. **Optimize smoothing parameters** – With the design in place, the REML
    optimizer in `estimate.rs` alternates between P-IRLS solves (via `pirls.rs`)
@@ -123,11 +132,13 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
 5. **Optional calibrator fitting** – If `model::calibrator_enabled()` returns
    true, `estimate::train_model` computes approximate leave-one-out (ALO)
    diagnostics from the converged fit using `calibrator::compute_alo_features`.
-   Those diagnostics (baseline predictor, its standard error, and hull distance)
-   feed into `calibrator::build_calibrator_design`, which mirrors the spline
-   machinery to create a smaller additive model. REML smoothing selection is
-   reused through `calibrator::fit_calibrator`, yielding coefficients, block
-   lambdas, and (for identity models) a residual scale estimate.
+   Those diagnostics (baseline predictor, its standard error, and the signed
+   distance to the peeled hull, along with the identity-scale baseline needed
+   for constraints) feed into `calibrator::build_calibrator_design`, which
+   mirrors the spline machinery to create a smaller additive model. REML
+   smoothing selection is reused through `calibrator::fit_calibrator`, yielding
+   coefficients, block lambdas, and (for identity models) a residual scale
+   estimate.
 6. **Persist the result** – The fitted coefficients, smoothing parameters, hull,
    and calibrator (if present) are serialized through `model::TrainedModel` so
    that downstream tools can reload them exactly.
