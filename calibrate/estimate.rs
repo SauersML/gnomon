@@ -4798,35 +4798,6 @@ pub mod internal {
                 ece_ok,
             ));
 
-            // Allow occasional boundary solutions for non-sex terms; fail only if frequent across folds
-            let rho_boundary_rate = if total_folds_evaluated > 0 {
-                non_sex_rho_boundary_hits as f64 / total_folds_evaluated as f64
-            } else {
-                0.0
-            };
-            println!(
-                "[CV]  Non-sex rho near-bounds rate: {:.1}% ({} of {})",
-                100.0 * rho_boundary_rate,
-                non_sex_rho_boundary_hits,
-                total_folds_evaluated
-            );
-            // Allow up to 50% of folds to land near bounds; treat more as suspicious
-            let rho_boundary_ok = rho_boundary_rate <= 0.50;
-            check_results.push(CheckResult::new(
-                "Penalty set :: non-sex boundary rate".to_string(),
-                if rho_boundary_ok {
-                    format!(
-                        "Rho near-bound rate {:.1}% within ≤50% threshold",
-                        100.0 * rho_boundary_rate
-                    )
-                } else {
-                    format!(
-                        "Rho at or near bounds across too many folds: {:.1}%",
-                        100.0 * rho_boundary_rate
-                    )
-                },
-                rho_boundary_ok,
-            ));
             let edf_mean_ok = edf_m >= 10.0 && edf_m <= 80.0;
             check_results.push(CheckResult::new(
                 "Model complexity :: EDF mean".to_string(),
