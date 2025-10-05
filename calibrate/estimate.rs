@@ -3136,13 +3136,251 @@ pub mod internal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::calibrate::construction::TermType;
+        use crate::calibrate::construction::{ModelLayout, TermType};
         use crate::calibrate::model::{
             BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
         };
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
+        use rand::seq::SliceRandom;
         use std::f64::consts::PI;
+
+        struct RealWorldTestFixture {
+            n_samples: usize,
+            p: Array1<f64>,
+            pcs: Array2<f64>,
+            y: Array1<f64>,
+            sex: Array1<f64>,
+            base_config: ModelConfig,
+        }
+
+        fn build_realworld_test_fixture() -> RealWorldTestFixture {
+            let n_samples = 840;
+            let mut rng = StdRng::seed_from_u64(42);
+
+            let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
+            let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
+            let pcs = pc1_values
+                .clone()
+                .into_shape_with_order((n_samples, 1))
+                .unwrap();
+
+            let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
+                let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
+                let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
+                let interaction = 0.4 * (pgs_val * pc_val).tanh();
+                -0.1 + pgs_effect + pc_effect + interaction
+            };
+
+            let y: Array1<f64> = (0..n_samples)
+                .map(|i| {
+                    let logit = true_logit(p[i], pcs[[i, 0]]);
+                    let prob = 1.0 / (1.0 + f64::exp(-logit));
+                    let prob = prob.clamp(1e-4, 1.0 - 1e-4);
+                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                })
+                .collect();
+
+            let sex = Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64));
+
+            let base_config = ModelConfig {
+                link_function: LinkFunction::Logit,
+                penalty_order: 2,
+                convergence_tolerance: 1e-6,
+                max_iterations: 100,
+                reml_convergence_tolerance: 1e-3,
+                reml_max_iterations: 30,
+                pgs_basis_config: BasisConfig {
+                    num_knots: 5,
+                    degree: 3,
+                },
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 5,
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
+                }],
+                pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
+            };
+
+            RealWorldTestFixture {
+                n_samples,
+                p,
+                pcs,
+                y,
+                sex,
+                base_config,
+            }
+        }
+
+        fn is_sex_related(label: &str, term_type: &TermType) -> bool {
+            matches!(term_type, TermType::SexPgsInteraction)
+                || label.to_ascii_lowercase().contains("sex")
+        }
+
+        fn assign_penalty_labels(layout: &ModelLayout) -> (Vec<String>, Vec<TermType>) {
+            let mut labels = vec![String::new(); layout.num_penalties];
+            let mut types = vec![TermType::PcMainEffect; layout.num_penalties];
+            for block in &layout.penalty_map {
+                for (component_idx, &pen_idx) in block.penalty_indices.iter().enumerate() {
+                    let label = if block.penalty_indices.len() > 1 {
+                        match block.term_type {
+                            TermType::SexPgsInteraction => match component_idx {
+                                0 => "f(PGS,sex)[PGS]".to_string(),
+                                1 => "f(PGS,sex)[sex]".to_string(),
+                                _ => format!("{}[{}]", block.term_name, component_idx + 1),
+                            },
+                            _ => format!("{}[{}]", block.term_name, component_idx + 1),
+                        }
+                    } else {
+                        block.term_name.clone()
+                    };
+                    labels[pen_idx] = label;
+                    types[pen_idx] = block.term_type.clone();
+                }
+            }
+            (labels, types)
+        }
+
+        struct SingleFoldResult {
+            labels: Vec<String>,
+            types: Vec<TermType>,
+            rho_values: Vec<f64>,
+        }
+
+        fn run_single_fold_realworld() -> SingleFoldResult {
+            let RealWorldTestFixture {
+                n_samples,
+                p,
+                pcs,
+                y,
+                sex,
+                base_config,
+            } = build_realworld_test_fixture();
+
+            let mut idx: Vec<usize> = (0..n_samples).collect();
+            let mut rng_fold = StdRng::seed_from_u64(42);
+            idx.shuffle(&mut rng_fold);
+
+            let k_folds = 6_usize;
+            let fold_size = (n_samples as f64 / k_folds as f64).ceil() as usize;
+            let start = 0;
+            let end = fold_size.min(n_samples);
+
+            let train_idx: Vec<usize> = idx
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, &sample)| {
+                    if pos >= start && pos < end {
+                        None
+                    } else {
+                        Some(sample)
+                    }
+                })
+                .collect();
+
+            let take = |arr: &Array1<f64>, ids: &Vec<usize>| -> Array1<f64> {
+                Array1::from(ids.iter().map(|&i| arr[i]).collect::<Vec<_>>())
+            };
+            let take_pcs = |mat: &Array2<f64>, ids: &Vec<usize>| -> Array2<f64> {
+                Array2::from_shape_fn((ids.len(), mat.ncols()), |(r, c)| mat[[ids[r], c]])
+            };
+
+            let data_train = TrainingData {
+                y: take(&y, &train_idx),
+                p: take(&p, &train_idx),
+                sex: take(&sex, &train_idx),
+                pcs: take_pcs(&pcs, &train_idx),
+                weights: Array1::<f64>::ones(train_idx.len()),
+            };
+
+            let trained = train_model(&data_train, &base_config).expect("training failed");
+            let (_, _, layout, ..) =
+                build_design_and_penalty_matrices(&data_train, &trained.config)
+                    .expect("layout");
+
+            let rho_values: Vec<f64> = trained
+                .lambdas
+                .iter()
+                .map(|&l| l.ln().clamp(-RHO_BOUND, RHO_BOUND))
+                .collect();
+            let (labels, types) = assign_penalty_labels(&layout);
+
+            SingleFoldResult {
+                labels,
+                types,
+                rho_values,
+            }
+        }
+
+        #[test]
+        fn test_realworld_sex_penalty_avoids_negative_bound() {
+            let SingleFoldResult {
+                labels,
+                types,
+                rho_values,
+            } = run_single_fold_realworld();
+
+            let mut found_sex_term = false;
+            for (idx, label) in labels.iter().enumerate() {
+                if is_sex_related(label, &types[idx]) {
+                    found_sex_term = true;
+                    assert!(
+                        rho_values[idx] > -(RHO_BOUND - 1.0),
+                        "Sex-related penalty '{}' hit the negative rho bound (rho={:.2})",
+                        label,
+                        rho_values[idx]
+                    );
+                }
+            }
+
+            assert!(found_sex_term, "Expected to find at least one sex-related penalty term");
+        }
+
+        #[test]
+        fn test_realworld_pgs_pc1_penalties_not_both_hugging_positive_bound() {
+            let SingleFoldResult {
+                labels,
+                types: _,
+                rho_values,
+            } = run_single_fold_realworld();
+
+            let mut pgs_pc1_stats = Vec::new();
+            for (idx, label) in labels.iter().enumerate() {
+                if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
+                    let near_pos_bound = rho_values[idx] >= RHO_BOUND - 1.0;
+                    pgs_pc1_stats.push((label.clone(), near_pos_bound, rho_values[idx]));
+                }
+            }
+
+            assert_eq!(
+                pgs_pc1_stats.len(),
+                2,
+                "Expected two f(PGS,PC1) penalty components, found {}",
+                pgs_pc1_stats.len()
+            );
+
+            let both_hug_positive = pgs_pc1_stats.iter().all(|(_, near, _)| *near);
+            let rho_debug: Vec<String> = pgs_pc1_stats
+                .iter()
+                .map(|(label, _, rho)| format!("{}: {:.2}", label, rho))
+                .collect();
+            assert!(
+                !both_hug_positive,
+                "Both f(PGS,PC1) penalties hugged the +rho bound ({}): {}",
+                RHO_BOUND - 1.0,
+                rho_debug.join(", ")
+            );
+        }
 
         fn make_identity_gradient_fixture() -> (
             Array1<f64>,
@@ -4094,65 +4332,14 @@ pub mod internal {
         /// Real-world evaluation: discrimination, calibration, complexity, and stability via CV.
         #[test]
         fn test_model_realworld_metrics() {
-            // --- Data generation (additive truth) ---
-            let n_samples = 840;
-            let mut rng = StdRng::seed_from_u64(42);
-
-            let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
-            let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
-            let pcs = pc1_values
-                .clone()
-                .into_shape_with_order((n_samples, 1))
-                .unwrap();
-
-            let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
-                let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
-                let interaction = 0.4 * (pgs_val * pc_val).tanh();
-                -0.1 + pgs_effect + pc_effect + interaction
-            };
-
-            // Outcomes
-            let y: Array1<f64> = (0..n_samples)
-                .map(|i| {
-                    let logit = true_logit(p[i], pcs[[i, 0]]);
-                    let prob = 1.0 / (1.0 + f64::exp(-logit));
-                    let prob = prob.clamp(1e-4, 1.0 - 1e-4);
-                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
-                })
-                .collect();
-
-            let sex = Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64));
-
-            // Base config
-            let base_config = ModelConfig {
-                link_function: LinkFunction::Logit,
-                penalty_order: 2,
-                convergence_tolerance: 1e-6,
-                max_iterations: 100,
-                reml_convergence_tolerance: 1e-3,
-                reml_max_iterations: 30,
-                pgs_basis_config: BasisConfig {
-                    num_knots: 5,
-                    degree: 3,
-                },
-                pc_configs: vec![PrincipalComponentConfig {
-                    name: "PC1".to_string(),
-                    basis_config: BasisConfig {
-                        num_knots: 5,
-                        degree: 3,
-                    },
-                    range: (-1.5, 1.5),
-                }],
-                pgs_range: (-2.0, 2.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: std::collections::HashMap::new(),
-                knot_vectors: std::collections::HashMap::new(),
-                range_transforms: std::collections::HashMap::new(),
-                pc_null_transforms: std::collections::HashMap::new(),
-                interaction_centering_means: std::collections::HashMap::new(),
-                interaction_orth_alpha: std::collections::HashMap::new(),
-            };
+            let RealWorldTestFixture {
+                n_samples,
+                p,
+                pcs,
+                y,
+                sex,
+                base_config,
+            } = build_realworld_test_fixture();
 
             // --- CV setup ---
             let repeats = vec![42_u64];
@@ -4192,11 +4379,6 @@ pub mod internal {
                     sorted[mid]
                 };
                 Some(median)
-            }
-
-            fn is_sex_related(label: &str, term_type: &TermType) -> bool {
-                matches!(term_type, TermType::SexPgsInteraction)
-                    || label.to_ascii_lowercase().contains("sex")
             }
 
             println!(
@@ -4284,32 +4466,7 @@ pub mod internal {
                             .expect("layout");
 
                     if penalty_labels.is_none() {
-                        let mut labels = vec![String::new(); layout.num_penalties];
-                        let mut types = vec![TermType::PcMainEffect; layout.num_penalties];
-                        for block in &layout.penalty_map {
-                            for (component_idx, &pen_idx) in
-                                block.penalty_indices.iter().enumerate()
-                            {
-                                let label = if block.penalty_indices.len() > 1 {
-                                    match block.term_type {
-                                        TermType::SexPgsInteraction => match component_idx {
-                                            0 => "f(PGS,sex)[PGS]".to_string(),
-                                            1 => "f(PGS,sex)[sex]".to_string(),
-                                            _ => format!(
-                                                "{}[{}]",
-                                                block.term_name,
-                                                component_idx + 1
-                                            ),
-                                        },
-                                        _ => format!("{}[{}]", block.term_name, component_idx + 1),
-                                    }
-                                } else {
-                                    block.term_name.clone()
-                                };
-                                labels[pen_idx] = label;
-                                types[pen_idx] = block.term_type.clone();
-                            }
-                        }
+                        let (labels, types) = assign_penalty_labels(&layout);
                         for (idx, label) in labels.iter().enumerate() {
                             let label_set = !label.is_empty();
                             let context = if label_set {
