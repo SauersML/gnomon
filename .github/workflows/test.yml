@@ -230,9 +230,11 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [[ -d build-output/target ]]; then
+          RELEASE_BIN="build-output/target/release/gnomon"
+          if [[ -f "$RELEASE_BIN" ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
+            echo "::notice::No release binary found at $RELEASE_BIN; downstream Python jobs will be skipped."
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
