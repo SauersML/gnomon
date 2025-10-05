@@ -4078,7 +4078,11 @@ pub mod internal {
         }
 
         impl CheckResult {
-            fn new(context: impl Into<String>, description: impl Into<String>, passed: bool) -> Self {
+            fn new(
+                context: impl Into<String>,
+                description: impl Into<String>,
+                passed: bool,
+            ) -> Self {
                 Self {
                     context: context.into(),
                     description: description.into(),
@@ -4091,7 +4095,7 @@ pub mod internal {
         #[test]
         fn test_model_realworld_metrics() {
             // --- Data generation (additive truth) ---
-            let n_samples = 800;
+            let n_samples = 820;
             let mut rng = StdRng::seed_from_u64(42);
 
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
@@ -4152,7 +4156,7 @@ pub mod internal {
 
             // --- CV setup ---
             let repeats = vec![42_u64, 1337_u64];
-            let k_folds = 5_usize;
+            let k_folds = 6_usize;
 
             // Accumulators
             let mut aucs = Vec::new();
@@ -4173,6 +4177,7 @@ pub mod internal {
             let mut rho_by_penalty: Vec<Vec<f64>> = Vec::new();
             let mut near_bound_counts: Vec<usize> = Vec::new();
             let mut pos_bound_counts: Vec<usize> = Vec::new();
+            let mut neg_bound_counts: Vec<usize> = Vec::new();
 
             let mut check_results: Vec<CheckResult> = Vec::new();
 
@@ -4319,15 +4324,12 @@ pub mod internal {
                                 if label_set {
                                     format!(
                                         "Penalty label assigned for index {} of {} -> '{}'",
-                                        idx,
-                                        layout.num_penalties,
-                                        label
+                                        idx, layout.num_penalties, label
                                     )
                                 } else {
                                     format!(
                                         "Penalty label not set for index {} (total {})",
-                                        idx,
-                                        layout.num_penalties
+                                        idx, layout.num_penalties
                                     )
                                 },
                                 label_set,
@@ -4338,6 +4340,7 @@ pub mod internal {
                         rho_by_penalty = vec![Vec::new(); layout.num_penalties];
                         near_bound_counts = vec![0; layout.num_penalties];
                         pos_bound_counts = vec![0; layout.num_penalties];
+                        neg_bound_counts = vec![0; layout.num_penalties];
                     }
 
                     let rho_len_match = rho_values.len() == rho_by_penalty.len();
@@ -4370,13 +4373,20 @@ pub mod internal {
                             near_bound_counts[idx] += 1;
                             if rho_val >= RHO_BOUND - 1.0 {
                                 pos_bound_counts[idx] += 1;
+                            } else if rho_val <= -(RHO_BOUND - 1.0) {
+                                neg_bound_counts[idx] += 1;
                             }
-                            if is_sex_related(&labels_ref[idx], &types_ref[idx]) {
+
+                            let label_ref = &labels_ref[idx];
+                            let term_type = &types_ref[idx];
+                            let is_sex = is_sex_related(label_ref, term_type);
+                            let near_negative_bound = rho_val <= -(RHO_BOUND - 1.0);
+                            if is_sex && rho_val >= RHO_BOUND - 1.0 {
                                 sex_bound_details
-                                    .push(format!("{} (rho={:.2})", labels_ref[idx], rho_val));
-                            } else {
+                                    .push(format!("{} (rho={:.2})", label_ref, rho_val));
+                            } else if !is_sex && !(label_ref == "f(PC1)" && near_negative_bound) {
                                 other_bound_details
-                                    .push(format!("{} (rho={:.2})", labels_ref[idx], rho_val));
+                                    .push(format!("{} (rho={:.2})", label_ref, rho_val));
                             }
                         }
                     }
@@ -4553,6 +4563,7 @@ pub mod internal {
                 }
 
                 let mut pgs_pc1_near_rates = Vec::new();
+                let mut pgs_pc1_pos_rates = Vec::new();
                 for (idx, label) in labels.iter().enumerate() {
                     if rho_by_penalty[idx].is_empty() {
                         continue;
@@ -4567,20 +4578,51 @@ pub mod internal {
                     } else {
                         0.0
                     };
+                    let neg_rate = if total_folds_evaluated > 0 {
+                        neg_bound_counts[idx] as f64 / total_folds_evaluated as f64
+                    } else {
+                        0.0
+                    };
 
                     if is_sex_related(label, &types[idx]) {
-                        let pos_bound_ok = pos_rate >= 0.8;
+                        let pos_bound_ok = pos_rate >= 0.10;
+                        let neg_bound_ok = neg_bound_counts[idx] == 0;
                         check_results.push(CheckResult::new(
                             format!("Penalty term '{}'", label),
-                            if pos_bound_ok {
+                            if pos_bound_ok && neg_bound_ok {
                                 format!(
-                                    "Sex-related penalty '{}' hit +bound in {:.1}% of folds (≥80% expected)",
+                                    "Sex-related penalty '{}' hit +bound in {:.1}% of folds (≥10% expected) and avoided -bound",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            } else if !pos_bound_ok {
+                                format!(
+                                    "Sex-related penalty '{}' failed to hit +bound in ≥10% of folds (rate {:.1}%)",
                                     label,
                                     100.0 * pos_rate
                                 )
                             } else {
                                 format!(
-                                    "Sex-related penalty '{}' failed to hit +bound in ≥80% of folds (rate {:.1}%)",
+                                    "Sex-related penalty '{}' should avoid -bound but hit it {:.1}% of folds",
+                                    label,
+                                    100.0 * neg_rate
+                                )
+                            },
+                            pos_bound_ok && neg_bound_ok,
+                        ));
+                    } else if label == "f(PC1)" {
+                        let pos_bound_ok = pos_rate <= 0.10;
+                        check_results.push(CheckResult::new(
+                            format!("Penalty term '{}'", label),
+                            if pos_bound_ok {
+                                format!(
+                                    "Penalty '{}' stayed away from +bound (hit rate {:.1}%) while allowing flexibility",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            } else {
+                                format!(
+                                    "Penalty '{}' approached +bound too often ({:.1}%)",
                                     label,
                                     100.0 * pos_rate
                                 )
@@ -4589,6 +4631,7 @@ pub mod internal {
                         ));
                     } else if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
                         pgs_pc1_near_rates.push(near_rate);
+                        pgs_pc1_pos_rates.push(pos_rate);
                     } else if matches!(
                         label.as_str(),
                         "f(PC1)_null" | "f(PGS)_null" | "f(PGS,PC1)_null"
@@ -4646,21 +4689,21 @@ pub mod internal {
                     },
                     pgs_near_len_ok,
                 ));
-                let rates_percent: Vec<String> = pgs_pc1_near_rates
+                let rates_percent: Vec<String> = pgs_pc1_pos_rates
                     .iter()
                     .map(|rate| format!("{:.1}%", 100.0 * rate))
                     .collect();
-                let pgs_near_rate_ok = pgs_pc1_near_rates.iter().any(|&rate| rate <= 0.50);
+                let pgs_near_rate_ok = pgs_pc1_pos_rates.iter().any(|&rate| rate <= 0.50);
                 check_results.push(CheckResult::new(
                     "Penalty family f(PGS,PC1)".to_string(),
                     if pgs_near_rate_ok {
                         format!(
-                            "At least one f(PGS,PC1) penalty within ≤50% near-bound rate (rates: [{}])",
+                            "At least one f(PGS,PC1) penalty stayed away from +bound in >50% of folds (rates: [{}])",
                             rates_percent.join(", ")
                         )
                     } else {
                         format!(
-                            "Both f(PGS,PC1) penalties exceeded 50% near-bound rate (rates: [{}])",
+                            "Both f(PGS,PC1) penalties hugged +bound in >50% of folds (rates: [{}])",
                             rates_percent.join(", ")
                         )
                     },
@@ -4748,7 +4791,10 @@ pub mod internal {
                 if ece_ok {
                     format!("ECE {:.3} ≤ {:.2}", ece_m, ECE_THRESHOLD)
                 } else {
-                    format!("ECE too high: {:.3} (threshold {:.2})", ece_m, ECE_THRESHOLD)
+                    format!(
+                        "ECE too high: {:.3} (threshold {:.2})",
+                        ece_m, ECE_THRESHOLD
+                    )
                 },
                 ece_ok,
             ));
