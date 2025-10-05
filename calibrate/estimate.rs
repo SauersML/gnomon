@@ -4572,11 +4572,30 @@ pub mod internal {
                             },
                             pos_bound_ok,
                         ));
+                    } else if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
+                        pgs_pc1_near_rates.push(near_rate);
+                    } else if matches!(
+                        label.as_str(),
+                        "f(PC1)_null" | "f(PGS)_null" | "f(PGS,PC1)_null"
+                    ) {
+                        let pos_rate_ok = pos_rate <= 0.50;
+                        check_results.push(CheckResult::new(
+                            if pos_rate_ok {
+                                format!(
+                                    "Null-space penalty '{}' +bound rate {:.1}% within ≤50% threshold",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            } else {
+                                format!(
+                                    "Null-space penalty '{}' hit +bound too often ({:.1}%)",
+                                    label,
+                                    100.0 * pos_rate
+                                )
+                            },
+                            pos_rate_ok,
+                        ));
                     } else {
-                        if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
-                            pgs_pc1_near_rates.push(near_rate);
-                            continue;
-                        }
                         let near_rate_ok = near_rate <= 0.50;
                         check_results.push(CheckResult::new(
                             if near_rate_ok {
@@ -4768,7 +4787,6 @@ pub mod internal {
                 },
                 proj_mean_ok,
             ));
-        }
 
             println!("=== test_model_realworld_metrics Check Summary ===");
             let failed_checks: Vec<&CheckResult> =
@@ -4783,7 +4801,6 @@ pub mod internal {
                     failed_checks.len()
                 );
             }
-
         }
 
         /// Calculates the Area Under the ROC Curve (AUC) using the trapezoidal rule.
