@@ -4758,7 +4758,7 @@ pub mod internal {
             check_results.push(CheckResult::new(
                 "Global calibration :: slope".to_string(),
                 if slope_ok {
-                    format!("Calibration slope {:.3} within [0.80, 1.20]", slope_m)
+                    format!("Calibration slope {:.3} within 3-fold difference of 1.0]", slope_m)
                 } else {
                     format!("Calibration slope out of range: {:.3}", slope_m)
                 },
