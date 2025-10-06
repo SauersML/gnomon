@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use gnomon::download;
-use gnomon::io::get_shared_runtime;
+use gnomon::io::{get_shared_runtime, gcs_billing_project_from_env};
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
@@ -412,6 +412,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let (bucket, object) = split_gcs_uri_dir_and_leaf(normalized)?;
 
     let runtime = get_shared_runtime().map_err(|e| format!("{e}"))?;
+    let user_project = gcs_billing_project_from_env();
 
     let make_control = |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
         Ok(runtime
@@ -427,26 +428,44 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             .list_objects()
             .set_parent(format!("projects/_/buckets/{bucket}"))
             .set_prefix(prefix.to_string());
+        if let Some(up) = &user_project {
+            req = req.set_user_project(up.clone());
+        }
         if let Some(tok) = page_token.take() {
             req = req.set_page_token(tok);
         }
         let resp = runtime
             .block_on(req.send())
-            .map_err(|e| format!("Error listing gs://{bucket}/{prefix}: {e}"))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
+                    format!("This is a Requester Pays bucket. Set GOOGLE_PROJECT (or `gcloud config set project ...`) and re-run. Original error while listing gs://{bucket}/{prefix}: {msg}")
+                } else {
+                    format!("Error listing gs://{bucket}/{prefix}: {msg}")
+                }
+            })?;
         let next = (!resp.next_page_token.is_empty()).then(|| resp.next_page_token.clone());
         Ok((resp.objects, next))
     };
 
     let try_head = |control: &StorageControl, object_name: &str| -> Result<google_cloud_storage::model::Object, Box<dyn Error + Send + Sync>> {
+        let mut req = control
+            .get_object()
+            .set_bucket(format!("projects/_/buckets/{bucket}"))
+            .set_object(object_name.to_string());
+        if let Some(up) = &user_project {
+            req = req.set_user_project(up.clone());
+        }
         runtime
-            .block_on(
-                control
-                    .get_object()
-                    .set_bucket(format!("projects/_/buckets/{bucket}"))
-                    .set_object(object_name.to_string())
-                    .send(),
-            )
-            .map_err(|e| format!("Failed to fetch metadata for gs://{bucket}/{object_name}: {e}").into())
+            .block_on(req.send())
+            .map_err(|e| {
+                let msg = e.to_string();
+                if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
+                    format!("This is a Requester Pays bucket. Set GOOGLE_PROJECT (or `gcloud config set project ...`) and re-run. Original error while fetching metadata for gs://{bucket}/{object_name}: {msg}").into()
+                } else {
+                    format!("Failed to fetch metadata for gs://{bucket}/{object_name}: {msg}").into()
+                }
+            })
     };
 
     let control = match make_control(None) {
