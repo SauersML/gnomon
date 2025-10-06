@@ -3155,7 +3155,7 @@ pub mod internal {
         }
 
         fn build_realworld_test_fixture() -> RealWorldTestFixture {
-            let n_samples = 1176;
+            let n_samples = 1650;
             let mut rng = StdRng::seed_from_u64(42);
 
             let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
