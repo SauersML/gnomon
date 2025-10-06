@@ -411,40 +411,32 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let runtime = get_shared_runtime().map_err(|e| format!("{e}"))?;
     let user_project = gcs_billing_project_from_env();
 
-    let make_control =
-        |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
-            fn load_adc_credentials(
-                quota_project: Option<String>,
-            ) -> Result<Credentials, Box<dyn Error + Send + Sync>> {
+    let build_control = |creds: Option<Credentials>,
+                         quota_project: Option<String>| async move {
+        let effective_creds = match creds {
+            Some(c) => Some(c),
+            None => {
                 let mut builder = google_cloud_auth::credentials::Builder::default();
                 if let Some(project) = quota_project {
                     builder = builder.with_quota_project_id(project);
                 }
-                builder
-                    .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}").into())
+                Some(
+                    builder
+                        .build()
+                        .map_err(|e| format!("Failed to load ADC credentials: {e}").into())?,
+                )
             }
-
-            let effective_creds = match creds {
-                Some(c) => Some(c),
-                None => {
-                    let quota = gcs_billing_project_from_env();
-                    Some(load_adc_credentials(quota)?)
-                }
-            };
-
-            let build_future = async move {
-                let mut builder = StorageControl::builder();
-                if let Some(creds) = effective_creds {
-                    builder = builder.with_credentials(creds);
-                }
-                builder.build().await
-            };
-
-            let build_res = runtime.block_on(build_future);
-            Ok(build_res
-                .map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
         };
+
+        let mut builder = StorageControl::builder();
+        if let Some(creds) = effective_creds {
+            builder = builder.with_credentials(creds);
+        }
+        builder
+            .build()
+            .await
+            .map_err(|e| format!("Failed to create Cloud Storage control client: {e}").into())
+    };
 
     let try_list_objects = |control: &StorageControl,
                             prefix: &str,
@@ -496,21 +488,22 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             })
     };
 
-    let control = match make_control(None) {
-        Ok(control) => control,
-        Err(e) => {
-            let e_msg = e.to_string();
-            match make_control(Some(AnonymousCredentials::new().build())) {
-                Ok(control) => control,
-                Err(e2) => {
-                    return Err(format!(
+    let control = runtime.block_on(async {
+        match build_control(None, user_project.clone()).await {
+            Ok(control) => Ok(control),
+            Err(e) => {
+                let e_msg = e.to_string();
+                let anonymous_creds = AnonymousCredentials::new().build();
+                match build_control(Some(anonymous_creds), user_project.clone()).await {
+                    Ok(control) => Ok(control),
+                    Err(e2) => Err(format!(
                         "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
                     )
-                    .into());
+                    .into()),
                 }
             }
         }
-    };
+    })?;
 
     if !wants_dir_scan && !object.ends_with('/') {
         let triad_prefix = if object.ends_with(".bed") {
