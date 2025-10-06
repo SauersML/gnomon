@@ -3166,12 +3166,15 @@ pub mod internal {
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
 
-            let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
-                let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
-                let interaction = 1.2 * (pgs_val * pc_val).tanh();
-                -0.1 + pgs_effect + pc_effect + interaction
-            };
+            let normal = Normal::new(0.0, 0.9).unwrap();
+            let intercept_noise = Array1::from_shape_fn(n_samples, |_| normal.sample(&mut rng));
+            let pgs_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.45..1.55));
+            let pc_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.4..1.6));
+            let interaction_coeffs =
+                Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.7..1.8));
+            let response_scales = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.75..1.35));
+            let pgs_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
+            let pc_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
 
             let logit_shift = Normal::new(0.0, 1.2).unwrap();
             let logit_scale = Normal::new(0.0, 0.45).unwrap();
