@@ -450,23 +450,59 @@ impl RemoteByteRangeSource {
         runtime: &Arc<Runtime>,
         credentials: Option<Credentials>,
     ) -> Result<(Storage, StorageControl), PipelineError> {
-        let storage_builder = match credentials.clone() {
-            Some(creds) => Storage::builder().with_credentials(creds),
-            None => Storage::builder(),
-        };
-        let storage = runtime.block_on(storage_builder.build()).map_err(|e| {
-            PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
-        })?;
+        // Build Storage with credentials that include the quota (billing) project when available.
+        let storage = runtime
+            .block_on({
+                let mut b = Storage::builder();
+                match credentials.clone() {
+                    Some(creds) => {
+                        b = b.with_credentials(creds);
+                    }
+                    None => {
+                        if let Some(qp) = gcs_billing_project_from_env() {
+                            let creds = google_cloud_auth::credentials::Builder::default()
+                                .with_quota_project_id(qp)
+                                .build()
+                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                            b = b.with_credentials(creds);
+                        } else {
+                            let creds = google_cloud_auth::credentials::Builder::default()
+                                .build()
+                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                            b = b.with_credentials(creds);
+                        }
+                    }
+                }
+                b.build()
+            })
+            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage client: {e}")))?;
 
-        let control_builder = match credentials {
-            Some(creds) => StorageControl::builder().with_credentials(creds),
-            None => StorageControl::builder(),
-        };
-        let control = runtime.block_on(control_builder.build()).map_err(|e| {
-            PipelineError::Io(format!(
-                "Failed to create Cloud Storage control client: {e}"
-            ))
-        })?;
+        // Build StorageControl with credentials that include the same quota (billing) project.
+        let control = runtime
+            .block_on({
+                let mut b = StorageControl::builder();
+                match credentials {
+                    Some(creds) => {
+                        b = b.with_credentials(creds);
+                    }
+                    None => {
+                        if let Some(qp) = gcs_billing_project_from_env() {
+                            let creds = google_cloud_auth::credentials::Builder::default()
+                                .with_quota_project_id(qp)
+                                .build()
+                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                            b = b.with_credentials(creds);
+                        } else {
+                            let creds = google_cloud_auth::credentials::Builder::default()
+                                .build()
+                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                            b = b.with_credentials(creds);
+                        }
+                    }
+                }
+                b.build()
+            })
+            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage control client: {e}")))?;
 
         Ok((storage, control))
     }
