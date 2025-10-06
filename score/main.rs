@@ -428,9 +428,6 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             .list_objects()
             .set_parent(format!("projects/_/buckets/{bucket}"))
             .set_prefix(prefix.to_string());
-        if let Some(up) = &user_project {
-            req = req.set_user_project(up.clone());
-        }
         if let Some(tok) = page_token.take() {
             req = req.set_page_token(tok);
         }
@@ -453,9 +450,6 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             .get_object()
             .set_bucket(format!("projects/_/buckets/{bucket}"))
             .set_object(object_name.to_string());
-        if let Some(up) = &user_project {
-            req = req.set_user_project(up.clone());
-        }
         runtime
             .block_on(req.send())
             .map_err(|e| {
