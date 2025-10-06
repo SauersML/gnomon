@@ -3141,8 +3141,9 @@ pub mod internal {
             BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
         };
         use ndarray::{Array, Array1, Array2};
-        use rand::{Rng, SeedableRng, rngs::StdRng};
         use rand::seq::SliceRandom;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use rand_distr::{Distribution, Normal};
         use std::f64::consts::PI;
 
         struct RealWorldTestFixture {
@@ -3172,9 +3173,17 @@ pub mod internal {
                 -0.1 + pgs_effect + pc_effect + interaction
             };
 
+            let logit_shift = Normal::new(0.0, 1.2).unwrap();
+            let logit_scale = Normal::new(0.0, 0.45).unwrap();
+            let logit_curvature = Normal::new(0.0, 0.25).unwrap();
+
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
-                    let logit = true_logit(p[i], pcs[[i, 0]]);
+                    let base_logit = true_logit(p[i], pcs[[i, 0]]);
+                    let random_scale = (1.0_f64 + logit_scale.sample(&mut rng)).clamp(0.25_f64, 2.75_f64);
+                    let random_shift = logit_shift.sample(&mut rng);
+                    let nonlinear_warp = logit_curvature.sample(&mut rng) * base_logit.powi(3);
+                    let logit = random_scale * base_logit + random_shift + nonlinear_warp;
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
                     let prob = prob.clamp(1e-4, 1.0 - 1e-4);
                     if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
