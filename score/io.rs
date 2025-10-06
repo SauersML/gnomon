@@ -21,9 +21,9 @@ use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
 use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::env;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -45,23 +45,26 @@ pub fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
         return Ok(Arc::clone(runtime));
     }
 
-    let runtime = Arc::new(Runtime::new().map_err(|e| {
-        PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}"))
-    })?);
+    let runtime = Arc::new(
+        Runtime::new()
+            .map_err(|e| PipelineError::Io(format!("Failed to initialize Tokio runtime: {e}")))?,
+    );
 
     match RUNTIME_MANAGER.set(Arc::clone(&runtime)) {
         Ok(()) => Ok(runtime),
-        Err(_) => Ok(
-            RUNTIME_MANAGER
-                .get()
-                .cloned()
-                .expect("Tokio runtime should be initialized"),
-        ),
+        Err(_) => Ok(RUNTIME_MANAGER
+            .get()
+            .cloned()
+            .expect("Tokio runtime should be initialized")),
     }
 }
 
 pub fn gcs_billing_project_from_env() -> Option<String> {
-    for key in ["GOOGLE_PROJECT", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"] {
+    for key in [
+        "GOOGLE_PROJECT",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+    ] {
         if let Ok(v) = env::var(key) {
             if !v.trim().is_empty() {
                 return Some(v);
@@ -74,7 +77,6 @@ pub fn gcs_billing_project_from_env() -> Option<String> {
 /// A trait that abstracts sequential, line-oriented access to text data such as
 /// `.bim` and `.fam` files, regardless of the underlying storage medium.
 pub trait TextSource: Send {
-
     fn len(&self) -> Option<u64> {
         None
     }
@@ -463,19 +465,29 @@ impl RemoteByteRangeSource {
                             let creds = google_cloud_auth::credentials::Builder::default()
                                 .with_quota_project_id(qp)
                                 .build()
-                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                                .map_err(|e| {
+                                    PipelineError::Io(format!(
+                                        "Failed to load ADC credentials: {e}"
+                                    ))
+                                })?;
                             b = b.with_credentials(creds);
                         } else {
                             let creds = google_cloud_auth::credentials::Builder::default()
                                 .build()
-                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                                .map_err(|e| {
+                                    PipelineError::Io(format!(
+                                        "Failed to load ADC credentials: {e}"
+                                    ))
+                                })?;
                             b = b.with_credentials(creds);
                         }
                     }
                 }
                 b.build()
             })
-            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage client: {e}")))?;
+            .map_err(|e| {
+                PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
+            })?;
 
         // Build StorageControl with credentials that include the same quota (billing) project.
         let control = runtime
@@ -490,19 +502,31 @@ impl RemoteByteRangeSource {
                             let creds = google_cloud_auth::credentials::Builder::default()
                                 .with_quota_project_id(qp)
                                 .build()
-                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                                .map_err(|e| {
+                                    PipelineError::Io(format!(
+                                        "Failed to load ADC credentials: {e}"
+                                    ))
+                                })?;
                             b = b.with_credentials(creds);
                         } else {
                             let creds = google_cloud_auth::credentials::Builder::default()
                                 .build()
-                                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+                                .map_err(|e| {
+                                    PipelineError::Io(format!(
+                                        "Failed to load ADC credentials: {e}"
+                                    ))
+                                })?;
                             b = b.with_credentials(creds);
                         }
                     }
                 }
                 b.build()
             })
-            .map_err(|e| PipelineError::Io(format!("Failed to create Cloud Storage control client: {e}")))?;
+            .map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to create Cloud Storage control client: {e}"
+                ))
+            })?;
 
         Ok((storage, control))
     }
@@ -521,7 +545,6 @@ impl RemoteByteRangeSource {
                 .send(),
         )
     }
-
 
     fn is_authentication_error(error: &google_cloud_storage::Error) -> bool {
         let message = error.to_string();

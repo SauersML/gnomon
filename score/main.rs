@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use gnomon::download;
-use gnomon::io::{get_shared_runtime, gcs_billing_project_from_env};
+use gnomon::io::{gcs_billing_project_from_env, get_shared_runtime};
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
@@ -266,10 +266,7 @@ fn finalize_and_write_output(
     final_scores: &[f64],
     final_counts: &[u32],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (output_dir, out_stem) = if output_prefix
-        .to_string_lossy()
-        .starts_with("gs://")
-    {
+    let (output_dir, out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
         let stem = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
@@ -399,7 +396,7 @@ fn split_gcs_uri_dir_and_leaf(raw: &str) -> Result<(String, String), Box<dyn Err
 /// Robust GCS resolver that supports: exact triad prefix, *.bed in a "directory",
 /// trailing slash, and star suffix.
 fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
-    use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
+    use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
     use google_cloud_storage::client::StorageControl;
 
     let wants_dir_scan = uri.ends_with("/*") || uri.ends_with('/');
@@ -414,31 +411,48 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let runtime = get_shared_runtime().map_err(|e| format!("{e}"))?;
     let user_project = gcs_billing_project_from_env();
 
-    let make_control = |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
-        let build_res = runtime.block_on(async {
-            let mut b = StorageControl::builder();
-            if let Some(c) = creds {
-                b = b.with_credentials(c);
-            } else if let Some(qp) = gcs_billing_project_from_env() {
-                let adc = google_cloud_auth::credentials::Builder::default()
-                    .with_quota_project_id(qp)
+    let make_control =
+        |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+            fn load_adc_credentials(
+                quota_project: Option<String>,
+            ) -> Result<Credentials, Box<dyn Error + Send + Sync>> {
+                let mut builder = google_cloud_auth::credentials::Builder::default();
+                if let Some(project) = quota_project {
+                    builder = builder.with_quota_project_id(project);
+                }
+                builder
                     .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
-                b = b.with_credentials(adc);
-            } else {
-                // Fall back to plain ADC without explicit quota project.
-                let adc = google_cloud_auth::credentials::Builder::default()
-                    .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
-                b = b.with_credentials(adc);
+                    .map_err(|e| format!("Failed to load ADC credentials: {e}").into())
             }
-            b.build().await
-        });
-        Ok(build_res.map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
-    };
 
+            let effective_creds = match creds {
+                Some(c) => Some(c),
+                None => {
+                    let quota = gcs_billing_project_from_env();
+                    Some(load_adc_credentials(quota)?)
+                }
+            };
 
-    let try_list_objects = |control: &StorageControl, prefix: &str, mut page_token: Option<String>| -> Result<(Vec<google_cloud_storage::model::Object>, Option<String>), Box<dyn Error + Send + Sync>> {
+            let build_future = async move {
+                let mut builder = StorageControl::builder();
+                if let Some(creds) = effective_creds {
+                    builder = builder.with_credentials(creds);
+                }
+                builder.build().await
+            };
+
+            let build_res = runtime.block_on(build_future);
+            Ok(build_res
+                .map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
+        };
+
+    let try_list_objects = |control: &StorageControl,
+                            prefix: &str,
+                            mut page_token: Option<String>|
+     -> Result<
+        (Vec<google_cloud_storage::model::Object>, Option<String>),
+        Box<dyn Error + Send + Sync>,
+    > {
         let mut req = control
             .list_objects()
             .set_parent(format!("projects/_/buckets/{bucket}"))
@@ -460,7 +474,12 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
         Ok((resp.objects, next))
     };
 
-    let try_head = |control: &StorageControl, object_name: &str| -> Result<google_cloud_storage::model::Object, Box<dyn Error + Send + Sync>> {
+    let try_head = |control: &StorageControl,
+                    object_name: &str|
+     -> Result<
+        google_cloud_storage::model::Object,
+        Box<dyn Error + Send + Sync>,
+    > {
         let req = control
             .get_object()
             .set_bucket(format!("projects/_/buckets/{bucket}"))
@@ -484,9 +503,10 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             match make_control(Some(AnonymousCredentials::new().build())) {
                 Ok(control) => control,
                 Err(e2) => {
-                    return Err(
-                        format!("Unable to initialize Cloud Storage clients: {e_msg} / {e2}").into(),
-                    );
+                    return Err(format!(
+                        "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
+                    )
+                    .into());
                 }
             }
         }
@@ -536,7 +556,10 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
         }
         if let Some((base, ext)) = name.rsplit_once('.') {
             if ["bed", "bim", "fam"].contains(&ext) {
-                by_prefix.entry(base.to_string()).or_default().insert(ext.to_string());
+                by_prefix
+                    .entry(base.to_string())
+                    .or_default()
+                    .insert(ext.to_string());
             }
         }
     }
