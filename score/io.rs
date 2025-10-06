@@ -395,7 +395,7 @@ impl RemoteByteRangeSource {
         let (mut storage, control) = Self::create_clients(&runtime, None)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
         let user_project = gcs_billing_project_from_env();
-        let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object, user_project.as_deref()) {
+        let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object) {
             Ok(metadata) => metadata,
             Err(err) if Self::is_authentication_error(&err) => {
                 let err_msg = err.to_string();
@@ -412,7 +412,7 @@ impl RemoteByteRangeSource {
                     ))
                 })?;
                 storage = fallback_storage;
-                Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object, user_project.as_deref())
+                Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object)
                     .map_err(|retry_err| {
                         PipelineError::Io(format!(
                             "Failed to fetch metadata for gs://{bucket}/{object} with anonymous credentials: {retry_err} (initial error: {err_msg})"
@@ -476,17 +476,16 @@ impl RemoteByteRangeSource {
         control: &StorageControl,
         bucket_path: &str,
         object: &str,
-        user_project: Option<&str>,
     ) -> Result<google_cloud_storage::model::Object, google_cloud_storage::Error> {
-        let mut req = control
-            .get_object()
-            .set_bucket(bucket_path.to_string())
-            .set_object(object.to_string());
-        if let Some(up) = user_project {
-            req = req.set_user_project(up.to_string());
-        }
-        runtime.block_on(req.send())
+        runtime.block_on(
+            control
+                .get_object()
+                .set_bucket(bucket_path.to_string())
+                .set_object(object.to_string())
+                .send(),
+        )
     }
+
 
     fn is_authentication_error(error: &google_cloud_storage::Error) -> bool {
         let message = error.to_string();
@@ -527,13 +526,9 @@ impl RemoteByteRangeSource {
         let runtime = Arc::clone(&self.runtime);
         let user_project = self.user_project.clone();
         let mut data = runtime.block_on(async move {
-            let mut builder = storage
+            let mut response = storage
                 .read_object(bucket_path.clone(), object.clone())
-                .set_read_range(ReadRange::segment(start, length as u64));
-            if let Some(up) = user_project.clone() {
-                builder = builder.set_user_project(up);
-            }
-            let mut response = builder
+                .set_read_range(ReadRange::segment(start, length as u64))
                 .send()
                 .await
                 .map_err(|e| {
