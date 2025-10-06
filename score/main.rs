@@ -19,6 +19,7 @@ use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
 use gnomon::types::PreparationResult;
+use google_cloud_gax::client_builder::Error as ClientBuilderError;
 use natord::compare;
 use std::error::Error;
 use std::ffi::OsString;
@@ -423,18 +424,23 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
                 let adc = google_cloud_auth::credentials::Builder::default()
                     .with_quota_project_id(qp)
                     .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
+                    .map_err(ClientBuilderError::cred)?;
                 b = b.with_credentials(adc);
             } else {
                 // Fall back to plain ADC without explicit quota project.
                 let adc = google_cloud_auth::credentials::Builder::default()
                     .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
+                    .map_err(ClientBuilderError::cred)?;
                 b = b.with_credentials(adc);
             }
             b.build().await
         });
-        Ok(build_res.map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
+        Ok(build_res.map_err(|e| -> Box<dyn Error + Send + Sync> {
+            Box::new(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to create Cloud Storage control client: {e}"),
+            ))
+        })?)
     };
 
 
