@@ -412,8 +412,8 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let user_project = gcs_billing_project_from_env();
 
     let build_control = |creds: Option<Credentials>,
-                         quota_project: Option<String>| async move {
-        let effective_creds = match creds {
+                     quota_project: Option<String>| async move
+    -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
             Some(c) => Some(c),
             None => {
                 let mut builder = google_cloud_auth::credentials::Builder::default();
@@ -423,7 +423,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
                 Some(
                     builder
                         .build()
-                        .map_err(|e| format!("Failed to load ADC credentials: {e}").into())?,
+                        .map_err(|e| Box::<dyn Error + Send + Sync>::from(format!("Failed to load ADC credentials: {e}")))?,
                 )
             }
         };
@@ -435,7 +435,8 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
         builder
             .build()
             .await
-            .map_err(|e| format!("Failed to create Cloud Storage control client: {e}").into())
+            .map_err(|e| Box::<dyn Error + Send + Sync>::from(format!("Failed to create Cloud Storage control client: {e}")))
+
     };
 
     let try_list_objects = |control: &StorageControl,
@@ -496,9 +497,9 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
                 let anonymous_creds = AnonymousCredentials::new().build();
                 match build_control(Some(anonymous_creds), user_project.clone()).await {
                     Ok(control) => Ok(control),
-                    Err(e2) => Err(format!(
+                    Err(Box::<dyn Error + Send + Sync>::from(format!(
                         "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
-                    )
+                    ))),
                     .into()),
                 }
             }
