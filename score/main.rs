@@ -412,8 +412,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let user_project = gcs_billing_project_from_env();
 
     let build_control = |creds: Option<Credentials>,
-                         quota_project: Option<String>| async move
-        -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+        quota_project: Option<String>| async move {
         let effective_creds = match creds {
             Some(c) => Some(c),
             None => {
