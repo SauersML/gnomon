@@ -415,13 +415,28 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let user_project = gcs_billing_project_from_env();
 
     let make_control = |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
-        Ok(runtime
-            .block_on(match creds {
-                Some(c) => StorageControl::builder().with_credentials(c).build(),
-                None => StorageControl::builder().build(),
-            })
-            .map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
+        let build_res = runtime.block_on(async {
+            let mut b = StorageControl::builder();
+            if let Some(c) = creds {
+                b = b.with_credentials(c);
+            } else if let Some(qp) = gcs_billing_project_from_env() {
+                let adc = google_cloud_auth::credentials::Builder::default()
+                    .with_quota_project_id(qp)
+                    .build()
+                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
+                b = b.with_credentials(adc);
+            } else {
+                // Fall back to plain ADC without explicit quota project.
+                let adc = google_cloud_auth::credentials::Builder::default()
+                    .build()
+                    .map_err(|e| format!("Failed to load ADC credentials: {e}"))?;
+                b = b.with_credentials(adc);
+            }
+            b.build().await
+        });
+        Ok(build_res.map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
     };
+
 
     let try_list_objects = |control: &StorageControl, prefix: &str, mut page_token: Option<String>| -> Result<(Vec<google_cloud_storage::model::Object>, Option<String>), Box<dyn Error + Send + Sync>> {
         let mut req = control
