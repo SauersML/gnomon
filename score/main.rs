@@ -446,7 +446,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     };
 
     let try_head = |control: &StorageControl, object_name: &str| -> Result<google_cloud_storage::model::Object, Box<dyn Error + Send + Sync>> {
-        let mut req = control
+        let req = control
             .get_object()
             .set_bucket(format!("projects/_/buckets/{bucket}"))
             .set_object(object_name.to_string());
