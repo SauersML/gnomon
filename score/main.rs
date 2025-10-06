@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use gnomon::download;
+use gnomon::io::get_shared_runtime;
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
@@ -95,10 +96,15 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         if !args.score.exists() && score_arg_str.contains("PGS") {
             // Define the permanent cache directory. Placing it relative to the
             // output is a good strategy, keeping all generated files together.
-            let output_parent_dir = fileset_prefixes[0]
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let scores_cache_dir = output_parent_dir.join("gnomon_score_cache");
+            let scores_cache_dir = {
+                let p0 = &fileset_prefixes[0];
+                let parent_local = p0
+                    .to_string_lossy()
+                    .starts_with("gs://")
+                    .then(|| Path::new(".").to_path_buf())
+                    .unwrap_or_else(|| p0.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
+                parent_local.join("gnomon_score_cache")
+            };
 
             download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?
         } else {
@@ -260,17 +266,27 @@ fn finalize_and_write_output(
     final_scores: &[f64],
     final_counts: &[u32],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let output_dir = output_prefix.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-
-    // Construct a self-describing output filename based on the primary input prefix.
-    let out_filename = {
-        let mut s = output_prefix
+    let (output_dir, out_stem) = if output_prefix
+        .to_string_lossy()
+        .starts_with("gs://")
+    {
+        let stem = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
-        s.push(".sscore");
-        s
+        (Path::new(".").to_path_buf(), stem)
+    } else {
+        let dir = output_prefix
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let stem = output_prefix
+            .file_name()
+            .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
+        (dir, stem)
     };
+    fs::create_dir_all(&output_dir)?;
+    let mut out_filename = out_stem;
+    out_filename.push(".sscore");
     let out_path = output_dir.join(&out_filename);
 
     eprintln!(
@@ -299,14 +315,26 @@ fn finalize_and_write_output(
 
 /// Discovers and validates all PLINK filesets from a given path.
 ///
-/// Handles three cases:
-/// 1. Path is a prefix (`/path/to/data` -> `data.bed`, `data.bim`, `data.fam`).
-/// 2. Path is a single `.bed` file (`/path/to/data.bed`).
-/// 3. Path is a directory containing one or more complete filesets.
+/// Local (unchanged):
+///   1) /path/to/prefix        -> prefix.{bed,bim,fam}
+///   2) /path/to/prefix.bed    -> prefix.{bed,bim,fam}
+///   3) /path/to/dir/          -> scan for *.bed in that dir, validate triads
+///
+/// Remote (new):
+///   A) gs://bucket/prefix           -> prefix.{bed,bim,fam}
+///   B) gs://bucket/prefix.bed       -> prefix.{bed,bim,fam}
+///   C) gs://bucket/dir/             -> list all *.bed under that prefix
+///   D) gs://bucket/dir/*            -> same as (C) (star is treated as “all under dir/”)
 fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    // --- GCS handling first ---
+    if let Some(s) = path.to_str() {
+        if is_gcs_uri_str(s) {
+            return resolve_gcs_filesets(s);
+        }
+    }
+
+    // --- ORIGINAL LOCAL LOGIC (unchanged) ---
     if !path.is_dir() {
-        // --- SINGLE-FILESET PATH: Treat as a prefix, validate, and wrap in a Vec ---
-        // This handles both --input-path my_file.bed and --input-path my_file
         let prefix = if path.extension().is_some() {
             path.with_extension("")
         } else {
@@ -326,7 +354,6 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         return Ok(vec![prefix]);
     }
 
-    // --- MULTI-FILESET PATH: Scan, sort, and validate directory ---
     let mut bed_files: Vec<PathBuf> = fs::read_dir(path)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -337,7 +364,6 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         return Err(format!("No .bed files found in directory '{}'.", path.display()).into());
     }
 
-    // Natural sort ensures chr2 comes before chr10. Critical for correctness.
     bed_files.sort_by(|a, b| compare(&a.to_string_lossy(), &b.to_string_lossy()));
 
     let mut prefixes = Vec::with_capacity(bed_files.len());
@@ -353,6 +379,164 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         prefixes.push(prefix);
     }
     Ok(prefixes)
+}
+
+fn is_gcs_uri_str(s: &str) -> bool {
+    s.starts_with("gs://")
+}
+
+fn split_gcs_uri_dir_and_leaf(raw: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let without = raw.trim_start_matches("gs://");
+    let mut it = without.splitn(2, '/');
+    let bucket = it.next().unwrap_or_default();
+    let object = it.next().unwrap_or_default();
+    if bucket.is_empty() {
+        return Err(format!("Malformed GCS URI '{raw}': missing bucket").into());
+    }
+    Ok((bucket.to_string(), object.to_string()))
+}
+
+/// Robust GCS resolver that supports: exact triad prefix, *.bed in a "directory",
+/// trailing slash, and star suffix.
+fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
+    use google_cloud_storage::client::StorageControl;
+
+    let wants_dir_scan = uri.ends_with("/*") || uri.ends_with('/');
+    let normalized = if uri.ends_with("/*") {
+        &uri[..uri.len() - 1]
+    } else {
+        uri
+    };
+
+    let (bucket, object) = split_gcs_uri_dir_and_leaf(normalized)?;
+
+    let runtime = get_shared_runtime().map_err(|e| format!("{e}"))?;
+
+    let make_control = |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+        Ok(runtime
+            .block_on(match creds {
+                Some(c) => StorageControl::builder().with_credentials(c).build(),
+                None => StorageControl::builder().build(),
+            })
+            .map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
+    };
+
+    let try_list_objects = |control: &StorageControl, prefix: &str, mut page_token: Option<String>| -> Result<(Vec<google_cloud_storage::model::Object>, Option<String>), Box<dyn Error + Send + Sync>> {
+        let mut req = control
+            .list_objects()
+            .set_parent(format!("projects/_/buckets/{bucket}"))
+            .set_prefix(prefix.to_string());
+        if let Some(tok) = page_token.take() {
+            req = req.set_page_token(tok);
+        }
+        let resp = runtime
+            .block_on(req.send())
+            .map_err(|e| format!("Error listing gs://{bucket}/{prefix}: {e}"))?;
+        let next = (!resp.next_page_token.is_empty()).then(|| resp.next_page_token.clone());
+        Ok((resp.objects, next))
+    };
+
+    let try_head = |control: &StorageControl, object_name: &str| -> Result<google_cloud_storage::model::Object, Box<dyn Error + Send + Sync>> {
+        runtime
+            .block_on(
+                control
+                    .get_object()
+                    .set_bucket(format!("projects/_/buckets/{bucket}"))
+                    .set_object(object_name.to_string())
+                    .send(),
+            )
+            .map_err(|e| format!("Failed to fetch metadata for gs://{bucket}/{object_name}: {e}").into())
+    };
+
+    let control = match make_control(None) {
+        Ok(control) => control,
+        Err(e) => {
+            let e_msg = e.to_string();
+            match make_control(Some(AnonymousCredentials::new().build())) {
+                Ok(control) => control,
+                Err(e2) => {
+                    return Err(
+                        format!("Unable to initialize Cloud Storage clients: {e_msg} / {e2}").into(),
+                    );
+                }
+            }
+        }
+    };
+
+    if !wants_dir_scan && !object.ends_with('/') {
+        let triad_prefix = if object.ends_with(".bed") {
+            object[..object.len() - 4].to_string()
+        } else {
+            object.clone()
+        };
+
+        for ext in ["bed", "bim", "fam"] {
+            let name = format!("{triad_prefix}.{ext}");
+            let _ = try_head(&control, &name)?;
+        }
+        return Ok(vec![PathBuf::from(format!("gs://{bucket}/{triad_prefix}"))]);
+    }
+
+    let scan_prefix = if object.is_empty() || object.ends_with('/') {
+        object.clone()
+    } else {
+        format!("{object}/")
+    };
+
+    let mut page_token: Option<String> = None;
+    let mut objects: Vec<google_cloud_storage::model::Object> = Vec::new();
+    loop {
+        let (mut items, next) = try_list_objects(&control, &scan_prefix, page_token)?;
+        objects.append(&mut items);
+        if next.is_none() {
+            break;
+        }
+        page_token = next;
+    }
+
+    if objects.is_empty() {
+        return Err(format!("No objects found under gs://{bucket}/{scan_prefix}").into());
+    }
+
+    use std::collections::{HashMap, HashSet};
+    let mut by_prefix: HashMap<String, HashSet<String>> = HashMap::new();
+    for obj in objects.into_iter().filter(|o| !o.name.ends_with('/')) {
+        let name = obj.name;
+        if !name.starts_with(&scan_prefix) {
+            continue;
+        }
+        if let Some((base, ext)) = name.rsplit_once('.') {
+            if ["bed", "bim", "fam"].contains(&ext) {
+                by_prefix.entry(base.to_string()).or_default().insert(ext.to_string());
+            }
+        }
+    }
+
+    let mut complete: Vec<String> = by_prefix
+        .into_iter()
+        .filter_map(|(base, exts)| {
+            if exts.contains("bed") && exts.contains("bim") && exts.contains("fam") {
+                Some(base)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if complete.is_empty() {
+        return Err(format!(
+            "No complete PLINK filesets (.bed/.bim/.fam) under gs://{bucket}/{scan_prefix}"
+        )
+        .into());
+    }
+
+    complete.sort_by(|a, b| compare(a, b));
+
+    Ok(complete
+        .into_iter()
+        .map(|base| PathBuf::from(format!("gs://{bucket}/{base}")))
+        .collect())
 }
 
 /// Writes the final calculated scores to a self-describing, tab-separated file.

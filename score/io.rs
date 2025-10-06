@@ -39,7 +39,7 @@ const REMOTE_CACHE_CAPACITY: usize = 8;
 
 static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
 
-fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
+pub fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
     if let Some(runtime) = RUNTIME_MANAGER.get() {
         return Ok(Arc::clone(runtime));
     }
