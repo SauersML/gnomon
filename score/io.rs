@@ -23,6 +23,7 @@ use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::env;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -59,9 +60,21 @@ pub fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
     }
 }
 
+pub fn gcs_billing_project_from_env() -> Option<String> {
+    for key in ["GOOGLE_PROJECT", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"] {
+        if let Ok(v) = env::var(key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// A trait that abstracts sequential, line-oriented access to text data such as
 /// `.bim` and `.fam` files, regardless of the underlying storage medium.
 pub trait TextSource: Send {
+
     fn len(&self) -> Option<u64> {
         None
     }
@@ -371,6 +384,7 @@ struct RemoteByteRangeSource {
     storage: Storage,
     bucket_path: String,
     object: String,
+    user_project: Option<String>,
     len: u64,
     cache: Mutex<RemoteCache>,
 }
@@ -380,7 +394,8 @@ impl RemoteByteRangeSource {
         let runtime = get_shared_runtime()?;
         let (mut storage, control) = Self::create_clients(&runtime, None)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
-        let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object) {
+        let user_project = gcs_billing_project_from_env();
+        let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object, user_project.as_deref()) {
             Ok(metadata) => metadata,
             Err(err) if Self::is_authentication_error(&err) => {
                 let err_msg = err.to_string();
@@ -397,7 +412,7 @@ impl RemoteByteRangeSource {
                     ))
                 })?;
                 storage = fallback_storage;
-                Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object)
+                Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object, user_project.as_deref())
                     .map_err(|retry_err| {
                         PipelineError::Io(format!(
                             "Failed to fetch metadata for gs://{bucket}/{object} with anonymous credentials: {retry_err} (initial error: {err_msg})"
@@ -425,6 +440,7 @@ impl RemoteByteRangeSource {
             storage,
             bucket_path,
             object: object.to_string(),
+            user_project,
             len,
             cache: Mutex::new(RemoteCache::new(REMOTE_CACHE_CAPACITY)),
         })
@@ -460,14 +476,16 @@ impl RemoteByteRangeSource {
         control: &StorageControl,
         bucket_path: &str,
         object: &str,
+        user_project: Option<&str>,
     ) -> Result<google_cloud_storage::model::Object, google_cloud_storage::Error> {
-        runtime.block_on(
-            control
-                .get_object()
-                .set_bucket(bucket_path.to_string())
-                .set_object(object.to_string())
-                .send(),
-        )
+        let mut req = control
+            .get_object()
+            .set_bucket(bucket_path.to_string())
+            .set_object(object.to_string());
+        if let Some(up) = user_project {
+            req = req.set_user_project(up.to_string());
+        }
+        runtime.block_on(req.send())
     }
 
     fn is_authentication_error(error: &google_cloud_storage::Error) -> bool {
@@ -507,17 +525,29 @@ impl RemoteByteRangeSource {
         let object_for_log = object.clone();
         let storage = self.storage.clone();
         let runtime = Arc::clone(&self.runtime);
+        let user_project = self.user_project.clone();
         let mut data = runtime.block_on(async move {
-            let mut response = storage
+            let mut builder = storage
                 .read_object(bucket_path.clone(), object.clone())
-                .set_read_range(ReadRange::segment(start, length as u64))
+                .set_read_range(ReadRange::segment(start, length as u64));
+            if let Some(up) = user_project.clone() {
+                builder = builder.set_user_project(up);
+            }
+            let mut response = builder
                 .send()
                 .await
                 .map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to start range read at offset {start} for gs://{}/{object}: {e}",
-                        bucket_path
-                    ))
+                    let msg = e.to_string();
+                    if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
+                        PipelineError::Io(format!(
+                            "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`) and re-run. Original error: {msg}"
+                        ))
+                    } else {
+                        PipelineError::Io(format!(
+                            "Failed to start range read at offset {start} for gs://{}/{object}: {msg}",
+                            bucket_path
+                        ))
+                    }
                 })?;
             let mut buffer = Vec::with_capacity(length);
             while let Some(chunk) = response.next().await {
