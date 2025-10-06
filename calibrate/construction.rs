@@ -282,19 +282,19 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Sex×PGS varying-coefficient interaction (single block with double penalty)
+        // Sex×PGS varying-coefficient interaction (single block with a combined penalty)
         if sex_pgs_interaction_basis_ncols > 0 {
             let range = current_col..current_col + sex_pgs_interaction_basis_ncols;
             penalty_map.push(PenalizedBlock {
                 term_name: "f(PGS,sex)".to_string(),
                 col_range: range.clone(),
-                penalty_indices: vec![penalty_idx_counter, penalty_idx_counter + 1],
+                penalty_indices: vec![penalty_idx_counter],
                 term_type: TermType::SexPgsInteraction,
             });
             sex_pgs_cols = Some(range.clone());
             sex_pgs_block_idx = Some(penalty_map.len() - 1);
             current_col += sex_pgs_interaction_basis_ncols;
-            penalty_idx_counter += 2;
+            penalty_idx_counter += 1;
         }
 
         // Tensor product interaction effects (number of penalties depends on configuration)
@@ -662,15 +662,15 @@ pub fn build_design_and_penalty_matrices(
         let block = &layout.penalty_map[block_idx];
         let col_range = block.col_range.clone();
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
-        let penalty_idx_wiggle = block.penalty_indices[0];
-        let penalty_idx_null = block.penalty_indices[1];
+        let penalty_idx = block.penalty_indices[0];
 
-        s_list[penalty_idx_wiggle]
+        let wiggle_norm = &s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle);
+        let null_norm = &s_sex_pgs_null / frob(&s_sex_pgs_null);
+        let combined = wiggle_norm + null_norm;
+
+        s_list[penalty_idx]
             .slice_mut(s![col_range.clone(), col_range.clone()])
-            .assign(&(&s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle)));
-        s_list[penalty_idx_null]
-            .slice_mut(s![col_range.clone(), col_range.clone()])
-            .assign(&(&s_sex_pgs_null / frob(&s_sex_pgs_null)));
+            .assign(&combined);
     }
 
     let s_pgs_interaction = if matches!(
@@ -2078,11 +2078,11 @@ mod tests {
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // With null-space penalization and the sex×PGS varying coefficient:
-        // PC null + PC range + two anisotropic interaction penalties + two sex×PGS penalties
+        // PC null + PC range + two anisotropic interaction penalties + one combined sex×PGS penalty
         assert_eq!(
             s_list.len(),
-            6,
-            "Should have exactly 6 penalty matrices: PC null, PC range, two anisotropic interaction penalties, and two sex×PGS penalties",
+            5,
+            "Should have exactly 5 penalty matrices: PC null, PC range, two anisotropic interaction penalties, and one sex×PGS penalty",
         );
 
         let interaction_block = layout
@@ -2105,8 +2105,8 @@ mod tests {
 
         assert_eq!(
             sex_pgs_block.penalty_indices.len(),
-            2,
-            "Sex×PGS interaction should have a double penalty",
+            1,
+            "Sex×PGS interaction should use a single smoothing parameter",
         );
 
         // Locate explicit PC range and PC null penalty blocks
@@ -2187,7 +2187,7 @@ mod tests {
             }
         }
 
-        // Validate sex×PGS penalty structure (double penalty)
+        // Validate sex×PGS penalty structure (double-component combined penalty)
         let (pgs_basis_unc, _) = create_bspline_basis(
             data.p.view(),
             config.pgs_range,
@@ -2213,24 +2213,19 @@ mod tests {
             Array2::<f64>::zeros((z_transform.ncols(), z_transform.ncols()))
         };
 
-        let s_sex_pgs_wiggle_block = &s_list[sex_pgs_block.penalty_indices[0]];
-        let s_sex_pgs_null_block = &s_list[sex_pgs_block.penalty_indices[1]];
+        let s_sex_pgs_block_mat = &s_list[sex_pgs_block.penalty_indices[0]];
         let sex_range = sex_pgs_block.col_range.clone();
 
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
         let expected_wiggle = &s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle);
         let expected_null = &s_sex_pgs_null / frob(&s_sex_pgs_null);
+        let expected_combined = &expected_wiggle + &expected_null;
 
         for (row_offset, r) in sex_range.clone().enumerate() {
             for (col_offset, c) in sex_range.clone().enumerate() {
                 assert_abs_diff_eq!(
-                    s_sex_pgs_wiggle_block[[r, c]],
-                    expected_wiggle[[row_offset, col_offset]],
-                    epsilon = 1e-12
-                );
-                assert_abs_diff_eq!(
-                    s_sex_pgs_null_block[[r, c]],
-                    expected_null[[row_offset, col_offset]],
+                    s_sex_pgs_block_mat[[r, c]],
+                    expected_combined[[row_offset, col_offset]],
                     epsilon = 1e-12
                 );
             }
@@ -2239,8 +2234,7 @@ mod tests {
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
                 if !(sex_range.contains(&r) && sex_range.contains(&c)) {
-                    assert_abs_diff_eq!(s_sex_pgs_wiggle_block[[r, c]], 0.0, epsilon = 1e-12);
-                    assert_abs_diff_eq!(s_sex_pgs_null_block[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_sex_pgs_block_mat[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
@@ -2304,8 +2298,8 @@ mod tests {
             "Sex×PGS interaction block should exist in a PGS-only model."
         );
         assert_eq!(
-            layout.num_penalties, 2,
-            "PGS-only model should have the double penalty for the sex×PGS interaction."
+            layout.num_penalties, 1,
+            "PGS-only model should have a single smoothing parameter for the sex×PGS interaction."
         );
     }
 
