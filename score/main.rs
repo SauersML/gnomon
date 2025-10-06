@@ -412,31 +412,35 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let user_project = gcs_billing_project_from_env();
 
     let build_control = |creds: Option<Credentials>,
-                     quota_project: Option<String>| async move
-    -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+                         quota_project: Option<String>| async move
+        -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+        let effective_creds = match creds {
             Some(c) => Some(c),
             None => {
-                let mut builder = google_cloud_auth::credentials::Builder::default();
+                let mut c_builder = google_cloud_auth::credentials::Builder::default();
                 if let Some(project) = quota_project {
-                    builder = builder.with_quota_project_id(project);
+                    c_builder = c_builder.with_quota_project_id(project);
                 }
                 Some(
-                    builder
+                    c_builder
                         .build()
-                        .map_err(|e| Box::<dyn Error + Send + Sync>::from(format!("Failed to load ADC credentials: {e}")))?,
+                        .map_err(|e| Box::<dyn Error + Send + Sync>::from(
+                            format!("Failed to load ADC credentials: {e}")
+                        ))?,
                 )
             }
         };
-
-        let mut builder = StorageControl::builder();
+    
+        let mut sc_builder = StorageControl::builder();
         if let Some(creds) = effective_creds {
-            builder = builder.with_credentials(creds);
+            sc_builder = sc_builder.with_credentials(creds);
         }
-        builder
+        sc_builder
             .build()
             .await
-            .map_err(|e| Box::<dyn Error + Send + Sync>::from(format!("Failed to create Cloud Storage control client: {e}")))
-
+            .map_err(|e| Box::<dyn Error + Send + Sync>::from(
+                format!("Failed to create Cloud Storage control client: {e}")
+            ))
     };
 
     let try_list_objects = |control: &StorageControl,
@@ -497,10 +501,9 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
                 let anonymous_creds = AnonymousCredentials::new().build();
                 match build_control(Some(anonymous_creds), user_project.clone()).await {
                     Ok(control) => Ok(control),
-                    Err(Box::<dyn Error + Send + Sync>::from(format!(
-                        "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
-                    ))),
-                    .into()),
+                    Err(e2) => Err(Box::<dyn Error + Send + Sync>::from(
+                        format!("Unable to initialize Cloud Storage clients: {e_msg} / {e2}")
+                    )),
                 }
             }
         }
