@@ -3143,6 +3143,7 @@ pub mod internal {
         use ndarray::{Array, Array1, Array2};
         use rand::{Rng, SeedableRng, rngs::StdRng};
         use rand::seq::SliceRandom;
+        use rand_distr::{Distribution, Normal};
         use std::f64::consts::PI;
 
         struct RealWorldTestFixture {
@@ -3165,16 +3166,33 @@ pub mod internal {
                 .into_shape_with_order((n_samples, 1))
                 .unwrap();
 
-            let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
-                let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
-                let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
-                let interaction = 1.2 * (pgs_val * pc_val).tanh();
-                -0.1 + pgs_effect + pc_effect + interaction
-            };
+            let normal = Normal::new(0.0, 0.9).unwrap();
+            let intercept_noise = Array1::from_shape_fn(n_samples, |_| normal.sample(&mut rng));
+            let pgs_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.45..1.55));
+            let pc_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.4..1.6));
+            let interaction_coeffs =
+                Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.7..1.8));
+            let response_scales = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.75..1.35));
+            let pgs_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
+            let pc_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
 
             let y: Array1<f64> = (0..n_samples)
                 .map(|i| {
-                    let logit = true_logit(p[i], pcs[[i, 0]]);
+                    let pgs_val = p[i];
+                    let pc_val = pcs[[i, 0]];
+                    let pgs_effect = 0.8
+                        * (pgs_val * 0.9 + pgs_phase_shifts[i]).sin()
+                        + 0.3 * ((pgs_val + 0.25 * pgs_phase_shifts[i]).powi(3) / 6.0);
+                    let pc_effect = 0.6
+                        * (pc_val * 0.7 + pc_phase_shifts[i]).cos()
+                        + 0.5 * (pc_val + 0.1 * pc_phase_shifts[i]).powi(2);
+                    let interaction = 1.2 * ((pgs_val * pc_val) + 0.5 * intercept_noise[i]).tanh();
+                    let logit = response_scales[i]
+                        * (-0.1
+                            + intercept_noise[i]
+                            + pgs_coeffs[i] * pgs_effect
+                            + pc_coeffs[i] * pc_effect
+                            + interaction_coeffs[i] * interaction);
                     let prob = 1.0 / (1.0 + f64::exp(-logit));
                     let prob = prob.clamp(1e-4, 1.0 - 1e-4);
                     if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
