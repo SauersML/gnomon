@@ -3168,7 +3168,7 @@ pub mod internal {
             let true_logit = |pgs_val: f64, pc_val: f64| -> f64 {
                 let pgs_effect = 0.8 * (pgs_val * 0.9).sin() + 0.3 * (pgs_val.powi(3) / 6.0);
                 let pc_effect = 0.6 * (pc_val * 0.7).cos() + 0.5 * pc_val.powi(2);
-                let interaction = 0.4 * (pgs_val * pc_val).tanh();
+                let interaction = 1.2 * (pgs_val * pc_val).tanh();
                 -0.1 + pgs_effect + pc_effect + interaction
             };
 
@@ -3538,7 +3538,7 @@ pub mod internal {
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
                 let term1 = (pgs_val * 0.25).sin() * 1.0;
                 let term2 = 1.0 * pc_val.powi(2);
-                let term3 = 0.30 * (pgs_val * pc_val).tanh();
+                let term3 = 0.9 * (pgs_val * pc_val).tanh();
                 0.0 + term1 + term2 + term3
             };
 
@@ -3718,7 +3718,7 @@ pub mod internal {
             let true_function = |pgs_val: f64, pc_val: f64| -> f64 {
                 let term1 = (pgs_val * 0.25).sin() * 1.0;
                 let term2 = 1.0 * pc_val.powi(2);
-                let term3 = 0.30 * (pgs_val * pc_val).tanh();
+                let term3 = 0.9 * (pgs_val * pc_val).tanh();
                 0.0 + term1 + term2 + term3
             };
 
@@ -5904,7 +5904,7 @@ pub mod internal {
                 let signal = 0.1
                     + 0.5 * (pgs_val * 0.8_f64).tanh()
                     + 0.4 * (pc_val * 0.6_f64).sin()
-                    + 0.3 * (pgs_val * pc_val * 0.5_f64).tanh();
+                    + 1.0 * (pgs_val * pc_val * 0.5_f64).tanh();
 
                 // Add substantial noise to prevent separation
                 let noise = rng.gen_range(-1.2..1.2);
