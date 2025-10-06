@@ -10,7 +10,7 @@ gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarr
 ```
 
 Run a local score:
-``
+```
 ./gnomon/target/release/gnomon score --score "score.txt" arrays
 ```
 
