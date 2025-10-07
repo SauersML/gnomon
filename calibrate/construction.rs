@@ -313,8 +313,12 @@ impl ModelLayout {
                         indices
                     }
                     InteractionPenaltyKind::Anisotropic => {
-                        let indices = vec![penalty_idx_counter, penalty_idx_counter + 1];
-                        penalty_idx_counter += 2;
+                        let indices = vec![
+                            penalty_idx_counter,
+                            penalty_idx_counter + 1,
+                            penalty_idx_counter + 2,
+                        ];
+                        penalty_idx_counter += 3;
                         indices
                     }
                 };
@@ -506,6 +510,11 @@ pub fn build_design_and_penalty_matrices(
     let s_pgs_main =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
     let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
+    let pgs_null_projector = if z_null_pgs.ncols() > 0 {
+        z_null_pgs.dot(&z_null_pgs.t())
+    } else {
+        Array2::zeros((pgs_main_basis_unc.ncols(), pgs_main_basis_unc.ncols()))
+    };
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
@@ -517,6 +526,7 @@ pub fn build_design_and_penalty_matrices(
     let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
     let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut pc_unconstrained_bases_main: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
+    let mut pc_null_projectors: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
 
     // Check if we have any PCs to process
     if config.pc_configs.is_empty() {
@@ -551,13 +561,18 @@ pub fn build_design_and_penalty_matrices(
         pc_range_bases.push(pc_range_basis);
 
         // Build null-space (if any)
-        if z_null_pc.ncols() > 0 {
+        let null_projector = if z_null_pc.ncols() > 0 {
+            let projector = z_null_pc.dot(&z_null_pc.t());
             let pc_null_basis = pc_main_basis_unc.dot(&z_null_pc);
             pc_null_bases.push(Some(pc_null_basis));
             pc_null_transforms.insert(pc_name.clone(), z_null_pc);
+            projector
         } else {
             pc_null_bases.push(None);
-        }
+            Array2::zeros((pc_main_basis_unc.ncols(), pc_main_basis_unc.ncols()))
+        };
+
+        pc_null_projectors.push(null_projector);
 
         // Store PC range transformation for interactions and main effects
         range_transforms.insert(pc_name.clone(), z_range_pc);
@@ -621,7 +636,7 @@ pub fn build_design_and_penalty_matrices(
         pgs_int_ncols,
     )?;
 
-    // Stage: Create individual penalty matrices—one per PC main and two per interaction
+    // Stage: Create individual penalty matrices—one per PC main and (for anisotropic) three per interaction
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
     let mut s_list = Vec::with_capacity(layout.num_penalties);
@@ -713,9 +728,9 @@ pub fn build_design_and_penalty_matrices(
                 }
             }
             InteractionPenaltyKind::Anisotropic => {
-                if block.penalty_indices.len() != 2 {
+                if block.penalty_indices.len() != 3 {
                     return Err(EstimationError::LayoutError(format!(
-                        "Interaction block {} should have exactly 2 penalty indices in anisotropic mode, found {}",
+                        "Interaction block {} should have exactly 3 penalty indices in anisotropic mode, found {}",
                         block.term_name,
                         block.penalty_indices.len()
                     )));
@@ -753,6 +768,7 @@ pub fn build_design_and_penalty_matrices(
 
                 let penalty_idx_pgs = block.penalty_indices[0];
                 let penalty_idx_pc = block.penalty_indices[1];
+                let penalty_idx_null = block.penalty_indices[2];
 
                 s_list[penalty_idx_pgs]
                     .slice_mut(s![col_range.clone(), col_range.clone()])
@@ -760,6 +776,16 @@ pub fn build_design_and_penalty_matrices(
                 s_list[penalty_idx_pc]
                     .slice_mut(s![col_range.clone(), col_range.clone()])
                     .assign(&(&s_kron_pc / nf2));
+
+                let pc_null_proj = &pc_null_projectors[pc_idx];
+                let s_kron_null = kronecker_product(&pgs_null_projector, pc_null_proj);
+                let nf_null = frob(&s_kron_null);
+
+                if nf_null > 1e-12 {
+                    s_list[penalty_idx_null]
+                        .slice_mut(s![col_range.clone(), col_range.clone()])
+                        .assign(&(&s_kron_null / nf_null));
+                }
             }
         }
     }
@@ -885,9 +911,7 @@ pub fn build_design_and_penalty_matrices(
             row *= sex_value;
         }
 
-        let intercept = x_matrix
-            .column(layout.intercept_col)
-            .to_owned();
+        let intercept = x_matrix.column(layout.intercept_col).to_owned();
         let sex_main = layout.sex_col.ok_or_else(|| {
             EstimationError::LayoutError(
                 "Layout is missing the sex main-effect column required for the sex×PGS interaction"
@@ -1010,9 +1034,7 @@ pub fn build_design_and_penalty_matrices(
 
             // Build main-effect matrix M = [Intercept | Sex | PGS_main | PC_main_for_this_pc (null + range)]
             // Extract intercept, sex, and PGS main
-            let intercept = x_matrix
-                .column(layout.intercept_col)
-                .to_owned();
+            let intercept = x_matrix.column(layout.intercept_col).to_owned();
             let sex_main = layout
                 .sex_col
                 .map(|col| x_matrix.slice(s![.., col..col + 1]).to_owned());
@@ -2078,11 +2100,11 @@ mod tests {
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // With null-space penalization and the sex×PGS varying coefficient:
-        // PC null + PC range + two anisotropic interaction penalties + two sex×PGS penalties
+        // PC null + PC range + three anisotropic interaction penalties + two sex×PGS penalties
         assert_eq!(
             s_list.len(),
-            6,
-            "Should have exactly 6 penalty matrices: PC null, PC range, two anisotropic interaction penalties, and two sex×PGS penalties",
+            7,
+            "Should have exactly 7 penalty matrices: PC null, PC range, three anisotropic interaction penalties, and two sex×PGS penalties",
         );
 
         let interaction_block = layout
@@ -2093,8 +2115,8 @@ mod tests {
 
         assert_eq!(
             interaction_block.penalty_indices.len(),
-            2,
-            "Interaction term should have two penalty indices in anisotropic mode",
+            3,
+            "Interaction term should have three penalty indices in anisotropic mode",
         );
 
         let sex_pgs_block = layout
@@ -2157,8 +2179,17 @@ mod tests {
         let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
         let expected_pc_norm = &expected_pc / frob(&expected_pc);
 
+        let (z_null_pgs, _) = basis::null_range_whiten(&s_pgs).expect("PGS null transform");
+        let (z_null_pc, _) = basis::null_range_whiten(&s_pc).expect("PC null transform");
+        let expected_null = kronecker_product(
+            &z_null_pgs.dot(&z_null_pgs.t()),
+            &z_null_pc.dot(&z_null_pc.t()),
+        );
+        let expected_null_norm = &expected_null / frob(&expected_null);
+
         let s_interaction_pgs = &s_list[interaction_block.penalty_indices[0]];
         let s_interaction_pc = &s_list[interaction_block.penalty_indices[1]];
+        let s_interaction_null = &s_list[interaction_block.penalty_indices[2]];
 
         // Check interaction penalty blocks match expected anisotropic structure
         let col_range = interaction_block.col_range.clone();
@@ -2174,6 +2205,11 @@ mod tests {
                     expected_pc_norm[[row_offset, col_offset]],
                     epsilon = 1e-12
                 );
+                assert_abs_diff_eq!(
+                    s_interaction_null[[r, c]],
+                    expected_null_norm[[row_offset, col_offset]],
+                    epsilon = 1e-12
+                );
             }
         }
 
@@ -2183,6 +2219,7 @@ mod tests {
                 if !(col_range.contains(&r) && col_range.contains(&c)) {
                     assert_abs_diff_eq!(s_interaction_pgs[[r, c]], 0.0, epsilon = 1e-12);
                     assert_abs_diff_eq!(s_interaction_pc[[r, c]], 0.0, epsilon = 1e-12);
+                    assert_abs_diff_eq!(s_interaction_null[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
@@ -2535,11 +2572,11 @@ mod tests {
         let ib = layout.interaction_block_idx[0];
         let block = &layout.penalty_map[ib];
 
-        // Anisotropic => two penalties for the interaction
+        // Anisotropic => three penalties for the interaction (PGS wiggle, PC wiggle, joint null)
         assert_eq!(
             block.penalty_indices.len(),
-            2,
-            "anisotropic interaction must have two penalty indices"
+            3,
+            "anisotropic interaction must have three penalty indices"
         );
 
         // With degree=3, num_knots=1 => unconstrained main width = 4 on both margins.
@@ -2552,14 +2589,15 @@ mod tests {
         );
 
         // Penalty sub-blocks should be present and each normalized to unit Frobenius norm
-        for &pi in &block.penalty_indices {
+        for (idx, &pi) in block.penalty_indices.iter().enumerate() {
             let sub = s_list[pi]
                 .slice(s![block.col_range.clone(), block.col_range.clone()])
                 .to_owned();
             let fnorm = frob_norm(&sub);
             assert!(
                 (fnorm - 1.0).abs() < 1e-8,
-                "anisotropic penalty sub-block not unit-normalized; got {:.6e}",
+                "anisotropic penalty sub-block {} not unit-normalized; got {:.6e}",
+                idx,
                 fnorm
             );
         }

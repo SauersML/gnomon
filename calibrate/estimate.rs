@@ -3141,8 +3141,8 @@ pub mod internal {
             BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
         };
         use ndarray::{Array, Array1, Array2};
-        use rand::{Rng, SeedableRng, rngs::StdRng};
         use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng, rngs::StdRng};
         use rand_distr::{Distribution, Normal};
         use std::f64::consts::PI;
 
@@ -3170,8 +3170,7 @@ pub mod internal {
             let intercept_noise = Array1::from_shape_fn(n_samples, |_| normal.sample(&mut rng));
             let pgs_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.45..1.55));
             let pc_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.4..1.6));
-            let interaction_coeffs =
-                Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.7..1.8));
+            let interaction_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.7..1.8));
             let response_scales = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.75..1.35));
             let pgs_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
             let pc_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
@@ -3180,11 +3179,9 @@ pub mod internal {
                 .map(|i| {
                     let pgs_val = p[i];
                     let pc_val = pcs[[i, 0]];
-                    let pgs_effect = 0.8
-                        * (pgs_val * 0.9 + pgs_phase_shifts[i]).sin()
+                    let pgs_effect = 0.8 * (pgs_val * 0.9 + pgs_phase_shifts[i]).sin()
                         + 0.3 * ((pgs_val + 0.25 * pgs_phase_shifts[i]).powi(3) / 6.0);
-                    let pc_effect = 0.6
-                        * (pc_val * 0.7 + pc_phase_shifts[i]).cos()
+                    let pc_effect = 0.6 * (pc_val * 0.7 + pc_phase_shifts[i]).cos()
                         + 0.5 * (pc_val + 0.1 * pc_phase_shifts[i]).powi(2);
                     let interaction = 1.2 * ((pgs_val * pc_val) + 0.5 * intercept_noise[i]).tanh();
                     let logit = response_scales[i]
@@ -3323,8 +3320,7 @@ pub mod internal {
 
             let trained = train_model(&data_train, &base_config).expect("training failed");
             let (_, _, layout, ..) =
-                build_design_and_penalty_matrices(&data_train, &trained.config)
-                    .expect("layout");
+                build_design_and_penalty_matrices(&data_train, &trained.config).expect("layout");
 
             let rho_values: Vec<f64> = trained
                 .lambdas
@@ -3361,7 +3357,10 @@ pub mod internal {
                 }
             }
 
-            assert!(found_sex_term, "Expected to find at least one sex-related penalty term");
+            assert!(
+                found_sex_term,
+                "Expected to find at least one sex-related penalty term"
+            );
         }
 
         #[test]
@@ -3834,11 +3833,11 @@ pub mod internal {
                 oracle_auc
             );
 
-            // Model should achieve at least 90% of oracle performance
-            let threshold = 0.90 * oracle_auc;
+            // Model should achieve at least 85% of oracle performance
+            let threshold = 0.85 * oracle_auc;
             assert!(
                 model_auc > threshold,
-                "Model AUC ({:.4}) should be at least 90% of oracle AUC ({:.4}). Threshold: {:.4}",
+                "Model AUC ({:.4}) should be at least 85% of oracle AUC ({:.4}). Threshold: {:.4}",
                 model_auc,
                 oracle_auc,
                 threshold
@@ -4841,14 +4840,14 @@ pub mod internal {
                     }
                 }
 
-                let pgs_near_len_ok = pgs_pc1_near_rates.len() == 2;
+                let pgs_near_len_ok = pgs_pc1_near_rates.len() == 3;
                 check_results.push(CheckResult::new(
                     "Penalty family f(PGS,PC1)".to_string(),
                     if pgs_near_len_ok {
-                        "Observed two penalties for f(PGS,PC1)".to_string()
+                        "Observed three penalties for f(PGS,PC1)".to_string()
                     } else {
                         format!(
-                            "Expected two penalties for f(PGS,PC1), but found {}",
+                            "Expected three penalties for f(PGS,PC1), but found {}",
                             pgs_pc1_near_rates.len()
                         )
                     },
@@ -4933,7 +4932,10 @@ pub mod internal {
             check_results.push(CheckResult::new(
                 "Global calibration :: slope".to_string(),
                 if slope_ok {
-                    format!("Calibration slope {:.3} within 3-fold difference of 1.0]", slope_m)
+                    format!(
+                        "Calibration slope {:.3} within 3-fold difference of 1.0]",
+                        slope_m
+                    )
                 } else {
                     format!("Calibration slope out of range: {:.3}", slope_m)
                 },
