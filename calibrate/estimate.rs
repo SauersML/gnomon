@@ -3181,7 +3181,20 @@ pub mod internal {
                         + 0.3 * ((pgs_val + 0.25 * pgs_phase_shifts[i]).powi(3) / 6.0);
                     let pc_effect = 0.6 * (pc_val * 0.7 + pc_phase_shifts[i]).cos()
                         + 0.5 * (pc_val + 0.1 * pc_phase_shifts[i]).powi(2);
-                    let interaction = 1.2 * ((pgs_val * pc_val) + 0.5 * intercept_noise[i]).tanh();
+                    let smooth_interaction = ((pgs_val * pc_val) + 0.5 * intercept_noise[i]).tanh();
+                    let high_freq_wiggle = 0.45
+                        * (1.7 * pgs_val + 0.8 * pc_val + pgs_phase_shifts[i]).sin()
+                        * (1.1 * pgs_val - 1.5 * pc_val + pc_phase_shifts[i]).cos();
+                    let localized_wiggle = 0.3
+                        * f64::exp(
+                            -0.5
+                                * ((pgs_val - 0.65).powi(2) / 0.35
+                                    + (pc_val + 0.4).powi(2) / 0.45),
+                        )
+                        * ((3.2 * pgs_val).sin() + (2.8 * pc_val).cos());
+                    let interaction = 0.9 * smooth_interaction
+                        + 0.6 * high_freq_wiggle
+                        + 0.5 * localized_wiggle;
                     let logit = response_scales[i]
                         * (-0.1
                             + intercept_noise[i]
