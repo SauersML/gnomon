@@ -80,7 +80,6 @@ pub fn load_adc_credentials(runtime: &Arc<Runtime>) -> Result<Credentials, Pipel
         builder = builder.with_quota_project_id(project);
     }
 
-    let _guard = runtime.enter();
     builder
         .build()
         .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))
