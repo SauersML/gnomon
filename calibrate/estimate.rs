@@ -529,13 +529,8 @@ pub fn train_model(
         Some(to_z_from_rho(&fallback_rho))
     };
 
-    // Fallback to previous default if none were finite (will likely be rescued by the barrier)
-    let initial_z = start_z.unwrap_or_else(|| {
-        eprintln!(
-            "[Init] Could not find a finite-cost seed; falling back to rho = 1.0 (lambda = e) and barrier handling."
-        );
-        to_z_from_rho(&Array1::from_elem(layout.num_penalties, 1.0))
-    });
+    // Fallback handled above; `start_z` is always populated at this point.
+    let initial_z = start_z.unwrap();
 
     // Map to rho space for gradient check (always-on)
     let initial_rho = to_rho_from_z(&initial_z);
