@@ -1,6 +1,6 @@
 # Gnomon CLI Overview
 
-The `gnomon` binary exposes several subcommands through Clap. Each subcommand wraps a
+The `gnomon` binary exposes several subcommands. Each subcommand wraps a
 specific workflow for computing or calibrating polygenic scores. Run `gnomon --help`
 to see global usage information.
 
@@ -19,14 +19,13 @@ Optional arguments:
   calculation.
 
 ### `train`
-Train a generalized additive model (GAM) used for calibration and saves it to
-`model.toml`.
+Train a generalized additive model used for calibration and saves it to `model.toml`.
 
 Required arguments:
 - `training_data`: path to a TSV file with phenotype, score, and PC columns.
 - `--num-pcs <N>`: number of principal components to include.
 
-Key optional arguments:
+Optional arguments:
 - `--pgs-knots` / `--pgs-degree`: configure the spline basis for the polygenic score.
 - `--pc-knots` / `--pc-degree`: configure the spline basis for principal components.
 - `--penalty-order`: order of the difference penalty matrix.
