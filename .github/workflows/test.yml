@@ -182,6 +182,26 @@ jobs:
           path: export/build-meta.txt
           retention-days: 30
 
+      - name: Pack target-all cache tar (main only)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=()
+          [ -d target/release ] && paths+=("target/release")
+          [ -d target/profiling ] && paths+=("target/profiling")
+          if [ ${#paths[@]} -eq 0 ]; then
+            echo "No target/{release,profiling} to pack"; exit 0
+          fi
+          tar -cf "target-all-${{ steps.naming.outputs.short_sha }}.tar" "${paths[@]}"
+          ls -lh "target-all-${{ steps.naming.outputs.short_sha }}.tar"
+      - name: Upload artifact – target-all cache (main only)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-all-${{ steps.naming.outputs.short_sha }}
+          path: target-all-${{ steps.naming.outputs.short_sha }}.tar
+          retention-days: 3
       - name: Prepare trimmed build artifact (always)
         if: always()
         shell: bash
@@ -325,7 +345,7 @@ jobs:
             find build-output -maxdepth 3 -print
             exit 1
           else
-            echo "::error::No build-output artifact was downloaded."
+            echo "::error::No build-output was downloaded."
             exit 1
           fi
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
