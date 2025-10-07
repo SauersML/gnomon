@@ -396,7 +396,7 @@ fn split_gcs_uri_dir_and_leaf(raw: &str) -> Result<(String, String), Box<dyn Err
 /// Robust GCS resolver that supports: exact triad prefix, *.bed in a "directory",
 /// trailing slash, and star suffix.
 fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
-    use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
+    use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
     use google_cloud_storage::client::StorageControl;
 
     let wants_dir_scan = uri.ends_with("/*") || uri.ends_with('/');
@@ -413,37 +413,36 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
 
     let make_control =
         |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
-            fn load_adc_credentials(
-                quota_project: Option<String>,
-            ) -> Result<Credentials, Box<dyn Error + Send + Sync>> {
-                let mut builder = google_cloud_auth::credentials::Builder::default();
-                if let Some(project) = quota_project {
-                    builder = builder.with_quota_project_id(project);
-                }
-                builder
-                    .build()
-                    .map_err(|e| format!("Failed to load ADC credentials: {e}").into())
-            }
-
-            let effective_creds = match creds {
-                Some(c) => Some(c),
-                None => {
-                    let quota = gcs_billing_project_from_env();
-                    Some(load_adc_credentials(quota)?)
-                }
-            };
-
-            let build_future = async move {
+            runtime.block_on(async move {
                 let mut builder = StorageControl::builder();
+                let effective_creds = match creds {
+                    Some(c) => Some(c),
+                    None => {
+                        let mut adc_builder = google_cloud_auth::credentials::Builder::default();
+                        if let Some(project) = gcs_billing_project_from_env() {
+                            adc_builder = adc_builder.with_quota_project_id(project);
+                        }
+                        Some(
+                            adc_builder
+                                .build()
+                                .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                                    format!("Failed to load ADC credentials: {e}").into()
+                                })?,
+                        )
+                    }
+                };
+
                 if let Some(creds) = effective_creds {
                     builder = builder.with_credentials(creds);
                 }
-                builder.build().await
-            };
 
-            let build_res = runtime.block_on(build_future);
-            Ok(build_res
-                .map_err(|e| format!("Failed to create Cloud Storage control client: {e}"))?)
+                builder
+                    .build()
+                    .await
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                        format!("Failed to create Cloud Storage control client: {e}").into()
+                    })
+            })
         };
 
     let try_list_objects = |control: &StorageControl,
