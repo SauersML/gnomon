@@ -15,9 +15,10 @@ description = "A high-performance engine for polygenic score calculation."
 repository = "https://github.com/SauersML/gnomon/"
 keywords = ["bioinformatics", "genomics"]
 categories = ["science"]
+build = "shared/build.rs"
 
 [lib]
-path = "score/lib.rs"
+path = "shared/lib.rs"
 
 [[bin]]
 name = "gnomon"
