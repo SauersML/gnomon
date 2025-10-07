@@ -74,7 +74,7 @@ pub fn gcs_billing_project_from_env() -> Option<String> {
     None
 }
 
-pub fn load_adc_credentials(runtime: &Arc<Runtime>) -> Result<Credentials, PipelineError> {
+pub fn load_adc_credentials() -> Result<Credentials, PipelineError> {
     let mut builder = google_cloud_auth::credentials::Builder::default();
     if let Some(project) = gcs_billing_project_from_env() {
         builder = builder.with_quota_project_id(project);
@@ -465,7 +465,7 @@ impl RemoteByteRangeSource {
     ) -> Result<(Storage, StorageControl), PipelineError> {
         let base_credentials = match credentials {
             Some(creds) => creds,
-            None => load_adc_credentials(runtime)?,
+            None => load_adc_credentials()?,
         };
 
         let storage_credentials = base_credentials.clone();
