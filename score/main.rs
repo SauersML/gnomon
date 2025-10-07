@@ -444,6 +444,18 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
                     })
             })
         };
+    
+        let mut sc_builder = StorageControl::builder();
+        if let Some(creds) = effective_creds {
+            sc_builder = sc_builder.with_credentials(creds);
+        }
+        sc_builder
+            .build()
+            .await
+            .map_err(|e| Box::<dyn Error + Send + Sync>::from(
+                format!("Failed to create Cloud Storage control client: {e}")
+            ))
+    };
 
     let try_list_objects = |control: &StorageControl,
                             prefix: &str,
@@ -495,21 +507,21 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             })
     };
 
-    let control = match make_control(None) {
-        Ok(control) => control,
-        Err(e) => {
-            let e_msg = e.to_string();
-            match make_control(Some(AnonymousCredentials::new().build())) {
-                Ok(control) => control,
-                Err(e2) => {
-                    return Err(format!(
-                        "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
-                    )
-                    .into());
+    let control = runtime.block_on(async {
+        match build_control(None, user_project.clone()).await {
+            Ok(control) => Ok(control),
+            Err(e) => {
+                let e_msg = e.to_string();
+                let anonymous_creds = AnonymousCredentials::new().build();
+                match build_control(Some(anonymous_creds), user_project.clone()).await {
+                    Ok(control) => Ok(control),
+                    Err(e2) => Err(Box::<dyn Error + Send + Sync>::from(
+                        format!("Unable to initialize Cloud Storage clients: {e_msg} / {e2}")
+                    )),
                 }
             }
         }
-    };
+    })?;
 
     if !wants_dir_scan && !object.ends_with('/') {
         let triad_prefix = if object.ends_with(".bed") {
