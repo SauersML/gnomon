@@ -2761,7 +2761,6 @@ pub mod internal {
 
             // --- Extract stable transformed quantities ---
             let beta_transformed = &pirls_result.beta_transformed;
-            let hessian_transformed = &pirls_result.penalized_hessian_transformed;
             let reparam_result = &pirls_result.reparam_result;
             // Use cached X·Qs from PIRLS
             let rs_transformed = &reparam_result.rs_transformed;
@@ -2775,10 +2774,9 @@ pub mod internal {
                 );
             }
 
-            // Check for severe indefiniteness in the original Hessian (before stabilization)
-            // This suggests a problematic region we should retreat from
-            if let Ok((eigenvalues, _)) = hessian_transformed.eigh(Side::Lower) {
-                // Original behavior for severe indefiniteness
+            // Check that the stabilized effective Hessian is still numerically valid.
+            // If even the ridged matrix is indefinite, the PIRLS fit is unreliable and we retreat.
+            if let Ok((eigenvalues, _)) = h_eff.eigh(Side::Lower) {
                 let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
                 if min_eig < SEVERE_INDEFINITENESS {
