@@ -4914,9 +4914,35 @@ pub mod internal {
                             },
                             pos_bound_ok,
                         ));
-                    } else if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
+                    } else if let Some(component) = label
+                        .strip_prefix("f(PGS,PC1)[")
+                        .and_then(|suffix| suffix.strip_suffix(']'))
+                    {
                         pgs_pc1_near_rates.push(near_rate);
                         pgs_pc1_pos_rates.push(pos_rate);
+
+                        if component == "3" {
+                            // The third anisotropic component corresponds to the joint null-space
+                            // projector for f(PGS, PC1); treat it like other explicit null penalties.
+                            let pos_rate_ok = pos_rate <= 0.50;
+                            check_results.push(CheckResult::new(
+                                format!("Penalty term '{}'", label),
+                                if pos_rate_ok {
+                                    format!(
+                                        "Null-space penalty '{}' +bound rate {:.1}% within ≤50% threshold",
+                                        label,
+                                        100.0 * pos_rate
+                                    )
+                                } else {
+                                    format!(
+                                        "Null-space penalty '{}' hit +bound too often ({:.1}%)",
+                                        label,
+                                        100.0 * pos_rate
+                                    )
+                                },
+                                pos_rate_ok,
+                            ));
+                        }
                     } else if matches!(
                         label.as_str(),
                         "f(PC1)_null" | "f(PGS)_null" | "f(PGS,PC1)_null"
