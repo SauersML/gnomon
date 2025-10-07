@@ -1,10 +1,10 @@
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatMut, MatRef};
+use faer::{Accum, Mat, MatMut};
 use std::error::Error;
 
 use super::fit::{
-    DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource, DEFAULT_BLOCK_WIDTH,
+    DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
 };
 
 pub struct HwePcaProjector<'model> {
@@ -106,13 +106,9 @@ impl<'model> HwePcaProjector<'model> {
                 n_samples,
                 filled,
             );
-            standardize_projection_block(scaler, &mut block, processed, filled);
+            standardize_projection_block(scaler, block.as_mut(), processed, filled);
 
-            let standardized = MatRef::from_column_major_slice(
-                &block_storage[..n_samples * filled],
-                n_samples,
-                filled,
-            );
+            let standardized = block.into_const();
             let loadings_block = loadings.submatrix(processed, 0, filled, self.model.components());
 
             matmul(
@@ -143,7 +139,7 @@ impl<'model> HwePcaProjector<'model> {
 
 fn standardize_projection_block(
     scaler: &HweScaler,
-    block: &mut MatMut<'_, f64>,
+    block: MatMut<'_, f64>,
     offset: usize,
     filled: usize,
 ) {
