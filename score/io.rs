@@ -74,6 +74,18 @@ pub fn gcs_billing_project_from_env() -> Option<String> {
     None
 }
 
+pub fn load_adc_credentials(runtime: &Arc<Runtime>) -> Result<Credentials, PipelineError> {
+    let mut builder = google_cloud_auth::credentials::Builder::default();
+    if let Some(project) = gcs_billing_project_from_env() {
+        builder = builder.with_quota_project_id(project);
+    }
+
+    let _guard = runtime.enter();
+    builder
+        .build()
+        .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))
+}
+
 /// A trait that abstracts sequential, line-oriented access to text data such as
 /// `.bim` and `.fam` files, regardless of the underlying storage medium.
 pub trait TextSource: Send {
@@ -452,52 +464,32 @@ impl RemoteByteRangeSource {
         runtime: &Arc<Runtime>,
         credentials: Option<Credentials>,
     ) -> Result<(Storage, StorageControl), PipelineError> {
-        fn load_adc_credentials() -> Result<Credentials, PipelineError> {
-            let mut builder = google_cloud_auth::credentials::Builder::default();
-            if let Some(project) = gcs_billing_project_from_env() {
-                builder = builder.with_quota_project_id(project);
-            }
-            builder
-                .build()
-                .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))
-        }
+        let base_credentials = match credentials {
+            Some(creds) => creds,
+            None => load_adc_credentials(runtime)?,
+        };
 
-        let storage_credentials = credentials.clone();
-        // Build Storage with credentials that include the quota (billing) project when available.
+        let storage_credentials = base_credentials.clone();
         let storage = runtime.block_on(async move {
-            let mut builder = Storage::builder();
-            match storage_credentials {
-                Some(creds) => {
-                    builder = builder.with_credentials(creds);
-                }
-                None => {
-                    let creds = load_adc_credentials()?;
-                    builder = builder.with_credentials(creds);
-                }
-            }
-            builder.build().await.map_err(|e| {
-                PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
-            })
+            Storage::builder()
+                .with_credentials(storage_credentials)
+                .build()
+                .await
+                .map_err(|e| {
+                    PipelineError::Io(format!("Failed to create Cloud Storage client: {e}"))
+                })
         })?;
 
-        let control_credentials = credentials;
-        // Build StorageControl with credentials that include the same quota (billing) project.
         let control = runtime.block_on(async move {
-            let mut builder = StorageControl::builder();
-            match control_credentials {
-                Some(creds) => {
-                    builder = builder.with_credentials(creds);
-                }
-                None => {
-                    let creds = load_adc_credentials()?;
-                    builder = builder.with_credentials(creds);
-                }
-            }
-            builder.build().await.map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to create Cloud Storage control client: {e}"
-                ))
-            })
+            StorageControl::builder()
+                .with_credentials(base_credentials)
+                .build()
+                .await
+                .map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to create Cloud Storage control client: {e}"
+                    ))
+                })
         })?;
 
         Ok((storage, control))

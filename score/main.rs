@@ -14,7 +14,9 @@
 
 use clap::Parser;
 use gnomon::download;
-use gnomon::io::{gcs_billing_project_from_env, get_shared_runtime};
+use gnomon::io::{
+    gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials,
+};
 use gnomon::pipeline::{self, PipelineContext};
 use gnomon::prepare;
 use gnomon::reformat;
@@ -413,30 +415,15 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
 
     let make_control =
         |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
+            let credentials = match creds {
+                Some(existing) => existing,
+                None => load_adc_credentials(&runtime)
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("{e}").into() })?,
+            };
+
             runtime.block_on(async move {
-                let mut builder = StorageControl::builder();
-                let effective_creds = match creds {
-                    Some(c) => Some(c),
-                    None => {
-                        let mut adc_builder = google_cloud_auth::credentials::Builder::default();
-                        if let Some(project) = gcs_billing_project_from_env() {
-                            adc_builder = adc_builder.with_quota_project_id(project);
-                        }
-                        Some(
-                            adc_builder
-                                .build()
-                                .map_err(|e| -> Box<dyn Error + Send + Sync> {
-                                    format!("Failed to load ADC credentials: {e}").into()
-                                })?,
-                        )
-                    }
-                };
-
-                if let Some(creds) = effective_creds {
-                    builder = builder.with_credentials(creds);
-                }
-
-                builder
+                StorageControl::builder()
+                    .with_credentials(credentials)
                     .build()
                     .await
                     .map_err(|e| -> Box<dyn Error + Send + Sync> {
