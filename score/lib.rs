@@ -13,7 +13,11 @@ pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
 pub mod types;
-pub mod shared;
+#[path = "../shared/files.rs"]
+pub mod shared_files;
+pub mod shared {
+    pub use super::shared_files as files;
+}
 
 // Add calibrate module
 #[path = "../calibrate/lib.rs"]
