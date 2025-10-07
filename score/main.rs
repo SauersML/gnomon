@@ -417,7 +417,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
         |creds: Option<Credentials>| -> Result<StorageControl, Box<dyn Error + Send + Sync>> {
             let credentials = match creds {
                 Some(existing) => existing,
-                None => load_adc_credentials(&runtime)
+                None => load_adc_credentials()
                     .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("{e}").into() })?,
             };
 
