@@ -10,25 +10,17 @@
 // shared buffer pool to minimize allocations and provides natural backpressure if
 // consumers cannot keep up.
 
+use crate::decide::ComputePath;
 use crate::pipeline::PipelineError;
+pub use crate::shared::files::{
+    gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials, open_bed_source,
+    open_text_source, BedSource, ByteRangeSource, TextSource, PROGRESS_UPDATE_BATCH_SIZE,
+};
 use crate::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
-use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
-use google_cloud_storage::client::{Storage, StorageControl};
-use google_cloud_storage::model_ext::ReadRange;
-use log::{debug, warn};
-use memmap2::Mmap;
-use std::collections::{HashMap, VecDeque};
-use std::env;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::runtime::Runtime;
+use std::sync::Arc;
 
 /// The generic entry point for the producer thread.
 ///

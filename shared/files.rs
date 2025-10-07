@@ -1,6 +1,4 @@
 use crate::pipeline::PipelineError;
-use crossbeam_channel::Sender;
-use crossbeam_queue::ArrayQueue;
 use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
@@ -14,12 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 
 /// The number of variants to process locally before updating the global atomic counter.
 /// A power of 2 is often efficient
-const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
+pub const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_CACHE_CAPACITY: usize = 8;
@@ -887,4 +884,4 @@ mod tests {
     }
 }
 
-# next test: gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2  
+// next test: gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2
