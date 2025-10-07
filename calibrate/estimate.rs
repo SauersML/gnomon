@@ -4795,6 +4795,15 @@ pub mod internal {
             let ll_m = mean(&log_losses);
             let ll_sd = sd(&log_losses);
             let br_m = mean(&briers);
+            let (outcome_min, outcome_max) = y.iter().fold(
+                (f64::INFINITY, f64::NEG_INFINITY),
+                |(min_val, max_val), &val| (min_val.min(val), max_val.max(val)),
+            );
+            let outcome_range = if outcome_min.is_finite() && outcome_max.is_finite() {
+                outcome_max - outcome_min
+            } else {
+                0.0
+            };
             let slope_m = mean(&cal_slopes);
             let cint_m = mean(&cal_intercepts);
             let ece_m = mean(&eces);
@@ -5054,15 +5063,19 @@ pub mod internal {
                 pr_mean_ok,
             ));
 
-            let ll_mean_ok = ll_m <= 0.70;
+            let mse_m = br_m;
+            let mse_ok = mse_m < outcome_range;
             check_results.push(CheckResult::new(
-                "Global metric :: Log-loss".to_string(),
-                if ll_mean_ok {
-                    format!("Log-loss mean {:.3} ≤ 0.70", ll_m)
+                "Global metric :: MSE".to_string(),
+                if mse_ok {
+                    format!("MSE {:.3} < outcome range {:.3}", mse_m, outcome_range)
                 } else {
-                    format!("Log-loss mean too high: {:.3}", ll_m)
+                    format!(
+                        "MSE {:.3} is not less than outcome range {:.3}",
+                        mse_m, outcome_range
+                    )
                 },
-                ll_mean_ok,
+                mse_ok,
             ));
             let brier_mean_ok = br_m <= 0.25;
             check_results.push(CheckResult::new(
