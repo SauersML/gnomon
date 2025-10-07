@@ -13,10 +13,8 @@ pub mod shared {
 #[path = "../score/mod.rs"]
 mod score;
 
-pub use score::*;
-
-#[path = "../map/lib.rs"]
+#[path = "../map/mod.rs"]
 pub mod map;
 
-#[path = "../calibrate/lib.rs"]
+#[path = "../calibrate/mod.rs"]
 pub mod calibrate;
