@@ -24,6 +24,8 @@
 // External Crate for Optimization
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
+use self::internal::RemlState;
+
 // Crate-level imports
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
@@ -98,6 +100,250 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
 
 fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
     z.mapv(|v| RHO_BOUND * v.tanh())
+}
+
+fn build_asymmetric_fallback(len: usize) -> Array1<f64> {
+    let mut fallback = Array1::zeros(len);
+    for i in 0..fallback.len() {
+        fallback[i] = (i as f64) * 0.1;
+    }
+    fallback
+}
+
+fn run_gradient_check(
+    label: &str,
+    reml_state: &RemlState<'_>,
+    rho: &Array1<f64>,
+) -> Result<(), EstimationError> {
+    eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy for candidate {label}");
+    if rho.is_empty() {
+        return Ok(());
+    }
+
+    let g_analytic = reml_state.compute_gradient(rho)?;
+    let g_fd = compute_fd_gradient(reml_state, rho)?;
+
+    let dot = g_analytic.dot(&g_fd);
+    let n_a = g_analytic.dot(&g_analytic).sqrt();
+    let n_f = g_fd.dot(&g_fd).sqrt();
+    let cosine_sim = if n_a * n_f > 1e-12 {
+        dot / (n_a * n_f)
+    } else if n_a < 1e-12 && n_f < 1e-12 {
+        1.0
+    } else {
+        0.0
+    };
+    let rel_l2 = {
+        let diff = &g_fd - &g_analytic;
+        let dnorm = diff.dot(&diff).sqrt();
+        dnorm / (n_a.max(n_f).max(1.0))
+    };
+
+    eprintln!("  Cosine similarity = {:.6}", cosine_sim);
+    eprintln!("  Relative L2 error = {:.6e}", rel_l2);
+
+    let g_ref: Array1<f64> = g_analytic
+        .iter()
+        .zip(g_fd.iter())
+        .map(|(&a, &f)| a.abs().max(f.abs()))
+        .collect();
+    let g_inf = g_ref.iter().fold(0.0_f64, |m, &v| m.max(v));
+    let tau_abs = 1e-6_f64;
+    let tau_rel = 1e-3_f64 * g_inf;
+    let mask: Vec<bool> = g_ref
+        .iter()
+        .map(|&r| r >= tau_abs || r >= tau_rel)
+        .collect();
+
+    let mut kept = 0usize;
+    let mut ok = 0usize;
+    for i in 0..g_analytic.len() {
+        if mask[i] {
+            kept += 1;
+            let r = g_ref[i];
+            let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
+            let rel_fac = if scale >= 0.10 {
+                0.15
+            } else if scale >= 0.03 {
+                0.35
+            } else {
+                0.70
+            };
+            let tol_i = 1e-8_f64 + rel_fac * r;
+            if (g_analytic[i] - g_fd[i]).abs() <= tol_i {
+                ok += 1;
+            }
+        }
+    }
+    let comp_rate = if kept > 0 {
+        (ok as f64) / (kept as f64)
+    } else {
+        1.0
+    };
+    eprintln!(
+        "  Component pass rate (masked) = {:.1}% (kept {} of {})",
+        100.0 * comp_rate,
+        kept,
+        g_analytic.len()
+    );
+
+    let cosine_ok = cosine_sim >= 0.999;
+    let rel_ok = (rel_l2 <= 5e-2) || (n_a < 1e-6);
+    let comp_ok = if kept <= 3 {
+        comp_rate >= 0.50
+    } else {
+        comp_rate >= 0.70
+    };
+
+    if !(cosine_ok && rel_ok && comp_ok) {
+        let comp_min_req = if kept <= 3 { 0.50 } else { 0.70 };
+        let mut gates: Vec<String> = Vec::new();
+        gates.push(format!(
+            "cosine={:.6} (min {:.6}) [{}]",
+            cosine_sim,
+            0.999,
+            if cosine_ok { "OK" } else { "FAIL" }
+        ));
+        let rel_max = 5e-2_f64;
+        gates.push(format!(
+            "relL2={:.3e} (max {:.3e}) [{}]{}",
+            rel_l2,
+            rel_max,
+            if rel_ok { "OK" } else { "FAIL" },
+            if n_a < 1e-6 {
+                " (analytic grad ~0, relaxed)"
+            } else {
+                ""
+            }
+        ));
+        gates.push(format!(
+            "compRate(masked)={:.1}% (kept {}/{}; min {:.0}%) [{}]",
+            100.0 * comp_rate,
+            kept,
+            g_analytic.len(),
+            100.0 * comp_min_req,
+            if comp_ok { "OK" } else { "FAIL" }
+        ));
+
+        #[allow(clippy::type_complexity)]
+        let mut offenders: Vec<(usize, f64, f64, f64, f64, f64)> = Vec::new();
+        for i in 0..g_analytic.len() {
+            if !mask[i] {
+                continue;
+            }
+            let a = g_analytic[i];
+            let f = g_fd[i];
+            let r = g_ref[i];
+            let denom = 1e-8_f64.max(r);
+            let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
+            let rel_fac = if scale >= 0.10 {
+                0.15
+            } else if scale >= 0.03 {
+                0.35
+            } else {
+                0.70
+            };
+            let tol_i = 1e-8_f64 + rel_fac * r;
+            let rel = (a - f).abs() / denom;
+            if (a - f).abs() > tol_i {
+                offenders.push((i, a, f, (a - f).abs(), rel, tol_i));
+            }
+        }
+        offenders.sort_by(|x, y| y.4.partial_cmp(&x.4).unwrap_or(std::cmp::Ordering::Equal));
+        let top_k = usize::min(3, offenders.len());
+        let offenders_str = if top_k > 0 {
+            let mut lines = Vec::new();
+            for j in 0..top_k {
+                let (i, a, f, absd, rel, tol_i) = offenders[j];
+                lines.push(format!(
+                    "  - idx {}: a={:.3e}, fd={:.3e}, |Δ|={:.3e}, rel={:.3e}, tol_i={:.3e}",
+                    i, a, f, absd, rel, tol_i
+                ));
+            }
+            lines.join("\n")
+        } else {
+            "  - (no masked per-component offenders; failing gate(s) were global)".to_string()
+        };
+
+        let msg = format!(
+            "[Candidate {label}] Gradient check FAILED\nGates:\n  {}\nMask: tau_abs={:.1e}, tau_rel={:.1e} (||g||_inf={:.3e})\nOffenders (top {}):\n{}",
+            gates.join("\n  "),
+            1e-6_f64,
+            1e-3_f64 * g_inf,
+            g_inf,
+            top_k,
+            offenders_str
+        );
+        eprintln!("{msg}");
+        log::error!("{msg}");
+        return Err(EstimationError::RemlOptimizationFailed(msg));
+    }
+
+    eprintln!("  ✓ Gradient check passed!");
+    Ok(())
+}
+
+fn run_bfgs_for_candidate(
+    label: &str,
+    reml_state: &RemlState<'_>,
+    config: &ModelConfig,
+    initial_z: Array1<f64>,
+) -> Result<BfgsSolution, EstimationError> {
+    eprintln!("\n[Candidate {label}] Running BFGS optimization from queued seed");
+    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+        .with_tolerance(config.reml_convergence_tolerance)
+        .with_max_iterations(config.reml_max_iterations as usize)
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0xC0FFEE_u64);
+
+    let solution = match solver.run() {
+        Ok(solution) => {
+            eprintln!("\n[Candidate {label}] BFGS converged successfully according to tolerance.");
+            solution
+        }
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
+            eprintln!(
+                "[Candidate {label}] Line search stopped early; using best-so-far parameters."
+            );
+            *last_solution
+        }
+        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
+            eprintln!(
+                "\n[Candidate {label}] WARNING: BFGS hit the iteration cap; using best-so-far parameters."
+            );
+            eprintln!(
+                "[Candidate {label}] Last recorded gradient norm: {:.2e}",
+                last_solution.final_gradient_norm
+            );
+            *last_solution
+        }
+        Err(e) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "Candidate {label} failed with a critical BFGS error: {e:?}"
+            )));
+        }
+    };
+
+    if reml_state.consecutive_cost_error_count() >= MAX_CONSECUTIVE_INNER_ERRORS {
+        let last_msg = reml_state
+            .last_cost_error_string()
+            .unwrap_or_else(|| "unknown error".to_string());
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "Candidate {label} aborted due to repeated inner-loop failures ({} consecutive). Last error: {}",
+            reml_state.consecutive_cost_error_count(),
+            last_msg
+        )));
+    }
+
+    if !solution.final_value.is_finite() {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "Candidate {label} produced a non-finite final value: {}",
+            solution.final_value
+        )));
+    }
+
+    Ok(solution)
 }
 
 fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -506,296 +752,154 @@ pub fn train_model(
         (None, None) => false,
     };
 
-    let start_z = if pick_asym {
-        let (asym_rho, asym_cost, asym_idx) = best_asymmetric_seed.unwrap();
-        eprintln!(
-            "[Init] Using best asymmetric seed #{} (cost = {:.6})",
-            asym_idx, asym_cost
-        );
-        Some(to_z_from_rho(&asym_rho))
-    } else if let Some((sym_rho, sym_cost, sym_idx)) = best_symmetric_seed {
-        eprintln!(
-            "[Init] Using symmetric seed #{} (cost = {:.6}) (no viable asymmetric seed within margin)",
-            sym_idx, sym_cost
-        );
-        Some(to_z_from_rho(&sym_rho))
-    } else {
-        // Both failed - use asymmetric fallback
-        eprintln!("[Init] All seeds failed; using small asymmetric fallback.");
-        let mut fallback_rho = Array1::zeros(layout.num_penalties);
-        for i in 0..fallback_rho.len() {
-            fallback_rho[i] = (i as f64) * 0.1;
-        }
-        Some(to_z_from_rho(&fallback_rho))
-    };
+    let asym_candidate = best_asymmetric_seed;
+    let sym_candidate = best_symmetric_seed;
+    let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = Vec::new();
 
-    // Fallback to previous default if none were finite (will likely be rescued by the barrier)
-    let initial_z = start_z.unwrap_or_else(|| {
-        eprintln!(
-            "[Init] Could not find a finite-cost seed; falling back to rho = 1.0 (lambda = e) and barrier handling."
-        );
-        to_z_from_rho(&Array1::from_elem(layout.num_penalties, 1.0))
-    });
-
-    // Map to rho space for gradient check (always-on)
-    let initial_rho = to_rho_from_z(&initial_z);
-
-    // Always-on gradient check - run once at the initial point (release builds included)
-    eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy at initial point");
-    if !initial_rho.is_empty() {
-        // Compute both gradients once
-        let g_analytic = reml_state.compute_gradient(&initial_rho)?;
-        let g_fd = compute_fd_gradient(&reml_state, &initial_rho)?;
-
-        // Cosine similarity and relative L2 error
-        let dot = g_analytic.dot(&g_fd);
-        let n_a = g_analytic.dot(&g_analytic).sqrt();
-        let n_f = g_fd.dot(&g_fd).sqrt();
-        let cosine_sim = if n_a * n_f > 1e-12 {
-            dot / (n_a * n_f)
-        } else if n_a < 1e-12 && n_f < 1e-12 {
-            1.0
-        } else {
-            0.0
-        };
-        let rel_l2 = {
-            let diff = &g_fd - &g_analytic;
-            let dnorm = diff.dot(&diff).sqrt();
-            dnorm / (n_a.max(n_f).max(1.0))
-        };
-
-        eprintln!("  Cosine similarity = {:.6}", cosine_sim);
-        eprintln!("  Relative L2 error = {:.6e}", rel_l2);
-
-        // Mask tiny components before computing per-component rate
-        let g_ref: Array1<f64> = g_analytic
-            .iter()
-            .zip(g_fd.iter())
-            .map(|(&a, &f)| a.abs().max(f.abs()))
-            .collect();
-        let g_inf = g_ref.iter().fold(0.0_f64, |m, &v| m.max(v));
-        let tau_abs = 1e-6_f64;
-        let tau_rel = 1e-3_f64 * g_inf;
-        let mask: Vec<bool> = g_ref
-            .iter()
-            .map(|&r| r >= tau_abs || r >= tau_rel)
-            .collect();
-
-        let mut kept = 0usize;
-        let mut ok = 0usize;
-        for i in 0..g_analytic.len() {
-            if mask[i] {
-                kept += 1;
-                let r = g_ref[i];
-                // Scale-aware per-component tolerance: looser for very small components
-                let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
-                let rel_fac = if scale >= 0.10 {
-                    0.15
-                } else if scale >= 0.03 {
-                    0.35
-                } else {
-                    0.70
-                };
-                let tol_i = 1e-8_f64 + rel_fac * r;
-                if (g_analytic[i] - g_fd[i]).abs() <= tol_i {
-                    ok += 1;
-                }
-            }
-        }
-        let comp_rate = if kept > 0 {
-            (ok as f64) / (kept as f64)
-        } else {
-            1.0
-        };
-        eprintln!(
-            "  Component pass rate (masked) = {:.1}% (kept {} of {})",
-            100.0 * comp_rate,
-            kept,
-            g_analytic.len()
-        );
-
-        // Acceptance: global metrics plus masked component rate
-        let cosine_ok = cosine_sim >= 0.999;
-        let rel_ok = (rel_l2 <= 5e-2) || (n_a < 1e-6);
-        // For tiny kept sets (<=3), accept 50% to avoid false negatives in low-dim noisy cases
-        let comp_ok = if kept <= 3 {
-            comp_rate >= 0.50
-        } else {
-            comp_rate >= 0.70
-        };
-
-        if !(cosine_ok && rel_ok && comp_ok) {
-            // Build clear failure diagnostics: which gates failed and why
-            let comp_min_req = if kept <= 3 { 0.50 } else { 0.70 };
-            let mut gates: Vec<String> = Vec::new();
-            gates.push(format!(
-                "cosine={:.6} (min {:.6}) [{}]",
-                cosine_sim,
-                0.999,
-                if cosine_ok { "OK" } else { "FAIL" }
-            ));
-            let rel_max = 5e-2_f64;
-            gates.push(format!(
-                "relL2={:.3e} (max {:.3e}) [{}]{}",
-                rel_l2,
-                rel_max,
-                if rel_ok { "OK" } else { "FAIL" },
-                if n_a < 1e-6 {
-                    " (analytic grad ~0, relaxed)"
-                } else {
-                    ""
-                }
-            ));
-            gates.push(format!(
-                "compRate(masked)={:.1}% (kept {}/{}; min {:.0}%) [{}]",
-                100.0 * comp_rate,
-                kept,
-                g_analytic.len(),
-                100.0 * comp_min_req,
-                if comp_ok { "OK" } else { "FAIL" }
-            ));
-
-            // List top offending components under the same tolerance rule used above
-            #[allow(clippy::type_complexity)]
-            let mut offenders: Vec<(usize, f64, f64, f64, f64, f64)> = Vec::new();
-            for i in 0..g_analytic.len() {
-                if !mask[i] {
-                    continue;
-                }
-                let a = g_analytic[i];
-                let f = g_fd[i];
-                let r = g_ref[i];
-                let denom = 1e-8_f64.max(r);
-                let scale = if g_inf > 0.0 { r / g_inf } else { 0.0 };
-                let rel_fac = if scale >= 0.10 {
-                    0.15
-                } else if scale >= 0.03 {
-                    0.35
-                } else {
-                    0.70
-                };
-                let tol_i = 1e-8_f64 + rel_fac * r;
-                let rel = (a - f).abs() / denom;
-                if (a - f).abs() > tol_i {
-                    offenders.push((i, a, f, (a - f).abs(), rel, tol_i));
-                }
-            }
-            offenders.sort_by(|x, y| y.4.partial_cmp(&x.4).unwrap_or(std::cmp::Ordering::Equal));
-            let top_k = usize::min(3, offenders.len());
-            let offenders_str = if top_k > 0 {
-                let mut lines = Vec::new();
-                for j in 0..top_k {
-                    let (i, a, f, absd, rel, tol_i) = offenders[j];
-                    lines.push(format!(
-                        "  - idx {}: a={:.3e}, fd={:.3e}, |Δ|={:.3e}, rel={:.3e}, tol_i={:.3e}",
-                        i, a, f, absd, rel, tol_i
-                    ));
-                }
-                lines.join("\n")
-            } else {
-                "  - (no masked per-component offenders; failing gate(s) were global)".to_string()
-            };
-
-            let msg = format!(
-                "Initial gradient check FAILED\nGates:\n  {}\nMask: tau_abs={:.1e}, tau_rel={:.1e} (||g||_inf={:.3e})\nOffenders (top {}):\n{}",
-                gates.join("\n  "),
-                1e-6_f64,
-                1e-3_f64 * g_inf,
-                g_inf,
-                top_k,
-                offenders_str
+    if pick_asym {
+        if let Some((rho, cost, idx)) = asym_candidate {
+            eprintln!(
+                "[Init] Using best asymmetric seed #{} (cost = {:.6})",
+                idx, cost
             );
-            eprintln!("{}", msg);
-            log::error!("{}", msg);
-            return Err(EstimationError::RemlOptimizationFailed(msg));
+            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
         }
-        eprintln!("  ✓ Gradient check passed!");
+        if let Some((rho, cost, idx)) = sym_candidate {
+            eprintln!(
+                "[Init] Also queueing best symmetric seed #{} (cost = {:.6})",
+                idx, cost
+            );
+            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+    } else {
+        if let Some((rho, cost, idx)) = sym_candidate {
+            eprintln!("[Init] Using symmetric seed #{} (cost = {:.6})", idx, cost);
+            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+        if let Some((rho, cost, idx)) = asym_candidate {
+            eprintln!(
+                "[Init] Also queueing best asymmetric seed #{} (cost = {:.6})",
+                idx, cost
+            );
+            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
     }
 
-    eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS...");
+    if candidate_plans.is_empty() {
+        eprintln!("[Init] All seeds failed; using ramped asymmetric fallback.");
+        candidate_plans.push((
+            "fallback-asymmetric".to_string(),
+            build_asymmetric_fallback(layout.num_penalties),
+            None,
+            None,
+        ));
+    }
 
-    // --- Run the BFGS Optimizer ---
-    // The closure is now a simple, robust method call.
-    // Rationale: We store the result instead of immediately crashing with `?`
-    // This allows us to inspect the error type and handle it gracefully.
-    // Run BFGS in unconstrained space z, with mapping handled inside cost_and_grad
-    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
-        .with_tolerance(config.reml_convergence_tolerance)
-        .with_max_iterations(config.reml_max_iterations as usize)
-        // optional but recommended: make the floating-point guards a bit tighter for smoother models
-        .with_fp_tolerances(1e2, 1e2)
-        // let the optimizer stop on "no meaningful improvement" without you checking it again
-        .with_no_improve_stop(1e-8, 5)
-        // determinism for the (small) stochastic jiggling used to escape flats
-        .with_rng_seed(0xC0FFEE_u64);
-    let bfgs_result = solver.run();
+    eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
 
-    // Rationale: This `match` block is the new control structure. It allows us
-    // to define different behaviors for a successful run vs. a failed run.
+    let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution)> = Vec::new();
+    let mut last_error: Option<EstimationError> = None;
+
+    for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+        eprintln!("\n[Candidate {label}] Evaluating seed");
+        if let Some(idx) = seed_index {
+            eprintln!("  -> Seed index: {idx}");
+        }
+        if let Some(cost) = seed_cost {
+            eprintln!("  -> Seed cost: {cost:.6}");
+        }
+
+        reml_state.reset_optimizer_tracking();
+        let initial_z = to_z_from_rho(&rho);
+        let initial_rho = to_rho_from_z(&initial_z);
+
+        if let Err(err) = run_gradient_check(&label, &reml_state, &initial_rho) {
+            eprintln!("[Candidate {label}] Gradient check failed: {err}");
+            last_error = Some(err);
+            continue;
+        }
+
+        match run_bfgs_for_candidate(&label, &reml_state, config, initial_z) {
+            Ok(solution) => {
+                eprintln!(
+                    "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
+                    solution.iterations, solution.final_value
+                );
+                successful_runs.push((label, seed_index, seed_cost, solution));
+                continue;
+            }
+            Err(err) => {
+                eprintln!("[Candidate {label}] BFGS failed: {err}");
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if successful_runs.is_empty() {
+        eprintln!(
+            "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
+        );
+        reml_state.reset_optimizer_tracking();
+        let fallback_rho = build_asymmetric_fallback(layout.num_penalties);
+        let fallback_z = to_z_from_rho(&fallback_rho);
+        let fallback_rho_checked = to_rho_from_z(&fallback_z);
+        let fallback_label = "fallback-retry".to_string();
+
+        match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
+            Ok(()) => {
+                match run_bfgs_for_candidate(&fallback_label, &reml_state, config, fallback_z) {
+                    Ok(solution) => {
+                        eprintln!(
+                            "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
+                            solution.iterations, solution.final_value
+                        );
+                        successful_runs.push((fallback_label, None, None, solution));
+                    }
+                    Err(err) => {
+                        eprintln!("[Fallback] BFGS failed: {err}");
+                        last_error = Some(err);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("[Fallback] Gradient check failed: {err}");
+                last_error = Some(err);
+            }
+        }
+
+        if successful_runs.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "All candidate seeds failed, including fallback retry.".to_string(),
+                )
+            }));
+        }
+    }
+
+    let (best_label, best_seed_index, best_seed_cost, best_solution) = successful_runs
+        .into_iter()
+        .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
+            Some(order) => order,
+            None => std::cmp::Ordering::Equal,
+        })
+        .unwrap();
+
     let BfgsSolution {
-        final_point: final_z, // This is the unconstrained parameter z, not rho
+        final_point: final_z,
         final_value,
         iterations,
         ..
-    } = match bfgs_result {
-        // Rationale: This is the ideal success path. If the optimizer converges
-        // according to its strict criteria, we log the success and use the result.
-        Ok(solution) => {
-            eprintln!("\nBFGS optimization converged successfully according to tolerance.");
-            solution
-        }
-        // Rationale: This is the core of our fix. We specifically catch the
-        // `LineSearchFailed` error, which we've diagnosed as acceptable. We print a
-        // helpful warning and extract `last_solution` (the best result found before
-        // failure), allowing the program to continue.
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            eprintln!("[INFO] Line search stopped early; using best-so-far parameters.");
-            *last_solution
-        }
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
-            // Stage: Emit a warning about the lack of convergence
-            eprintln!(
-                "\n[WARNING] BFGS optimization failed to converge within the maximum number of iterations."
-            );
-            eprintln!(
-                "[INFO] Proceeding with the best solution found. Final gradient norm: {:.2e}",
-                last_solution.final_gradient_norm
-            );
+    } = best_solution;
 
-            // Stage: Accept the best solution produced by BFGS
-            *last_solution
-        }
-        // Rationale: This is our safety net. Any other error from the optimizer
-        // (e.g., gradient was NaN) is still treated as a fatal error, ensuring
-        // the program doesn't continue with a potentially garbage result.
-        Err(e) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "BFGS failed with a critical error: {e:?}"
-            )));
-        }
-    };
-
-    // Abort if the inner loop encountered repeated numerical failures
-    // Use module-level constant
-    if reml_state.consecutive_cost_error_count() >= MAX_CONSECUTIVE_INNER_ERRORS {
-        let last_msg = reml_state
-            .last_cost_error_string()
-            .unwrap_or_else(|| "unknown error".to_string());
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "Aborted due to repeated inner-loop failures ({} consecutive). Last error: {}",
-            reml_state.consecutive_cost_error_count(),
-            last_msg
-        )));
-    }
-
-    if !final_value.is_finite() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "BFGS optimization did not find a finite solution, final value: {final_value}"
-        )));
-    }
     eprintln!(
-        "\nBFGS optimization completed in {iterations} iterations with final value: {final_value:.6}"
+        "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
     );
+    if let Some(idx) = best_seed_index {
+        eprintln!("  -> Originating seed index: {idx}");
+    }
+    if let Some(cost) = best_seed_cost {
+        eprintln!("  -> Seed cost: {cost:.6}");
+    }
     log::info!("REML optimization completed successfully");
 
     // --- Finalize the Model (same as before) ---
@@ -1579,6 +1683,15 @@ pub mod internal {
     }
 
     impl<'a> RemlState<'a> {
+        pub fn reset_optimizer_tracking(&self) {
+            *self.eval_count.borrow_mut() = 0;
+            *self.last_cost.borrow_mut() = f64::INFINITY;
+            *self.last_grad_norm.borrow_mut() = f64::INFINITY;
+            *self.consecutive_cost_errors.borrow_mut() = 0;
+            *self.last_cost_error_msg.borrow_mut() = None;
+            self.current_eval_bundle.borrow_mut().take();
+        }
+
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
         ///
@@ -3185,16 +3298,13 @@ pub mod internal {
                     let high_freq_wiggle = 0.45
                         * (1.7 * pgs_val + 0.8 * pc_val + pgs_phase_shifts[i]).sin()
                         * (1.1 * pgs_val - 1.5 * pc_val + pc_phase_shifts[i]).cos();
-                    let localized_wiggle = 0.3
-                        * f64::exp(
-                            -0.5
-                                * ((pgs_val - 0.65).powi(2) / 0.35
-                                    + (pc_val + 0.4).powi(2) / 0.45),
-                        )
-                        * ((3.2 * pgs_val).sin() + (2.8 * pc_val).cos());
-                    let interaction = 0.9 * smooth_interaction
-                        + 0.6 * high_freq_wiggle
-                        + 0.5 * localized_wiggle;
+                    let localized_wiggle =
+                        0.3 * f64::exp(
+                            -0.5 * ((pgs_val - 0.65).powi(2) / 0.35
+                                + (pc_val + 0.4).powi(2) / 0.45),
+                        ) * ((3.2 * pgs_val).sin() + (2.8 * pc_val).cos());
+                    let interaction =
+                        0.9 * smooth_interaction + 0.6 * high_freq_wiggle + 0.5 * localized_wiggle;
                     let logit = response_scales[i]
                         * (-0.1
                             + intercept_noise[i]
