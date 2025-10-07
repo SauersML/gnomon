@@ -15,7 +15,7 @@ use crate::pipeline::PipelineError;
 use crate::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
-use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
+use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
@@ -25,10 +25,10 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 
 /// The number of variants to process locally before updating the global atomic counter.
@@ -80,9 +80,20 @@ pub fn load_adc_credentials() -> Result<Credentials, PipelineError> {
         builder = builder.with_quota_project_id(project);
     }
 
-    builder
+    let runtime = if tokio::runtime::Handle::try_current().is_err() {
+        Some(get_shared_runtime()?)
+    } else {
+        None
+    };
+    let runtime_guard = runtime.as_ref().map(|rt| rt.enter());
+
+    let credentials = builder
         .build()
-        .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))
+        .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
+
+    drop(runtime_guard);
+
+    Ok(credentials)
 }
 
 /// A trait that abstracts sequential, line-oriented access to text data such as
@@ -904,6 +915,7 @@ pub fn multi_file_producer_thread<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     const PUBLIC_BUCKET: &str = "genomics-public-data";
     const PUBLIC_REFERENCE_OBJECT: &str = "references/hg38/v0/Homo_sapiens_assembly38.fasta";
@@ -998,6 +1010,88 @@ mod tests {
             tail_buffer.iter().any(|&byte| byte != 0),
             "Expected trailing read to yield streamed data"
         );
+
+        Ok(())
+    }
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var(key).ok();
+            unsafe { env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                unsafe { env::set_var(self.key, original) };
+            } else {
+                unsafe { env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn write_stub_adc_file(path: &Path) {
+        const AUTHORIZED_USER: &str = r#"{
+  "client_id": "test-client-id",
+  "client_secret": "test-client-secret",
+  "refresh_token": "test-refresh-token",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "type": "authorized_user"
+}"#;
+        std::fs::write(path, AUTHORIZED_USER).expect("failed to write stub ADC file");
+    }
+
+    #[test]
+    fn load_adc_credentials_without_runtime_supports_storage_client() -> Result<(), PipelineError> {
+        let env_lock = env_mutex().lock().unwrap();
+
+        let adc_file = NamedTempFile::new().expect("failed to create temp ADC file");
+        write_stub_adc_file(adc_file.path());
+
+        let adc_guard = EnvVarGuard::set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            adc_file
+                .path()
+                .to_str()
+                .expect("temporary path should be valid UTF-8"),
+        );
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        let credentials = load_adc_credentials()?;
+
+        let runtime = get_shared_runtime()?;
+        let storage_control = runtime.block_on(async move {
+            StorageControl::builder()
+                .with_credentials(credentials.clone())
+                .build()
+                .await
+                .map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to create Cloud Storage control client for test: {e}"
+                    ))
+                })
+        })?;
+
+        // Ensure the credentials are exercised in the same way as the CLI, which
+        // constructs a storage client after loading ADC credentials without an
+        // existing runtime.
+        let _ = storage_control;
+
+        drop(adc_guard);
+        drop(env_lock);
 
         Ok(())
     }
