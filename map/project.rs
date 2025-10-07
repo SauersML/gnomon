@@ -1,10 +1,10 @@
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatMut, MatRef, Par};
+use faer::{Accum, Mat, MatMut, MatRef};
 use std::error::Error;
 
 use super::fit::{
-    DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
+    DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource, DEFAULT_BLOCK_WIDTH,
 };
 
 pub struct HwePcaProjector<'model> {
@@ -121,7 +121,7 @@ impl<'model> HwePcaProjector<'model> {
                 standardized,
                 loadings_block,
                 1.0,
-                Par::Seq,
+                faer::get_global_parallelism(),
             );
 
             processed += filled;

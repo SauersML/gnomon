@@ -2,7 +2,8 @@ use core::cmp::min;
 use core::fmt;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
-use faer::{Accum, Mat, MatMut, MatRef, Par, Side};
+use faer::{unzip, zip, Unbind};
+use faer::{Accum, Mat, MatMut, MatRef, Side};
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -147,11 +148,11 @@ impl HweScaler {
         block: &mut MatMut<'_, f64>,
         variant_range: Range<usize>,
     ) {
-        let freqs = &self.frequencies;
-        let scales = &self.scales;
-        for (local_col, variant_index) in variant_range.enumerate() {
-            let mean = 2.0 * freqs[variant_index];
-            let denom = scales[variant_index].max(HWE_SCALE_FLOOR);
+        let freqs = &self.frequencies[variant_range.clone()];
+        let scales = &self.scales[variant_range];
+        for (local_col, (&freq, &scale)) in freqs.iter().zip(scales.iter()).enumerate() {
+            let mean = 2.0 * freq;
+            let denom = scale.max(HWE_SCALE_FLOOR);
             let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
             for row in 0..block.nrows() {
                 let raw = block[(row, local_col)];
@@ -332,17 +333,17 @@ where
             filled,
         );
 
-        for local_col in 0..filled {
+        for (local_col, column) in block.as_ref().col_iter().enumerate() {
             let variant_index = processed + local_col;
             let mut sum = 0.0f64;
             let mut calls = 0usize;
-            for row in 0..n_samples {
-                let value = block[(row, local_col)];
-                if value.is_finite() {
-                    sum += value;
+            zip!(column).for_each(|unzip!(value)| {
+                let raw = *value;
+                if raw.is_finite() {
+                    sum += raw;
                     calls += 1;
                 }
-            }
+            });
             allele_sums[variant_index] += sum;
             allele_counts[variant_index] += calls;
         }
@@ -428,7 +429,7 @@ where
             block_ref,
             block_ref.transpose(),
             scale,
-            Par::Seq,
+            faer::get_global_parallelism(),
         );
 
         processed += filled;
@@ -468,26 +469,30 @@ fn decompose_gram_matrix(gram: Mat<f64>) -> Result<Eigenpairs, HwePcaError> {
         selected.push(idx);
     }
 
-    let mut vectors = Mat::zeros(eig.U().nrows(), selected.len());
-    for (component, src_col) in selected.into_iter().enumerate() {
-        for row in 0..eig.U().nrows() {
-            vectors[(row, component)] = eig.U()[(row, src_col)];
-        }
-    }
+    let vectors = Mat::from_fn(eig.U().nrows(), selected.len(), |row_idx, col_idx| {
+        let row = row_idx.unbound();
+        let component = col_idx.unbound();
+        let src_col = selected[component];
+        eig.U()[(row, src_col)]
+    });
 
     Ok(Eigenpairs { values, vectors })
 }
 
 fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
     let mut singular_values = Vec::with_capacity(decomposition.values.len());
-    let mut sample_scores = Mat::zeros(n_samples, decomposition.values.len());
+    let mut sample_scores = decomposition.vectors.clone();
 
-    for (component, &lambda) in decomposition.values.iter().enumerate() {
+    for (&lambda, mut column) in decomposition
+        .values
+        .iter()
+        .zip(sample_scores.col_iter_mut())
+    {
         let sigma = ((n_samples - 1) as f64 * lambda).sqrt();
         singular_values.push(sigma);
-        for row in 0..n_samples {
-            sample_scores[(row, component)] = decomposition.vectors[(row, component)] * sigma;
-        }
+        zip!(&mut column).for_each(|unzip!(value)| {
+            *value *= sigma;
+        });
     }
 
     (singular_values, sample_scores)
@@ -554,7 +559,7 @@ where
             block_ref.transpose(),
             sample_basis,
             1.0,
-            Par::Seq,
+            faer::get_global_parallelism(),
         );
 
         for local_col in 0..filled {
