@@ -22,7 +22,7 @@ path = "shared/lib.rs"
 
 [[bin]]
 name = "gnomon"
-path = "src/main.rs"
+path = "cli/main.rs"
 
 [dependencies]
 ahash = "0.8.12"
@@ -93,4 +93,3 @@ grep = "0.3.2"
 [[bench]]
 name = "path_benchmark"
 harness = false
-
