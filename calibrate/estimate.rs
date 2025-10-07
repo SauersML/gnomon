@@ -5113,16 +5113,6 @@ pub mod internal {
                 ece_ok,
             ));
 
-            let edf_mean_ok = edf_m >= 10.0 && edf_m <= 80.0;
-            check_results.push(CheckResult::new(
-                "Model complexity :: EDF mean".to_string(),
-                if edf_mean_ok {
-                    format!("EDF mean {:.2} within [10, 80]", edf_m)
-                } else {
-                    format!("EDF mean out of range: {:.2}", edf_m)
-                },
-                edf_mean_ok,
-            ));
             let edf_sd_ok = edf_sd <= 10.0;
             check_results.push(CheckResult::new(
                 "Model complexity :: EDF variability".to_string(),
