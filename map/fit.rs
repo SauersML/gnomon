@@ -2,8 +2,9 @@ use core::cmp::min;
 use core::fmt;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
-use faer::{unzip, zip, Unbind};
-use faer::{Accum, Mat, MatMut, MatRef, Side};
+use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
+use faer::{Unbind, unzip, zip};
+use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -145,22 +146,57 @@ impl HweScaler {
 
     pub(crate) fn standardize_block(
         &self,
-        block: &mut MatMut<'_, f64>,
+        mut block: MatMut<'_, f64>,
         variant_range: Range<usize>,
     ) {
-        let freqs = &self.frequencies[variant_range.clone()];
-        let scales = &self.scales[variant_range];
-        for (local_col, (&freq, &scale)) in freqs.iter().zip(scales.iter()).enumerate() {
-            let mean = 2.0 * freq;
-            let denom = scale.max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
-            for row in 0..block.nrows() {
-                let raw = block[(row, local_col)];
-                block[(row, local_col)] = if raw.is_finite() {
-                    (raw - mean) * inv
-                } else {
-                    0.0
-                };
+        let start = variant_range.start;
+        let end = variant_range.end;
+        let freqs = &self.frequencies[start..end];
+        let scales = &self.scales[start..end];
+        let filled = freqs.len();
+
+        debug_assert_eq!(filled, block.ncols());
+        let mut block = block.subcols_mut(0, filled);
+
+        let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
+            let mut contiguous = column
+                .try_as_col_major_mut()
+                .expect("projection block column must be contiguous");
+            let values = contiguous.as_slice_mut();
+            if inv == 0.0 {
+                values.fill(0.0);
+            } else {
+                for value in values {
+                    let raw = *value;
+                    *value = if raw.is_finite() {
+                        (raw - mean) * inv
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        };
+
+        if filled >= 32 && rayon::current_num_threads() > 1 {
+            block
+                .par_col_iter_mut()
+                .enumerate()
+                .for_each(|(idx, column)| {
+                    let freq = freqs[idx];
+                    let scale = scales[idx];
+                    let mean = 2.0 * freq;
+                    let denom = scale.max(HWE_SCALE_FLOOR);
+                    let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                    apply_standardization(column, mean, inv);
+                });
+        } else {
+            for (idx, column) in block.col_iter_mut().enumerate() {
+                let freq = freqs[idx];
+                let scale = scales[idx];
+                let mean = 2.0 * freq;
+                let denom = scale.max(HWE_SCALE_FLOOR);
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                apply_standardization(column, mean, inv);
             }
         }
     }
@@ -415,13 +451,9 @@ where
             n_samples,
             filled,
         );
-        scaler.standardize_block(&mut block, processed..processed + filled);
+        scaler.standardize_block(block.as_mut(), processed..processed + filled);
 
-        let block_ref = MatRef::from_column_major_slice(
-            &block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
+        let block_ref = block.into_const();
 
         matmul(
             gram.as_mut(),
@@ -539,13 +571,9 @@ where
             n_samples,
             filled,
         );
-        scaler.standardize_block(&mut block, processed..processed + filled);
+        scaler.standardize_block(block.as_mut(), processed..processed + filled);
 
-        let block_ref = MatRef::from_column_major_slice(
-            &block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
+        let block_ref = block.into_const();
 
         let mut chunk = MatMut::from_column_major_slice_mut(
             &mut chunk_storage[..filled * n_components],
