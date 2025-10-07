@@ -10,10 +10,10 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
 
-const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
-const HWE_SCALE_FLOOR: f64 = 1.0e-6;
-const EIGENVALUE_EPSILON: f64 = 1.0e-9;
-const DEFAULT_BLOCK_WIDTH: usize = 2_048;
+pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
+pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
+pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
+pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 
 pub trait VariantBlockSource {
     type Error;
@@ -113,7 +113,7 @@ impl fmt::Display for HwePcaError {
         match self {
             HwePcaError::InvalidInput(msg) => f.write_str(msg),
             HwePcaError::Source(err) => write!(f, "source error: {err}"),
-            HwePcaError::Eigen(msg) => write!(f, "eigendecomposition failed: {msg}"),
+            HwePcaError::Eigen(msg) => f.write_str(msg),
         }
     }
 }
@@ -128,7 +128,10 @@ pub struct HweScaler {
 
 impl HweScaler {
     fn new(frequencies: Vec<f64>, scales: Vec<f64>) -> Self {
-        Self { frequencies, scales }
+        Self {
+            frequencies,
+            scales,
+        }
     }
 
     pub fn allele_frequencies(&self) -> &[f64] {
@@ -139,14 +142,21 @@ impl HweScaler {
         &self.scales
     }
 
-    fn standardize_block(&self, block: &mut MatMut<'_, f64>, variant_range: Range<usize>) {
+    pub(crate) fn standardize_block(
+        &self,
+        block: &mut MatMut<'_, f64>,
+        variant_range: Range<usize>,
+    ) {
+        let freqs = &self.frequencies;
+        let scales = &self.scales;
         for (local_col, variant_index) in variant_range.enumerate() {
-            let mean = 2.0 * self.frequencies[variant_index];
-            let denom = self.scales[variant_index].max(HWE_SCALE_FLOOR);
+            let mean = 2.0 * freqs[variant_index];
+            let denom = scales[variant_index].max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
             for row in 0..block.nrows() {
                 let raw = block[(row, local_col)];
                 block[(row, local_col)] = if raw.is_finite() {
-                    (raw - mean) / denom
+                    (raw - mean) * inv
                 } else {
                     0.0
                 };
@@ -155,37 +165,20 @@ impl HweScaler {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct HwePcaOptions {
-    pub max_components: Option<usize>,
-    pub eigen_tol: Option<f64>,
-}
-
 #[derive(Clone, Debug)]
 pub struct HwePcaModel {
-    pub n_samples: usize,
-    pub n_variants: usize,
-    pub scaler: HweScaler,
-    pub eigenvalues: Vec<f64>,
-    pub singular_values: Vec<f64>,
-    pub sample_basis: Mat<f64>,
-    pub sample_scores: Mat<f64>,
-    pub loadings: Mat<f64>,
+    n_samples: usize,
+    n_variants: usize,
+    scaler: HweScaler,
+    eigenvalues: Vec<f64>,
+    singular_values: Vec<f64>,
+    sample_basis: Mat<f64>,
+    sample_scores: Mat<f64>,
+    loadings: Mat<f64>,
 }
 
 impl HwePcaModel {
     pub fn fit<S>(source: &mut S) -> Result<Self, HwePcaError>
-    where
-        S: VariantBlockSource,
-        S::Error: Error + Send + Sync + 'static,
-    {
-        Self::fit_with_options(source, HwePcaOptions::default())
-    }
-
-    pub fn fit_with_options<S>(
-        source: &mut S,
-        options: HwePcaOptions,
-    ) -> Result<Self, HwePcaError>
     where
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
@@ -204,23 +197,6 @@ impl HwePcaModel {
             ));
         }
 
-        if let Some(limit) = options.max_components {
-            if limit == 0 {
-                return Err(HwePcaError::InvalidInput(
-                    "max_components must be greater than zero",
-                ));
-            }
-        }
-
-        let eigen_tol = options
-            .eigen_tol
-            .unwrap_or(EIGENVALUE_EPSILON)
-            .max(0.0);
-        let component_limit = options
-            .max_components
-            .unwrap_or(usize::MAX)
-            .min(n_samples);
-
         let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
         let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
@@ -230,8 +206,7 @@ impl HwePcaModel {
             .reset()
             .map_err(|e| HwePcaError::Source(Box::new(e)))?;
         let gram = accumulate_gram_matrix(source, &scaler, block_capacity, &mut block_storage)?;
-
-        let decomposition = compute_eigenpairs(gram, component_limit, eigen_tol)?;
+        let decomposition = decompose_gram_matrix(gram)?;
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
                 "All eigenvalues are numerically zero; increase cohort size or review input data"
@@ -239,11 +214,7 @@ impl HwePcaModel {
             ));
         }
 
-        let (singular_values, sample_scores) = build_sample_scores(
-            n_samples,
-            &decomposition.values,
-            decomposition.vectors.as_ref(),
-        );
+        let (singular_values, sample_scores) = build_sample_scores(n_samples, &decomposition);
 
         source
             .reset()
@@ -269,51 +240,16 @@ impl HwePcaModel {
         })
     }
 
-    pub fn transform_variants_block(
-        &self,
-        mut block: MatMut<'_, f64>,
-        variant_offset: usize,
-    ) -> Result<Mat<f64>, HwePcaError> {
-        let block_len = block.ncols();
-        if block.nrows() != self.n_samples {
-            return Err(HwePcaError::InvalidInput(
-                "transform_variants_block: sample dimension mismatch",
-            ));
-        }
-        if variant_offset + block_len > self.n_variants {
-            return Err(HwePcaError::InvalidInput(
-                "transform_variants_block: variant range exceeds training dimensions",
-            ));
-        }
-        if block_len == 0 {
-            return Ok(Mat::zeros(0, self.components()));
-        }
+    pub fn n_samples(&self) -> usize {
+        self.n_samples
+    }
 
-        self.scaler
-            .standardize_block(&mut block, variant_offset..variant_offset + block_len);
+    pub fn n_variants(&self) -> usize {
+        self.n_variants
+    }
 
-        let mut transformed = Mat::zeros(block_len, self.components());
-        matmul(
-            transformed.as_mut(),
-            Accum::Replace,
-            block.transpose(),
-            self.sample_basis.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-
-        for row in 0..block_len {
-            for component in 0..self.components() {
-                let sigma = self.singular_values[component];
-                transformed[(row, component)] = if sigma > 0.0 {
-                    transformed[(row, component)] / sigma
-                } else {
-                    0.0
-                };
-            }
-        }
-
-        Ok(transformed)
+    pub fn scaler(&self) -> &HweScaler {
+        &self.scaler
     }
 
     pub fn components(&self) -> usize {
@@ -353,7 +289,7 @@ impl HwePcaModel {
     }
 }
 
-struct EigenDecomposition {
+struct Eigenpairs {
     values: Vec<f64>,
     vectors: Mat<f64>,
 }
@@ -390,7 +326,7 @@ where
             ));
         }
 
-        let mut block = MatMut::from_column_major_slice_mut(
+        let block = MatMut::from_column_major_slice_mut(
             &mut block_storage[..n_samples * filled],
             n_samples,
             filled,
@@ -507,31 +443,25 @@ where
     Ok(gram)
 }
 
-fn compute_eigenpairs(
-    gram: Mat<f64>,
-    component_limit: usize,
-    eigen_tol: f64,
-) -> Result<EigenDecomposition, HwePcaError> {
+fn decompose_gram_matrix(gram: Mat<f64>) -> Result<Eigenpairs, HwePcaError> {
     let eig = SelfAdjointEigen::new(gram.as_ref(), Side::Upper)
         .map_err(|err| HwePcaError::Eigen(format!("{err:?}")))?;
-    let mut ordering: Vec<(f64, usize)> = eig
+
+    let mut ordering: Vec<(usize, f64)> = eig
         .S()
         .column_vector()
         .iter()
         .copied()
         .enumerate()
-        .map(|(idx, value)| (value, idx))
+        .map(|(idx, value)| (idx, value))
         .collect();
-    ordering.sort_by(|(lhs, _), (rhs, _)| rhs.partial_cmp(lhs).unwrap_or(core::cmp::Ordering::Equal));
+    ordering
+        .sort_by(|(_, lhs), (_, rhs)| rhs.partial_cmp(lhs).unwrap_or(core::cmp::Ordering::Equal));
 
-    let limit = component_limit.min(eig.U().ncols());
     let mut values = Vec::new();
     let mut selected = Vec::new();
-    for (value, idx) in ordering.iter().copied() {
-        if values.len() == limit {
-            break;
-        }
-        if value <= eigen_tol {
+    for (idx, value) in ordering.iter().copied() {
+        if value <= EIGENVALUE_EPSILON {
             break;
         }
         values.push(value);
@@ -539,28 +469,24 @@ fn compute_eigenpairs(
     }
 
     let mut vectors = Mat::zeros(eig.U().nrows(), selected.len());
-    for (target_col, src_col) in selected.iter().copied().enumerate() {
+    for (component, src_col) in selected.into_iter().enumerate() {
         for row in 0..eig.U().nrows() {
-            vectors[(row, target_col)] = eig.U()[(row, src_col)];
+            vectors[(row, component)] = eig.U()[(row, src_col)];
         }
     }
 
-    Ok(EigenDecomposition { values, vectors })
+    Ok(Eigenpairs { values, vectors })
 }
 
-fn build_sample_scores(
-    n_samples: usize,
-    eigenvalues: &[f64],
-    sample_basis: MatRef<'_, f64>,
-) -> (Vec<f64>, Mat<f64>) {
-    let mut singular_values = Vec::with_capacity(eigenvalues.len());
-    let mut sample_scores = Mat::zeros(n_samples, eigenvalues.len());
+fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
+    let mut singular_values = Vec::with_capacity(decomposition.values.len());
+    let mut sample_scores = Mat::zeros(n_samples, decomposition.values.len());
 
-    for (component, &lambda) in eigenvalues.iter().enumerate() {
+    for (component, &lambda) in decomposition.values.iter().enumerate() {
         let sigma = ((n_samples - 1) as f64 * lambda).sqrt();
         singular_values.push(sigma);
         for row in 0..n_samples {
-            sample_scores[(row, component)] = sample_basis[(row, component)] * sigma;
+            sample_scores[(row, component)] = decomposition.vectors[(row, component)] * sigma;
         }
     }
 
@@ -707,10 +633,7 @@ impl Serialize for HwePcaModel {
             "sample_scores",
             &MatrixData::from_mat(self.sample_scores.as_ref()),
         )?;
-        state.serialize_field(
-            "loadings",
-            &MatrixData::from_mat(self.loadings.as_ref()),
-        )?;
+        state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
         state.end()
     }
 }
@@ -739,18 +662,9 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             scaler: raw.scaler,
             eigenvalues: raw.eigenvalues,
             singular_values: raw.singular_values,
-            sample_basis: raw
-                .sample_basis
-                .into_mat()
-                .map_err(DeError::custom)?,
-            sample_scores: raw
-                .sample_scores
-                .into_mat()
-                .map_err(DeError::custom)?,
-            loadings: raw
-                .loadings
-                .into_mat()
-                .map_err(DeError::custom)?,
+            sample_basis: raw.sample_basis.into_mat().map_err(DeError::custom)?,
+            sample_scores: raw.sample_scores.into_mat().map_err(DeError::custom)?,
+            loadings: raw.loadings.into_mat().map_err(DeError::custom)?,
         })
     }
 }
