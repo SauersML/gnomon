@@ -1,4 +1,4 @@
-#![feature(portable_simd)] // Do not remove this
+#![feature(portable_simd)]
 #![deny(unused_variables)]
 #![deny(dead_code)]
 #![deny(unused_imports)]
@@ -12,6 +12,7 @@ pub mod kernel;
 pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
+
 #[path = "../shared/files.rs"]
 pub mod shared_files;
 pub mod types;
@@ -19,9 +20,8 @@ pub mod shared {
     pub use super::shared_files as files;
 }
 
-#[path = "../map/mod.rs"]
+#[path = "../map/lib.rs"]
 pub mod map;
 
-// Add calibrate module
 #[path = "../calibrate/lib.rs"]
 pub mod calibrate;
