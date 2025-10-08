@@ -271,35 +271,37 @@ impl Read for BcfSource {
 }
 
 fn skip_bcf_header(reader: &mut dyn Read) -> io::Result<u64> {
-    const MAGIC_LEN: usize = 3;
-    const VERSION_LEN: usize = 2;
-    const HEADER_FIELD_LEN: usize = 4;
+    use noodles_bcf::io::Reader as BcfReader;
 
-    let mut magic = [0u8; MAGIC_LEN];
-    reader.read_exact(&mut magic)?;
-    if magic != *b"BCF" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Encountered non-BCF data while concatenating streams",
-        ));
+    struct CountingReader<'a> {
+        inner: &'a mut dyn Read,
+        count: u64,
     }
 
-    let mut version = [0u8; VERSION_LEN];
-    reader.read_exact(&mut version)?;
+    impl<'a> CountingReader<'a> {
+        fn new(inner: &'a mut dyn Read) -> Self {
+            Self { inner, count: 0 }
+        }
 
-    let mut len_buf = [0u8; HEADER_FIELD_LEN];
-    reader.read_exact(&mut len_buf)?;
-    let header_len = u32::from_le_bytes(len_buf) as u64;
-
-    let consumed = io::copy(&mut reader.take(header_len), &mut io::sink())?;
-    if consumed != header_len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "BCF header ended unexpectedly while skipping concatenated input",
-        ));
+        fn into_inner(self) -> (&'a mut dyn Read, u64) {
+            (self.inner, self.count)
+        }
     }
 
-    Ok((MAGIC_LEN + VERSION_LEN + HEADER_FIELD_LEN) as u64 + header_len)
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.count += n as u64;
+            Ok(n)
+        }
+    }
+
+    let counting_reader = CountingReader::new(reader);
+    let mut bcf_reader = BcfReader::from(counting_reader);
+    bcf_reader.read_header()?;
+    let counting_reader = bcf_reader.into_inner();
+    let (_, consumed) = counting_reader.into_inner();
+    Ok(consumed)
 }
 
 pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
