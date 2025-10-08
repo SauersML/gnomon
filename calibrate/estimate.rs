@@ -1061,6 +1061,7 @@ pub fn train_model(
             penalty_order_dist: base_penalty_order,
             distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
+            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function),
         };
 
         // Build design and penalties for calibrator
