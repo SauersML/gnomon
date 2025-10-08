@@ -8,6 +8,7 @@ use memmap2::Mmap;
 use natord::compare;
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -133,6 +134,15 @@ impl BedSource {
 
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
         self.byte_source.read_at(offset, dst)
+    }
+}
+
+impl fmt::Debug for BedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BedSource")
+            .field("len", &self.len())
+            .field("has_mmap", &self.mmap.is_some())
+            .finish()
     }
 }
 
@@ -463,7 +473,8 @@ fn fetch_bcf_object_names(
 
 fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (_storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let (storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    drop(storage);
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
@@ -473,10 +484,11 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
     match attempt(&control) {
         Ok(names) => Ok(names),
         Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
-            let (_fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
+            let (fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
                 &runtime,
                 Some(AnonymousCredentials::new().build()),
             )?;
+            drop(fallback_storage);
             attempt(&fallback_control).map_err(|retry_err| {
                 convert_list_error(bucket, prefix, user_project.clone(), retry_err)
             })
@@ -1357,5 +1369,3 @@ mod tests {
         Ok(())
     }
 }
-
-// next test: gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2

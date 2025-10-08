@@ -1,11 +1,12 @@
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::fit::{HwePcaError, HwePcaModel};
-use super::io::{GenotypeDataset, GenotypeIoError};
-use super::project::{ProjectionOptions, ProjectionResult};
+use super::io::{
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
+    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
+};
+use super::project::ProjectionOptions;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -72,6 +73,16 @@ impl From<serde_json::Error> for MapDriverError {
     }
 }
 
+impl From<DatasetOutputError> for MapDriverError {
+    fn from(value: DatasetOutputError) -> Self {
+        match value {
+            DatasetOutputError::Io(err) => Self::Io(err),
+            DatasetOutputError::Serialization(err) => Self::Serialization(err),
+            DatasetOutputError::InvalidState(msg) => Self::InvalidState(msg),
+        }
+    }
+}
+
 /// Execute the provided [`MapCommand`].
 pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
@@ -99,9 +110,14 @@ fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
         model.n_variants()
     );
 
-    persist_model(&dataset, &model)?;
-    persist_sample_manifest(&dataset)?;
-    persist_fit_summary(&dataset, &model)?;
+    let model_path = save_hwe_model(&dataset, &model)?;
+    println!("Saved HWE PCA model to {}", model_path.display());
+
+    let manifest_path = save_sample_manifest(&dataset)?;
+    println!("Sample manifest saved to {}", manifest_path.display());
+
+    let summary_path = save_fit_summary(&dataset, &model)?;
+    println!("Fit summary saved to {}", summary_path.display());
 
     Ok(())
 }
@@ -116,7 +132,7 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         dataset.n_variants()
     );
 
-    let model = load_model_for_projection(&dataset)?;
+    let model = load_hwe_model(&dataset)?;
     println!("Model provides {} principal components", model.components());
 
     let mut source = dataset.block_source()?;
@@ -124,7 +140,12 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
     let projector = model.projector();
     let result = projector.project_with_options(&mut source, &options)?;
 
-    persist_projection_results(&dataset, &result)?;
+    let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
+
+    println!("Projection scores saved to {}", scores.display());
+    if let Some(path) = alignment {
+        println!("Projection alignment factors saved to {}", path.display());
+    }
 
     println!("Projection complete for {} samples", result.scores.nrows());
 
