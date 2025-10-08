@@ -147,11 +147,7 @@ impl HweScaler {
         &self.scales
     }
 
-    pub(crate) fn standardize_block(
-        &self,
-        block: MatMut<'_, f64>,
-        variant_range: Range<usize>,
-    ) {
+    pub(crate) fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>) {
         let start = variant_range.start;
         let end = variant_range.end;
         let freqs = &self.frequencies[start..end];
@@ -196,6 +192,46 @@ impl HweScaler {
                 apply_standardization(column, mean, inv);
             }
         }
+    }
+
+    pub(crate) fn standardize_block_with_mask(
+        &self,
+        mut block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        mut presence_out: MatMut<'_, f64>,
+    ) {
+        let start = variant_range.start;
+        let end = variant_range.end;
+        let freqs = &self.frequencies[start..end];
+        let filled = freqs.len();
+
+        debug_assert_eq!(filled, block.ncols());
+        debug_assert_eq!(filled, presence_out.ncols());
+        debug_assert_eq!(block.nrows(), presence_out.nrows());
+
+        let block_ref = block.as_ref();
+
+        for (mut presence_col, column) in presence_out
+            .subcols_mut(0, filled)
+            .col_iter_mut()
+            .zip(block_ref.subcols(0, filled).col_iter())
+        {
+            let mut presence_slice = presence_col
+                .try_as_col_major_mut()
+                .expect("presence column must be contiguous");
+            let column_slice = column
+                .try_as_col_major()
+                .expect("projection column must be contiguous");
+            for (presence, &raw) in presence_slice
+                .as_mut()
+                .iter_mut()
+                .zip(column_slice.as_slice())
+            {
+                *presence = if raw.is_finite() { 1.0 } else { 0.0 };
+            }
+        }
+
+        self.standardize_block(block, variant_range);
     }
 }
 
@@ -242,7 +278,7 @@ where
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
         let result = mask.select(standardized, zero);
-        result.copy_to_slice(chunk);
+        *chunk = result.to_array();
     }
 
     for value in remainder {
@@ -506,7 +542,7 @@ where
         );
         scaler.standardize_block(block.as_mut(), processed..processed + filled);
 
-        let block_ref = block.into_const();
+        let block_ref = block.as_ref();
 
         matmul(
             gram.as_mut(),
@@ -626,7 +662,7 @@ where
         );
         scaler.standardize_block(block.as_mut(), processed..processed + filled);
 
-        let block_ref = block.into_const();
+        let block_ref = block.as_ref();
 
         let mut chunk = MatMut::from_column_major_slice_mut(
             &mut chunk_storage[..filled * n_components],

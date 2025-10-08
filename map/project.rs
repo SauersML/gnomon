@@ -12,6 +12,41 @@ pub struct HwePcaProjector<'model> {
     model: &'model HwePcaModel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroAlignmentAction {
+    Zero,
+    NaN,
+}
+
+impl Default for ZeroAlignmentAction {
+    fn default() -> Self {
+        Self::Zero
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectionOptions {
+    pub missing_axis_renormalization: bool,
+    pub return_alignment: bool,
+    pub on_zero_alignment: ZeroAlignmentAction,
+}
+
+impl Default for ProjectionOptions {
+    fn default() -> Self {
+        Self {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProjectionResult {
+    pub scores: Mat<f64>,
+    pub alignment: Option<Mat<f64>>,
+}
+
 impl HwePcaModel {
     pub fn projector(&self) -> HwePcaProjector<'_> {
         HwePcaProjector { model: self }
@@ -26,24 +61,76 @@ impl HwePcaModel {
         let mut source = DenseBlockSource::new(data, n_samples, n_variants)?;
         self.projector().project(&mut source)
     }
-}
 
+    pub fn project_with_options<S>(
+        &self,
+        source: &mut S,
+        opts: &ProjectionOptions,
+    ) -> Result<ProjectionResult, HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+    {
+        self.projector().project_with_options(source, opts)
+    }
+}
 impl<'model> HwePcaProjector<'model> {
     pub fn project<S>(&self, source: &mut S) -> Result<Mat<f64>, HwePcaError>
     where
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
+        let options = ProjectionOptions::default();
+        let result = self.project_with_options(source, &options)?;
+        Ok(result.scores)
+    }
+
+    pub fn project_with_options<S>(
+        &self,
+        source: &mut S,
+        opts: &ProjectionOptions,
+    ) -> Result<ProjectionResult, HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+    {
         let n_samples = source.n_samples();
         let mut scores = Mat::zeros(n_samples, self.model.components());
-        self.project_into(source, scores.as_mut())?;
-        Ok(scores)
+        let mut alignment = if opts.return_alignment {
+            Some(Mat::zeros(n_samples, self.model.components()))
+        } else {
+            None
+        };
+
+        self.project_into_with_options(
+            source,
+            scores.as_mut(),
+            opts,
+            alignment.as_mut().map(|mat| mat.as_mut()),
+        )?;
+
+        Ok(ProjectionResult { scores, alignment })
     }
 
     pub fn project_into<S>(
         &self,
         source: &mut S,
+        scores: MatMut<'_, f64>,
+    ) -> Result<(), HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+    {
+        let options = ProjectionOptions::default();
+        self.project_into_with_options(source, scores, &options, None)
+    }
+
+    fn project_into_with_options<S>(
+        &self,
+        source: &mut S,
         mut scores: MatMut<'_, f64>,
+        opts: &ProjectionOptions,
+        mut alignment_out: Option<MatMut<'_, f64>>,
     ) -> Result<(), HwePcaError>
     where
         S: VariantBlockSource,
@@ -51,6 +138,7 @@ impl<'model> HwePcaProjector<'model> {
     {
         let n_samples = source.n_samples();
         let n_variants = source.n_variants();
+        let components = self.model.components();
 
         if n_samples == 0 {
             return Err(HwePcaError::InvalidInput(
@@ -67,10 +155,17 @@ impl<'model> HwePcaProjector<'model> {
                 "Projection output row count mismatch",
             ));
         }
-        if scores.ncols() != self.model.components() {
+        if scores.ncols() != components {
             return Err(HwePcaError::InvalidInput(
                 "Projection output column count must equal number of components",
             ));
+        }
+        if let Some(ref alignment) = alignment_out {
+            if alignment.nrows() != n_samples || alignment.ncols() != components {
+                return Err(HwePcaError::InvalidInput(
+                    "Alignment output shape must match projection output",
+                ));
+            }
         }
 
         scores.fill(0.0);
@@ -85,9 +180,29 @@ impl<'model> HwePcaProjector<'model> {
             .checked_mul(block_capacity)
             .ok_or_else(|| HwePcaError::InvalidInput("Projection workspace size overflow"))?;
         let mut block_storage = vec![0.0f64; elements];
+        let mut presence_storage = if opts.missing_axis_renormalization {
+            vec![0.0f64; elements]
+        } else {
+            Vec::new()
+        };
+        let mut sq_loadings_storage = if opts.missing_axis_renormalization {
+            vec![
+                0.0f64;
+                block_capacity.checked_mul(components).ok_or_else(|| {
+                    HwePcaError::InvalidInput("Projection workspace size overflow")
+                })?
+            ]
+        } else {
+            Vec::new()
+        };
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
         let mut processed = 0usize;
+        let mut alignment_r2 = if opts.missing_axis_renormalization {
+            Some(Mat::zeros(n_samples, components))
+        } else {
+            None
+        };
 
         loop {
             let filled = source
@@ -107,19 +222,70 @@ impl<'model> HwePcaProjector<'model> {
                 n_samples,
                 filled,
             );
-            standardize_projection_block(scaler, block.as_mut(), processed, filled);
 
-            let standardized = block.into_const();
-            let loadings_block = loadings.submatrix(processed, 0, filled, self.model.components());
+            if opts.missing_axis_renormalization {
+                let mut presence_block = MatMut::from_column_major_slice_mut(
+                    &mut presence_storage[..n_samples * filled],
+                    n_samples,
+                    filled,
+                );
+                scaler.standardize_block_with_mask(
+                    block.as_mut(),
+                    processed..processed + filled,
+                    presence_block.as_mut(),
+                );
 
-            matmul(
-                scores.as_mut(),
-                Accum::Add,
-                standardized,
-                loadings_block,
-                1.0,
-                faer::get_global_parallelism(),
-            );
+                let standardized = block.as_ref();
+                let loadings_block = loadings.submatrix(processed, 0, filled, components);
+
+                matmul(
+                    scores.as_mut(),
+                    Accum::Add,
+                    standardized,
+                    loadings_block,
+                    1.0,
+                    faer::get_global_parallelism(),
+                );
+
+                let mut sq_block = MatMut::from_column_major_slice_mut(
+                    &mut sq_loadings_storage[..filled * components],
+                    filled,
+                    components,
+                );
+                for col in 0..components {
+                    for row in 0..filled {
+                        let value = loadings_block[(row, col)];
+                        sq_block[(row, col)] = value * value;
+                    }
+                }
+
+                if let Some(ref mut r2) = alignment_r2 {
+                    let presence_block_ref = presence_block.as_ref();
+                    let sq_block_ref = sq_block.as_ref();
+                    matmul(
+                        r2.as_mut(),
+                        Accum::Add,
+                        presence_block_ref,
+                        sq_block_ref,
+                        1.0,
+                        faer::get_global_parallelism(),
+                    );
+                }
+            } else {
+                standardize_projection_block(scaler, block.as_mut(), processed, filled);
+
+                let standardized = block.as_ref();
+                let loadings_block = loadings.submatrix(processed, 0, filled, components);
+
+                matmul(
+                    scores.as_mut(),
+                    Accum::Add,
+                    standardized,
+                    loadings_block,
+                    1.0,
+                    faer::get_global_parallelism(),
+                );
+            }
 
             processed += filled;
         }
@@ -130,6 +296,55 @@ impl<'model> HwePcaProjector<'model> {
             ));
         }
 
+        if let Some(r2) = alignment_r2 {
+            match alignment_out.as_mut() {
+                Some(alignment_mat) => {
+                    for row in 0..n_samples {
+                        for col in 0..components {
+                            let mass = r2[(row, col)];
+                            if mass > 0.0 {
+                                let norm = mass.sqrt();
+                                scores[(row, col)] /= norm;
+                                alignment_mat[(row, col)] = norm;
+                            } else {
+                                match opts.on_zero_alignment {
+                                    ZeroAlignmentAction::Zero => {
+                                        scores[(row, col)] = 0.0;
+                                    }
+                                    ZeroAlignmentAction::NaN => {
+                                        scores[(row, col)] = f64::NAN;
+                                    }
+                                }
+                                alignment_mat[(row, col)] = 0.0;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for row in 0..n_samples {
+                        for col in 0..components {
+                            let mass = r2[(row, col)];
+                            if mass > 0.0 {
+                                let norm = mass.sqrt();
+                                scores[(row, col)] /= norm;
+                            } else {
+                                match opts.on_zero_alignment {
+                                    ZeroAlignmentAction::Zero => {
+                                        scores[(row, col)] = 0.0;
+                                    }
+                                    ZeroAlignmentAction::NaN => {
+                                        scores[(row, col)] = f64::NAN;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(alignment_mat) = alignment_out.as_mut() {
+            alignment_mat.fill(1.0);
+        }
+
         Ok(())
     }
 
@@ -137,7 +352,6 @@ impl<'model> HwePcaProjector<'model> {
         self.model
     }
 }
-
 fn standardize_projection_block(
     scaler: &HweScaler,
     block: MatMut<'_, f64>,
@@ -168,4 +382,278 @@ fn projection_block_capacity(
     capacity = min(capacity, default);
     capacity = min(capacity, n_variants);
     capacity
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    const N_SAMPLES: usize = 3;
+    const N_VARIANTS: usize = 4;
+    const TOLERANCE: f64 = 1e-10;
+
+    fn sample_data() -> Vec<f64> {
+        vec![
+            0.0, 1.0, 2.0, // variant 0
+            1.0, 2.0, 0.0, // variant 1
+            2.0, 1.0, 0.0, // variant 2
+            1.0, 0.0, 2.0, // variant 3
+        ]
+    }
+
+    fn fit_example_model() -> HwePcaModel {
+        let data = sample_data();
+        let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
+        HwePcaModel::fit(&mut source).expect("model fit")
+    }
+
+    fn assert_mats_close(a: &Mat<f64>, b: &Mat<f64>, tol: f64) {
+        assert_eq!(a.nrows(), b.nrows());
+        assert_eq!(a.ncols(), b.ncols());
+        for row in 0..a.nrows() {
+            for col in 0..a.ncols() {
+                let left = a[(row, col)];
+                let right = b[(row, col)];
+                if left.is_nan() && right.is_nan() {
+                    continue;
+                }
+                assert!(
+                    (left - right).abs() <= tol,
+                    "mismatch at ({row}, {col}): {left} vs {right}"
+                );
+            }
+        }
+    }
+
+    fn set_sample_to_nan(data: &mut [f64], sample_idx: usize) {
+        for variant in 0..N_VARIANTS {
+            data[variant * N_SAMPLES + sample_idx] = f64::NAN;
+        }
+    }
+
+    fn set_variant_to_nan(data: &mut [f64], variant_idx: usize) {
+        let start = variant_idx * N_SAMPLES;
+        let end = start + N_SAMPLES;
+        for value in &mut data[start..end] {
+            *value = f64::NAN;
+        }
+    }
+    #[test]
+    fn renormalization_matches_baseline_without_missingness() {
+        let model = fit_example_model();
+        let data = sample_data();
+
+        let mut baseline_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("baseline");
+        let baseline = model
+            .projector()
+            .project(&mut baseline_source)
+            .expect("baseline projection");
+
+        let mut renorm_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let result = model
+            .projector()
+            .project_with_options(&mut renorm_source, &options)
+            .expect("renormalized projection");
+        assert_mats_close(&baseline, &result.scores, 1e-10);
+
+        let alignment = result.alignment.expect("alignment");
+        for row in 0..alignment.nrows() {
+            for col in 0..alignment.ncols() {
+                assert!(
+                    (alignment[(row, col)] - 1.0).abs() <= 1e-12,
+                    "alignment mismatch at ({row}, {col})"
+                );
+            }
+        }
+    }
+    #[test]
+    fn zero_alignment_behavior_respected() {
+        let model = fit_example_model();
+        let mut data = sample_data();
+        set_sample_to_nan(&mut data, 1);
+
+        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_scores = model
+            .projector()
+            .project(&mut raw_source)
+            .expect("raw projection");
+
+        let mut renorm_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::NaN,
+        };
+        let result = model
+            .projector()
+            .project_with_options(&mut renorm_source, &options)
+            .expect("renormalized projection");
+        let alignment = result.alignment.expect("alignment");
+
+        for row in [0usize, 2usize] {
+            for col in 0..result.scores.ncols() {
+                let norm = alignment[(row, col)];
+                if norm > 0.0 {
+                    let expected = raw_scores[(row, col)] / norm;
+                    assert!(
+                        (result.scores[(row, col)] - expected).abs() <= 1e-10,
+                        "renormalized score mismatch at ({row}, {col})"
+                    );
+                    assert!(
+                        (norm - 1.0).abs() <= 1e-12,
+                        "alignment unexpectedly deviates from 1 at ({row}, {col})"
+                    );
+                }
+            }
+        }
+
+        for col in 0..result.scores.ncols() {
+            assert!(result.scores[(1, col)].is_nan());
+            assert_eq!(alignment[(1, col)], 0.0);
+        }
+    }
+    #[test]
+    fn dropping_variant_matches_manual_renormalization() {
+        let model = fit_example_model();
+        let mut data = sample_data();
+        let dropped_variant = 1;
+        set_variant_to_nan(&mut data, dropped_variant);
+
+        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_scores = model
+            .projector()
+            .project(&mut raw_source)
+            .expect("raw projection");
+
+        let mut renorm_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let result = model
+            .projector()
+            .project_with_options(&mut renorm_source, &options)
+            .expect("renormalized projection");
+        let alignment = result.alignment.expect("alignment");
+
+        let loadings = model.variant_loadings();
+        for col in 0..result.scores.ncols() {
+            let missing = loadings[(dropped_variant, col)];
+            let retained_mass = (1.0 - missing * missing).max(0.0);
+            let expected_norm = retained_mass.sqrt();
+            for row in 0..result.scores.nrows() {
+                if expected_norm > 0.0 {
+                    let expected = raw_scores[(row, col)] / expected_norm;
+                    assert!(
+                        (result.scores[(row, col)] - expected).abs() <= 1e-10,
+                        "renormalized score mismatch at ({row}, {col})"
+                    );
+                    assert!(
+                        (alignment[(row, col)] - expected_norm).abs() <= 1e-12,
+                        "alignment mismatch at ({row}, {col})"
+                    );
+                } else {
+                    assert_eq!(result.scores[(row, col)], 0.0);
+                    assert_eq!(alignment[(row, col)], 0.0);
+                }
+            }
+        }
+    }
+    struct ChunkedBlockSource<'a> {
+        data: &'a [f64],
+        dims: (usize, usize),
+        cursor: usize,
+        chunk: usize,
+    }
+
+    impl<'a> ChunkedBlockSource<'a> {
+        fn new(data: &'a [f64], n_samples: usize, n_variants: usize, chunk: usize) -> Self {
+            Self {
+                data,
+                dims: (n_samples, n_variants),
+                cursor: 0,
+                chunk: chunk.max(1),
+            }
+        }
+    }
+
+    impl<'a> VariantBlockSource for ChunkedBlockSource<'a> {
+        type Error = Infallible;
+
+        fn n_samples(&self) -> usize {
+            self.dims.0
+        }
+
+        fn n_variants(&self) -> usize {
+            self.dims.1
+        }
+
+        fn reset(&mut self) -> Result<(), Self::Error> {
+            self.cursor = 0;
+            Ok(())
+        }
+
+        fn next_block_into(
+            &mut self,
+            max_variants: usize,
+            storage: &mut [f64],
+        ) -> Result<usize, Self::Error> {
+            if max_variants == 0 {
+                return Ok(0);
+            }
+            let remaining = self.n_variants().saturating_sub(self.cursor);
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let ncols = remaining.min(self.chunk).min(max_variants);
+            let nrows = self.n_samples();
+            let len = nrows * ncols;
+            let start = self.cursor * nrows;
+            let end = start + len;
+            storage[..len].copy_from_slice(&self.data[start..end]);
+            self.cursor += ncols;
+            Ok(ncols)
+        }
+    }
+
+    #[test]
+    fn block_boundary_missingness_is_stable() {
+        let model = fit_example_model();
+        let mut data = sample_data();
+        data[1 * N_SAMPLES + 0] = f64::NAN;
+        data[2 * N_SAMPLES + 2] = f64::NAN;
+
+        let mut dense_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let dense_result = model
+            .projector()
+            .project_with_options(&mut dense_source, &options)
+            .expect("dense projection");
+
+        let mut chunked_source = ChunkedBlockSource::new(&data, N_SAMPLES, N_VARIANTS, 2);
+        let chunked_result = model
+            .projector()
+            .project_with_options(&mut chunked_source, &options)
+            .expect("chunked projection");
+
+        assert_mats_close(&dense_result.scores, &chunked_result.scores, TOLERANCE);
+
+        let dense_alignment = dense_result.alignment.expect("dense alignment");
+        let chunked_alignment = chunked_result.alignment.expect("chunked alignment");
+        assert_mats_close(&dense_alignment, &chunked_alignment, TOLERANCE);
+    }
 }
