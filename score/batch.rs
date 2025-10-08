@@ -12,8 +12,8 @@
 // scientific logic or reconciliation. We don't support over 100 scores.
 // It will panic / overflow if we try.
 
-use crate::kernel;
-use crate::types::{
+use crate::score::kernel;
+use crate::score::types::{
     EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
     ReconciledVariantIndex,
 };

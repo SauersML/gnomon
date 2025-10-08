@@ -1,8 +1,8 @@
-use crate::batch;
-use crate::complex::{ComplexVariantResolver, resolve_complex_variants};
-use crate::decide::{self, DecisionContext, RunStrategy};
-use crate::io;
-use crate::types::{
+use crate::score::batch;
+use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
+use crate::score::decide::{self, DecisionContext, RunStrategy};
+use crate::score::io;
+use crate::score::types::{
     EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex,
     WorkItem,
 };

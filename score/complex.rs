@@ -1,6 +1,6 @@
-use crate::io::BedSource;
-use crate::pipeline::{PipelineError, ScopeGuard};
-use crate::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
+use crate::score::io::BedSource;
+use crate::score::pipeline::{PipelineError, ScopeGuard};
+use crate::score::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
 use ahash::AHashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
