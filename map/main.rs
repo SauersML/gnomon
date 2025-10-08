@@ -1,6 +1,5 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-
 use super::fit::{HwePcaError, HwePcaModel};
 use super::io::{
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
