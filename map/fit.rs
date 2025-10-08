@@ -290,6 +290,43 @@ where
     }
 }
 
+#[inline(always)]
+fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
+    sum_and_count_finite_impl::<STANDARDIZATION_SIMD_LANES>(values)
+}
+
+#[inline(always)]
+fn sum_and_count_finite_impl<const LANES: usize>(values: &[f64]) -> (f64, usize)
+where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    let zero = Simd::<f64, LANES>::splat(0.0);
+
+    let (chunks, remainder) = values.as_chunks::<LANES>();
+    for chunk in chunks {
+        let lane = Simd::<f64, LANES>::from_slice(chunk);
+        let mask = lane.is_finite();
+        let finite = mask.select(lane, zero);
+        sum += finite.reduce_sum();
+        count += mask
+            .to_array()
+            .into_iter()
+            .map(|flag| flag as usize)
+            .sum::<usize>();
+    }
+
+    for &value in remainder {
+        if value.is_finite() {
+            sum += value;
+            count += 1;
+        }
+    }
+
+    (sum, count)
+}
+
 #[derive(Clone, Debug)]
 pub struct HwePcaModel {
     n_samples: usize,
@@ -459,15 +496,10 @@ where
 
         for (local_col, column) in block.as_ref().col_iter().enumerate() {
             let variant_index = processed + local_col;
-            let mut sum = 0.0f64;
-            let mut calls = 0usize;
-            zip!(column).for_each(|unzip!(value)| {
-                let raw = *value;
-                if raw.is_finite() {
-                    sum += raw;
-                    calls += 1;
-                }
-            });
+            let contiguous = column
+                .try_as_col_major()
+                .expect("variant block column must be contiguous");
+            let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
             allele_sums[variant_index] += sum;
             allele_counts[variant_index] += calls;
         }
