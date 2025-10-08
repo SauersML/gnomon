@@ -137,8 +137,8 @@ impl BedSource {
     }
 }
 
-impl fmt::Debug for BedSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for BedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BedSource")
             .field("len", &self.len())
             .field("has_mmap", &self.mmap.is_some())
@@ -172,18 +172,19 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
 struct PreparedBcfReader {
     reader: Box<dyn Read + Send>,
     len: u64,
+    skip_header: bool,
 }
 
 /// Provides sequential access to one or more BCF streams. The data is
 /// transparently decompressed when the underlying files are BGZF-compressed.
 pub struct BcfSource {
-    readers: VecDeque<Box<dyn Read + Send>>,
+    readers: VecDeque<PreparedBcfReader>,
     current: Option<Box<dyn Read + Send>>,
     total_len: Option<u64>,
 }
 
 impl BcfSource {
-    fn from_readers(readers: Vec<PreparedBcfReader>) -> Result<Self, PipelineError> {
+    fn from_readers(mut readers: Vec<PreparedBcfReader>) -> Result<Self, PipelineError> {
         if readers.is_empty() {
             return Err(PipelineError::Io(
                 "No BCF files were discovered for the requested input".to_string(),
@@ -197,8 +198,9 @@ impl BcfSource {
         })?;
 
         let mut queue = VecDeque::with_capacity(readers.len());
-        for reader in readers {
-            queue.push_back(reader.reader);
+        for (idx, mut reader) in readers.drain(..).enumerate() {
+            reader.skip_header = idx > 0;
+            queue.push_back(reader);
         }
 
         Ok(Self {
@@ -214,11 +216,8 @@ impl BcfSource {
         }
 
         loop {
-            if self.current.is_none() {
-                self.current = self.readers.pop_front();
-                if self.current.is_none() {
-                    return Ok(0);
-                }
+            if !self.ensure_current_reader()? {
+                return Ok(0);
             }
 
             if let Some(reader) = self.current.as_mut() {
@@ -231,6 +230,25 @@ impl BcfSource {
                 }
             }
         }
+    }
+
+    fn ensure_current_reader(&mut self) -> io::Result<bool> {
+        while self.current.is_none() {
+            let prepared = match self.readers.pop_front() {
+                Some(reader) => reader,
+                None => return Ok(false),
+            };
+
+            let mut reader = prepared.reader;
+            if prepared.skip_header {
+                skip_bcf_header(reader.as_mut())?;
+                self.total_len = None;
+            }
+
+            self.current = Some(reader);
+        }
+
+        Ok(true)
     }
 
     /// Returns the combined compressed length of the underlying BCF objects
@@ -250,6 +268,38 @@ impl Read for BcfSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.read_internal(buf)
     }
+}
+
+fn skip_bcf_header(reader: &mut dyn Read) -> io::Result<u64> {
+    const MAGIC_LEN: usize = 3;
+    const VERSION_LEN: usize = 2;
+    const HEADER_FIELD_LEN: usize = 4;
+
+    let mut magic = [0u8; MAGIC_LEN];
+    reader.read_exact(&mut magic)?;
+    if magic != *b"BCF" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encountered non-BCF data while concatenating streams",
+        ));
+    }
+
+    let mut version = [0u8; VERSION_LEN];
+    reader.read_exact(&mut version)?;
+
+    let mut len_buf = [0u8; HEADER_FIELD_LEN];
+    reader.read_exact(&mut len_buf)?;
+    let header_len = u32::from_le_bytes(len_buf) as u64;
+
+    let consumed = io::copy(&mut reader.take(header_len), &mut io::sink())?;
+    if consumed != header_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "BCF header ended unexpectedly while skipping concatenated input",
+        ));
+    }
+
+    Ok((MAGIC_LEN + VERSION_LEN + HEADER_FIELD_LEN) as u64 + header_len)
 }
 
 pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
@@ -368,7 +418,11 @@ fn open_local_bcf_reader(path: &Path) -> Result<PreparedBcfReader, PipelineError
         Box::new(BufReader::new(file))
     };
 
-    Ok(PreparedBcfReader { reader, len })
+    Ok(PreparedBcfReader {
+        reader,
+        len,
+        skip_header: false,
+    })
 }
 
 fn is_gzip_magic(magic: &[u8; 2]) -> bool {
@@ -473,8 +527,7 @@ fn fetch_bcf_object_names(
 
 fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
-    drop(storage);
+    let (_, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
@@ -484,7 +537,7 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
     match attempt(&control) {
         Ok(names) => Ok(names),
         Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
-            let (fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
+            let (_, fallback_control) = RemoteByteRangeSource::create_clients(
                 &runtime,
                 Some(AnonymousCredentials::new().build()),
             )?;
@@ -1137,7 +1190,11 @@ fn prepare_remote_bcf_reader(
     } else {
         Box::new(reader)
     };
-    Ok(PreparedBcfReader { reader, len })
+    Ok(PreparedBcfReader {
+        reader,
+        len,
+        skip_header: false,
+    })
 }
 
 struct RemoteCache {

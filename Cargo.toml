@@ -53,7 +53,7 @@ dyn-stack = "0.13"
 noodles-bcf = "0.78.0"
 noodles-vcf = "0.81.0"
 noodles-bgzf = "0.43.0"
-serde_json = "1.0"
+serde_json = "1.0.145"
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 

@@ -20,7 +20,8 @@ use noodles_vcf::{
     variant::RecordBuf,
     variant::record::samples::keys::key,
     variant::record_buf::samples::sample::{
-        self, Value, value::Array, value::genotype::Genotype as SampleGenotype,
+        self, Value,
+        value::{Array, genotype::Genotype as SampleGenotype},
     },
 };
 use thiserror::Error;
@@ -501,6 +502,15 @@ pub struct PlinkVariantRecordIter {
     line: usize,
 }
 
+impl std::fmt::Debug for PlinkVariantRecordIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlinkVariantRecordIter")
+            .field("path", &self.path)
+            .field("line", &self.line)
+            .finish()
+    }
+}
+
 impl PlinkVariantRecordIter {
     fn new(path: PathBuf, reader: Box<dyn TextSource>) -> Self {
         Self {
@@ -798,8 +808,8 @@ pub struct BcfVariantBlockSource {
     emitted: usize,
 }
 
-impl fmt::Debug for BcfVariantBlockSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for BcfVariantBlockSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BcfVariantBlockSource")
             .field("path", &self.path)
             .field("n_samples", &self.n_samples)
@@ -936,7 +946,7 @@ fn compute_output_hint(path: &Path) -> OutputHint {
 
 fn create_bcf_reader(path: &Path) -> Result<BcfReader<BgzfReader<BcfSource>>, BcfIoError> {
     let source = open_bcf_source(path)?;
-    Ok(BcfReader::new(source))
+    Ok(BcfReader::from(source))
 }
 
 fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {
@@ -1034,10 +1044,10 @@ fn numeric_from_value(value: &Value) -> Result<Option<f64>, BcfIoError> {
             }
         }
         Value::Array(Array::Integer(values)) => {
-            Ok(values.get(0).and_then(|opt| opt.map(|n| n as f64)))
+            Ok(values.get(0).copied().flatten().map(|n| n as f64))
         }
         Value::Array(Array::Float(values)) => {
-            Ok(values.get(0).and_then(|opt| opt.map(|n| n as f64)))
+            Ok(values.get(0).copied().flatten().map(|n| n as f64))
         }
         Value::Array(_) => Ok(None),
         Value::Genotype(genotype) => dosage_from_genotype(genotype.as_ref()),
@@ -1172,4 +1182,78 @@ fn is_remote_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("gs://"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn fake_bcf_header() -> Vec<u8> {
+        let header_text =
+            b"##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\n\0";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BCF");
+        bytes.push(2);
+        bytes.push(2);
+        bytes.extend_from_slice(&(header_text.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(header_text);
+        bytes
+    }
+
+    fn write_fake_bcf<P: AsRef<Path>>(path: P, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut file = File::create(path)?;
+        let header = fake_bcf_header();
+        file.write_all(&header)?;
+        file.write_all(payload)?;
+        Ok(header)
+    }
+
+    fn read_all(mut source: BcfSource) -> Vec<u8> {
+        let mut data = Vec::new();
+        source.read_to_end(&mut data).unwrap();
+        data
+    }
+
+    #[test]
+    fn bcf_source_reads_single_file_without_modification() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.bcf");
+        let header = write_fake_bcf(&path, &[0x01, 0x02, 0x03]).unwrap();
+
+        let source = open_bcf_source(&path).unwrap();
+        let bytes = read_all(source);
+
+        let mut expected = header;
+        expected.extend_from_slice(&[0x01, 0x02, 0x03]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn bcf_source_skips_headers_when_concatenating_directory() {
+        let dir = tempdir().unwrap();
+        let files = [
+            ("chr2.bcf", vec![0x20]),
+            ("chr10.bcf", vec![0x10]),
+            ("chr1.bcf", vec![0x01]),
+        ];
+
+        for (name, payload) in &files {
+            let path = dir.path().join(name);
+            write_fake_bcf(&path, payload).unwrap();
+        }
+
+        let mut expected = fake_bcf_header();
+        expected.extend_from_slice(&[0x01]);
+        expected.extend_from_slice(&[0x20]);
+        expected.extend_from_slice(&[0x10]);
+
+        let source = open_bcf_source(dir.path()).unwrap();
+        let bytes = read_all(source);
+
+        assert_eq!(bytes, expected);
+    }
 }
