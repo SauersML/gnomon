@@ -502,15 +502,6 @@ pub struct PlinkVariantRecordIter {
     line: usize,
 }
 
-impl std::fmt::Debug for PlinkVariantRecordIter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlinkVariantRecordIter")
-            .field("path", &self.path)
-            .field("line", &self.line)
-            .finish()
-    }
-}
-
 impl PlinkVariantRecordIter {
     fn new(path: PathBuf, reader: Box<dyn TextSource>) -> Self {
         Self {
@@ -946,7 +937,8 @@ fn compute_output_hint(path: &Path) -> OutputHint {
 
 fn create_bcf_reader(path: &Path) -> Result<BcfReader<BgzfReader<BcfSource>>, BcfIoError> {
     let source = open_bcf_source(path)?;
-    Ok(BcfReader::from(source))
+    let reader = BgzfReader::new(source);
+    Ok(BcfReader::from(reader))
 }
 
 fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {

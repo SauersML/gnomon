@@ -8,7 +8,6 @@ use memmap2::Mmap;
 use natord::compare;
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -543,7 +542,6 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
                 &runtime,
                 Some(AnonymousCredentials::new().build()),
             )?;
-            drop(fallback_storage);
             attempt(&fallback_control).map_err(|retry_err| {
                 convert_list_error(bucket, prefix, user_project.clone(), retry_err)
             })
