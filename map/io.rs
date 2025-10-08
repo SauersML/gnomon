@@ -1,10 +1,23 @@
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::str;
-use std::sync::OnceLock;
+use std::str::{self, FromStr};
+use std::sync::{Arc, OnceLock};
 
 use crate::map::fit::VariantBlockSource;
 use crate::score::pipeline::PipelineError;
-use crate::shared::files::{open_bed_source, open_text_source, BedSource, TextSource};
+use crate::shared::files::{
+    BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
+};
+use noodles_bcf::io::Reader as BcfReader;
+use noodles_vcf::{
+    self as vcf,
+    variant::RecordBuf,
+    variant::record_buf::samples::{
+        keys::key,
+        sample::{self, Value, value::Array, value::genotype::Genotype as SampleGenotype},
+    },
+};
 use thiserror::Error;
 
 const PLINK_HEADER_LEN: u64 = 3;
@@ -18,7 +31,11 @@ pub enum PlinkIoError {
     #[error("unexpected end of .bed payload (expected {expected} bytes, found {actual})")]
     TruncatedBed { expected: u64, actual: u64 },
     #[error("malformed record in {path} at line {line}: {message}")]
-    MalformedRecord { path: String, line: usize, message: String },
+    MalformedRecord {
+        path: String,
+        line: usize,
+        message: String,
+    },
     #[error("{path} is not valid UTF-8: {source}")]
     Utf8 {
         path: String,
@@ -27,8 +44,34 @@ pub enum PlinkIoError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum BcfIoError {
+    #[error("pipeline I/O error: {0}")]
+    Pipeline(#[from] PipelineError),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("BCF dataset is missing sample names")]
+    MissingSamples,
+    #[error("BCF dataset contains no variant records")]
+    NoVariants,
+    #[error("BCF genotype decode error: {0}")]
+    Decode(String),
+    #[error("BCF stream header did not match initial header when reopening")]
+    HeaderMismatch,
+    #[error("unexpected end of BCF stream (expected {expected} variants, read {actual})")]
+    UnexpectedEof { expected: usize, actual: usize },
+}
+
+#[derive(Debug, Error)]
+pub enum GenotypeIoError {
+    #[error(transparent)]
+    Plink(#[from] PlinkIoError),
+    #[error(transparent)]
+    Bcf(#[from] BcfIoError),
+}
+
 #[derive(Clone, Debug)]
-pub struct PlinkSampleRecord {
+pub struct SampleRecord {
     pub family_id: String,
     pub individual_id: String,
     pub paternal_id: String,
@@ -38,12 +81,117 @@ pub struct PlinkSampleRecord {
 }
 
 #[derive(Debug)]
+pub enum GenotypeDataset {
+    Plink(PlinkDataset),
+    Bcf(BcfDataset),
+}
+
+impl GenotypeDataset {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
+        let path = path.as_ref();
+        if guess_is_bcf(path) {
+            Ok(Self::Bcf(BcfDataset::open(path)?))
+        } else {
+            Ok(Self::Plink(PlinkDataset::open(path)?))
+        }
+    }
+
+    pub fn samples(&self) -> &[SampleRecord] {
+        match self {
+            Self::Plink(dataset) => dataset.samples(),
+            Self::Bcf(dataset) => dataset.samples(),
+        }
+    }
+
+    pub fn n_samples(&self) -> usize {
+        match self {
+            Self::Plink(dataset) => dataset.n_samples(),
+            Self::Bcf(dataset) => dataset.n_samples(),
+        }
+    }
+
+    pub fn n_variants(&self) -> usize {
+        match self {
+            Self::Plink(dataset) => dataset.n_variants(),
+            Self::Bcf(dataset) => dataset.n_variants(),
+        }
+    }
+
+    pub fn block_source(&self) -> Result<DatasetBlockSource, GenotypeIoError> {
+        match self {
+            Self::Plink(dataset) => Ok(DatasetBlockSource::Plink(dataset.block_source())),
+            Self::Bcf(dataset) => Ok(DatasetBlockSource::Bcf(dataset.block_source()?)),
+        }
+    }
+
+    pub fn data_path(&self) -> &Path {
+        match self {
+            Self::Plink(dataset) => dataset.bed_path(),
+            Self::Bcf(dataset) => dataset.input_path(),
+        }
+    }
+
+    pub fn output_path(&self, filename: &str) -> PathBuf {
+        match self {
+            Self::Plink(dataset) => dataset.output_path(filename),
+            Self::Bcf(dataset) => dataset.output_path(filename),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DatasetBlockSource {
+    Plink(PlinkVariantBlockSource),
+    Bcf(BcfVariantBlockSource),
+}
+
+impl VariantBlockSource for DatasetBlockSource {
+    type Error = GenotypeIoError;
+
+    fn n_samples(&self) -> usize {
+        match self {
+            Self::Plink(source) => source.n_samples(),
+            Self::Bcf(source) => source.n_samples(),
+        }
+    }
+
+    fn n_variants(&self) -> usize {
+        match self {
+            Self::Plink(source) => source.n_variants(),
+            Self::Bcf(source) => source.n_variants(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Self::Plink(source) => source.reset().map_err(GenotypeIoError::from),
+            Self::Bcf(source) => source.reset().map_err(GenotypeIoError::from),
+        }
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        match self {
+            Self::Plink(source) => source
+                .next_block_into(max_variants, storage)
+                .map_err(GenotypeIoError::from),
+            Self::Bcf(source) => source
+                .next_block_into(max_variants, storage)
+                .map_err(GenotypeIoError::from),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct PlinkDataset {
     bed: BedSource,
     bed_path: PathBuf,
     bim_path: PathBuf,
     fam_path: PathBuf,
-    samples: Vec<PlinkSampleRecord>,
+    samples: Vec<SampleRecord>,
     n_variants: usize,
     bytes_per_variant: usize,
 }
@@ -104,7 +252,7 @@ impl PlinkDataset {
         })
     }
 
-    pub fn samples(&self) -> &[PlinkSampleRecord] {
+    pub fn samples(&self) -> &[SampleRecord] {
         &self.samples
     }
 
@@ -150,6 +298,23 @@ impl PlinkDataset {
             self.n_variants,
         )
     }
+
+    pub fn output_path(&self, filename: &str) -> PathBuf {
+        if is_remote_path(&self.bed_path) {
+            let stem = self
+                .bed_path
+                .file_stem()
+                .map(|s| s.to_os_string())
+                .unwrap_or_else(|| OsString::from("dataset"));
+            let mut local = PathBuf::from(stem);
+            local.set_extension(filename);
+            local
+        } else {
+            let mut local = self.bed_path.clone();
+            local.set_extension(filename);
+            local
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -161,7 +326,11 @@ pub struct PlinkVariantRecordIter {
 
 impl PlinkVariantRecordIter {
     fn new(path: PathBuf, reader: Box<dyn TextSource>) -> Self {
-        Self { path, reader, line: 0 }
+        Self {
+            path,
+            reader,
+            line: 0,
+        }
     }
 }
 
@@ -189,12 +358,7 @@ impl Iterator for PlinkVariantRecordIter {
                     let path = self.path.display().to_string();
                     let text = match str::from_utf8(line) {
                         Ok(s) => s,
-                        Err(err) => {
-                            return Some(Err(PlinkIoError::Utf8 {
-                                path,
-                                source: err,
-                            }))
-                        }
+                        Err(err) => return Some(Err(PlinkIoError::Utf8 { path, source: err })),
                     };
                     let mut fields = text.split_whitespace();
                     let rec = match (
@@ -205,20 +369,22 @@ impl Iterator for PlinkVariantRecordIter {
                         fields.next(),
                         fields.next(),
                     ) {
-                        (Some(chr), Some(id), Some(cm), Some(pos), Some(a1), Some(a2)) => PlinkVariantRecord {
-                            chromosome: chr.to_string(),
-                            identifier: id.to_string(),
-                            genetic_distance: cm.to_string(),
-                            position: pos.to_string(),
-                            allele1: a1.to_string(),
-                            allele2: a2.to_string(),
-                        },
+                        (Some(chr), Some(id), Some(cm), Some(pos), Some(a1), Some(a2)) => {
+                            PlinkVariantRecord {
+                                chromosome: chr.to_string(),
+                                identifier: id.to_string(),
+                                genetic_distance: cm.to_string(),
+                                position: pos.to_string(),
+                                allele1: a1.to_string(),
+                                allele2: a2.to_string(),
+                            }
+                        }
                         _ => {
                             return Some(Err(PlinkIoError::MalformedRecord {
                                 path,
                                 line: self.line,
                                 message: "expected 6 whitespace-delimited fields".to_string(),
-                            }))
+                            }));
                         }
                     };
                     return Some(Ok(rec));
@@ -230,6 +396,7 @@ impl Iterator for PlinkVariantRecordIter {
     }
 }
 
+#[derive(Debug)]
 pub struct PlinkVariantBlockSource {
     bed: BedSource,
     bytes_per_variant: usize,
@@ -240,12 +407,7 @@ pub struct PlinkVariantBlockSource {
 }
 
 impl PlinkVariantBlockSource {
-    fn new(
-        bed: BedSource,
-        bytes_per_variant: usize,
-        n_samples: usize,
-        n_variants: usize,
-    ) -> Self {
+    fn new(bed: BedSource, bytes_per_variant: usize, n_samples: usize, n_variants: usize) -> Self {
         Self {
             bed,
             bytes_per_variant,
@@ -301,10 +463,12 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 actual: self.bed.len(),
             })?;
 
-        let end = offset.checked_add(block_bytes).ok_or_else(|| PlinkIoError::TruncatedBed {
-            expected: u64::MAX,
-            actual: self.bed.len(),
-        })?;
+        let end = offset
+            .checked_add(block_bytes)
+            .ok_or_else(|| PlinkIoError::TruncatedBed {
+                expected: u64::MAX,
+                actual: self.bed.len(),
+            })?;
         if end > self.bed.len() {
             return Err(PlinkIoError::TruncatedBed {
                 expected: block_bytes,
@@ -325,7 +489,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             let bytes = &self.buffer[start..end];
             let dest_offset = variant_idx * nrows;
             let dest = &mut storage[dest_offset..dest_offset + nrows];
-            decode_variant(bytes, dest, nrows, table);
+            decode_plink_variant(bytes, dest, nrows, table);
         }
 
         self.cursor += ncols;
@@ -333,82 +497,376 @@ impl VariantBlockSource for PlinkVariantBlockSource {
     }
 }
 
-fn normalize_path(path: &Path, extension: &str) -> PathBuf {
-    if path.extension().map_or(false, |ext| ext == extension) {
-        path.to_owned()
-    } else {
-        path.with_extension(extension)
-    }
+#[derive(Debug)]
+pub struct BcfDataset {
+    input_path: PathBuf,
+    header: Arc<vcf::Header>,
+    samples: Vec<SampleRecord>,
+    n_variants: usize,
+    output_hint: OutputHint,
 }
 
-fn validate_bed_header(header: &[u8]) -> Result<(), PlinkIoError> {
-    match header {
-        [0x6c, 0x1b, 0x01] => Ok(()),
-        [0x6c, 0x1b, mode] => Err(PlinkIoError::InvalidHeader(format!(
-            "unsupported mode byte {mode:#04x} (only variant-major mode is supported)"
-        ))),
-        _ => Err(PlinkIoError::InvalidHeader(
-            "missing PLINK magic bytes 0x6c 0x1b".to_string(),
-        )),
-    }
+#[derive(Clone, Debug)]
+enum OutputHint {
+    LocalFile(PathBuf),
+    LocalDirectory(PathBuf),
+    RemoteStem(OsString),
 }
 
-fn read_fam_records(path: &Path) -> Result<Vec<PlinkSampleRecord>, PlinkIoError> {
-    let mut reader = open_text_source(path)?;
-    let mut records = Vec::new();
-    let mut line_no = 0usize;
+impl BcfDataset {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, BcfIoError> {
+        let path = path.as_ref();
+        let input_path = path.to_path_buf();
+        let output_hint = compute_output_hint(path);
 
-    while let Some(line) = reader.next_line()? {
-        line_no += 1;
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+        let mut reader = create_bcf_reader(&input_path)?;
+        let header = Arc::new(reader.read_header()?);
+        let sample_names: Vec<String> = header
+            .sample_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        if sample_names.is_empty() {
+            return Err(BcfIoError::MissingSamples);
         }
-        let text = str::from_utf8(line).map_err(|err| PlinkIoError::Utf8 {
-            path: path.display().to_string(),
-            source: err,
-        })?;
-        let mut fields = text.split_whitespace();
-        let (Some(fid), Some(iid), Some(pid), Some(mid), Some(sex), Some(phenotype)) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            return Err(PlinkIoError::MalformedRecord {
-                path: path.display().to_string(),
-                line: line_no,
-                message: "expected 6 whitespace-delimited fields".to_string(),
+        let samples = sample_names
+            .iter()
+            .map(|name| SampleRecord {
+                family_id: name.clone(),
+                individual_id: name.clone(),
+                paternal_id: "0".to_string(),
+                maternal_id: "0".to_string(),
+                sex: "0".to_string(),
+                phenotype: "-9".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut record = RecordBuf::default();
+        let mut n_variants = 0usize;
+        loop {
+            let bytes = reader.read_record_buf(header.as_ref(), &mut record)?;
+            if bytes == 0 {
+                break;
+            }
+            n_variants += 1;
+        }
+
+        if n_variants == 0 {
+            return Err(BcfIoError::NoVariants);
+        }
+
+        Ok(Self {
+            input_path,
+            header,
+            samples,
+            n_variants,
+            output_hint,
+        })
+    }
+
+    pub fn samples(&self) -> &[SampleRecord] {
+        &self.samples
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn n_variants(&self) -> usize {
+        self.n_variants
+    }
+
+    pub fn input_path(&self) -> &Path {
+        &self.input_path
+    }
+
+    pub fn block_source(&self) -> Result<BcfVariantBlockSource, BcfIoError> {
+        BcfVariantBlockSource::new(
+            self.input_path.clone(),
+            Arc::clone(&self.header),
+            self.samples.len(),
+            self.n_variants,
+        )
+    }
+
+    pub fn output_path(&self, filename: &str) -> PathBuf {
+        match &self.output_hint {
+            OutputHint::LocalFile(path) => {
+                let mut local = path.clone();
+                local.set_extension(filename);
+                local
+            }
+            OutputHint::LocalDirectory(dir) => dir.join(filename),
+            OutputHint::RemoteStem(stem) => {
+                let mut local = PathBuf::from(stem);
+                local.set_extension(filename);
+                local
+            }
+        }
+    }
+}
+
+pub struct BcfVariantBlockSource {
+    path: PathBuf,
+    header: Arc<vcf::Header>,
+    reader: BcfReader<BcfSource>,
+    record: RecordBuf,
+    n_samples: usize,
+    n_variants: usize,
+    emitted: usize,
+}
+
+impl BcfVariantBlockSource {
+    fn new(
+        path: PathBuf,
+        header: Arc<vcf::Header>,
+        n_samples: usize,
+        n_variants: usize,
+    ) -> Result<Self, BcfIoError> {
+        let mut reader = create_bcf_reader(&path)?;
+        let reopened = reader.read_header()?;
+        verify_header(&reopened, header.as_ref())?;
+        Ok(Self {
+            path,
+            header,
+            reader,
+            record: RecordBuf::default(),
+            n_samples,
+            n_variants,
+            emitted: 0,
+        })
+    }
+
+    fn reopen(&mut self) -> Result<(), BcfIoError> {
+        let mut reader = create_bcf_reader(&self.path)?;
+        let header = reader.read_header()?;
+        verify_header(&header, self.header.as_ref())?;
+        self.reader = reader;
+        self.record = RecordBuf::default();
+        self.emitted = 0;
+        Ok(())
+    }
+}
+
+impl VariantBlockSource for BcfVariantBlockSource {
+    type Error = BcfIoError;
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn n_variants(&self) -> usize {
+        self.n_variants
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.reopen()
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        if max_variants == 0 {
+            return Ok(0);
+        }
+        if self.emitted >= self.n_variants {
+            return Ok(0);
+        }
+
+        let capacity = self.n_variants - self.emitted;
+        let target = capacity.min(max_variants);
+        let mut filled = 0usize;
+        while filled < target {
+            let bytes = self
+                .reader
+                .read_record_buf(self.header.as_ref(), &mut self.record)?;
+            if bytes == 0 {
+                break;
+            }
+            let offset = filled * self.n_samples;
+            let dest = &mut storage[offset..offset + self.n_samples];
+            decode_bcf_record(&self.record, dest, self.n_samples)?;
+            filled += 1;
+        }
+
+        self.emitted += filled;
+        if filled == 0 && self.emitted < self.n_variants {
+            return Err(BcfIoError::UnexpectedEof {
+                expected: self.n_variants,
+                actual: self.emitted,
             });
-        };
-
-        records.push(PlinkSampleRecord {
-            family_id: fid.to_string(),
-            individual_id: iid.to_string(),
-            paternal_id: pid.to_string(),
-            maternal_id: mid.to_string(),
-            sex: sex.to_string(),
-            phenotype: phenotype.to_string(),
-        });
-    }
-
-    Ok(records)
-}
-
-fn count_bim_records(path: &Path) -> Result<usize, PlinkIoError> {
-    let mut reader = open_text_source(path)?;
-    let mut count = 0usize;
-    while let Some(line) = reader.next_line()? {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
         }
-        count += 1;
+
+        Ok(filled)
     }
-    Ok(count)
 }
 
-fn decode_variant(bytes: &[u8], dest: &mut [f64], n_samples: usize, table: &[[f64; 4]; 256]) {
+fn guess_is_bcf(path: &Path) -> bool {
+    if is_remote_path(path) {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        lower.ends_with(".bcf") || lower.ends_with("/*") || lower.ends_with('/')
+    } else if path.is_dir() {
+        true
+    } else {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("bcf"))
+            .unwrap_or(false)
+    }
+}
+
+fn compute_output_hint(path: &Path) -> OutputHint {
+    if is_remote_path(path) {
+        let mut trimmed = path.to_string_lossy().into_owned();
+        while trimmed.ends_with('*') {
+            trimmed.pop();
+        }
+        while trimmed.ends_with('/') {
+            trimmed.pop();
+        }
+        if trimmed.is_empty() {
+            return OutputHint::RemoteStem(OsString::from("dataset"));
+        }
+        let stem = Path::new(&trimmed)
+            .file_stem()
+            .map(|s| s.to_os_string())
+            .unwrap_or_else(|| OsString::from("dataset"));
+        OutputHint::RemoteStem(stem)
+    } else if path.is_dir() {
+        OutputHint::LocalDirectory(path.to_path_buf())
+    } else {
+        OutputHint::LocalFile(path.to_path_buf())
+    }
+}
+
+fn create_bcf_reader(path: &Path) -> Result<BcfReader<BcfSource>, BcfIoError> {
+    let source = open_bcf_source(path)?;
+    Ok(BcfReader::new(source))
+}
+
+fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {
+    let observed_samples = observed.sample_names();
+    let expected_samples = expected.sample_names();
+    if observed_samples != expected_samples {
+        return Err(BcfIoError::HeaderMismatch);
+    }
+    Ok(())
+}
+
+fn decode_bcf_record(
+    record: &RecordBuf,
+    dest: &mut [f64],
+    n_samples: usize,
+) -> Result<(), BcfIoError> {
+    if dest.len() < n_samples {
+        return Err(BcfIoError::Decode(
+            "destination buffer shorter than number of samples".to_string(),
+        ));
+    }
+
+    dest[..n_samples].fill(f64::NAN);
+
+    let samples = record.samples();
+    let ds_series = samples.select("DS");
+    let gt_series = samples.select(key::GENOTYPE);
+
+    for sample_idx in 0..n_samples {
+        if let Some(series) = ds_series.as_ref() {
+            match series.get(sample_idx) {
+                Some(Some(value)) => {
+                    if let Some(dosage) = numeric_from_value(value)? {
+                        dest[sample_idx] = dosage;
+                        continue;
+                    }
+                }
+                Some(None) => {
+                    dest[sample_idx] = f64::NAN;
+                    continue;
+                }
+                None => {}
+            }
+        }
+
+        if let Some(series) = gt_series.as_ref() {
+            match series.get(sample_idx) {
+                Some(Some(Value::Genotype(genotype))) => {
+                    if let Some(dosage) = dosage_from_genotype(genotype.as_ref())? {
+                        dest[sample_idx] = dosage;
+                        continue;
+                    }
+                }
+                Some(Some(Value::String(text))) => {
+                    let genotype = SampleGenotype::from_str(text).map_err(|err| {
+                        BcfIoError::Decode(format!(
+                            "failed to parse genotype string '{text}': {err}"
+                        ))
+                    })?;
+                    if let Some(dosage) = dosage_from_genotype(genotype.as_ref())? {
+                        dest[sample_idx] = dosage;
+                        continue;
+                    }
+                }
+                Some(Some(value)) => {
+                    if let Some(dosage) = numeric_from_value(value)? {
+                        dest[sample_idx] = dosage;
+                        continue;
+                    }
+                }
+                Some(None) => {
+                    dest[sample_idx] = f64::NAN;
+                    continue;
+                }
+                None => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn numeric_from_value(value: &Value) -> Result<Option<f64>, BcfIoError> {
+    match value {
+        Value::Integer(n) => Ok(Some(*n as f64)),
+        Value::Float(n) => Ok(Some(*n as f64)),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed.parse::<f64>().map(Some).map_err(|err| {
+                    BcfIoError::Decode(format!("failed to parse numeric string '{trimmed}': {err}"))
+                })
+            }
+        }
+        Value::Array(Array::Integer(values)) => {
+            Ok(values.get(0).and_then(|opt| opt.map(|n| n as f64)))
+        }
+        Value::Array(Array::Float(values)) => {
+            Ok(values.get(0).and_then(|opt| opt.map(|n| n as f64)))
+        }
+        Value::Array(_) => Ok(None),
+        Value::Genotype(genotype) => dosage_from_genotype(genotype.as_ref()),
+        Value::Character(_) => Ok(None),
+    }
+}
+
+fn dosage_from_genotype(
+    genotype: &[sample::value::genotype::Allele],
+) -> Result<Option<f64>, BcfIoError> {
+    let mut total = 0.0f64;
+    for allele in genotype {
+        match allele.position() {
+            Some(0) => {}
+            Some(_) => total += 1.0,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(total))
+}
+
+fn decode_plink_variant(bytes: &[u8], dest: &mut [f64], n_samples: usize, table: &[[f64; 4]; 256]) {
     let mut sample_idx = 0usize;
     for &byte in bytes {
         if sample_idx >= n_samples {
@@ -440,4 +898,85 @@ fn decode_table() -> &'static [[f64; 4]; 256] {
         }
         table
     })
+}
+
+fn normalize_path(path: &Path, extension: &str) -> PathBuf {
+    if path.extension().map_or(false, |ext| ext == extension) {
+        path.to_owned()
+    } else {
+        path.with_extension(extension)
+    }
+}
+
+fn validate_bed_header(header: &[u8]) -> Result<(), PlinkIoError> {
+    match header {
+        [0x6c, 0x1b, 0x01] => Ok(()),
+        [0x6c, 0x1b, mode] => Err(PlinkIoError::InvalidHeader(format!(
+            "unsupported mode byte {mode:#04x} (only variant-major mode is supported)"
+        ))),
+        _ => Err(PlinkIoError::InvalidHeader(
+            "missing PLINK magic bytes 0x6c 0x1b".to_string(),
+        )),
+    }
+}
+
+fn read_fam_records(path: &Path) -> Result<Vec<SampleRecord>, PlinkIoError> {
+    let mut reader = open_text_source(path)?;
+    let mut records = Vec::new();
+    let mut line_no = 0usize;
+
+    while let Some(line) = reader.next_line()? {
+        line_no += 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let text = str::from_utf8(line).map_err(|err| PlinkIoError::Utf8 {
+            path: path.display().to_string(),
+            source: err,
+        })?;
+        let mut fields = text.split_whitespace();
+        let (Some(fid), Some(iid), Some(pid), Some(mid), Some(sex), Some(phenotype)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err(PlinkIoError::MalformedRecord {
+                path: path.display().to_string(),
+                line: line_no,
+                message: "expected 6 whitespace-delimited fields".to_string(),
+            });
+        };
+
+        records.push(SampleRecord {
+            family_id: fid.to_string(),
+            individual_id: iid.to_string(),
+            paternal_id: pid.to_string(),
+            maternal_id: mid.to_string(),
+            sex: sex.to_string(),
+            phenotype: phenotype.to_string(),
+        });
+    }
+
+    Ok(records)
+}
+
+fn count_bim_records(path: &Path) -> Result<usize, PlinkIoError> {
+    let mut reader = open_text_source(path)?;
+    let mut count = 0usize;
+    while let Some(line) = reader.next_line()? {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn is_remote_path(path: &Path) -> bool {
+    path.to_str()
+        .map(|s| s.starts_with("gs://"))
+        .unwrap_or(false)
 }

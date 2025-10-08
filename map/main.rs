@@ -4,8 +4,8 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::fit::{HwePcaError, HwePcaModel};
+use super::io::{GenotypeDataset, GenotypeIoError};
 use super::project::{ProjectionOptions, ProjectionResult};
-use super::io::{PlinkDataset, PlinkIoError};
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -19,7 +19,7 @@ pub enum MapCommand {
 pub enum MapDriverError {
     Hwe(HwePcaError),
     Io(std::io::Error),
-    Plink(PlinkIoError),
+    Dataset(GenotypeIoError),
     Serialization(serde_json::Error),
     InvalidState(String),
 }
@@ -29,7 +29,7 @@ impl fmt::Display for MapDriverError {
         match self {
             Self::Hwe(err) => write!(f, "HWE PCA error: {err}"),
             Self::Io(err) => write!(f, "I/O error: {err}"),
-            Self::Plink(err) => write!(f, "PLINK dataset error: {err}"),
+            Self::Dataset(err) => write!(f, "genotype dataset error: {err}"),
             Self::Serialization(err) => write!(f, "serialization error: {err}"),
             Self::InvalidState(msg) => write!(f, "{msg}"),
         }
@@ -41,7 +41,7 @@ impl std::error::Error for MapDriverError {
         match self {
             Self::Hwe(err) => Some(err),
             Self::Io(err) => Some(err),
-            Self::Plink(err) => Some(err),
+            Self::Dataset(err) => Some(err),
             Self::Serialization(err) => Some(err),
             Self::InvalidState(_) => None,
         }
@@ -60,9 +60,9 @@ impl From<std::io::Error> for MapDriverError {
     }
 }
 
-impl From<PlinkIoError> for MapDriverError {
-    fn from(value: PlinkIoError) -> Self {
-        Self::Plink(value)
+impl From<GenotypeIoError> for MapDriverError {
+    fn from(value: GenotypeIoError) -> Self {
+        Self::Dataset(value)
     }
 }
 
@@ -90,7 +90,7 @@ fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
         dataset.n_variants()
     );
 
-    let mut source = dataset.block_source();
+    let mut source = dataset.block_source()?;
     let model = HwePcaModel::fit(&mut source)?;
 
     println!(
@@ -117,32 +117,25 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
     );
 
     let model = load_model_for_projection(&dataset)?;
-    println!(
-        "Model provides {} principal components",
-        model.components()
-    );
+    println!("Model provides {} principal components", model.components());
 
-    let mut source = dataset.block_source();
+    let mut source = dataset.block_source()?;
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let result = projector.project_with_options(&mut source, &options)?;
 
     persist_projection_results(&dataset, &result)?;
 
-    println!(
-        "Projection complete for {} samples",
-        result.scores.nrows()
-    );
+    println!("Projection complete for {} samples", result.scores.nrows());
 
     Ok(())
 }
 
-fn open_dataset(path: &Path) -> Result<PlinkDataset, MapDriverError> {
-    let dataset = PlinkDataset::open(path)?;
-    Ok(dataset)
+fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
+    Ok(GenotypeDataset::open(path)?)
 }
 
-fn persist_model(dataset: &PlinkDataset, model: &HwePcaModel) -> Result<(), MapDriverError> {
+fn persist_model(dataset: &GenotypeDataset, model: &HwePcaModel) -> Result<(), MapDriverError> {
     let model_path = dataset_output_path(dataset, "hwe.json");
     prepare_output_path(&model_path)?;
 
@@ -155,7 +148,7 @@ fn persist_model(dataset: &PlinkDataset, model: &HwePcaModel) -> Result<(), MapD
     Ok(())
 }
 
-fn load_model_for_projection(dataset: &PlinkDataset) -> Result<HwePcaModel, MapDriverError> {
+fn load_model_for_projection(dataset: &GenotypeDataset) -> Result<HwePcaModel, MapDriverError> {
     let model_path = dataset_output_path(dataset, "hwe.json");
     let file = File::open(&model_path)?;
     let reader = BufReader::new(file);
@@ -173,7 +166,7 @@ fn load_model_for_projection(dataset: &PlinkDataset) -> Result<HwePcaModel, MapD
 }
 
 fn persist_projection_results(
-    dataset: &PlinkDataset,
+    dataset: &GenotypeDataset,
     result: &ProjectionResult,
 ) -> Result<(), MapDriverError> {
     let scores = result.scores.as_ref();
@@ -239,15 +232,12 @@ fn persist_projection_results(
     Ok(())
 }
 
-fn persist_sample_manifest(dataset: &PlinkDataset) -> Result<(), MapDriverError> {
+fn persist_sample_manifest(dataset: &GenotypeDataset) -> Result<(), MapDriverError> {
     let manifest_path = dataset_output_path(dataset, "samples.tsv");
     prepare_output_path(&manifest_path)?;
     let mut writer = BufWriter::new(File::create(&manifest_path)?);
 
-    writeln!(
-        writer,
-        "FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE"
-    )?;
+    writeln!(writer, "FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE")?;
 
     for record in dataset.samples() {
         writeln!(
@@ -267,7 +257,10 @@ fn persist_sample_manifest(dataset: &PlinkDataset) -> Result<(), MapDriverError>
     Ok(())
 }
 
-fn persist_fit_summary(dataset: &PlinkDataset, model: &HwePcaModel) -> Result<(), MapDriverError> {
+fn persist_fit_summary(
+    dataset: &GenotypeDataset,
+    model: &HwePcaModel,
+) -> Result<(), MapDriverError> {
     let summary_path = dataset_output_path(dataset, "hwe.summary.tsv");
     prepare_output_path(&summary_path)?;
     let mut writer = BufWriter::new(File::create(&summary_path)?);
@@ -290,21 +283,8 @@ fn persist_fit_summary(dataset: &PlinkDataset, model: &HwePcaModel) -> Result<()
     Ok(())
 }
 
-fn dataset_output_path(dataset: &PlinkDataset, extension: &str) -> PathBuf {
-    let bed_path = dataset.bed_path();
-    if is_remote_path(bed_path) {
-        let stem = bed_path
-            .file_stem()
-            .map(|s| s.to_os_string())
-            .unwrap_or_else(|| "dataset".into());
-        let mut local = PathBuf::from(stem);
-        local.set_extension(extension);
-        local
-    } else {
-        let mut local = bed_path.to_path_buf();
-        local.set_extension(extension);
-        local
-    }
+fn dataset_output_path(dataset: &GenotypeDataset, filename: &str) -> PathBuf {
+    dataset.output_path(filename)
 }
 
 fn prepare_output_path(path: &Path) -> Result<(), MapDriverError> {
@@ -314,10 +294,4 @@ fn prepare_output_path(path: &Path) -> Result<(), MapDriverError> {
         }
     }
     Ok(())
-}
-
-fn is_remote_path(path: &Path) -> bool {
-    path.to_str()
-        .map(|s| s.starts_with("gs://"))
-        .unwrap_or(false)
 }

@@ -1,6 +1,6 @@
 use crate::score::pipeline::PipelineError;
 use flate2::read::MultiGzDecoder;
-use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
+use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
@@ -310,14 +310,17 @@ fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
 }
 
 fn gather_local_bcf_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
-    let read_dir = fs::read_dir(dir).map_err(|e| {
-        PipelineError::Io(format!("Unable to list {}: {e}", dir.display()))
-    })?;
+    let read_dir = fs::read_dir(dir)
+        .map_err(|e| PipelineError::Io(format!("Unable to list {}: {e}", dir.display())))?;
 
     let mut files = Vec::new();
     for entry in read_dir {
-        let entry = entry
-            .map_err(|e| PipelineError::Io(format!("Unable to read directory entry in {}: {e}", dir.display())))?;
+        let entry = entry.map_err(|e| {
+            PipelineError::Io(format!(
+                "Unable to read directory entry in {}: {e}",
+                dir.display()
+            ))
+        })?;
         let path = entry.path();
         if path.is_file() && has_bcf_extension(&path) {
             files.push(path);
@@ -441,12 +444,13 @@ fn fetch_bcf_object_names(
                 .objects
                 .into_iter()
                 .filter(|o| !o.name.ends_with('/'))
-                .filter(|o| o
-                    .name
-                    .rsplit('.')
-                    .next()
-                    .map(|ext| ext.eq_ignore_ascii_case("bcf"))
-                    .unwrap_or(false))
+                .filter(|o| {
+                    o.name
+                        .rsplit('.')
+                        .next()
+                        .map(|ext| ext.eq_ignore_ascii_case("bcf"))
+                        .unwrap_or(false)
+                })
                 .map(|o| o.name),
         );
         if response.next_page_token.is_empty() {
@@ -463,7 +467,8 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
-    let attempt = |control: &StorageControl| fetch_bcf_object_names(&runtime, control, &bucket_path, prefix);
+    let attempt =
+        |control: &StorageControl| fetch_bcf_object_names(&runtime, control, &bucket_path, prefix);
 
     match attempt(&control) {
         Ok(names) => Ok(names),
@@ -518,7 +523,8 @@ fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
     };
     let (bucket, object) = parse_gcs_uri(normalized)?;
     let lower = object.to_lowercase();
-    let treat_as_directory = normalized.ends_with('/') || object.is_empty() || !lower.ends_with(".bcf");
+    let treat_as_directory =
+        normalized.ends_with('/') || object.is_empty() || !lower.ends_with(".bcf");
 
     if !treat_as_directory {
         match RemoteByteRangeSource::new(&bucket, &object) {
@@ -1111,10 +1117,8 @@ fn prepare_remote_bcf_reader(
 ) -> Result<PreparedBcfReader, PipelineError> {
     let len = source.len();
     let source = Arc::new(source);
-    let mut reader = RemoteStreamingReader::new(
-        format!("gs://{bucket}/{object}"),
-        Arc::clone(&source),
-    );
+    let mut reader =
+        RemoteStreamingReader::new(format!("gs://{bucket}/{object}"), Arc::clone(&source));
     let is_gzip = reader.peek_gzip_magic()?;
     let reader: Box<dyn Read + Send> = if is_gzip {
         Box::new(MultiGzDecoder::new(reader))
@@ -1168,7 +1172,6 @@ impl RemoteCache {
         self.order.push_back(key);
     }
 }
-
 
 #[cfg(test)]
 mod tests {

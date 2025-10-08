@@ -50,6 +50,8 @@ wolfe_bfgs = "0.1.6"
 log = "0.4.27"
 faer = "0.22.6"
 dyn-stack = "0.13"
+noodles-bcf = "0.78.0"
+noodles-vcf = "0.78.0"
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 
