@@ -12,6 +12,8 @@ on:
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
+      - 'map/**/*.rs'
+      - 'map/*.rs'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
@@ -21,6 +23,8 @@ on:
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
+      - 'map/**/*.rs'
+      - 'map/*.rs'
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +51,9 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '**/*.rs'
+            map:
+              - 'map/**/*.rs'
+              - 'map/*.rs'
       # -----------------------------------------------------------------------
 
       - name: Install Rust nightly
@@ -98,6 +105,10 @@ jobs:
         if: steps.rust_changes.outputs.rust == 'true'
         run: cargo +nightly test --release -- --show-output
         continue-on-error: true
+
+      - name: Run map-specific tests
+        if: steps.rust_changes.outputs.map == 'true'
+        run: cargo +nightly test --release map::
 
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
