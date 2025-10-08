@@ -11,7 +11,7 @@ pub mod shared {
 }
 
 #[path = "../score/mod.rs"]
-mod score;
+pub mod score;
 
 #[path = "../map/mod.rs"]
 pub mod map;

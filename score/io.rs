@@ -10,13 +10,15 @@
 // shared buffer pool to minimize allocations and provides natural backpressure if
 // consumers cannot keep up.
 
-use crate::decide::ComputePath;
-use crate::pipeline::PipelineError;
+use crate::score::decide::ComputePath;
+use crate::score::pipeline::PipelineError;
 pub use crate::shared::files::{
     gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials, open_bed_source,
     open_text_source, BedSource, ByteRangeSource, TextSource, PROGRESS_UPDATE_BATCH_SIZE,
 };
-use crate::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
+use crate::score::types::{
+    FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem,
+};
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicU64, Ordering};

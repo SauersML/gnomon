@@ -8,9 +8,9 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
-use crate::io::{open_text_source, TextSource};
-use crate::pipeline::PipelineError;
-use crate::types::{
+use crate::score::io::{open_text_source, TextSource};
+use crate::score::pipeline::PipelineError;
+use crate::score::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo,
 };

@@ -13,14 +13,14 @@
 #![deny(unused_imports)]
 
 use clap::Parser;
-use gnomon::download;
-use gnomon::io::{
+use gnomon::score::download;
+use gnomon::score::io::{
     gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials,
 };
-use gnomon::pipeline::{self, PipelineContext};
-use gnomon::prepare;
-use gnomon::reformat;
-use gnomon::types::PreparationResult;
+use gnomon::score::pipeline::{self, PipelineContext};
+use gnomon::score::prepare;
+use gnomon::score::reformat;
+use gnomon::score::types::PreparationResult;
 use natord::compare;
 use std::error::Error;
 use std::ffi::OsString;

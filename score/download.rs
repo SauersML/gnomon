@@ -4,7 +4,7 @@
 //
 // ========================================================================================
 
-use crate::reformat;
+use crate::score::reformat;
 use dwldutil::{DLFile, Downloader};
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
