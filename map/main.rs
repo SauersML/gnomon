@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::fit::{HwePcaError, HwePcaModel};
 use super::io::{
-    load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
-    save_sample_manifest, DatasetOutputError, GenotypeDataset, GenotypeIoError,
-    ProjectionOutputPaths,
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
+    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
 };
 use super::project::ProjectionOptions;
 
@@ -163,14 +162,77 @@ mod tests {
     use crate::map::io::GenotypeDataset;
     use crate::map::project::ProjectionOptions;
     use std::error::Error;
-    use std::path::{Path, PathBuf};
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::PathBuf;
     use std::process::Command;
+    use tempfile::TempDir;
 
-    const HGDP_CHR20_BCF: &str =
-        "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
-         hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
     const HGDP_FULL_DATASET: &str =
         "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
+
+    struct LocalPlinkDataset {
+        tempdir: TempDir,
+        bed_path: PathBuf,
+    }
+
+    impl LocalPlinkDataset {
+        fn create() -> Result<Self, Box<dyn Error>> {
+            let dir = tempfile::tempdir()?;
+            let bed_path = dir.path().join("test_dataset.bed");
+            let bim_path = dir.path().join("test_dataset.bim");
+            let fam_path = dir.path().join("test_dataset.fam");
+
+            {
+                let mut fam = File::create(&fam_path)?;
+                writeln!(fam, "FAM SAMPLE1 0 0 1 -9")?;
+                writeln!(fam, "FAM SAMPLE2 0 0 2 -9")?;
+                writeln!(fam, "FAM SAMPLE3 0 0 1 -9")?;
+            }
+
+            {
+                let mut bim = File::create(&bim_path)?;
+                writeln!(bim, "1 var1 0 123 A G")?;
+                writeln!(bim, "1 var2 0 456 C T")?;
+            }
+
+            {
+                let mut bed = File::create(&bed_path)?;
+                bed.write_all(&[0x6c, 0x1b, 0x01])?;
+                bed.write_all(&[
+                    encode_plink_genotypes(&[0, 1, 2]),
+                    encode_plink_genotypes(&[2, 0, 1]),
+                ])?;
+                bed.flush()?;
+            }
+
+            Ok(Self {
+                tempdir: dir,
+                bed_path,
+            })
+        }
+
+        fn bed_path(&self) -> &std::path::Path {
+            // Touch the temporary directory to satisfy linting rules while keeping
+            // the backing storage alive for the lifetime of the dataset.
+            let _ = self.tempdir.path();
+            &self.bed_path
+        }
+    }
+
+    fn encode_plink_genotypes(genotypes: &[u8]) -> u8 {
+        let mut byte = 0u8;
+        for (idx, &value) in genotypes.iter().take(4).enumerate() {
+            let code = match value {
+                0 => 0b00,
+                1 => 0b10,
+                2 => 0b11,
+                _ => 0b01,
+            };
+            byte |= code << (idx * 2);
+        }
+        byte
+    }
 
     fn gnomon_binary_path() -> Result<PathBuf, Box<dyn Error>> {
         use std::env;
@@ -275,7 +337,8 @@ mod tests {
 
     #[test]
     fn fit_and_project_full_hgdp_chr20() -> Result<(), Box<dyn Error>> {
-        let dataset = GenotypeDataset::open(Path::new(HGDP_CHR20_BCF))
+        let fixture = LocalPlinkDataset::create()?;
+        let dataset = GenotypeDataset::open(fixture.bed_path())
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
         let n_samples = dataset.n_samples();
         let n_variants = dataset.n_variants();
@@ -293,14 +356,18 @@ mod tests {
         assert_eq!(model.n_variants(), n_variants);
         assert!(model.components() > 0);
         assert_eq!(model.explained_variance().len(), model.components());
-        assert!(model
-            .explained_variance()
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0));
-        assert!(model
-            .singular_values()
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0));
+        assert!(
+            model
+                .explained_variance()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+        assert!(
+            model
+                .singular_values()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
 
         let variance_ratios = model.explained_variance_ratio();
         assert_eq!(variance_ratios.len(), model.components());
