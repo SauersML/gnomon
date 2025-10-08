@@ -172,10 +172,9 @@ mod tests {
 
     #[test]
     fn cli_fit_and_project_full_hgdp_dataset() -> Result<(), Box<dyn Error>> {
-        let binary = std::env::var("CARGO_BIN_EXE_gnomon")
-            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let binary = env!("CARGO_BIN_EXE_gnomon");
 
-        let fit_output = Command::new(&binary)
+        let fit_output = Command::new(binary)
             .arg("--fit")
             .arg(HGDP_FULL_DATASET)
             .output()
@@ -189,7 +188,7 @@ mod tests {
             String::from_utf8_lossy(&fit_output.stderr)
         );
 
-        let project_output = Command::new(&binary)
+        let project_output = Command::new(binary)
             .arg("--project")
             .arg(HGDP_FULL_DATASET)
             .output()
