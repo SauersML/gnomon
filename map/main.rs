@@ -162,7 +162,7 @@ mod tests {
     use crate::map::io::GenotypeDataset;
     use crate::map::project::ProjectionOptions;
     use std::error::Error;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
@@ -170,11 +170,30 @@ mod tests {
     const HGDP_FULL_DATASET: &str =
         "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
 
+    fn gnomon_binary_path() -> Result<PathBuf, Box<dyn Error>> {
+        use std::env;
+
+        let current_exe = env::current_exe()?;
+        let binary_dir = current_exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .ok_or_else(|| "unable to determine cargo target directory")?;
+
+        let binary_name = format!("gnomon{}", env::consts::EXE_SUFFIX);
+        let binary_path = binary_dir.join(&binary_name);
+
+        if binary_path.exists() {
+            Ok(binary_path)
+        } else {
+            Err(format!("gnomon binary not found at {}", binary_path.display()).into())
+        }
+    }
+
     #[test]
     fn cli_fit_and_project_full_hgdp_dataset() -> Result<(), Box<dyn Error>> {
-        let binary = env!("CARGO_BIN_EXE_gnomon");
+        let binary = gnomon_binary_path()?;
 
-        let fit_output = Command::new(binary)
+        let fit_output = Command::new(&binary)
             .arg("--fit")
             .arg(HGDP_FULL_DATASET)
             .output()
@@ -188,7 +207,7 @@ mod tests {
             String::from_utf8_lossy(&fit_output.stderr)
         );
 
-        let project_output = Command::new(binary)
+        let project_output = Command::new(&binary)
             .arg("--project")
             .arg(HGDP_FULL_DATASET)
             .output()
