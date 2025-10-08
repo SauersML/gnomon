@@ -740,7 +740,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 9)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 8)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
