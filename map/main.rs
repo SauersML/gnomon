@@ -3,9 +3,142 @@ use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
     save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
 };
+use super::progress::{
+    FitProgressObserver, FitProgressStage, ProjectionProgressObserver, ProjectionProgressStage,
+};
 use super::project::ProjectionOptions;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::fmt;
+use std::mem;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+fn default_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} {msg:<40} {percent:>3}% |{bar:40.cyan/blue}| {pos}/{len}",
+    )
+    .expect("valid progress template")
+    .progress_chars("=>-")
+}
+
+struct ConsoleFitProgress {
+    bars: HashMap<FitProgressStage, ProgressBar>,
+}
+
+impl ConsoleFitProgress {
+    fn new() -> Self {
+        Self {
+            bars: HashMap::new(),
+        }
+    }
+
+    fn stage_message(stage: FitProgressStage) -> &'static str {
+        match stage {
+            FitProgressStage::AlleleStatistics => "Estimating allele statistics",
+            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
+            FitProgressStage::Loadings => "Computing variant loadings",
+        }
+    }
+
+    fn stage_complete(stage: FitProgressStage) -> &'static str {
+        match stage {
+            FitProgressStage::AlleleStatistics => "Allele statistics complete",
+            FitProgressStage::GramMatrix => "Gram matrix finalized",
+            FitProgressStage::Loadings => "Variant loadings complete",
+        }
+    }
+}
+
+impl FitProgressObserver for ConsoleFitProgress {
+    fn on_stage_start(&mut self, stage: FitProgressStage, total_variants: usize) {
+        let pb = ProgressBar::new(total_variants as u64);
+        pb.set_style(default_progress_style());
+        pb.set_message(Self::stage_message(stage));
+        pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+        self.bars.insert(stage, pb);
+    }
+
+    fn on_stage_advance(&mut self, stage: FitProgressStage, processed_variants: usize) {
+        if let Some(bar) = self.bars.get(&stage) {
+            bar.set_position(processed_variants as u64);
+        }
+    }
+
+    fn on_stage_finish(&mut self, stage: FitProgressStage) {
+        if let Some(bar) = self.bars.remove(&stage) {
+            bar.finish_with_message(Self::stage_complete(stage));
+        }
+    }
+}
+
+impl Drop for ConsoleFitProgress {
+    fn drop(&mut self) {
+        for (stage, bar) in mem::take(&mut self.bars) {
+            bar.abandon_with_message(format!("{} (aborted)", Self::stage_message(stage)));
+        }
+    }
+}
+
+struct ConsoleProjectionProgress {
+    bar: Option<(ProjectionProgressStage, ProgressBar)>,
+}
+
+impl ConsoleProjectionProgress {
+    fn new() -> Self {
+        Self { bar: None }
+    }
+
+    fn stage_message(stage: ProjectionProgressStage) -> &'static str {
+        match stage {
+            ProjectionProgressStage::Projection => "Projecting samples",
+        }
+    }
+
+    fn stage_complete(stage: ProjectionProgressStage) -> &'static str {
+        match stage {
+            ProjectionProgressStage::Projection => "Projection complete",
+        }
+    }
+}
+
+impl ProjectionProgressObserver for ConsoleProjectionProgress {
+    fn on_stage_start(&mut self, stage: ProjectionProgressStage, total_variants: usize) {
+        let pb = ProgressBar::new(total_variants as u64);
+        pb.set_style(default_progress_style());
+        pb.set_message(Self::stage_message(stage));
+        pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+        self.bar = Some((stage, pb));
+    }
+
+    fn on_stage_advance(&mut self, stage: ProjectionProgressStage, processed_variants: usize) {
+        if let Some((current, bar)) = self.bar.as_ref() {
+            if *current == stage {
+                bar.set_position(processed_variants as u64);
+            }
+        }
+    }
+
+    fn on_stage_finish(&mut self, stage: ProjectionProgressStage) {
+        if let Some((current, bar)) = self.bar.take() {
+            if current == stage {
+                bar.finish_with_message(Self::stage_complete(stage));
+            } else {
+                bar.abandon();
+            }
+        }
+    }
+}
+
+impl Drop for ConsoleProjectionProgress {
+    fn drop(&mut self) {
+        if let Some((stage, bar)) = self.bar.take() {
+            bar.abandon_with_message(format!("{} (aborted)", Self::stage_message(stage)));
+        }
+    }
+}
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -91,59 +224,77 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
 }
 
 fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
-    println!("Starting HWE PCA fit for {}", genotype_path.display());
+    println!("=== HWE PCA model fitting ===");
+    println!("Input genotype location: {}", genotype_path.display());
 
     let dataset = open_dataset(genotype_path)?;
     println!(
-        "Detected {} samples across {} variants",
+        "Resolved genotype data file: {}",
+        dataset.data_path().display()
+    );
+    println!(
+        "Dataset dimensions: {} samples × {} variants",
         dataset.n_samples(),
         dataset.n_variants()
     );
 
     let mut source = dataset.block_source()?;
-    let model = HwePcaModel::fit(&mut source)?;
+    let mut progress = ConsoleFitProgress::new();
+    let model = HwePcaModel::fit_with_progress(&mut source, &mut progress)?;
 
     println!(
-        "Model fitted for {} samples and {} variants",
-        model.n_samples(),
-        model.n_variants()
+        "Retained {} principal components across {} samples",
+        model.components(),
+        model.n_samples()
     );
 
     let model_path = save_hwe_model(&dataset, &model)?;
-    println!("Saved HWE PCA model to {}", model_path.display());
-
     let manifest_path = save_sample_manifest(&dataset)?;
-    println!("Sample manifest saved to {}", manifest_path.display());
-
     let summary_path = save_fit_summary(&dataset, &model)?;
-    println!("Fit summary saved to {}", summary_path.display());
+
+    println!("Generated output artifacts:");
+    println!("  • Model JSON      : {}", model_path.display());
+    println!("  • Sample manifest : {}", manifest_path.display());
+    println!("  • Fit summary     : {}", summary_path.display());
 
     Ok(())
 }
 
 fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
-    println!("Starting projection for {}", genotype_path.display());
+    println!("=== Sample projection into PCA space ===");
+    println!("Input genotype location: {}", genotype_path.display());
 
     let dataset = open_dataset(genotype_path)?;
     println!(
-        "Loaded projection dataset with {} samples and {} variants",
+        "Resolved genotype data file: {}",
+        dataset.data_path().display()
+    );
+    println!(
+        "Dataset dimensions: {} samples × {} variants",
         dataset.n_samples(),
         dataset.n_variants()
     );
 
     let model = load_hwe_model(&dataset)?;
-    println!("Model provides {} principal components", model.components());
+    println!(
+        "Loaded model with {} principal components spanning {} variants",
+        model.components(),
+        model.n_variants()
+    );
 
     let mut source = dataset.block_source()?;
     let options = ProjectionOptions::default();
     let projector = model.projector();
-    let result = projector.project_with_options(&mut source, &options)?;
+    let mut progress = ConsoleProjectionProgress::new();
+    let result =
+        projector.project_with_options_and_progress(&mut source, &options, &mut progress)?;
 
     let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
 
-    println!("Projection scores saved to {}", scores.display());
+    println!("Generated projection outputs:");
+    println!("  • Scores    : {}", scores.display());
     if let Some(path) = alignment {
-        println!("Projection alignment factors saved to {}", path.display());
+        println!("  • Alignment : {}", path.display());
     }
 
     println!("Projection complete for {} samples", result.scores.nrows());
@@ -169,8 +320,7 @@ mod tests {
     use noodles_vcf::variant::record_buf::samples::sample::Value;
     use noodles_vcf::variant::record_buf::samples::sample::value::Array;
     use noodles_vcf::variant::record_buf::samples::sample::value::genotype::{
-        Allele as SampleAllele,
-        Genotype as SampleGenotype,
+        Allele as SampleAllele, Genotype as SampleGenotype,
     };
     use std::error::Error;
     use std::fmt::Write as _;
@@ -334,8 +484,8 @@ mod tests {
     }
 
     fn detect_compression(path: &Path) -> Result<(BcfCompression, Vec<u8>), Box<dyn Error>> {
-        let mut source = open_bcf_source(path)
-            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let mut source =
+            open_bcf_source(path).map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
         let mut prefix = vec![0u8; 4096];
         let mut total = 0usize;
         while total < prefix.len() {
@@ -424,10 +574,7 @@ mod tests {
                 result
             }
             Value::Genotype(genotype) => {
-                eprintln!(
-                    "[partial-test] dosage_from_value: genotype {:?}",
-                    genotype
-                );
+                eprintln!("[partial-test] dosage_from_value: genotype {:?}", genotype);
                 dosage_from_genotype(genotype.as_ref())
             }
             other => {
@@ -524,8 +671,7 @@ mod tests {
             observed_samples, sample_count
         );
         assert_eq!(
-            observed_samples,
-            sample_count,
+            observed_samples, sample_count,
             "record should include per-sample data"
         );
         let ds_series = samples.select("DS");
@@ -540,9 +686,7 @@ mod tests {
                 eprintln!("[partial-test] sample {idx} DS raw: {raw:?}");
                 if let Some(Some(value)) = raw {
                     if let Some(dosage) = dosage_from_value(value) {
-                        eprintln!(
-                            "[partial-test] sample {idx} DS-derived dosage: {dosage}"
-                        );
+                        eprintln!("[partial-test] sample {idx} DS-derived dosage: {dosage}");
                         decoded = Some(dosage);
                         break;
                     }
@@ -553,9 +697,7 @@ mod tests {
                 eprintln!("[partial-test] sample {idx} GT raw: {raw:?}");
                 if let Some(Some(value)) = raw {
                     if let Some(dosage) = dosage_from_value(value) {
-                        eprintln!(
-                            "[partial-test] sample {idx} GT-derived dosage: {dosage}"
-                        );
+                        eprintln!("[partial-test] sample {idx} GT-derived dosage: {dosage}");
                         decoded = Some(dosage);
                         break;
                     }
@@ -637,11 +779,10 @@ mod tests {
         match compression {
             BcfCompression::Bgzf => {
                 eprintln!("[partial-test] compression detected: BGZF");
-                let source = open_bcf_source(path)
-                    .map_err(|err| -> Box<dyn Error> {
-                        eprintln!("[partial-test] failed to reopen remote BCF: {err}");
-                        Box::new(err)
-                    })?;
+                let source = open_bcf_source(path).map_err(|err| -> Box<dyn Error> {
+                    eprintln!("[partial-test] failed to reopen remote BCF: {err}");
+                    Box::new(err)
+                })?;
                 let recording = RecordingReader::new(source, 4096);
                 eprintln!("[partial-test] recording reader initialized (bgzf path)");
                 let limited = LimitedReader::new(recording, MAX_COMPRESSED_BYTES);
@@ -681,11 +822,10 @@ mod tests {
             }
             BcfCompression::Plain => {
                 eprintln!("[partial-test] compression detected: plain BCF");
-                let source = open_bcf_source(path)
-                    .map_err(|err| -> Box<dyn Error> {
-                        eprintln!("[partial-test] failed to reopen remote BCF: {err}");
-                        Box::new(err)
-                    })?;
+                let source = open_bcf_source(path).map_err(|err| -> Box<dyn Error> {
+                    eprintln!("[partial-test] failed to reopen remote BCF: {err}");
+                    Box::new(err)
+                })?;
                 let recording = RecordingReader::new(source, 4096);
                 eprintln!("[partial-test] recording reader initialized (plain path)");
                 let limited = LimitedReader::new(recording, MAX_COMPRESSED_BYTES);

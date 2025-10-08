@@ -1,6 +1,9 @@
 use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
 };
+use super::progress::{
+    NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
+};
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatMut};
@@ -69,7 +72,9 @@ impl HwePcaModel {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
-        self.projector().project_with_options(source, opts)
+        let mut progress = NoopProjectionProgress::default();
+        self.projector()
+            .project_with_options_and_progress(source, opts, &mut progress)
     }
 }
 impl<'model> HwePcaProjector<'model> {
@@ -92,6 +97,21 @@ impl<'model> HwePcaProjector<'model> {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
+        let mut progress = NoopProjectionProgress::default();
+        self.project_with_options_and_progress(source, opts, &mut progress)
+    }
+
+    pub fn project_with_options_and_progress<S, P>(
+        &self,
+        source: &mut S,
+        opts: &ProjectionOptions,
+        progress: &mut P,
+    ) -> Result<ProjectionResult, HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+        P: ProjectionProgressObserver,
+    {
         let n_samples = source.n_samples();
         let mut scores = Mat::zeros(n_samples, self.model.components());
         let mut alignment = if opts.return_alignment {
@@ -100,11 +120,12 @@ impl<'model> HwePcaProjector<'model> {
             None
         };
 
-        self.project_into_with_options(
+        self.project_into_with_options_and_progress(
             source,
             scores.as_mut(),
             opts,
             alignment.as_mut().map(|mat| mat.as_mut()),
+            progress,
         )?;
 
         Ok(ProjectionResult { scores, alignment })
@@ -120,7 +141,8 @@ impl<'model> HwePcaProjector<'model> {
         S::Error: Error + Send + Sync + 'static,
     {
         let options = ProjectionOptions::default();
-        self.project_into_with_options(source, scores, &options, None)
+        let mut progress = NoopProjectionProgress::default();
+        self.project_into_with_options_and_progress(source, scores, &options, None, &mut progress)
     }
 
     fn project_into_with_options<S>(
@@ -133,6 +155,29 @@ impl<'model> HwePcaProjector<'model> {
     where
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
+    {
+        let mut progress = NoopProjectionProgress::default();
+        self.project_into_with_options_and_progress(
+            source,
+            scores,
+            opts,
+            alignment_out,
+            &mut progress,
+        )
+    }
+
+    fn project_into_with_options_and_progress<S, P>(
+        &self,
+        source: &mut S,
+        mut scores: MatMut<'_, f64>,
+        opts: &ProjectionOptions,
+        mut alignment_out: Option<MatMut<'_, f64>>,
+        progress: &mut P,
+    ) -> Result<(), HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+        P: ProjectionProgressObserver,
     {
         let n_samples = source.n_samples();
         let n_variants = source.n_variants();
@@ -207,6 +252,8 @@ impl<'model> HwePcaProjector<'model> {
         } else {
             None
         };
+
+        progress.on_stage_start(ProjectionProgressStage::Projection, n_variants);
 
         loop {
             let filled = source
@@ -292,6 +339,7 @@ impl<'model> HwePcaProjector<'model> {
             }
 
             processed += filled;
+            progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
         }
 
         if processed != n_variants {
@@ -299,6 +347,8 @@ impl<'model> HwePcaProjector<'model> {
                 "VariantBlockSource terminated early during projection",
             ));
         }
+
+        progress.on_stage_finish(ProjectionProgressStage::Projection);
 
         if let Some(r2) = alignment_r2 {
             match alignment_out.as_mut() {
