@@ -13,6 +13,10 @@ pub mod shared {
 #[path = "../score/mod.rs"]
 mod score;
 
+pub use score::{
+    batch, complex, decide, download, io, kernel, pipeline, prepare, reformat, types,
+};
+
 #[path = "../map/mod.rs"]
 pub mod map;
 
