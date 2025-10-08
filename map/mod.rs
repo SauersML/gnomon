@@ -2,7 +2,6 @@ pub mod fit;
 pub mod io;
 pub mod main;
 pub mod project;
-
 pub use fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
 };
