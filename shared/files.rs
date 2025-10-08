@@ -1,14 +1,16 @@
 use crate::score::pipeline::PipelineError;
-use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
+use flate2::read::MultiGzDecoder;
+use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
 use memmap2::Mmap;
+use natord::compare;
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -157,6 +159,89 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
     }
 }
 
+struct PreparedBcfReader {
+    reader: Box<dyn Read + Send>,
+    len: u64,
+}
+
+/// Provides sequential access to one or more BCF streams. The data is
+/// transparently decompressed when the underlying files are BGZF-compressed.
+pub struct BcfSource {
+    readers: VecDeque<Box<dyn Read + Send>>,
+    current: Option<Box<dyn Read + Send>>,
+    total_len: Option<u64>,
+}
+
+impl BcfSource {
+    fn from_readers(readers: Vec<PreparedBcfReader>) -> Result<Self, PipelineError> {
+        if readers.is_empty() {
+            return Err(PipelineError::Io(
+                "No BCF files were discovered for the requested input".to_string(),
+            ));
+        }
+
+        let total_len = readers.iter().try_fold(0u64, |acc, r| {
+            acc.checked_add(r.len).ok_or_else(|| {
+                PipelineError::Io("Combined BCF length exceeds u64::MAX".to_string())
+            })
+        })?;
+
+        let mut queue = VecDeque::with_capacity(readers.len());
+        for reader in readers {
+            queue.push_back(reader.reader);
+        }
+
+        Ok(Self {
+            readers: queue,
+            current: None,
+            total_len: Some(total_len),
+        })
+    }
+
+    fn read_internal(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.current.is_none() {
+                self.current = self.readers.pop_front();
+                if self.current.is_none() {
+                    return Ok(0);
+                }
+            }
+
+            if let Some(reader) = self.current.as_mut() {
+                match reader.read(buf) {
+                    Ok(0) => {
+                        self.current = None;
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
+
+    /// Returns the combined compressed length of the underlying BCF objects
+    /// when known.
+    pub fn len(&self) -> Option<u64> {
+        self.total_len
+    }
+
+    /// Reads decompressed bytes from the concatenated BCF streams into `buf`.
+    pub fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, PipelineError> {
+        self.read_internal(buf)
+            .map_err(|e| PipelineError::Io(format!("Error reading BCF stream: {e}")))
+    }
+}
+
+impl Read for BcfSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_internal(buf)
+    }
+}
+
 pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
     if is_gcs_path(path) {
         let uri = path
@@ -175,10 +260,106 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
     }
 }
 
+pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+    if is_gcs_path(path) {
+        return open_remote_bcf_source(path);
+    }
+
+    if path.is_dir() {
+        let mut entries = gather_local_bcf_files(path)?;
+        entries.sort_by(|a, b| compare_paths(a, b));
+        let readers = entries
+            .into_iter()
+            .map(|p| open_local_bcf_reader(&p))
+            .collect::<Result<Vec<_>, _>>()?;
+        BcfSource::from_readers(readers)
+    } else if has_bcf_extension(path) {
+        let reader = open_local_bcf_reader(path)?;
+        BcfSource::from_readers(vec![reader])
+    } else {
+        Err(PipelineError::Io(format!(
+            "Path {} is not a .bcf file or directory",
+            path.display()
+        )))
+    }
+}
+
 fn is_gcs_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("gs://"))
         .unwrap_or(false)
+}
+
+fn has_bcf_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("bcf"))
+        .unwrap_or(false)
+}
+
+fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let a_str = a
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| a.to_string_lossy().into_owned());
+    let b_str = b
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| b.to_string_lossy().into_owned());
+    compare(&a_str, &b_str)
+}
+
+fn gather_local_bcf_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
+    let read_dir = fs::read_dir(dir).map_err(|e| {
+        PipelineError::Io(format!("Unable to list {}: {e}", dir.display()))
+    })?;
+
+    let mut files = Vec::new();
+    for entry in read_dir {
+        let entry = entry
+            .map_err(|e| PipelineError::Io(format!("Unable to read directory entry in {}: {e}", dir.display())))?;
+        let path = entry.path();
+        if path.is_file() && has_bcf_extension(&path) {
+            files.push(path);
+        }
+    }
+
+    if files.is_empty() {
+        return Err(PipelineError::Io(format!(
+            "No .bcf files found in directory {}",
+            dir.display()
+        )));
+    }
+
+    Ok(files)
+}
+
+fn open_local_bcf_reader(path: &Path) -> Result<PreparedBcfReader, PipelineError> {
+    let mut file = File::open(path)
+        .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| PipelineError::Io(format!("Metadata for {}: {e}", path.display())))?;
+    let len = metadata.len();
+
+    let mut magic = [0u8; 2];
+    let bytes_read = file
+        .read(&mut magic)
+        .map_err(|e| PipelineError::Io(format!("Reading {}: {e}", path.display())))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| PipelineError::Io(format!("Seeking {}: {e}", path.display())))?;
+
+    let reader: Box<dyn Read + Send> = if bytes_read == 2 && is_gzip_magic(&magic) {
+        Box::new(MultiGzDecoder::new(BufReader::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    Ok(PreparedBcfReader { reader, len })
+}
+
+fn is_gzip_magic(magic: &[u8; 2]) -> bool {
+    magic[0] == 0x1F && magic[1] == 0x8B
 }
 
 fn parse_gcs_uri(uri: &str) -> Result<(String, String), PipelineError> {
@@ -193,6 +374,173 @@ fn parse_gcs_uri(uri: &str) -> Result<(String, String), PipelineError> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| PipelineError::Io(format!("Malformed GCS URI '{uri}': missing object")))?;
     Ok((bucket.to_string(), object.to_string()))
+}
+
+fn normalize_gcs_prefix(object: &str) -> String {
+    if object.is_empty() {
+        String::new()
+    } else if object.ends_with('/') {
+        object.to_string()
+    } else {
+        format!("{object}/")
+    }
+}
+
+fn is_not_found_error(err: &PipelineError) -> bool {
+    match err {
+        PipelineError::Io(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("not found") || lower.contains("no such object") || lower.contains("404")
+        }
+        _ => false,
+    }
+}
+
+fn convert_list_error(
+    bucket: &str,
+    prefix: &str,
+    user_project: Option<String>,
+    err: google_cloud_storage::Error,
+) -> PipelineError {
+    let location = if prefix.is_empty() {
+        format!("gs://{bucket}")
+    } else {
+        format!("gs://{bucket}/{prefix}")
+    };
+    let msg = err.to_string();
+    if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
+        PipelineError::Io(format!(
+            "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`). Original error while listing {location}: {msg}"
+        ))
+    } else {
+        PipelineError::Io(format!(
+            "Failed to list BCF objects under {location}: {msg}"
+        ))
+    }
+}
+
+fn fetch_bcf_object_names(
+    runtime: &Arc<Runtime>,
+    control: &StorageControl,
+    bucket_path: &str,
+    prefix: &str,
+) -> Result<Vec<String>, google_cloud_storage::Error> {
+    let mut page_token: Option<String> = None;
+    let mut names = Vec::new();
+    loop {
+        let mut request = control
+            .list_objects()
+            .set_parent(bucket_path.to_string())
+            .set_prefix(prefix.to_string());
+        if let Some(token) = page_token.take() {
+            request = request.set_page_token(token);
+        }
+        let response = runtime.block_on(request.send())?;
+        names.extend(
+            response
+                .objects
+                .into_iter()
+                .filter(|o| !o.name.ends_with('/'))
+                .filter(|o| o
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .map(|ext| ext.eq_ignore_ascii_case("bcf"))
+                    .unwrap_or(false))
+                .map(|o| o.name),
+        );
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        page_token = Some(response.next_page_token);
+    }
+    Ok(names)
+}
+
+fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
+    let runtime = get_shared_runtime()?;
+    let (_storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let bucket_path = format!("projects/_/buckets/{bucket}");
+    let user_project = gcs_billing_project_from_env();
+
+    let attempt = |control: &StorageControl| fetch_bcf_object_names(&runtime, control, &bucket_path, prefix);
+
+    match attempt(&control) {
+        Ok(names) => Ok(names),
+        Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
+            let (_fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
+                &runtime,
+                Some(AnonymousCredentials::new().build()),
+            )?;
+            attempt(&fallback_control).map_err(|retry_err| {
+                convert_list_error(bucket, prefix, user_project.clone(), retry_err)
+            })
+        }
+        Err(err) => Err(convert_list_error(bucket, prefix, user_project, err)),
+    }
+}
+
+fn open_remote_bcf_prefix(
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<PreparedBcfReader>, PipelineError> {
+    let mut objects = list_remote_bcf_objects(bucket, prefix)?;
+    if objects.is_empty() {
+        let location = if prefix.is_empty() {
+            format!("gs://{bucket}")
+        } else {
+            format!("gs://{bucket}/{prefix}")
+        };
+        return Err(PipelineError::Io(format!(
+            "No .bcf objects found under {location}"
+        )));
+    }
+
+    objects.sort_by(|a, b| compare(a, b));
+
+    let mut readers = Vec::with_capacity(objects.len());
+    for object in objects {
+        let source = RemoteByteRangeSource::new(bucket, &object)?;
+        readers.push(prepare_remote_bcf_reader(bucket, &object, source)?);
+    }
+
+    Ok(readers)
+}
+
+fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+    let uri = path
+        .to_str()
+        .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+    let normalized = if uri.ends_with("/*") {
+        &uri[..uri.len() - 1]
+    } else {
+        uri
+    };
+    let (bucket, object) = parse_gcs_uri(normalized)?;
+    let lower = object.to_lowercase();
+    let treat_as_directory = normalized.ends_with('/') || object.is_empty() || !lower.ends_with(".bcf");
+
+    if !treat_as_directory {
+        match RemoteByteRangeSource::new(&bucket, &object) {
+            Ok(source) => {
+                let reader = prepare_remote_bcf_reader(&bucket, &object, source)?;
+                return BcfSource::from_readers(vec![reader]);
+            }
+            Err(err) => {
+                if is_not_found_error(&err) {
+                    let prefix = normalize_gcs_prefix(&object);
+                    let readers = open_remote_bcf_prefix(&bucket, &prefix)?;
+                    return BcfSource::from_readers(readers);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    let prefix = normalize_gcs_prefix(&object);
+    let readers = open_remote_bcf_prefix(&bucket, &prefix)?;
+    BcfSource::from_readers(readers)
 }
 
 struct MmapByteRangeSource {
@@ -651,6 +999,129 @@ impl ByteRangeSource for RemoteByteRangeSource {
 
         Ok(())
     }
+}
+
+struct RemoteStreamingReader {
+    path_display: String,
+    source: Arc<RemoteByteRangeSource>,
+    offset: u64,
+    len: u64,
+    buffer: Vec<u8>,
+    cursor: usize,
+    valid: usize,
+}
+
+impl RemoteStreamingReader {
+    fn new(path_display: String, source: Arc<RemoteByteRangeSource>) -> Self {
+        let len = source.len();
+        Self {
+            path_display,
+            source,
+            offset: 0,
+            len,
+            buffer: Vec::with_capacity(REMOTE_BLOCK_SIZE),
+            cursor: 0,
+            valid: 0,
+        }
+    }
+
+    fn ensure_buffer(&mut self) -> Result<bool, PipelineError> {
+        if self.cursor < self.valid {
+            return Ok(true);
+        }
+        if self.offset >= self.len {
+            return Ok(false);
+        }
+
+        let remaining = self.len - self.offset;
+        let to_read = remaining.min(REMOTE_BLOCK_SIZE as u64) as usize;
+        if self.buffer.len() < to_read {
+            self.buffer.resize(to_read, 0);
+        }
+
+        self.source
+            .read_at(self.offset, &mut self.buffer[..to_read])
+            .map_err(|e| augment_pipeline_error(e, &self.path_display))?;
+        self.offset += to_read as u64;
+        self.cursor = 0;
+        self.valid = to_read;
+        Ok(true)
+    }
+
+    fn peek_gzip_magic(&mut self) -> Result<bool, PipelineError> {
+        if self.valid.saturating_sub(self.cursor) < 2 {
+            while self.valid.saturating_sub(self.cursor) < 2 {
+                if !self.ensure_buffer()? {
+                    break;
+                }
+                if self.valid.saturating_sub(self.cursor) >= 2 {
+                    break;
+                }
+            }
+        }
+
+        if self.valid.saturating_sub(self.cursor) >= 2 {
+            Ok(self.buffer[self.cursor] == 0x1F && self.buffer[self.cursor + 1] == 0x8B)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+impl Read for RemoteStreamingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0;
+        while total < buf.len() {
+            if self.cursor >= self.valid {
+                if !self
+                    .ensure_buffer()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                {
+                    break;
+                }
+                if self.cursor >= self.valid {
+                    continue;
+                }
+            }
+
+            let available = self.valid - self.cursor;
+            let to_copy = available.min(buf.len() - total);
+            if to_copy == 0 {
+                break;
+            }
+
+            buf[total..total + to_copy]
+                .copy_from_slice(&self.buffer[self.cursor..self.cursor + to_copy]);
+            self.cursor += to_copy;
+            total += to_copy;
+        }
+
+        Ok(total)
+    }
+}
+
+fn prepare_remote_bcf_reader(
+    bucket: &str,
+    object: &str,
+    source: RemoteByteRangeSource,
+) -> Result<PreparedBcfReader, PipelineError> {
+    let len = source.len();
+    let source = Arc::new(source);
+    let mut reader = RemoteStreamingReader::new(
+        format!("gs://{bucket}/{object}"),
+        Arc::clone(&source),
+    );
+    let is_gzip = reader.peek_gzip_magic()?;
+    let reader: Box<dyn Read + Send> = if is_gzip {
+        Box::new(MultiGzDecoder::new(reader))
+    } else {
+        Box::new(reader)
+    };
+    Ok(PreparedBcfReader { reader, len })
 }
 
 struct RemoteCache {
