@@ -195,9 +195,9 @@ impl HweScaler {
 
     pub(crate) fn standardize_block_with_mask(
         &self,
-        mut block: MatMut<'_, f64>,
+        block: MatMut<'_, f64>,
         variant_range: Range<usize>,
-        mut presence_out: MatMut<'_, f64>,
+        presence_out: MatMut<'_, f64>,
     ) {
         let start = variant_range.start;
         let end = variant_range.end;
@@ -210,7 +210,7 @@ impl HweScaler {
 
         let block_ref = block.as_ref();
 
-        for (mut presence_col, column) in presence_out
+        for (presence_col, column) in presence_out
             .subcols_mut(0, filled)
             .col_iter_mut()
             .zip(block_ref.subcols(0, filled).col_iter())
