@@ -1,5 +1,6 @@
 use core::cmp::min;
 use core::fmt;
+use core::simd::{LaneCount, Simd, StdFloat, SupportedLaneCount};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
 use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
@@ -159,22 +160,16 @@ impl HweScaler {
         let mut block = block.subcols_mut(0, filled);
 
         let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
+            if inv == 0.0 {
+                column.fill(0.0);
+                return;
+            }
+
             let mut contiguous = column
                 .try_as_col_major_mut()
                 .expect("projection block column must be contiguous");
             let values = contiguous.as_slice_mut();
-            if inv == 0.0 {
-                values.fill(0.0);
-            } else {
-                for value in values {
-                    let raw = *value;
-                    *value = if raw.is_finite() {
-                        (raw - mean) * inv
-                    } else {
-                        0.0
-                    };
-                }
-            }
+            standardize_column_simd(values, mean, inv);
         };
 
         if filled >= 32 && rayon::current_num_threads() > 1 {
@@ -199,6 +194,62 @@ impl HweScaler {
                 apply_standardization(column, mean, inv);
             }
         }
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+const STANDARDIZATION_SIMD_LANES: usize = 8;
+
+#[cfg(all(
+    not(target_feature = "avx512f"),
+    any(
+        target_feature = "avx",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    )
+))]
+const STANDARDIZATION_SIMD_LANES: usize = 4;
+
+#[cfg(all(
+    not(target_feature = "avx512f"),
+    not(any(
+        target_feature = "avx",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    ))
+))]
+const STANDARDIZATION_SIMD_LANES: usize = 2;
+
+#[inline(always)]
+fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
+    standardize_column_simd_impl::<STANDARDIZATION_SIMD_LANES>(values, mean, inv);
+}
+
+#[inline(always)]
+fn standardize_column_simd_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
+where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let mean_simd = Simd::<f64, LANES>::splat(mean);
+    let inv_simd = Simd::<f64, LANES>::splat(inv);
+    let zero = Simd::<f64, LANES>::splat(0.0);
+
+    let (chunks, remainder) = values.as_chunks_mut::<LANES>();
+    for chunk in chunks {
+        let lane = Simd::<f64, LANES>::from_slice(chunk);
+        let mask = lane.is_finite();
+        let standardized = (lane - mean_simd) * inv_simd;
+        let result = mask.select(standardized, zero);
+        result.write_to_slice(chunk);
+    }
+
+    for value in remainder {
+        let raw = *value;
+        *value = if raw.is_finite() {
+            (raw - mean) * inv
+        } else {
+            0.0
+        };
     }
 }
 
