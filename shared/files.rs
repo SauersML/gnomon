@@ -1,5 +1,4 @@
 use crate::score::pipeline::PipelineError;
-use flate2::read::MultiGzDecoder;
 use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
@@ -168,10 +167,17 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BcfCompression {
+    Plain,
+    Bgzf,
+}
+
 struct PreparedBcfReader {
     reader: Box<dyn Read + Send>,
     len: u64,
     skip_header: bool,
+    compression: BcfCompression,
 }
 
 /// Provides sequential access to one or more BCF streams. The data is
@@ -180,6 +186,7 @@ pub struct BcfSource {
     readers: VecDeque<PreparedBcfReader>,
     current: Option<Box<dyn Read + Send>>,
     total_len: Option<u64>,
+    compression: BcfCompression,
 }
 
 impl BcfSource {
@@ -187,6 +194,20 @@ impl BcfSource {
         if readers.is_empty() {
             return Err(PipelineError::Io(
                 "No BCF files were discovered for the requested input".to_string(),
+            ));
+        }
+
+        let compression = readers
+            .first()
+            .map(|reader| reader.compression)
+            .ok_or_else(|| PipelineError::Io("Missing BCF reader compression".to_string()))?;
+
+        if readers
+            .iter()
+            .any(|reader| reader.compression != compression)
+        {
+            return Err(PipelineError::Io(
+                "Mixed BCF compression modes detected; expected all BGZF or all plain".to_string(),
             ));
         }
 
@@ -206,6 +227,7 @@ impl BcfSource {
             readers: queue,
             current: None,
             total_len: Some(total_len),
+            compression,
         })
     }
 
@@ -240,7 +262,7 @@ impl BcfSource {
 
             let mut reader = prepared.reader;
             if prepared.skip_header {
-                skip_bcf_header(reader.as_mut())?;
+                skip_bcf_header(reader.as_mut(), prepared.compression)?;
                 self.total_len = None;
             }
 
@@ -256,6 +278,10 @@ impl BcfSource {
         self.total_len
     }
 
+    pub fn compression(&self) -> BcfCompression {
+        self.compression
+    }
+
     /// Reads decompressed bytes from the concatenated BCF streams into `buf`.
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, PipelineError> {
         self.read_internal(buf)
@@ -269,8 +295,9 @@ impl Read for BcfSource {
     }
 }
 
-fn skip_bcf_header(reader: &mut dyn Read) -> io::Result<u64> {
+fn skip_bcf_header(reader: &mut dyn Read, compression: BcfCompression) -> io::Result<u64> {
     use noodles_bcf::io::Reader as BcfReader;
+    use noodles_bgzf::io::Reader as BgzfReader;
 
     struct CountingReader<'a> {
         inner: &'a mut dyn Read,
@@ -296,10 +323,26 @@ fn skip_bcf_header(reader: &mut dyn Read) -> io::Result<u64> {
     }
 
     let counting_reader = CountingReader::new(reader);
-    let mut bcf_reader = BcfReader::from(counting_reader);
-    bcf_reader.read_header()?;
-    let counting_reader = bcf_reader.into_inner();
-    let (_, consumed) = counting_reader.into_inner();
+
+    let consumed = match compression {
+        BcfCompression::Plain => {
+            let mut bcf_reader = BcfReader::from(counting_reader);
+            bcf_reader.read_header()?;
+            let counting_reader = bcf_reader.into_inner();
+            let (_, consumed) = counting_reader.into_inner();
+            consumed
+        }
+        BcfCompression::Bgzf => {
+            let bgzf_reader = BgzfReader::new(counting_reader);
+            let mut bcf_reader = BcfReader::from(bgzf_reader);
+            bcf_reader.read_header()?;
+            let bgzf_reader = bcf_reader.into_inner();
+            let counting_reader = bgzf_reader.into_inner();
+            let (_, consumed) = counting_reader.into_inner();
+            consumed
+        }
+    };
+
     Ok(consumed)
 }
 
@@ -413,16 +456,19 @@ fn open_local_bcf_reader(path: &Path) -> Result<PreparedBcfReader, PipelineError
     file.seek(SeekFrom::Start(0))
         .map_err(|e| PipelineError::Io(format!("Seeking {}: {e}", path.display())))?;
 
-    let reader: Box<dyn Read + Send> = if bytes_read == 2 && is_gzip_magic(&magic) {
-        Box::new(MultiGzDecoder::new(BufReader::new(file)))
+    let compression = if bytes_read == 2 && is_gzip_magic(&magic) {
+        BcfCompression::Bgzf
     } else {
-        Box::new(BufReader::new(file))
+        BcfCompression::Plain
     };
+
+    let reader: Box<dyn Read + Send> = Box::new(BufReader::new(file));
 
     Ok(PreparedBcfReader {
         reader,
         len,
         skip_header: false,
+        compression,
     })
 }
 
@@ -1185,15 +1231,17 @@ fn prepare_remote_bcf_reader(
     let mut reader =
         RemoteStreamingReader::new(format!("gs://{bucket}/{object}"), Arc::clone(&source));
     let is_gzip = reader.peek_gzip_magic()?;
-    let reader: Box<dyn Read + Send> = if is_gzip {
-        Box::new(MultiGzDecoder::new(reader))
+    let compression = if is_gzip {
+        BcfCompression::Bgzf
     } else {
-        Box::new(reader)
+        BcfCompression::Plain
     };
+    let reader: Box<dyn Read + Send> = Box::new(reader);
     Ok(PreparedBcfReader {
         reader,
         len,
         skip_header: false,
+        compression,
     })
 }
 

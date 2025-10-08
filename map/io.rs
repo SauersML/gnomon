@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::sync::{Arc, OnceLock};
@@ -11,9 +11,11 @@ use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
+    BcfCompression, BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source,
+    open_text_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
+use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::{
     self as vcf,
     variant::RecordBuf,
@@ -26,6 +28,8 @@ use noodles_vcf::{
 use thiserror::Error;
 
 const PLINK_HEADER_LEN: u64 = 3;
+
+type DynBcfReader = BcfReader<Box<dyn Read + Send>>;
 
 #[derive(Debug, Error)]
 pub enum PlinkIoError {
@@ -705,8 +709,14 @@ impl BcfDataset {
         let input_path = path.to_path_buf();
         let output_hint = compute_output_hint(path);
 
-        let mut reader = create_bcf_reader(&input_path)?;
-        let header = Arc::new(reader.read_header()?);
+        let (mut reader, compression) = create_bcf_reader(&input_path).map_err(|err| {
+            print_bcf_diagnostics(&input_path, None, "initializing BCF reader", &err);
+            err
+        })?;
+        let header = Arc::new(reader.read_header().map_err(|err| {
+            print_bcf_diagnostics(&input_path, Some(compression), "reading BCF header", &err);
+            err
+        })?);
         let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
         if sample_names.is_empty() {
             return Err(BcfIoError::MissingSamples);
@@ -726,7 +736,17 @@ impl BcfDataset {
         let mut record = RecordBuf::default();
         let mut n_variants = 0usize;
         loop {
-            let bytes = reader.read_record_buf(header.as_ref(), &mut record)?;
+            let bytes = reader
+                .read_record_buf(header.as_ref(), &mut record)
+                .map_err(|err| {
+                    print_bcf_diagnostics(
+                        &input_path,
+                        Some(compression),
+                        "scanning BCF records to count variants",
+                        &err,
+                    );
+                    err
+                })?;
             if bytes == 0 {
                 break;
             }
@@ -791,7 +811,8 @@ impl BcfDataset {
 pub struct BcfVariantBlockSource {
     path: PathBuf,
     header: Arc<vcf::Header>,
-    reader: BcfReader<BcfSource>,
+    reader: DynBcfReader,
+    compression: BcfCompression,
     record: RecordBuf,
     n_samples: usize,
     n_variants: usize,
@@ -805,6 +826,7 @@ impl std::fmt::Debug for BcfVariantBlockSource {
             .field("n_samples", &self.n_samples)
             .field("n_variants", &self.n_variants)
             .field("emitted", &self.emitted)
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -816,13 +838,23 @@ impl BcfVariantBlockSource {
         n_samples: usize,
         n_variants: usize,
     ) -> Result<Self, BcfIoError> {
-        let mut reader = create_bcf_reader(&path)?;
-        let reopened = reader.read_header()?;
-        verify_header(&reopened, header.as_ref())?;
+        let (mut reader, compression) = create_bcf_reader(&path).map_err(|err| {
+            print_bcf_diagnostics(&path, None, "initializing BCF reader", &err);
+            err
+        })?;
+        let reopened = reader.read_header().map_err(|err| {
+            print_bcf_diagnostics(&path, Some(compression), "reading BCF header", &err);
+            err
+        })?;
+        verify_header(&reopened, header.as_ref()).map_err(|err| {
+            print_bcf_diagnostics(&path, Some(compression), "verifying BCF header", &err);
+            err
+        })?;
         Ok(Self {
             path,
             header,
             reader,
+            compression,
             record: RecordBuf::default(),
             n_samples,
             n_variants,
@@ -831,10 +863,30 @@ impl BcfVariantBlockSource {
     }
 
     fn reopen(&mut self) -> Result<(), BcfIoError> {
-        let mut reader = create_bcf_reader(&self.path)?;
-        let header = reader.read_header()?;
-        verify_header(&header, self.header.as_ref())?;
+        let (mut reader, compression) = create_bcf_reader(&self.path).map_err(|err| {
+            print_bcf_diagnostics(&self.path, None, "reinitializing BCF reader", &err);
+            err
+        })?;
+        let header = reader.read_header().map_err(|err| {
+            print_bcf_diagnostics(
+                &self.path,
+                Some(compression),
+                "reading BCF header on reopen",
+                &err,
+            );
+            err
+        })?;
+        verify_header(&header, self.header.as_ref()).map_err(|err| {
+            print_bcf_diagnostics(
+                &self.path,
+                Some(compression),
+                "verifying BCF header on reopen",
+                &err,
+            );
+            err
+        })?;
         self.reader = reader;
+        self.compression = compression;
         self.record = RecordBuf::default();
         self.emitted = 0;
         Ok(())
@@ -874,7 +926,16 @@ impl VariantBlockSource for BcfVariantBlockSource {
         while filled < target {
             let bytes = self
                 .reader
-                .read_record_buf(self.header.as_ref(), &mut self.record)?;
+                .read_record_buf(self.header.as_ref(), &mut self.record)
+                .map_err(|err| {
+                    print_bcf_diagnostics(
+                        &self.path,
+                        Some(self.compression),
+                        "reading BCF record block",
+                        &err,
+                    );
+                    err
+                })?;
             if bytes == 0 {
                 break;
             }
@@ -934,9 +995,51 @@ fn compute_output_hint(path: &Path) -> OutputHint {
     }
 }
 
-fn create_bcf_reader(path: &Path) -> Result<BcfReader<BcfSource>, BcfIoError> {
+fn create_bcf_reader(path: &Path) -> Result<(DynBcfReader, BcfCompression), BcfIoError> {
     let source = open_bcf_source(path)?;
-    Ok(BcfReader::from(source))
+    let compression = source.compression();
+    let reader: Box<dyn Read + Send> = match compression {
+        BcfCompression::Plain => Box::new(source),
+        BcfCompression::Bgzf => Box::new(BgzfReader::new(source)),
+    };
+    Ok((BcfReader::from(reader), compression))
+}
+
+fn print_bcf_diagnostics(
+    path: &Path,
+    compression: Option<BcfCompression>,
+    stage: &str,
+    err: &(dyn std::error::Error + '_),
+) {
+    let location = if is_remote_path(path) {
+        "remote (GCS)"
+    } else if path.is_dir() {
+        "local directory"
+    } else {
+        "local file"
+    };
+
+    eprintln!("BCF diagnostics:");
+    eprintln!("  • Path        : {}", path.display());
+    eprintln!("  • Location    : {location}");
+    match compression {
+        Some(mode) => eprintln!("  • Compression : {:?}", mode),
+        None => eprintln!("  • Compression : unknown (detected before reader initialization)"),
+    }
+    eprintln!("  • Stage       : {stage}");
+    eprintln!("  • Underlying error: {err}");
+
+    if let Some(BcfCompression::Bgzf) = compression {
+        if err
+            .to_string()
+            .to_lowercase()
+            .contains("invalid bgzf header")
+        {
+            eprintln!(
+                "  • Hint        : The BGZF stream appears corrupt or truncated; ensure the source is a complete BGZF-compressed .bcf file."
+            );
+        }
+    }
 }
 
 fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {
