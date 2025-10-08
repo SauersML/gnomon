@@ -1,4 +1,5 @@
 pub mod fit;
+pub mod io;
 pub mod main;
 pub mod project;
 
