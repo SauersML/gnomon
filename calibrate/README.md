@@ -36,8 +36,10 @@ stored for prediction-time standard errors.
 Each smooth term is represented with B-spline bases generated in
 [`basis.rs`](basis.rs). Difference penalties of configurable order control the
 wiggliness of the univariate smooths, tensor-product penalties regularize the
-interactions with PCs, and a double-penalty construction (null-space plus
-wiggle penalty) tempers the sex×PGS varying coefficient. These penalties
+interactions with PCs using directional smoothness along the PGS and PC axes
+plus an explicit null⊗null shrinkage, and a wiggle-only penalty tempers the
+sex×PGS varying coefficient while its null space is handled by the purity
+projection. These penalties
 respect the null spaces implied by the ANOVA constraints so that intercepts,
 sex main effects, and other lower-order components remain unpenalized by
 construction.
