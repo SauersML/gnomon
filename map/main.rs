@@ -158,14 +158,53 @@ fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
 
 #[cfg(test)]
 mod tests {
-    use super::fit::HwePcaModel;
-    use super::io::GenotypeDataset;
-    use super::project::ProjectionOptions;
+    use crate::map::fit::HwePcaModel;
+    use crate::map::io::GenotypeDataset;
+    use crate::map::project::ProjectionOptions;
     use std::error::Error;
     use std::path::Path;
+    use std::process::Command;
 
     const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
          hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
+    const HGDP_FULL_DATASET: &str =
+        "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
+
+    #[test]
+    fn cli_fit_and_project_full_hgdp_dataset() -> Result<(), Box<dyn Error>> {
+        let binary = std::env::var("CARGO_BIN_EXE_gnomon")
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        let fit_output = Command::new(&binary)
+            .arg("--fit")
+            .arg(HGDP_FULL_DATASET)
+            .output()
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        assert!(
+            fit_output.status.success(),
+            "`gnomon --fit` failed: status={:?}\nstdout={}\nstderr={}",
+            fit_output.status,
+            String::from_utf8_lossy(&fit_output.stdout),
+            String::from_utf8_lossy(&fit_output.stderr)
+        );
+
+        let project_output = Command::new(&binary)
+            .arg("--project")
+            .arg(HGDP_FULL_DATASET)
+            .output()
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        assert!(
+            project_output.status.success(),
+            "`gnomon --project` failed: status={:?}\nstdout={}\nstderr={}",
+            project_output.status,
+            String::from_utf8_lossy(&project_output.stdout),
+            String::from_utf8_lossy(&project_output.stderr)
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn fit_and_project_full_hgdp_chr20() -> Result<(), Box<dyn Error>> {
