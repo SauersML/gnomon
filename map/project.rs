@@ -1,5 +1,6 @@
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
+use faer::prelude::IntoConst;
 use faer::{Accum, Mat, MatMut};
 use std::error::Error;
 

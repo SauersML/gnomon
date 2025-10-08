@@ -2,6 +2,7 @@ use core::cmp::min;
 use core::fmt;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
+use faer::prelude::IntoConst;
 use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
 use faer::{Unbind, unzip, zip};
 use rayon::prelude::*;
@@ -154,7 +155,7 @@ impl HweScaler {
         let filled = freqs.len();
 
         debug_assert_eq!(filled, block.ncols());
-        let mut block = block.subcols_mut(0, filled);
+        let block = block.subcols_mut(0, filled);
 
         let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
             if inv == 0.0 {

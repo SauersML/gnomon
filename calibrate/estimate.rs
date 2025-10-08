@@ -1061,6 +1061,7 @@ pub fn train_model(
             penalty_order_dist: base_penalty_order,
             distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
+            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function),
         };
 
         // Build design and penalties for calibrator
@@ -1224,6 +1225,7 @@ pub struct ExternalOptimOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
+    pub firth: Option<crate::calibrate::calibrator::FirthSpec>,
 }
 
 pub struct ExternalOptimResult {
@@ -8104,6 +8106,7 @@ mod gradient_validation_tests {
             tol: 1e-6,
             max_iter: 100,
             nullspace_dims: vec![0, 0],
+            firth: Some(crate::calibrate::calibrator::FirthSpec::all_enabled()),
         };
 
         // Fit model and extract results for diagnostic purposes
