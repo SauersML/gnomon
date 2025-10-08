@@ -1357,5 +1357,3 @@ mod tests {
         Ok(())
     }
 }
-
-// next test: gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2
