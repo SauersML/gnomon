@@ -26,9 +26,15 @@ impl fmt::Display for FitProgressStage {
 
 /// Observer for reporting incremental progress while fitting a model.
 pub trait FitProgressObserver {
-    fn on_stage_start(&mut self, _stage: FitProgressStage, _total_variants: usize) {}
-    fn on_stage_advance(&mut self, _stage: FitProgressStage, _processed_variants: usize) {}
-    fn on_stage_finish(&mut self, _stage: FitProgressStage) {}
+    fn on_stage_start(&mut self, stage: FitProgressStage, total_variants: usize) {
+        let _ = (stage, total_variants);
+    }
+    fn on_stage_advance(&mut self, stage: FitProgressStage, processed_variants: usize) {
+        let _ = (stage, processed_variants);
+    }
+    fn on_stage_finish(&mut self, stage: FitProgressStage) {
+        let _ = stage;
+    }
 }
 
 #[derive(Default)]
@@ -58,9 +64,15 @@ impl fmt::Display for ProjectionProgressStage {
 
 /// Observer for reporting incremental progress during projection.
 pub trait ProjectionProgressObserver {
-    fn on_stage_start(&mut self, _stage: ProjectionProgressStage, _total_variants: usize) {}
-    fn on_stage_advance(&mut self, _stage: ProjectionProgressStage, _processed_variants: usize) {}
-    fn on_stage_finish(&mut self, _stage: ProjectionProgressStage) {}
+    fn on_stage_start(&mut self, stage: ProjectionProgressStage, total_variants: usize) {
+        let _ = (stage, total_variants);
+    }
+    fn on_stage_advance(&mut self, stage: ProjectionProgressStage, processed_variants: usize) {
+        let _ = (stage, processed_variants);
+    }
+    fn on_stage_finish(&mut self, stage: ProjectionProgressStage) {
+        let _ = stage;
+    }
 }
 
 #[derive(Default)]

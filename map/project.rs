@@ -145,27 +145,6 @@ impl<'model> HwePcaProjector<'model> {
         self.project_into_with_options_and_progress(source, scores, &options, None, &mut progress)
     }
 
-    fn project_into_with_options<S>(
-        &self,
-        source: &mut S,
-        mut scores: MatMut<'_, f64>,
-        opts: &ProjectionOptions,
-        mut alignment_out: Option<MatMut<'_, f64>>,
-    ) -> Result<(), HwePcaError>
-    where
-        S: VariantBlockSource,
-        S::Error: Error + Send + Sync + 'static,
-    {
-        let mut progress = NoopProjectionProgress::default();
-        self.project_into_with_options_and_progress(
-            source,
-            scores,
-            opts,
-            alignment_out,
-            &mut progress,
-        )
-    }
-
     fn project_into_with_options_and_progress<S, P>(
         &self,
         source: &mut S,
