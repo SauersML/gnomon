@@ -1,6 +1,5 @@
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::prelude::IntoConst;
 use faer::{Accum, Mat, MatMut};
 use std::error::Error;
 
@@ -34,9 +33,9 @@ pub struct ProjectionOptions {
 impl Default for ProjectionOptions {
     fn default() -> Self {
         Self {
-            missing_axis_renormalization: false,
+            missing_axis_renormalization: true,
             return_alignment: false,
-            on_zero_alignment: ZeroAlignmentAction::Zero,
+            on_zero_alignment: ZeroAlignmentAction::NaN,
         }
     }
 }
@@ -139,6 +138,12 @@ impl<'model> HwePcaProjector<'model> {
         let n_samples = source.n_samples();
         let n_variants = source.n_variants();
         let components = self.model.components();
+
+        if opts.return_alignment && !opts.missing_axis_renormalization {
+            return Err(HwePcaError::InvalidInput(
+                "Alignment output requires missing axis renormalization",
+            ));
+        }
 
         if n_samples == 0 {
             return Err(HwePcaError::InvalidInput(
@@ -341,8 +346,11 @@ impl<'model> HwePcaProjector<'model> {
                     }
                 }
             }
-        } else if let Some(alignment_mat) = alignment_out.as_mut() {
-            alignment_mat.fill(1.0);
+        } else if alignment_out.is_some() {
+            debug_assert!(
+                opts.missing_axis_renormalization,
+                "alignment_out should be None when renormalization is disabled",
+            );
         }
 
         Ok(())
@@ -480,10 +488,16 @@ mod tests {
         set_sample_to_nan(&mut data, 1);
 
         let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
         let raw_scores = model
             .projector()
-            .project(&mut raw_source)
-            .expect("raw projection");
+            .project_with_options(&mut raw_source, &raw_options)
+            .expect("raw projection")
+            .scores;
 
         let mut renorm_source =
             DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
@@ -528,10 +542,16 @@ mod tests {
         set_variant_to_nan(&mut data, dropped_variant);
 
         let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
         let raw_scores = model
             .projector()
-            .project(&mut raw_source)
-            .expect("raw projection");
+            .project_with_options(&mut raw_source, &raw_options)
+            .expect("raw projection")
+            .scores;
 
         let mut renorm_source =
             DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
@@ -568,6 +588,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn alignment_request_without_renormalization_fails() {
+        let model = fit_example_model();
+        let data = sample_data();
+
+        let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
+        let options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+
+        let err = model
+            .projector()
+            .project_with_options(&mut source, &options)
+            .expect_err("alignment without renormalization should fail");
+
+        assert!(matches!(err, HwePcaError::InvalidInput(_)));
     }
     struct ChunkedBlockSource<'a> {
         data: &'a [f64],
