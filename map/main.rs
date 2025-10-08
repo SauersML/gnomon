@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use super::fit::{HwePcaError, HwePcaModel};
 use super::io::{
-    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
-    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
+    load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
+    save_sample_manifest, DatasetOutputError, GenotypeDataset, GenotypeIoError,
+    ProjectionOutputPaths,
 };
 use super::project::ProjectionOptions;
 
@@ -162,18 +163,84 @@ mod tests {
     use crate::map::io::GenotypeDataset;
     use crate::map::project::ProjectionOptions;
     use std::error::Error;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
+    const HGDP_CHR20_BCF: &str =
+        "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
          hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
     const HGDP_FULL_DATASET: &str =
         "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
 
+    fn gnomon_binary_path() -> Result<PathBuf, Box<dyn Error>> {
+        use std::env;
+
+        let current_exe = env::current_exe()?;
+        let binary_dir = current_exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .ok_or_else(|| "unable to determine cargo target directory")?;
+
+        let binary_name = format!("gnomon{}", env::consts::EXE_SUFFIX);
+        let binary_path = binary_dir.join(&binary_name);
+
+        if binary_path.exists() {
+            return Ok(binary_path);
+        }
+
+        let target_dir = binary_dir
+            .parent()
+            .ok_or_else(|| "unable to determine cargo target directory")?;
+        let workspace_root = target_dir
+            .parent()
+            .ok_or_else(|| "unable to determine workspace root for cargo build")?;
+
+        let profile = binary_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "unable to determine cargo profile")?;
+
+        let mut build_cmd = Command::new("cargo");
+        build_cmd
+            .arg("build")
+            .arg("--bin")
+            .arg("gnomon")
+            .current_dir(workspace_root);
+
+        match profile {
+            "debug" => {}
+            "release" => {
+                build_cmd.arg("--release");
+            }
+            other => {
+                build_cmd.arg("--profile").arg(other);
+            }
+        }
+
+        let output = build_cmd
+            .output()
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "failed to build gnomon binary: status={:?} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        if binary_path.exists() {
+            Ok(binary_path)
+        } else {
+            Err(format!("gnomon binary not found at {}", binary_path.display()).into())
+        }
+    }
+
     #[test]
     fn cli_fit_and_project_full_hgdp_dataset() -> Result<(), Box<dyn Error>> {
-        let binary = std::env::var("CARGO_BIN_EXE_gnomon")
-            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let binary = gnomon_binary_path()?;
 
         let fit_output = Command::new(&binary)
             .arg("--fit")
@@ -226,18 +293,14 @@ mod tests {
         assert_eq!(model.n_variants(), n_variants);
         assert!(model.components() > 0);
         assert_eq!(model.explained_variance().len(), model.components());
-        assert!(
-            model
-                .explained_variance()
-                .iter()
-                .all(|value| value.is_finite() && *value >= 0.0)
-        );
-        assert!(
-            model
-                .singular_values()
-                .iter()
-                .all(|value| value.is_finite() && *value >= 0.0)
-        );
+        assert!(model
+            .explained_variance()
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        assert!(model
+            .singular_values()
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0));
 
         let variance_ratios = model.explained_variance_ratio();
         assert_eq!(variance_ratios.len(), model.components());
