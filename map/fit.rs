@@ -1,3 +1,4 @@
+use super::progress::{FitProgressObserver, FitProgressStage, NoopFitProgress};
 use core::cmp::min;
 use core::fmt;
 use faer::linalg::matmul::matmul;
@@ -308,6 +309,16 @@ impl HwePcaModel {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
+        let mut progress = NoopFitProgress::default();
+        Self::fit_with_progress(source, &mut progress)
+    }
+
+    pub fn fit_with_progress<S, P>(source: &mut S, progress: &mut P) -> Result<Self, HwePcaError>
+    where
+        S: VariantBlockSource,
+        S::Error: Error + Send + Sync + 'static,
+        P: FitProgressObserver,
+    {
         let n_samples = source.n_samples();
         let n_variants = source.n_variants();
 
@@ -325,12 +336,19 @@ impl HwePcaModel {
         let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
         let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
-        let scaler = stream_allele_statistics(source, block_capacity, &mut block_storage)?;
+        let scaler =
+            stream_allele_statistics(source, block_capacity, &mut block_storage, progress)?;
 
         source
             .reset()
             .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-        let gram = accumulate_gram_matrix(source, &scaler, block_capacity, &mut block_storage)?;
+        let gram = accumulate_gram_matrix(
+            source,
+            &scaler,
+            block_capacity,
+            &mut block_storage,
+            progress,
+        )?;
         let decomposition = decompose_gram_matrix(gram)?;
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
@@ -351,6 +369,7 @@ impl HwePcaModel {
             &mut block_storage,
             decomposition.vectors.as_ref(),
             &singular_values,
+            progress,
         )?;
 
         Ok(Self {
@@ -419,20 +438,24 @@ struct Eigenpairs {
     vectors: Mat<f64>,
 }
 
-fn stream_allele_statistics<S>(
+fn stream_allele_statistics<S, P>(
     source: &mut S,
     block_capacity: usize,
     block_storage: &mut [f64],
+    progress: &mut P,
 ) -> Result<HweScaler, HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
     let n_variants = source.n_variants();
     let mut allele_sums = vec![0.0f64; n_variants];
     let mut allele_counts = vec![0usize; n_variants];
     let mut processed = 0usize;
+
+    progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants);
 
     source
         .reset()
@@ -473,6 +496,7 @@ where
         }
 
         processed += filled;
+        progress.on_stage_advance(FitProgressStage::AlleleStatistics, processed);
     }
 
     if processed != n_variants {
@@ -480,6 +504,8 @@ where
             "VariantBlockSource terminated early during allele counting",
         ));
     }
+
+    progress.on_stage_finish(FitProgressStage::AlleleStatistics);
 
     let mut frequencies = vec![0.0f64; n_variants];
     let mut scales = vec![1.0f64; n_variants];
@@ -505,21 +531,25 @@ where
     Ok(HweScaler::new(frequencies, scales))
 }
 
-fn accumulate_gram_matrix<S>(
+fn accumulate_gram_matrix<S, P>(
     source: &mut S,
     scaler: &HweScaler,
     block_capacity: usize,
     block_storage: &mut [f64],
+    progress: &mut P,
 ) -> Result<Mat<f64>, HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
     let n_variants = source.n_variants();
     let mut gram = Mat::zeros(n_samples, n_samples);
     let mut processed = 0usize;
     let scale = 1.0 / ((n_samples - 1) as f64);
+
+    progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
 
     loop {
         let filled = source
@@ -553,6 +583,7 @@ where
         );
 
         processed += filled;
+        progress.on_stage_advance(FitProgressStage::GramMatrix, processed);
     }
 
     if processed != n_variants {
@@ -560,6 +591,8 @@ where
             "VariantBlockSource terminated early during Gram accumulation",
         ));
     }
+
+    progress.on_stage_finish(FitProgressStage::GramMatrix);
 
     Ok(gram)
 }
@@ -618,17 +651,19 @@ fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64
     (singular_values, sample_scores)
 }
 
-fn compute_variant_loadings<S>(
+fn compute_variant_loadings<S, P>(
     source: &mut S,
     scaler: &HweScaler,
     block_capacity: usize,
     block_storage: &mut [f64],
     sample_basis: MatRef<'_, f64>,
     singular_values: &[f64],
+    progress: &mut P,
 ) -> Result<Mat<f64>, HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
     let n_variants = source.n_variants();
@@ -640,6 +675,8 @@ where
         .iter()
         .map(|&sigma| if sigma > 0.0 { 1.0 / sigma } else { 0.0 })
         .collect();
+
+    progress.on_stage_start(FitProgressStage::Loadings, n_variants);
 
     loop {
         let filled = source
@@ -687,6 +724,7 @@ where
         }
 
         processed += filled;
+        progress.on_stage_advance(FitProgressStage::Loadings, processed);
     }
 
     if processed != n_variants {
@@ -694,6 +732,8 @@ where
             "VariantBlockSource terminated early while computing loadings",
         ));
     }
+
+    progress.on_stage_finish(FitProgressStage::Loadings);
 
     Ok(loadings)
 }
