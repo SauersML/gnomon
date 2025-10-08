@@ -12,6 +12,7 @@ on:
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
+      - 'map/**'
       - 'map/**/*.rs'
       - 'map/*.rs'
   pull_request:
@@ -23,6 +24,7 @@ on:
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
+      - 'map/**'
       - 'map/**/*.rs'
       - 'map/*.rs'
 
@@ -102,13 +104,13 @@ jobs:
 
       - name: Run Rust unit tests
         id: test_step
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: steps.rust_changes.outputs.rust == 'true' && steps.rust_changes.outputs.map != 'true'
         run: cargo +nightly test --release -- --show-output
         continue-on-error: true
 
       - name: Run map-specific tests
         if: steps.rust_changes.outputs.map == 'true'
-        run: cargo +nightly test --release map::
+        run: cargo +nightly test --release map:: -- --show-output
 
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
