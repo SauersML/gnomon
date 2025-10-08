@@ -27,6 +27,27 @@ pub struct CalibratorFeatures {
 }
 
 /// Configuration of the calibrator smooths and penalties
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FirthScope {
+    All,
+    BackboneOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirthSpec {
+    pub enabled: bool,
+    pub scope: FirthScope,
+}
+
+impl FirthSpec {
+    pub fn all_enabled() -> Self {
+        Self {
+            enabled: true,
+            scope: FirthScope::All,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalibratorSpec {
     pub link: LinkFunction,
@@ -40,6 +61,17 @@ pub struct CalibratorSpec {
     /// Optional training weights to use for STZ constraint and fitting
     /// If not provided, uniform weights (1.0) will be used
     pub prior_weights: Option<Array1<f64>>,
+    #[serde(default)]
+    pub firth: Option<FirthSpec>,
+}
+
+impl CalibratorSpec {
+    pub fn firth_default_for_link(link: LinkFunction) -> Option<FirthSpec> {
+        match link {
+            LinkFunction::Logit => Some(FirthSpec::all_enabled()),
+            LinkFunction::Identity => None,
+        }
+    }
 }
 
 /// Schema and parameters needed to rebuild the calibrator design at inference
@@ -1794,11 +1826,28 @@ pub fn fit_calibrator(
         )));
     }
 
+    let firth = CalibratorSpec::firth_default_for_link(link);
+    if matches!(link, LinkFunction::Logit) {
+        if let Some(ref firth_spec) = firth {
+            if firth_spec.enabled {
+                eprintln!(
+                    "[CAL] Firth penalization active for calibrator fit (scope={:?})",
+                    firth_spec.scope
+                );
+            } else {
+                eprintln!("[CAL] Firth penalization disabled for calibrator fit");
+            }
+        } else {
+            eprintln!("[CAL] Firth penalization disabled for calibrator fit");
+        }
+    }
+
     let opts = ExternalOptimOptions {
         link,
         max_iter: 75,
         tol: 1e-3,
         nullspace_dims: active_null_dims.clone(),
+        firth,
     };
     eprintln!(
         "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
@@ -3521,6 +3570,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x, _, schema, _) = build_calibrator_design(&features, &spec).unwrap();
@@ -3605,6 +3655,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x, penalties, schema, _) = build_calibrator_design(&features, &spec).unwrap();
@@ -3675,6 +3726,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build the calibrator design
@@ -3766,6 +3818,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         let spec_with_ridge = CalibratorSpec {
@@ -3787,6 +3840,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         // Build designs for both specs
@@ -3946,6 +4000,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -4048,6 +4103,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         // Build design
@@ -4077,6 +4133,7 @@ mod tests {
             max_iter: 50,
             tol: 1e-3_f64,
             nullspace_dims: penalty_nullspace_dims.clone(),
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         // Set uniform weights
@@ -4186,6 +4243,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -4298,6 +4356,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -4449,6 +4508,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -4584,6 +4644,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let ece_improvement_for_amplitude = |amplitude: f64| -> f64 {
@@ -4764,6 +4825,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x_cal, penalties, schema, offset) =
@@ -4919,6 +4981,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -5051,6 +5114,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x_cal, rs_blocks, _, _) = build_calibrator_design(&alo_features, &spec).unwrap();
@@ -5148,6 +5212,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x_cal, penalties, schema, offset) =
@@ -5265,6 +5330,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
@@ -5445,6 +5511,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x_cal, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
@@ -5528,6 +5595,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,                 // Enable distance hinging
             prior_weights: Some(weights.clone()), // Use non-uniform weights
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design and fit calibrator
@@ -5664,6 +5732,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design and fit calibrator
@@ -5883,6 +5952,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design and fit calibrator
@@ -6058,6 +6128,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         let (x_cal, rs_blocks, _, _) = build_calibrator_design(&features, &spec).unwrap();
@@ -6151,6 +6222,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         // Build design and fit calibrator
@@ -6366,6 +6438,7 @@ mod tests {
                 penalty_order_dist: 2,
                 distance_hinge: false,
                 prior_weights: None,
+                firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
             };
 
             // Build design and fit calibrator
@@ -6517,6 +6590,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Time the design matrix construction
@@ -6648,6 +6722,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -6766,6 +6841,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: false,
             prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build design
@@ -7098,6 +7174,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,
             prior_weights: None, // Uniform weights
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Non-uniform weights version
@@ -7128,6 +7205,7 @@ mod tests {
             penalty_order_dist: 2,
             distance_hinge: true,
             prior_weights: Some(weights.clone()), // Non-uniform weights
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
 
         // Build designs and fit models for both weight cases
