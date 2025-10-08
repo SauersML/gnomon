@@ -2,7 +2,6 @@ use core::cmp::min;
 use core::fmt;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
-use faer::prelude::IntoConst;
 use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
 use faer::{Unbind, unzip, zip};
 use rayon::prelude::*;
