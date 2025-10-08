@@ -1,17 +1,30 @@
 use super::progress::{FitProgressObserver, FitProgressStage, NoopFitProgress};
-use core::cmp::min;
+use core::cmp::{Ordering, min};
 use core::fmt;
+use core::marker::PhantomData;
+use dyn_stack::{MemBuffer, MemStack, StackReq};
+use faer::col::Col;
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::SelfAdjointEigen;
-use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
-use faer::{Unbind, unzip, zip};
+use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
+use faer::mat::AsMatMut;
+use faer::matrix_free::LinOp;
+use faer::matrix_free::eigen::{
+    PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+};
+use faer::prelude::ReborrowMut;
+use faer::{
+    Accum, ColMut, Mat, MatMut, MatRef, Par, get_global_parallelism, set_global_parallelism, unzip,
+    zip,
+};
 use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::UnsafeCell;
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 
@@ -19,6 +32,32 @@ pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
+
+struct ParallelismGuard {
+    previous: Par,
+}
+
+impl ParallelismGuard {
+    fn new() -> Self {
+        let previous = get_global_parallelism();
+        let desired = Par::rayon(rayon::current_num_threads());
+        set_global_parallelism(desired);
+        Self { previous }
+    }
+
+    fn active_parallelism(&self) -> Par {
+        get_global_parallelism()
+    }
+}
+
+impl Drop for ParallelismGuard {
+    fn drop(&mut self) {
+        set_global_parallelism(self.previous);
+    }
+}
+
+#[derive(Debug)]
+struct OperatorError;
 
 pub trait VariantBlockSource {
     type Error;
@@ -170,7 +209,11 @@ impl HweScaler {
             standardize_column_simd(values, mean, inv);
         };
 
-        if filled >= 32 && rayon::current_num_threads() > 1 {
+        let use_parallel = filled >= 32
+            && rayon::current_num_threads() > 1
+            && matches!(get_global_parallelism(), Par::Seq);
+
+        if use_parallel {
             block
                 .par_col_iter_mut()
                 .enumerate()
@@ -343,7 +386,7 @@ pub struct HwePcaModel {
 impl HwePcaModel {
     pub fn fit<S>(source: &mut S) -> Result<Self, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
     {
         let mut progress = NoopFitProgress::default();
@@ -352,7 +395,7 @@ impl HwePcaModel {
 
     pub fn fit_with_progress<S, P>(source: &mut S, progress: &mut P) -> Result<Self, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
         P: FitProgressObserver,
     {
@@ -370,23 +413,23 @@ impl HwePcaModel {
             ));
         }
 
+        let parallelism_guard = ParallelismGuard::new();
+        if matches!(parallelism_guard.active_parallelism(), Par::Seq) {}
         let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
         let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
         let scaler =
             stream_allele_statistics(source, block_capacity, &mut block_storage, progress)?;
 
-        source
-            .reset()
-            .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-        let gram = accumulate_gram_matrix(
-            source,
-            &scaler,
-            block_capacity,
-            &mut block_storage,
-            progress,
-        )?;
-        let decomposition = decompose_gram_matrix(gram)?;
+        let operator =
+            StandardizedCovarianceOp::new(source, &scaler, block_capacity, block_storage);
+
+        progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
+        let decomposition_result = compute_covariance_eigenpairs(&operator);
+        let (source, mut block_storage) = operator.into_parts();
+        let decomposition = decomposition_result?;
+        progress.on_stage_finish(FitProgressStage::GramMatrix);
+
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
                 "All eigenvalues are numerically zero; increase cohort size or review input data"
@@ -475,6 +518,313 @@ struct Eigenpairs {
     vectors: Mat<f64>,
 }
 
+struct StandardizedCovarianceOp<'a, S>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    source: *mut S,
+    scaler: &'a HweScaler,
+    block_storage: UnsafeCell<Option<Vec<f64>>>,
+    n_samples: usize,
+    n_variants: usize,
+    block_capacity: usize,
+    scale: f64,
+    error: UnsafeCell<Option<HwePcaError>>,
+    marker: PhantomData<&'a mut S>,
+}
+
+impl<'a, S> StandardizedCovarianceOp<'a, S>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    fn new(
+        source: &'a mut S,
+        scaler: &'a HweScaler,
+        block_capacity: usize,
+        block_storage: Vec<f64>,
+    ) -> Self {
+        let n_samples = source.n_samples();
+        let n_variants = source.n_variants();
+        assert_eq!(
+            block_storage.len(),
+            n_samples * block_capacity,
+            "block storage size must match block capacity",
+        );
+        let scale = 1.0 / ((n_samples - 1) as f64);
+        Self {
+            source: source as *mut S,
+            scaler,
+            block_storage: UnsafeCell::new(Some(block_storage)),
+            n_samples,
+            n_variants,
+            block_capacity,
+            scale,
+            error: UnsafeCell::new(None),
+            marker: PhantomData,
+        }
+    }
+
+    fn into_parts(self) -> (&'a mut S, Vec<f64>) {
+        let source = self.source;
+        let storage = unsafe {
+            (*self.block_storage.get())
+                .take()
+                .expect("block storage already taken")
+        };
+        (unsafe { &mut *source }, storage)
+    }
+
+    fn take_error(&self) -> Option<HwePcaError> {
+        unsafe { (*self.error.get()).take() }
+    }
+
+    fn fail_source(&self, err: S::Error) -> ! {
+        self.record_error(HwePcaError::Source(Box::new(err)))
+    }
+
+    fn fail_invalid(&self, msg: &'static str) -> ! {
+        self.record_error(HwePcaError::InvalidInput(msg))
+    }
+
+    fn record_error(&self, err: HwePcaError) -> ! {
+        let slot = unsafe { &mut *self.error.get() };
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+        std::panic::panic_any(OperatorError);
+    }
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+}
+
+impl<'a, S> fmt::Debug for StandardizedCovarianceOp<'a, S>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StandardizedCovarianceOp")
+            .field("n_samples", &self.n_samples)
+            .field("n_variants", &self.n_variants)
+            .field("block_capacity", &self.block_capacity)
+            .finish()
+    }
+}
+
+unsafe impl<'a, S> Sync for StandardizedCovarianceOp<'a, S>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+}
+
+impl<'a, S> LinOp<f64> for StandardizedCovarianceOp<'a, S>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        match par {
+            Par::Seq => {}
+            _ => {}
+        }
+        temp_mat_scratch::<f64>(self.block_capacity, rhs_ncols)
+    }
+
+    fn nrows(&self) -> usize {
+        self.n_samples
+    }
+
+    fn ncols(&self) -> usize {
+        self.n_samples
+    }
+
+    fn apply(
+        &self,
+        mut out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        match par {
+            Par::Seq => {}
+            _ => {}
+        }
+        debug_assert_eq!(out.nrows(), self.n_samples);
+        debug_assert_eq!(rhs.nrows(), self.n_samples);
+
+        out.fill(0.0);
+
+        if rhs.ncols() == 0 {
+            return;
+        }
+
+        let block_storage_opt = unsafe { &mut *self.block_storage.get() };
+        let block_storage = block_storage_opt
+            .as_mut()
+            .expect("block storage missing during operator application");
+
+        let source = unsafe { &mut *self.source };
+
+        if let Err(err) = source.reset() {
+            self.fail_source(err);
+        }
+
+        let (mut proj_uninit, _) =
+            unsafe { temp_mat_uninit::<f64, _, _>(self.block_capacity, rhs.ncols(), stack) };
+        let mut proj_storage = proj_uninit.as_mat_mut();
+
+        let mut processed = 0usize;
+
+        loop {
+            let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
+                Ok(filled) => filled,
+                Err(err) => self.fail_source(err),
+            };
+
+            if filled == 0 {
+                break;
+            }
+
+            if processed + filled > self.n_variants {
+                self.fail_invalid("VariantBlockSource returned more variants than reported");
+            }
+
+            let block_slice = &mut block_storage[..self.n_samples * filled];
+            let mut block =
+                MatMut::from_column_major_slice_mut(block_slice, self.n_samples, filled);
+            self.scaler
+                .standardize_block(block.as_mut(), processed..processed + filled);
+
+            let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
+
+            matmul(
+                proj_block.as_mut(),
+                Accum::Replace,
+                block.as_ref().transpose(),
+                rhs,
+                1.0,
+                get_global_parallelism(),
+            );
+
+            matmul(
+                out.rb_mut(),
+                Accum::Add,
+                block.as_ref(),
+                proj_block.as_ref(),
+                self.scale,
+                get_global_parallelism(),
+            );
+
+            processed += filled;
+        }
+
+        if processed != self.n_variants {
+            self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
+        }
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        self.apply(out, rhs, par, stack);
+    }
+}
+
+fn compute_covariance_eigenpairs<S>(
+    operator: &StandardizedCovarianceOp<'_, S>,
+) -> Result<Eigenpairs, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let n = operator.n_samples();
+    if n == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(0, 0),
+        });
+    }
+
+    let mut eigvecs = Mat::zeros(n, n);
+    let mut eigvals = vec![0.0f64; n];
+    let v0 = Col::from_fn(n, |idx| if idx == 0 { 1.0 } else { 0.0 });
+
+    let params = PartialEigenParams::default();
+    let par = Par::Seq;
+    let scratch = partial_eigen_scratch(operator, n, par, params);
+    let mut mem = MemBuffer::new(scratch);
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut stack = MemStack::new(&mut mem);
+        partial_self_adjoint_eigen(
+            eigvecs.as_mut(),
+            &mut eigvals,
+            operator,
+            v0.as_ref(),
+            f64::EPSILON * 128.0,
+            par,
+            &mut stack,
+            params,
+        )
+    }));
+
+    let info = match result {
+        Ok(info) => info,
+        Err(payload) => {
+            if payload.downcast_ref::<OperatorError>().is_some() {
+                let err = operator.take_error().unwrap_or_else(|| {
+                    HwePcaError::Eigen(
+                        "matrix-free eigensolver aborted with an internal error".into(),
+                    )
+                });
+                return Err(err);
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+
+    if let Some(err) = operator.take_error() {
+        return Err(err);
+    }
+
+    let n_converged = info.n_converged_eigen.min(n);
+    let mut ordering = Vec::with_capacity(n_converged);
+    for idx in 0..n_converged {
+        let lambda = eigvals[idx];
+        ordering.push((idx, lambda));
+    }
+
+    ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+    let mut values = Vec::new();
+    let mut selected = Vec::new();
+    for (idx, value) in ordering.into_iter() {
+        if value <= EIGENVALUE_EPSILON {
+            break;
+        }
+        values.push(value);
+        selected.push(idx);
+    }
+
+    let mut vectors = Mat::zeros(n, selected.len());
+    for (col_idx, &src) in selected.iter().enumerate() {
+        for row in 0..n {
+            vectors[(row, col_idx)] = eigvecs[(row, src)];
+        }
+    }
+
+    Ok(Eigenpairs { values, vectors })
+}
+
 fn stream_allele_statistics<S, P>(
     source: &mut S,
     block_capacity: usize,
@@ -561,107 +911,6 @@ where
     }
 
     Ok(HweScaler::new(frequencies, scales))
-}
-
-fn accumulate_gram_matrix<S, P>(
-    source: &mut S,
-    scaler: &HweScaler,
-    block_capacity: usize,
-    block_storage: &mut [f64],
-    progress: &mut P,
-) -> Result<Mat<f64>, HwePcaError>
-where
-    S: VariantBlockSource,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver,
-{
-    let n_samples = source.n_samples();
-    let n_variants = source.n_variants();
-    let mut gram = Mat::zeros(n_samples, n_samples);
-    let mut processed = 0usize;
-    let scale = 1.0 / ((n_samples - 1) as f64);
-
-    progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
-
-    loop {
-        let filled = source
-            .next_block_into(block_capacity, block_storage)
-            .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-        if filled == 0 {
-            break;
-        }
-        if processed + filled > n_variants {
-            return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported",
-            ));
-        }
-
-        let mut block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-        scaler.standardize_block(block.as_mut(), processed..processed + filled);
-
-        let block_ref = block.as_ref();
-
-        matmul(
-            gram.as_mut(),
-            Accum::Add,
-            block_ref,
-            block_ref.transpose(),
-            scale,
-            faer::get_global_parallelism(),
-        );
-
-        processed += filled;
-        progress.on_stage_advance(FitProgressStage::GramMatrix, processed);
-    }
-
-    if processed != n_variants {
-        return Err(HwePcaError::InvalidInput(
-            "VariantBlockSource terminated early during Gram accumulation",
-        ));
-    }
-
-    progress.on_stage_finish(FitProgressStage::GramMatrix);
-
-    Ok(gram)
-}
-
-fn decompose_gram_matrix(gram: Mat<f64>) -> Result<Eigenpairs, HwePcaError> {
-    let eig = SelfAdjointEigen::new(gram.as_ref(), Side::Upper)
-        .map_err(|err| HwePcaError::Eigen(format!("{err:?}")))?;
-
-    let mut ordering: Vec<(usize, f64)> = eig
-        .S()
-        .column_vector()
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, value)| (idx, value))
-        .collect();
-    ordering
-        .sort_by(|(_, lhs), (_, rhs)| rhs.partial_cmp(lhs).unwrap_or(core::cmp::Ordering::Equal));
-
-    let mut values = Vec::new();
-    let mut selected = Vec::new();
-    for (idx, value) in ordering.iter().copied() {
-        if value <= EIGENVALUE_EPSILON {
-            break;
-        }
-        values.push(value);
-        selected.push(idx);
-    }
-
-    let vectors = Mat::from_fn(eig.U().nrows(), selected.len(), |row_idx, col_idx| {
-        let row = row_idx.unbound();
-        let component = col_idx.unbound();
-        let src_col = selected[component];
-        eig.U()[(row, src_col)]
-    });
-
-    Ok(Eigenpairs { values, vectors })
 }
 
 fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
