@@ -1,8 +1,8 @@
 use core::cmp::min;
 use core::fmt;
-use core::simd::{LaneCount, Simd, StdFloat, SupportedLaneCount};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
+use faer::prelude::IntoConst;
 use faer::{Accum, ColMut, Mat, MatMut, MatRef, Side};
 use faer::{Unbind, unzip, zip};
 use rayon::prelude::*;
@@ -12,6 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
+use std::simd::num::SimdFloat;
+use std::simd::{LaneCount, Simd, SupportedLaneCount};
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
@@ -147,7 +149,7 @@ impl HweScaler {
 
     pub(crate) fn standardize_block(
         &self,
-        mut block: MatMut<'_, f64>,
+        block: MatMut<'_, f64>,
         variant_range: Range<usize>,
     ) {
         let start = variant_range.start;
@@ -157,7 +159,7 @@ impl HweScaler {
         let filled = freqs.len();
 
         debug_assert_eq!(filled, block.ncols());
-        let mut block = block.subcols_mut(0, filled);
+        let block = block.subcols_mut(0, filled);
 
         let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
             if inv == 0.0 {
@@ -165,7 +167,7 @@ impl HweScaler {
                 return;
             }
 
-            let mut contiguous = column
+            let contiguous = column
                 .try_as_col_major_mut()
                 .expect("projection block column must be contiguous");
             let values = contiguous.as_slice_mut();
@@ -240,7 +242,7 @@ where
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
         let result = mask.select(standardized, zero);
-        result.write_to_slice(chunk);
+        result.copy_to_slice(chunk);
     }
 
     for value in remainder {
