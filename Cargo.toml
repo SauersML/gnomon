@@ -48,7 +48,7 @@ toml = "0.8.23"
 polars = { version = "0.50.0", features = ["csv", "ndarray"] }
 wolfe_bfgs = "0.1.6"
 log = "0.4.27"
-faer = "0.22.6"
+faer = "0.23.2"
 dyn-stack = "0.13"
 noodles-bcf = "0.78.0"
 noodles-vcf = "0.81.0"
