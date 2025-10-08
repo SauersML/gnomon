@@ -3370,17 +3370,25 @@ pub mod internal {
             let mut types = vec![TermType::PcMainEffect; layout.num_penalties];
             for block in &layout.penalty_map {
                 for (component_idx, &pen_idx) in block.penalty_indices.iter().enumerate() {
-                    let label = if block.penalty_indices.len() > 1 {
-                        match block.term_type {
-                            TermType::SexPgsInteraction => match component_idx {
-                                0 => "f(PGS,sex)[PGS]".to_string(),
-                                1 => "f(PGS,sex)[sex]".to_string(),
-                                _ => format!("{}[{}]", block.term_name, component_idx + 1),
-                            },
-                            _ => format!("{}[{}]", block.term_name, component_idx + 1),
+                    let label = match block.term_type {
+                        TermType::SexPgsInteraction => "f(PGS,sex)[PGS]".to_string(),
+                        TermType::Interaction if block.penalty_indices.len() == 3 => {
+                            match component_idx {
+                                0 => format!("{}[PGS]", block.term_name),
+                                1 => format!("{}[PC]", block.term_name),
+                                2 => format!("{}[null]", block.term_name),
+                                _ => unreachable!(
+                                    "Unexpected component index for interaction penalties"
+                                ),
+                            }
                         }
-                    } else {
-                        block.term_name.clone()
+                        _ => {
+                            if block.penalty_indices.len() > 1 {
+                                format!("{}[{}]", block.term_name, component_idx + 1)
+                            } else {
+                                block.term_name.clone()
+                            }
+                        }
                     };
                     labels[pen_idx] = label;
                     types[pen_idx] = block.term_type.clone();

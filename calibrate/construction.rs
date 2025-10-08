@@ -282,19 +282,19 @@ impl ModelLayout {
         let pgs_main_cols = current_col..current_col + pgs_main_basis_ncols;
         current_col += pgs_main_basis_ncols; // Still advance the column counter
 
-        // Sex×PGS varying-coefficient interaction (single block with double penalty)
+        // Sex×PGS varying-coefficient interaction (single block with wiggle penalty)
         if sex_pgs_interaction_basis_ncols > 0 {
             let range = current_col..current_col + sex_pgs_interaction_basis_ncols;
             penalty_map.push(PenalizedBlock {
                 term_name: "f(PGS,sex)".to_string(),
                 col_range: range.clone(),
-                penalty_indices: vec![penalty_idx_counter, penalty_idx_counter + 1],
+                penalty_indices: vec![penalty_idx_counter],
                 term_type: TermType::SexPgsInteraction,
             });
             sex_pgs_cols = Some(range.clone());
             sex_pgs_block_idx = Some(penalty_map.len() - 1);
             current_col += sex_pgs_interaction_basis_ncols;
-            penalty_idx_counter += 2;
+            penalty_idx_counter += 1;
         }
 
         // Tensor product interaction effects (number of penalties depends on configuration)
@@ -471,16 +471,18 @@ pub fn build_design_and_penalty_matrices(
 
     let n_samples = data.y.len();
 
+    let n_pcs = config.pc_configs.len();
+
     // Initialize knot vector, sum-to-zero constraint, and range transform storage
     let mut sum_to_zero_constraints = HashMap::new();
     let mut knot_vectors = HashMap::new();
     let mut range_transforms = HashMap::new();
     let mut pc_null_transforms: HashMap<String, Array2<f64>> = HashMap::new();
+    let mut pc_null_projectors: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut interaction_centering_means = HashMap::new();
     let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
 
     // Reserve capacities to avoid rehashing/reallocation
-    let n_pcs = config.pc_configs.len();
     // +1 for PGS entries where applicable
     knot_vectors.reserve(n_pcs + 1);
     range_transforms.reserve(n_pcs + 1);
@@ -510,11 +512,7 @@ pub fn build_design_and_penalty_matrices(
     let s_pgs_main =
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
     let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
-    let pgs_null_projector = if z_null_pgs.ncols() > 0 {
-        z_null_pgs.dot(&z_null_pgs.t())
-    } else {
-        Array2::zeros((pgs_main_basis_unc.ncols(), pgs_main_basis_unc.ncols()))
-    };
+    let pgs_null_projector = z_null_pgs.dot(&z_null_pgs.t());
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
@@ -526,7 +524,6 @@ pub fn build_design_and_penalty_matrices(
     let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
     let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut pc_unconstrained_bases_main: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
-    let mut pc_null_projectors: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
 
     // Check if we have any PCs to process
     if config.pc_configs.is_empty() {
@@ -561,18 +558,15 @@ pub fn build_design_and_penalty_matrices(
         pc_range_bases.push(pc_range_basis);
 
         // Build null-space (if any)
-        let null_projector = if z_null_pc.ncols() > 0 {
-            let projector = z_null_pc.dot(&z_null_pc.t());
+        if z_null_pc.ncols() > 0 {
             let pc_null_basis = pc_main_basis_unc.dot(&z_null_pc);
             pc_null_bases.push(Some(pc_null_basis));
-            pc_null_transforms.insert(pc_name.clone(), z_null_pc);
-            projector
+            pc_null_transforms.insert(pc_name.clone(), z_null_pc.clone());
+            pc_null_projectors.push(Some(z_null_pc.dot(&z_null_pc.t())));
         } else {
             pc_null_bases.push(None);
-            Array2::zeros((pc_main_basis_unc.ncols(), pc_main_basis_unc.ncols()))
-        };
-
-        pc_null_projectors.push(null_projector);
+            pc_null_projectors.push(None);
+        }
 
         // Store PC range transformation for interactions and main effects
         range_transforms.insert(pc_name.clone(), z_range_pc);
@@ -646,16 +640,8 @@ pub fn build_design_and_penalty_matrices(
         s_list.push(Array2::zeros((p, p)));
     }
 
-    // Precompute double-penalty components for the sex×PGS interaction
+    // Precompute the wiggle penalty component for the sex×PGS interaction
     let s_sex_pgs_wiggle = pgs_z_transform.t().dot(&s_pgs_main.dot(&pgs_z_transform));
-    let s_sex_pgs_null = if z_null_pgs.ncols() > 0 {
-        let null_penalty_unc = z_null_pgs.dot(&z_null_pgs.t());
-        pgs_z_transform
-            .t()
-            .dot(&null_penalty_unc.dot(&pgs_z_transform))
-    } else {
-        Array2::<f64>::zeros((pgs_z_transform.ncols(), pgs_z_transform.ncols()))
-    };
 
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
@@ -678,14 +664,10 @@ pub fn build_design_and_penalty_matrices(
         let col_range = block.col_range.clone();
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
         let penalty_idx_wiggle = block.penalty_indices[0];
-        let penalty_idx_null = block.penalty_indices[1];
 
         s_list[penalty_idx_wiggle]
             .slice_mut(s![col_range.clone(), col_range.clone()])
             .assign(&(&s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle)));
-        s_list[penalty_idx_null]
-            .slice_mut(s![col_range.clone(), col_range.clone()])
-            .assign(&(&s_sex_pgs_null / frob(&s_sex_pgs_null)));
     }
 
     let s_pgs_interaction = if matches!(
@@ -760,11 +742,28 @@ pub fn build_design_and_penalty_matrices(
 
                 let s_kron_pgs = kronecker_product(s_pgs, &i_pc);
                 let s_kron_pc = kronecker_product(i_pgs, &s_pc);
+                let pc_null_projector = pc_null_projectors[pc_idx]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "PC {} is missing a null-space projector required for anisotropic interaction penalties",
+                            pc_config.name
+                        ))
+                    })?;
+                let s_kron_null = kronecker_product(&pgs_null_projector, pc_null_projector);
 
                 let frob =
                     |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
                 let nf1 = frob(&s_kron_pgs);
                 let nf2 = frob(&s_kron_pc);
+                let nf3 = frob(&s_kron_null);
+
+                if nf3 <= 1e-12 {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Null interaction penalty for f(PGS,{}) is numerically zero; purity projection should leave a non-trivial null⊗null span",
+                        pc_config.name
+                    )));
+                }
 
                 let penalty_idx_pgs = block.penalty_indices[0];
                 let penalty_idx_pc = block.penalty_indices[1];
@@ -776,16 +775,9 @@ pub fn build_design_and_penalty_matrices(
                 s_list[penalty_idx_pc]
                     .slice_mut(s![col_range.clone(), col_range.clone()])
                     .assign(&(&s_kron_pc / nf2));
-
-                let pc_null_proj = &pc_null_projectors[pc_idx];
-                let s_kron_null = kronecker_product(&pgs_null_projector, pc_null_proj);
-                let nf_null = frob(&s_kron_null);
-
-                if nf_null > 1e-12 {
-                    s_list[penalty_idx_null]
-                        .slice_mut(s![col_range.clone(), col_range.clone()])
-                        .assign(&(&s_kron_null / nf_null));
-                }
+                s_list[penalty_idx_null]
+                    .slice_mut(s![col_range.clone(), col_range.clone()])
+                    .assign(&(&s_kron_null / nf3));
             }
         }
     }
@@ -2100,11 +2092,11 @@ mod tests {
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // With null-space penalization and the sex×PGS varying coefficient:
-        // PC null + PC range + three anisotropic interaction penalties + two sex×PGS penalties
+        // PC null + PC range + three anisotropic interaction penalties + one sex×PGS penalty
         assert_eq!(
             s_list.len(),
-            7,
-            "Should have exactly 7 penalty matrices: PC null, PC range, three anisotropic interaction penalties, and two sex×PGS penalties",
+            6,
+            "Should have exactly 6 penalty matrices: PC null, PC range, three anisotropic interaction penalties, and one sex×PGS penalty",
         );
 
         let interaction_block = layout
@@ -2113,11 +2105,7 @@ mod tests {
             .find(|b| b.term_type == TermType::Interaction)
             .expect("Interaction block not found in layout");
 
-        assert_eq!(
-            interaction_block.penalty_indices.len(),
-            3,
-            "Interaction term should have three penalty indices in anisotropic mode",
-        );
+        assert_eq!(interaction_block.penalty_indices.len(), 3);
 
         let sex_pgs_block = layout
             .penalty_map
@@ -2125,11 +2113,7 @@ mod tests {
             .find(|b| b.term_type == TermType::SexPgsInteraction)
             .expect("Sex×PGS block not found in layout");
 
-        assert_eq!(
-            sex_pgs_block.penalty_indices.len(),
-            2,
-            "Sex×PGS interaction should have a double penalty",
-        );
+        assert_eq!(sex_pgs_block.penalty_indices.len(), 1);
 
         // Locate explicit PC range and PC null penalty blocks
         let pc_range_block = layout
@@ -2175,16 +2159,15 @@ mod tests {
 
         let expected_pgs = kronecker_product(&s_pgs, &i_pc);
         let expected_pc = kronecker_product(&i_pgs, &s_pc);
-        let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
-        let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
-        let expected_pc_norm = &expected_pc / frob(&expected_pc);
-
-        let (z_null_pgs, _) = basis::null_range_whiten(&s_pgs).expect("PGS null transform");
-        let (z_null_pc, _) = basis::null_range_whiten(&s_pc).expect("PC null transform");
+        let (z_null_pgs, _) = basis::null_range_whiten(&s_pgs).expect("PGS null/range");
+        let (z_null_pc, _) = basis::null_range_whiten(&s_pc).expect("PC null/range");
         let expected_null = kronecker_product(
             &z_null_pgs.dot(&z_null_pgs.t()),
             &z_null_pc.dot(&z_null_pc.t()),
         );
+        let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
+        let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
+        let expected_pc_norm = &expected_pc / frob(&expected_pc);
         let expected_null_norm = &expected_null / frob(&expected_null);
 
         let s_interaction_pgs = &s_list[interaction_block.penalty_indices[0]];
@@ -2224,7 +2207,7 @@ mod tests {
             }
         }
 
-        // Validate sex×PGS penalty structure (double penalty)
+        // Validate sex×PGS penalty structure (wiggle only)
         let (pgs_basis_unc, _) = create_bspline_basis(
             data.p.view(),
             config.pgs_range,
@@ -2241,33 +2224,18 @@ mod tests {
         let s_pgs =
             create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)
                 .expect("PGS penalty");
-        let (z_null, _) = basis::null_range_whiten(&s_pgs).expect("null-range split");
         let s_sex_pgs_wiggle = z_transform.t().dot(&s_pgs.dot(&z_transform));
-        let s_sex_pgs_null = if z_null.ncols() > 0 {
-            let null_penalty = z_null.dot(&z_null.t());
-            z_transform.t().dot(&null_penalty.dot(&z_transform))
-        } else {
-            Array2::<f64>::zeros((z_transform.ncols(), z_transform.ncols()))
-        };
-
         let s_sex_pgs_wiggle_block = &s_list[sex_pgs_block.penalty_indices[0]];
-        let s_sex_pgs_null_block = &s_list[sex_pgs_block.penalty_indices[1]];
         let sex_range = sex_pgs_block.col_range.clone();
 
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
         let expected_wiggle = &s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle);
-        let expected_null = &s_sex_pgs_null / frob(&s_sex_pgs_null);
 
         for (row_offset, r) in sex_range.clone().enumerate() {
             for (col_offset, c) in sex_range.clone().enumerate() {
                 assert_abs_diff_eq!(
                     s_sex_pgs_wiggle_block[[r, c]],
                     expected_wiggle[[row_offset, col_offset]],
-                    epsilon = 1e-12
-                );
-                assert_abs_diff_eq!(
-                    s_sex_pgs_null_block[[r, c]],
-                    expected_null[[row_offset, col_offset]],
                     epsilon = 1e-12
                 );
             }
@@ -2277,7 +2245,6 @@ mod tests {
             for c in 0..layout.total_coeffs {
                 if !(sex_range.contains(&r) && sex_range.contains(&c)) {
                     assert_abs_diff_eq!(s_sex_pgs_wiggle_block[[r, c]], 0.0, epsilon = 1e-12);
-                    assert_abs_diff_eq!(s_sex_pgs_null_block[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }
         }
@@ -2341,8 +2308,8 @@ mod tests {
             "Sex×PGS interaction block should exist in a PGS-only model."
         );
         assert_eq!(
-            layout.num_penalties, 2,
-            "PGS-only model should have the double penalty for the sex×PGS interaction."
+            layout.num_penalties, 1,
+            "PGS-only model should have a single penalty for the sex×PGS interaction."
         );
     }
 
