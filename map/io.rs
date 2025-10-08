@@ -1,10 +1,13 @@
 use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::sync::{Arc, OnceLock};
 
-use crate::map::fit::VariantBlockSource;
+use crate::map::fit::{HwePcaModel, VariantBlockSource};
+use crate::map::project::ProjectionResult;
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
     BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
@@ -68,6 +71,16 @@ pub enum GenotypeIoError {
     Plink(#[from] PlinkIoError),
     #[error(transparent)]
     Bcf(#[from] BcfIoError),
+}
+
+#[derive(Debug, Error)]
+pub enum DatasetOutputError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("{0}")]
+    InvalidState(String),
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +150,169 @@ impl GenotypeDataset {
             Self::Bcf(dataset) => dataset.output_path(filename),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectionOutputPaths {
+    pub scores: PathBuf,
+    pub alignment: Option<PathBuf>,
+}
+
+pub fn save_hwe_model(
+    dataset: &GenotypeDataset,
+    model: &HwePcaModel,
+) -> Result<PathBuf, DatasetOutputError> {
+    let model_path = dataset.output_path("hwe.json");
+    prepare_output_path(&model_path)?;
+
+    let file = File::create(&model_path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, model)?;
+    writer.flush()?;
+
+    Ok(model_path)
+}
+
+pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetOutputError> {
+    let model_path = dataset.output_path("hwe.json");
+    let file = File::open(&model_path)?;
+    let reader = BufReader::new(file);
+    let model: HwePcaModel = serde_json::from_reader(reader)?;
+
+    if model.n_variants() != dataset.n_variants() {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "Model expects {} variants but dataset provides {}",
+            model.n_variants(),
+            dataset.n_variants()
+        )));
+    }
+
+    Ok(model)
+}
+
+pub fn save_projection_results(
+    dataset: &GenotypeDataset,
+    result: &ProjectionResult,
+) -> Result<ProjectionOutputPaths, DatasetOutputError> {
+    let scores = result.scores.as_ref();
+    let samples = dataset.samples();
+
+    if samples.len() != scores.nrows() {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "Projection scores contain {} rows but dataset has {} samples",
+            scores.nrows(),
+            samples.len()
+        )));
+    }
+
+    let scores_path = dataset.output_path("projection.scores.tsv");
+    prepare_output_path(&scores_path)?;
+    let mut writer = BufWriter::new(File::create(&scores_path)?);
+
+    write!(writer, "FID\tIID")?;
+    for idx in 0..scores.ncols() {
+        write!(writer, "\tPC{}", idx + 1)?;
+    }
+    writeln!(writer)?;
+
+    for (row, sample) in samples.iter().enumerate() {
+        write!(writer, "{}\t{}", sample.family_id, sample.individual_id)?;
+        for col in 0..scores.ncols() {
+            let value = scores[(row, col)];
+            write!(writer, "\t{}", value)?;
+        }
+        writeln!(writer)?;
+    }
+
+    writer.flush()?;
+
+    let mut alignment_path = None;
+    if let Some(alignment) = result.alignment.as_ref() {
+        let path = dataset.output_path("projection.alignment.tsv");
+        prepare_output_path(&path)?;
+        let mut writer = BufWriter::new(File::create(&path)?);
+
+        write!(writer, "FID\tIID")?;
+        for idx in 0..alignment.ncols() {
+            write!(writer, "\tPC{}", idx + 1)?;
+        }
+        writeln!(writer)?;
+
+        for (row, sample) in samples.iter().enumerate() {
+            write!(writer, "{}\t{}", sample.family_id, sample.individual_id)?;
+            for col in 0..alignment.ncols() {
+                let value = alignment[(row, col)];
+                write!(writer, "\t{}", value)?;
+            }
+            writeln!(writer)?;
+        }
+
+        writer.flush()?;
+        alignment_path = Some(path);
+    }
+
+    Ok(ProjectionOutputPaths {
+        scores: scores_path,
+        alignment: alignment_path,
+    })
+}
+
+pub fn save_sample_manifest(dataset: &GenotypeDataset) -> Result<PathBuf, DatasetOutputError> {
+    let manifest_path = dataset.output_path("samples.tsv");
+    prepare_output_path(&manifest_path)?;
+    let mut writer = BufWriter::new(File::create(&manifest_path)?);
+
+    writeln!(writer, "FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE")?;
+
+    for record in dataset.samples() {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            record.family_id,
+            record.individual_id,
+            record.paternal_id,
+            record.maternal_id,
+            record.sex,
+            record.phenotype
+        )?;
+    }
+
+    writer.flush()?;
+    Ok(manifest_path)
+}
+
+pub fn save_fit_summary(
+    dataset: &GenotypeDataset,
+    model: &HwePcaModel,
+) -> Result<PathBuf, DatasetOutputError> {
+    let summary_path = dataset.output_path("hwe.summary.tsv");
+    prepare_output_path(&summary_path)?;
+    let mut writer = BufWriter::new(File::create(&summary_path)?);
+
+    writeln!(writer, "metric\tvalue")?;
+    writeln!(writer, "n_samples\t{}", model.n_samples())?;
+    writeln!(writer, "n_variants\t{}", model.n_variants())?;
+
+    for (idx, variance) in model.explained_variance().iter().copied().enumerate() {
+        writeln!(writer, "explained_variance_PC{}\t{}", idx + 1, variance)?;
+    }
+
+    let ratios = model.explained_variance_ratio();
+    for (idx, ratio) in ratios.into_iter().enumerate() {
+        writeln!(writer, "explained_variance_ratio_PC{}\t{}", idx + 1, ratio)?;
+    }
+
+    writer.flush()?;
+    Ok(summary_path)
+}
+
+fn prepare_output_path(path: &Path) -> Result<(), io::Error> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
