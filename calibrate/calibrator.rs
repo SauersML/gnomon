@@ -34,9 +34,7 @@ pub struct FirthSpec {
 
 impl FirthSpec {
     pub fn all_enabled() -> Self {
-        Self {
-            enabled: true,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -1822,9 +1820,7 @@ pub fn fit_calibrator(
     if matches!(link, LinkFunction::Logit) {
         if let Some(ref firth_spec) = firth {
             if firth_spec.enabled {
-                eprintln!(
-                    "[CAL] Firth penalization active for calibrator fit",
-                );
+                eprintln!("[CAL] Firth penalization active for calibrator fit",);
             } else {
                 eprintln!("[CAL] Firth penalization disabled for calibrator fit");
             }

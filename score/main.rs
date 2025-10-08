@@ -14,9 +14,7 @@
 
 use clap::Parser;
 use gnomon::score::download;
-use gnomon::score::io::{
-    gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials,
-};
+use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials};
 use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
@@ -398,7 +396,7 @@ fn split_gcs_uri_dir_and_leaf(raw: &str) -> Result<(String, String), Box<dyn Err
 /// Robust GCS resolver that supports: exact triad prefix, *.bed in a "directory",
 /// trailing slash, and star suffix.
 fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
-    use google_cloud_auth::credentials::{anonymous::Builder as AnonymousCredentials, Credentials};
+    use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
     use google_cloud_storage::client::StorageControl;
 
     let wants_dir_scan = uri.ends_with("/*") || uri.ends_with('/');
@@ -489,9 +487,9 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             match make_control(Some(anonymous_creds)) {
                 Ok(control) => control,
                 Err(e2) => {
-                    return Err(Box::<dyn Error + Send + Sync>::from(
-                        format!("Unable to initialize Cloud Storage clients: {e_msg} / {e2}")
-                    ));
+                    return Err(Box::<dyn Error + Send + Sync>::from(format!(
+                        "Unable to initialize Cloud Storage clients: {e_msg} / {e2}"
+                    )));
                 }
             }
         }

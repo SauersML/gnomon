@@ -1,10 +1,10 @@
+use super::fit::{
+    DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
+};
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatMut};
 use std::error::Error;
-use super::fit::{
-    DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
-};
 
 pub struct HwePcaProjector<'model> {
     model: &'model HwePcaModel,

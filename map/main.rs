@@ -1,12 +1,11 @@
-use std::fmt;
-use std::path::{Path, PathBuf};
 use super::fit::{HwePcaError, HwePcaModel};
 use super::io::{
-    load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
-    save_sample_manifest, DatasetOutputError, GenotypeDataset, GenotypeIoError,
-    ProjectionOutputPaths,
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
+    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
 };
 use super::project::ProjectionOptions;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -161,12 +160,26 @@ mod tests {
     use crate::map::fit::HwePcaModel;
     use crate::map::io::GenotypeDataset;
     use crate::map::project::ProjectionOptions;
+    use crate::shared::files::open_bcf_source;
+    use noodles_bcf::io::Reader as BcfReader;
+    use noodles_bgzf::io::Reader as BgzfReader;
+    use noodles_vcf::variant::RecordBuf;
+    use noodles_vcf::variant::record::AlternateBases as _;
+    use noodles_vcf::variant::record::samples::keys::key;
+    use noodles_vcf::variant::record_buf::samples::sample::Value;
+    use noodles_vcf::variant::record_buf::samples::sample::value::Array;
+    use noodles_vcf::variant::record_buf::samples::sample::value::genotype::{
+        Allele as SampleAllele,
+        Genotype as SampleGenotype,
+    };
     use std::error::Error;
+    use std::fmt::Write as _;
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::str::FromStr;
 
-    const HGDP_CHR20_BCF: &str =
-        "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
+    const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
          hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
     const HGDP_FULL_DATASET: &str =
         "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
@@ -237,6 +250,328 @@ mod tests {
         }
     }
 
+    struct LimitedReader<R> {
+        inner: R,
+        consumed: u64,
+        limit: u64,
+    }
+
+    impl<R> LimitedReader<R> {
+        fn new(inner: R, limit: u64) -> Self {
+            Self {
+                inner,
+                consumed: 0,
+                limit,
+            }
+        }
+
+        fn into_inner(self) -> (R, u64) {
+            (self.inner, self.consumed)
+        }
+    }
+
+    impl<R: Read> Read for LimitedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.consumed >= self.limit {
+                return Ok(0);
+            }
+            let remaining = (self.limit - self.consumed) as usize;
+            let to_read = remaining.min(buf.len());
+            let n = self.inner.read(&mut buf[..to_read])?;
+            self.consumed += n as u64;
+            Ok(n)
+        }
+    }
+
+    struct RecordingReader<R> {
+        inner: R,
+        recorded: Vec<u8>,
+        max_record: usize,
+    }
+
+    impl<R> RecordingReader<R> {
+        fn new(inner: R, max_record: usize) -> Self {
+            Self {
+                inner,
+                recorded: Vec::with_capacity(max_record.min(4096)),
+                max_record,
+            }
+        }
+
+        fn recorded_bytes(&self) -> &[u8] {
+            &self.recorded
+        }
+    }
+
+    impl<R: Read> Read for RecordingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            if n == 0 {
+                eprintln!("[partial-test] RecordingReader: inner returned EOF");
+            } else {
+                eprintln!("[partial-test] RecordingReader: read {n} bytes");
+            }
+            if n > 0 && self.recorded.len() < self.max_record {
+                let remaining = self.max_record - self.recorded.len();
+                let to_copy = remaining.min(n);
+                self.recorded.extend_from_slice(&buf[..to_copy]);
+                eprintln!(
+                    "[partial-test] RecordingReader: recorded {} total bytes",
+                    self.recorded.len()
+                );
+            }
+            Ok(n)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum BcfCompression {
+        Bgzf,
+        Plain,
+    }
+
+    fn detect_compression(path: &Path) -> Result<(BcfCompression, Vec<u8>), Box<dyn Error>> {
+        let mut source = open_bcf_source(path)
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let mut prefix = vec![0u8; 4096];
+        let mut total = 0usize;
+        while total < prefix.len() {
+            let read = source.read(&mut prefix[total..])?;
+            if read == 0 {
+                break;
+            }
+            total += read;
+        }
+        prefix.truncate(total);
+
+        let compression = if prefix.starts_with(&[0x1F, 0x8B]) {
+            BcfCompression::Bgzf
+        } else if prefix.starts_with(b"BCF") {
+            BcfCompression::Plain
+        } else {
+            return Err(format!(
+                "Unable to determine compression for {}: prefix {:?}",
+                path.display(),
+                &prefix[..prefix.len().min(16)]
+            )
+            .into());
+        };
+
+        Ok((compression, prefix))
+    }
+
+    fn hexdump(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        for (idx, byte) in bytes.iter().enumerate() {
+            if idx > 0 {
+                if idx % 16 == 0 {
+                    out.push('\n');
+                } else if idx % 4 == 0 {
+                    out.push(' ');
+                }
+            }
+            let _ = write!(&mut out, "{:02X}", byte);
+        }
+        out
+    }
+
+    fn dosage_from_value(value: &Value) -> Option<f64> {
+        match value {
+            Value::Integer(n) => {
+                eprintln!("[partial-test] dosage_from_value: integer {n}");
+                Some(*n as f64)
+            }
+            Value::Float(n) => {
+                eprintln!("[partial-test] dosage_from_value: float {n}");
+                Some(*n as f64)
+            }
+            Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    eprintln!("[partial-test] dosage_from_value: empty string");
+                    None
+                } else if let Ok(parsed) = trimmed.parse::<f64>() {
+                    eprintln!(
+                        "[partial-test] dosage_from_value: parsed numeric string '{trimmed}' -> {parsed}"
+                    );
+                    Some(parsed)
+                } else {
+                    eprintln!(
+                        "[partial-test] dosage_from_value: attempting genotype parse for '{trimmed}'"
+                    );
+                    SampleGenotype::from_str(trimmed)
+                        .ok()
+                        .and_then(|genotype| dosage_from_genotype(genotype.as_ref()))
+                }
+            }
+            Value::Array(Array::Integer(values)) => {
+                let result = values.get(0).copied().flatten().map(|n| n as f64);
+                eprintln!(
+                    "[partial-test] dosage_from_value: integer array {:?} -> {:?}",
+                    values, result
+                );
+                result
+            }
+            Value::Array(Array::Float(values)) => {
+                let result = values.get(0).copied().flatten().map(|n| n as f64);
+                eprintln!(
+                    "[partial-test] dosage_from_value: float array {:?} -> {:?}",
+                    values, result
+                );
+                result
+            }
+            Value::Genotype(genotype) => {
+                eprintln!(
+                    "[partial-test] dosage_from_value: genotype {:?}",
+                    genotype
+                );
+                dosage_from_genotype(genotype.as_ref())
+            }
+            other => {
+                eprintln!("[partial-test] dosage_from_value: unsupported value {other:?}");
+                None
+            }
+        }
+    }
+
+    fn dosage_from_genotype(genotype: &[SampleAllele]) -> Option<f64> {
+        let mut total = 0.0;
+        for (idx, allele) in genotype.iter().enumerate() {
+            eprintln!("[partial-test] dosage_from_genotype: allele[{idx}] = {allele:?}");
+            match allele.position() {
+                Some(0) => {}
+                Some(_) => total += 1.0,
+                None => return None,
+            }
+        }
+        eprintln!("[partial-test] dosage_from_genotype: total dosage {total}");
+        Some(total)
+    }
+
+    fn process_reader<R: Read>(
+        reader: &mut BcfReader<R>,
+    ) -> Result<(usize, Option<f64>), Box<dyn Error>> {
+        eprintln!("[partial-test] reading header");
+        let header = reader.read_header()?;
+        let sample_count = header.sample_names().len();
+        eprintln!(
+            "[partial-test] header read: samples={} contigs={}",
+            sample_count,
+            header.contigs().len()
+        );
+        let sample_preview: Vec<_> = header.sample_names().iter().take(5).collect();
+        eprintln!("[partial-test] sample preview: {sample_preview:?}");
+        if let Some(contig) = header.contigs().keys().next() {
+            eprintln!("[partial-test] first contig key: {contig}");
+        }
+        assert!(
+            !header.sample_names().is_empty(),
+            "BCF header should list at least one sample"
+        );
+        assert!(
+            !header.contigs().is_empty(),
+            "BCF header should include contig definitions"
+        );
+
+        let mut record = RecordBuf::default();
+        eprintln!("[partial-test] reading first record");
+        let bytes = reader.read_record_buf(&header, &mut record)?;
+        eprintln!("[partial-test] record byte count: {bytes}");
+        assert!(bytes > 0, "expected to decode the first variant record");
+        let variant_start = record
+            .variant_start()
+            .expect("variant start position should be present");
+        eprintln!(
+            "[partial-test] record location: {}:{}",
+            record.reference_sequence_name(),
+            usize::from(variant_start)
+        );
+        assert!(
+            usize::from(variant_start) > 0,
+            "variant position must be positive"
+        );
+        assert!(
+            !record.reference_bases().is_empty(),
+            "reference allele should not be empty"
+        );
+        eprintln!(
+            "[partial-test] reference bases: {}",
+            record.reference_bases()
+        );
+        assert!(
+            !record.alternate_bases().as_ref().is_empty(),
+            "alternate allele set should not be empty"
+        );
+        let mut alt_preview = Vec::new();
+        for alt in record.alternate_bases().iter() {
+            match alt {
+                Ok(allele) => alt_preview.push(allele.to_string()),
+                Err(err) => alt_preview.push(format!("<err: {err}>",)),
+            }
+        }
+        eprintln!("[partial-test] alternate alleles: {alt_preview:?}");
+        eprintln!("[partial-test] record IDs: {:?}", record.ids());
+        eprintln!("[partial-test] record filters: {:?}", record.filters());
+        eprintln!("[partial-test] record format keys: {:?}", record.format());
+
+        let samples = record.samples();
+        let observed_samples = samples.values().count();
+        eprintln!(
+            "[partial-test] observed sample records: {} (expected {})",
+            observed_samples, sample_count
+        );
+        assert_eq!(
+            observed_samples,
+            sample_count,
+            "record should include per-sample data"
+        );
+        let ds_series = samples.select("DS");
+        let gt_series = samples.select(key::GENOTYPE);
+        eprintln!("[partial-test] DS present: {}", ds_series.is_some());
+        eprintln!("[partial-test] GT present: {}", gt_series.is_some());
+        let mut decoded = None;
+
+        for idx in 0..sample_count {
+            if let Some(series) = ds_series.as_ref() {
+                let raw = series.get(idx);
+                eprintln!("[partial-test] sample {idx} DS raw: {raw:?}");
+                if let Some(Some(value)) = raw {
+                    if let Some(dosage) = dosage_from_value(value) {
+                        eprintln!(
+                            "[partial-test] sample {idx} DS-derived dosage: {dosage}"
+                        );
+                        decoded = Some(dosage);
+                        break;
+                    }
+                }
+            }
+            if let Some(series) = gt_series.as_ref() {
+                let raw = series.get(idx);
+                eprintln!("[partial-test] sample {idx} GT raw: {raw:?}");
+                if let Some(Some(value)) = raw {
+                    if let Some(dosage) = dosage_from_value(value) {
+                        eprintln!(
+                            "[partial-test] sample {idx} GT-derived dosage: {dosage}"
+                        );
+                        decoded = Some(dosage);
+                        break;
+                    }
+                }
+            }
+        }
+
+        eprintln!("[partial-test] decoded dosage result: {decoded:?}");
+        assert!(
+            decoded.is_some(),
+            "expected to derive a dosage from DS or GT fields"
+        );
+
+        Ok((sample_count, decoded))
+    }
+
     #[test]
     fn cli_fit_and_project_full_hgdp_dataset() -> Result<(), Box<dyn Error>> {
         let binary = gnomon_binary_path()?;
@@ -273,6 +608,124 @@ mod tests {
     }
 
     #[test]
+    fn download_partial_hgdp_chr20_header_and_first_record() -> Result<(), Box<dyn Error>> {
+        const MAX_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+
+        eprintln!(
+            "[partial-test] starting partial download with limit {} bytes",
+            MAX_COMPRESSED_BYTES
+        );
+
+        let path = Path::new(HGDP_CHR20_BCF);
+        let (compression, probe_prefix) = detect_compression(path)?;
+        eprintln!(
+            "[partial-test] compression probe: {:?} ({} bytes captured)",
+            compression,
+            probe_prefix.len()
+        );
+        if !probe_prefix.is_empty() {
+            let preview_len = probe_prefix.len().min(256);
+            eprintln!(
+                "[partial-test] probe hex preview ({} bytes):\n{}",
+                preview_len,
+                hexdump(&probe_prefix[..preview_len])
+            );
+        } else {
+            eprintln!("[partial-test] probe produced no bytes");
+        }
+
+        match compression {
+            BcfCompression::Bgzf => {
+                eprintln!("[partial-test] compression detected: BGZF");
+                let source = open_bcf_source(path)
+                    .map_err(|err| -> Box<dyn Error> {
+                        eprintln!("[partial-test] failed to reopen remote BCF: {err}");
+                        Box::new(err)
+                    })?;
+                let recording = RecordingReader::new(source, 4096);
+                eprintln!("[partial-test] recording reader initialized (bgzf path)");
+                let limited = LimitedReader::new(recording, MAX_COMPRESSED_BYTES);
+                eprintln!(
+                    "[partial-test] limited reader created with limit {}",
+                    MAX_COMPRESSED_BYTES
+                );
+                let bgzf_reader = BgzfReader::new(limited);
+                eprintln!("[partial-test] BGZF reader instantiated");
+                let mut reader = BcfReader::from(bgzf_reader);
+                eprintln!("[partial-test] BCF reader ready (bgzf path)");
+
+                let (_, decoded) = process_reader(&mut reader)?;
+
+                let bgzf_reader = reader.into_inner();
+                let limited = bgzf_reader.into_inner();
+                let (recording, consumed) = limited.into_inner();
+                let recorded_bytes = recording.recorded_bytes();
+                eprintln!(
+                    "[partial-test] final recorded compressed bytes: {}",
+                    recorded_bytes.len()
+                );
+                if !recorded_bytes.is_empty() {
+                    let preview_len = recorded_bytes.len().min(256);
+                    eprintln!(
+                        "[partial-test] final compressed prefix hex ({} bytes):\n{}",
+                        preview_len,
+                        hexdump(&recorded_bytes[..preview_len])
+                    );
+                }
+                eprintln!("[partial-test] total compressed bytes consumed: {consumed}");
+                assert!(
+                    consumed > 0 && consumed <= MAX_COMPRESSED_BYTES,
+                    "expected to read only a small prefix of the remote object (read {consumed} bytes)"
+                );
+                eprintln!("[partial-test] decoded dosage (bgzf path): {decoded:?}");
+            }
+            BcfCompression::Plain => {
+                eprintln!("[partial-test] compression detected: plain BCF");
+                let source = open_bcf_source(path)
+                    .map_err(|err| -> Box<dyn Error> {
+                        eprintln!("[partial-test] failed to reopen remote BCF: {err}");
+                        Box::new(err)
+                    })?;
+                let recording = RecordingReader::new(source, 4096);
+                eprintln!("[partial-test] recording reader initialized (plain path)");
+                let limited = LimitedReader::new(recording, MAX_COMPRESSED_BYTES);
+                eprintln!(
+                    "[partial-test] limited reader created with limit {}",
+                    MAX_COMPRESSED_BYTES
+                );
+                let mut reader = BcfReader::from(limited);
+                eprintln!("[partial-test] BCF reader ready (plain path)");
+
+                let (_, decoded) = process_reader(&mut reader)?;
+
+                let limited = reader.into_inner();
+                let (recording, consumed) = limited.into_inner();
+                let recorded_bytes = recording.recorded_bytes();
+                eprintln!(
+                    "[partial-test] final recorded bytes (plain path): {}",
+                    recorded_bytes.len()
+                );
+                if !recorded_bytes.is_empty() {
+                    let preview_len = recorded_bytes.len().min(256);
+                    eprintln!(
+                        "[partial-test] final plain prefix hex ({} bytes):\n{}",
+                        preview_len,
+                        hexdump(&recorded_bytes[..preview_len])
+                    );
+                }
+                eprintln!("[partial-test] total bytes consumed: {consumed}");
+                assert!(
+                    consumed > 0 && consumed <= MAX_COMPRESSED_BYTES,
+                    "expected to read only a small prefix of the remote object (read {consumed} bytes)"
+                );
+                eprintln!("[partial-test] decoded dosage (plain path): {decoded:?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn fit_and_project_full_hgdp_chr20() -> Result<(), Box<dyn Error>> {
         let dataset = GenotypeDataset::open(Path::new(HGDP_CHR20_BCF))
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
@@ -292,14 +745,18 @@ mod tests {
         assert_eq!(model.n_variants(), n_variants);
         assert!(model.components() > 0);
         assert_eq!(model.explained_variance().len(), model.components());
-        assert!(model
-            .explained_variance()
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0));
-        assert!(model
-            .singular_values()
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0));
+        assert!(
+            model
+                .explained_variance()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+        assert!(
+            model
+                .singular_values()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
 
         let variance_ratios = model.explained_variance_ratio();
         assert_eq!(variance_ratios.len(), model.components());

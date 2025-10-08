@@ -8,7 +8,7 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
-use crate::score::io::{open_text_source, TextSource};
+use crate::score::io::{TextSource, open_text_source};
 use crate::score::pipeline::PipelineError;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
@@ -198,7 +198,10 @@ pub enum PrepError {
     Parse(String),
     Header(String),
     InconsistentKeepId(String),
-    PipelineIo { path: PathBuf, message: String },
+    PipelineIo {
+        path: PathBuf,
+        message: String,
+    },
     /// An error indicating that no variants from the score files could be matched
     /// to variants in the genotype data.
     NoOverlappingVariants(MergeDiagnosticInfo),
@@ -741,7 +744,7 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
                             return Some(Err(PrepError::Parse(format!(
                                 "Invalid UTF-8 in BIM file '{}': {e}",
                                 self.current_path.display()
-                            ))))
+                            ))));
                         }
                     };
 
@@ -754,9 +757,7 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
                     let a1 = parts.next();
                     let a2 = parts.next();
 
-                    if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) =
-                        (chr, pos, a1, a2)
-                    {
+                    if let (Some(chr_str), Some(pos_str), Some(a1), Some(a2)) = (chr, pos, a1, a2) {
                         match parse_key(chr_str, pos_str) {
                             Ok(key) => {
                                 return Some(Ok(KeyedBimRecord {
@@ -1092,8 +1093,8 @@ fn parse_fam_and_build_lookup(
 }
 
 fn read_fam_file(path: &Path) -> Result<Vec<String>, PrepError> {
-    let mut source = open_text_source(path)
-        .map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
+    let mut source =
+        open_text_source(path).map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
     let mut iids = Vec::new();
     let mut line_number = 0usize;
 

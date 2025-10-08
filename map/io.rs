@@ -14,7 +14,6 @@ use crate::shared::files::{
     BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
-use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::{
     self as vcf,
     variant::RecordBuf,
@@ -792,7 +791,7 @@ impl BcfDataset {
 pub struct BcfVariantBlockSource {
     path: PathBuf,
     header: Arc<vcf::Header>,
-    reader: BcfReader<BgzfReader<BcfSource>>,
+    reader: BcfReader<BcfSource>,
     record: RecordBuf,
     n_samples: usize,
     n_variants: usize,
@@ -935,10 +934,9 @@ fn compute_output_hint(path: &Path) -> OutputHint {
     }
 }
 
-fn create_bcf_reader(path: &Path) -> Result<BcfReader<BgzfReader<BcfSource>>, BcfIoError> {
+fn create_bcf_reader(path: &Path) -> Result<BcfReader<BcfSource>, BcfIoError> {
     let source = open_bcf_source(path)?;
-    let reader = BgzfReader::new(source);
-    Ok(BcfReader::from(reader))
+    Ok(BcfReader::from(source))
 }
 
 fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {

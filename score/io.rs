@@ -12,17 +12,16 @@
 
 use crate::score::decide::ComputePath;
 use crate::score::pipeline::PipelineError;
+use crate::score::types::{FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem};
 pub use crate::shared::files::{
+    BedSource, ByteRangeSource, PROGRESS_UPDATE_BATCH_SIZE, TextSource,
     gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials, open_bed_source,
-    open_text_source, BedSource, ByteRangeSource, TextSource, PROGRESS_UPDATE_BATCH_SIZE,
-};
-use crate::score::types::{
-    FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem,
+    open_text_source,
 };
 use crossbeam_channel::Sender;
 use crossbeam_queue::ArrayQueue;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The generic entry point for the producer thread.
 ///
