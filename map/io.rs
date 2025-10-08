@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::io::{BufReader, BufWriter, Write};
@@ -13,12 +14,13 @@ use crate::shared::files::{
     BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
+use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::{
     self as vcf,
     variant::RecordBuf,
-    variant::record_buf::samples::{
-        keys::key,
-        sample::{self, Value, value::Array, value::genotype::Genotype as SampleGenotype},
+    variant::record::samples::keys::key,
+    variant::record_buf::samples::sample::{
+        self, Value, value::Array, value::genotype::Genotype as SampleGenotype,
     },
 };
 use thiserror::Error;
@@ -493,7 +495,6 @@ impl PlinkDataset {
     }
 }
 
-#[derive(Debug)]
 pub struct PlinkVariantRecordIter {
     path: PathBuf,
     reader: Box<dyn TextSource>,
@@ -507,6 +508,15 @@ impl PlinkVariantRecordIter {
             reader,
             line: 0,
         }
+    }
+}
+
+impl fmt::Debug for PlinkVariantRecordIter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlinkVariantRecordIter")
+            .field("path", &self.path)
+            .field("line", &self.line)
+            .finish()
     }
 }
 
@@ -697,11 +707,7 @@ impl BcfDataset {
 
         let mut reader = create_bcf_reader(&input_path)?;
         let header = Arc::new(reader.read_header()?);
-        let sample_names: Vec<String> = header
-            .sample_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
+        let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
         if sample_names.is_empty() {
             return Err(BcfIoError::MissingSamples);
         }
@@ -785,11 +791,22 @@ impl BcfDataset {
 pub struct BcfVariantBlockSource {
     path: PathBuf,
     header: Arc<vcf::Header>,
-    reader: BcfReader<BcfSource>,
+    reader: BcfReader<BgzfReader<BcfSource>>,
     record: RecordBuf,
     n_samples: usize,
     n_variants: usize,
     emitted: usize,
+}
+
+impl fmt::Debug for BcfVariantBlockSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BcfVariantBlockSource")
+            .field("path", &self.path)
+            .field("n_samples", &self.n_samples)
+            .field("n_variants", &self.n_variants)
+            .field("emitted", &self.emitted)
+            .finish()
+    }
 }
 
 impl BcfVariantBlockSource {
@@ -917,7 +934,7 @@ fn compute_output_hint(path: &Path) -> OutputHint {
     }
 }
 
-fn create_bcf_reader(path: &Path) -> Result<BcfReader<BcfSource>, BcfIoError> {
+fn create_bcf_reader(path: &Path) -> Result<BcfReader<BgzfReader<BcfSource>>, BcfIoError> {
     let source = open_bcf_source(path)?;
     Ok(BcfReader::new(source))
 }
