@@ -3,7 +3,7 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use ndarray::{Array1, ArrayView1};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -13,6 +13,7 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, TrainedModel};
+use gnomon::map::main as map_cli;
 
 #[derive(Args)]
 pub struct TrainArgs {
@@ -368,8 +369,16 @@ mod score_main;
                  and training GAM models for score calibration."
 )]
 struct Cli {
+    /// Fit an HWE PCA model from the provided genotype dataset
+    #[arg(long, value_name = "PATH", conflicts_with = "project")]
+    fit: Option<PathBuf>,
+
+    /// Project samples using an existing HWE PCA model
+    #[arg(long, value_name = "PATH", conflicts_with = "fit")]
+    project: Option<PathBuf>,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -404,20 +413,50 @@ fn main() {
     // Ensure each invocation starts with calibration enabled unless explicitly disabled.
     gnomon::calibrate::model::reset_calibrator_flag();
 
-    let result = match cli.command {
-        Commands::Score {
-            input_path,
-            score,
-            keep,
-        } => run_score(input_path, score, keep),
-        Commands::Train(args) => train(args),
-        Commands::Infer(args) => infer(args),
+    if (cli.fit.is_some() || cli.project.is_some()) && cli.command.is_some() {
+        eprintln!("Error: --fit/--project cannot be combined with subcommands.");
+        process::exit(2);
+    }
+
+    let result = if let Some(path) = cli.fit {
+        run_map_fit(path)
+    } else if let Some(path) = cli.project {
+        run_map_project(path)
+    } else {
+        match cli.command {
+            Some(Commands::Score {
+                input_path,
+                score,
+                keep,
+            }) => run_score(input_path, score, keep),
+            Some(Commands::Train(args)) => train(args),
+            Some(Commands::Infer(args)) => infer(args),
+            None => {
+                Cli::command().print_help().expect("print help");
+                println!();
+                Ok(())
+            }
+        }
     };
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
         process::exit(1);
     }
+}
+
+fn run_map_fit(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Fit {
+        genotype_path: path,
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+fn run_map_project(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Project {
+        genotype_path: path,
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
 fn run_score(
