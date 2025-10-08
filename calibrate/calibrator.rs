@@ -28,22 +28,14 @@ pub struct CalibratorFeatures {
 
 /// Configuration of the calibrator smooths and penalties
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FirthScope {
-    All,
-    BackboneOnly,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirthSpec {
     pub enabled: bool,
-    pub scope: FirthScope,
 }
 
 impl FirthSpec {
     pub fn all_enabled() -> Self {
         Self {
             enabled: true,
-            scope: FirthScope::All,
         }
     }
 }
@@ -1831,8 +1823,7 @@ pub fn fit_calibrator(
         if let Some(ref firth_spec) = firth {
             if firth_spec.enabled {
                 eprintln!(
-                    "[CAL] Firth penalization active for calibrator fit (scope={:?})",
-                    firth_spec.scope
+                    "[CAL] Firth penalization active for calibrator fit",
                 );
             } else {
                 eprintln!("[CAL] Firth penalization disabled for calibrator fit");
