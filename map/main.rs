@@ -1,11 +1,12 @@
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::fit::{HwePcaError, HwePcaModel};
-use super::io::{GenotypeDataset, GenotypeIoError};
-use super::project::{ProjectionOptions, ProjectionResult};
+use super::io::{
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
+    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
+};
+use super::project::ProjectionOptions;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -72,6 +73,16 @@ impl From<serde_json::Error> for MapDriverError {
     }
 }
 
+impl From<DatasetOutputError> for MapDriverError {
+    fn from(value: DatasetOutputError) -> Self {
+        match value {
+            DatasetOutputError::Io(err) => Self::Io(err),
+            DatasetOutputError::Serialization(err) => Self::Serialization(err),
+            DatasetOutputError::InvalidState(msg) => Self::InvalidState(msg),
+        }
+    }
+}
+
 /// Execute the provided [`MapCommand`].
 pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
@@ -99,9 +110,14 @@ fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
         model.n_variants()
     );
 
-    persist_model(&dataset, &model)?;
-    persist_sample_manifest(&dataset)?;
-    persist_fit_summary(&dataset, &model)?;
+    let model_path = save_hwe_model(&dataset, &model)?;
+    println!("Saved HWE PCA model to {}", model_path.display());
+
+    let manifest_path = save_sample_manifest(&dataset)?;
+    println!("Sample manifest saved to {}", manifest_path.display());
+
+    let summary_path = save_fit_summary(&dataset, &model)?;
+    println!("Fit summary saved to {}", summary_path.display());
 
     Ok(())
 }
@@ -116,7 +132,7 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         dataset.n_variants()
     );
 
-    let model = load_model_for_projection(&dataset)?;
+    let model = load_hwe_model(&dataset)?;
     println!("Model provides {} principal components", model.components());
 
     let mut source = dataset.block_source()?;
@@ -124,7 +140,12 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
     let projector = model.projector();
     let result = projector.project_with_options(&mut source, &options)?;
 
-    persist_projection_results(&dataset, &result)?;
+    let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
+
+    println!("Projection scores saved to {}", scores.display());
+    if let Some(path) = alignment {
+        println!("Projection alignment factors saved to {}", path.display());
+    }
 
     println!("Projection complete for {} samples", result.scores.nrows());
 
@@ -294,4 +315,165 @@ fn prepare_output_path(path: &Path) -> Result<(), MapDriverError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit::{DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaModel};
+    use super::io::{DatasetBlockSource, GenotypeDataset};
+    use super::project::ProjectionOptions;
+    use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+    use std::error::Error;
+    use std::path::Path;
+
+    const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
+         hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
+    const RNG_SEED: u64 = 0xC0FFEE5EEDBADD5;
+
+    #[test]
+    fn fit_and_project_split_hgdp_chr20() -> Result<(), Box<dyn Error>> {
+        let dataset = GenotypeDataset::open(Path::new(HGDP_CHR20_BCF))
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let mut block_source = dataset
+            .block_source()
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        let n_samples = block_source.n_samples();
+        let n_variants = block_source.n_variants();
+        assert!(n_samples >= 3, "expected at least three samples for PCA");
+        assert!(n_variants > 0, "expected at least one variant in dataset");
+        assert_eq!(dataset.samples().len(), n_samples);
+
+        let dense_matrix = collect_dense_matrix(&mut block_source)?;
+
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
+        let mut sample_indices: Vec<usize> = (0..n_samples).collect();
+        sample_indices.shuffle(&mut rng);
+
+        let min_train = 2usize;
+        let min_inference = 1usize;
+        let mut train_count = ((n_samples as f64) * 0.8).round() as usize;
+        if train_count < min_train {
+            train_count = min_train;
+        }
+        if train_count > n_samples.saturating_sub(min_inference) {
+            train_count = n_samples - min_inference;
+        }
+        let inference_count = n_samples - train_count;
+        assert!(inference_count >= min_inference);
+
+        let train_indices = &sample_indices[..train_count];
+        let inference_indices = &sample_indices[train_count..];
+
+        let train_matrix =
+            slice_samples_into_dense(&dense_matrix, n_samples, n_variants, train_indices);
+        let inference_matrix =
+            slice_samples_into_dense(&dense_matrix, n_samples, n_variants, inference_indices);
+
+        let mut train_source = DenseBlockSource::new(&train_matrix, train_count, n_variants)
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let model = HwePcaModel::fit(&mut train_source)
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        assert_eq!(model.n_samples(), train_count);
+        assert_eq!(model.n_variants(), n_variants);
+        assert!(model.components() > 0);
+        assert_eq!(model.explained_variance().len(), model.components());
+        assert!(
+            model
+                .explained_variance()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+        assert!(
+            model
+                .singular_values()
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+
+        let variance_ratios = model.explained_variance_ratio();
+        assert_eq!(variance_ratios.len(), model.components());
+        let variance_ratio_sum: f64 = variance_ratios.iter().copied().sum();
+        assert!(
+            variance_ratio_sum <= 1.0 + 1e-9,
+            "explained variance ratios must sum to at most 1 (observed {variance_ratio_sum})"
+        );
+
+        let mut inference_source =
+            DenseBlockSource::new(&inference_matrix, inference_count, n_variants)
+                .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let projection = model
+            .projector()
+            .project_with_options(&mut inference_source, &ProjectionOptions::default())
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+
+        assert_eq!(projection.scores.nrows(), inference_count);
+        assert_eq!(projection.scores.ncols(), model.components());
+        assert!(projection.alignment.is_none());
+
+        let scores = projection.scores.as_ref();
+        for row in 0..scores.nrows() {
+            for col in 0..scores.ncols() {
+                let value = scores[(row, col)];
+                assert!(
+                    value.is_finite(),
+                    "projection score for sample {row} PC {col} should be finite"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_dense_matrix(source: &mut DatasetBlockSource) -> Result<Vec<f64>, Box<dyn Error>> {
+        let n_samples = source.n_samples();
+        let n_variants = source.n_variants();
+        let block_capacity = DEFAULT_BLOCK_WIDTH.max(1);
+        let mut storage = vec![0.0f64; n_samples * block_capacity];
+        let mut dense = vec![0.0f64; n_samples * n_variants];
+        let mut emitted = 0usize;
+
+        while emitted < n_variants {
+            let filled = source
+                .next_block_into(block_capacity, &mut storage)
+                .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+            if filled == 0 {
+                break;
+            }
+
+            for local_idx in 0..filled {
+                let src_offset = local_idx * n_samples;
+                let dest_offset = (emitted + local_idx) * n_samples;
+                dense[dest_offset..dest_offset + n_samples]
+                    .copy_from_slice(&storage[src_offset..src_offset + n_samples]);
+            }
+
+            emitted += filled;
+        }
+
+        assert_eq!(
+            emitted, n_variants,
+            "expected to materialize all {n_variants} variants but only processed {emitted}"
+        );
+
+        Ok(dense)
+    }
+
+    fn slice_samples_into_dense(
+        data: &[f64],
+        n_samples: usize,
+        n_variants: usize,
+        selected: &[usize],
+    ) -> Vec<f64> {
+        let mut subset = vec![0.0f64; selected.len() * n_variants];
+        for variant_idx in 0..n_variants {
+            let column = &data[variant_idx * n_samples..(variant_idx + 1) * n_samples];
+            let dest_offset = variant_idx * selected.len();
+            for (row_offset, &sample_idx) in selected.iter().enumerate() {
+                subset[dest_offset + row_offset] = column[sample_idx];
+            }
+        }
+        subset
+    }
 }
