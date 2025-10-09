@@ -11,7 +11,8 @@ use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BcfCompression, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
+    BcfCompression, BedSource, TextSource, list_bcf_paths, open_bcf_source, open_bed_source,
+    open_text_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
@@ -689,7 +690,8 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 #[derive(Debug)]
 pub struct BcfDataset {
     input_path: PathBuf,
-    header: Arc<vcf::Header>,
+    parts: Vec<PathBuf>,
+    sample_names: Arc<Vec<String>>,
     samples: Vec<SampleRecord>,
     n_variants: usize,
     output_hint: OutputHint,
@@ -708,57 +710,83 @@ impl BcfDataset {
         let input_path = path.to_path_buf();
         let output_hint = compute_output_hint(path);
 
-        let (mut reader, compression) = create_bcf_reader(&input_path).map_err(|err| {
-            print_bcf_diagnostics(&input_path, None, "initializing BCF reader", &err);
-            err
-        })?;
-        let header = Arc::new(reader.read_header().map_err(|err| {
-            print_bcf_diagnostics(&input_path, Some(compression), "reading BCF header", &err);
-            err
-        })?);
-        let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
-        if sample_names.is_empty() {
-            return Err(BcfIoError::MissingSamples);
-        }
-        let samples = sample_names
-            .iter()
-            .map(|name| SampleRecord {
-                family_id: name.clone(),
-                individual_id: name.clone(),
-                paternal_id: "0".to_string(),
-                maternal_id: "0".to_string(),
-                sex: "0".to_string(),
-                phenotype: "-9".to_string(),
-            })
-            .collect::<Vec<_>>();
+        let parts = list_bcf_paths(path).map_err(BcfIoError::from)?;
 
+        let mut expected_sample_names: Option<Vec<String>> = None;
+        let mut samples: Option<Vec<SampleRecord>> = None;
         let mut record = RecordBuf::default();
         let mut n_variants = 0usize;
-        loop {
-            let bytes = reader
-                .read_record_buf(header.as_ref(), &mut record)
-                .map_err(|err| {
-                    print_bcf_diagnostics(
-                        &input_path,
-                        Some(compression),
-                        "scanning BCF records to count variants",
-                        &err,
-                    );
-                    err
-                })?;
-            if bytes == 0 {
-                break;
+
+        for part in &parts {
+            let (mut reader, compression) = create_bcf_reader_for_file(part).map_err(|err| {
+                print_bcf_diagnostics(part, None, "initializing BCF reader", &err);
+                err
+            })?;
+            let header = reader.read_header().map_err(|err| {
+                print_bcf_diagnostics(part, Some(compression), "reading BCF header", &err);
+                err
+            })?;
+
+            if expected_sample_names.is_none() {
+                let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
+                if sample_names.is_empty() {
+                    return Err(BcfIoError::MissingSamples);
+                }
+                let sample_records = sample_names
+                    .iter()
+                    .map(|name| SampleRecord {
+                        family_id: name.clone(),
+                        individual_id: name.clone(),
+                        paternal_id: "0".to_string(),
+                        maternal_id: "0".to_string(),
+                        sex: "0".to_string(),
+                        phenotype: "-9".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                expected_sample_names = Some(sample_names);
+                samples = Some(sample_records);
+            } else {
+                let expected = expected_sample_names
+                    .as_ref()
+                    .expect("sample names initialized");
+                let observed = header.sample_names();
+                if observed.len() != expected.len()
+                    || !observed.iter().zip(expected.iter()).all(|(a, b)| a == b)
+                {
+                    return Err(BcfIoError::HeaderMismatch);
+                }
             }
-            n_variants += 1;
+
+            loop {
+                let bytes = reader
+                    .read_record_buf(&header, &mut record)
+                    .map_err(|err| {
+                        print_bcf_diagnostics(
+                            part,
+                            Some(compression),
+                            "scanning BCF records to count variants",
+                            &err,
+                        );
+                        err
+                    })?;
+                if bytes == 0 {
+                    break;
+                }
+                n_variants += 1;
+            }
         }
 
         if n_variants == 0 {
             return Err(BcfIoError::NoVariants);
         }
 
+        let expected_sample_names = expected_sample_names.expect("sample names captured");
+        let samples = samples.expect("sample records captured");
+
         Ok(Self {
             input_path,
-            header,
+            parts,
+            sample_names: Arc::new(expected_sample_names),
             samples,
             n_variants,
             output_hint,
@@ -783,9 +811,8 @@ impl BcfDataset {
 
     pub fn block_source(&self) -> Result<BcfVariantBlockSource, BcfIoError> {
         BcfVariantBlockSource::new(
-            self.input_path.clone(),
-            Arc::clone(&self.header),
-            self.samples.len(),
+            self.parts.clone(),
+            Arc::clone(&self.sample_names),
             self.n_variants,
         )
     }
@@ -808,11 +835,13 @@ impl BcfDataset {
 }
 
 pub struct BcfVariantBlockSource {
-    path: PathBuf,
-    header: Arc<vcf::Header>,
-    reader: DynBcfReader,
-    compression: BcfCompression,
+    parts: Vec<PathBuf>,
+    part_idx: usize,
+    reader: Option<DynBcfReader>,
+    compression: Option<BcfCompression>,
+    header: Option<Arc<vcf::Header>>,
     record: RecordBuf,
+    sample_names: Arc<Vec<String>>,
     n_samples: usize,
     n_variants: usize,
     emitted: usize,
@@ -821,7 +850,7 @@ pub struct BcfVariantBlockSource {
 impl std::fmt::Debug for BcfVariantBlockSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BcfVariantBlockSource")
-            .field("path", &self.path)
+            .field("current_part", &self.parts.get(self.part_idx))
             .field("n_samples", &self.n_samples)
             .field("n_variants", &self.n_variants)
             .field("emitted", &self.emitted)
@@ -832,62 +861,62 @@ impl std::fmt::Debug for BcfVariantBlockSource {
 
 impl BcfVariantBlockSource {
     fn new(
-        path: PathBuf,
-        header: Arc<vcf::Header>,
-        n_samples: usize,
+        parts: Vec<PathBuf>,
+        sample_names: Arc<Vec<String>>,
         n_variants: usize,
     ) -> Result<Self, BcfIoError> {
-        let (mut reader, compression) = create_bcf_reader(&path).map_err(|err| {
-            print_bcf_diagnostics(&path, None, "initializing BCF reader", &err);
-            err
-        })?;
-        let reopened = reader.read_header().map_err(|err| {
-            print_bcf_diagnostics(&path, Some(compression), "reading BCF header", &err);
-            err
-        })?;
-        verify_header(&reopened, header.as_ref()).map_err(|err| {
-            print_bcf_diagnostics(&path, Some(compression), "verifying BCF header", &err);
-            err
-        })?;
-        Ok(Self {
-            path,
-            header,
-            reader,
-            compression,
+        let n_samples = sample_names.len();
+        let mut source = Self {
+            parts,
+            part_idx: 0,
+            reader: None,
+            compression: None,
+            header: None,
             record: RecordBuf::default(),
+            sample_names,
             n_samples,
             n_variants,
             emitted: 0,
-        })
+        };
+        if !source.parts.is_empty() {
+            source.open_part(0)?;
+        }
+        Ok(source)
     }
 
-    fn reopen(&mut self) -> Result<(), BcfIoError> {
-        let (mut reader, compression) = create_bcf_reader(&self.path).map_err(|err| {
-            print_bcf_diagnostics(&self.path, None, "reinitializing BCF reader", &err);
+    fn open_part(&mut self, idx: usize) -> Result<(), BcfIoError> {
+        self.part_idx = idx;
+        if idx >= self.parts.len() {
+            self.reader = None;
+            self.compression = None;
+            self.header = None;
+            return Ok(());
+        }
+
+        let path = &self.parts[idx];
+        let (mut reader, compression) = create_bcf_reader_for_file(path).map_err(|err| {
+            print_bcf_diagnostics(path, None, "initializing BCF reader", &err);
             err
         })?;
         let header = reader.read_header().map_err(|err| {
-            print_bcf_diagnostics(
-                &self.path,
-                Some(compression),
-                "reading BCF header on reopen",
-                &err,
-            );
+            print_bcf_diagnostics(path, Some(compression), "reading BCF header", &err);
             err
         })?;
-        verify_header(&header, self.header.as_ref()).map_err(|err| {
-            print_bcf_diagnostics(
-                &self.path,
-                Some(compression),
-                "verifying BCF header on reopen",
-                &err,
-            );
-            err
-        })?;
-        self.reader = reader;
-        self.compression = compression;
+
+        let observed = header.sample_names();
+        if observed.len() != self.sample_names.len()
+            || !observed
+                .iter()
+                .zip(self.sample_names.iter())
+                .all(|(a, b)| a == b)
+        {
+            return Err(BcfIoError::HeaderMismatch);
+        }
+
+        self.reader = Some(reader);
+        self.compression = Some(compression);
+        self.header = Some(Arc::new(header));
         self.record = RecordBuf::default();
-        self.emitted = 0;
         Ok(())
     }
 }
@@ -904,7 +933,14 @@ impl VariantBlockSource for BcfVariantBlockSource {
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
-        self.reopen()
+        self.emitted = 0;
+        if self.parts.is_empty() {
+            self.reader = None;
+            self.compression = None;
+            self.header = None;
+            return Ok(());
+        }
+        self.open_part(0)
     }
 
     fn next_block_into(
@@ -918,26 +954,43 @@ impl VariantBlockSource for BcfVariantBlockSource {
         if self.emitted >= self.n_variants {
             return Ok(0);
         }
-
-        let capacity = self.n_variants - self.emitted;
-        let target = capacity.min(max_variants);
         let mut filled = 0usize;
-        while filled < target {
-            let bytes = self
-                .reader
-                .read_record_buf(self.header.as_ref(), &mut self.record)
-                .map_err(|err| {
-                    print_bcf_diagnostics(
-                        &self.path,
-                        Some(self.compression),
-                        "reading BCF record block",
-                        &err,
-                    );
-                    err
-                })?;
-            if bytes == 0 {
+        while filled < max_variants && self.emitted + filled < self.n_variants {
+            if self.reader.is_none() {
                 break;
             }
+
+            let header = match self.header.as_ref() {
+                Some(header) => Arc::clone(header),
+                None => break,
+            };
+            let reader = match self.reader.as_mut() {
+                Some(reader) => reader,
+                None => break,
+            };
+
+            let compression = self.compression;
+            let path = self.parts.get(self.part_idx).cloned();
+            let bytes = reader
+                .read_record_buf(header.as_ref(), &mut self.record)
+                .map_err(|err| {
+                    if let Some(part_path) = path.as_ref() {
+                        print_bcf_diagnostics(
+                            part_path,
+                            compression,
+                            "reading BCF record block",
+                            &err,
+                        );
+                    }
+                    err
+                })?;
+
+            if bytes == 0 {
+                let next_idx = self.part_idx + 1;
+                self.open_part(next_idx)?;
+                continue;
+            }
+
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             decode_bcf_record(&self.record, dest, self.n_samples)?;
@@ -994,7 +1047,7 @@ fn compute_output_hint(path: &Path) -> OutputHint {
     }
 }
 
-fn create_bcf_reader(path: &Path) -> Result<(DynBcfReader, BcfCompression), BcfIoError> {
+fn create_bcf_reader_for_file(path: &Path) -> Result<(DynBcfReader, BcfCompression), BcfIoError> {
     let source = open_bcf_source(path)?;
     let compression = source.compression();
     let reader: Box<dyn Read + Send> = match compression {
@@ -1039,15 +1092,6 @@ fn print_bcf_diagnostics(
             );
         }
     }
-}
-
-fn verify_header(observed: &vcf::Header, expected: &vcf::Header) -> Result<(), BcfIoError> {
-    let observed_samples = observed.sample_names();
-    let expected_samples = expected.sample_names();
-    if observed_samples != expected_samples {
-        return Err(BcfIoError::HeaderMismatch);
-    }
-    Ok(())
 }
 
 fn decode_bcf_record(
@@ -1279,10 +1323,10 @@ fn is_remote_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::files::BcfSource;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::Path;
-    use crate::shared::files::BcfSource;
     use tempfile::tempdir;
 
     fn fake_bcf_header() -> Vec<u8> {

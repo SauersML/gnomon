@@ -364,28 +364,41 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
     }
 }
 
-pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+pub fn list_bcf_paths(path: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     if is_gcs_path(path) {
-        return open_remote_bcf_source(path);
+        let (bucket, objects) = resolve_remote_bcf_objects(path)?;
+        let mut parts = Vec::with_capacity(objects.len());
+        for object in objects {
+            parts.push(PathBuf::from(format!("gs://{bucket}/{object}")));
+        }
+        return Ok(parts);
     }
 
     if path.is_dir() {
         let mut entries = gather_local_bcf_files(path)?;
         entries.sort_by(|a, b| compare_paths(a, b));
-        let readers = entries
-            .into_iter()
-            .map(|p| open_local_bcf_reader(&p))
-            .collect::<Result<Vec<_>, _>>()?;
-        BcfSource::from_readers(readers)
+        Ok(entries)
     } else if has_bcf_extension(path) {
-        let reader = open_local_bcf_reader(path)?;
-        BcfSource::from_readers(vec![reader])
+        Ok(vec![path.to_path_buf()])
     } else {
         Err(PipelineError::Io(format!(
             "Path {} is not a .bcf file or directory",
             path.display()
         )))
     }
+}
+
+pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+    if is_gcs_path(path) {
+        return open_remote_bcf_source(path);
+    }
+
+    let entries = list_bcf_paths(path)?;
+    let readers = entries
+        .into_iter()
+        .map(|p| open_local_bcf_reader(&p))
+        .collect::<Result<Vec<_>, _>>()?;
+    BcfSource::from_readers(readers)
 }
 
 fn is_gcs_path(path: &Path) -> bool {
@@ -596,34 +609,7 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
     }
 }
 
-fn open_remote_bcf_prefix(
-    bucket: &str,
-    prefix: &str,
-) -> Result<Vec<PreparedBcfReader>, PipelineError> {
-    let mut objects = list_remote_bcf_objects(bucket, prefix)?;
-    if objects.is_empty() {
-        let location = if prefix.is_empty() {
-            format!("gs://{bucket}")
-        } else {
-            format!("gs://{bucket}/{prefix}")
-        };
-        return Err(PipelineError::Io(format!(
-            "No .bcf objects found under {location}"
-        )));
-    }
-
-    objects.sort_by(|a, b| compare(a, b));
-
-    let mut readers = Vec::with_capacity(objects.len());
-    for object in objects {
-        let source = RemoteByteRangeSource::new(bucket, &object)?;
-        readers.push(prepare_remote_bcf_reader(bucket, &object, source)?);
-    }
-
-    Ok(readers)
-}
-
-fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), PipelineError> {
     let uri = path
         .to_str()
         .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
@@ -637,26 +623,53 @@ fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
     let treat_as_directory =
         normalized.ends_with('/') || object.is_empty() || !lower.ends_with(".bcf");
 
+    let mut objects: Vec<String>;
+
     if !treat_as_directory {
         match RemoteByteRangeSource::new(&bucket, &object) {
-            Ok(source) => {
-                let reader = prepare_remote_bcf_reader(&bucket, &object, source)?;
-                return BcfSource::from_readers(vec![reader]);
+            Ok(_) => {
+                objects = vec![object.clone()];
             }
             Err(err) => {
                 if is_not_found_error(&err) {
                     let prefix = normalize_gcs_prefix(&object);
-                    let readers = open_remote_bcf_prefix(&bucket, &prefix)?;
-                    return BcfSource::from_readers(readers);
+                    objects = list_remote_bcf_objects(&bucket, &prefix)?;
+                    if objects.is_empty() {
+                        return Err(no_remote_bcf_objects_error(&bucket, &prefix));
+                    }
                 } else {
                     return Err(err);
                 }
             }
         }
+    } else {
+        let prefix = normalize_gcs_prefix(&object);
+        objects = list_remote_bcf_objects(&bucket, &prefix)?;
+        if objects.is_empty() {
+            return Err(no_remote_bcf_objects_error(&bucket, &prefix));
+        }
     }
 
-    let prefix = normalize_gcs_prefix(&object);
-    let readers = open_remote_bcf_prefix(&bucket, &prefix)?;
+    objects.sort_by(|a, b| compare(a, b));
+    Ok((bucket, objects))
+}
+
+fn no_remote_bcf_objects_error(bucket: &str, prefix: &str) -> PipelineError {
+    let location = if prefix.is_empty() {
+        format!("gs://{bucket}")
+    } else {
+        format!("gs://{bucket}/{prefix}")
+    };
+    PipelineError::Io(format!("No .bcf objects found under {location}"))
+}
+
+fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+    let (bucket, objects) = resolve_remote_bcf_objects(path)?;
+    let mut readers = Vec::with_capacity(objects.len());
+    for object in objects {
+        let source = RemoteByteRangeSource::new(&bucket, &object)?;
+        readers.push(prepare_remote_bcf_reader(&bucket, &object, source)?);
+    }
     BcfSource::from_readers(readers)
 }
 
