@@ -4,7 +4,7 @@ use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
-use faer::col::{Col, ColRef};
+use faer::col::Col;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
@@ -201,48 +201,7 @@ impl HweScaler {
         let end = variant_range.end;
         let freqs = &self.frequencies[start..end];
         let scales = &self.scales[start..end];
-        let filled = freqs.len();
-
-        debug_assert_eq!(filled, block.ncols());
-        let block = block.subcols_mut(0, filled);
-
-        let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
-            if inv == 0.0 {
-                column.fill(0.0);
-                return;
-            }
-
-            let contiguous = column
-                .try_as_col_major_mut()
-                .expect("projection block column must be contiguous");
-            let values = contiguous.as_slice_mut();
-            standardize_column_simd(values, mean, inv);
-        };
-
-        let use_parallel = filled >= 32 && par.degree() > 1;
-
-        if use_parallel {
-            block
-                .par_col_iter_mut()
-                .enumerate()
-                .for_each(|(idx, column)| {
-                    let freq = freqs[idx];
-                    let scale = scales[idx];
-                    let mean = 2.0 * freq;
-                    let denom = scale.max(HWE_SCALE_FLOOR);
-                    let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                    apply_standardization(column, mean, inv);
-                });
-        } else {
-            for (idx, column) in block.col_iter_mut().enumerate() {
-                let freq = freqs[idx];
-                let scale = scales[idx];
-                let mean = 2.0 * freq;
-                let denom = scale.max(HWE_SCALE_FLOOR);
-                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                apply_standardization(column, mean, inv);
-            }
-        }
+        standardize_block_impl(block, freqs, scales, par);
     }
 
     pub(crate) fn standardize_block_with_mask(
@@ -274,6 +233,175 @@ impl HweScaler {
         }
 
         self.standardize_block(block, variant_range, par);
+    }
+}
+
+fn standardize_block_impl(
+    block: MatMut<'_, f64>,
+    freqs: &[f64],
+    scales: &[f64],
+    par: Par,
+) {
+    let filled = freqs.len();
+
+    debug_assert_eq!(filled, block.ncols());
+    debug_assert_eq!(filled, scales.len());
+    let block = block.subcols_mut(0, filled);
+
+    let apply_standardization = |mut column: ColMut<'_, f64>, mean: f64, inv: f64| {
+        if inv == 0.0 {
+            column.fill(0.0);
+            return;
+        }
+
+        let contiguous = column
+            .try_as_col_major_mut()
+            .expect("projection block column must be contiguous");
+        let values = contiguous.as_slice_mut();
+        standardize_column_simd(values, mean, inv);
+    };
+
+    let use_parallel = filled >= 32 && par.degree() > 1;
+
+    if use_parallel {
+        block
+            .par_col_iter_mut()
+            .enumerate()
+            .for_each(|(idx, column)| {
+                let freq = freqs[idx];
+                let scale = scales[idx];
+                let mean = 2.0 * freq;
+                let denom = scale.max(HWE_SCALE_FLOOR);
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                apply_standardization(column, mean, inv);
+            });
+    } else {
+        for (idx, column) in block.col_iter_mut().enumerate() {
+            let freq = freqs[idx];
+            let scale = scales[idx];
+            let mean = 2.0 * freq;
+            let denom = scale.max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            apply_standardization(column, mean, inv);
+        }
+    }
+}
+
+struct VariantStatsCache {
+    frequencies: Vec<f64>,
+    scales: Vec<f64>,
+    block_sums: Vec<f64>,
+    block_calls: Vec<usize>,
+    computed: bool,
+}
+
+impl VariantStatsCache {
+    fn new(n_variants: usize, block_capacity: usize) -> Self {
+        Self {
+            frequencies: vec![0.0; n_variants],
+            scales: vec![HWE_SCALE_FLOOR; n_variants],
+            block_sums: vec![0.0; block_capacity],
+            block_calls: vec![0usize; block_capacity],
+            computed: false,
+        }
+    }
+
+    fn is_computed(&self) -> bool {
+        self.computed
+    }
+
+    fn ensure_statistics(
+        &mut self,
+        block: MatRef<'_, f64>,
+        variant_range: Range<usize>,
+        par: Par,
+    ) {
+        if self.computed {
+            return;
+        }
+
+        let filled = block.ncols();
+        let sums_slice = &mut self.block_sums[..filled];
+        let calls_slice = &mut self.block_calls[..filled];
+
+        let use_parallel = filled >= 32 && par.degree() > 1;
+
+        if use_parallel {
+            sums_slice
+                .par_iter_mut()
+                .zip(calls_slice.par_iter_mut())
+                .zip(block.par_col_iter())
+                .for_each(|((sum_slot, calls_slot), column)| {
+                    let contiguous = column
+                        .try_as_col_major()
+                        .expect("variant block column must be contiguous");
+                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                    *sum_slot = sum;
+                    *calls_slot = calls;
+                });
+        } else {
+            sums_slice
+                .iter_mut()
+                .zip(calls_slice.iter_mut())
+                .zip(block.col_iter())
+                .for_each(|((sum_slot, calls_slot), column)| {
+                    let contiguous = column
+                        .try_as_col_major()
+                        .expect("variant block column must be contiguous");
+                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                    *sum_slot = sum;
+                    *calls_slot = calls;
+                });
+        }
+
+        for (local_col, (&sum, &calls)) in sums_slice
+            .iter()
+            .zip(calls_slice.iter())
+            .enumerate()
+        {
+            let variant_index = variant_range.start + local_col;
+            if calls == 0 {
+                self.frequencies[variant_index] = 0.0;
+                self.scales[variant_index] = HWE_SCALE_FLOOR;
+                continue;
+            }
+
+            let mean_genotype = sum / (calls as f64);
+            let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
+            let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
+            self.frequencies[variant_index] = allele_freq;
+            let derived_scale = variance.sqrt();
+            self.scales[variant_index] = if derived_scale < HWE_SCALE_FLOOR {
+                HWE_SCALE_FLOOR
+            } else {
+                derived_scale
+            };
+        }
+    }
+
+    fn standardize_block(
+        &self,
+        block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        par: Par,
+    ) {
+        let start = variant_range.start;
+        let end = variant_range.end;
+        let freqs = &self.frequencies[start..end];
+        let scales = &self.scales[start..end];
+        standardize_block_impl(block, freqs, scales, par);
+    }
+
+    fn mark_computed(&mut self) {
+        self.computed = true;
+    }
+
+    fn into_scaler(self) -> Option<HweScaler> {
+        if self.computed {
+            Some(HweScaler::new(self.frequencies, self.scales))
+        } else {
+            None
+        }
     }
 }
 
@@ -416,19 +544,20 @@ impl HwePcaModel {
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
         let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
-        let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+        let block_storage = vec![0.0f64; n_samples * block_capacity];
 
-        let scaler =
-            stream_allele_statistics(source, block_capacity, &mut block_storage, progress, par)?;
+        progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants);
+        progress.on_stage_finish(FitProgressStage::AlleleStatistics);
 
-        let operator =
-            StandardizedCovarianceOp::new(source, &scaler, block_capacity, block_storage);
+        let operator = StandardizedCovarianceOp::new(source, block_capacity, block_storage);
 
         progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
         let decomposition_result = compute_covariance_eigenpairs(&operator, par);
-        let (source, mut block_storage) = operator.into_parts();
+        let (source, mut block_storage, scaler_opt) = operator.into_parts();
         let decomposition = decomposition_result?;
         progress.on_stage_finish(FitProgressStage::GramMatrix);
+
+        let scaler = scaler_opt.expect("covariance operator statistics missing after execution");
 
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
@@ -534,12 +663,12 @@ where
     S::Error: Error + Send + Sync + 'static,
 {
     source: *mut S,
-    scaler: &'a HweScaler,
     block_storage: UnsafeCell<Option<Vec<f64>>>,
     n_samples: usize,
     n_variants: usize,
     block_capacity: usize,
     scale: f64,
+    stats: UnsafeCell<VariantStatsCache>,
     error: UnsafeCell<Option<HwePcaError>>,
     marker: PhantomData<&'a mut S>,
 }
@@ -551,7 +680,6 @@ where
 {
     fn new(
         source: &'a mut S,
-        scaler: &'a HweScaler,
         block_capacity: usize,
         block_storage: Vec<f64>,
     ) -> Self {
@@ -565,25 +693,27 @@ where
         let scale = 1.0 / ((n_samples - 1) as f64);
         Self {
             source: source as *mut S,
-            scaler,
             block_storage: UnsafeCell::new(Some(block_storage)),
             n_samples,
             n_variants,
             block_capacity,
             scale,
+            stats: UnsafeCell::new(VariantStatsCache::new(n_variants, block_capacity)),
             error: UnsafeCell::new(None),
             marker: PhantomData,
         }
     }
 
-    fn into_parts(self) -> (&'a mut S, Vec<f64>) {
+    fn into_parts(self) -> (&'a mut S, Vec<f64>, Option<HweScaler>) {
         let source = self.source;
         let storage = unsafe {
             (*self.block_storage.get())
                 .take()
                 .expect("block storage already taken")
         };
-        (unsafe { &mut *source }, storage)
+        let stats = self.stats.into_inner();
+        let scaler = stats.into_scaler();
+        (unsafe { &mut *source }, storage, scaler)
     }
 
     fn take_error(&self) -> Option<HwePcaError> {
@@ -608,6 +738,26 @@ where
 
     fn n_samples(&self) -> usize {
         self.n_samples
+    }
+
+    fn stats_computed(&self) -> bool {
+        unsafe { (*self.stats.get()).is_computed() }
+    }
+
+    fn standardize_block_in_place(
+        &self,
+        block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        par: Par,
+    ) {
+        let stats = unsafe { &mut *self.stats.get() };
+        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+        stats.standardize_block(block, variant_range, par);
+    }
+
+    fn mark_stats_computed(&self) {
+        let stats = unsafe { &mut *self.stats.get() };
+        stats.mark_computed();
     }
 }
 
@@ -690,6 +840,8 @@ where
 
         let mut processed = 0usize;
 
+        let stats_ready = self.stats_computed();
+
         loop {
             let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
                 Ok(filled) => filled,
@@ -707,8 +859,8 @@ where
             let block_slice = &mut block_storage[..self.n_samples * filled];
             let mut block =
                 MatMut::from_column_major_slice_mut(block_slice, self.n_samples, filled);
-            self.scaler
-                .standardize_block(block.as_mut(), processed..processed + filled, par);
+            let variant_range = processed..processed + filled;
+            self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
 
             let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
@@ -735,6 +887,10 @@ where
 
         if processed != self.n_variants {
             self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
+        }
+
+        if !stats_ready {
+            self.mark_stats_computed();
         }
     }
 
@@ -949,9 +1105,8 @@ where
             filled,
         );
 
-        operator
-            .scaler
-            .standardize_block(block.as_mut(), processed..processed + filled, par);
+        let variant_range = processed..processed + filled;
+        operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
 
         matmul(
             covariance.as_mut(),
@@ -969,6 +1124,10 @@ where
         return Err(HwePcaError::InvalidInput(
             "VariantBlockSource terminated early during covariance accumulation",
         ));
+    }
+
+    if !operator.stats_computed() {
+        operator.mark_stats_computed();
     }
 
     Ok(covariance)
@@ -1040,135 +1199,6 @@ where
     }
 
     Ok((info, eigvals, eigvecs))
-}
-
-fn stream_allele_statistics<S, P>(
-    source: &mut S,
-    block_capacity: usize,
-    block_storage: &mut [f64],
-    progress: &mut P,
-    par: Par,
-) -> Result<HweScaler, HwePcaError>
-where
-    S: VariantBlockSource,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver,
-{
-    let n_samples = source.n_samples();
-    let n_variants = source.n_variants();
-    let mut allele_sums = vec![0.0f64; n_variants];
-    let mut allele_counts = vec![0usize; n_variants];
-    let mut block_sums = vec![0.0f64; block_capacity];
-    let mut block_calls = vec![0usize; block_capacity];
-    let mut processed = 0usize;
-
-    progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants);
-
-    source
-        .reset()
-        .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-
-    loop {
-        let filled = source
-            .next_block_into(block_capacity, block_storage)
-            .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-        if filled == 0 {
-            break;
-        }
-        if processed + filled > n_variants {
-            return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported",
-            ));
-        }
-
-        let block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-
-        let block_ref = block.as_ref();
-        let sums_slice = &mut block_sums[..filled];
-        let calls_slice = &mut block_calls[..filled];
-
-        let use_parallel = filled >= 32 && par.degree() > 1;
-        if use_parallel {
-            sums_slice
-                .par_iter_mut()
-                .zip(calls_slice.par_iter_mut())
-                .zip(block_ref.par_col_iter())
-                .for_each(|((sum_slot, calls_slot), column)| {
-                    let contiguous = column
-                        .try_as_col_major()
-                        .expect("variant block column must be contiguous");
-                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
-                    *sum_slot = sum;
-                    *calls_slot = calls;
-                });
-        } else {
-            sums_slice
-                .iter_mut()
-                .zip(calls_slice.iter_mut())
-                .zip(block_ref.col_iter())
-                .for_each(|((sum_slot, calls_slot), column)| {
-                    let contiguous = column
-                        .try_as_col_major()
-                        .expect("variant block column must be contiguous");
-                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
-                    *sum_slot = sum;
-                    *calls_slot = calls;
-                });
-        }
-
-        for (local_col, (&sum, &calls)) in sums_slice.iter().zip(calls_slice.iter()).enumerate() {
-            let variant_index = processed + local_col;
-            allele_sums[variant_index] += sum;
-            allele_counts[variant_index] += calls;
-        }
-
-        processed += filled;
-        progress.on_stage_advance(FitProgressStage::AlleleStatistics, processed);
-    }
-
-    if processed != n_variants {
-        return Err(HwePcaError::InvalidInput(
-            "VariantBlockSource terminated early during allele counting",
-        ));
-    }
-
-    progress.on_stage_finish(FitProgressStage::AlleleStatistics);
-
-    let mut frequencies = vec![0.0f64; n_variants];
-    let mut scales = vec![1.0f64; n_variants];
-
-    let mut freq_col = ColMut::from_slice_mut(&mut frequencies);
-    let mut scale_col = ColMut::from_slice_mut(&mut scales);
-    let sums_col = ColRef::from_slice(&allele_sums);
-    let calls_col = ColRef::from_slice(&allele_counts);
-
-    zip!(freq_col.rb_mut(), scale_col.rb_mut(), sums_col, calls_col).for_each(
-        |unzip!(freq, scale, sum, calls)| {
-            let calls = *calls;
-            if calls == 0 {
-                *freq = 0.0;
-                *scale = HWE_SCALE_FLOOR;
-                return;
-            }
-
-            let mean_genotype = *sum / (calls as f64);
-            let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
-            let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
-            *freq = allele_freq;
-            let derived_scale = variance.sqrt();
-            *scale = if derived_scale < HWE_SCALE_FLOOR {
-                HWE_SCALE_FLOOR
-            } else {
-                derived_scale
-            };
-        },
-    );
-
-    Ok(HweScaler::new(frequencies, scales))
 }
 
 fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
