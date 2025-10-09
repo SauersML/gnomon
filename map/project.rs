@@ -73,9 +73,9 @@ impl HwePcaModel {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
-        let mut progress = NoopProjectionProgress::default();
+        let progress = NoopProjectionProgress::default();
         self.projector()
-            .project_with_options_and_progress(source, opts, &mut progress)
+            .project_with_options_and_progress(source, opts, &progress)
     }
 }
 impl<'model> HwePcaProjector<'model> {
@@ -98,15 +98,15 @@ impl<'model> HwePcaProjector<'model> {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
-        let mut progress = NoopProjectionProgress::default();
-        self.project_with_options_and_progress(source, opts, &mut progress)
+        let progress = NoopProjectionProgress::default();
+        self.project_with_options_and_progress(source, opts, &progress)
     }
 
     pub fn project_with_options_and_progress<S, P>(
         &self,
         source: &mut S,
         opts: &ProjectionOptions,
-        progress: &mut P,
+        progress: &P,
     ) -> Result<ProjectionResult, HwePcaError>
     where
         S: VariantBlockSource,
@@ -142,8 +142,8 @@ impl<'model> HwePcaProjector<'model> {
         S::Error: Error + Send + Sync + 'static,
     {
         let options = ProjectionOptions::default();
-        let mut progress = NoopProjectionProgress::default();
-        self.project_into_with_options_and_progress(source, scores, &options, None, &mut progress)
+        let progress = NoopProjectionProgress::default();
+        self.project_into_with_options_and_progress(source, scores, &options, None, &progress)
     }
 
     fn project_into_with_options_and_progress<S, P>(
@@ -152,7 +152,7 @@ impl<'model> HwePcaProjector<'model> {
         mut scores: MatMut<'_, f64>,
         opts: &ProjectionOptions,
         mut alignment_out: Option<MatMut<'_, f64>>,
-        progress: &mut P,
+        progress: &P,
     ) -> Result<(), HwePcaError>
     where
         S: VariantBlockSource,
