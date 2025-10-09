@@ -1503,7 +1503,7 @@ fn create_variant_reader_for_file(
         VariantFormat::Vcf => {
             let reader: Box<dyn BufRead + Send> = match compression {
                 VariantCompression::Plain => Box::new(BufReader::new(source)),
-                VariantCompression::Bgzf => Box::new(BgzfReader::new(source)),
+                VariantCompression::Bgzf => Box::new(BgzfReader::new(BufReader::new(source))),
             };
             VariantStreamReader::Vcf(VcfReader::new(reader))
         }
@@ -1520,7 +1520,7 @@ fn print_variant_diagnostics(
     err: &(dyn std::error::Error + '_),
 ) {
     let location = if is_remote_path(path) {
-        "remote (GCS)"
+        "remote (GCS/HTTP)"
     } else if path.is_dir() {
         "local directory"
     } else {
@@ -1818,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn bcf_source_reads_single_file_without_modification() {
+    fn variant_source_reads_single_file_without_modification() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sample.bcf");
         let header = write_fake_bcf(&path, &[0x01, 0x02, 0x03]).unwrap();
@@ -1832,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn bcf_source_skips_headers_when_concatenating_directory() {
+    fn variant_source_skips_headers_when_concatenating_directory() {
         let dir = tempdir().unwrap();
         let files = [
             ("chr2.bcf", vec![0x20]),
