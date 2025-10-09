@@ -6,7 +6,8 @@ use super::progress::{
 };
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatMut, Par};
+use faer::prelude::ReborrowMut;
+use faer::{Accum, Mat, MatMut, Par, unzip, zip};
 use std::error::Error;
 
 pub struct HwePcaProjector<'model> {
@@ -284,12 +285,10 @@ impl<'model> HwePcaProjector<'model> {
                     filled,
                     components,
                 );
-                for col in 0..components {
-                    for row in 0..filled {
-                        let value = loadings_block[(row, col)];
-                        sq_block[(row, col)] = value * value;
-                    }
-                }
+                zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
+                    let value = *value;
+                    *sq = value * value;
+                });
 
                 if let Some(ref mut r2) = alignment_r2 {
                     let presence_block_ref = presence_block.as_ref();
@@ -334,46 +333,44 @@ impl<'model> HwePcaProjector<'model> {
         if let Some(r2) = alignment_r2 {
             match alignment_out.as_mut() {
                 Some(alignment_mat) => {
-                    for row in 0..n_samples {
-                        for col in 0..components {
-                            let mass = r2[(row, col)];
+                    zip!(scores.rb_mut(), r2.as_ref(), alignment_mat.rb_mut()).for_each(
+                        |unzip!(score, mass, align)| {
+                            let mass = *mass;
                             if mass > 0.0 {
                                 let norm = mass.sqrt();
-                                scores[(row, col)] /= norm;
-                                alignment_mat[(row, col)] = norm;
+                                *score /= norm;
+                                *align = norm;
                             } else {
                                 match opts.on_zero_alignment {
                                     ZeroAlignmentAction::Zero => {
-                                        scores[(row, col)] = 0.0;
+                                        *score = 0.0;
                                     }
                                     ZeroAlignmentAction::NaN => {
-                                        scores[(row, col)] = f64::NAN;
+                                        *score = f64::NAN;
                                     }
                                 }
-                                alignment_mat[(row, col)] = 0.0;
+                                *align = 0.0;
                             }
-                        }
-                    }
+                        },
+                    );
                 }
                 None => {
-                    for row in 0..n_samples {
-                        for col in 0..components {
-                            let mass = r2[(row, col)];
-                            if mass > 0.0 {
-                                let norm = mass.sqrt();
-                                scores[(row, col)] /= norm;
-                            } else {
-                                match opts.on_zero_alignment {
-                                    ZeroAlignmentAction::Zero => {
-                                        scores[(row, col)] = 0.0;
-                                    }
-                                    ZeroAlignmentAction::NaN => {
-                                        scores[(row, col)] = f64::NAN;
-                                    }
+                    zip!(scores.rb_mut(), r2.as_ref()).for_each(|unzip!(score, mass)| {
+                        let mass = *mass;
+                        if mass > 0.0 {
+                            let norm = mass.sqrt();
+                            *score /= norm;
+                        } else {
+                            match opts.on_zero_alignment {
+                                ZeroAlignmentAction::Zero => {
+                                    *score = 0.0;
+                                }
+                                ZeroAlignmentAction::NaN => {
+                                    *score = f64::NAN;
                                 }
                             }
                         }
-                    }
+                    });
                 }
             }
         } else if alignment_out.is_some() {

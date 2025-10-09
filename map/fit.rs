@@ -3,7 +3,7 @@ use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
-use faer::col::Col;
+use faer::col::{Col, ColRef};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::SelfAdjointEigen;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
@@ -267,19 +267,9 @@ impl HweScaler {
             .col_iter_mut()
             .zip(block_ref.subcols(0, filled).col_iter())
         {
-            let mut presence_slice = presence_col
-                .try_as_col_major_mut()
-                .expect("presence column must be contiguous");
-            let column_slice = column
-                .try_as_col_major()
-                .expect("projection column must be contiguous");
-            for (presence, &raw) in presence_slice
-                .as_mut()
-                .iter_mut()
-                .zip(column_slice.as_slice())
-            {
+            zip!(presence_col, column).for_each(|unzip!(presence, raw)| {
                 *presence = if raw.is_finite() { 1.0 } else { 0.0 };
-            }
+            });
         }
 
         self.standardize_block(block, variant_range, par);
@@ -427,7 +417,7 @@ impl HwePcaModel {
         let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
         let scaler =
-            stream_allele_statistics(source, block_capacity, &mut block_storage, progress)?;
+            stream_allele_statistics(source, block_capacity, &mut block_storage, progress, par)?;
 
         let operator =
             StandardizedCovarianceOp::new(source, &scaler, block_capacity, block_storage);
@@ -1046,6 +1036,7 @@ fn stream_allele_statistics<S, P>(
     block_capacity: usize,
     block_storage: &mut [f64],
     progress: &mut P,
+    par: Par,
 ) -> Result<HweScaler, HwePcaError>
 where
     S: VariantBlockSource,
@@ -1056,6 +1047,8 @@ where
     let n_variants = source.n_variants();
     let mut allele_sums = vec![0.0f64; n_variants];
     let mut allele_counts = vec![0usize; n_variants];
+    let mut block_sums = vec![0.0f64; block_capacity];
+    let mut block_calls = vec![0usize; block_capacity];
     let mut processed = 0usize;
 
     progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants);
@@ -1083,12 +1076,41 @@ where
             filled,
         );
 
-        for (local_col, column) in block.as_ref().col_iter().enumerate() {
+        let block_ref = block.as_ref();
+        let sums_slice = &mut block_sums[..filled];
+        let calls_slice = &mut block_calls[..filled];
+
+        let use_parallel = filled >= 32 && par.degree() > 1;
+        if use_parallel {
+            sums_slice
+                .par_iter_mut()
+                .zip(calls_slice.par_iter_mut())
+                .zip(block_ref.par_col_iter())
+                .for_each(|((sum_slot, calls_slot), column)| {
+                    let contiguous = column
+                        .try_as_col_major()
+                        .expect("variant block column must be contiguous");
+                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                    *sum_slot = sum;
+                    *calls_slot = calls;
+                });
+        } else {
+            sums_slice
+                .iter_mut()
+                .zip(calls_slice.iter_mut())
+                .zip(block_ref.col_iter())
+                .for_each(|((sum_slot, calls_slot), column)| {
+                    let contiguous = column
+                        .try_as_col_major()
+                        .expect("variant block column must be contiguous");
+                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                    *sum_slot = sum;
+                    *calls_slot = calls;
+                });
+        }
+
+        for (local_col, (&sum, &calls)) in sums_slice.iter().zip(calls_slice.iter()).enumerate() {
             let variant_index = processed + local_col;
-            let contiguous = column
-                .try_as_col_major()
-                .expect("variant block column must be contiguous");
-            let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
             allele_sums[variant_index] += sum;
             allele_counts[variant_index] += calls;
         }
@@ -1108,23 +1130,32 @@ where
     let mut frequencies = vec![0.0f64; n_variants];
     let mut scales = vec![1.0f64; n_variants];
 
-    for (idx, (&sum, &calls)) in allele_sums.iter().zip(&allele_counts).enumerate() {
-        if calls == 0 {
-            frequencies[idx] = 0.0;
-            scales[idx] = HWE_SCALE_FLOOR;
-            continue;
-        }
-        let mean_genotype = sum / (calls as f64);
-        let freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
-        let variance = (2.0 * freq * (1.0 - freq)).max(HWE_VARIANCE_EPSILON);
-        frequencies[idx] = freq;
-        let scale = variance.sqrt();
-        scales[idx] = if scale < HWE_SCALE_FLOOR {
-            HWE_SCALE_FLOOR
-        } else {
-            scale
-        };
-    }
+    let mut freq_col = ColMut::from_slice_mut(&mut frequencies);
+    let mut scale_col = ColMut::from_slice_mut(&mut scales);
+    let sums_col = ColRef::from_slice(&allele_sums);
+    let calls_col = ColRef::from_slice(&allele_counts);
+
+    zip!(freq_col.rb_mut(), scale_col.rb_mut(), sums_col, calls_col).for_each(
+        |unzip!(freq, scale, sum, calls)| {
+            let calls = *calls;
+            if calls == 0 {
+                *freq = 0.0;
+                *scale = HWE_SCALE_FLOOR;
+                return;
+            }
+
+            let mean_genotype = *sum / (calls as f64);
+            let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
+            let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
+            *freq = allele_freq;
+            let derived_scale = variance.sqrt();
+            *scale = if derived_scale < HWE_SCALE_FLOOR {
+                HWE_SCALE_FLOOR
+            } else {
+                derived_scale
+            };
+        },
+    );
 
     Ok(HweScaler::new(frequencies, scales))
 }
@@ -1213,13 +1244,18 @@ where
             par,
         );
 
-        for local_col in 0..filled {
-            let global_variant = processed + local_col;
-            for component in 0..n_components {
-                loadings[(global_variant, component)] =
-                    chunk[(local_col, component)] * inverse_singular[component];
+        {
+            let chunk_view = chunk.as_mut();
+            for (column, &inv_sigma) in chunk_view.col_iter_mut().zip(inverse_singular.iter()) {
+                zip!(column).for_each(|unzip!(value)| {
+                    *value *= inv_sigma;
+                });
             }
         }
+
+        loadings
+            .submatrix_mut(processed, 0, filled, n_components)
+            .copy_from(chunk.as_ref());
 
         processed += filled;
         progress.on_stage_advance(FitProgressStage::Loadings, processed);
