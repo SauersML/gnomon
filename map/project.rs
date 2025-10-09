@@ -6,7 +6,7 @@ use super::progress::{
 };
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatMut};
+use faer::{Accum, Mat, MatMut, Par};
 use std::error::Error;
 
 pub struct HwePcaProjector<'model> {
@@ -226,6 +226,7 @@ impl<'model> HwePcaProjector<'model> {
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
         let mut processed = 0usize;
+        let par = faer::get_global_parallelism();
         let mut alignment_r2 = if opts.missing_axis_renormalization {
             Some(Mat::zeros(n_samples, components))
         } else {
@@ -263,6 +264,7 @@ impl<'model> HwePcaProjector<'model> {
                     block.as_mut(),
                     processed..processed + filled,
                     presence_block.as_mut(),
+                    par,
                 );
 
                 let standardized = block.as_ref();
@@ -274,7 +276,7 @@ impl<'model> HwePcaProjector<'model> {
                     standardized,
                     loadings_block,
                     1.0,
-                    faer::get_global_parallelism(),
+                    par,
                 );
 
                 let mut sq_block = MatMut::from_column_major_slice_mut(
@@ -298,11 +300,11 @@ impl<'model> HwePcaProjector<'model> {
                         presence_block_ref,
                         sq_block_ref,
                         1.0,
-                        faer::get_global_parallelism(),
+                        par,
                     );
                 }
             } else {
-                standardize_projection_block(scaler, block.as_mut(), processed, filled);
+                standardize_projection_block(scaler, block.as_mut(), processed, filled, par);
 
                 let standardized = block.as_ref();
                 let loadings_block = loadings.submatrix(processed, 0, filled, components);
@@ -313,7 +315,7 @@ impl<'model> HwePcaProjector<'model> {
                     standardized,
                     loadings_block,
                     1.0,
-                    faer::get_global_parallelism(),
+                    par,
                 );
             }
 
@@ -393,8 +395,9 @@ fn standardize_projection_block(
     block: MatMut<'_, f64>,
     offset: usize,
     filled: usize,
+    par: Par,
 ) {
-    scaler.standardize_block(block, offset..offset + filled);
+    scaler.standardize_block(block, offset..offset + filled, par);
 }
 
 fn projection_block_capacity(

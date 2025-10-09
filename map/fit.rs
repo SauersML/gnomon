@@ -190,7 +190,12 @@ impl HweScaler {
         &self.scales
     }
 
-    pub(crate) fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>) {
+    pub(crate) fn standardize_block(
+        &self,
+        block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        par: Par,
+    ) {
         let start = variant_range.start;
         let end = variant_range.end;
         let freqs = &self.frequencies[start..end];
@@ -213,9 +218,7 @@ impl HweScaler {
             standardize_column_simd(values, mean, inv);
         };
 
-        let use_parallel = filled >= 32
-            && rayon::current_num_threads() > 1
-            && matches!(get_global_parallelism(), Par::Seq);
+        let use_parallel = filled >= 32 && par.degree() > 1;
 
         if use_parallel {
             block
@@ -246,6 +249,7 @@ impl HweScaler {
         block: MatMut<'_, f64>,
         variant_range: Range<usize>,
         presence_out: MatMut<'_, f64>,
+        par: Par,
     ) {
         let start = variant_range.start;
         let end = variant_range.end;
@@ -278,7 +282,7 @@ impl HweScaler {
             }
         }
 
-        self.standardize_block(block, variant_range);
+        self.standardize_block(block, variant_range, par);
     }
 }
 
@@ -418,7 +422,7 @@ impl HwePcaModel {
         }
 
         let parallelism_guard = ParallelismGuard::new();
-        if matches!(parallelism_guard.active_parallelism(), Par::Seq) {}
+        let par = parallelism_guard.active_parallelism();
         let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
         let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
@@ -429,7 +433,7 @@ impl HwePcaModel {
             StandardizedCovarianceOp::new(source, &scaler, block_capacity, block_storage);
 
         progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
-        let decomposition_result = compute_covariance_eigenpairs(&operator);
+        let decomposition_result = compute_covariance_eigenpairs(&operator, par);
         let (source, mut block_storage) = operator.into_parts();
         let decomposition = decomposition_result?;
         progress.on_stage_finish(FitProgressStage::GramMatrix);
@@ -454,6 +458,7 @@ impl HwePcaModel {
             decomposition.vectors.as_ref(),
             &singular_values,
             progress,
+            par,
         )?;
 
         Ok(Self {
@@ -702,7 +707,7 @@ where
             let mut block =
                 MatMut::from_column_major_slice_mut(block_slice, self.n_samples, filled);
             self.scaler
-                .standardize_block(block.as_mut(), processed..processed + filled);
+                .standardize_block(block.as_mut(), processed..processed + filled, par);
 
             let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
@@ -712,7 +717,7 @@ where
                 block.as_ref().transpose(),
                 rhs,
                 1.0,
-                get_global_parallelism(),
+                par,
             );
 
             matmul(
@@ -721,7 +726,7 @@ where
                 block.as_ref(),
                 proj_block.as_ref(),
                 self.scale,
-                get_global_parallelism(),
+                par,
             );
 
             processed += filled;
@@ -745,6 +750,7 @@ where
 
 fn compute_covariance_eigenpairs<S>(
     operator: &StandardizedCovarianceOp<'_, S>,
+    par: Par,
 ) -> Result<Eigenpairs, HwePcaError>
 where
     S: VariantBlockSource + Send,
@@ -759,7 +765,7 @@ where
     }
 
     if n <= DENSE_EIGEN_FALLBACK_THRESHOLD {
-        return compute_covariance_eigenpairs_dense(operator);
+        return compute_covariance_eigenpairs_dense(operator, par);
     }
 
     let max_rank = n.saturating_sub(1);
@@ -772,7 +778,7 @@ where
 
     let mut max_partial = ((n - 1) / 2).min(MAX_PARTIAL_COMPONENTS);
     if max_partial == 0 {
-        return compute_covariance_eigenpairs_dense(operator);
+        return compute_covariance_eigenpairs_dense(operator, par);
     }
     max_partial = max_partial.min(max_rank);
 
@@ -781,7 +787,6 @@ where
         target = max_partial;
     }
 
-    let par = Par::Seq;
     let normalization = (n as f64).sqrt();
     let v0 = Col::from_fn(n, |_| 1.0 / normalization);
 
@@ -835,12 +840,13 @@ where
 
 fn compute_covariance_eigenpairs_dense<S>(
     operator: &StandardizedCovarianceOp<'_, S>,
+    par: Par,
 ) -> Result<Eigenpairs, HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
 {
-    let mut covariance = accumulate_covariance_matrix(operator)?;
+    let mut covariance = accumulate_covariance_matrix(operator, par)?;
     let n = covariance.nrows();
 
     for col in 0..n {
@@ -893,6 +899,7 @@ where
 
 fn accumulate_covariance_matrix<S>(
     operator: &StandardizedCovarianceOp<'_, S>,
+    par: Par,
 ) -> Result<Mat<f64>, HwePcaError>
 where
     S: VariantBlockSource + Send,
@@ -943,7 +950,7 @@ where
 
         operator
             .scaler
-            .standardize_block(block.as_mut(), processed..processed + filled);
+            .standardize_block(block.as_mut(), processed..processed + filled, par);
 
         matmul(
             covariance.as_mut(),
@@ -951,7 +958,7 @@ where
             block.as_ref(),
             block.as_ref().transpose(),
             operator.scale,
-            get_global_parallelism(),
+            par,
         );
 
         processed += filled;
@@ -1149,6 +1156,7 @@ fn compute_variant_loadings<S, P>(
     sample_basis: MatRef<'_, f64>,
     singular_values: &[f64],
     progress: &mut P,
+    par: Par,
 ) -> Result<Mat<f64>, HwePcaError>
 where
     S: VariantBlockSource,
@@ -1186,7 +1194,7 @@ where
             n_samples,
             filled,
         );
-        scaler.standardize_block(block.as_mut(), processed..processed + filled);
+        scaler.standardize_block(block.as_mut(), processed..processed + filled, par);
 
         let block_ref = block.as_ref();
 
@@ -1202,7 +1210,7 @@ where
             block_ref.transpose(),
             sample_basis,
             1.0,
-            faer::get_global_parallelism(),
+            par,
         );
 
         for local_col in 0..filled {
