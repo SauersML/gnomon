@@ -11,8 +11,7 @@ use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BcfCompression, BcfSource, BedSource, TextSource, open_bcf_source, open_bed_source,
-    open_text_source,
+    BcfCompression, BedSource, TextSource, open_bcf_source, open_bed_source, open_text_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
@@ -1283,6 +1282,7 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::Path;
+    use crate::shared::files::BcfSource;
     use tempfile::tempdir;
 
     fn fake_bcf_header() -> Vec<u8> {
