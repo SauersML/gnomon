@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
+use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
     BcfCompression, BedSource, TextSource, list_bcf_paths, open_bcf_source, open_bed_source,
@@ -137,10 +138,43 @@ impl GenotypeDataset {
     }
 
     pub fn block_source(&self) -> Result<DatasetBlockSource, GenotypeIoError> {
+        self.block_source_with_selection(None)
+    }
+
+    pub fn block_source_with_selection(
+        &self,
+        selection: Option<&[usize]>,
+    ) -> Result<DatasetBlockSource, GenotypeIoError> {
         match self {
-            Self::Plink(dataset) => Ok(DatasetBlockSource::Plink(dataset.block_source())),
-            Self::Bcf(dataset) => Ok(DatasetBlockSource::Bcf(dataset.block_source()?)),
+            Self::Plink(dataset) => Ok(DatasetBlockSource::Plink(
+                dataset.block_source_with_selection(selection.map(|indices| indices.to_vec())),
+            )),
+            Self::Bcf(dataset) => Ok(DatasetBlockSource::Bcf(
+                dataset.block_source_with_selection(selection.map(|indices| indices.to_vec()))?,
+            )),
         }
+    }
+
+    pub fn select_variants(
+        &self,
+        filter: &VariantFilter,
+    ) -> Result<VariantSelection, GenotypeIoError> {
+        match self {
+            Self::Plink(dataset) => dataset
+                .select_variants(filter)
+                .map_err(GenotypeIoError::from),
+            Self::Bcf(dataset) => dataset
+                .select_variants(filter)
+                .map_err(GenotypeIoError::from),
+        }
+    }
+
+    pub fn select_variants_by_keys(
+        &self,
+        keys: &[VariantKey],
+    ) -> Result<VariantSelection, GenotypeIoError> {
+        let filter = VariantFilter::from_keys(keys.to_vec());
+        self.select_variants(&filter)
     }
 
     pub fn data_path(&self) -> &Path {
@@ -185,7 +219,15 @@ pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetO
     let reader = BufReader::new(file);
     let model: HwePcaModel = serde_json::from_reader(reader)?;
 
-    if model.n_variants() != dataset.n_variants() {
+    if let Some(keys) = model.variant_keys() {
+        if keys.len() != model.n_variants() {
+            return Err(DatasetOutputError::InvalidState(format!(
+                "Model stores {} variant keys but reports {} variants",
+                keys.len(),
+                model.n_variants()
+            )));
+        }
+    } else if model.n_variants() != dataset.n_variants() {
         return Err(DatasetOutputError::InvalidState(format!(
             "Model expects {} variants but dataset provides {}",
             model.n_variants(),
@@ -469,16 +511,69 @@ impl PlinkDataset {
             self.bytes_per_variant,
             self.samples.len(),
             self.n_variants,
+            None,
         )
     }
 
     pub fn block_source(&self) -> PlinkVariantBlockSource {
+        self.block_source_with_selection(None)
+    }
+
+    pub fn block_source_with_selection(
+        &self,
+        selection: Option<Vec<usize>>,
+    ) -> PlinkVariantBlockSource {
         PlinkVariantBlockSource::new(
             self.bed.clone(),
             self.bytes_per_variant,
             self.samples.len(),
             self.n_variants,
+            selection,
         )
+    }
+
+    pub fn select_variants(
+        &self,
+        filter: &VariantFilter,
+    ) -> Result<VariantSelection, PlinkIoError> {
+        use std::collections::HashSet;
+
+        let mut iter = self.variant_records()?;
+        let mut indices = Vec::new();
+        let mut keys = Vec::new();
+        let mut matched = HashSet::new();
+        let mut index = 0usize;
+
+        while let Some(result) = iter.next() {
+            let record = result?;
+            let position =
+                record
+                    .position
+                    .parse::<u64>()
+                    .map_err(|err| PlinkIoError::MalformedRecord {
+                        path: iter.path.display().to_string(),
+                        line: iter.line,
+                        message: format!(
+                            "invalid position '{}' for variant {}: {err}",
+                            record.position, record.identifier
+                        ),
+                    })?;
+
+            let key = VariantKey::new(&record.chromosome, position);
+            if filter.contains(&key) && matched.insert(key.clone()) {
+                indices.push(index);
+                keys.push(key);
+            }
+            index += 1;
+        }
+
+        let missing = filter.missing_keys(&matched);
+        Ok(VariantSelection {
+            indices,
+            keys,
+            missing,
+            requested_unique: filter.requested_unique(),
+        })
     }
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
@@ -591,18 +686,26 @@ pub struct PlinkVariantBlockSource {
     bed: BedSource,
     bytes_per_variant: usize,
     n_samples: usize,
-    n_variants: usize,
+    total_variants: usize,
+    selection: Option<Vec<usize>>,
     cursor: usize,
     buffer: Vec<u8>,
 }
 
 impl PlinkVariantBlockSource {
-    fn new(bed: BedSource, bytes_per_variant: usize, n_samples: usize, n_variants: usize) -> Self {
+    fn new(
+        bed: BedSource,
+        bytes_per_variant: usize,
+        n_samples: usize,
+        n_variants: usize,
+        selection: Option<Vec<usize>>,
+    ) -> Self {
         Self {
             bed,
             bytes_per_variant,
             n_samples,
-            n_variants,
+            total_variants: n_variants,
+            selection,
             cursor: 0,
             buffer: Vec::new(),
         }
@@ -617,7 +720,10 @@ impl VariantBlockSource for PlinkVariantBlockSource {
     }
 
     fn n_variants(&self) -> usize {
-        self.n_variants
+        self.selection
+            .as_ref()
+            .map(|indices| indices.len())
+            .unwrap_or(self.total_variants)
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
@@ -633,57 +739,131 @@ impl VariantBlockSource for PlinkVariantBlockSource {
         if max_variants == 0 {
             return Ok(0);
         }
-        let remaining = self.n_variants.saturating_sub(self.cursor);
-        if remaining == 0 {
-            return Ok(0);
+        if let Some(selection) = &self.selection {
+            let remaining = selection.len().saturating_sub(self.cursor);
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let ncols = remaining.min(max_variants);
+            let slice = &selection[self.cursor..self.cursor + ncols];
+            let table = decode_table();
+            let nrows = self.n_samples;
+            let mut emitted = 0usize;
+
+            while emitted < ncols {
+                let current_index = slice[emitted];
+                if current_index >= self.total_variants {
+                    return Err(PlinkIoError::InvalidHeader(format!(
+                        "variant index {current_index} exceeds dataset bounds ({})",
+                        self.total_variants
+                    )));
+                }
+
+                let mut run = 1usize;
+                while emitted + run < ncols && slice[emitted + run] == current_index + run {
+                    run += 1;
+                }
+
+                let block_bytes = (self.bytes_per_variant as u64)
+                    .checked_mul(run as u64)
+                    .ok_or_else(|| PlinkIoError::TruncatedBed {
+                        expected: u64::MAX,
+                        actual: self.bed.len(),
+                    })?;
+
+                let offset = PLINK_HEADER_LEN
+                    .checked_add((current_index as u64) * (self.bytes_per_variant as u64))
+                    .ok_or_else(|| PlinkIoError::TruncatedBed {
+                        expected: u64::MAX,
+                        actual: self.bed.len(),
+                    })?;
+
+                let end =
+                    offset
+                        .checked_add(block_bytes)
+                        .ok_or_else(|| PlinkIoError::TruncatedBed {
+                            expected: u64::MAX,
+                            actual: self.bed.len(),
+                        })?;
+                if end > self.bed.len() {
+                    return Err(PlinkIoError::TruncatedBed {
+                        expected: block_bytes,
+                        actual: self.bed.len().saturating_sub(offset),
+                    });
+                }
+
+                let needed = block_bytes as usize;
+                self.buffer.resize(needed, 0);
+                self.bed.read_at(offset, &mut self.buffer[..])?;
+
+                for local in 0..run {
+                    let bytes_start = local * self.bytes_per_variant;
+                    let bytes_end = bytes_start + self.bytes_per_variant;
+                    let bytes = &self.buffer[bytes_start..bytes_end];
+                    let dest_offset = (emitted + local) * nrows;
+                    let dest = &mut storage[dest_offset..dest_offset + nrows];
+                    decode_plink_variant(bytes, dest, nrows, table);
+                }
+
+                emitted += run;
+            }
+
+            self.cursor += ncols;
+            Ok(ncols)
+        } else {
+            let remaining = self.total_variants.saturating_sub(self.cursor);
+            if remaining == 0 {
+                return Ok(0);
+            }
+
+            let ncols = remaining.min(max_variants);
+            let block_bytes = (self.bytes_per_variant as u64)
+                .checked_mul(ncols as u64)
+                .ok_or_else(|| PlinkIoError::TruncatedBed {
+                    expected: u64::MAX,
+                    actual: self.bed.len(),
+                })?;
+
+            let offset = PLINK_HEADER_LEN
+                .checked_add((self.cursor as u64) * (self.bytes_per_variant as u64))
+                .ok_or_else(|| PlinkIoError::TruncatedBed {
+                    expected: u64::MAX,
+                    actual: self.bed.len(),
+                })?;
+
+            let end =
+                offset
+                    .checked_add(block_bytes)
+                    .ok_or_else(|| PlinkIoError::TruncatedBed {
+                        expected: u64::MAX,
+                        actual: self.bed.len(),
+                    })?;
+            if end > self.bed.len() {
+                return Err(PlinkIoError::TruncatedBed {
+                    expected: block_bytes,
+                    actual: self.bed.len().saturating_sub(offset),
+                });
+            }
+
+            let needed = block_bytes as usize;
+            self.buffer.resize(needed, 0);
+
+            self.bed.read_at(offset, &mut self.buffer[..])?;
+
+            let table = decode_table();
+            let nrows = self.n_samples;
+            for variant_idx in 0..ncols {
+                let start = variant_idx * self.bytes_per_variant;
+                let end = start + self.bytes_per_variant;
+                let bytes = &self.buffer[start..end];
+                let dest_offset = variant_idx * nrows;
+                let dest = &mut storage[dest_offset..dest_offset + nrows];
+                decode_plink_variant(bytes, dest, nrows, table);
+            }
+
+            self.cursor += ncols;
+            Ok(ncols)
         }
-
-        let ncols = remaining.min(max_variants);
-        let block_bytes = (self.bytes_per_variant as u64)
-            .checked_mul(ncols as u64)
-            .ok_or_else(|| PlinkIoError::TruncatedBed {
-                expected: u64::MAX,
-                actual: self.bed.len(),
-            })?;
-
-        let offset = PLINK_HEADER_LEN
-            .checked_add((self.cursor as u64) * (self.bytes_per_variant as u64))
-            .ok_or_else(|| PlinkIoError::TruncatedBed {
-                expected: u64::MAX,
-                actual: self.bed.len(),
-            })?;
-
-        let end = offset
-            .checked_add(block_bytes)
-            .ok_or_else(|| PlinkIoError::TruncatedBed {
-                expected: u64::MAX,
-                actual: self.bed.len(),
-            })?;
-        if end > self.bed.len() {
-            return Err(PlinkIoError::TruncatedBed {
-                expected: block_bytes,
-                actual: self.bed.len().saturating_sub(offset),
-            });
-        }
-
-        let needed = block_bytes as usize;
-        self.buffer.resize(needed, 0);
-
-        self.bed.read_at(offset, &mut self.buffer[..])?;
-
-        let table = decode_table();
-        let nrows = self.n_samples;
-        for variant_idx in 0..ncols {
-            let start = variant_idx * self.bytes_per_variant;
-            let end = start + self.bytes_per_variant;
-            let bytes = &self.buffer[start..end];
-            let dest_offset = variant_idx * nrows;
-            let dest = &mut storage[dest_offset..dest_offset + nrows];
-            decode_plink_variant(bytes, dest, nrows, table);
-        }
-
-        self.cursor += ncols;
-        Ok(ncols)
     }
 }
 
@@ -810,10 +990,18 @@ impl BcfDataset {
     }
 
     pub fn block_source(&self) -> Result<BcfVariantBlockSource, BcfIoError> {
+        self.block_source_with_selection(None)
+    }
+
+    pub fn block_source_with_selection(
+        &self,
+        selection: Option<Vec<usize>>,
+    ) -> Result<BcfVariantBlockSource, BcfIoError> {
         BcfVariantBlockSource::new(
             self.parts.clone(),
             Arc::clone(&self.sample_names),
             self.n_variants,
+            selection,
         )
     }
 
@@ -832,6 +1020,63 @@ impl BcfDataset {
             }
         }
     }
+
+    pub fn select_variants(&self, filter: &VariantFilter) -> Result<VariantSelection, BcfIoError> {
+        use std::collections::HashSet;
+
+        let mut indices = Vec::new();
+        let mut keys = Vec::new();
+        let mut matched = HashSet::new();
+        let mut record_idx = 0usize;
+        let mut record = RecordBuf::default();
+
+        for part in &self.parts {
+            let (mut reader, compression) = create_bcf_reader_for_file(part).map_err(|err| {
+                print_bcf_diagnostics(part, None, "initializing BCF reader for variant list", &err);
+                err
+            })?;
+            let header = reader.read_header().map_err(|err| {
+                print_bcf_diagnostics(part, Some(compression), "reading BCF header", &err);
+                err
+            })?;
+
+            loop {
+                let bytes = reader
+                    .read_record_buf(&header, &mut record)
+                    .map_err(|err| {
+                        print_bcf_diagnostics(
+                            part,
+                            Some(compression),
+                            "scanning BCF records for variant list",
+                            &err,
+                        );
+                        err
+                    })?;
+                if bytes == 0 {
+                    break;
+                }
+
+                let chrom = record.reference_sequence_name().to_string();
+                if let Some(position) = record.variant_start() {
+                    let pos = position.get() as u64;
+                    let key = VariantKey::new(&chrom, pos);
+                    if filter.contains(&key) && matched.insert(key.clone()) {
+                        indices.push(record_idx);
+                        keys.push(key);
+                    }
+                }
+                record_idx += 1;
+            }
+        }
+
+        let missing = filter.missing_keys(&matched);
+        Ok(VariantSelection {
+            indices,
+            keys,
+            missing,
+            requested_unique: filter.requested_unique(),
+        })
+    }
 }
 
 pub struct BcfVariantBlockSource {
@@ -843,8 +1088,11 @@ pub struct BcfVariantBlockSource {
     record: RecordBuf,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
-    n_variants: usize,
+    total_variants: usize,
+    filtered_variants: usize,
+    selection: Option<Vec<usize>>,
     emitted: usize,
+    processed: usize,
 }
 
 impl std::fmt::Debug for BcfVariantBlockSource {
@@ -852,8 +1100,10 @@ impl std::fmt::Debug for BcfVariantBlockSource {
         f.debug_struct("BcfVariantBlockSource")
             .field("current_part", &self.parts.get(self.part_idx))
             .field("n_samples", &self.n_samples)
-            .field("n_variants", &self.n_variants)
+            .field("total_variants", &self.total_variants)
+            .field("filtered_variants", &self.filtered_variants)
             .field("emitted", &self.emitted)
+            .field("processed", &self.processed)
             .field("compression", &self.compression)
             .finish()
     }
@@ -864,8 +1114,13 @@ impl BcfVariantBlockSource {
         parts: Vec<PathBuf>,
         sample_names: Arc<Vec<String>>,
         n_variants: usize,
+        selection: Option<Vec<usize>>,
     ) -> Result<Self, BcfIoError> {
         let n_samples = sample_names.len();
+        let filtered_variants = selection
+            .as_ref()
+            .map(|indices| indices.len())
+            .unwrap_or(n_variants);
         let mut source = Self {
             parts,
             part_idx: 0,
@@ -875,8 +1130,11 @@ impl BcfVariantBlockSource {
             record: RecordBuf::default(),
             sample_names,
             n_samples,
-            n_variants,
+            total_variants: n_variants,
+            filtered_variants,
+            selection,
             emitted: 0,
+            processed: 0,
         };
         if !source.parts.is_empty() {
             source.open_part(0)?;
@@ -929,11 +1187,12 @@ impl VariantBlockSource for BcfVariantBlockSource {
     }
 
     fn n_variants(&self) -> usize {
-        self.n_variants
+        self.filtered_variants
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
         self.emitted = 0;
+        self.processed = 0;
         if self.parts.is_empty() {
             self.reader = None;
             self.compression = None;
@@ -951,61 +1210,135 @@ impl VariantBlockSource for BcfVariantBlockSource {
         if max_variants == 0 {
             return Ok(0);
         }
-        if self.emitted >= self.n_variants {
+        if self.emitted >= self.filtered_variants {
             return Ok(0);
         }
         let mut filled = 0usize;
-        while filled < max_variants && self.emitted + filled < self.n_variants {
-            if self.reader.is_none() {
-                break;
+        if self.selection.is_some() {
+            let target_total = self
+                .selection
+                .as_ref()
+                .map(|indices| indices.len())
+                .unwrap_or(0);
+            while filled < max_variants && self.emitted + filled < target_total {
+                if self.reader.is_none() {
+                    break;
+                }
+
+                let header = match self.header.as_ref() {
+                    Some(header) => Arc::clone(header),
+                    None => break,
+                };
+                let reader = match self.reader.as_mut() {
+                    Some(reader) => reader,
+                    None => break,
+                };
+
+                let compression = self.compression;
+                let path = self.parts.get(self.part_idx).cloned();
+                let bytes = reader
+                    .read_record_buf(header.as_ref(), &mut self.record)
+                    .map_err(|err| {
+                        if let Some(part_path) = path.as_ref() {
+                            print_bcf_diagnostics(
+                                part_path,
+                                compression,
+                                "reading BCF record block",
+                                &err,
+                            );
+                        }
+                        err
+                    })?;
+
+                if bytes == 0 {
+                    let next_idx = self.part_idx + 1;
+                    self.open_part(next_idx)?;
+                    continue;
+                }
+
+                let current_index = self.processed;
+                self.processed += 1;
+                let target_index = self.selection.as_ref().expect("selection must be present")
+                    [self.emitted + filled];
+
+                if current_index < target_index {
+                    continue;
+                }
+                if current_index > target_index {
+                    return Err(BcfIoError::Decode(format!(
+                        "variant index {target_index} requested by PCA list not found in dataset",
+                    )));
+                }
+
+                let offset = filled * self.n_samples;
+                let dest = &mut storage[offset..offset + self.n_samples];
+                decode_bcf_record(&self.record, dest, self.n_samples)?;
+                filled += 1;
             }
 
-            let header = match self.header.as_ref() {
-                Some(header) => Arc::clone(header),
-                None => break,
-            };
-            let reader = match self.reader.as_mut() {
-                Some(reader) => reader,
-                None => break,
-            };
-
-            let compression = self.compression;
-            let path = self.parts.get(self.part_idx).cloned();
-            let bytes = reader
-                .read_record_buf(header.as_ref(), &mut self.record)
-                .map_err(|err| {
-                    if let Some(part_path) = path.as_ref() {
-                        print_bcf_diagnostics(
-                            part_path,
-                            compression,
-                            "reading BCF record block",
-                            &err,
-                        );
-                    }
-                    err
-                })?;
-
-            if bytes == 0 {
-                let next_idx = self.part_idx + 1;
-                self.open_part(next_idx)?;
-                continue;
+            self.emitted += filled;
+            if filled == 0 && self.emitted < target_total {
+                return Err(BcfIoError::UnexpectedEof {
+                    expected: target_total,
+                    actual: self.emitted,
+                });
             }
 
-            let offset = filled * self.n_samples;
-            let dest = &mut storage[offset..offset + self.n_samples];
-            decode_bcf_record(&self.record, dest, self.n_samples)?;
-            filled += 1;
-        }
+            Ok(filled)
+        } else {
+            while filled < max_variants && self.emitted + filled < self.filtered_variants {
+                if self.reader.is_none() {
+                    break;
+                }
 
-        self.emitted += filled;
-        if filled == 0 && self.emitted < self.n_variants {
-            return Err(BcfIoError::UnexpectedEof {
-                expected: self.n_variants,
-                actual: self.emitted,
-            });
-        }
+                let header = match self.header.as_ref() {
+                    Some(header) => Arc::clone(header),
+                    None => break,
+                };
+                let reader = match self.reader.as_mut() {
+                    Some(reader) => reader,
+                    None => break,
+                };
 
-        Ok(filled)
+                let compression = self.compression;
+                let path = self.parts.get(self.part_idx).cloned();
+                let bytes = reader
+                    .read_record_buf(header.as_ref(), &mut self.record)
+                    .map_err(|err| {
+                        if let Some(part_path) = path.as_ref() {
+                            print_bcf_diagnostics(
+                                part_path,
+                                compression,
+                                "reading BCF record block",
+                                &err,
+                            );
+                        }
+                        err
+                    })?;
+
+                if bytes == 0 {
+                    let next_idx = self.part_idx + 1;
+                    self.open_part(next_idx)?;
+                    continue;
+                }
+
+                let offset = filled * self.n_samples;
+                let dest = &mut storage[offset..offset + self.n_samples];
+                decode_bcf_record(&self.record, dest, self.n_samples)?;
+                filled += 1;
+                self.processed += 1;
+            }
+
+            self.emitted += filled;
+            if filled == 0 && self.emitted < self.filtered_variants {
+                return Err(BcfIoError::UnexpectedEof {
+                    expected: self.filtered_variants,
+                    actual: self.emitted,
+                });
+            }
+
+            Ok(filled)
+        }
     }
 }
 

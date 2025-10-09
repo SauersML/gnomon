@@ -373,6 +373,15 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "project")]
     fit: Option<PathBuf>,
 
+    /// Optional variant list limiting SNVs used for PCA fitting
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "fit",
+        conflicts_with = "project"
+    )]
+    list: Option<PathBuf>,
+
     /// Project samples using an existing HWE PCA model
     #[arg(long, value_name = "PATH", conflicts_with = "fit")]
     project: Option<PathBuf>,
@@ -419,7 +428,7 @@ fn main() {
     }
 
     let result = if let Some(path) = cli.fit {
-        run_map_fit(path)
+        run_map_fit(path, cli.list)
     } else if let Some(path) = cli.project {
         run_map_project(path)
     } else {
@@ -445,9 +454,10 @@ fn main() {
     }
 }
 
-fn run_map_fit(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn run_map_fit(path: PathBuf, list: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: path,
+        variant_list: list,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }

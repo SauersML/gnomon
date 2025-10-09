@@ -7,6 +7,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, ProjectionProgressObserver, ProjectionProgressStage,
 };
 use super::project::ProjectionOptions;
+use super::variant_filter::{VariantFilter, VariantListError};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
@@ -143,8 +144,13 @@ impl Drop for ConsoleProjectionProgress {
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
 pub enum MapCommand {
-    Fit { genotype_path: PathBuf },
-    Project { genotype_path: PathBuf },
+    Fit {
+        genotype_path: PathBuf,
+        variant_list: Option<PathBuf>,
+    },
+    Project {
+        genotype_path: PathBuf,
+    },
 }
 
 /// Errors that can occur when executing `map` commands.
@@ -218,12 +224,15 @@ impl From<DatasetOutputError> for MapDriverError {
 /// Execute the provided [`MapCommand`].
 pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
-        MapCommand::Fit { genotype_path } => run_fit(&genotype_path),
+        MapCommand::Fit {
+            genotype_path,
+            variant_list,
+        } => run_fit(&genotype_path, variant_list.as_deref()),
         MapCommand::Project { genotype_path } => run_project(&genotype_path),
     }
 }
 
-fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
+fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapDriverError> {
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -238,9 +247,46 @@ fn run_fit(genotype_path: &Path) -> Result<(), MapDriverError> {
         dataset.n_variants()
     );
 
-    let mut source = dataset.block_source()?;
+    let mut variant_keys: Option<Vec<_>> = None;
+
+    let selection = if let Some(list_path) = variant_list {
+        let filter = VariantFilter::from_file(list_path)
+            .map_err(|err| map_variant_list_error(list_path, err))?;
+        let selection = dataset.select_variants(&filter)?;
+        if selection.indices.is_empty() {
+            return Err(MapDriverError::InvalidState(format!(
+                "Variant list {} did not match any variants in the dataset",
+                list_path.display()
+            )));
+        }
+
+        let matched = selection.matched_unique();
+        let missing = selection.requested_unique.saturating_sub(matched);
+        println!(
+            "Variant list matched {matched} of {} requested variants{}",
+            selection.requested_unique,
+            if missing > 0 {
+                format!(" ({} missing)", missing)
+            } else {
+                String::from("")
+            }
+        );
+        variant_keys = Some(selection.keys.clone());
+        Some(selection)
+    } else {
+        None
+    };
+
+    let mut source = dataset.block_source_with_selection(
+        selection
+            .as_ref()
+            .map(|selection| selection.indices.as_slice()),
+    )?;
     let mut progress = ConsoleFitProgress::new();
-    let model = HwePcaModel::fit_with_progress(&mut source, &mut progress)?;
+    let mut model = HwePcaModel::fit_with_progress(&mut source, &mut progress)?;
+    if let Some(keys) = variant_keys {
+        model.set_variant_keys(Some(keys));
+    }
 
     println!(
         "Retained {} principal components across {} samples",
@@ -282,7 +328,41 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         model.n_variants()
     );
 
-    let mut source = dataset.block_source()?;
+    let selection = if let Some(keys) = model.variant_keys() {
+        let selection = dataset.select_variants_by_keys(keys)?;
+        if !selection.missing.is_empty() {
+            return Err(MapDriverError::InvalidState(
+                "Projection dataset is missing variants required by the model".into(),
+            ));
+        }
+        if selection.indices.len() != model.n_variants() {
+            return Err(MapDriverError::InvalidState(format!(
+                "Model expects {} variants but matched {} in projection dataset",
+                model.n_variants(),
+                selection.indices.len()
+            )));
+        }
+        println!(
+            "Using stored variant subset with {} variants for projection",
+            selection.indices.len()
+        );
+        Some(selection)
+    } else {
+        if dataset.n_variants() != model.n_variants() {
+            return Err(MapDriverError::InvalidState(format!(
+                "Model expects {} variants but dataset provides {}",
+                model.n_variants(),
+                dataset.n_variants()
+            )));
+        }
+        None
+    };
+
+    let mut source = dataset.block_source_with_selection(
+        selection
+            .as_ref()
+            .map(|selection| selection.indices.as_slice()),
+    )?;
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let mut progress = ConsoleProjectionProgress::new();
@@ -306,11 +386,24 @@ fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
     Ok(GenotypeDataset::open(path)?)
 }
 
+fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError {
+    match err {
+        VariantListError::Io(io_err) => MapDriverError::Io(io_err),
+        VariantListError::Parse { line, message } => MapDriverError::InvalidState(format!(
+            "Failed to parse variant list {} (line {}): {}",
+            path.display(),
+            line,
+            message
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::map::fit::HwePcaModel;
     use crate::map::io::{
-        GenotypeDataset, ProjectionOutputPaths, load_hwe_model, save_hwe_model, save_projection_results,
+        GenotypeDataset, ProjectionOutputPaths, load_hwe_model, save_hwe_model,
+        save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
     use crate::shared::files::open_bcf_source;
@@ -346,11 +439,7 @@ mod tests {
     ) -> Result<PathBuf, Box<dyn Error>> {
         let response = client.get(url).send()?;
         if !response.status().is_success() {
-            return Err(format!(
-                "failed to download {url}: status {}",
-                response.status()
-            )
-            .into());
+            return Err(format!("failed to download {url}: status {}", response.status()).into());
         }
 
         let bytes = response.bytes()?;

@@ -1,4 +1,5 @@
 use super::progress::{FitProgressObserver, FitProgressStage, NoopFitProgress};
+use super::variant_filter::VariantKey;
 use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
@@ -379,6 +380,7 @@ pub struct HwePcaModel {
     sample_basis: Mat<f64>,
     sample_scores: Mat<f64>,
     loadings: Mat<f64>,
+    variant_keys: Option<Vec<VariantKey>>,
 }
 
 impl HwePcaModel {
@@ -460,6 +462,7 @@ impl HwePcaModel {
             sample_basis: decomposition.vectors,
             sample_scores,
             loadings,
+            variant_keys: None,
         })
     }
 
@@ -509,6 +512,14 @@ impl HwePcaModel {
 
     pub fn variant_loadings(&self) -> MatRef<'_, f64> {
         self.loadings.as_ref()
+    }
+
+    pub fn set_variant_keys(&mut self, keys: Option<Vec<VariantKey>>) {
+        self.variant_keys = keys;
+    }
+
+    pub fn variant_keys(&self) -> Option<&[VariantKey]> {
+        self.variant_keys.as_deref()
     }
 }
 
@@ -1314,7 +1325,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 8)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 9)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -1329,6 +1340,7 @@ impl Serialize for HwePcaModel {
             &MatrixData::from_mat(self.sample_scores.as_ref()),
         )?;
         state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
+        state.serialize_field("variant_keys", &self.variant_keys)?;
         state.end()
     }
 }
@@ -1348,6 +1360,8 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             sample_basis: MatrixData,
             sample_scores: MatrixData,
             loadings: MatrixData,
+            #[serde(default)]
+            variant_keys: Option<Vec<VariantKey>>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
@@ -1360,6 +1374,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             sample_basis: raw.sample_basis.into_mat().map_err(DeError::custom)?,
             sample_scores: raw.sample_scores.into_mat().map_err(DeError::custom)?,
             loadings: raw.loadings.into_mat().map_err(DeError::custom)?,
+            variant_keys: raw.variant_keys,
         })
     }
 }
