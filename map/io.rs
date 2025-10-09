@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -173,8 +174,30 @@ impl GenotypeDataset {
         &self,
         keys: &[VariantKey],
     ) -> Result<VariantSelection, GenotypeIoError> {
-        let filter = VariantFilter::from_keys(keys.to_vec());
-        self.select_variants(&filter)
+        let filter = VariantFilter::from_keys(keys.iter().cloned());
+        let mut selection = self.select_variants(&filter)?;
+
+        let original_indices = std::mem::take(&mut selection.indices);
+        let original_keys = std::mem::take(&mut selection.keys);
+
+        let mut matched = HashMap::with_capacity(original_keys.len());
+        for (index, key) in original_indices.into_iter().zip(original_keys.into_iter()) {
+            matched.insert(key.clone(), (index, key));
+        }
+
+        let mut ordered_indices = Vec::with_capacity(matched.len());
+        let mut ordered_keys = Vec::with_capacity(matched.len());
+
+        for key in keys {
+            if let Some((index, stored_key)) = matched.remove(key) {
+                ordered_indices.push(index);
+                ordered_keys.push(stored_key);
+            }
+        }
+
+        selection.indices = ordered_indices;
+        selection.keys = ordered_keys;
+        Ok(selection)
     }
 
     pub fn data_path(&self) -> &Path {
