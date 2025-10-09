@@ -8,7 +8,7 @@ use super::progress::{
 };
 use super::project::ProjectionOptions;
 use super::variant_filter::{VariantFilter, VariantListError};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
 use std::mem;
@@ -19,7 +19,7 @@ const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 fn default_progress_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.green} {msg:<40} {percent:>3}% |{bar:40.cyan/blue}| {pos}/{len}",
+        "{spinner:.green} {msg:<40} {percent:>3}% |{bar:40.cyan/blue}| {pos}/{len} [{elapsed_precise}<{eta_precise}]",
     )
     .expect("valid progress template")
     .progress_chars("=>-")
@@ -56,6 +56,7 @@ impl ConsoleFitProgress {
 impl FitProgressObserver for ConsoleFitProgress {
     fn on_stage_start(&mut self, stage: FitProgressStage, total_variants: usize) {
         let pb = ProgressBar::new(total_variants as u64);
+        pb.set_draw_target(ProgressDrawTarget::stdout());
         pb.set_style(default_progress_style());
         pb.set_message(Self::stage_message(stage));
         pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
@@ -108,6 +109,7 @@ impl ConsoleProjectionProgress {
 impl ProjectionProgressObserver for ConsoleProjectionProgress {
     fn on_stage_start(&mut self, stage: ProjectionProgressStage, total_variants: usize) {
         let pb = ProgressBar::new(total_variants as u64);
+        pb.set_draw_target(ProgressDrawTarget::stdout());
         pb.set_style(default_progress_style());
         pb.set_message(Self::stage_message(stage));
         pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
