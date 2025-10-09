@@ -5,10 +5,8 @@ use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
 use memmap2::Mmap;
 use natord::compare;
-use noodles_bcf::io::Writer as BcfWriter;
 use noodles_bgzf::io::Reader as BgzfReader;
-use noodles_vcf::variant::io::Write as _;
-use noodles_vcf::{self as vcf, io::Reader as VcfReader, variant::RecordBuf};
+use noodles_vcf::io::Reader as VcfReader;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
@@ -182,52 +180,66 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BcfCompression {
+pub enum VariantCompression {
     Plain,
     Bgzf,
 }
 
-struct PreparedBcfReader {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VariantFormat {
+    Bcf,
+    Vcf,
+}
+
+struct PreparedVariantReader {
     reader: Box<dyn Read + Send>,
     len: u64,
     skip_header: bool,
-    compression: BcfCompression,
+    compression: VariantCompression,
+    format: VariantFormat,
 }
 
-/// Provides sequential access to one or more BCF streams. The data is
+/// Provides sequential access to one or more variant streams. The data is
 /// transparently decompressed when the underlying files are BGZF-compressed.
-pub struct BcfSource {
-    readers: VecDeque<PreparedBcfReader>,
+pub struct VariantSource {
+    readers: VecDeque<PreparedVariantReader>,
     current: Option<Box<dyn Read + Send>>,
     total_len: Option<u64>,
-    compression: BcfCompression,
+    compression: VariantCompression,
+    format: VariantFormat,
 }
 
-impl BcfSource {
-    fn from_readers(mut readers: Vec<PreparedBcfReader>) -> Result<Self, PipelineError> {
+impl VariantSource {
+    fn from_readers(mut readers: Vec<PreparedVariantReader>) -> Result<Self, PipelineError> {
         if readers.is_empty() {
             return Err(PipelineError::Io(
-                "No BCF files were discovered for the requested input".to_string(),
+                "No variant files were discovered for the requested input".to_string(),
             ));
         }
 
         let compression = readers
             .first()
             .map(|reader| reader.compression)
-            .ok_or_else(|| PipelineError::Io("Missing BCF reader compression".to_string()))?;
+            .ok_or_else(|| PipelineError::Io("Missing variant reader compression".to_string()))?;
+
+        let format = readers
+            .first()
+            .map(|reader| reader.format)
+            .ok_or_else(|| PipelineError::Io("Missing variant format".to_string()))?;
 
         if readers
             .iter()
-            .any(|reader| reader.compression != compression)
+            .any(|reader| reader.compression != compression || reader.format != format)
         {
             return Err(PipelineError::Io(
-                "Mixed BCF compression modes detected; expected all BGZF or all plain".to_string(),
+                "Mixed variant compression modes detected; expected all BGZF or all plain"
+                    .to_string(),
             ));
         }
 
         let total_len = readers.iter().try_fold(0u64, |acc, r| {
             acc.checked_add(r.len).ok_or_else(|| {
-                PipelineError::Io("Combined BCF length exceeds u64::MAX".to_string())
+                PipelineError::Io("Combined variant length exceeds u64::MAX".to_string())
             })
         })?;
 
@@ -242,6 +254,7 @@ impl BcfSource {
             current: None,
             total_len: Some(total_len),
             compression,
+            format,
         })
     }
 
@@ -276,7 +289,7 @@ impl BcfSource {
 
             let mut reader = prepared.reader;
             if prepared.skip_header {
-                skip_bcf_header(reader.as_mut(), prepared.compression)?;
+                skip_variant_header(reader.as_mut(), prepared.compression, prepared.format)?;
                 self.total_len = None;
             }
 
@@ -286,30 +299,45 @@ impl BcfSource {
         Ok(true)
     }
 
-    /// Returns the combined compressed length of the underlying BCF objects
+    /// Returns the combined compressed length of the underlying variant objects
     /// when known.
     pub fn len(&self) -> Option<u64> {
         self.total_len
     }
 
-    pub fn compression(&self) -> BcfCompression {
+    pub fn compression(&self) -> VariantCompression {
         self.compression
     }
 
-    /// Reads decompressed bytes from the concatenated BCF streams into `buf`.
+    pub fn format(&self) -> VariantFormat {
+        self.format
+    }
+
+    /// Reads decompressed bytes from the concatenated variant streams into `buf`.
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, PipelineError> {
         self.read_internal(buf)
-            .map_err(|e| PipelineError::Io(format!("Error reading BCF stream: {e}")))
+            .map_err(|e| PipelineError::Io(format!("Error reading variant stream: {e}")))
     }
 }
 
-impl Read for BcfSource {
+impl Read for VariantSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.read_internal(buf)
     }
 }
 
-fn skip_bcf_header(reader: &mut dyn Read, compression: BcfCompression) -> io::Result<u64> {
+fn skip_variant_header(
+    reader: &mut dyn Read,
+    compression: VariantCompression,
+    format: VariantFormat,
+) -> io::Result<u64> {
+    match format {
+        VariantFormat::Bcf => skip_bcf_header(reader, compression),
+        VariantFormat::Vcf => skip_vcf_header(reader, compression),
+    }
+}
+
+fn skip_bcf_header(reader: &mut dyn Read, compression: VariantCompression) -> io::Result<u64> {
     use noodles_bcf::io::Reader as BcfReader;
     use noodles_bgzf::io::Reader as BgzfReader;
 
@@ -339,18 +367,68 @@ fn skip_bcf_header(reader: &mut dyn Read, compression: BcfCompression) -> io::Re
     let counting_reader = CountingReader::new(reader);
 
     let consumed = match compression {
-        BcfCompression::Plain => {
+        VariantCompression::Plain => {
             let mut bcf_reader = BcfReader::from(counting_reader);
             bcf_reader.read_header()?;
             let counting_reader = bcf_reader.into_inner();
             let (_, consumed) = counting_reader.into_inner();
             consumed
         }
-        BcfCompression::Bgzf => {
+        VariantCompression::Bgzf => {
             let bgzf_reader = BgzfReader::new(counting_reader);
             let mut bcf_reader = BcfReader::from(bgzf_reader);
             bcf_reader.read_header()?;
             let bgzf_reader = bcf_reader.into_inner();
+            let counting_reader = bgzf_reader.into_inner();
+            let (_, consumed) = counting_reader.into_inner();
+            consumed
+        }
+    };
+
+    Ok(consumed)
+}
+
+fn skip_vcf_header(reader: &mut dyn Read, compression: VariantCompression) -> io::Result<u64> {
+    struct CountingReader<'a> {
+        inner: &'a mut dyn Read,
+        count: u64,
+    }
+
+    impl<'a> CountingReader<'a> {
+        fn new(inner: &'a mut dyn Read) -> Self {
+            Self { inner, count: 0 }
+        }
+
+        fn into_inner(self) -> (&'a mut dyn Read, u64) {
+            (self.inner, self.count)
+        }
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.count += n as u64;
+            Ok(n)
+        }
+    }
+
+    let counting_reader = CountingReader::new(reader);
+
+    let consumed = match compression {
+        VariantCompression::Plain => {
+            let buf_reader = BufReader::new(counting_reader);
+            let mut vcf_reader = VcfReader::new(buf_reader);
+            vcf_reader.read_header()?;
+            let buf_reader = vcf_reader.into_inner();
+            let counting_reader = buf_reader.into_inner();
+            let (_, consumed) = counting_reader.into_inner();
+            consumed
+        }
+        VariantCompression::Bgzf => {
+            let bgzf_reader = BgzfReader::new(counting_reader);
+            let mut vcf_reader = VcfReader::new(bgzf_reader);
+            vcf_reader.read_header()?;
+            let bgzf_reader = vcf_reader.into_inner();
             let counting_reader = bgzf_reader.into_inner();
             let (_, consumed) = counting_reader.into_inner();
             consumed
@@ -388,9 +466,9 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
     }
 }
 
-pub fn list_bcf_paths(path: &Path) -> Result<Vec<PathBuf>, PipelineError> {
+pub fn list_variant_paths(path: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     if is_gcs_path(path) {
-        let (bucket, objects) = resolve_remote_bcf_objects(path)?;
+        let (bucket, objects) = resolve_remote_variant_objects(path)?;
         let mut parts = Vec::with_capacity(objects.len());
         for object in objects {
             parts.push(PathBuf::from(format!("gs://{bucket}/{object}")));
@@ -403,34 +481,34 @@ pub fn list_bcf_paths(path: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     }
 
     if path.is_dir() {
-        let mut entries = gather_local_bcf_files(path)?;
+        let mut entries = gather_local_variant_files(path)?;
         entries.sort_by(|a, b| compare_paths(a, b));
         Ok(entries)
-    } else if has_bcf_extension(path) {
+    } else if has_variant_extension(path) {
         Ok(vec![path.to_path_buf()])
     } else {
         Err(PipelineError::Io(format!(
-            "Path {} is not a .bcf file or directory",
+            "Path {} is not a recognized variant file or directory",
             path.display()
         )))
     }
 }
 
-pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+pub fn open_variant_source(path: &Path) -> Result<VariantSource, PipelineError> {
     if is_gcs_path(path) {
-        return open_remote_bcf_source(path);
+        return open_remote_variant_source(path);
     }
 
     if is_http_path(path) {
-        return open_http_bcf_source(path);
+        return open_http_variant_source(path);
     }
 
-    let entries = list_bcf_paths(path)?;
+    let entries = list_variant_paths(path)?;
     let readers = entries
         .into_iter()
-        .map(|p| open_local_bcf_reader(&p))
+        .map(|p| open_local_variant_reader(&p))
         .collect::<Result<Vec<_>, _>>()?;
-    BcfSource::from_readers(readers)
+    VariantSource::from_readers(readers)
 }
 
 fn is_gcs_path(path: &Path) -> bool {
@@ -445,11 +523,21 @@ fn is_http_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn has_bcf_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("bcf"))
-        .unwrap_or(false)
+fn has_variant_extension(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.ends_with(".bcf")
+        || lower.ends_with(".vcf")
+        || lower.ends_with(".vcf.gz")
+        || lower.ends_with(".vcf.bgz")
+}
+
+fn infer_variant_format_from_path(path: &str) -> VariantFormat {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".bcf") {
+        VariantFormat::Bcf
+    } else {
+        VariantFormat::Vcf
+    }
 }
 
 fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
@@ -464,7 +552,7 @@ fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
     compare(&a_str, &b_str)
 }
 
-fn gather_local_bcf_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
+fn gather_local_variant_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     let read_dir = fs::read_dir(dir)
         .map_err(|e| PipelineError::Io(format!("Unable to list {}: {e}", dir.display())))?;
 
@@ -477,14 +565,14 @@ fn gather_local_bcf_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
             ))
         })?;
         let path = entry.path();
-        if path.is_file() && has_bcf_extension(&path) {
+        if path.is_file() && has_variant_extension(&path) {
             files.push(path);
         }
     }
 
     if files.is_empty() {
         return Err(PipelineError::Io(format!(
-            "No .bcf files found in directory {}",
+            "No variant files found in directory {}",
             dir.display()
         )));
     }
@@ -492,7 +580,7 @@ fn gather_local_bcf_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     Ok(files)
 }
 
-fn open_local_bcf_reader(path: &Path) -> Result<PreparedBcfReader, PipelineError> {
+fn open_local_variant_reader(path: &Path) -> Result<PreparedVariantReader, PipelineError> {
     let mut file = File::open(path)
         .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
     let metadata = file
@@ -508,18 +596,21 @@ fn open_local_bcf_reader(path: &Path) -> Result<PreparedBcfReader, PipelineError
         .map_err(|e| PipelineError::Io(format!("Seeking {}: {e}", path.display())))?;
 
     let compression = if bytes_read == 2 && is_gzip_magic(&magic) {
-        BcfCompression::Bgzf
+        VariantCompression::Bgzf
     } else {
-        BcfCompression::Plain
+        VariantCompression::Plain
     };
 
     let reader: Box<dyn Read + Send> = Box::new(BufReader::new(file));
 
-    Ok(PreparedBcfReader {
+    let format = infer_variant_format_from_path(&path.to_string_lossy());
+
+    Ok(PreparedVariantReader {
         reader,
         len,
         skip_header: false,
         compression,
+        format,
     })
 }
 
@@ -579,12 +670,20 @@ fn convert_list_error(
         ))
     } else {
         PipelineError::Io(format!(
-            "Failed to list BCF objects under {location}: {msg}"
+            "Failed to list variant objects under {location}: {msg}"
         ))
     }
 }
 
-fn fetch_bcf_object_names(
+fn has_remote_variant_extension(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".bcf")
+        || lower.ends_with(".vcf")
+        || lower.ends_with(".vcf.gz")
+        || lower.ends_with(".vcf.bgz")
+}
+
+fn fetch_variant_object_names(
     runtime: &Arc<Runtime>,
     control: &StorageControl,
     bucket_path: &str,
@@ -606,13 +705,7 @@ fn fetch_bcf_object_names(
                 .objects
                 .into_iter()
                 .filter(|o| !o.name.ends_with('/'))
-                .filter(|o| {
-                    o.name
-                        .rsplit('.')
-                        .next()
-                        .map(|ext| ext.eq_ignore_ascii_case("bcf"))
-                        .unwrap_or(false)
-                })
+                .filter(|o| has_remote_variant_extension(&o.name))
                 .map(|o| o.name),
         );
         if response.next_page_token.is_empty() {
@@ -623,14 +716,15 @@ fn fetch_bcf_object_names(
     Ok(names)
 }
 
-fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
+fn list_remote_variant_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
     let runtime = get_shared_runtime()?;
     let (_, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
-    let attempt =
-        |control: &StorageControl| fetch_bcf_object_names(&runtime, control, &bucket_path, prefix);
+    let attempt = |control: &StorageControl| {
+        fetch_variant_object_names(&runtime, control, &bucket_path, prefix)
+    };
 
     match attempt(&control) {
         Ok(names) => Ok(names),
@@ -647,7 +741,7 @@ fn list_remote_bcf_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, Pi
     }
 }
 
-fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), PipelineError> {
+fn resolve_remote_variant_objects(path: &Path) -> Result<(String, Vec<String>), PipelineError> {
     let uri = path
         .to_str()
         .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
@@ -659,7 +753,7 @@ fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), Pipe
     let (bucket, object) = parse_gcs_uri(normalized)?;
     let lower = object.to_lowercase();
     let treat_as_directory =
-        normalized.ends_with('/') || object.is_empty() || !lower.ends_with(".bcf");
+        normalized.ends_with('/') || object.is_empty() || !has_remote_variant_extension(&lower);
 
     let mut objects: Vec<String>;
 
@@ -671,9 +765,9 @@ fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), Pipe
             Err(err) => {
                 if is_not_found_error(&err) {
                     let prefix = normalize_gcs_prefix(&object);
-                    objects = list_remote_bcf_objects(&bucket, &prefix)?;
+                    objects = list_remote_variant_objects(&bucket, &prefix)?;
                     if objects.is_empty() {
-                        return Err(no_remote_bcf_objects_error(&bucket, &prefix));
+                        return Err(no_remote_variant_objects_error(&bucket, &prefix));
                     }
                 } else {
                     return Err(err);
@@ -682,9 +776,9 @@ fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), Pipe
         }
     } else {
         let prefix = normalize_gcs_prefix(&object);
-        objects = list_remote_bcf_objects(&bucket, &prefix)?;
+        objects = list_remote_variant_objects(&bucket, &prefix)?;
         if objects.is_empty() {
-            return Err(no_remote_bcf_objects_error(&bucket, &prefix));
+            return Err(no_remote_variant_objects_error(&bucket, &prefix));
         }
     }
 
@@ -692,41 +786,35 @@ fn resolve_remote_bcf_objects(path: &Path) -> Result<(String, Vec<String>), Pipe
     Ok((bucket, objects))
 }
 
-fn no_remote_bcf_objects_error(bucket: &str, prefix: &str) -> PipelineError {
+fn no_remote_variant_objects_error(bucket: &str, prefix: &str) -> PipelineError {
     let location = if prefix.is_empty() {
         format!("gs://{bucket}")
     } else {
         format!("gs://{bucket}/{prefix}")
     };
-    PipelineError::Io(format!("No .bcf objects found under {location}"))
+    PipelineError::Io(format!("No variant objects found under {location}"))
 }
 
-fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
-    let (bucket, objects) = resolve_remote_bcf_objects(path)?;
+fn open_remote_variant_source(path: &Path) -> Result<VariantSource, PipelineError> {
+    let (bucket, objects) = resolve_remote_variant_objects(path)?;
     let mut readers = Vec::with_capacity(objects.len());
     for object in objects {
         let remote = RemoteByteRangeSource::new(&bucket, &object)?;
         let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
         let path_display = format!("gs://{bucket}/{object}");
-        readers.push(prepare_streaming_bcf_reader(path_display, source)?);
+        readers.push(prepare_streaming_variant_reader(path_display, source)?);
     }
-    BcfSource::from_readers(readers)
+    VariantSource::from_readers(readers)
 }
 
-fn open_http_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+fn open_http_variant_source(path: &Path) -> Result<VariantSource, PipelineError> {
     let url = path
         .to_str()
         .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
     let remote = HttpByteRangeSource::new(url)?;
     let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
-    let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".vcf") || lower.ends_with(".vcf.gz") || lower.ends_with(".vcf.bgz") {
-        let reader = prepare_vcf_reader(url.to_string(), Arc::clone(&source))?;
-        BcfSource::from_readers(vec![reader])
-    } else {
-        let reader = prepare_streaming_bcf_reader(url.to_string(), source)?;
-        BcfSource::from_readers(vec![reader])
-    }
+    let reader = prepare_streaming_variant_reader(url.to_string(), source)?;
+    VariantSource::from_readers(vec![reader])
 }
 
 struct MmapByteRangeSource {
@@ -1498,167 +1586,26 @@ impl Read for StreamingReader {
     }
 }
 
-struct VcfAsBcfReader {
-    path_display: String,
-    reader: VcfReader<BgzfReader<StreamingReader>>,
-    header: vcf::Header,
-    writer: BcfWriter<Vec<u8>>,
-    buffer_cursor: usize,
-    record: RecordBuf,
-    finished: bool,
-}
-
-impl VcfAsBcfReader {
-    fn new(path_display: String, source: Arc<dyn ByteRangeSource>) -> Result<Self, PipelineError> {
-        let streaming = StreamingReader::new(path_display.clone(), source);
-        let bgzf_reader = BgzfReader::new(streaming);
-        let mut reader = VcfReader::new(bgzf_reader);
-        let header = reader.read_header().map_err(|e| {
-            PipelineError::Io(format!(
-                "Failed to read VCF header from {path_display}: {e}"
-            ))
-        })?;
-
-        let mut writer = BcfWriter::from(Vec::with_capacity(8192));
-        writer.write_header(&header).map_err(|e| {
-            PipelineError::Io(format!(
-                "Failed to encode VCF header from {path_display} as BCF: {e}"
-            ))
-        })?;
-
-        Ok(Self {
-            path_display,
-            reader,
-            header,
-            writer,
-            buffer_cursor: 0,
-            record: RecordBuf::default(),
-            finished: false,
-        })
-    }
-
-    fn fill_buffer(&mut self) -> io::Result<bool> {
-        if self.finished {
-            return Ok(false);
-        }
-
-        let bytes = self
-            .reader
-            .read_record_buf(&self.header, &mut self.record)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to read VCF record from {}: {e}", self.path_display),
-                )
-            })?;
-
-        if bytes == 0 {
-            self.finished = true;
-            return Ok(false);
-        }
-
-        self.writer
-            .write_variant_record(&self.header, &self.record)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Failed to encode VCF record from {} as BCF: {e}",
-                        self.path_display
-                    ),
-                )
-            })?;
-
-        Ok(true)
-    }
-
-    fn available_bytes(&self) -> usize {
-        let buffer = self.writer.get_ref();
-        buffer.len().saturating_sub(self.buffer_cursor)
-    }
-
-    fn discard_consumed(&mut self) {
-        let len = self.writer.get_ref().len();
-        if self.buffer_cursor >= len {
-            self.writer.get_mut().clear();
-            self.buffer_cursor = 0;
-        }
-    }
-}
-
-impl Read for VcfAsBcfReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let mut total = 0;
-        while total < buf.len() {
-            self.discard_consumed();
-
-            if self.available_bytes() == 0 {
-                if !self.fill_buffer()? {
-                    break;
-                }
-                if self.available_bytes() == 0 {
-                    break;
-                }
-            }
-
-            let available = self.available_bytes();
-            let to_copy = available.min(buf.len() - total);
-            if to_copy == 0 {
-                break;
-            }
-
-            {
-                let buffer = self.writer.get_ref();
-                let start = self.buffer_cursor;
-                let end = start + to_copy;
-                buf[total..total + to_copy].copy_from_slice(&buffer[start..end]);
-            }
-
-            self.buffer_cursor += to_copy;
-            total += to_copy;
-        }
-
-        self.discard_consumed();
-
-        Ok(total)
-    }
-}
-
-fn prepare_streaming_bcf_reader(
+fn prepare_streaming_variant_reader(
     path_display: String,
     source: Arc<dyn ByteRangeSource>,
-) -> Result<PreparedBcfReader, PipelineError> {
+) -> Result<PreparedVariantReader, PipelineError> {
     let len = source.len();
-    let mut reader = StreamingReader::new(path_display, Arc::clone(&source));
+    let mut reader = StreamingReader::new(path_display.clone(), Arc::clone(&source));
     let is_gzip = reader.peek_gzip_magic()?;
     let compression = if is_gzip {
-        BcfCompression::Bgzf
+        VariantCompression::Bgzf
     } else {
-        BcfCompression::Plain
+        VariantCompression::Plain
     };
+    let format = infer_variant_format_from_path(&path_display);
     let reader: Box<dyn Read + Send> = Box::new(reader);
-    Ok(PreparedBcfReader {
+    Ok(PreparedVariantReader {
         reader,
         len,
         skip_header: false,
         compression,
-    })
-}
-
-fn prepare_vcf_reader(
-    path_display: String,
-    source: Arc<dyn ByteRangeSource>,
-) -> Result<PreparedBcfReader, PipelineError> {
-    let reader = VcfAsBcfReader::new(path_display, source)?;
-    Ok(PreparedBcfReader {
-        reader: Box::new(reader),
-        len: 0,
-        skip_header: false,
-        compression: BcfCompression::Plain,
+        format,
     })
 }
 

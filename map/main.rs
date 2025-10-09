@@ -406,7 +406,7 @@ mod tests {
         save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
-    use crate::shared::files::open_bcf_source;
+    use crate::shared::files::open_variant_source;
     use noodles_bcf::io::Reader as BcfReader;
     use noodles_bgzf::io::Reader as BgzfReader;
     use noodles_vcf::variant::RecordBuf;
@@ -697,7 +697,7 @@ mod tests {
 
     fn detect_compression(path: &Path) -> Result<(BcfCompression, Vec<u8>), Box<dyn Error>> {
         let mut source =
-            open_bcf_source(path).map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+            open_variant_source(path).map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
         let mut prefix = vec![0u8; 4096];
         let mut total = 0usize;
         while total < prefix.len() {
@@ -991,7 +991,7 @@ mod tests {
         match compression {
             BcfCompression::Bgzf => {
                 eprintln!("[partial-test] compression detected: BGZF");
-                let source = open_bcf_source(path).map_err(|err| -> Box<dyn Error> {
+                let source = open_variant_source(path).map_err(|err| -> Box<dyn Error> {
                     eprintln!("[partial-test] failed to reopen remote BCF: {err}");
                     Box::new(err)
                 })?;
@@ -1034,7 +1034,7 @@ mod tests {
             }
             BcfCompression::Plain => {
                 eprintln!("[partial-test] compression detected: plain BCF");
-                let source = open_bcf_source(path).map_err(|err| -> Box<dyn Error> {
+                let source = open_variant_source(path).map_err(|err| -> Box<dyn Error> {
                     eprintln!("[partial-test] failed to reopen remote BCF: {err}");
                     Box::new(err)
                 })?;
