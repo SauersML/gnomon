@@ -11,6 +11,7 @@ use super::variant_filter::{VariantFilter, VariantListError};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, IsTerminal};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,8 +26,54 @@ fn default_progress_style() -> ProgressStyle {
     .progress_chars("=>-")
 }
 
+fn progress_draw_target() -> ProgressDrawTarget {
+    if io::stdout().is_terminal() {
+        ProgressDrawTarget::stdout()
+    } else {
+        ProgressDrawTarget::hidden()
+    }
+}
+
+fn create_progress_bar(total_variants: usize, message: &'static str) -> ProgressBar {
+    let pb = ProgressBar::new(total_variants as u64);
+    pb.set_draw_target(progress_draw_target());
+    pb.set_style(default_progress_style());
+    pb.set_message(message);
+    if total_variants > 0 {
+        pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+    }
+    pb
+}
+
+struct ManagedStageBar {
+    total: u64,
+    bar: ProgressBar,
+}
+
+impl ManagedStageBar {
+    fn new(total_variants: usize, bar: ProgressBar) -> Self {
+        Self {
+            total: total_variants as u64,
+            bar,
+        }
+    }
+
+    fn update(&self, processed_variants: usize) {
+        let capped = processed_variants.min(self.total as usize) as u64;
+        self.bar.set_position(capped);
+    }
+
+    fn finish(self, message: &'static str) {
+        self.bar.finish_with_message(message);
+    }
+
+    fn abandon(self, message: String) {
+        self.bar.abandon_with_message(message);
+    }
+}
+
 struct ConsoleFitProgress {
-    bars: HashMap<FitProgressStage, ProgressBar>,
+    bars: HashMap<FitProgressStage, ManagedStageBar>,
 }
 
 impl ConsoleFitProgress {
@@ -55,23 +102,44 @@ impl ConsoleFitProgress {
 
 impl FitProgressObserver for ConsoleFitProgress {
     fn on_stage_start(&mut self, stage: FitProgressStage, total_variants: usize) {
-        let pb = ProgressBar::new(total_variants as u64);
-        pb.set_draw_target(ProgressDrawTarget::stdout());
-        pb.set_style(default_progress_style());
-        pb.set_message(Self::stage_message(stage));
-        pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-        self.bars.insert(stage, pb);
+        if let Some(existing) = self.bars.remove(&stage) {
+            log::warn!(
+                "restarting progress tracking for stage '{}'; previous progress abandoned",
+                stage
+            );
+            existing.abandon(format!("{} (restarted)", Self::stage_message(stage)));
+        }
+
+        if total_variants == 0 {
+            let pb = create_progress_bar(0, Self::stage_message(stage));
+            pb.finish_with_message(Self::stage_complete(stage));
+            return;
+        }
+
+        let pb = create_progress_bar(total_variants, Self::stage_message(stage));
+        self.bars
+            .insert(stage, ManagedStageBar::new(total_variants, pb));
     }
 
     fn on_stage_advance(&mut self, stage: FitProgressStage, processed_variants: usize) {
         if let Some(bar) = self.bars.get(&stage) {
-            bar.set_position(processed_variants as u64);
+            bar.update(processed_variants);
+        } else {
+            log::warn!(
+                "received progress update for stage '{}' with no active progress bar",
+                stage
+            );
         }
     }
 
     fn on_stage_finish(&mut self, stage: FitProgressStage) {
         if let Some(bar) = self.bars.remove(&stage) {
-            bar.finish_with_message(Self::stage_complete(stage));
+            bar.finish(Self::stage_complete(stage));
+        } else {
+            log::warn!(
+                "received completion for stage '{}' with no active progress bar",
+                stage
+            );
         }
     }
 }
@@ -79,13 +147,16 @@ impl FitProgressObserver for ConsoleFitProgress {
 impl Drop for ConsoleFitProgress {
     fn drop(&mut self) {
         for (stage, bar) in mem::take(&mut self.bars) {
-            bar.abandon_with_message(format!("{} (aborted)", Self::stage_message(stage)));
+            bar.abandon(format!(
+                "{} (aborted)",
+                Self::stage_message(stage)
+            ));
         }
     }
 }
 
 struct ConsoleProjectionProgress {
-    bar: Option<(ProjectionProgressStage, ProgressBar)>,
+    bar: Option<(ProjectionProgressStage, ManagedStageBar)>,
 }
 
 impl ConsoleProjectionProgress {
@@ -108,29 +179,64 @@ impl ConsoleProjectionProgress {
 
 impl ProjectionProgressObserver for ConsoleProjectionProgress {
     fn on_stage_start(&mut self, stage: ProjectionProgressStage, total_variants: usize) {
-        let pb = ProgressBar::new(total_variants as u64);
-        pb.set_draw_target(ProgressDrawTarget::stdout());
-        pb.set_style(default_progress_style());
-        pb.set_message(Self::stage_message(stage));
-        pb.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-        self.bar = Some((stage, pb));
+        if let Some((current_stage, bar)) = self.bar.take() {
+            log::warn!(
+                "starting new projection stage '{}' before finishing '{}'",
+                stage, current_stage
+            );
+            bar.abandon(format!(
+                "{} (interrupted)",
+                Self::stage_message(current_stage)
+            ));
+        }
+
+        if total_variants == 0 {
+            let pb = create_progress_bar(0, Self::stage_message(stage));
+            pb.finish_with_message(Self::stage_complete(stage));
+            return;
+        }
+
+        let pb = create_progress_bar(total_variants, Self::stage_message(stage));
+        self.bar = Some((stage, ManagedStageBar::new(total_variants, pb)));
     }
 
     fn on_stage_advance(&mut self, stage: ProjectionProgressStage, processed_variants: usize) {
         if let Some((current, bar)) = self.bar.as_ref() {
             if *current == stage {
-                bar.set_position(processed_variants as u64);
+                bar.update(processed_variants);
+            } else {
+                log::warn!(
+                    "received progress for projection stage '{}' while '{}' is active",
+                    stage, current
+                );
             }
+        } else {
+            log::warn!(
+                "received projection progress for stage '{}' with no active progress bar",
+                stage
+            );
         }
     }
 
     fn on_stage_finish(&mut self, stage: ProjectionProgressStage) {
         if let Some((current, bar)) = self.bar.take() {
             if current == stage {
-                bar.finish_with_message(Self::stage_complete(stage));
+                bar.finish(Self::stage_complete(stage));
             } else {
-                bar.abandon();
+                log::warn!(
+                    "received completion for projection stage '{}' while '{}' is active",
+                    stage, current
+                );
+                bar.abandon(format!(
+                    "{} (completed out of order)",
+                    Self::stage_message(current)
+                ));
             }
+        } else {
+            log::warn!(
+                "received completion for projection stage '{}' with no active progress bar",
+                stage
+            );
         }
     }
 }
@@ -138,7 +244,10 @@ impl ProjectionProgressObserver for ConsoleProjectionProgress {
 impl Drop for ConsoleProjectionProgress {
     fn drop(&mut self) {
         if let Some((stage, bar)) = self.bar.take() {
-            bar.abandon_with_message(format!("{} (aborted)", Self::stage_message(stage)));
+            bar.abandon(format!(
+                "{} (aborted)",
+                Self::stage_message(stage)
+            ));
         }
     }
 }
