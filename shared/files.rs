@@ -425,11 +425,13 @@ fn skip_vcf_header(reader: &mut dyn Read, compression: VariantCompression) -> io
             consumed
         }
         VariantCompression::Bgzf => {
-            let bgzf_reader = BgzfReader::new(counting_reader);
+            let buf_reader = BufReader::new(counting_reader);
+            let bgzf_reader = BgzfReader::new(buf_reader);
             let mut vcf_reader = VcfReader::new(bgzf_reader);
             vcf_reader.read_header()?;
             let bgzf_reader = vcf_reader.into_inner();
-            let counting_reader = bgzf_reader.into_inner();
+            let buf_reader = bgzf_reader.into_inner();
+            let counting_reader = buf_reader.into_inner();
             let (_, consumed) = counting_reader.into_inner();
             consumed
         }
