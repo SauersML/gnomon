@@ -5,16 +5,17 @@ use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::col::Col;
 use faer::linalg::matmul::matmul;
+use faer::linalg::solvers::SelfAdjointEigen;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
 use faer::matrix_free::eigen::{
-    PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
 };
 use faer::prelude::ReborrowMut;
 use faer::{
-    Accum, ColMut, Mat, MatMut, MatRef, Par, get_global_parallelism, set_global_parallelism, unzip,
-    zip,
+    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
+    unzip, zip,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -32,6 +33,9 @@ pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
+const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
+const INITIAL_PARTIAL_COMPONENTS: usize = 32;
+const MAX_PARTIAL_COMPONENTS: usize = 512;
 
 struct ParallelismGuard {
     previous: Par,
@@ -754,13 +758,244 @@ where
         });
     }
 
-    let mut eigvecs = Mat::zeros(n, n);
-    let mut eigvals = vec![0.0f64; n];
-    let v0 = Col::from_fn(n, |idx| if idx == 0 { 1.0 } else { 0.0 });
+    if n <= DENSE_EIGEN_FALLBACK_THRESHOLD {
+        return compute_covariance_eigenpairs_dense(operator);
+    }
 
-    let params = PartialEigenParams::default();
+    let max_rank = n.saturating_sub(1);
+    if max_rank == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    let mut max_partial = ((n - 1) / 2).min(MAX_PARTIAL_COMPONENTS);
+    if max_partial == 0 {
+        return compute_covariance_eigenpairs_dense(operator);
+    }
+    max_partial = max_partial.min(max_rank);
+
+    let mut target = INITIAL_PARTIAL_COMPONENTS.min(max_partial);
+    if target == 0 {
+        target = max_partial;
+    }
+
     let par = Par::Seq;
-    let scratch = partial_eigen_scratch(operator, n, par, params);
+    let normalization = (n as f64).sqrt();
+    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+
+    loop {
+        let params = partial_solver_params(n, target);
+        let (info, eigvals, eigvecs) = run_partial_eigensolver(operator, target, par, &v0, params)?;
+
+        let n_converged = info.n_converged_eigen.min(target);
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+        let mut positive = 0usize;
+        for &(_, value) in &ordering {
+            if value <= EIGENVALUE_EPSILON {
+                break;
+            }
+            positive += 1;
+        }
+
+        if positive == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        if positive == target && target < max_partial {
+            let next_target = (target * 2).min(max_partial);
+            if next_target > target {
+                target = next_target;
+                continue;
+            }
+        }
+
+        let mut values = Vec::with_capacity(positive);
+        let mut vectors = Mat::zeros(n, positive);
+        for (out_idx, (src_idx, value)) in ordering.into_iter().take(positive).enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
+            }
+        }
+
+        return Ok(Eigenpairs { values, vectors });
+    }
+}
+
+fn compute_covariance_eigenpairs_dense<S>(
+    operator: &StandardizedCovarianceOp<'_, S>,
+) -> Result<Eigenpairs, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let mut covariance = accumulate_covariance_matrix(operator)?;
+    let n = covariance.nrows();
+
+    for col in 0..n {
+        for row in 0..col {
+            let avg = 0.5 * (covariance[(row, col)] + covariance[(col, row)]);
+            covariance[(row, col)] = avg;
+            covariance[(col, row)] = avg;
+        }
+    }
+
+    let eig = SelfAdjointEigen::new(covariance.as_ref(), Side::Lower)
+        .map_err(|err| HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}")))?;
+
+    let diag = eig.S();
+    let basis = eig.U();
+
+    let mut ordering = Vec::with_capacity(n);
+    for idx in 0..n {
+        ordering.push((idx, diag[idx]));
+    }
+
+    ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+    let mut positive = 0usize;
+    for &(_, value) in &ordering {
+        if value <= EIGENVALUE_EPSILON {
+            break;
+        }
+        positive += 1;
+    }
+
+    if positive == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    let mut values = Vec::with_capacity(positive);
+    let mut vectors = Mat::zeros(n, positive);
+    for (out_idx, (src_idx, value)) in ordering.into_iter().take(positive).enumerate() {
+        values.push(value);
+        for row in 0..n {
+            vectors[(row, out_idx)] = basis[(row, src_idx)];
+        }
+    }
+
+    Ok(Eigenpairs { values, vectors })
+}
+
+fn accumulate_covariance_matrix<S>(
+    operator: &StandardizedCovarianceOp<'_, S>,
+) -> Result<Mat<f64>, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let n_samples = operator.n_samples;
+    let n_variants = operator.n_variants;
+    let mut covariance = Mat::zeros(n_samples, n_samples);
+
+    if n_samples == 0 || n_variants == 0 {
+        return Ok(covariance);
+    }
+
+    let block_capacity = operator.block_capacity;
+
+    let block_storage_opt = unsafe { &mut *operator.block_storage.get() };
+    let block_storage = block_storage_opt
+        .as_mut()
+        .expect("block storage missing during covariance accumulation");
+
+    let source = unsafe { &mut *operator.source };
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    let mut processed = 0usize;
+
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if processed + filled > n_variants {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported",
+            ));
+        }
+
+        let mut block = MatMut::from_column_major_slice_mut(
+            &mut block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+
+        operator
+            .scaler
+            .standardize_block(block.as_mut(), processed..processed + filled);
+
+        matmul(
+            covariance.as_mut(),
+            Accum::Add,
+            block.as_ref(),
+            block.as_ref().transpose(),
+            operator.scale,
+            get_global_parallelism(),
+        );
+
+        processed += filled;
+    }
+
+    if processed != n_variants {
+        return Err(HwePcaError::InvalidInput(
+            "VariantBlockSource terminated early during covariance accumulation",
+        ));
+    }
+
+    Ok(covariance)
+}
+
+fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
+    let mut params = PartialEigenParams::default();
+    let max_available = n.saturating_sub(1);
+    let min_dim = ((2 * target).max(64)).min(max_available);
+    let mut max_dim = ((4 * target).max(128)).min(max_available);
+    if max_dim <= min_dim {
+        max_dim = min_dim.min(max_available);
+    }
+    params.min_dim = min_dim.max(target);
+    params.max_dim = max_dim.max(params.min_dim);
+    params.max_restarts = 2048;
+    params
+}
+
+fn run_partial_eigensolver<S>(
+    operator: &StandardizedCovarianceOp<'_, S>,
+    target: usize,
+    par: Par,
+    v0: &Col<f64>,
+    params: PartialEigenParams,
+) -> Result<(PartialEigenInfo, Vec<f64>, Mat<f64>), HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let n = operator.n_samples();
+    let mut eigvecs = Mat::zeros(n, target);
+    let mut eigvals = vec![0.0f64; target];
+
+    let scratch = partial_eigen_scratch(operator, target, par, params);
     let mut mem = MemBuffer::new(scratch);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -796,33 +1031,7 @@ where
         return Err(err);
     }
 
-    let n_converged = info.n_converged_eigen.min(n);
-    let mut ordering = Vec::with_capacity(n_converged);
-    for idx in 0..n_converged {
-        let lambda = eigvals[idx];
-        ordering.push((idx, lambda));
-    }
-
-    ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
-
-    let mut values = Vec::new();
-    let mut selected = Vec::new();
-    for (idx, value) in ordering.into_iter() {
-        if value <= EIGENVALUE_EPSILON {
-            break;
-        }
-        values.push(value);
-        selected.push(idx);
-    }
-
-    let mut vectors = Mat::zeros(n, selected.len());
-    for (col_idx, &src) in selected.iter().enumerate() {
-        for row in 0..n {
-            vectors[(row, col_idx)] = eigvecs[(row, src)];
-        }
-    }
-
-    Ok(Eigenpairs { values, vectors })
+    Ok((info, eigvals, eigvecs))
 }
 
 fn stream_allele_statistics<S, P>(
