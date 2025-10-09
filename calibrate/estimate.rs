@@ -2976,6 +2976,10 @@ pub mod internal {
                     let scale = dp_c / (n - mp).max(LAML_RIDGE);
 
                     if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
+                        eprintln!(
+                            "[REML WARNING] Entire gradient falling back to central differences of compute_cost; expect heavy evaluations. dp_c={:.3e}",
+                            dp_c
+                        );
                         let mut grad_total = Array1::zeros(lambdas.len());
                         for k in 0..lambdas.len() {
                             let h = 1e-3_f64 * (1.0 + p[k].abs());
@@ -3015,6 +3019,10 @@ pub mod internal {
                     // to match the cost function.
                     let use_numeric_logh = dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH;
                     let numeric_logh_grad = if use_numeric_logh {
+                        eprintln!(
+                            "[REML WARNING] Switching ½·log|H| gradient to numeric_half_logh_grad (dp_c={:.3e}).",
+                            dp_c
+                        );
                         Some(self.numeric_half_logh_grad(p)?)
                     } else {
                         None
