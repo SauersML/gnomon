@@ -68,6 +68,12 @@ const LAML_RIDGE: f64 = 1e-8;
 /// Prevents logarithms and divisions by nearly-zero D_p from destabilizing the
 /// REML objective and its gradient in near-perfect-fit regimes.
 const DP_FLOOR: f64 = 1e-12;
+/// Width for the smooth deviance floor transition.
+///
+/// Kept generous (1e-8) so that finite-difference probes cannot straddle a
+/// sharp kink when the penalized deviance is near zero, yet still tiny relative
+/// to the typical residual sums of squares encountered during estimation.
+const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 // Use a unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
 // Allow additional headroom so the optimizer rarely collides with the hard box even
 // when the likelihood prefers effectively infinite smoothing.
@@ -108,6 +114,36 @@ fn build_asymmetric_fallback(len: usize) -> Array1<f64> {
         fallback[i] = (i as f64) * 0.1;
     }
     fallback
+}
+
+/// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
+///
+/// Returns the smoothed value and its derivative with respect to `dp`.
+fn smooth_floor_dp(dp: f64) -> (f64, f64) {
+    // Degenerate tau would reduce to the original hard max; guard against it.
+    let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
+    let scaled = (dp - DP_FLOOR) / tau;
+
+    // Stable softplus implementation.
+    let softplus = if scaled > 20.0 {
+        scaled + (-scaled).exp()
+    } else if scaled < -20.0 {
+        scaled.exp()
+    } else {
+        (1.0 + scaled.exp()).ln()
+    };
+
+    // Logistic function (softplus derivative) evaluated stably.
+    let sigma = if scaled >= 0.0 {
+        let exp_neg = (-scaled).exp();
+        1.0 / (1.0 + exp_neg)
+    } else {
+        let exp_pos = scaled.exp();
+        exp_pos / (1.0 + exp_pos)
+    };
+
+    let dp_c = DP_FLOOR + tau * softplus;
+    (dp_c, sigma)
 }
 
 fn run_gradient_check(
@@ -957,10 +993,11 @@ pub fn train_model(
 
     if let LinkFunction::Identity = config.link_function {
         let dp = final_fit.deviance + final_fit.stable_penalty_term;
+        let (dp_c, _) = smooth_floor_dp(dp);
         let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
         let mp = layout.total_coeffs.saturating_sub(penalty_rank) as f64;
         let denom = (reml_state.y().len() as f64 - mp).max(LAML_RIDGE);
-        let phi = dp.max(DP_FLOOR) / denom;
+        let phi = dp_c / denom;
         let rho_near_bounds = final_lambda
             .iter()
             .any(|&lambda| lambda.ln().abs() >= (RHO_BOUND - 1.0));
@@ -1346,7 +1383,7 @@ pub fn optimize_external_design(
                 .sum();
             let penalty = pirls_res.stable_penalty_term;
             let dp = rss + penalty;
-            let dp_c = dp.max(DP_FLOOR);
+            let (dp_c, _) = smooth_floor_dp(dp);
 
             let n = y_o.len() as f64;
             let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
@@ -2413,7 +2450,7 @@ pub mod internal {
                     }
 
                     let denom = (n - mp).max(LAML_RIDGE);
-                    let dp_c = dp.max(DP_FLOOR);
+                    let (dp_c, _) = smooth_floor_dp(dp);
                     if dp < DP_FLOOR {
                         log::warn!(
                             "Penalized deviance {:.3e} fell below DP_FLOOR; clamping to maintain REML stability.",
@@ -2931,12 +2968,34 @@ pub mod internal {
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
-                    let dp_c = dp.max(DP_FLOOR);
+                    let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
 
                     let factor_g = self.get_faer_factor(p, h_eff);
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
                     let scale = dp_c / (n - mp).max(LAML_RIDGE);
+
+                    if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
+                        eprintln!(
+                            "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
+                            dp_c
+                        );
+                        let mut grad_total = Array1::zeros(lambdas.len());
+                        for k in 0..lambdas.len() {
+                            let h = 1e-3_f64 * (1.0 + p[k].abs());
+                            if h == 0.0 {
+                                continue;
+                            }
+                            let mut rho_plus = p.clone();
+                            let mut rho_minus = p.clone();
+                            rho_plus[k] += h;
+                            rho_minus[k] -= h;
+                            let cost_plus = self.compute_cost(&rho_plus)?;
+                            let cost_minus = self.compute_cost(&rho_minus)?;
+                            grad_total[k] = (cost_plus - cost_minus) / (2.0 * h);
+                        }
+                        return Ok(grad_total);
+                    }
 
                     // Three-term gradient computation following mgcv gdi1
                     // for k in 0..lambdas.len() {
@@ -2954,6 +3013,21 @@ pub mod internal {
 
                     // factor_g already computed above; reuse it for trace terms
 
+                    // When the penalized deviance collapses to the numerical floor, the Hessian
+                    // can become so ill-conditioned that the analytic ½·log|H| derivative loses
+                    // fidelity.  Switch to an exact finite-difference evaluation in that regime
+                    // to match the cost function.
+                    let use_numeric_logh = dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH;
+                    let numeric_logh_grad = if use_numeric_logh {
+                        eprintln!(
+                            "[REML WARNING] Switching ½·log|H| gradient to numeric finite differences; dp_c={:.3e}.",
+                            dp_c
+                        );
+                        Some(self.numeric_half_logh_grad(p)?)
+                    } else {
+                        None
+                    };
+
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
                         let r_k = &rs_transformed[k];
@@ -2968,22 +3042,22 @@ pub mod internal {
                         // `REML1 <- oo$D1/(2*scale*gamma)` expression.
 
                         let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
-                        let deviance_grad_term = if dp <= DP_FLOOR {
-                            0.0
-                        } else {
-                            d1 / (2.0 * scale)
-                        };
+                        let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
                         // Component 2: derivative of the penalized Hessian determinant.
                         // R/C counterpart: `oo$trA1/2`.
                         // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
-                        let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
-                        let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
-                        let x = factor_g.solve(rt.as_ref());
-                        // Frobenius inner product ⟨X, Rt⟩
-                        let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt.as_ref());
-                        let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
-                        let log_det_h_grad_term = tra1 / 2.0;
+                        let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
+                            g[k]
+                        } else {
+                            let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
+                            let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
+                            let x = factor_g.solve(rt.as_ref());
+                            // Frobenius inner product ⟨X, Rt⟩
+                            let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt.as_ref());
+                            let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
+                            tra1 / 2.0
+                        };
 
                         // Component 3: derivative of the penalty pseudo-determinant.
                         // Use the stable derivative from the P-IRLS reparameterization.
