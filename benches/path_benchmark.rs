@@ -21,10 +21,17 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use gnomon::batch;
 use gnomon::kernel;
-use gnomon::types::{PersonSubset, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex};
+use gnomon::types::{
+    PersonSubset,
+    PipelineKind,
+    PreparationResult,
+    ReconciledVariantIndex,
+    ScoreColumnIndex,
+};
 
 use crossbeam_queue::ArrayQueue;
 use rand::seq::{SliceRandom, index};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,11 +114,14 @@ fn setup_benchmark_context(
         final_person_iids,
         num_people_to_score,
         total_num_people,
-        num_variants,
+        num_variants
+            .try_into()
+            .expect("num_variants should fit into u64 for benchmarking"),
         num_variants,
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
+        PipelineKind::SingleFile(PathBuf::from("benchmark")),
     );
     Arc::new(prep_result)
 }
@@ -206,10 +216,12 @@ fn benchmark_the_works(c: &mut Criterion) {
 
                     // --- 2. Benchmark person-major (pivot) path ---
                     let tile_pool = Arc::new(ArrayQueue::new(4));
-                    let sparse_index_pool = Arc::new(batch::SparseIndexPool::new());
-                    let mut batch_variant_data = Vec::with_capacity(
-                        PIVOT_PATH_BATCH_SIZE * prep_result.bytes_per_variant as usize,
-                    );
+                    let bytes_per_variant: usize = prep_result
+                        .bytes_per_variant
+                        .try_into()
+                        .expect("bytes_per_variant should fit into usize");
+                    let mut batch_variant_data =
+                        Vec::with_capacity(PIVOT_PATH_BATCH_SIZE * bytes_per_variant);
                     for _ in 0..PIVOT_PATH_BATCH_SIZE {
                         batch_variant_data
                             .extend_from_slice(&generate_variant_data_hwe(total_people, freq));
@@ -235,7 +247,6 @@ fn benchmark_the_works(c: &mut Criterion) {
                                         black_box(&mut scores_out),
                                         black_box(&mut missing_counts_out),
                                         black_box(&tile_pool),
-                                        black_box(&sparse_index_pool),
                                     )
                                     .unwrap();
                                 }

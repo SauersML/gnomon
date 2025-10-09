@@ -5,8 +5,9 @@
 // ========================================================================================
 
 use crate::score::reformat;
+use dwldutil::indicator::{IndicateSignal, Indicator, IndicatorFactory};
 use dwldutil::{DLFile, Downloader};
-use indicatif::ProgressStyle;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -14,6 +15,71 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// ========================================================================================
+//                               Progress indicator adapter
+// ========================================================================================
+
+#[derive(Clone)]
+struct DownloadIndicatorFactory {
+    style: ProgressStyle,
+    multiprogress: Arc<MultiProgress>,
+}
+
+impl DownloadIndicatorFactory {
+    fn new(style: ProgressStyle) -> Self {
+        Self {
+            style,
+            multiprogress: Arc::new(MultiProgress::new()),
+        }
+    }
+}
+
+impl Default for DownloadIndicatorFactory {
+    fn default() -> Self {
+        Self::new(ProgressStyle::default_bar())
+    }
+}
+
+impl IndicatorFactory for DownloadIndicatorFactory {
+    fn create_task(&self, name: &str, size: u64) -> impl Indicator {
+        let bar = ProgressBar::new(size).with_style(self.style.clone());
+        bar.set_draw_target(ProgressDrawTarget::hidden());
+        let bar = self.multiprogress.add(bar);
+        bar.set_message(name.to_string());
+        DownloadIndicatorTask { bar }
+    }
+}
+
+struct DownloadIndicatorTask {
+    bar: ProgressBar,
+}
+
+impl Indicator for DownloadIndicatorTask {
+    fn effect(&mut self, position: u64) {
+        self.bar.set_position(position);
+    }
+
+    fn signal(&mut self, signal: IndicateSignal) {
+        match signal {
+            IndicateSignal::Fail(message) => {
+                self.bar
+                    .finish_with_message(format!("Error -- {}", message));
+            }
+            IndicateSignal::State(message) => {
+                self.bar.set_message(message);
+            }
+            IndicateSignal::Success() => {
+                self.bar.finish_with_message("Done!".to_string());
+            }
+            IndicateSignal::Start() => {
+                self.bar
+                    .set_draw_target(ProgressDrawTarget::stdout());
+            }
+        }
+    }
+}
 
 // ========================================================================================
 //                              Public API
@@ -207,7 +273,7 @@ fn download_missing_files(
 
             let file_to_download = DLFile::new()
                 .with_url(&url)
-                .with_path(&temp_gz_path.to_string_lossy());
+                .with_path(&temp_gz_path);
 
             // Each call to `add_file` consumes the
             // downloader and returns a new one, so we must re-assign it.
@@ -221,8 +287,9 @@ fn download_missing_files(
         )
         .unwrap()
         .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        let indicator = DownloadIndicatorFactory::new(style);
         let configured_downloader = downloader
-            .with_style(style)
+            .with_indicator(indicator)
             .with_max_concurrent_downloads(12)
             .with_max_redirections(5);
 
