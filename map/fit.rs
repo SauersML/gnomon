@@ -27,8 +27,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cell::UnsafeCell;
 use std::convert::Infallible;
 use std::error::Error;
+use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr;
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::Arc;
@@ -740,17 +742,20 @@ where
     }
 
     fn into_parts(self) -> (&'a mut S, Vec<f64>, Option<HweScaler>) {
-        let source = self.source;
+        let mut this = ManuallyDrop::new(self);
+        let source = this.source;
         let storage = unsafe {
-            (*self.block_storage.get())
+            (*this.block_storage.get())
                 .take()
                 .expect("block storage already taken")
         };
-        let stats = self.stats.into_inner();
+        let stats = unsafe { ptr::read(this.stats.get()) };
         let scaler = stats.into_scaler();
-        if let Some(handle) = self.stats_progress.into_inner() {
+        if let Some(handle) = unsafe { (*this.stats_progress.get()).take() } {
             handle.finish();
         }
+        let error = unsafe { ptr::read(this.error.get()) };
+        drop(error);
         (unsafe { &mut *source }, storage, scaler)
     }
 
