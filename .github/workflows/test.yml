@@ -110,7 +110,7 @@ jobs:
 
       - name: Run map-specific tests
         if: steps.rust_changes.outputs.map == 'true'
-        run: cargo +nightly test --release map:: -- --nocapture
+        run: 'cargo +nightly test --release map:: -- --nocapture'
 
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
