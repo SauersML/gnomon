@@ -31,6 +31,10 @@ jobs:
           fi
           perf --version
 
+      - name: Allow perf events recording
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=0
+
       - name: Build release and profiling binaries
         run: |
           cargo +nightly build --release
