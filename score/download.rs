@@ -74,8 +74,7 @@ impl Indicator for DownloadIndicatorTask {
                 self.bar.finish_with_message("Done!".to_string());
             }
             IndicateSignal::Start() => {
-                self.bar
-                    .set_draw_target(ProgressDrawTarget::stdout());
+                self.bar.set_draw_target(ProgressDrawTarget::stdout());
             }
         }
     }

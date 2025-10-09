@@ -22,11 +22,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use gnomon::batch;
 use gnomon::kernel;
 use gnomon::types::{
-    PersonSubset,
-    PipelineKind,
-    PreparationResult,
-    ReconciledVariantIndex,
-    ScoreColumnIndex,
+    PersonSubset, PipelineKind, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
 };
 
 use crossbeam_queue::ArrayQueue;

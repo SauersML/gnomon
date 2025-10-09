@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::sync::{Arc, OnceLock};
@@ -13,11 +13,12 @@ use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BcfCompression, BedSource, TextSource, list_bcf_paths, open_bcf_source, open_bed_source,
-    open_text_source,
+    BedSource, TextSource, VariantCompression, VariantFormat, list_variant_paths, open_bed_source,
+    open_text_source, open_variant_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
+use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::{
     self as vcf,
     variant::RecordBuf,
@@ -32,6 +33,32 @@ use thiserror::Error;
 const PLINK_HEADER_LEN: u64 = 3;
 
 type DynBcfReader = BcfReader<Box<dyn Read + Send>>;
+type DynVcfReader = VcfReader<Box<dyn BufRead + Send>>;
+
+enum VariantStreamReader {
+    Bcf(DynBcfReader),
+    Vcf(DynVcfReader),
+}
+
+impl VariantStreamReader {
+    fn read_header(&mut self) -> io::Result<vcf::Header> {
+        match self {
+            Self::Bcf(reader) => reader.read_header(),
+            Self::Vcf(reader) => reader.read_header(),
+        }
+    }
+
+    fn read_record_buf(
+        &mut self,
+        header: &vcf::Header,
+        record: &mut RecordBuf,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Bcf(reader) => reader.read_record_buf(header, record),
+            Self::Vcf(reader) => reader.read_record_buf(header, record),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PlinkIoError {
@@ -56,20 +83,20 @@ pub enum PlinkIoError {
 }
 
 #[derive(Debug, Error)]
-pub enum BcfIoError {
+pub enum VariantIoError {
     #[error("pipeline I/O error: {0}")]
     Pipeline(#[from] PipelineError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("BCF dataset is missing sample names")]
+    #[error("Variant dataset is missing sample names")]
     MissingSamples,
-    #[error("BCF dataset contains no variant records")]
+    #[error("Variant dataset contains no variant records")]
     NoVariants,
-    #[error("BCF genotype decode error: {0}")]
+    #[error("Variant decode error: {0}")]
     Decode(String),
-    #[error("BCF stream header did not match initial header when reopening")]
+    #[error("Variant stream header did not match initial header when reopening")]
     HeaderMismatch,
-    #[error("unexpected end of BCF stream (expected {expected} variants, read {actual})")]
+    #[error("unexpected end of variant stream (expected {expected} variants, read {actual})")]
     UnexpectedEof { expected: usize, actual: usize },
 }
 
@@ -78,7 +105,7 @@ pub enum GenotypeIoError {
     #[error(transparent)]
     Plink(#[from] PlinkIoError),
     #[error(transparent)]
-    Bcf(#[from] BcfIoError),
+    Variant(#[from] VariantIoError),
 }
 
 #[derive(Debug, Error)]
@@ -104,14 +131,14 @@ pub struct SampleRecord {
 #[derive(Debug)]
 pub enum GenotypeDataset {
     Plink(PlinkDataset),
-    Bcf(BcfDataset),
+    Variants(VcfLikeDataset),
 }
 
 impl GenotypeDataset {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
         let path = path.as_ref();
-        if guess_is_bcf(path) {
-            Ok(Self::Bcf(BcfDataset::open(path)?))
+        if guess_is_variant_dataset(path) {
+            Ok(Self::Variants(VcfLikeDataset::open(path)?))
         } else {
             Ok(Self::Plink(PlinkDataset::open(path)?))
         }
@@ -120,21 +147,21 @@ impl GenotypeDataset {
     pub fn samples(&self) -> &[SampleRecord] {
         match self {
             Self::Plink(dataset) => dataset.samples(),
-            Self::Bcf(dataset) => dataset.samples(),
+            Self::Variants(dataset) => dataset.samples(),
         }
     }
 
     pub fn n_samples(&self) -> usize {
         match self {
             Self::Plink(dataset) => dataset.n_samples(),
-            Self::Bcf(dataset) => dataset.n_samples(),
+            Self::Variants(dataset) => dataset.n_samples(),
         }
     }
 
     pub fn n_variants(&self) -> usize {
         match self {
             Self::Plink(dataset) => dataset.n_variants(),
-            Self::Bcf(dataset) => dataset.n_variants(),
+            Self::Variants(dataset) => dataset.n_variants(),
         }
     }
 
@@ -150,7 +177,7 @@ impl GenotypeDataset {
             Self::Plink(dataset) => Ok(DatasetBlockSource::Plink(
                 dataset.block_source_with_selection(selection.map(|indices| indices.to_vec())),
             )),
-            Self::Bcf(dataset) => Ok(DatasetBlockSource::Bcf(
+            Self::Variants(dataset) => Ok(DatasetBlockSource::Variants(
                 dataset.block_source_with_selection(selection.map(|indices| indices.to_vec()))?,
             )),
         }
@@ -164,7 +191,7 @@ impl GenotypeDataset {
             Self::Plink(dataset) => dataset
                 .select_variants(filter)
                 .map_err(GenotypeIoError::from),
-            Self::Bcf(dataset) => dataset
+            Self::Variants(dataset) => dataset
                 .select_variants(filter)
                 .map_err(GenotypeIoError::from),
         }
@@ -203,14 +230,14 @@ impl GenotypeDataset {
     pub fn data_path(&self) -> &Path {
         match self {
             Self::Plink(dataset) => dataset.bed_path(),
-            Self::Bcf(dataset) => dataset.input_path(),
+            Self::Variants(dataset) => dataset.input_path(),
         }
     }
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
         match self {
             Self::Plink(dataset) => dataset.output_path(filename),
-            Self::Bcf(dataset) => dataset.output_path(filename),
+            Self::Variants(dataset) => dataset.output_path(filename),
         }
     }
 }
@@ -389,7 +416,7 @@ fn prepare_output_path(path: &Path) -> Result<(), io::Error> {
 #[derive(Debug)]
 pub enum DatasetBlockSource {
     Plink(PlinkVariantBlockSource),
-    Bcf(BcfVariantBlockSource),
+    Variants(VcfLikeVariantBlockSource),
 }
 
 impl VariantBlockSource for DatasetBlockSource {
@@ -398,21 +425,21 @@ impl VariantBlockSource for DatasetBlockSource {
     fn n_samples(&self) -> usize {
         match self {
             Self::Plink(source) => source.n_samples(),
-            Self::Bcf(source) => source.n_samples(),
+            Self::Variants(source) => source.n_samples(),
         }
     }
 
     fn n_variants(&self) -> usize {
         match self {
             Self::Plink(source) => source.n_variants(),
-            Self::Bcf(source) => source.n_variants(),
+            Self::Variants(source) => source.n_variants(),
         }
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
         match self {
             Self::Plink(source) => source.reset().map_err(GenotypeIoError::from),
-            Self::Bcf(source) => source.reset().map_err(GenotypeIoError::from),
+            Self::Variants(source) => source.reset().map_err(GenotypeIoError::from),
         }
     }
 
@@ -425,7 +452,7 @@ impl VariantBlockSource for DatasetBlockSource {
             Self::Plink(source) => source
                 .next_block_into(max_variants, storage)
                 .map_err(GenotypeIoError::from),
-            Self::Bcf(source) => source
+            Self::Variants(source) => source
                 .next_block_into(max_variants, storage)
                 .map_err(GenotypeIoError::from),
         }
@@ -891,7 +918,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 }
 
 #[derive(Debug)]
-pub struct BcfDataset {
+pub struct VcfLikeDataset {
     input_path: PathBuf,
     parts: Vec<PathBuf>,
     sample_names: Arc<Vec<String>>,
@@ -907,13 +934,13 @@ enum OutputHint {
     RemoteStem(OsString),
 }
 
-impl BcfDataset {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, BcfIoError> {
+impl VcfLikeDataset {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, VariantIoError> {
         let path = path.as_ref();
         let input_path = path.to_path_buf();
         let output_hint = compute_output_hint(path);
 
-        let parts = list_bcf_paths(path).map_err(BcfIoError::from)?;
+        let parts = list_variant_paths(path).map_err(VariantIoError::from)?;
 
         let mut expected_sample_names: Option<Vec<String>> = None;
         let mut samples: Option<Vec<SampleRecord>> = None;
@@ -921,19 +948,32 @@ impl BcfDataset {
         let mut n_variants = 0usize;
 
         for part in &parts {
-            let (mut reader, compression) = create_bcf_reader_for_file(part).map_err(|err| {
-                print_bcf_diagnostics(part, None, "initializing BCF reader", &err);
-                err
-            })?;
+            let (mut reader, compression, format) =
+                create_variant_reader_for_file(part).map_err(|err| {
+                    print_variant_diagnostics(
+                        part,
+                        None,
+                        None,
+                        "initializing variant reader",
+                        &err,
+                    );
+                    err
+                })?;
             let header = reader.read_header().map_err(|err| {
-                print_bcf_diagnostics(part, Some(compression), "reading BCF header", &err);
-                err
+                print_variant_diagnostics(
+                    part,
+                    Some(compression),
+                    Some(format),
+                    "reading variant header",
+                    &err,
+                );
+                VariantIoError::Io(err)
             })?;
 
             if expected_sample_names.is_none() {
                 let sample_names: Vec<String> = header.sample_names().iter().cloned().collect();
                 if sample_names.is_empty() {
-                    return Err(BcfIoError::MissingSamples);
+                    return Err(VariantIoError::MissingSamples);
                 }
                 let sample_records = sample_names
                     .iter()
@@ -956,7 +996,7 @@ impl BcfDataset {
                 if observed.len() != expected.len()
                     || !observed.iter().zip(expected.iter()).all(|(a, b)| a == b)
                 {
-                    return Err(BcfIoError::HeaderMismatch);
+                    return Err(VariantIoError::HeaderMismatch);
                 }
             }
 
@@ -964,13 +1004,14 @@ impl BcfDataset {
                 let bytes = reader
                     .read_record_buf(&header, &mut record)
                     .map_err(|err| {
-                        print_bcf_diagnostics(
+                        print_variant_diagnostics(
                             part,
                             Some(compression),
-                            "scanning BCF records to count variants",
+                            Some(format),
+                            "scanning variant records to count variants",
                             &err,
                         );
-                        err
+                        VariantIoError::Io(err)
                     })?;
                 if bytes == 0 {
                     break;
@@ -980,7 +1021,7 @@ impl BcfDataset {
         }
 
         if n_variants == 0 {
-            return Err(BcfIoError::NoVariants);
+            return Err(VariantIoError::NoVariants);
         }
 
         let expected_sample_names = expected_sample_names.expect("sample names captured");
@@ -1012,15 +1053,15 @@ impl BcfDataset {
         &self.input_path
     }
 
-    pub fn block_source(&self) -> Result<BcfVariantBlockSource, BcfIoError> {
+    pub fn block_source(&self) -> Result<VcfLikeVariantBlockSource, VariantIoError> {
         self.block_source_with_selection(None)
     }
 
     pub fn block_source_with_selection(
         &self,
         selection: Option<Vec<usize>>,
-    ) -> Result<BcfVariantBlockSource, BcfIoError> {
-        BcfVariantBlockSource::new(
+    ) -> Result<VcfLikeVariantBlockSource, VariantIoError> {
+        VcfLikeVariantBlockSource::new(
             self.parts.clone(),
             Arc::clone(&self.sample_names),
             self.n_variants,
@@ -1044,7 +1085,10 @@ impl BcfDataset {
         }
     }
 
-    pub fn select_variants(&self, filter: &VariantFilter) -> Result<VariantSelection, BcfIoError> {
+    pub fn select_variants(
+        &self,
+        filter: &VariantFilter,
+    ) -> Result<VariantSelection, VariantIoError> {
         use std::collections::HashSet;
 
         let mut indices = Vec::new();
@@ -1054,26 +1098,40 @@ impl BcfDataset {
         let mut record = RecordBuf::default();
 
         for part in &self.parts {
-            let (mut reader, compression) = create_bcf_reader_for_file(part).map_err(|err| {
-                print_bcf_diagnostics(part, None, "initializing BCF reader for variant list", &err);
-                err
-            })?;
+            let (mut reader, compression, format) =
+                create_variant_reader_for_file(part).map_err(|err| {
+                    print_variant_diagnostics(
+                        part,
+                        None,
+                        None,
+                        "initializing variant reader for variant list",
+                        &err,
+                    );
+                    err
+                })?;
             let header = reader.read_header().map_err(|err| {
-                print_bcf_diagnostics(part, Some(compression), "reading BCF header", &err);
-                err
+                print_variant_diagnostics(
+                    part,
+                    Some(compression),
+                    Some(format),
+                    "reading variant header",
+                    &err,
+                );
+                VariantIoError::Io(err)
             })?;
 
             loop {
                 let bytes = reader
                     .read_record_buf(&header, &mut record)
                     .map_err(|err| {
-                        print_bcf_diagnostics(
+                        print_variant_diagnostics(
                             part,
                             Some(compression),
-                            "scanning BCF records for variant list",
+                            Some(format),
+                            "scanning variant records for variant list",
                             &err,
                         );
-                        err
+                        VariantIoError::Io(err)
                     })?;
                 if bytes == 0 {
                     break;
@@ -1102,11 +1160,12 @@ impl BcfDataset {
     }
 }
 
-pub struct BcfVariantBlockSource {
+pub struct VcfLikeVariantBlockSource {
     parts: Vec<PathBuf>,
     part_idx: usize,
-    reader: Option<DynBcfReader>,
-    compression: Option<BcfCompression>,
+    reader: Option<VariantStreamReader>,
+    compression: Option<VariantCompression>,
+    format: Option<VariantFormat>,
     header: Option<Arc<vcf::Header>>,
     record: RecordBuf,
     sample_names: Arc<Vec<String>>,
@@ -1118,9 +1177,9 @@ pub struct BcfVariantBlockSource {
     processed: usize,
 }
 
-impl std::fmt::Debug for BcfVariantBlockSource {
+impl std::fmt::Debug for VcfLikeVariantBlockSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BcfVariantBlockSource")
+        f.debug_struct("VcfLikeVariantBlockSource")
             .field("current_part", &self.parts.get(self.part_idx))
             .field("n_samples", &self.n_samples)
             .field("total_variants", &self.total_variants)
@@ -1128,17 +1187,18 @@ impl std::fmt::Debug for BcfVariantBlockSource {
             .field("emitted", &self.emitted)
             .field("processed", &self.processed)
             .field("compression", &self.compression)
+            .field("format", &self.format)
             .finish()
     }
 }
 
-impl BcfVariantBlockSource {
+impl VcfLikeVariantBlockSource {
     fn new(
         parts: Vec<PathBuf>,
         sample_names: Arc<Vec<String>>,
         n_variants: usize,
         selection: Option<Vec<usize>>,
-    ) -> Result<Self, BcfIoError> {
+    ) -> Result<Self, VariantIoError> {
         let n_samples = sample_names.len();
         let filtered_variants = selection
             .as_ref()
@@ -1149,6 +1209,7 @@ impl BcfVariantBlockSource {
             part_idx: 0,
             reader: None,
             compression: None,
+            format: None,
             header: None,
             record: RecordBuf::default(),
             sample_names,
@@ -1165,23 +1226,31 @@ impl BcfVariantBlockSource {
         Ok(source)
     }
 
-    fn open_part(&mut self, idx: usize) -> Result<(), BcfIoError> {
+    fn open_part(&mut self, idx: usize) -> Result<(), VariantIoError> {
         self.part_idx = idx;
         if idx >= self.parts.len() {
             self.reader = None;
             self.compression = None;
+            self.format = None;
             self.header = None;
             return Ok(());
         }
 
         let path = &self.parts[idx];
-        let (mut reader, compression) = create_bcf_reader_for_file(path).map_err(|err| {
-            print_bcf_diagnostics(path, None, "initializing BCF reader", &err);
-            err
-        })?;
+        let (mut reader, compression, format) =
+            create_variant_reader_for_file(path).map_err(|err| {
+                print_variant_diagnostics(path, None, None, "initializing variant reader", &err);
+                err
+            })?;
         let header = reader.read_header().map_err(|err| {
-            print_bcf_diagnostics(path, Some(compression), "reading BCF header", &err);
-            err
+            print_variant_diagnostics(
+                path,
+                Some(compression),
+                Some(format),
+                "reading variant header",
+                &err,
+            );
+            VariantIoError::Io(err)
         })?;
 
         let observed = header.sample_names();
@@ -1191,19 +1260,20 @@ impl BcfVariantBlockSource {
                 .zip(self.sample_names.iter())
                 .all(|(a, b)| a == b)
         {
-            return Err(BcfIoError::HeaderMismatch);
+            return Err(VariantIoError::HeaderMismatch);
         }
 
         self.reader = Some(reader);
         self.compression = Some(compression);
+        self.format = Some(format);
         self.header = Some(Arc::new(header));
         self.record = RecordBuf::default();
         Ok(())
     }
 }
 
-impl VariantBlockSource for BcfVariantBlockSource {
-    type Error = BcfIoError;
+impl VariantBlockSource for VcfLikeVariantBlockSource {
+    type Error = VariantIoError;
 
     fn n_samples(&self) -> usize {
         self.n_samples
@@ -1219,6 +1289,7 @@ impl VariantBlockSource for BcfVariantBlockSource {
         if self.parts.is_empty() {
             self.reader = None;
             self.compression = None;
+            self.format = None;
             self.header = None;
             return Ok(());
         }
@@ -1258,19 +1329,21 @@ impl VariantBlockSource for BcfVariantBlockSource {
                 };
 
                 let compression = self.compression;
+                let format = self.format;
                 let path = self.parts.get(self.part_idx).cloned();
                 let bytes = reader
                     .read_record_buf(header.as_ref(), &mut self.record)
                     .map_err(|err| {
                         if let Some(part_path) = path.as_ref() {
-                            print_bcf_diagnostics(
+                            print_variant_diagnostics(
                                 part_path,
                                 compression,
-                                "reading BCF record block",
+                                format,
+                                "reading variant record block",
                                 &err,
                             );
                         }
-                        err
+                        VariantIoError::Io(err)
                     })?;
 
                 if bytes == 0 {
@@ -1288,20 +1361,20 @@ impl VariantBlockSource for BcfVariantBlockSource {
                     continue;
                 }
                 if current_index > target_index {
-                    return Err(BcfIoError::Decode(format!(
+                    return Err(VariantIoError::Decode(format!(
                         "variant index {target_index} requested by PCA list not found in dataset",
                     )));
                 }
 
                 let offset = filled * self.n_samples;
                 let dest = &mut storage[offset..offset + self.n_samples];
-                decode_bcf_record(&self.record, dest, self.n_samples)?;
+                decode_variant_record(&self.record, dest, self.n_samples)?;
                 filled += 1;
             }
 
             self.emitted += filled;
             if filled == 0 && self.emitted < target_total {
-                return Err(BcfIoError::UnexpectedEof {
+                return Err(VariantIoError::UnexpectedEof {
                     expected: target_total,
                     actual: self.emitted,
                 });
@@ -1324,19 +1397,21 @@ impl VariantBlockSource for BcfVariantBlockSource {
                 };
 
                 let compression = self.compression;
+                let format = self.format;
                 let path = self.parts.get(self.part_idx).cloned();
                 let bytes = reader
                     .read_record_buf(header.as_ref(), &mut self.record)
                     .map_err(|err| {
                         if let Some(part_path) = path.as_ref() {
-                            print_bcf_diagnostics(
+                            print_variant_diagnostics(
                                 part_path,
                                 compression,
-                                "reading BCF record block",
+                                format,
+                                "reading variant record block",
                                 &err,
                             );
                         }
-                        err
+                        VariantIoError::Io(err)
                     })?;
 
                 if bytes == 0 {
@@ -1347,14 +1422,14 @@ impl VariantBlockSource for BcfVariantBlockSource {
 
                 let offset = filled * self.n_samples;
                 let dest = &mut storage[offset..offset + self.n_samples];
-                decode_bcf_record(&self.record, dest, self.n_samples)?;
+                decode_variant_record(&self.record, dest, self.n_samples)?;
                 filled += 1;
                 self.processed += 1;
             }
 
             self.emitted += filled;
             if filled == 0 && self.emitted < self.filtered_variants {
-                return Err(BcfIoError::UnexpectedEof {
+                return Err(VariantIoError::UnexpectedEof {
                     expected: self.filtered_variants,
                     actual: self.emitted,
                 });
@@ -1365,10 +1440,11 @@ impl VariantBlockSource for BcfVariantBlockSource {
     }
 }
 
-fn guess_is_bcf(path: &Path) -> bool {
+fn guess_is_variant_dataset(path: &Path) -> bool {
     if is_remote_path(path) {
         let lower = path.to_string_lossy().to_ascii_lowercase();
         lower.ends_with(".bcf")
+            || lower.ends_with(".vcf")
             || lower.ends_with(".vcf.gz")
             || lower.ends_with(".vcf.bgz")
             || lower.ends_with(".bgz")
@@ -1377,10 +1453,11 @@ fn guess_is_bcf(path: &Path) -> bool {
     } else if path.is_dir() {
         true
     } else {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("bcf"))
-            .unwrap_or(false)
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        lower.ends_with(".bcf")
+            || lower.ends_with(".vcf")
+            || lower.ends_with(".vcf.gz")
+            || lower.ends_with(".vcf.bgz")
     }
 }
 
@@ -1408,19 +1485,37 @@ fn compute_output_hint(path: &Path) -> OutputHint {
     }
 }
 
-fn create_bcf_reader_for_file(path: &Path) -> Result<(DynBcfReader, BcfCompression), BcfIoError> {
-    let source = open_bcf_source(path)?;
+fn create_variant_reader_for_file(
+    path: &Path,
+) -> Result<(VariantStreamReader, VariantCompression, VariantFormat), VariantIoError> {
+    let source = open_variant_source(path)?;
     let compression = source.compression();
-    let reader: Box<dyn Read + Send> = match compression {
-        BcfCompression::Plain => Box::new(source),
-        BcfCompression::Bgzf => Box::new(BgzfReader::new(source)),
+    let format = source.format();
+
+    let reader = match format {
+        VariantFormat::Bcf => {
+            let reader: Box<dyn Read + Send> = match compression {
+                VariantCompression::Plain => Box::new(source),
+                VariantCompression::Bgzf => Box::new(BgzfReader::new(source)),
+            };
+            VariantStreamReader::Bcf(BcfReader::from(reader))
+        }
+        VariantFormat::Vcf => {
+            let reader: Box<dyn BufRead + Send> = match compression {
+                VariantCompression::Plain => Box::new(BufReader::new(source)),
+                VariantCompression::Bgzf => Box::new(BgzfReader::new(source)),
+            };
+            VariantStreamReader::Vcf(VcfReader::new(reader))
+        }
     };
-    Ok((BcfReader::from(reader), compression))
+
+    Ok((reader, compression, format))
 }
 
-fn print_bcf_diagnostics(
+fn print_variant_diagnostics(
     path: &Path,
-    compression: Option<BcfCompression>,
+    compression: Option<VariantCompression>,
+    format: Option<VariantFormat>,
     stage: &str,
     err: &(dyn std::error::Error + '_),
 ) {
@@ -1432,9 +1527,13 @@ fn print_bcf_diagnostics(
         "local file"
     };
 
-    eprintln!("BCF diagnostics:");
+    eprintln!("Variant diagnostics:");
     eprintln!("  • Path        : {}", path.display());
     eprintln!("  • Location    : {location}");
+    match format {
+        Some(kind) => eprintln!("  • Format      : {:?}", kind),
+        None => eprintln!("  • Format      : unknown (detected before reader initialization)"),
+    }
     match compression {
         Some(mode) => eprintln!("  • Compression : {:?}", mode),
         None => eprintln!("  • Compression : unknown (detected before reader initialization)"),
@@ -1442,7 +1541,7 @@ fn print_bcf_diagnostics(
     eprintln!("  • Stage       : {stage}");
     eprintln!("  • Underlying error: {err}");
 
-    if let Some(BcfCompression::Bgzf) = compression {
+    if let Some(VariantCompression::Bgzf) = compression {
         if err
             .to_string()
             .to_lowercase()
@@ -1455,13 +1554,13 @@ fn print_bcf_diagnostics(
     }
 }
 
-fn decode_bcf_record(
+fn decode_variant_record(
     record: &RecordBuf,
     dest: &mut [f64],
     n_samples: usize,
-) -> Result<(), BcfIoError> {
+) -> Result<(), VariantIoError> {
     if dest.len() < n_samples {
-        return Err(BcfIoError::Decode(
+        return Err(VariantIoError::Decode(
             "destination buffer shorter than number of samples".to_string(),
         ));
     }
@@ -1499,7 +1598,7 @@ fn decode_bcf_record(
                 }
                 Some(Some(Value::String(text))) => {
                     let genotype = SampleGenotype::from_str(text).map_err(|err| {
-                        BcfIoError::Decode(format!(
+                        VariantIoError::Decode(format!(
                             "failed to parse genotype string '{text}': {err}"
                         ))
                     })?;
@@ -1526,7 +1625,7 @@ fn decode_bcf_record(
     Ok(())
 }
 
-fn numeric_from_value(value: &Value) -> Result<Option<f64>, BcfIoError> {
+fn numeric_from_value(value: &Value) -> Result<Option<f64>, VariantIoError> {
     match value {
         Value::Integer(n) => Ok(Some(*n as f64)),
         Value::Float(n) => Ok(Some(*n as f64)),
@@ -1536,7 +1635,9 @@ fn numeric_from_value(value: &Value) -> Result<Option<f64>, BcfIoError> {
                 Ok(None)
             } else {
                 trimmed.parse::<f64>().map(Some).map_err(|err| {
-                    BcfIoError::Decode(format!("failed to parse numeric string '{trimmed}': {err}"))
+                    VariantIoError::Decode(format!(
+                        "failed to parse numeric string '{trimmed}': {err}"
+                    ))
                 })
             }
         }
@@ -1554,7 +1655,7 @@ fn numeric_from_value(value: &Value) -> Result<Option<f64>, BcfIoError> {
 
 fn dosage_from_genotype(
     genotype: &[sample::value::genotype::Allele],
-) -> Result<Option<f64>, BcfIoError> {
+) -> Result<Option<f64>, VariantIoError> {
     let mut total = 0.0f64;
     for allele in genotype {
         match allele.position() {
@@ -1684,7 +1785,7 @@ fn is_remote_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::files::BcfSource;
+    use crate::shared::files::VariantSource;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::Path;
@@ -1710,7 +1811,7 @@ mod tests {
         Ok(header)
     }
 
-    fn read_all(mut source: BcfSource) -> Vec<u8> {
+    fn read_all(mut source: VariantSource) -> Vec<u8> {
         let mut data = Vec::new();
         source.read_to_end(&mut data).unwrap();
         data
@@ -1722,7 +1823,7 @@ mod tests {
         let path = dir.path().join("sample.bcf");
         let header = write_fake_bcf(&path, &[0x01, 0x02, 0x03]).unwrap();
 
-        let source = open_bcf_source(&path).unwrap();
+        let source = open_variant_source(&path).unwrap();
         let bytes = read_all(source);
 
         let mut expected = header;
@@ -1749,7 +1850,7 @@ mod tests {
         expected.extend_from_slice(&[0x20]);
         expected.extend_from_slice(&[0x10]);
 
-        let source = open_bcf_source(dir.path()).unwrap();
+        let source = open_variant_source(dir.path()).unwrap();
         let bytes = read_all(source);
 
         assert_eq!(bytes, expected);
