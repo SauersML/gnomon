@@ -309,7 +309,9 @@ fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
 #[cfg(test)]
 mod tests {
     use crate::map::fit::HwePcaModel;
-    use crate::map::io::GenotypeDataset;
+    use crate::map::io::{
+        GenotypeDataset, ProjectionOutputPaths, load_hwe_model, save_hwe_model, save_projection_results,
+    };
     use crate::map::project::ProjectionOptions;
     use crate::shared::files::open_bcf_source;
     use noodles_bcf::io::Reader as BcfReader;
@@ -324,10 +326,131 @@ mod tests {
     };
     use std::error::Error;
     use std::fmt::Write as _;
+    use std::fs::{self, File};
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::str::FromStr;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use zip::read::ZipArchive;
+
+    use reqwest::blocking::Client;
+    use std::io::{self, Cursor};
+
+    fn download_and_extract(
+        client: &Client,
+        url: &str,
+        expected_filename: &str,
+        output_dir: &Path,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let response = client.get(url).send()?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "failed to download {url}: status {}",
+                response.status()
+            )
+            .into());
+        }
+
+        let bytes = response.bytes()?;
+        let cursor = Cursor::new(bytes.to_vec());
+        let mut archive = ZipArchive::new(cursor)?;
+        let mut extracted_path = None;
+
+        for idx in 0..archive.len() {
+            let mut entry = archive.by_index(idx)?;
+            if !entry.is_file() {
+                continue;
+            }
+
+            let enclosed = entry
+                .enclosed_name()
+                .ok_or_else(|| format!("archive entry has invalid name: {}", entry.name()))?
+                .to_path_buf();
+            let file_name = enclosed
+                .file_name()
+                .ok_or_else(|| format!("archive entry missing file name: {}", enclosed.display()))?
+                .to_owned();
+            let out_path = output_dir.join(&file_name);
+            let mut out_file = File::create(&out_path)?;
+            io::copy(&mut entry, &mut out_file)?;
+
+            let matches_expected = file_name
+                .to_str()
+                .map(|name| name == expected_filename)
+                .unwrap_or(false);
+            if matches_expected {
+                extracted_path = Some(out_path);
+                break;
+            }
+        }
+
+        extracted_path
+            .ok_or_else(|| format!("{expected_filename} not found in archive {url}").into())
+    }
+
+    #[test]
+    fn fit_and_project_downloaded_plink_dataset() -> Result<(), Box<dyn Error>> {
+        let work_dir = tempdir()?;
+        let data_dir = work_dir.path().join("data");
+        fs::create_dir(&data_dir)?;
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .user_agent("gnomon-test/fit-and-project")
+            .build()?;
+
+        let archives = [
+            (
+                "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/chr22_subset50.fam.zip",
+                "chr22_subset50.fam",
+            ),
+            (
+                "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/chr22_subset50.bim.zip",
+                "chr22_subset50.bim",
+            ),
+            (
+                "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/chr22_subset50.bed.zip",
+                "chr22_subset50.bed",
+            ),
+        ];
+
+        for (url, expected) in archives {
+            download_and_extract(&client, url, expected, &data_dir)?;
+        }
+
+        let bed_path = data_dir.join("chr22_subset50.bed");
+        let dataset = GenotypeDataset::open(&bed_path)?;
+
+        let mut fit_source = dataset.block_source()?;
+        let model = HwePcaModel::fit(&mut fit_source)?;
+        let model_path = save_hwe_model(&dataset, &model)?;
+        assert!(model_path.exists(), "expected saved model to exist");
+
+        let reloaded = load_hwe_model(&dataset)?;
+        assert_eq!(reloaded.components(), model.components());
+
+        let mut projection_source = dataset.block_source()?;
+        let mut options = ProjectionOptions::default();
+        options.return_alignment = true;
+        let result = reloaded
+            .projector()
+            .project_with_options(&mut projection_source, &options)?;
+
+        assert_eq!(result.scores.nrows(), dataset.n_samples());
+        assert_eq!(result.scores.ncols(), reloaded.components());
+
+        let ProjectionOutputPaths { scores, alignment } =
+            save_projection_results(&dataset, &result)?;
+
+        assert!(scores.exists(), "projection scores were not written");
+        if let Some(alignment) = alignment {
+            assert!(alignment.exists(), "projection alignment was not written");
+        }
+
+        Ok(())
+    }
 
     const HGDP_CHR20_BCF: &str = "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/\
          hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf";
