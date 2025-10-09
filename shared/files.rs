@@ -5,6 +5,13 @@ use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
 use memmap2::Mmap;
 use natord::compare;
+use noodles_bcf::io::Writer as BcfWriter;
+use noodles_bgzf::io::Reader as BgzfReader;
+use noodles_vcf::variant::io::Write as _;
+use noodles_vcf::{self as vcf, io::Reader as VcfReader, variant::RecordBuf};
+use reqwest::StatusCode;
+use reqwest::blocking::Client;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
@@ -21,6 +28,7 @@ pub const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_CACHE_CAPACITY: usize = 8;
+const HTTP_USER_AGENT: &str = "gnomon-http-client/1.0";
 
 static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
 
@@ -145,8 +153,8 @@ impl std::fmt::Debug for BedSource {
 }
 
 /// Creates a `BedSource` for the provided `.bed` path. Local paths are
-/// memory-mapped, while `gs://` locations stream data directly from Cloud
-/// Storage.
+/// memory-mapped, while remote locations stream data directly from their
+/// backing storage.
 pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
     if is_gcs_path(path) {
         let uri = path
@@ -154,6 +162,12 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
         let remote = RemoteByteRangeSource::new(&bucket, &object)?;
+        Ok(BedSource::new(Arc::new(remote), None))
+    } else if is_http_path(path) {
+        let url = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+        let remote = HttpByteRangeSource::new(url)?;
         Ok(BedSource::new(Arc::new(remote), None))
     } else {
         let file = File::open(path)
@@ -353,8 +367,18 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
         let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        Ok(Box::new(RemoteTextSource::new(
+        let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
+        Ok(Box::new(StreamingTextSource::new(
             format!("gs://{bucket}/{object}"),
+            source,
+        )))
+    } else if is_http_path(path) {
+        let url = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+        let remote = HttpByteRangeSource::new(url)?;
+        Ok(Box::new(StreamingTextSource::new(
+            url.to_string(),
             Arc::new(remote),
         )))
     } else {
@@ -372,6 +396,10 @@ pub fn list_bcf_paths(path: &Path) -> Result<Vec<PathBuf>, PipelineError> {
             parts.push(PathBuf::from(format!("gs://{bucket}/{object}")));
         }
         return Ok(parts);
+    }
+
+    if is_http_path(path) {
+        return Ok(vec![path.to_path_buf()]);
     }
 
     if path.is_dir() {
@@ -393,6 +421,10 @@ pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
         return open_remote_bcf_source(path);
     }
 
+    if is_http_path(path) {
+        return open_http_bcf_source(path);
+    }
+
     let entries = list_bcf_paths(path)?;
     let readers = entries
         .into_iter()
@@ -404,6 +436,12 @@ pub fn open_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
 fn is_gcs_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("gs://"))
+        .unwrap_or(false)
+}
+
+fn is_http_path(path: &Path) -> bool {
+    path.to_str()
+        .map(|s| s.starts_with("http://") || s.starts_with("https://"))
         .unwrap_or(false)
 }
 
@@ -667,10 +705,28 @@ fn open_remote_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
     let (bucket, objects) = resolve_remote_bcf_objects(path)?;
     let mut readers = Vec::with_capacity(objects.len());
     for object in objects {
-        let source = RemoteByteRangeSource::new(&bucket, &object)?;
-        readers.push(prepare_remote_bcf_reader(&bucket, &object, source)?);
+        let remote = RemoteByteRangeSource::new(&bucket, &object)?;
+        let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
+        let path_display = format!("gs://{bucket}/{object}");
+        readers.push(prepare_streaming_bcf_reader(path_display, source)?);
     }
     BcfSource::from_readers(readers)
+}
+
+fn open_http_bcf_source(path: &Path) -> Result<BcfSource, PipelineError> {
+    let url = path
+        .to_str()
+        .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+    let remote = HttpByteRangeSource::new(url)?;
+    let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
+    let lower = url.to_ascii_lowercase();
+    if lower.ends_with(".vcf") || lower.ends_with(".vcf.gz") || lower.ends_with(".vcf.bgz") {
+        let reader = prepare_vcf_reader(url.to_string(), Arc::clone(&source))?;
+        BcfSource::from_readers(vec![reader])
+    } else {
+        let reader = prepare_streaming_bcf_reader(url.to_string(), source)?;
+        BcfSource::from_readers(vec![reader])
+    }
 }
 
 struct MmapByteRangeSource {
@@ -759,9 +815,9 @@ impl TextSource for LocalTextSource {
     }
 }
 
-struct RemoteTextSource {
+struct StreamingTextSource {
     path_display: String,
-    source: Arc<RemoteByteRangeSource>,
+    source: Arc<dyn ByteRangeSource>,
     offset: u64,
     len: u64,
     buffer: Vec<u8>,
@@ -771,8 +827,8 @@ struct RemoteTextSource {
     carry_active: bool,
 }
 
-impl RemoteTextSource {
-    fn new(path_display: String, source: Arc<RemoteByteRangeSource>) -> Self {
+impl StreamingTextSource {
+    fn new(path_display: String, source: Arc<dyn ByteRangeSource>) -> Self {
         let len = source.len();
         Self {
             path_display,
@@ -808,7 +864,7 @@ impl RemoteTextSource {
     }
 }
 
-impl TextSource for RemoteTextSource {
+impl TextSource for StreamingTextSource {
     fn len(&self) -> Option<u64> {
         Some(self.len)
     }
@@ -1131,9 +1187,217 @@ impl ByteRangeSource for RemoteByteRangeSource {
     }
 }
 
-struct RemoteStreamingReader {
+struct HttpByteRangeSource {
+    client: Client,
+    url: String,
+    len: u64,
+    cache: Mutex<RemoteCache>,
+}
+
+impl HttpByteRangeSource {
+    fn new(url: &str) -> Result<Self, PipelineError> {
+        let client = Client::builder()
+            .user_agent(HTTP_USER_AGENT)
+            .build()
+            .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))?;
+        let len = Self::fetch_length(&client, url)?;
+        Ok(Self {
+            client,
+            url: url.to_string(),
+            len,
+            cache: Mutex::new(RemoteCache::new(REMOTE_CACHE_CAPACITY)),
+        })
+    }
+
+    fn fetch_length(client: &Client, url: &str) -> Result<u64, PipelineError> {
+        match client.head(url).send() {
+            Ok(response) if response.status().is_success() => {
+                if let Some(len) =
+                    Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
+                {
+                    return Ok(len);
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        let response = client
+            .get(url)
+            .header(RANGE, "bytes=0-0")
+            .send()
+            .map_err(|e| {
+                PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}"))
+            })?;
+
+        if response.status() == StatusCode::PARTIAL_CONTENT {
+            if let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE)) {
+                let _ = response.bytes();
+                return Ok(total);
+            }
+        }
+
+        if response.status().is_success() {
+            if let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
+                let _ = response.bytes();
+                return Ok(len);
+            }
+        }
+
+        let status = response.status();
+        Err(PipelineError::Io(format!(
+            "Failed to determine content length for {url}: HTTP {status}"
+        )))
+    }
+
+    fn parse_content_length(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+        header
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.parse::<u64>().ok())
+    }
+
+    fn parse_content_range(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+        let text = header?.to_str().ok()?;
+        let total = text.split('/').nth(1)?;
+        total.parse::<u64>().ok()
+    }
+
+    fn block_length(&self, start: u64) -> usize {
+        let remaining = self.len.saturating_sub(start);
+        remaining.min(REMOTE_BLOCK_SIZE as u64) as usize
+    }
+
+    fn ensure_block(&self, start: u64) -> Result<Arc<Vec<u8>>, PipelineError> {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(block) = cache.get(start) {
+                return Ok(block);
+            }
+        }
+
+        let length = self.block_length(start);
+        if length == 0 {
+            return Err(PipelineError::Io(format!(
+                "Requested block beyond end of object {url}",
+                url = self.url
+            )));
+        }
+
+        let data = self.fetch_block(start, length)?;
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(start, Arc::clone(&data));
+        Ok(data)
+    }
+
+    fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
+        let end = start
+            .checked_add(length as u64)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| PipelineError::Io("HTTP range end overflow".to_string()))?;
+        let range = format!("bytes={start}-{end}");
+        let response = self
+            .client
+            .get(&self.url)
+            .header(RANGE, range)
+            .send()
+            .map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to read HTTP range from {}: {e:?}",
+                    self.url
+                ))
+            })?;
+        let status = response.status();
+        if status != StatusCode::PARTIAL_CONTENT {
+            if !(status.is_success() && start == 0) {
+                return Err(PipelineError::Io(format!(
+                    "HTTP range request for {} returned unexpected status {status}",
+                    self.url
+                )));
+            }
+        }
+
+        let bytes = response.bytes().map_err(|e| {
+            PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
+        })?;
+        let mut data = bytes.to_vec();
+        if data.len() < length {
+            return Err(PipelineError::Io(format!(
+                "HTTP range read from {} truncated: expected {length} bytes, received {}",
+                self.url,
+                data.len()
+            )));
+        }
+        if data.len() > length {
+            data.truncate(length);
+        }
+        Ok(Arc::new(data))
+    }
+}
+
+impl ByteRangeSource for HttpByteRangeSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        if offset >= self.len {
+            return Err(PipelineError::Io(format!(
+                "Attempted to read past end of HTTP resource {} at offset {offset}",
+                self.url
+            )));
+        }
+        let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
+            PipelineError::Io("Offset overflow while reading HTTP resource".to_string())
+        })?;
+        if end > self.len {
+            return Err(PipelineError::Io(format!(
+                "Attempted to read past end of HTTP resource {} (offset {offset}, len {})",
+                self.url,
+                dst.len()
+            )));
+        }
+
+        let mut remaining = dst.len();
+        let mut cursor = 0usize;
+        let mut current_offset = offset;
+        let block_size = REMOTE_BLOCK_SIZE as u64;
+
+        while remaining > 0 {
+            let block_start = (current_offset / block_size) * block_size;
+            let block = self.ensure_block(block_start)?;
+            let within_block = (current_offset - block_start) as usize;
+            if within_block >= block.len() {
+                return Err(PipelineError::Io(format!(
+                    "Computed block offset {within_block} exceeds block size {} for {}",
+                    block.len(),
+                    self.url
+                )));
+            }
+            let available = block.len() - within_block;
+            let to_copy = available.min(remaining);
+            dst[cursor..cursor + to_copy]
+                .copy_from_slice(&block[within_block..within_block + to_copy]);
+            cursor += to_copy;
+            remaining -= to_copy;
+            current_offset += to_copy as u64;
+
+            if within_block + to_copy == block.len() {
+                let next_start = block_start + block_size;
+                if next_start < self.len {
+                    let _ = self.ensure_block(next_start);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct StreamingReader {
     path_display: String,
-    source: Arc<RemoteByteRangeSource>,
+    source: Arc<dyn ByteRangeSource>,
     offset: u64,
     len: u64,
     buffer: Vec<u8>,
@@ -1141,8 +1405,8 @@ struct RemoteStreamingReader {
     valid: usize,
 }
 
-impl RemoteStreamingReader {
-    fn new(path_display: String, source: Arc<RemoteByteRangeSource>) -> Self {
+impl StreamingReader {
+    fn new(path_display: String, source: Arc<dyn ByteRangeSource>) -> Self {
         let len = source.len();
         Self {
             path_display,
@@ -1198,7 +1462,7 @@ impl RemoteStreamingReader {
     }
 }
 
-impl Read for RemoteStreamingReader {
+impl Read for StreamingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1234,15 +1498,142 @@ impl Read for RemoteStreamingReader {
     }
 }
 
-fn prepare_remote_bcf_reader(
-    bucket: &str,
-    object: &str,
-    source: RemoteByteRangeSource,
+struct VcfAsBcfReader {
+    path_display: String,
+    reader: VcfReader<BgzfReader<StreamingReader>>,
+    header: vcf::Header,
+    writer: BcfWriter<Vec<u8>>,
+    buffer_cursor: usize,
+    record: RecordBuf,
+    finished: bool,
+}
+
+impl VcfAsBcfReader {
+    fn new(path_display: String, source: Arc<dyn ByteRangeSource>) -> Result<Self, PipelineError> {
+        let streaming = StreamingReader::new(path_display.clone(), source);
+        let bgzf_reader = BgzfReader::new(streaming);
+        let mut reader = VcfReader::new(bgzf_reader);
+        let header = reader.read_header().map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to read VCF header from {path_display}: {e}"
+            ))
+        })?;
+
+        let mut writer = BcfWriter::from(Vec::with_capacity(8192));
+        writer.write_header(&header).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to encode VCF header from {path_display} as BCF: {e}"
+            ))
+        })?;
+
+        Ok(Self {
+            path_display,
+            reader,
+            header,
+            writer,
+            buffer_cursor: 0,
+            record: RecordBuf::default(),
+            finished: false,
+        })
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<bool> {
+        if self.finished {
+            return Ok(false);
+        }
+
+        let bytes = self
+            .reader
+            .read_record_buf(&self.header, &mut self.record)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to read VCF record from {}: {e}", self.path_display),
+                )
+            })?;
+
+        if bytes == 0 {
+            self.finished = true;
+            return Ok(false);
+        }
+
+        self.writer
+            .write_variant_record(&self.header, &self.record)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Failed to encode VCF record from {} as BCF: {e}",
+                        self.path_display
+                    ),
+                )
+            })?;
+
+        Ok(true)
+    }
+
+    fn available_bytes(&self) -> usize {
+        let buffer = self.writer.get_ref();
+        buffer.len().saturating_sub(self.buffer_cursor)
+    }
+
+    fn discard_consumed(&mut self) {
+        let len = self.writer.get_ref().len();
+        if self.buffer_cursor >= len {
+            self.writer.get_mut().clear();
+            self.buffer_cursor = 0;
+        }
+    }
+}
+
+impl Read for VcfAsBcfReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0;
+        while total < buf.len() {
+            self.discard_consumed();
+
+            if self.available_bytes() == 0 {
+                if !self.fill_buffer()? {
+                    break;
+                }
+                if self.available_bytes() == 0 {
+                    break;
+                }
+            }
+
+            let available = self.available_bytes();
+            let to_copy = available.min(buf.len() - total);
+            if to_copy == 0 {
+                break;
+            }
+
+            {
+                let buffer = self.writer.get_ref();
+                let start = self.buffer_cursor;
+                let end = start + to_copy;
+                buf[total..total + to_copy].copy_from_slice(&buffer[start..end]);
+            }
+
+            self.buffer_cursor += to_copy;
+            total += to_copy;
+        }
+
+        self.discard_consumed();
+
+        Ok(total)
+    }
+}
+
+fn prepare_streaming_bcf_reader(
+    path_display: String,
+    source: Arc<dyn ByteRangeSource>,
 ) -> Result<PreparedBcfReader, PipelineError> {
     let len = source.len();
-    let source = Arc::new(source);
-    let mut reader =
-        RemoteStreamingReader::new(format!("gs://{bucket}/{object}"), Arc::clone(&source));
+    let mut reader = StreamingReader::new(path_display, Arc::clone(&source));
     let is_gzip = reader.peek_gzip_magic()?;
     let compression = if is_gzip {
         BcfCompression::Bgzf
@@ -1255,6 +1646,19 @@ fn prepare_remote_bcf_reader(
         len,
         skip_header: false,
         compression,
+    })
+}
+
+fn prepare_vcf_reader(
+    path_display: String,
+    source: Arc<dyn ByteRangeSource>,
+) -> Result<PreparedBcfReader, PipelineError> {
+    let reader = VcfAsBcfReader::new(path_display, source)?;
+    Ok(PreparedBcfReader {
+        reader: Box::new(reader),
+        len: 0,
+        skip_header: false,
+        compression: BcfCompression::Plain,
     })
 }
 

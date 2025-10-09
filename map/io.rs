@@ -1345,7 +1345,12 @@ impl VariantBlockSource for BcfVariantBlockSource {
 fn guess_is_bcf(path: &Path) -> bool {
     if is_remote_path(path) {
         let lower = path.to_string_lossy().to_ascii_lowercase();
-        lower.ends_with(".bcf") || lower.ends_with("/*") || lower.ends_with('/')
+        lower.ends_with(".bcf")
+            || lower.ends_with(".vcf.gz")
+            || lower.ends_with(".vcf.bgz")
+            || lower.ends_with(".bgz")
+            || lower.ends_with("/*")
+            || lower.ends_with('/')
     } else if path.is_dir() {
         true
     } else {
@@ -1649,7 +1654,7 @@ fn count_bim_records(path: &Path) -> Result<usize, PlinkIoError> {
 
 fn is_remote_path(path: &Path) -> bool {
     path.to_str()
-        .map(|s| s.starts_with("gs://"))
+        .map(|s| s.starts_with("gs://") || s.starts_with("http://") || s.starts_with("https://"))
         .unwrap_or(false)
 }
 

@@ -1378,3 +1378,157 @@ impl<'de> Deserialize<'de> for HwePcaModel {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::io::GenotypeDataset;
+    use std::path::Path;
+
+    const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
+    const MAX_TEST_VARIANTS: usize = 32;
+    const MAX_TEST_SAMPLES: usize = 8;
+
+    struct LimitedBlockSource<T> {
+        inner: T,
+        sample_limit: usize,
+        variant_limit: usize,
+        remaining_variants: usize,
+        inner_samples: usize,
+        scratch: Vec<f64>,
+    }
+
+    impl<T> LimitedBlockSource<T>
+    where
+        T: VariantBlockSource,
+    {
+        fn new(inner: T, max_samples: usize, max_variants: usize) -> Self {
+            let inner_samples = inner.n_samples();
+            let inner_variants = inner.n_variants();
+            let sample_limit = max_samples.max(2).min(inner_samples);
+            let variant_limit = max_variants.max(1).min(inner_variants);
+            let scratch = vec![0.0; inner_samples * variant_limit];
+            Self {
+                inner,
+                sample_limit,
+                variant_limit,
+                remaining_variants: variant_limit,
+                inner_samples,
+                scratch,
+            }
+        }
+    }
+
+    impl<T> VariantBlockSource for LimitedBlockSource<T>
+    where
+        T: VariantBlockSource,
+    {
+        type Error = T::Error;
+
+        fn n_samples(&self) -> usize {
+            self.sample_limit
+        }
+
+        fn n_variants(&self) -> usize {
+            self.variant_limit
+        }
+
+        fn reset(&mut self) -> Result<(), Self::Error> {
+            self.inner.reset()?;
+            self.remaining_variants = self.variant_limit;
+            Ok(())
+        }
+
+        fn next_block_into(
+            &mut self,
+            max_variants: usize,
+            storage: &mut [f64],
+        ) -> Result<usize, Self::Error> {
+            if self.remaining_variants == 0 {
+                return Ok(0);
+            }
+
+            let request = max_variants.min(self.remaining_variants);
+            if request == 0 {
+                return Ok(0);
+            }
+
+            let inner_len = self.inner_samples * request;
+            let read = self
+                .inner
+                .next_block_into(request, &mut self.scratch[..inner_len])?;
+            let consumed = read.min(self.remaining_variants);
+            self.remaining_variants -= consumed;
+
+            let samples = self.sample_limit;
+            for variant_idx in 0..read {
+                let inner_offset = variant_idx * self.inner_samples;
+                let outer_offset = variant_idx * samples;
+                let src = &self.scratch[inner_offset..inner_offset + samples];
+                let dst = &mut storage[outer_offset..outer_offset + samples];
+                dst.copy_from_slice(src);
+            }
+
+            Ok(read)
+        }
+    }
+
+    fn should_skip(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        lower.contains("dns error")
+            || lower.contains("timed out")
+            || lower.contains("temporary failure")
+            || lower.contains("could not resolve host")
+            || lower.contains("connection refused")
+            || lower.contains("network is unreachable")
+    }
+
+    #[test]
+    fn fit_hwe_pca_from_http_vcf_stream() {
+        let path = Path::new(TEST_VCF_URL);
+        let dataset = match GenotypeDataset::open(path) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                let msg = err.to_string();
+                if should_skip(&msg) {
+                    eprintln!("skipping HTTP PCA test: {msg}");
+                    return;
+                }
+                panic!("Failed to open dataset: {msg}");
+            }
+        };
+
+        let block_source = match dataset.block_source() {
+            Ok(source) => source,
+            Err(err) => {
+                let msg = err.to_string();
+                if should_skip(&msg) {
+                    eprintln!("skipping HTTP PCA test: {msg}");
+                    return;
+                }
+                panic!("Failed to create block source: {msg}");
+            }
+        };
+
+        let mut limited_source =
+            LimitedBlockSource::new(block_source, MAX_TEST_SAMPLES, MAX_TEST_VARIANTS);
+        let expected_variants = limited_source.n_variants();
+        let expected_samples = limited_source.n_samples();
+
+        let model = match HwePcaModel::fit(&mut limited_source) {
+            Ok(model) => model,
+            Err(err) => {
+                let msg = err.to_string();
+                if should_skip(&msg) {
+                    eprintln!("skipping HTTP PCA test: {msg}");
+                    return;
+                }
+                panic!("Failed to fit PCA model: {msg}");
+            }
+        };
+
+        assert_eq!(expected_samples, model.n_samples());
+        assert_eq!(expected_variants, model.n_variants());
+        assert!(model.components() > 0);
+    }
+}
