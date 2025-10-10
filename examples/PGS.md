@@ -86,3 +86,16 @@ plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); pl
 
 <img width="390" height="379" alt="image" src="https://github.com/user-attachments/assets/96f101be-c18f-494f-bdd6-4550364c6644" />
 
+Let's make the case definition.
+
+**ICD-10:**
+- C18.0–C18.9 — Malignant neoplasm of colon
+- C19 — Malignant neoplasm of rectosigmoid junction. 
+- C20 — Malignant neoplasm of rectum. 
+
+**ICD-9:**
+- 153.0–153.9 — Malignant neoplasm of colon.
+- 154.0 — Malignant neoplasm of rectosigmoid junction.
+- 154.1 — Malignant neoplasm of rectum.
+
+For simplicity, we aren't using a time-to-event model. Some of our "controls" will go on to develop colorectal cancer later in life.
