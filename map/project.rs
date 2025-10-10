@@ -427,6 +427,7 @@ mod tests {
     const N_SAMPLES: usize = 3;
     const N_VARIANTS: usize = 4;
     const TOLERANCE: f64 = 1e-10;
+    const TEST_COMPONENTS: usize = 2;
 
     fn sample_data() -> Vec<f64> {
         vec![
@@ -440,7 +441,7 @@ mod tests {
     fn fit_example_model() -> HwePcaModel {
         let data = sample_data();
         let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
-        HwePcaModel::fit(&mut source).expect("model fit")
+        HwePcaModel::fit_k(&mut source, TEST_COMPONENTS).expect("model fit")
     }
 
     fn assert_mats_close(a: &Mat<f64>, b: &Mat<f64>, tol: f64) {

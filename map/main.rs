@@ -17,6 +17,7 @@ pub enum MapCommand {
     Fit {
         genotype_path: PathBuf,
         variant_list: Option<PathBuf>,
+        components: usize,
     },
     Project {
         genotype_path: PathBuf,
@@ -97,12 +98,17 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
         MapCommand::Fit {
             genotype_path,
             variant_list,
-        } => run_fit(&genotype_path, variant_list.as_deref()),
+            components,
+        } => run_fit(&genotype_path, variant_list.as_deref(), components),
         MapCommand::Project { genotype_path } => run_project(&genotype_path),
     }
 }
 
-fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapDriverError> {
+fn run_fit(
+    genotype_path: &Path,
+    variant_list: Option<&Path>,
+    components: usize,
+) -> Result<(), MapDriverError> {
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -121,6 +127,8 @@ fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapD
         dataset.n_samples(),
         variant_display
     );
+
+    println!("Requested principal components: {components}");
 
     let mut variant_keys: Option<Vec<_>> = None;
     let mut selection_plan = SelectionPlan::All;
@@ -166,7 +174,7 @@ fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapD
 
     let mut source = dataset.block_source_with_plan(selection_plan)?;
     let progress = fit_progress();
-    let mut model = HwePcaModel::fit_with_progress(&mut source, &progress)?;
+    let mut model = HwePcaModel::fit_k_with_progress(&mut source, components, &progress)?;
 
     if let Some(outcome) = source.take_selection_outcome() {
         if outcome.requested_unique > 0 {
@@ -194,12 +202,21 @@ fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapD
         model.set_variant_keys(Some(keys));
     }
 
-    println!(
-        "Retained {} principal components across {} samples ({} variants)",
-        model.components(),
-        model.n_samples(),
-        model.n_variants()
-    );
+    let retained = model.components();
+    if retained == components {
+        println!(
+            "Retained {retained} principal components across {} samples ({} variants)",
+            model.n_samples(),
+            model.n_variants()
+        );
+    } else {
+        println!(
+            "Retained {retained} principal components (requested {components}) across {} samples ({} variants)",
+            model.n_samples(),
+            model.n_variants()
+        );
+        println!("Note: dataset provides only {retained} positive principal components.");
+    }
 
     let model_path = save_hwe_model(&dataset, &model)?;
     let manifest_path = save_sample_manifest(&dataset)?;
@@ -287,8 +304,7 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
-    let result =
-        projector.project_with_options_and_progress(&mut source, &options, &*progress)?;
+    let result = projector.project_with_options_and_progress(&mut source, &options, &*progress)?;
 
     if let Some(outcome) = source.take_selection_outcome() {
         if !outcome.missing_keys.is_empty() {
@@ -367,6 +383,8 @@ mod tests {
 
     use reqwest::blocking::Client;
     use std::io::{self, Cursor};
+
+    const TEST_COMPONENTS: usize = 8;
 
     fn download_and_extract(
         client: &Client,
@@ -450,7 +468,7 @@ mod tests {
         let dataset = GenotypeDataset::open(&bed_path)?;
 
         let mut fit_source = dataset.block_source()?;
-        let model = HwePcaModel::fit(&mut fit_source)?;
+        let model = HwePcaModel::fit_k(&mut fit_source, TEST_COMPONENTS)?;
         let model_path = save_hwe_model(&dataset, &model)?;
         assert!(model_path.exists(), "expected saved model to exist");
 
@@ -870,6 +888,8 @@ mod tests {
         let fit_output = Command::new(&binary)
             .arg("--fit")
             .arg(HGDP_FULL_DATASET)
+            .arg("--components")
+            .arg(TEST_COMPONENTS.to_string())
             .output()
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
 
@@ -1055,7 +1075,7 @@ mod tests {
         let mut train_source = dataset
             .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
-        let mut model = HwePcaModel::fit(&mut train_source)
+        let mut model = HwePcaModel::fit_k(&mut train_source, TEST_COMPONENTS)
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
 
         if let Some(sel) = &selection {
