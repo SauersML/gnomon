@@ -21,9 +21,10 @@ Strong performers seem to include:
 - PGS003852
 - PGS004303
 
-We'll assess these scores on two metrics in the test data:
+We'll assess these scores on three metrics in the test data:
 - Odds ratio (per standard deviation of score)
 - AUROC
+- Nagelkerke's R²
 
 We want to avoid imputation, but we still want lots of samples with many variants.
 
