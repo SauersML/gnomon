@@ -153,3 +153,113 @@ pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided
 The GenoBoost method (PGS004303), which uses non-additive models, doesn't perform well relative to the others. The ICD10 codes included in the construction of PGS004303 were similar to ours: C18,C19,C20.
 
 The best performing scores are PGS003852, PGS003979, and PGS003433. One thing common to each of these scores is that the associated study involves colorectal cancer specifically (as opposed to being general and studying many diseases at once).
+
+Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
+
+```
+import os, numpy as np, pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import roc_auc_score
+
+d = pd.read_csv('../../arrays.sscore', sep='\t')
+d['#IID'] = d['#IID'].astype(str)
+d = d.set_index('#IID')
+score_cols = [c for c in d.columns if c.endswith('_AVG')]
+
+try:
+    covars
+except NameError:
+    NUM_PCS = 16
+    PCS_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+    SEX_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
+    storage_opts = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
+    pcs_raw = pd.read_csv(PCS_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","pca_features"])
+    parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
+    pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
+    pc_df = pd.DataFrame(pcs_raw["pca_features"].apply(parse).to_list(), columns=pc_cols)\
+              .assign(person_id=pcs_raw["research_id"].astype(str)).set_index("person_id")
+    sex_df = pd.read_csv(SEX_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","dragen_sex_ploidy"])\
+              .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"]\
+              .map({"XX":0,"XY":1}).to_frame("sex").dropna()
+    covars = pc_df.join(sex_df, how="inner").filter(pc_cols+["sex"]).dropna()
+
+if 'cases' not in globals():
+    raise NameError("Variable 'cases' not found.")
+case_set = set(pd.Series(cases, dtype=str))
+
+rows = []
+for sc in score_cols:
+    tmp = d[[sc]].join(covars, how='inner').dropna()
+    if tmp.empty: 
+        continue
+    y = tmp.index.to_series().isin(case_set).astype('i1').to_numpy()
+    X = tmp[["sex"] + pc_cols + [sc]].astype(float).to_numpy()
+    mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
+    mdl.fit(X, y)
+    auc = roc_auc_score(y, mdl.predict_proba(X)[:,1])
+    rows.append({"score": sc.replace("_AVG",""), "n": int(len(tmp)), "cases": int(y.sum()), "controls": int(len(y)-y.sum()), "AUROC": float(auc)})
+
+out = pd.DataFrame(rows).sort_values("AUROC", ascending=False).reset_index(drop=True)
+display(out)
+```
+
+
+| score     | cases | controls | AUROC    |
+| :-------- | ----: | -------: | :------- |
+| PGS003852 |  2985 |   410352 | 0.619005 |
+| PGS003979 |  2985 |   410352 | 0.617833 |
+| PGS003433 |  2985 |   410352 | 0.610325 |
+| PGS000765 |  2985 |   410352 | 0.600296 |
+| PGS004904 |  2985 |   410352 | 0.599918 |
+| PGS003386 |  2985 |   410352 | 0.596961 |
+| PGS004303 |  2985 |   410352 | 0.592681 |
+
+This improves the scores somewhat, but there's a few problems. First, we typically want one prediction per individual, but now we have seven (one per score). Further, we're training on the same dataset we're evaluating on.
+
+Now, let's test the same model, except jointly fitting all scores (except for PGS004303) using cross-validation to avoid overfitting.
+
+```
+import os, numpy as np, pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import roc_auc_score
+
+d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID')
+d.index = d.index.astype(str)
+pgs = [c for c in d.columns if c.endswith('_AVG') and c != 'PGS004303_AVG']
+
+try:
+    covars
+except NameError:
+    NUM_PCS=16; pc_cols=[f"PC{i}" for i in range(1,NUM_PCS+1)]
+    so={"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
+    pcs=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv", sep="\t", storage_options=so, usecols=["research_id","pca_features"])
+    parse=lambda s,k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
+    pc_df=pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols).assign(person_id=pcs["research_id"].astype(str)).set_index("person_id")
+    sex=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv", sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+    sex_df=sex.assign(person_id=sex["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"].map({"XX":0,"XY":1}).to_frame("sex").dropna()
+    covars=pc_df.join(sex_df, how="inner").filter(pc_cols+["sex"]).dropna()
+
+covars = covars.copy()
+covars.index = covars.index.astype(str)
+
+if 'cases' not in globals(): raise NameError("Variable 'cases' not found.")
+case_set=set(pd.Series(cases, dtype=str))
+
+Xy = covars.join(d[pgs], how="inner").dropna()
+y = Xy.index.to_series().isin(case_set).astype('i1').to_numpy()
+X = Xy.to_numpy()
+
+cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
+mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
+p = cross_val_predict(mdl, X, y, cv=cv, method="predict_proba")[:,1]
+auc = roc_auc_score(y, p)
+
+pd.DataFrame([{"n": int(len(y)), "cases": int(y.sum()), "controls": int(len(y)-y.sum()), "predictors": X.shape[1], "AUROC": float(auc)}])
+```
+
+This yields an AUROC of 0.617375.
