@@ -1295,7 +1295,9 @@ impl VcfLikeVariantBlockSource {
             .unwrap_or_default()
             .as_millis();
         let mut spool_path = root.join(format!("part{}_{}", idx, unique));
-        if let Some(ext) = path.extension() {
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+            spool_path.set_file_name(format!("part{}_{}_{}", idx, unique, file_name));
+        } else if let Some(ext) = path.extension() {
             spool_path.set_extension(ext);
         }
 
