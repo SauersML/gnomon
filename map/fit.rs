@@ -1828,7 +1828,11 @@ mod tests {
             let inner_samples = inner.n_samples();
             let inner_variants = inner.n_variants();
             let sample_limit = max_samples.max(2).min(inner_samples);
-            let variant_limit = max_variants.max(1).min(inner_variants);
+            let variant_limit = if inner_variants == 0 {
+                max_variants.max(1)
+            } else {
+                max_variants.max(1).min(inner_variants)
+            };
             let scratch = vec![0.0; inner_samples * variant_limit];
             Self {
                 inner,
