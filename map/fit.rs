@@ -104,6 +104,11 @@ pub trait VariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, Self::Error>;
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        let _ = self;
+        None
+    }
 }
 
 pub struct DenseBlockSource<'a> {
@@ -316,28 +321,34 @@ struct VariantStatsCache {
     scales: Vec<f64>,
     block_sums: Vec<f64>,
     block_calls: Vec<usize>,
-    computed: bool,
+    finalized_len: Option<usize>,
 }
 
 impl VariantStatsCache {
-    fn new(n_variants: usize, block_capacity: usize) -> Self {
+    fn new(block_capacity: usize) -> Self {
         Self {
-            frequencies: vec![0.0; n_variants],
-            scales: vec![HWE_SCALE_FLOOR; n_variants],
+            frequencies: Vec::new(),
+            scales: Vec::new(),
             block_sums: vec![0.0; block_capacity],
             block_calls: vec![0usize; block_capacity],
-            computed: false,
+            finalized_len: None,
         }
     }
 
-    fn is_computed(&self) -> bool {
-        self.computed
+    fn is_finalized(&self) -> bool {
+        self.finalized_len.is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.finalized_len.unwrap_or(self.frequencies.len())
     }
 
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
-        if self.computed {
+        if self.is_finalized() {
             return;
         }
+
+        debug_assert!(variant_range.start == self.frequencies.len());
 
         let filled = block.ncols();
         let sums_slice = &mut self.block_sums[..filled];
@@ -373,41 +384,49 @@ impl VariantStatsCache {
                 });
         }
 
-        for (local_col, (&sum, &calls)) in sums_slice.iter().zip(calls_slice.iter()).enumerate() {
-            let variant_index = variant_range.start + local_col;
+        for (&sum, &calls) in sums_slice.iter().zip(calls_slice.iter()) {
             if calls == 0 {
-                self.frequencies[variant_index] = 0.0;
-                self.scales[variant_index] = HWE_SCALE_FLOOR;
+                self.frequencies.push(0.0);
+                self.scales.push(HWE_SCALE_FLOOR);
                 continue;
             }
 
             let mean_genotype = sum / (calls as f64);
             let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
             let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
-            self.frequencies[variant_index] = allele_freq;
             let derived_scale = variance.sqrt();
-            self.scales[variant_index] = if derived_scale < HWE_SCALE_FLOOR {
+
+            self.frequencies.push(allele_freq);
+            self.scales.push(if derived_scale < HWE_SCALE_FLOOR {
                 HWE_SCALE_FLOOR
             } else {
                 derived_scale
-            };
+            });
         }
+
+        debug_assert_eq!(self.frequencies.len(), variant_range.end);
+        debug_assert_eq!(self.scales.len(), variant_range.end);
     }
 
     fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
-        let start = variant_range.start;
         let end = variant_range.end;
+        let len = self.len();
+        assert!(
+            end <= len,
+            "standardization requested beyond computed statistics"
+        );
+        let start = variant_range.start;
         let freqs = &self.frequencies[start..end];
         let scales = &self.scales[start..end];
         standardize_block_impl(block, freqs, scales, par);
     }
 
-    fn mark_computed(&mut self) {
-        self.computed = true;
+    fn finalize(&mut self) {
+        self.finalized_len = Some(self.frequencies.len());
     }
 
     fn into_scaler(self) -> Option<HweScaler> {
-        if self.computed {
+        if self.finalized_len.is_some() {
             Some(HweScaler::new(self.frequencies, self.scales))
         } else {
             None
@@ -538,25 +557,24 @@ impl HwePcaModel {
         P: FitProgressObserver + 'static,
     {
         let n_samples = source.n_samples();
-        let n_variants = source.n_variants();
+        let n_variants_hint = source.n_variants();
 
         if n_samples < 2 {
             return Err(HwePcaError::InvalidInput(
                 "HWE PCA requires at least two samples",
             ));
         }
-        if n_variants == 0 {
-            return Err(HwePcaError::InvalidInput(
-                "HWE PCA requires at least one variant",
-            ));
-        }
 
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
-        let block_capacity = min(DEFAULT_BLOCK_WIDTH.max(1), n_variants);
+        let block_capacity = if n_variants_hint > 0 {
+            min(DEFAULT_BLOCK_WIDTH.max(1), n_variants_hint)
+        } else {
+            DEFAULT_BLOCK_WIDTH.max(1)
+        };
         let block_storage = vec![0.0f64; n_samples * block_capacity];
 
-        progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants);
+        progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
         let stats_progress =
             StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
 
@@ -570,7 +588,7 @@ impl HwePcaModel {
         let gram_mode = covariance_computation_mode(n_samples);
         let gram_progress_handle = match gram_mode {
             CovarianceComputationMode::Dense => {
-                progress.on_stage_start(FitProgressStage::GramMatrix, n_variants);
+                progress.on_stage_start(FitProgressStage::GramMatrix, n_variants_hint);
                 Some(StageProgressHandle::new(
                     Arc::clone(progress),
                     FitProgressStage::GramMatrix,
@@ -578,18 +596,36 @@ impl HwePcaModel {
             }
             CovarianceComputationMode::Partial => {
                 progress.on_stage_start(FitProgressStage::GramMatrix, 0);
-                progress.on_stage_estimate(FitProgressStage::GramMatrix, n_variants);
+                if n_variants_hint > 0 {
+                    progress.on_stage_estimate(FitProgressStage::GramMatrix, n_variants_hint);
+                }
                 None
             }
         };
 
         let decomposition_result =
             compute_covariance_eigenpairs(&operator, par, gram_mode, gram_progress_handle.as_ref());
+        let observed_variants = operator
+            .observed_n_variants()
+            .expect("covariance operator must observe variants during first pass");
         let (source, mut block_storage, scaler_opt) = operator.into_parts();
         let decomposition = decomposition_result?;
-        progress.on_stage_finish(FitProgressStage::GramMatrix);
 
         let scaler = scaler_opt.expect("covariance operator statistics missing after execution");
+        let variant_count = scaler.variant_scales().len();
+        debug_assert_eq!(variant_count, observed_variants);
+        if variant_count == 0 {
+            return Err(HwePcaError::InvalidInput(
+                "HWE PCA requires at least one variant",
+            ));
+        }
+
+        log::info!("Observed {} variants during first pass", variant_count);
+
+        if gram_progress_handle.is_none() {
+            progress.on_stage_total(FitProgressStage::GramMatrix, variant_count);
+        }
+        progress.on_stage_finish(FitProgressStage::GramMatrix);
 
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
@@ -606,6 +642,7 @@ impl HwePcaModel {
         let loadings = compute_variant_loadings(
             source,
             &scaler,
+            variant_count,
             block_capacity,
             &mut block_storage,
             decomposition.vectors.as_ref(),
@@ -616,7 +653,7 @@ impl HwePcaModel {
 
         Ok(Self {
             n_samples,
-            n_variants,
+            n_variants: variant_count,
             scaler,
             eigenvalues: decomposition.values,
             singular_values,
@@ -698,10 +735,11 @@ where
     source: *mut S,
     block_storage: UnsafeCell<Option<Vec<f64>>>,
     n_samples: usize,
-    n_variants: usize,
+    n_variants_hint: usize,
     block_capacity: usize,
     scale: f64,
     stats: UnsafeCell<VariantStatsCache>,
+    observed_variants: UnsafeCell<Option<usize>>,
     stats_progress: UnsafeCell<Option<StageProgressHandle<P>>>,
     error: UnsafeCell<Option<HwePcaError>>,
     marker: PhantomData<&'a mut S>,
@@ -720,7 +758,7 @@ where
         stats_progress: Option<StageProgressHandle<P>>,
     ) -> Self {
         let n_samples = source.n_samples();
-        let n_variants = source.n_variants();
+        let n_variants_hint = source.n_variants();
         assert_eq!(
             block_storage.len(),
             n_samples * block_capacity,
@@ -731,10 +769,11 @@ where
             source: source as *mut S,
             block_storage: UnsafeCell::new(Some(block_storage)),
             n_samples,
-            n_variants,
+            n_variants_hint,
             block_capacity,
             scale,
-            stats: UnsafeCell::new(VariantStatsCache::new(n_variants, block_capacity)),
+            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity)),
+            observed_variants: UnsafeCell::new(None),
             stats_progress: UnsafeCell::new(stats_progress),
             error: UnsafeCell::new(None),
             marker: PhantomData,
@@ -783,8 +822,24 @@ where
         self.n_samples
     }
 
+    fn observed_n_variants(&self) -> Option<usize> {
+        unsafe { *self.observed_variants.get() }
+    }
+
+    fn effective_n_variants(&self) -> usize {
+        self.observed_n_variants()
+            .or_else(|| {
+                if self.n_variants_hint > 0 {
+                    Some(self.n_variants_hint)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
     fn stats_computed(&self) -> bool {
-        unsafe { (*self.stats.get()).is_computed() }
+        unsafe { (*self.stats.get()).is_finalized() }
     }
 
     fn standardize_block_in_place(
@@ -800,7 +855,7 @@ where
 
     fn mark_stats_computed(&self) {
         let stats = unsafe { &mut *self.stats.get() };
-        stats.mark_computed();
+        stats.finalize();
         let slot = unsafe { &mut *self.stats_progress.get() };
         if let Some(handle) = slot.take() {
             handle.finish();
@@ -817,7 +872,10 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StandardizedCovarianceOp")
             .field("n_samples", &self.n_samples)
-            .field("n_variants", &self.n_variants)
+            .field("n_variants_hint", &self.n_variants_hint)
+            .field("observed_variants", &unsafe {
+                *self.observed_variants.get()
+            })
             .field("block_capacity", &self.block_capacity)
             .finish()
     }
@@ -905,6 +963,14 @@ where
         let mut processed = 0usize;
 
         let stats_ready = self.stats_computed();
+        let mut observed = unsafe { *self.observed_variants.get() };
+        let to_usize = |value: u64| -> usize {
+            if value > usize::MAX as u64 {
+                usize::MAX
+            } else {
+                value as usize
+            }
+        };
 
         loop {
             let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
@@ -916,8 +982,17 @@ where
                 break;
             }
 
-            if processed + filled > self.n_variants {
-                self.fail_invalid("VariantBlockSource returned more variants than reported");
+            if let Some(expected_total) = observed {
+                if processed + filled > expected_total {
+                    self.fail_invalid(
+                        "VariantBlockSource returned more variants than previously observed",
+                    );
+                }
+            } else if self.n_variants_hint > 0
+                && processed + filled > self.n_variants_hint
+                && !stats_ready
+            {
+                self.fail_invalid("VariantBlockSource returned more variants than reported hint");
             }
 
             let block_slice = &mut block_storage[..self.n_samples * filled];
@@ -950,16 +1025,39 @@ where
 
             if !stats_ready {
                 if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
-                    handle.advance(processed);
+                    if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
+                        if let Some(total) = total_bytes {
+                            handle.set_total(to_usize(total));
+                        }
+                        handle.advance(to_usize(bytes_read));
+                    } else {
+                        handle.advance(processed);
+                    }
                 }
             }
         }
 
-        if processed != self.n_variants {
-            self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
+        if processed == 0 {
+            self.fail_invalid("VariantBlockSource yielded no variants");
+        }
+
+        if let Some(expected_total) = observed {
+            if processed != expected_total {
+                self.fail_invalid(
+                    "VariantBlockSource terminated early during covariance accumulation",
+                );
+            }
+        } else {
+            observed = Some(processed);
+            unsafe {
+                *self.observed_variants.get() = observed;
+            }
         }
 
         if !stats_ready {
+            if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
+                handle.set_total(processed);
+            }
             self.mark_stats_computed();
         }
     }
@@ -1140,10 +1238,9 @@ where
     P: FitProgressObserver + 'static,
 {
     let n_samples = operator.n_samples;
-    let n_variants = operator.n_variants;
     let mut covariance = Mat::zeros(n_samples, n_samples);
 
-    if n_samples == 0 || n_variants == 0 {
+    if n_samples == 0 {
         return Ok(covariance);
     }
 
@@ -1160,6 +1257,14 @@ where
         .map_err(|err| HwePcaError::Source(Box::new(err)))?;
 
     let mut processed = 0usize;
+    let mut observed = operator.observed_n_variants();
+    let to_usize = |value: u64| -> usize {
+        if value > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            value as usize
+        }
+    };
 
     loop {
         let filled = source
@@ -1170,9 +1275,18 @@ where
             break;
         }
 
-        if processed + filled > n_variants {
+        if let Some(expected_total) = observed {
+            if processed + filled > expected_total {
+                return Err(HwePcaError::InvalidInput(
+                    "VariantBlockSource returned more variants than previously observed",
+                ));
+            }
+        } else if operator.n_variants_hint > 0
+            && processed + filled > operator.n_variants_hint
+            && !operator.stats_computed()
+        {
             return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported",
+                "VariantBlockSource returned more variants than reported hint",
             ));
         }
 
@@ -1197,14 +1311,37 @@ where
         processed += filled;
 
         if let Some(handle) = progress {
-            handle.advance(processed);
+            if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
+                if let Some(total) = total_bytes {
+                    handle.set_total(to_usize(total));
+                }
+                handle.advance(to_usize(bytes_read));
+            } else {
+                handle.advance(processed);
+            }
         }
     }
 
-    if processed != n_variants {
+    if processed == 0 {
         return Err(HwePcaError::InvalidInput(
-            "VariantBlockSource terminated early during covariance accumulation",
+            "VariantBlockSource yielded no variants",
         ));
+    }
+
+    if let Some(expected_total) = observed {
+        if processed != expected_total {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource terminated early during covariance accumulation",
+            ));
+        }
+    } else {
+        observed = Some(processed);
+        unsafe {
+            *operator.observed_variants.get() = observed;
+        }
+        if let Some(handle) = progress {
+            handle.set_total(processed);
+        }
     }
 
     if !operator.stats_computed() {
@@ -1309,6 +1446,7 @@ fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64
 fn compute_variant_loadings<S, P>(
     source: &mut S,
     scaler: &HweScaler,
+    expected_variants: usize,
     block_capacity: usize,
     block_storage: &mut [f64],
     sample_basis: MatRef<'_, f64>,
@@ -1322,9 +1460,8 @@ where
     P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
-    let n_variants = source.n_variants();
     let n_components = singular_values.len();
-    let mut loadings = Mat::zeros(n_variants, n_components);
+    let mut loadings = Mat::zeros(expected_variants, n_components);
     let mut processed = 0usize;
     let mut chunk_storage = vec![0.0f64; block_capacity * n_components];
     let inverse_singular: Vec<f64> = singular_values
@@ -1332,7 +1469,7 @@ where
         .map(|&sigma| if sigma > 0.0 { 1.0 / sigma } else { 0.0 })
         .collect();
 
-    progress.on_stage_start(FitProgressStage::Loadings, n_variants);
+    progress.on_stage_start(FitProgressStage::Loadings, expected_variants);
 
     loop {
         let filled = source
@@ -1341,7 +1478,7 @@ where
         if filled == 0 {
             break;
         }
-        if processed + filled > n_variants {
+        if processed + filled > expected_variants {
             return Err(HwePcaError::InvalidInput(
                 "VariantBlockSource returned more variants than reported",
             ));
@@ -1388,7 +1525,7 @@ where
         progress.on_stage_advance(FitProgressStage::Loadings, processed);
     }
 
-    if processed != n_variants {
+    if processed != expected_variants {
         return Err(HwePcaError::InvalidInput(
             "VariantBlockSource terminated early while computing loadings",
         ));

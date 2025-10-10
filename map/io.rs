@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -7,14 +8,15 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BedSource, TextSource, VariantCompression, VariantFormat, list_variant_paths, open_bed_source,
-    open_text_source, open_variant_source,
+    BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, list_variant_paths,
+    open_bed_source, open_text_source, open_variant_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
@@ -134,6 +136,20 @@ pub enum GenotypeDataset {
     Variants(VcfLikeDataset),
 }
 
+#[derive(Clone, Debug)]
+pub enum SelectionPlan {
+    All,
+    ByIndices(Vec<usize>),
+    ByKeys(Arc<VariantFilter>),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SelectionOutcome {
+    pub matched_keys: Vec<VariantKey>,
+    pub missing_keys: Vec<VariantKey>,
+    pub requested_unique: usize,
+}
+
 impl GenotypeDataset {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
         let path = path.as_ref();
@@ -165,20 +181,49 @@ impl GenotypeDataset {
         }
     }
 
+    pub fn variant_count_hint(&self) -> Option<usize> {
+        match self {
+            Self::Plink(dataset) => Some(dataset.n_variants()),
+            Self::Variants(dataset) => dataset.variant_count_hint(),
+        }
+    }
+
     pub fn block_source(&self) -> Result<DatasetBlockSource, GenotypeIoError> {
-        self.block_source_with_selection(None)
+        self.block_source_with_plan(SelectionPlan::All)
     }
 
     pub fn block_source_with_selection(
         &self,
         selection: Option<&[usize]>,
     ) -> Result<DatasetBlockSource, GenotypeIoError> {
-        match self {
-            Self::Plink(dataset) => Ok(DatasetBlockSource::Plink(
-                dataset.block_source_with_selection(selection.map(|indices| indices.to_vec())),
-            )),
-            Self::Variants(dataset) => Ok(DatasetBlockSource::Variants(
-                dataset.block_source_with_selection(selection.map(|indices| indices.to_vec()))?,
+        let plan = match selection {
+            Some(indices) => SelectionPlan::ByIndices(indices.to_vec()),
+            None => SelectionPlan::All,
+        };
+        self.block_source_with_plan(plan)
+    }
+
+    pub fn block_source_with_plan(
+        &self,
+        plan: SelectionPlan,
+    ) -> Result<DatasetBlockSource, GenotypeIoError> {
+        match (self, plan) {
+            (Self::Plink(dataset), SelectionPlan::All) => {
+                Ok(DatasetBlockSource::Plink(dataset.block_source()))
+            }
+            (Self::Plink(dataset), SelectionPlan::ByIndices(indices)) => Ok(
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices))),
+            ),
+            (Self::Plink(dataset), SelectionPlan::ByKeys(filter)) => {
+                let selection = dataset
+                    .select_variants(filter.as_ref())
+                    .map_err(GenotypeIoError::from)?;
+                Ok(DatasetBlockSource::Plink(
+                    dataset.block_source_with_selection(Some(selection.indices)),
+                ))
+            }
+            (Self::Variants(dataset), plan) => Ok(DatasetBlockSource::Variants(
+                dataset.block_source_with_plan(plan)?,
             )),
         }
     }
@@ -277,12 +322,14 @@ pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetO
                 model.n_variants()
             )));
         }
-    } else if model.n_variants() != dataset.n_variants() {
-        return Err(DatasetOutputError::InvalidState(format!(
-            "Model expects {} variants but dataset provides {}",
-            model.n_variants(),
-            dataset.n_variants()
-        )));
+    } else if let Some(hint) = dataset.variant_count_hint() {
+        if hint > 0 && model.n_variants() != hint {
+            return Err(DatasetOutputError::InvalidState(format!(
+                "Model expects {} variants but dataset provides {}",
+                model.n_variants(),
+                hint
+            )));
+        }
     }
 
     Ok(model)
@@ -455,6 +502,46 @@ impl VariantBlockSource for DatasetBlockSource {
             Self::Variants(source) => source
                 .next_block_into(max_variants, storage)
                 .map_err(GenotypeIoError::from),
+        }
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        match self {
+            Self::Plink(_) => None,
+            Self::Variants(source) => source.progress_bytes(),
+        }
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            return None;
+        }
+        if self.metrics_per_part.is_empty() {
+            return None;
+        }
+        let mut total_read = 0u64;
+        let mut aggregated_total = Some(0u64);
+        for metrics in &self.metrics_per_part {
+            let (read, total) = metrics.snapshot();
+            total_read = total_read.saturating_add(read);
+            match (aggregated_total, total) {
+                (Some(acc), Some(value)) => {
+                    aggregated_total = Some(acc.saturating_add(value));
+                }
+                _ => {
+                    aggregated_total = None;
+                }
+            }
+        }
+        Some((total_read, aggregated_total))
+    }
+}
+
+impl DatasetBlockSource {
+    pub fn take_selection_outcome(&mut self) -> Option<SelectionOutcome> {
+        match self {
+            Self::Variants(source) => source.take_selection_outcome(),
+            _ => None,
         }
     }
 }
@@ -923,7 +1010,7 @@ pub struct VcfLikeDataset {
     parts: Vec<PathBuf>,
     sample_names: Arc<Vec<String>>,
     samples: Vec<SampleRecord>,
-    n_variants: usize,
+    n_variants_hint: Option<usize>,
     output_hint: OutputHint,
 }
 
@@ -944,12 +1031,10 @@ impl VcfLikeDataset {
 
         let mut expected_sample_names: Option<Vec<String>> = None;
         let mut samples: Option<Vec<SampleRecord>> = None;
-        let mut record = RecordBuf::default();
-        let mut n_variants = 0usize;
 
         for part in &parts {
-            let (mut reader, compression, format) =
-                create_variant_reader_for_file(part).map_err(|err| {
+            let (mut reader, compression, format, _) = create_variant_reader_for_file(part)
+                .map_err(|err| {
                     print_variant_diagnostics(
                         part,
                         None,
@@ -999,29 +1084,6 @@ impl VcfLikeDataset {
                     return Err(VariantIoError::HeaderMismatch);
                 }
             }
-
-            loop {
-                let bytes = reader
-                    .read_record_buf(&header, &mut record)
-                    .map_err(|err| {
-                        print_variant_diagnostics(
-                            part,
-                            Some(compression),
-                            Some(format),
-                            "scanning variant records to count variants",
-                            &err,
-                        );
-                        VariantIoError::Io(err)
-                    })?;
-                if bytes == 0 {
-                    break;
-                }
-                n_variants += 1;
-            }
-        }
-
-        if n_variants == 0 {
-            return Err(VariantIoError::NoVariants);
         }
 
         let expected_sample_names = expected_sample_names.expect("sample names captured");
@@ -1032,7 +1094,7 @@ impl VcfLikeDataset {
             parts,
             sample_names: Arc::new(expected_sample_names),
             samples,
-            n_variants,
+            n_variants_hint: None,
             output_hint,
         })
     }
@@ -1046,7 +1108,11 @@ impl VcfLikeDataset {
     }
 
     pub fn n_variants(&self) -> usize {
-        self.n_variants
+        self.n_variants_hint.unwrap_or(0)
+    }
+
+    pub fn variant_count_hint(&self) -> Option<usize> {
+        self.n_variants_hint
     }
 
     pub fn input_path(&self) -> &Path {
@@ -1054,18 +1120,18 @@ impl VcfLikeDataset {
     }
 
     pub fn block_source(&self) -> Result<VcfLikeVariantBlockSource, VariantIoError> {
-        self.block_source_with_selection(None)
+        self.block_source_with_plan(SelectionPlan::All)
     }
 
-    pub fn block_source_with_selection(
+    pub fn block_source_with_plan(
         &self,
-        selection: Option<Vec<usize>>,
+        plan: SelectionPlan,
     ) -> Result<VcfLikeVariantBlockSource, VariantIoError> {
         VcfLikeVariantBlockSource::new(
             self.parts.clone(),
             Arc::clone(&self.sample_names),
-            self.n_variants,
-            selection,
+            self.n_variants_hint,
+            plan,
         )
     }
 
@@ -1098,8 +1164,8 @@ impl VcfLikeDataset {
         let mut record = RecordBuf::default();
 
         for part in &self.parts {
-            let (mut reader, compression, format) =
-                create_variant_reader_for_file(part).map_err(|err| {
+            let (mut reader, compression, format, _) = create_variant_reader_for_file(part)
+                .map_err(|err| {
                     print_variant_diagnostics(
                         part,
                         None,
@@ -1170,11 +1236,27 @@ pub struct VcfLikeVariantBlockSource {
     record: RecordBuf,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
-    total_variants: usize,
-    filtered_variants: usize,
-    selection: Option<Vec<usize>>,
+    total_variants_hint: Option<usize>,
+    filtered_variants_hint: usize,
+    selection_plan: SelectionPlan,
+    matched_keys: Vec<VariantKey>,
+    matched_seen: HashSet<VariantKey>,
+    missing_keys: Option<Vec<VariantKey>>,
+    requested_unique: usize,
+    streamed_variants: usize,
+    stream_exhausted: bool,
+    selection_finalized: bool,
+    metrics_per_part: Vec<Arc<ReadMetrics>>,
     emitted: usize,
     processed: usize,
+    spool_entries: Vec<Option<SpoolEntry>>,
+    spool_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct SpoolEntry {
+    path: PathBuf,
+    complete: bool,
 }
 
 impl std::fmt::Debug for VcfLikeVariantBlockSource {
@@ -1182,28 +1264,116 @@ impl std::fmt::Debug for VcfLikeVariantBlockSource {
         f.debug_struct("VcfLikeVariantBlockSource")
             .field("current_part", &self.parts.get(self.part_idx))
             .field("n_samples", &self.n_samples)
-            .field("total_variants", &self.total_variants)
-            .field("filtered_variants", &self.filtered_variants)
+            .field("total_variants_hint", &self.total_variants_hint)
+            .field("filtered_variants_hint", &self.filtered_variants_hint)
             .field("emitted", &self.emitted)
             .field("processed", &self.processed)
+            .field("streamed_variants", &self.streamed_variants)
+            .field("stream_exhausted", &self.stream_exhausted)
+            .field("selection_finalized", &self.selection_finalized)
             .field("compression", &self.compression)
             .field("format", &self.format)
+            .field("spool_root", &self.spool_root)
             .finish()
     }
 }
 
 impl VcfLikeVariantBlockSource {
+    fn ensure_spool_root(&mut self) -> Result<PathBuf, io::Error> {
+        if let Some(root) = &self.spool_root {
+            return Ok(root.clone());
+        }
+
+        let mut root = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        root.push(format!("gnomon-spool-{}-{}", std::process::id(), unique));
+        fs::create_dir_all(&root)?;
+        self.spool_root = Some(root.clone());
+        Ok(root)
+    }
+
+    fn spool_part(&mut self, idx: usize) -> Result<SpoolEntry, VariantIoError> {
+        let path = &self.parts[idx];
+        let root = self.ensure_spool_root().map_err(VariantIoError::Io)?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let mut spool_path = root.join(format!("part{}_{}", idx, unique));
+        if let Some(ext) = path.extension() {
+            spool_path.set_extension(ext);
+        }
+
+        let mut source = open_variant_source(path).map_err(VariantIoError::from)?;
+        let mut file = File::create(&spool_path).map_err(VariantIoError::Io)?;
+        if let Err(err) = io::copy(&mut source, &mut file) {
+            let _ = fs::remove_file(&spool_path);
+            return Err(VariantIoError::Io(err));
+        }
+
+        Ok(SpoolEntry {
+            path: spool_path,
+            complete: true,
+        })
+    }
+
+    fn reader_for_part(
+        &mut self,
+        idx: usize,
+    ) -> Result<
+        (
+            VariantStreamReader,
+            VariantCompression,
+            VariantFormat,
+            Arc<ReadMetrics>,
+        ),
+        VariantIoError,
+    > {
+        let path = &self.parts[idx];
+        if is_remote_path(path) {
+            if self.spool_entries.len() <= idx {
+                self.spool_entries.resize(idx + 1, None);
+            }
+
+            if let Some(entry) = self.spool_entries[idx].as_ref() {
+                if entry.complete {
+                    return create_variant_reader_for_file(&entry.path);
+                }
+            }
+
+            let entry = self.spool_part(idx)?;
+            let reader = create_variant_reader_for_file(&entry.path)?;
+            self.spool_entries[idx] = Some(entry);
+            return Ok(reader);
+        }
+
+        if self.spool_entries.len() <= idx {
+            self.spool_entries.resize(idx + 1, None);
+        }
+
+        create_variant_reader_for_file(path)
+    }
+
     fn new(
         parts: Vec<PathBuf>,
         sample_names: Arc<Vec<String>>,
-        n_variants: usize,
-        selection: Option<Vec<usize>>,
+        n_variants_hint: Option<usize>,
+        selection_plan: SelectionPlan,
     ) -> Result<Self, VariantIoError> {
         let n_samples = sample_names.len();
-        let filtered_variants = selection
-            .as_ref()
-            .map(|indices| indices.len())
-            .unwrap_or(n_variants);
+        let filtered_variants_hint = match &selection_plan {
+            SelectionPlan::All => n_variants_hint.unwrap_or(0),
+            SelectionPlan::ByIndices(indices) => indices.len(),
+            SelectionPlan::ByKeys(filter) => filter.requested_unique(),
+        };
+        let requested_unique = match &selection_plan {
+            SelectionPlan::ByKeys(filter) => filter.requested_unique(),
+            SelectionPlan::ByIndices(indices) => indices.len(),
+            SelectionPlan::All => n_variants_hint.unwrap_or(0),
+        };
         let mut source = Self {
             parts,
             part_idx: 0,
@@ -1214,11 +1384,21 @@ impl VcfLikeVariantBlockSource {
             record: RecordBuf::default(),
             sample_names,
             n_samples,
-            total_variants: n_variants,
-            filtered_variants,
-            selection,
+            total_variants_hint: n_variants_hint,
+            filtered_variants_hint,
+            selection_plan,
+            matched_keys: Vec::new(),
+            matched_seen: HashSet::new(),
+            missing_keys: None,
+            requested_unique,
+            streamed_variants: 0,
+            stream_exhausted: false,
+            selection_finalized: false,
+            metrics_per_part: Vec::new(),
             emitted: 0,
             processed: 0,
+            spool_entries: Vec::new(),
+            spool_root: None,
         };
         if !source.parts.is_empty() {
             source.open_part(0)?;
@@ -1236,15 +1416,15 @@ impl VcfLikeVariantBlockSource {
             return Ok(());
         }
 
-        let path = &self.parts[idx];
-        let (mut reader, compression, format) =
-            create_variant_reader_for_file(path).map_err(|err| {
+        let (mut reader, compression, format, metrics) =
+            self.reader_for_part(idx).map_err(|err| {
+                let path = &self.parts[idx];
                 print_variant_diagnostics(path, None, None, "initializing variant reader", &err);
                 err
             })?;
         let header = reader.read_header().map_err(|err| {
             print_variant_diagnostics(
-                path,
+                &self.parts[idx],
                 Some(compression),
                 Some(format),
                 "reading variant header",
@@ -1263,12 +1443,67 @@ impl VcfLikeVariantBlockSource {
             return Err(VariantIoError::HeaderMismatch);
         }
 
+        if self.metrics_per_part.len() <= idx {
+            self.metrics_per_part.push(metrics);
+        } else {
+            self.metrics_per_part[idx] = metrics;
+        }
+
         self.reader = Some(reader);
         self.compression = Some(compression);
         self.format = Some(format);
         self.header = Some(Arc::new(header));
         self.record = RecordBuf::default();
         Ok(())
+    }
+
+    fn read_next_variant(&mut self) -> Result<Option<usize>, VariantIoError> {
+        loop {
+            let header = match self.header.as_ref() {
+                Some(header) => Arc::clone(header),
+                None => {
+                    self.stream_exhausted = true;
+                    return Ok(None);
+                }
+            };
+
+            let reader = match self.reader.as_mut() {
+                Some(reader) => reader,
+                None => {
+                    self.stream_exhausted = true;
+                    return Ok(None);
+                }
+            };
+
+            let compression = self.compression;
+            let format = self.format;
+            let path = self.parts.get(self.part_idx).cloned();
+            let bytes = reader
+                .read_record_buf(header.as_ref(), &mut self.record)
+                .map_err(|err| {
+                    if let Some(part_path) = path.as_ref() {
+                        print_variant_diagnostics(
+                            part_path,
+                            compression,
+                            format,
+                            "reading variant record block",
+                            &err,
+                        );
+                    }
+                    VariantIoError::Io(err)
+                })?;
+
+            if bytes == 0 {
+                let next_idx = self.part_idx + 1;
+                self.open_part(next_idx)?;
+                continue;
+            }
+
+            let current_index = self.processed;
+            self.processed = self.processed.saturating_add(1);
+            self.streamed_variants = self.streamed_variants.saturating_add(1);
+            return Ok(Some(current_index));
+        }
     }
 }
 
@@ -1280,12 +1515,20 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
     }
 
     fn n_variants(&self) -> usize {
-        self.filtered_variants
+        self.filtered_variants_hint
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
         self.emitted = 0;
         self.processed = 0;
+        self.streamed_variants = 0;
+        self.stream_exhausted = false;
+        if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            self.matched_seen.clear();
+        }
+        for metrics in &self.metrics_per_part {
+            metrics.reset();
+        }
         if self.parts.is_empty() {
             self.reader = None;
             self.compression = None;
@@ -1304,138 +1547,194 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         if max_variants == 0 {
             return Ok(0);
         }
-        if self.emitted >= self.filtered_variants {
+        if self.stream_exhausted {
+            self.finalize_selection();
             return Ok(0);
         }
+
+        let filled = match &self.selection_plan {
+            SelectionPlan::All => self.next_block_all(max_variants, storage)?,
+            SelectionPlan::ByIndices(indices) => {
+                self.next_block_indices(indices, max_variants, storage)?
+            }
+            SelectionPlan::ByKeys(filter) => {
+                self.next_block_keys(filter.as_ref(), max_variants, storage)?
+            }
+        };
+
+        if filled == 0 && self.stream_exhausted {
+            self.finalize_selection();
+        }
+
+        Ok(filled)
+    }
+
+    fn next_block_all(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, VariantIoError> {
         let mut filled = 0usize;
-        if self.selection.is_some() {
-            let target_total = self
-                .selection
-                .as_ref()
-                .map(|indices| indices.len())
-                .unwrap_or(0);
-            while filled < max_variants && self.emitted + filled < target_total {
-                if self.reader.is_none() {
-                    break;
-                }
+        while filled < max_variants {
+            let Some(_) = self.read_next_variant()? else {
+                break;
+            };
 
-                let header = match self.header.as_ref() {
-                    Some(header) => Arc::clone(header),
-                    None => break,
-                };
-                let reader = match self.reader.as_mut() {
-                    Some(reader) => reader,
-                    None => break,
-                };
+            let offset = filled * self.n_samples;
+            let dest = &mut storage[offset..offset + self.n_samples];
+            decode_variant_record(&self.record, dest, self.n_samples)?;
+            filled += 1;
+        }
 
-                let compression = self.compression;
-                let format = self.format;
-                let path = self.parts.get(self.part_idx).cloned();
-                let bytes = reader
-                    .read_record_buf(header.as_ref(), &mut self.record)
-                    .map_err(|err| {
-                        if let Some(part_path) = path.as_ref() {
-                            print_variant_diagnostics(
-                                part_path,
-                                compression,
-                                format,
-                                "reading variant record block",
-                                &err,
-                            );
-                        }
-                        VariantIoError::Io(err)
-                    })?;
+        if filled == 0 && self.stream_exhausted {
+            return Ok(0);
+        }
 
-                if bytes == 0 {
-                    let next_idx = self.part_idx + 1;
-                    self.open_part(next_idx)?;
-                    continue;
-                }
+        self.emitted += filled;
+        Ok(filled)
+    }
 
-                let current_index = self.processed;
-                self.processed += 1;
-                let target_index = self.selection.as_ref().expect("selection must be present")
-                    [self.emitted + filled];
+    fn next_block_indices(
+        &mut self,
+        indices: &[usize],
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, VariantIoError> {
+        let target_total = indices.len();
+        let mut filled = 0usize;
 
-                if current_index < target_index {
-                    continue;
-                }
-                if current_index > target_index {
-                    return Err(VariantIoError::Decode(format!(
-                        "variant index {target_index} requested by PCA list not found in dataset",
-                    )));
-                }
+        while filled < max_variants && self.emitted + filled < target_total {
+            let Some(current_index) = self.read_next_variant()? else {
+                break;
+            };
 
-                let offset = filled * self.n_samples;
-                let dest = &mut storage[offset..offset + self.n_samples];
-                decode_variant_record(&self.record, dest, self.n_samples)?;
-                filled += 1;
+            let target_index = indices[self.emitted + filled];
+            if current_index < target_index {
+                continue;
+            }
+            if current_index > target_index {
+                return Err(VariantIoError::Decode(format!(
+                    "variant index {target_index} requested by PCA list not found in dataset",
+                )));
             }
 
-            self.emitted += filled;
-            if filled == 0 && self.emitted < target_total {
-                return Err(VariantIoError::UnexpectedEof {
-                    expected: target_total,
-                    actual: self.emitted,
-                });
-            }
+            let offset = filled * self.n_samples;
+            let dest = &mut storage[offset..offset + self.n_samples];
+            decode_variant_record(&self.record, dest, self.n_samples)?;
+            filled += 1;
+        }
 
-            Ok(filled)
+        if filled == 0 && self.stream_exhausted && self.emitted < target_total {
+            return Err(VariantIoError::UnexpectedEof {
+                expected: target_total,
+                actual: self.emitted,
+            });
+        }
+
+        self.emitted += filled;
+        Ok(filled)
+    }
+
+    fn next_block_keys(
+        &mut self,
+        filter: &VariantFilter,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, VariantIoError> {
+        let mut filled = 0usize;
+        let target_total = if self.selection_finalized {
+            self.filtered_variants_hint
         } else {
-            while filled < max_variants && self.emitted + filled < self.filtered_variants {
-                if self.reader.is_none() {
-                    break;
-                }
+            self.requested_unique
+        };
 
-                let header = match self.header.as_ref() {
-                    Some(header) => Arc::clone(header),
-                    None => break,
-                };
-                let reader = match self.reader.as_mut() {
-                    Some(reader) => reader,
-                    None => break,
-                };
+        while filled < max_variants && (target_total == 0 || self.emitted + filled < target_total) {
+            let Some(_) = self.read_next_variant()? else {
+                break;
+            };
 
-                let compression = self.compression;
-                let format = self.format;
-                let path = self.parts.get(self.part_idx).cloned();
-                let bytes = reader
-                    .read_record_buf(header.as_ref(), &mut self.record)
-                    .map_err(|err| {
-                        if let Some(part_path) = path.as_ref() {
-                            print_variant_diagnostics(
-                                part_path,
-                                compression,
-                                format,
-                                "reading variant record block",
-                                &err,
-                            );
+            let chrom = self.record.reference_sequence_name().to_string();
+            if let Some(position) = self.record.variant_start() {
+                let pos = position.get() as u64;
+                let key = VariantKey::new(&chrom, pos);
+                if filter.contains(&key) {
+                    let is_new_match = self.matched_seen.insert(key.clone());
+                    if is_new_match {
+                        let offset = filled * self.n_samples;
+                        let dest = &mut storage[offset..offset + self.n_samples];
+                        decode_variant_record(&self.record, dest, self.n_samples)?;
+                        if !self.selection_finalized {
+                            self.matched_keys.push(key);
                         }
-                        VariantIoError::Io(err)
-                    })?;
-
-                if bytes == 0 {
-                    let next_idx = self.part_idx + 1;
-                    self.open_part(next_idx)?;
-                    continue;
+                        filled += 1;
+                        if target_total > 0 && self.emitted + filled >= target_total {
+                            self.stream_exhausted = true;
+                            break;
+                        }
+                        continue;
+                    }
                 }
-
-                let offset = filled * self.n_samples;
-                let dest = &mut storage[offset..offset + self.n_samples];
-                decode_variant_record(&self.record, dest, self.n_samples)?;
-                filled += 1;
-                self.processed += 1;
             }
+        }
 
-            self.emitted += filled;
-            if filled == 0 && self.emitted < self.filtered_variants {
-                return Err(VariantIoError::UnexpectedEof {
-                    expected: self.filtered_variants,
-                    actual: self.emitted,
-                });
+        if filled == 0 && self.stream_exhausted {
+            // No additional matches in this pass.
+        }
+
+        self.emitted += filled;
+        Ok(filled)
+    }
+
+    fn finalize_selection(&mut self) {
+        if self.selection_finalized {
+            return;
+        }
+
+        match &self.selection_plan {
+            SelectionPlan::All => {
+                self.filtered_variants_hint = self.emitted;
+                self.total_variants_hint = Some(self.processed);
             }
+            SelectionPlan::ByIndices(_) => {
+                self.total_variants_hint = Some(self.processed);
+            }
+            SelectionPlan::ByKeys(filter) => {
+                let missing = filter.missing_keys(&self.matched_seen);
+                self.missing_keys = Some(missing);
+                self.filtered_variants_hint = self.matched_keys.len();
+                self.total_variants_hint = Some(self.processed);
+            }
+        }
 
-            Ok(filled)
+        self.selection_finalized = true;
+    }
+
+    pub fn take_selection_outcome(&mut self) -> Option<SelectionOutcome> {
+        if !matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            return None;
+        }
+        if !self.selection_finalized {
+            self.finalize_selection();
+        }
+        let matched_keys = std::mem::take(&mut self.matched_keys);
+        let missing_keys = self.missing_keys.take().unwrap_or_default();
+        Some(SelectionOutcome {
+            matched_keys,
+            missing_keys,
+            requested_unique: self.requested_unique,
+        })
+    }
+}
+
+impl Drop for VcfLikeVariantBlockSource {
+    fn drop(&mut self) {
+        for entry in &self.spool_entries {
+            if let Some(entry) = entry {
+                let _ = fs::remove_file(&entry.path);
+            }
+        }
+        if let Some(root) = &self.spool_root {
+            let _ = fs::remove_dir_all(root);
         }
     }
 }
@@ -1487,10 +1786,19 @@ fn compute_output_hint(path: &Path) -> OutputHint {
 
 fn create_variant_reader_for_file(
     path: &Path,
-) -> Result<(VariantStreamReader, VariantCompression, VariantFormat), VariantIoError> {
+) -> Result<
+    (
+        VariantStreamReader,
+        VariantCompression,
+        VariantFormat,
+        Arc<ReadMetrics>,
+    ),
+    VariantIoError,
+> {
     let source = open_variant_source(path)?;
     let compression = source.compression();
     let format = source.format();
+    let metrics = source.metrics();
 
     let reader = match format {
         VariantFormat::Bcf => {
@@ -1509,7 +1817,7 @@ fn create_variant_reader_for_file(
         }
     };
 
-    Ok((reader, compression, format))
+    Ok((reader, compression, format, metrics))
 }
 
 fn print_variant_diagnostics(
