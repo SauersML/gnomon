@@ -48,7 +48,8 @@ jobs:
           perf record -g -o "$PERF_DATA" -- \
             target/profiling/gnomon \
             --fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" \
-            --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"
+            --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 16"
 
       - name: Render perf reports
         env:
