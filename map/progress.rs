@@ -348,13 +348,8 @@ impl Drop for ConsoleFitProgress {
 }
 
 enum ProjectionStageBar {
-    Determinate {
-        total: u64,
-        bar: ProgressBar,
-    },
-    Spinner {
-        bar: ProgressBar,
-    },
+    Determinate { total: u64, bar: ProgressBar },
+    Spinner { bar: ProgressBar },
 }
 
 impl ProjectionStageBar {

@@ -370,7 +370,12 @@ mod score_main;
 )]
 struct Cli {
     /// Fit an HWE PCA model from the provided genotype dataset
-    #[arg(long, value_name = "PATH", conflicts_with = "project")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "project",
+        requires = "components"
+    )]
     fit: Option<PathBuf>,
 
     /// Optional variant list limiting SNVs used for PCA fitting
@@ -381,6 +386,10 @@ struct Cli {
         conflicts_with = "project"
     )]
     list: Option<PathBuf>,
+
+    /// Number of principal components to retain when fitting the HWE PCA model
+    #[arg(long, value_name = "N", requires = "fit", conflicts_with = "project")]
+    components: Option<usize>,
 
     /// Project samples using an existing HWE PCA model
     #[arg(long, value_name = "PATH", conflicts_with = "fit")]
@@ -418,21 +427,29 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    let Cli {
+        fit,
+        list,
+        project,
+        command,
+        components,
+    } = cli;
 
     // Ensure each invocation starts with calibration enabled unless explicitly disabled.
     gnomon::calibrate::model::reset_calibrator_flag();
 
-    if (cli.fit.is_some() || cli.project.is_some()) && cli.command.is_some() {
+    if (fit.is_some() || project.is_some()) && command.is_some() {
         eprintln!("Error: --fit/--project cannot be combined with subcommands.");
         process::exit(2);
     }
 
-    let result = if let Some(path) = cli.fit {
-        run_map_fit(path, cli.list)
-    } else if let Some(path) = cli.project {
+    let result = if let Some(path) = fit {
+        let components = components.expect("clap enforces --components with --fit");
+        run_map_fit(path, list, components)
+    } else if let Some(path) = project {
         run_map_project(path)
     } else {
-        match cli.command {
+        match command {
             Some(Commands::Score {
                 input_path,
                 score,
@@ -454,10 +471,15 @@ fn main() {
     }
 }
 
-fn run_map_fit(path: PathBuf, list: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_map_fit(
+    path: PathBuf,
+    list: Option<PathBuf>,
+    components: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: path,
         variant_list: list,
+        components,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }

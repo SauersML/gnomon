@@ -8,7 +8,6 @@ use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::col::Col;
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::SelfAdjointEigen;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
@@ -40,8 +39,8 @@ pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
-const INITIAL_PARTIAL_COMPONENTS: usize = 32;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
+const DEFAULT_GRAM_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CovarianceComputationMode {
@@ -49,22 +48,26 @@ enum CovarianceComputationMode {
     Partial,
 }
 
-fn covariance_computation_mode(n: usize) -> CovarianceComputationMode {
-    if n <= DENSE_EIGEN_FALLBACK_THRESHOLD {
-        return CovarianceComputationMode::Dense;
+fn gram_matrix_budget_bytes() -> usize {
+    match std::env::var("GNOMON_GRAM_BUDGET_BYTES") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) if parsed == 0 => usize::MAX,
+            Ok(parsed) => usize::try_from(parsed).unwrap_or(usize::MAX),
+            Err(_) => DEFAULT_GRAM_BUDGET_BYTES,
+        },
+        Err(_) => DEFAULT_GRAM_BUDGET_BYTES,
     }
+}
 
-    let max_rank = n.saturating_sub(1);
-    if max_rank == 0 {
-        return CovarianceComputationMode::Dense;
+fn gram_matrix_size_bytes(n: usize) -> Option<usize> {
+    n.checked_mul(n)?.checked_mul(core::mem::size_of::<f64>())
+}
+
+fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceComputationMode {
+    match gram_matrix_size_bytes(n) {
+        Some(bytes) if bytes <= budget_bytes => CovarianceComputationMode::Dense,
+        _ => CovarianceComputationMode::Partial,
     }
-
-    let max_partial = ((n - 1) / 2).min(MAX_PARTIAL_COMPONENTS);
-    if max_partial == 0 {
-        return CovarianceComputationMode::Dense;
-    }
-
-    CovarianceComputationMode::Partial
 }
 
 struct ParallelismGuard {
@@ -541,16 +544,20 @@ pub struct HwePcaModel {
 }
 
 impl HwePcaModel {
-    pub fn fit<S>(source: &mut S) -> Result<Self, HwePcaError>
+    pub fn fit_k<S>(source: &mut S, components: usize) -> Result<Self, HwePcaError>
     where
         S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
     {
         let progress = Arc::new(NoopFitProgress::default());
-        Self::fit_with_progress(source, &progress)
+        Self::fit_k_with_progress(source, components, &progress)
     }
 
-    pub fn fit_with_progress<S, P>(source: &mut S, progress: &Arc<P>) -> Result<Self, HwePcaError>
+    pub fn fit_k_with_progress<S, P>(
+        source: &mut S,
+        components: usize,
+        progress: &Arc<P>,
+    ) -> Result<Self, HwePcaError>
     where
         S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
@@ -564,6 +571,15 @@ impl HwePcaModel {
                 "HWE PCA requires at least two samples",
             ));
         }
+
+        if components == 0 {
+            return Err(HwePcaError::InvalidInput(
+                "Requested component count must be at least one",
+            ));
+        }
+
+        let max_rank = n_samples.saturating_sub(1);
+        let target_components = components.min(max_rank);
 
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
@@ -585,7 +601,9 @@ impl HwePcaModel {
             Some(stats_progress),
         );
 
-        let gram_mode = covariance_computation_mode(n_samples);
+        let gram_budget = gram_matrix_budget_bytes();
+        let gram_bytes = gram_matrix_size_bytes(n_samples);
+        let gram_mode = covariance_computation_mode(n_samples, gram_budget);
         let gram_progress_handle = match gram_mode {
             CovarianceComputationMode::Dense => {
                 progress.on_stage_start(FitProgressStage::GramMatrix, n_variants_hint);
@@ -603,8 +621,27 @@ impl HwePcaModel {
             }
         };
 
-        let decomposition_result =
-            compute_covariance_eigenpairs(&operator, par, gram_mode, gram_progress_handle.as_ref());
+        if matches!(gram_mode, CovarianceComputationMode::Partial) {
+            if let Some(bytes) = gram_bytes {
+                log::info!(
+                    "Skipping explicit Gram matrix ({} bytes exceeds budget of {} bytes); using matrix-free solver",
+                    bytes,
+                    gram_budget
+                );
+            } else {
+                log::info!(
+                    "Skipping explicit Gram matrix due to size overflow; using matrix-free solver"
+                );
+            }
+        }
+
+        let decomposition_result = compute_covariance_eigenpairs(
+            &operator,
+            par,
+            gram_mode,
+            target_components,
+            gram_progress_handle.as_ref(),
+        );
         let observed_variants = operator
             .observed_n_variants()
             .expect("covariance operator must observe variants during first pass");
@@ -724,6 +761,47 @@ impl HwePcaModel {
 struct Eigenpairs {
     values: Vec<f64>,
     vectors: Mat<f64>,
+}
+
+#[derive(Debug)]
+struct DenseSymmetricOp<'a> {
+    matrix: MatRef<'a, f64>,
+}
+
+impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
+    fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        let _ = (rhs_ncols, par);
+        StackReq::empty()
+    }
+
+    fn nrows(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.matrix.ncols()
+    }
+
+    fn apply(
+        &self,
+        mut out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        let _ = stack;
+        matmul(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0, par);
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        self.apply(out, rhs, par, stack);
+    }
 }
 
 struct StandardizedCovarianceOp<'a, S, P>
@@ -1065,6 +1143,7 @@ fn compute_covariance_eigenpairs<S, P>(
     operator: &StandardizedCovarianceOp<'_, S, P>,
     par: Par,
     mode: CovarianceComputationMode,
+    top_k: usize,
     progress: Option<&StageProgressHandle<P>>,
 ) -> Result<Eigenpairs, HwePcaError>
 where
@@ -1073,15 +1152,11 @@ where
     P: FitProgressObserver + 'static,
 {
     let n = operator.n_samples();
-    if n == 0 {
+    if n == 0 || top_k == 0 {
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(0, 0),
         });
-    }
-
-    if matches!(mode, CovarianceComputationMode::Dense) {
-        return compute_covariance_eigenpairs_dense(operator, par, progress);
     }
 
     let max_rank = n.saturating_sub(1);
@@ -1092,19 +1167,26 @@ where
         });
     }
 
-    let mut max_partial = ((n - 1) / 2).min(MAX_PARTIAL_COMPONENTS);
-    if max_partial == 0 {
-        return compute_covariance_eigenpairs_dense(operator, par, progress);
+    let desired = top_k.min(max_rank);
+    if desired == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
     }
-    max_partial = max_partial.min(max_rank);
 
-    let mut target = INITIAL_PARTIAL_COMPONENTS.min(max_partial);
-    if target == 0 {
-        target = max_partial;
+    if matches!(mode, CovarianceComputationMode::Dense) {
+        return compute_covariance_eigenpairs_dense(operator, par, desired, progress);
+    }
+
+    let upper_target = max_rank.min(MAX_PARTIAL_COMPONENTS.max(desired));
+    if upper_target == 0 {
+        return compute_covariance_eigenpairs_dense(operator, par, desired, progress);
     }
 
     let normalization = (n as f64).sqrt();
     let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+    let mut target = desired.min(upper_target).max(1);
 
     loop {
         let params = partial_solver_params(n, target);
@@ -1133,30 +1215,33 @@ where
             });
         }
 
-        if positive == target && target < max_partial {
-            let next_target = (target * 2).min(max_partial);
-            if next_target > target {
-                target = next_target;
-                continue;
-            }
-        }
-
-        let mut values = Vec::with_capacity(positive);
-        let mut vectors = Mat::zeros(n, positive);
-        for (out_idx, (src_idx, value)) in ordering.into_iter().take(positive).enumerate() {
+        let keep = positive.min(desired);
+        let mut values = Vec::with_capacity(keep);
+        let mut vectors = Mat::zeros(n, keep);
+        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
             values.push(value);
             for row in 0..n {
                 vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
             }
         }
 
-        return Ok(Eigenpairs { values, vectors });
+        if keep >= desired || target >= upper_target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        let next_target = (target * 2).min(upper_target);
+        if next_target == target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        target = next_target;
     }
 }
 
 fn compute_covariance_eigenpairs_dense<S, P>(
     operator: &StandardizedCovarianceOp<'_, S, P>,
     par: Par,
+    top_k: usize,
     progress: Option<&StageProgressHandle<P>>,
 ) -> Result<Eigenpairs, HwePcaError>
 where
@@ -1175,44 +1260,128 @@ where
         }
     }
 
-    let eig = SelfAdjointEigen::new(covariance.as_ref(), Side::Lower)
-        .map_err(|err| HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}")))?;
-
-    let diag = eig.S();
-    let basis = eig.U();
-
-    let mut ordering = Vec::with_capacity(n);
-    for idx in 0..n {
-        ordering.push((idx, diag[idx]));
-    }
-
-    ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
-
-    let mut positive = 0usize;
-    for &(_, value) in &ordering {
-        if value <= EIGENVALUE_EPSILON {
-            break;
-        }
-        positive += 1;
-    }
-
-    if positive == 0 {
+    if n == 0 || top_k == 0 {
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
         });
     }
 
-    let mut values = Vec::with_capacity(positive);
-    let mut vectors = Mat::zeros(n, positive);
-    for (out_idx, (src_idx, value)) in ordering.into_iter().take(positive).enumerate() {
-        values.push(value);
-        for row in 0..n {
-            vectors[(row, out_idx)] = basis[(row, src_idx)];
+    if n <= DENSE_EIGEN_FALLBACK_THRESHOLD || top_k + 8 >= n {
+        let eig = covariance.self_adjoint_eigen(Side::Lower).map_err(|err| {
+            HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}"))
+        })?;
+
+        let diag = eig.S();
+        let basis = eig.U();
+
+        let mut ordering = Vec::with_capacity(n);
+        for idx in 0..n {
+            ordering.push((idx, diag[idx]));
         }
+
+        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+        let mut positive = 0usize;
+        for &(_, value) in &ordering {
+            if value <= EIGENVALUE_EPSILON {
+                break;
+            }
+            positive += 1;
+        }
+
+        let keep = positive.min(top_k);
+        if keep == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        let mut values = Vec::with_capacity(keep);
+        let mut vectors = Mat::zeros(n, keep);
+        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = basis[(row, src_idx)];
+            }
+        }
+
+        return Ok(Eigenpairs { values, vectors });
     }
 
-    Ok(Eigenpairs { values, vectors })
+    let gram = covariance.as_ref();
+    let upper_target = n.min(MAX_PARTIAL_COMPONENTS.max(top_k));
+    let mut target = top_k.min(upper_target).max(1);
+
+    let normalization = (n as f64).sqrt();
+    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+    let op = DenseSymmetricOp { matrix: gram };
+
+    loop {
+        let params = partial_solver_params(n, target);
+        let mut eigvecs = Mat::zeros(n, target);
+        let mut eigvals = vec![0.0f64; target];
+        let scratch = partial_eigen_scratch(&op, params.max_dim, par, params);
+        let mut mem = MemBuffer::new(scratch);
+        let info = {
+            let mut stack = MemStack::new(&mut mem);
+            partial_self_adjoint_eigen(
+                eigvecs.as_mut(),
+                &mut eigvals,
+                &op,
+                v0.as_ref(),
+                f64::EPSILON * 128.0,
+                par,
+                &mut stack,
+                params,
+            )
+        };
+
+        let n_converged = info.n_converged_eigen.min(target);
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+        let mut positive = 0usize;
+        for &(_, value) in &ordering {
+            if value <= EIGENVALUE_EPSILON {
+                break;
+            }
+            positive += 1;
+        }
+
+        if positive == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        let keep = positive.min(top_k);
+        let mut values = Vec::with_capacity(keep);
+        let mut vectors = Mat::zeros(n, keep);
+        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
+            }
+        }
+
+        if keep >= top_k || target >= upper_target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        let next_target = (target * 2).min(upper_target);
+        if next_target == target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        target = next_target;
+    }
 }
 
 fn accumulate_covariance_matrix<S, P>(
@@ -1342,13 +1511,11 @@ where
 fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
     let mut params = PartialEigenParams::default();
     let max_available = n.saturating_sub(1);
-    let min_dim = ((2 * target).max(64)).min(max_available);
-    let mut max_dim = ((4 * target).max(128)).min(max_available);
-    if max_dim <= min_dim {
-        max_dim = min_dim.min(max_available);
+    params.min_dim = target.max(64).min(max_available); // let Faer clamp internally
+    params.max_dim = (2 * target).max(128).min(max_available);
+    if params.max_dim < params.min_dim {
+        params.max_dim = params.min_dim;
     }
-    params.min_dim = min_dim.max(target);
-    params.max_dim = max_dim.max(params.min_dim);
     params.max_restarts = 2048;
     params
 }
@@ -1629,6 +1796,7 @@ mod tests {
     const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
     const MAX_TEST_VARIANTS: usize = 32;
     const MAX_TEST_SAMPLES: usize = 8;
+    const TEST_COMPONENTS: usize = 4;
 
     struct LimitedBlockSource<T> {
         inner: T,
@@ -1756,7 +1924,7 @@ mod tests {
         let expected_variants = limited_source.n_variants();
         let expected_samples = limited_source.n_samples();
 
-        let model = match HwePcaModel::fit(&mut limited_source) {
+        let model = match HwePcaModel::fit_k(&mut limited_source, TEST_COMPONENTS) {
             Ok(model) => model,
             Err(err) => {
                 let msg = err.to_string();
