@@ -393,4 +393,122 @@ plt.xticks(g["decile"]); plt.legend(); plt.tight_layout(); plt.show()
 
 <img width="690" height="440" alt="image" src="https://github.com/user-attachments/assets/d5e0e3ac-2028-4553-be52-5cc328ef6b94" />
 
+Let's get the per-code OR/SD:
 
+```
+import os, numpy as np, pandas as pd, statsmodels.api as sm, matplotlib.pyplot as plt
+from scipy.stats import norm
+from google.cloud import bigquery as bq
+
+cdr_id=os.environ["WORKSPACE_CDR"]
+pgs_col="PGS003852_AVG"
+
+cond_codes=[f"C18.{i}" for i in range(10)]+["C19","C20"]+[f"153.{i}" for i in range(10)]+["154.0","154.1"]
+cond_codes=[c.upper() for c in (cond_codes+[c.replace(".","") for c in cond_codes])]
+cond_codes_n=[c.replace(".","") for c in cond_codes]
+codes_exact=["Z85.038","V10.05"]; codes_exact=[c.upper() for c in (codes_exact+[c.replace(".","") for c in codes_exact])]
+
+sql=f"""
+WITH obs_raw AS (
+  SELECT DISTINCT CAST(person_id AS STRING) person_id,
+         REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]','') AS code_n
+  FROM `{cdr_id}.observation`
+  WHERE observation_source_value IS NOT NULL
+    AND (
+      UPPER(TRIM(observation_source_value)) IN UNNEST(@codes_exact)
+      OR REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]','') IN UNNEST(@codes_exact)
+      OR STARTS_WITH(REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]',''),'Z8503')
+    )
+),
+obs AS (
+  SELECT person_id,
+         CASE
+           WHEN code_n='V1005' THEN 'V10.05'
+           WHEN code_n='Z85038' THEN 'Z85.038'
+           WHEN REGEXP_CONTAINS(code_n, r'^Z8503[0-9]$') THEN CONCAT('Z85.03', SUBSTR(code_n,6,1))
+           ELSE code_n
+         END AS code
+  FROM obs_raw
+),
+cond_raw AS (
+  SELECT DISTINCT CAST(person_id AS STRING) person_id,
+         REGEXP_REPLACE(UPPER(TRIM(condition_source_value)),'[^A-Z0-9]','') AS code_n
+  FROM `{cdr_id}.condition_occurrence`
+  WHERE condition_source_value IS NOT NULL
+    AND (
+      UPPER(TRIM(condition_source_value)) IN UNNEST(@cond_codes)
+      OR REGEXP_REPLACE(UPPER(TRIM(condition_source_value)),'[^A-Z0-9]','') IN UNNEST(@cond_codes_n)
+    )
+),
+cond AS (
+  SELECT person_id,
+         CASE
+           WHEN REGEXP_CONTAINS(code_n, r'^C18[0-9]$') THEN CONCAT('C18.', SUBSTR(code_n,4,1))
+           WHEN code_n='C19' THEN 'C19'
+           WHEN code_n='C20' THEN 'C20'
+           WHEN REGEXP_CONTAINS(code_n, r'^153[0-9]$') THEN CONCAT('153.', SUBSTR(code_n,4,1))
+           WHEN code_n IN ('1540','1541') THEN CONCAT('154.', SUBSTR(code_n,4,1))
+           ELSE code_n
+         END AS code
+  FROM cond_raw
+),
+all_codes AS (
+  SELECT 'OBS' AS src, code, person_id FROM obs WHERE code IS NOT NULL
+  UNION ALL
+  SELECT 'COND' AS src, code, person_id FROM cond WHERE code IS NOT NULL
+)
+SELECT src, code, person_id FROM all_codes
+"""
+cp=bq.Client().query(sql, job_config=bq.QueryJobConfig(query_parameters=[
+    bq.ArrayQueryParameter("codes_exact","STRING",codes_exact),
+    bq.ArrayQueryParameter("cond_codes","STRING",cond_codes),
+    bq.ArrayQueryParameter("cond_codes_n","STRING",cond_codes_n),
+])).to_dataframe()
+
+df=pd.read_csv('../../arrays.sscore', sep='\t')
+idcol=next((c for c in ['#IID','IID','person_id','research_id','sample_id','ID'] if c in df.columns), None)
+if idcol is None: raise ValueError("ID column not found in ../../arrays.sscore")
+df[idcol]=df[idcol].astype(str); df=df.set_index(idcol)
+x=pd.to_numeric(df[pgs_col], errors='coerce'); x=x.dropna(); ids=pd.Index(x.index.astype(str))
+
+rows=[]
+for code in sorted(cp['code'].unique()):
+    pid=set(cp.loc[cp['code']==code, 'person_id'].astype(str))
+    idx=ids
+    y=idx.to_series().isin(pid).astype(int).to_numpy()
+    xv=x.reindex(idx).to_numpy()
+    m=float(np.nanmean(xv)); s=float(np.nanstd(xv))
+    if not np.isfinite(s) or s==0: continue
+    z=(xv-m)/s
+    n=len(z); n1=int(y.sum())
+    if n1==0 or n1==n: continue
+    try:
+        X=sm.add_constant(pd.DataFrame({'z':z}))
+        fit=sm.Logit(y, X).fit(disp=0, maxiter=200)
+        beta=float(fit.params['z']); se=float(fit.bse['z'])
+    except Exception:
+        try:
+            fit=sm.GLM(y, X, family=sm.families.Binomial()).fit()
+            beta=float(fit.params['z']); se=float(fit.bse['z'])
+        except Exception:
+            continue
+    OR=float(np.exp(beta))
+    zstat=beta/se if se>0 else np.nan
+    p=float(norm.sf(zstat)) if np.isfinite(zstat) else np.nan
+    rows.append({'code':code,'n':n,'cases':n1,'OR_perSD':OR,'p_one_sided':p})
+
+res=pd.DataFrame(rows)
+res=res[res['n']>=30].dropna(subset=['OR_perSD']).sort_values('OR_perSD', ascending=True)
+
+plt.figure(figsize=(9, max(3, 0.5*len(res))))
+bars=plt.barh(res['code'], res['OR_perSD'])
+xmax=float(res['OR_perSD'].max()*1.15) if len(res) else 1.0
+plt.xlim(0, xmax)
+for rect,pv in zip(bars, res['p_one_sided']):
+    txt = f"p={pv:.1e}" if np.isfinite(pv) else "p=n/a"
+    plt.text(rect.get_width()*1.01, rect.get_y()+rect.get_height()/2, txt, va="center")
+plt.xlabel("OR per SD (PGS003852)"); plt.ylabel("ICD code"); plt.title("PGS003852 OR/SD by ICD code (n≥30)")
+plt.tight_layout(); plt.show()
+```
+
+<img width="889" height="1339" alt="image" src="https://github.com/user-attachments/assets/3f9a820e-1632-471a-b2da-ac802d009401" />
