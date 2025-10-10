@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
@@ -349,7 +350,6 @@ enum ProjectionStageBar {
         bar: ProgressBar,
     },
     Spinner {
-        base_message: &'static str,
         bar: ProgressBar,
     },
 }
@@ -372,10 +372,7 @@ impl ProjectionStageBar {
             bar.set_style(spinner_style());
             bar.set_message(ConsoleProjectionProgress::stage_message(stage));
             bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-            Self::Spinner {
-                base_message: ConsoleProjectionProgress::stage_message(stage),
-                bar,
-            }
+            Self::Spinner { bar }
         }
     }
 

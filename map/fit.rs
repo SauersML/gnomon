@@ -781,7 +781,7 @@ where
     }
 
     fn into_parts(self) -> (&'a mut S, Vec<f64>, Option<HweScaler>) {
-        let mut this = ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         let source = this.source;
         let storage = unsafe {
             (*this.block_storage.get())
