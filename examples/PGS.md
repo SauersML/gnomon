@@ -108,5 +108,48 @@ Let's make the case definition.
 - 154.0 — Malignant neoplasm of rectosigmoid junction.
 - 154.1 — Malignant neoplasm of rectum.
 
+```
+cdr_id = os.environ["WORKSPACE_CDR"]
+from google.cloud import bigquery as bq
+codes=[f"C18.{i}" for i in range(10)]+["C19","C20"]+[f"153.{i}" for i in range(10)]+["154.0","154.1"]; codes=[c.upper() for c in (codes+[c.replace(".","") for c in codes])]
+sql=f"""SELECT DISTINCT CAST(person_id AS STRING) person_id
+        FROM `{cdr_id}.condition_occurrence`
+        WHERE condition_source_value IS NOT NULL
+          AND UPPER(TRIM(condition_source_value)) IN UNNEST(@codes)"""
+cases=bq.Client().query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes","STRING",codes)])).to_dataframe()["person_id"].astype(str)
+```
+
 For simplicity, we aren't using a time-to-event model. Some of our "controls" will go on to develop colorectal cancer later in life.
 
+Calculate metrics:
+```
+import pandas as pd, numpy as np, statsmodels.api as sm
+from sklearn.metrics import roc_auc_score
+from scipy.stats import mannwhitneyu, norm, chi2
+d=pd.read_csv('../../arrays.sscore',sep='\t'); idcol=d.columns[0]; y=d[idcol].astype(str).isin(set(cases)).astype(int)
+res=[]
+for s in d.filter(regex='_AVG$').columns:
+    x=pd.to_numeric(d[s],errors='coerce'); t=pd.DataFrame({'y':y,'x':x}).dropna()
+    if t['y'].nunique()<2 or t['x'].std(ddof=0)==0: continue
+    z=(t['x']-t['x'].mean())/t['x'].std(ddof=0); X=sm.add_constant(pd.DataFrame({'z':z}))
+    m=sm.Logit(t['y'],X).fit(disp=False, maxiter=200); beta=float(m.params['z']); se=float(m.bse['z'])
+    OR=np.exp(beta); p_or=1-norm.cdf(beta/se)
+    auc=roc_auc_score(t['y'],t['x']); p_auc=mannwhitneyu(t.loc[t['y']==1,'x'],t.loc[t['y']==0,'x'],alternative='greater').pvalue
+    n=len(t); r2=(1-np.exp((2/n)*(m.llnull-m.llf)))/(1-np.exp(2*m.llnull/n)); p_r2=1-chi2.cdf(2*(m.llf-m.llnull),1)
+    res.append([s,n,int(t['y'].sum()),int(n-t['y'].sum()),OR,p_or,auc,p_auc,r2,p_r2])
+pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided_OR>1','AUROC','p_one_sided_AUC>0.5','Nagelkerke_R2','p_one_sided_R2>0']).sort_values('Nagelkerke_R2',ascending=False)
+```
+
+| Score         |       N | Cases | Controls | OR per SD | P (OR>1) | AUROC | P (AUC>0.5) | Nagelkerke R² | P (R²>0) |
+| ------------- | ------: | ----: | -------: | --------: | -------: | ----: | ----------: | ------------: | -------: |
+| PGS003852_AVG | 447,278 | 3,192 |  444,086 |     1.293 |  <1e-100 | 0.573 |    1.04e-45 |         0.57% |  <1e-100 |
+| PGS003979_AVG | 447,278 | 3,192 |  444,086 |     1.294 |  <1e-100 | 0.571 |    5.83e-44 |         0.57% |  <1e-100 |
+| PGS003433_AVG | 447,278 | 3,192 |  444,086 |     1.276 |  <1e-100 | 0.569 |    1.27e-41 |         0.52% |  <1e-100 |
+| PGS000765_AVG | 447,278 | 3,192 |  444,086 |     1.211 |  <1e-100 | 0.554 |    1.28e-26 |         0.32% |  <1e-100 |
+| PGS004904_AVG | 447,278 | 3,192 |  444,086 |     1.176 |  <1e-100 | 0.545 |    5.37e-19 |         0.23% |  <1e-100 |
+| PGS003386_AVG | 447,278 | 3,192 |  444,086 |     1.095 | 1.63e-07 | 0.526 |    3.09e-07 |         0.07% | 3.29e-07 |
+| PGS004303_AVG | 447,278 | 3,192 |  444,086 |     1.027 |    0.070 | 0.507 |       0.096 |         0.01% |    0.141 |
+
+The GenoBoost method (PGS004303), which uses non-additive models, doesn't perform well relative to the others. The ICD10 codes included in the construction of PGS004303 were similar to ours: C18,C19,C20.
+
+The best performing scores are PGS003852, PGS003979, and PGS003433. One thing common to each of these scores is that the associated study involves colorectal cancer specifically (as opposed to being general and studying many diseases at once).
