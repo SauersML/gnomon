@@ -1899,59 +1899,23 @@ mod tests {
         }
     }
 
-    fn should_skip(message: &str) -> bool {
-        let lower = message.to_lowercase();
-        lower.contains("dns error")
-            || lower.contains("timed out")
-            || lower.contains("temporary failure")
-            || lower.contains("could not resolve host")
-            || lower.contains("connection refused")
-            || lower.contains("network is unreachable")
-    }
-
     #[test]
     fn fit_hwe_pca_from_http_vcf_stream() {
         let path = Path::new(TEST_VCF_URL);
-        let dataset = match GenotypeDataset::open(path) {
-            Ok(dataset) => dataset,
-            Err(err) => {
-                let msg = err.to_string();
-                if should_skip(&msg) {
-                    eprintln!("skipping HTTP PCA test: {msg}");
-                    return;
-                }
-                panic!("Failed to open dataset: {msg}");
-            }
-        };
+        let dataset = GenotypeDataset::open(path)
+            .unwrap_or_else(|err| panic!("Failed to open dataset: {err}"));
 
-        let block_source = match dataset.block_source() {
-            Ok(source) => source,
-            Err(err) => {
-                let msg = err.to_string();
-                if should_skip(&msg) {
-                    eprintln!("skipping HTTP PCA test: {msg}");
-                    return;
-                }
-                panic!("Failed to create block source: {msg}");
-            }
-        };
+        let block_source = dataset
+            .block_source()
+            .unwrap_or_else(|err| panic!("Failed to create block source: {err}"));
 
         let mut limited_source =
             LimitedBlockSource::new(block_source, MAX_TEST_SAMPLES, MAX_TEST_VARIANTS);
         let expected_variants = limited_source.n_variants();
         let expected_samples = limited_source.n_samples();
 
-        let model = match HwePcaModel::fit_k(&mut limited_source, TEST_COMPONENTS) {
-            Ok(model) => model,
-            Err(err) => {
-                let msg = err.to_string();
-                if should_skip(&msg) {
-                    eprintln!("skipping HTTP PCA test: {msg}");
-                    return;
-                }
-                panic!("Failed to fit PCA model: {msg}");
-            }
-        };
+        let model = HwePcaModel::fit_k(&mut limited_source, TEST_COMPONENTS)
+            .unwrap_or_else(|err| panic!("Failed to fit PCA model: {err}"));
 
         assert_eq!(expected_samples, model.n_samples());
         assert_eq!(expected_variants, model.n_variants());
