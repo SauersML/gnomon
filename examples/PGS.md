@@ -40,3 +40,9 @@ For now, let's download the microarray data. This may impact the variant overlap
 ```
 gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarray/plink/* .
 ```
+
+Now we can run the scores. It should be faster to run them all at once instead of one at a time.
+```
+./gnomon/target/release/gnomon score --score "PGS000765,PGS004904,PGS003433,PGS003979,PGS003386,PGS003852,PGS004303" arrays
+```
+
