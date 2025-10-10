@@ -263,3 +263,27 @@ pd.DataFrame([{"n": int(len(y)), "cases": int(y.sum()), "controls": int(len(y)-y
 ```
 
 This yields an AUROC of 0.617375. (Adding a ridge penalty gives a similar value of 0.617.)
+
+Let's analyze a different subset of colorectal cancer-related ICD codes.
+
+**ICD-10**
+- Z85.038 — Personal history of malignant neoplasm of large intestine.
+- Z85.04x — Personal history of malignant neoplasm of rectum/rectosigmoid junction/anal canal.
+- Z43.3* — Encounter for attention to colostomy (any 4th digit).
+- Z93.3* — Colostomy status (any 4th digit).
+- 0DTP* — Resection of rectum (approach-specific).
+- 0DTN* — Resection of sigmoid colon (approach-specific).
+- DD07* — Beam radiation of rectum (Radiation Therapy section).
+- DD05* — Beam radiation of colon (Radiation Therapy section).
+- DDY5* — Other radiation to colon (Radiation Therapy, modality-specific).
+- 0D1N0Z4 — Bypass sigmoid colon to cutaneous (colostomy creation), open approach.
+- 0D1L0Z4 — Bypass transverse colon to cutaneous (colostomy creation), open approach.
+
+**ICD-9**
+- 48.5x — Abdominoperineal resection (APR) of rectum (procedure family).
+- 48.6x — Anterior/low anterior and other resections of rectum (procedure family).
+- 45.7x — Segmental colectomies (e.g., right, transverse, left hemicolectomy; sigmoidectomy).
+- 45.8x — Total intra-abdominal colectomy.
+- 46.1x — Colostomy creation.
+- 46.5x — Closure of intestinal stoma (stoma takedown).
+
