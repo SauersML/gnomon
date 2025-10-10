@@ -1,13 +1,15 @@
 use super::fit::{HwePcaError, HwePcaModel};
 use super::io::{
-    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, load_hwe_model,
-    save_fit_summary, save_hwe_model, save_projection_results, save_sample_manifest,
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
+    load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
+    save_sample_manifest,
 };
 use super::progress::{fit_progress, projection_progress};
 use super::project::ProjectionOptions;
 use super::variant_filter::{VariantFilter, VariantListError};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -109,57 +111,94 @@ fn run_fit(genotype_path: &Path, variant_list: Option<&Path>) -> Result<(), MapD
         "Resolved genotype data file: {}",
         dataset.data_path().display()
     );
+    let variant_hint = dataset.variant_count_hint();
+    let variant_display = match variant_hint {
+        Some(count) if count > 0 => count.to_string(),
+        _ => String::from("unknown"),
+    };
     println!(
         "Dataset dimensions: {} samples × {} variants",
         dataset.n_samples(),
-        dataset.n_variants()
+        variant_display
     );
 
     let mut variant_keys: Option<Vec<_>> = None;
+    let mut selection_plan = SelectionPlan::All;
 
-    let selection = if let Some(list_path) = variant_list {
+    if let Some(list_path) = variant_list {
         let filter = VariantFilter::from_file(list_path)
             .map_err(|err| map_variant_list_error(list_path, err))?;
-        let selection = dataset.select_variants(&filter)?;
-        if selection.indices.is_empty() {
-            return Err(MapDriverError::InvalidState(format!(
-                "Variant list {} did not match any variants in the dataset",
-                list_path.display()
-            )));
-        }
 
-        let matched = selection.matched_unique();
-        let missing = selection.requested_unique.saturating_sub(matched);
-        println!(
-            "Variant list matched {matched} of {} requested variants{}",
-            selection.requested_unique,
-            if missing > 0 {
-                format!(" ({} missing)", missing)
-            } else {
-                String::from("")
+        match &dataset {
+            GenotypeDataset::Plink(_) => {
+                let selection = dataset.select_variants(&filter)?;
+                if selection.indices.is_empty() {
+                    return Err(MapDriverError::InvalidState(format!(
+                        "Variant list {} did not match any variants in the dataset",
+                        list_path.display()
+                    )));
+                }
+
+                let matched = selection.matched_unique();
+                let missing = selection.requested_unique.saturating_sub(matched);
+                println!(
+                    "Variant list matched {matched} of {} requested variants{}",
+                    selection.requested_unique,
+                    if missing > 0 {
+                        format!(" ({} missing)", missing)
+                    } else {
+                        String::from("")
+                    }
+                );
+
+                variant_keys = Some(selection.keys.clone());
+                selection_plan = SelectionPlan::ByIndices(selection.indices);
             }
-        );
-        variant_keys = Some(selection.keys.clone());
-        Some(selection)
-    } else {
-        None
-    };
+            GenotypeDataset::Variants(_) => {
+                let requested = filter.requested_unique();
+                println!(
+                    "Variant list contains {requested} unique variants; streaming match will be reported during fit",
+                );
+                selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
+            }
+        }
+    }
 
-    let mut source = dataset.block_source_with_selection(
-        selection
-            .as_ref()
-            .map(|selection| selection.indices.as_slice()),
-    )?;
+    let mut source = dataset.block_source_with_plan(selection_plan)?;
     let progress = fit_progress();
     let mut model = HwePcaModel::fit_with_progress(&mut source, &progress)?;
+
+    if let Some(outcome) = source.take_selection_outcome() {
+        if outcome.requested_unique > 0 {
+            let matched = outcome.matched_keys.len();
+            let missing = outcome.missing_keys.len();
+            println!(
+                "Variant list matched {matched} of {} requested variants{}",
+                outcome.requested_unique,
+                if missing > 0 {
+                    format!(" ({} missing)", missing)
+                } else {
+                    String::from("")
+                }
+            );
+        }
+        if outcome.matched_keys.is_empty() {
+            return Err(MapDriverError::InvalidState(
+                "Variant list did not match any variants in the dataset".into(),
+            ));
+        }
+        variant_keys = Some(outcome.matched_keys);
+    }
+
     if let Some(keys) = variant_keys {
         model.set_variant_keys(Some(keys));
     }
 
     println!(
-        "Retained {} principal components across {} samples",
+        "Retained {} principal components across {} samples ({} variants)",
         model.components(),
-        model.n_samples()
+        model.n_samples(),
+        model.n_variants()
     );
 
     let model_path = save_hwe_model(&dataset, &model)?;
@@ -183,10 +222,15 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         "Resolved genotype data file: {}",
         dataset.data_path().display()
     );
+    let variant_hint = dataset.variant_count_hint();
+    let variant_display = match variant_hint {
+        Some(count) if count > 0 => count.to_string(),
+        _ => String::from("unknown"),
+    };
     println!(
         "Dataset dimensions: {} samples × {} variants",
         dataset.n_samples(),
-        dataset.n_variants()
+        variant_display
     );
 
     let model = load_hwe_model(&dataset)?;
@@ -196,45 +240,69 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         model.n_variants()
     );
 
-    let selection = if let Some(keys) = model.variant_keys() {
-        let selection = dataset.select_variants_by_keys(keys)?;
-        if !selection.missing.is_empty() {
-            return Err(MapDriverError::InvalidState(
-                "Projection dataset is missing variants required by the model".into(),
-            ));
+    let mut selection_plan = SelectionPlan::All;
+
+    if let Some(keys) = model.variant_keys() {
+        match &dataset {
+            GenotypeDataset::Plink(_) => {
+                let selection = dataset.select_variants_by_keys(keys)?;
+                if !selection.missing.is_empty() {
+                    return Err(MapDriverError::InvalidState(
+                        "Projection dataset is missing variants required by the model".into(),
+                    ));
+                }
+                if selection.indices.len() != model.n_variants() {
+                    return Err(MapDriverError::InvalidState(format!(
+                        "Model expects {} variants but matched {} in projection dataset",
+                        model.n_variants(),
+                        selection.indices.len()
+                    )));
+                }
+                println!(
+                    "Using stored variant subset with {} variants for projection",
+                    selection.indices.len()
+                );
+                selection_plan = SelectionPlan::ByIndices(selection.indices);
+            }
+            GenotypeDataset::Variants(_) => {
+                println!(
+                    "Using stored variant subset with {} variants for projection",
+                    model.n_variants()
+                );
+                let filter = VariantFilter::from_keys(keys.iter().cloned());
+                selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
+            }
         }
-        if selection.indices.len() != model.n_variants() {
-            return Err(MapDriverError::InvalidState(format!(
-                "Model expects {} variants but matched {} in projection dataset",
-                model.n_variants(),
-                selection.indices.len()
-            )));
-        }
-        println!(
-            "Using stored variant subset with {} variants for projection",
-            selection.indices.len()
-        );
-        Some(selection)
-    } else {
-        if dataset.n_variants() != model.n_variants() {
+    } else if let Some(known) = dataset.variant_count_hint() {
+        if known > 0 && known != model.n_variants() {
             return Err(MapDriverError::InvalidState(format!(
                 "Model expects {} variants but dataset provides {}",
                 model.n_variants(),
-                dataset.n_variants()
+                known
             )));
         }
-        None
-    };
+    }
 
-    let mut source = dataset.block_source_with_selection(
-        selection
-            .as_ref()
-            .map(|selection| selection.indices.as_slice()),
-    )?;
+    let mut source = dataset.block_source_with_plan(selection_plan)?;
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
     let result = projector.project_with_options_and_progress(&mut source, &options, &progress)?;
+
+    if let Some(outcome) = source.take_selection_outcome() {
+        if !outcome.missing_keys.is_empty() {
+            return Err(MapDriverError::InvalidState(
+                "Projection dataset is missing variants required by the model".into(),
+            ));
+        }
+        if outcome.matched_keys.len() != model.n_variants() {
+            return Err(MapDriverError::InvalidState(format!(
+                "Model expects {} variants but matched {} in projection dataset",
+                model.n_variants(),
+                outcome.matched_keys.len()
+            )));
+        }
+    }
 
     let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
 

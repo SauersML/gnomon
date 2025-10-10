@@ -42,6 +42,9 @@ pub trait FitProgressObserver: Send + Sync {
     fn on_stage_advance(&self, stage: FitProgressStage, processed_variants: usize) {
         let _ = (stage, processed_variants);
     }
+    fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
+        let _ = (stage, total_variants);
+    }
     fn on_stage_finish(&self, stage: FitProgressStage) {
         let _ = stage;
     }
@@ -80,6 +83,10 @@ where
 
     pub fn estimate(&self, estimated_total: usize) {
         self.observer.on_stage_estimate(self.stage, estimated_total);
+    }
+
+    pub fn set_total(&self, total_variants: usize) {
+        self.observer.on_stage_total(self.stage, total_variants);
     }
 
     pub fn finish(self) {
@@ -147,16 +154,12 @@ fn spinner_style() -> ProgressStyle {
 }
 
 enum StageBarMode {
-    Determinate {
-        total: u64,
-    },
-    Spinner {
-        base_message: &'static str,
-        approximate: Option<u64>,
-    },
+    Determinate { total: u64 },
+    Spinner { approximate: Option<u64> },
 }
 
 struct ManagedStageBar {
+    stage: FitProgressStage,
     bar: ProgressBar,
     mode: StageBarMode,
 }
@@ -170,6 +173,7 @@ impl ManagedStageBar {
             bar.set_message(ConsoleFitProgress::stage_message(stage));
             bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
             Self {
+                stage,
                 bar,
                 mode: StageBarMode::Determinate {
                     total: total as u64,
@@ -182,11 +186,9 @@ impl ManagedStageBar {
             bar.set_message(ConsoleFitProgress::stage_message(stage));
             bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
             Self {
+                stage,
                 bar,
-                mode: StageBarMode::Spinner {
-                    base_message: ConsoleFitProgress::stage_message(stage),
-                    approximate: None,
-                },
+                mode: StageBarMode::Spinner { approximate: None },
             }
         }
     }
@@ -204,23 +206,35 @@ impl ManagedStageBar {
     }
 
     fn set_estimate(&mut self, estimated_total: usize) {
-        if let StageBarMode::Spinner {
-            base_message,
-            approximate,
-        } = &mut self.mode
-        {
+        if let StageBarMode::Spinner { approximate } = &mut self.mode {
             *approximate = Some(estimated_total as u64);
-            self.refresh_spinner_message(*base_message, *approximate);
+            self.refresh_spinner_message(*approximate);
         }
     }
 
-    fn refresh_spinner_message(&self, base_message: &'static str, approximate: Option<u64>) {
+    fn refresh_spinner_message(&self, approximate: Option<u64>) {
+        let base_message = ConsoleFitProgress::stage_message(self.stage);
         if let Some(approx) = approximate {
             self.bar
                 .set_message(format!("{base_message} (≈{} variants)", approx));
         } else {
             self.bar.set_message(base_message);
         }
+    }
+
+    fn set_total(&mut self, new_total: usize) {
+        if new_total == 0 {
+            return;
+        }
+        let total = new_total as u64;
+        let current = self.bar.position().min(total);
+        self.bar.set_style(determinate_style());
+        self.bar.set_length(total);
+        self.bar
+            .set_message(ConsoleFitProgress::stage_message(self.stage));
+        self.bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+        self.bar.set_position(current);
+        self.mode = StageBarMode::Determinate { total };
     }
 
     fn finish(self, message: &'static str) {
@@ -285,6 +299,13 @@ impl FitProgressObserver for ConsoleFitProgress {
         let mut inner = self.inner.lock().unwrap();
         if let Some(existing) = inner.get_mut(&stage) {
             existing.set_estimate(estimated_total);
+        }
+    }
+
+    fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.get_mut(&stage) {
+            existing.set_total(total_variants);
         }
     }
 

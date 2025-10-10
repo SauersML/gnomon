@@ -15,9 +15,8 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
 /// The number of variants to process locally before updating the global atomic counter.
@@ -27,6 +26,49 @@ pub const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_CACHE_CAPACITY: usize = 8;
 const HTTP_USER_AGENT: &str = "gnomon-http-client/1.0";
+
+const UNKNOWN_TOTAL_BYTES: u64 = u64::MAX;
+
+#[derive(Debug)]
+pub struct ReadMetrics {
+    bytes_read: AtomicU64,
+    total_bytes: AtomicU64,
+}
+
+impl ReadMetrics {
+    pub fn new(total_bytes: Option<u64>) -> Self {
+        Self {
+            bytes_read: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(total_bytes.unwrap_or(UNKNOWN_TOTAL_BYTES)),
+        }
+    }
+
+    pub fn record(&self, bytes: usize) {
+        if bytes > 0 {
+            self.bytes_read.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> (u64, Option<u64>) {
+        let read = self.bytes_read.load(Ordering::Relaxed);
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        let total_opt = if total == UNKNOWN_TOTAL_BYTES {
+            None
+        } else {
+            Some(total)
+        };
+        (read, total_opt)
+    }
+
+    pub fn set_total(&self, total: Option<u64>) {
+        let value = total.unwrap_or(UNKNOWN_TOTAL_BYTES);
+        self.total_bytes.store(value, Ordering::Relaxed);
+    }
+
+    pub fn reset(&self) {
+        self.bytes_read.store(0, Ordering::Relaxed);
+    }
+}
 
 static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
 
@@ -207,6 +249,7 @@ pub struct VariantSource {
     total_len: Option<u64>,
     compression: VariantCompression,
     format: VariantFormat,
+    metrics: Arc<ReadMetrics>,
 }
 
 impl VariantSource {
@@ -243,6 +286,8 @@ impl VariantSource {
             })
         })?;
 
+        let metrics = Arc::new(ReadMetrics::new(Some(total_len)));
+
         let mut queue = VecDeque::with_capacity(readers.len());
         for (idx, mut reader) in readers.drain(..).enumerate() {
             reader.skip_header = idx > 0;
@@ -255,6 +300,7 @@ impl VariantSource {
             total_len: Some(total_len),
             compression,
             format,
+            metrics,
         })
     }
 
@@ -274,7 +320,11 @@ impl VariantSource {
                         self.current = None;
                         continue;
                     }
-                    other => return other,
+                    Ok(bytes) => {
+                        self.metrics.record(bytes);
+                        return Ok(bytes);
+                    }
+                    Err(err) => return Err(err),
                 }
             }
         }
@@ -291,6 +341,7 @@ impl VariantSource {
             if prepared.skip_header {
                 skip_variant_header(reader.as_mut(), prepared.compression, prepared.format)?;
                 self.total_len = None;
+                self.metrics.set_total(None);
             }
 
             self.current = Some(reader);
@@ -303,6 +354,10 @@ impl VariantSource {
     /// when known.
     pub fn len(&self) -> Option<u64> {
         self.total_len
+    }
+
+    pub fn metrics(&self) -> Arc<ReadMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     pub fn compression(&self) -> VariantCompression {
