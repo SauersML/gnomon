@@ -1,28 +1,29 @@
-//! A single-file, pure-Rust façade which **consumes** PLINK 2.0 inputs
-//! (`.pgen/.pvar/.psam`) and **presents** virtual PLINK 1.9 outputs
-//! (`.bed/.bim/.fam`) through the *same streaming traits* your code
+//! A single-file, pure-Rust façade which consumes PLINK 2.0 inputs
+//! (`.pgen/.pvar/.psam`) and presents virtual PLINK 1.9 outputs
+//! (`.bed/.bim/.fam`) through the same streaming traits your code
 //! already uses:
 //!   - `.bed` → `ByteRangeSource` (random-access byte ranges)
 //!   - `.bim` / `.fam` → `TextSource` (pull-based line iterator)
 //!
 //! ## Fixed semantics (“best options”, no knobs)
-//! - **Multiallelic**: always **split** every ALT; never drop. Variant
-//!   order in the virtual outputs matches `.pvar`, expanded in **ALT
-//!   order** and with multiallelics deterministically split.
-//! - **Allele orientation**: **A1 = ALT**, **A2 = REF** (per split ALT).
-//!   The virtual `.bim` follows the PLINK 1.9 contract with `cM = 0` and
-//!   synthesised IDs when needed.
-//! - **Genotype basis**: prefer hard-calls; otherwise **hard-call from
-//!   dosage** using **nearest-integer with ±0.10 tolerance**, else
-//!   **missing**.
-//! - **Ploidy**: autosomes+PAR diploid; `X` (non-PAR), `Y`, and `MT`
-//!   treated as haploid for males. Heterozygotes in these contexts are
-//!   coerced to **missing** before PLINK 1.9 packing.
-//! - **.bed encoding**: exact PLINK 1.9 2-bit codes (`00`=hom ALT, `01`
+//! - Multiallelic: always split every ALT; never drop. Variant order in
+//!   the virtual outputs matches `.pvar`, expanded in ALT order and with
+//!   multiallelics deterministically split.
+//! - Allele orientation: A1 equals ALT and A2 equals REF (per split
+//!   ALT). The virtual `.bim` follows the PLINK 1.9 contract with `cM =`
+//!   `0` and synthesised IDs when needed.
+//! - Genotype basis: prefer hard-calls; otherwise derive a hard-call from
+//!   dosage using nearest-integer with ±0.10 tolerance, else mark the
+//!   value as missing.
+//! - Ploidy: autosomes plus pseudoautosomal regions are diploid; `X`
+//!   (non-PAR), `Y`, and `MT` are treated as haploid for males.
+//!   Heterozygotes in these contexts are coerced to missing before PLINK
+//!   1.9 packing.
+//! - `.bed` encoding: exact PLINK 1.9 2-bit codes (`00` hom ALT, `01`
 //!   missing, `10` het, `11` hom REF; least-significant bit first within
 //!   each byte).
-//! - **Split IDs**: if `ID != "."` → `ID__ALT=<ALT>`; else
-//!   `CHR:POS:REF:ALT`.
+//! - Split IDs: if `ID != "."` → `ID__ALT=<ALT>`; else use
+//!   `chr:pos:ref:alt`.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -55,8 +56,8 @@ pub struct VirtualPlink19 {
     pub fam: Box<dyn TextSource>,
 }
 
-/// Open from **paths**. `.pvar` and `.psam` are opened with your existing
-/// `open_text_source`. The `.pgen` is opened as a **local file** here.
+/// Open from filesystem paths. `.pvar` and `.psam` are opened with your existing
+/// `open_text_source`. The `.pgen` is opened as a local file here.
 /// If you need remote `.pgen` support, use `open_virtual_plink19_from_sources`
 /// and pass an appropriate `ByteRangeSource` for `.pgen`.
 pub fn open_virtual_plink19_from_paths(
@@ -77,7 +78,7 @@ pub fn open_virtual_plink19_from_paths(
     )
 }
 
-/// Open from **sources**. Callers may pass custom/remote-capable
+/// Open from caller-provided sources. Callers may pass custom/remote-capable
 /// `ByteRangeSource` for `.pgen` and `TextSource`s for `.pvar/.psam`.
 pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
@@ -146,7 +147,7 @@ struct PsamColumns {
 
 impl PsamInfo {
     fn from_psam(source: &mut dyn TextSource) -> Result<Self, PipelineError> {
-        // `.psam` may have multiple header lines; only the **final** header line
+        // `.psam` may have multiple header lines; only the final header line
         // begins with `#FID` or `#IID`. We track the last header encountered and
         // parse rows as we stream them to capture per-sample sex information.
         let mut header: Option<Vec<String>> = None;
@@ -240,8 +241,8 @@ impl PsamColumns {
 // PVAR → VariantPlan (always split) + BIM streaming transform
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Mapping from **virtual BED variant index** (post-split) to **PGEN record index**
-/// and the **ALT ordinal** within that record.
+/// Mapping from virtual BED variant index (post-split) to PGEN record index
+/// and the ALT ordinal within that record.
 #[derive(Clone)]
 struct VariantPlan {
     /// Total input variants before splitting (to sanity check decoder bounds).
@@ -285,18 +286,15 @@ impl VariantPlan {
                 .next()
                 .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
                 .trim();
-            let _pos = fields
+            fields
                 .next()
-                .ok_or_else(|| ioerr(".pvar missing POS"))?
-                .trim();
-            let _id = fields
+                .ok_or_else(|| ioerr(".pvar missing POS"))?;
+            fields
                 .next()
-                .ok_or_else(|| ioerr(".pvar missing ID"))?
-                .trim();
-            let _refa = fields
+                .ok_or_else(|| ioerr(".pvar missing ID"))?;
+            fields
                 .next()
-                .ok_or_else(|| ioerr(".pvar missing REF"))?
-                .trim();
+                .ok_or_else(|| ioerr(".pvar missing REF"))?;
             let alt = fields
                 .next()
                 .ok_or_else(|| ioerr(".pvar missing ALT"))?
@@ -356,7 +354,7 @@ fn ioerr(msg: &str) -> PipelineError {
 struct VirtualBim {
     inner: Box<dyn TextSource>,
     header_seen: bool,
-    // carry state for multi-ALT expansion of the **current** PVAR row
+    // carry state for multi-ALT expansion of the current PVAR row
     current_emitted: usize,
     current_alts: Vec<String>,
     current_fixed: (String, String, String, String), // (chr, pos, id, ref)
@@ -938,10 +936,10 @@ impl PgenDecoder {
     }
 
     /// Decode variant `in_idx` for ALT ordinal `alt_ord` (1-based), and write
-    /// **hard-calls** into `dst` (len == N). Values:
-    ///   - 0 → homozygous for **A2** (ALT absent; A1 dosage 0)
+    /// hard-calls into `dst` (len == N). Values:
+    ///   - 0 → homozygous for A2 (ALT absent; A1 dosage 0)
     ///   - 1 → heterozygous (A1 dosage 1)
-    ///   - 2 → homozygous for **A1** (ALT present twice; A1 dosage 2)
+    ///   - 2 → homozygous for A1 (ALT present twice; A1 dosage 2)
     ///   - 255 → missing
     ///
     /// Working subset: record payload layout
