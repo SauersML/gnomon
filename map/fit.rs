@@ -112,6 +112,11 @@ pub trait VariantBlockSource {
         let _ = self;
         None
     }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        let _ = self;
+        None
+    }
 }
 
 pub struct DenseBlockSource<'a> {
@@ -1030,7 +1035,7 @@ where
 
         let stats_ready = self.stats_computed();
         let mut observed = unsafe { *self.observed_variants.get() };
-        let mut used_byte_progress = false;
+        let mut used_source_progress = false;
 
         loop {
             let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
@@ -1086,8 +1091,16 @@ where
             if !stats_ready {
                 if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
                     if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                        used_byte_progress = true;
+                        used_source_progress = true;
                         handle.advance_bytes(bytes_read, total_bytes);
+                    } else if let Some((work_done, total_work)) = source.progress_variants() {
+                        used_source_progress = true;
+                        if let Some(total) = total_work {
+                            handle.set_total(total);
+                        } else if self.n_variants_hint > 0 {
+                            handle.estimate(self.n_variants_hint);
+                        }
+                        handle.advance(work_done);
                     } else {
                         handle.advance(processed);
                     }
@@ -1114,7 +1127,9 @@ where
 
         if !stats_ready {
             if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
-                if !used_byte_progress {
+                if let Some((_, Some(total))) = source.progress_variants() {
+                    handle.set_total(total);
+                } else if !used_source_progress {
                     handle.set_total(processed);
                 }
             }
@@ -1409,7 +1424,7 @@ where
 
     let mut processed = 0usize;
     let mut observed = operator.observed_n_variants();
-    let mut used_byte_progress = false;
+    let mut used_source_progress = false;
 
     loop {
         let filled = source
@@ -1457,8 +1472,16 @@ where
 
         if let Some(handle) = progress {
             if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                used_byte_progress = true;
+                used_source_progress = true;
                 handle.advance_bytes(bytes_read, total_bytes);
+            } else if let Some((work_done, total_work)) = source.progress_variants() {
+                used_source_progress = true;
+                if let Some(total) = total_work {
+                    handle.set_total(total);
+                } else if operator.n_variants_hint > 0 {
+                    handle.estimate(operator.n_variants_hint);
+                }
+                handle.advance(work_done);
             } else {
                 handle.advance(processed);
             }
@@ -1483,7 +1506,9 @@ where
             *operator.observed_variants.get() = observed;
         }
         if let Some(handle) = progress {
-            if !used_byte_progress {
+            if let Some((_, Some(total))) = source.progress_variants() {
+                handle.set_total(total);
+            } else if !used_source_progress {
                 handle.set_total(processed);
             }
         }

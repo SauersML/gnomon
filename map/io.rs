@@ -511,6 +511,13 @@ impl VariantBlockSource for DatasetBlockSource {
             Self::Variants(source) => source.progress_bytes(),
         }
     }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        match self {
+            Self::Plink(source) => source.progress_variants(),
+            Self::Variants(source) => source.progress_variants(),
+        }
+    }
 }
 
 impl DatasetBlockSource {
@@ -977,6 +984,15 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             self.cursor += ncols;
             Ok(ncols)
         }
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        let total = self
+            .selection
+            .as_ref()
+            .map(|indices| indices.len())
+            .unwrap_or(self.total_variants);
+        Some((self.cursor.min(total), Some(total)))
     }
 }
 
@@ -1548,6 +1564,15 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
 
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         VcfLikeVariantBlockSource::progress_bytes(self)
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        let work_done = if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            self.processed
+        } else {
+            self.emitted
+        };
+        Some((work_done, self.total_variants_hint))
     }
 }
 
