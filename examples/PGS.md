@@ -46,3 +46,7 @@ Now we can run the scores. It should be faster to run them all at once instead o
 ./gnomon/target/release/gnomon score --score "PGS000765,PGS004904,PGS003433,PGS003979,PGS003386,PGS003852,PGS004303" arrays
 ```
 
+This should take 11 minutes to run, and output a file called:
+```
+arrays.sscore
+```
