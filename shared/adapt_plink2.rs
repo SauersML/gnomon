@@ -143,6 +143,7 @@ struct PsamColumns {
     mat_idx: Option<usize>,
     sex_idx: Option<usize>,
     pheno_idx: Option<usize>,
+    pheno1_idx: Option<usize>,
 }
 
 impl PsamInfo {
@@ -209,7 +210,7 @@ fn parse_sex_token(token: &str) -> u8 {
         "2" => 2,
         "M" | "m" => 1,
         "F" | "f" => 2,
-        "0" | "NA" | "na" | "Na" | "nA" | "." => 0,
+        "0" | "NA" | "na" | "Na" | "nA" | "." | "nan" | "NaN" | "NAN" => 0,
         _ => 0,
     }
 }
@@ -225,6 +226,7 @@ impl PsamColumns {
                 "MAT" => out.mat_idx = Some(i),
                 "SEX" => out.sex_idx = Some(i),
                 "PHENO" | "PHENOTYPE" => out.pheno_idx = Some(i),
+                "PHENO1" => out.pheno1_idx = Some(i),
                 _ => {}
             }
         }
@@ -243,6 +245,14 @@ impl PsamColumns {
 
 /// Mapping from virtual BED variant index (post-split) to PGEN record index
 /// and the ALT ordinal within that record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HaploidyKind {
+    Diploid,
+    HaploidMales,
+    HaploidAll,
+    HaploidMalesFemalesMissing,
+}
+
 #[derive(Clone)]
 struct VariantPlan {
     /// Total input variants before splitting (to sanity check decoder bounds).
@@ -251,24 +261,45 @@ struct VariantPlan {
     out_variants: usize,
     /// Dense mapping: out_idx → (in_idx, alt_ordinal_1based).
     out_to_in: Vec<(u32, u16)>,
-    /// Per-output variant haploidy flag (true if haploid for male samples).
-    is_haploid: Vec<bool>,
+    /// Per-output variant haploidy behaviour.
+    haploidy: Vec<HaploidyKind>,
+}
+
+#[derive(Clone)]
+struct VariantRangeEntry {
+    chrom: String,
+    pos: u64,
+    out_start: usize,
+    out_end: usize,
 }
 
 impl VariantPlan {
     fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
-        let mut haploid: Vec<bool> = Vec::with_capacity(1 << 20);
+        let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
+        let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
         let mut have_header = false;
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
+        let mut max_x_pos: u64 = 0;
 
         while let Some(line) = pvar.next_line()? {
             let s = str::from_utf8(line)
                 .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .pvar: {e}")))?;
-            if s.starts_with('#') {
-                // #CHROM POS ID REF ALT [...]; only one header expected up-front
-                have_header = true;
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                let header_body = trimmed.trim_start_matches('#');
+                if header_body
+                    .split_whitespace()
+                    .next()
+                    .map(|t| t.eq_ignore_ascii_case("CHROM"))
+                    .unwrap_or(false)
+                {
+                    have_header = true;
+                }
                 continue;
             }
             if !have_header {
@@ -276,56 +307,58 @@ impl VariantPlan {
                     "Missing .pvar header (#CHROM ... ALT)".to_string(),
                 ));
             }
-            if s.trim().is_empty() {
-                in_idx += 1;
-                in_variants += 1;
-                continue;
-            }
-            let mut fields = s.split('\t');
-            let chrom = fields
+
+            let mut fields = trimmed.split_whitespace();
+            let chrom_raw = fields
                 .next()
-                .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
-                .trim();
-            fields
+                .ok_or_else(|| ioerr(".pvar missing #CHROM"))?;
+            let pos_raw = fields
                 .next()
                 .ok_or_else(|| ioerr(".pvar missing POS"))?;
-            fields
+            let _ = fields
                 .next()
                 .ok_or_else(|| ioerr(".pvar missing ID"))?;
-            fields
+            let _ = fields
                 .next()
                 .ok_or_else(|| ioerr(".pvar missing REF"))?;
-            let alt = fields
+            let alt_raw = fields
                 .next()
-                .ok_or_else(|| ioerr(".pvar missing ALT"))?
-                .trim();
+                .ok_or_else(|| ioerr(".pvar missing ALT"))?;
 
-            let chrom_upper = chrom.to_ascii_uppercase();
-            let is_haploid_variant = match chrom_upper.as_str() {
-                "XY" => false,
-                "X" | "Y" | "MT" => true,
-                _ => false,
-            };
-
-            // ALT may be comma-separated (multi-ALT).
-            let mut alt_ord: u16 = 1;
-            let mut emitted_any = false;
-            for a in alt.split(',') {
-                let alt_trimmed = a.trim();
-                if !alt_trimmed.is_empty() {
-                    out_to_in.push((in_idx, alt_ord));
-                    haploid.push(is_haploid_variant);
-                    alt_ord += 1;
-                    emitted_any = true;
-                }
+            let chrom = normalize_chrom(chrom_raw);
+            let pos = pos_raw
+                .parse::<u64>()
+                .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
+            if chrom == "X" {
+                max_x_pos = max_x_pos.max(pos);
             }
-            // Even if no ALT tokens, we count the input variant.
+
+            let out_start = out_to_in.len();
+            let mut alt_ord: u16 = 1;
+            for alt in alt_raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty() && *t != ".") {
+                out_to_in.push((in_idx, alt_ord));
+                haploidy.push(HaploidyKind::Diploid); // placeholder, patched later
+                alt_ord += 1;
+            }
+            let out_end = out_to_in.len();
+            per_variant.push(VariantRangeEntry {
+                chrom,
+                pos,
+                out_start,
+                out_end,
+            });
+
             in_idx += 1;
             in_variants += 1;
+        }
 
-            // If ALT was empty, we simply do not emit anything for that variant.
-            if !emitted_any {
-                // Nothing to do; plan just has no projection for this input line.
+        let build = infer_genome_build(max_x_pos);
+        for entry in per_variant {
+            let hap = haploidy_for_variant(&entry.chrom, entry.pos, build);
+            for idx in entry.out_start..entry.out_end {
+                if let Some(slot) = haploidy.get_mut(idx) {
+                    *slot = hap;
+                }
             }
         }
 
@@ -333,7 +366,7 @@ impl VariantPlan {
             in_variants,
             out_variants: out_to_in.len(),
             out_to_in,
-            is_haploid: haploid,
+            haploidy,
         })
     }
 
@@ -341,10 +374,75 @@ impl VariantPlan {
     fn mapping(&self, out_idx: usize) -> Option<(u32, u16)> {
         self.out_to_in.get(out_idx).copied()
     }
+
+    #[inline]
+    fn haploidy(&self, out_idx: usize) -> Option<HaploidyKind> {
+        self.haploidy.get(out_idx).copied()
+    }
 }
 
 fn ioerr(msg: &str) -> PipelineError {
     PipelineError::Io(msg.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenomeBuild {
+    Grch37,
+    Grch38,
+}
+
+fn infer_genome_build(max_x_pos: u64) -> GenomeBuild {
+    const GRCH38_THRESHOLD: u64 = 155_700_000;
+    const GRCH37_THRESHOLD: u64 = 154_900_000;
+    if max_x_pos >= GRCH38_THRESHOLD {
+        GenomeBuild::Grch38
+    } else if max_x_pos >= GRCH37_THRESHOLD {
+        GenomeBuild::Grch37
+    } else {
+        GenomeBuild::Grch38
+    }
+}
+
+fn normalize_chrom(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut body = trimmed;
+    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("chr") {
+        body = &trimmed[3..];
+    }
+    let upper = body.to_ascii_uppercase();
+    match upper.as_str() {
+        "M" => "MT".to_string(),
+        _ => upper,
+    }
+}
+
+const GRCH37_X_PAR: &[(u64, u64)] = &[(60_001, 2_699_520), (154_931_044, 155_260_560)];
+const GRCH38_X_PAR: &[(u64, u64)] = &[(10_001, 2_781_479), (155_701_383, 156_030_895)];
+
+fn in_any_range(pos: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges.iter().any(|(start, end)| pos >= *start && pos <= *end)
+}
+
+fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKind {
+    match chrom {
+        "X" => {
+            let ranges = match build {
+                GenomeBuild::Grch37 => GRCH37_X_PAR,
+                GenomeBuild::Grch38 => GRCH38_X_PAR,
+            };
+            if in_any_range(pos, ranges) {
+                HaploidyKind::Diploid
+            } else {
+                HaploidyKind::HaploidMales
+            }
+        }
+        "Y" => HaploidyKind::HaploidMalesFemalesMissing,
+        "MT" => HaploidyKind::HaploidAll,
+        _ => HaploidyKind::Diploid,
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -418,7 +516,7 @@ impl TextSource for VirtualBim {
                 Some(bytes) => {
                     let s = str::from_utf8(bytes)
                         .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .pvar: {e}")))?;
-                    if s.starts_with('#') {
+                    if s.trim().starts_with('#') {
                         self.header_seen = true;
                         continue;
                     }
@@ -428,12 +526,12 @@ impl TextSource for VirtualBim {
                     if s.trim().is_empty() {
                         continue;
                     }
-                    let mut fields = s.split('\t');
+                    let mut fields = s.split_whitespace();
                     let chr = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
-                        .trim()
-                        .to_string();
+                        .trim();
+                    let chr = normalize_chrom(chr);
                     let pos = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing POS"))?
@@ -451,13 +549,12 @@ impl TextSource for VirtualBim {
                         .to_string();
                     let alt = fields
                         .next()
-                        .ok_or_else(|| ioerr(".pvar missing ALT"))?
-                        .trim();
+                        .ok_or_else(|| ioerr(".pvar missing ALT"))?;
 
                     self.current_alts.clear();
                     for a in alt.split(',') {
                         let a = a.trim();
-                        if !a.is_empty() {
+                        if !a.is_empty() && a != "." {
                             self.current_alts.push(a.to_string());
                         }
                     }
@@ -585,7 +682,9 @@ fn fam_map_line(s: &str, idx: &PsamColumns) -> Result<String, PipelineError> {
     let pat = get(idx.pat_idx).unwrap_or("0");
     let mat = get(idx.mat_idx).unwrap_or("0");
     let sex = get(idx.sex_idx).unwrap_or("0"); // 0=unknown, 1=male, 2=female
-    let phe = get(idx.pheno_idx).unwrap_or("-9"); // -9 missing
+    let phe = get(idx.pheno1_idx)
+        .or_else(|| get(idx.pheno_idx))
+        .unwrap_or("-9");
 
     Ok(format!("{fid}\t{iid}\t{pat}\t{mat}\t{sex}\t{phe}"))
 }
@@ -663,11 +762,36 @@ impl VirtualBed {
     }
 }
 
-fn enforce_haploidy(hardcalls: &mut [u8], sex_by_sample: &[u8]) {
-    let n = hardcalls.len().min(sex_by_sample.len());
-    for i in 0..n {
-        if sex_by_sample[i] == 1 && hardcalls[i] == 1 {
-            hardcalls[i] = 255;
+fn enforce_haploidy(hardcalls: &mut [u8], sex_by_sample: &[u8], kind: HaploidyKind) {
+    match kind {
+        HaploidyKind::Diploid => {}
+        HaploidyKind::HaploidAll => {
+            for val in hardcalls.iter_mut() {
+                if *val == 1 {
+                    *val = 255;
+                }
+            }
+        }
+        HaploidyKind::HaploidMales => {
+            let n = hardcalls.len().min(sex_by_sample.len());
+            for i in 0..n {
+                if sex_by_sample[i] == 1 && hardcalls[i] == 1 {
+                    hardcalls[i] = 255;
+                }
+            }
+        }
+        HaploidyKind::HaploidMalesFemalesMissing => {
+            let n = hardcalls.len().min(sex_by_sample.len());
+            for i in 0..n {
+                let sex = sex_by_sample[i];
+                if sex == 2 {
+                    hardcalls[i] = 255;
+                    continue;
+                }
+                if hardcalls[i] == 1 {
+                    hardcalls[i] = 255;
+                }
+            }
         }
     }
 }
@@ -739,13 +863,10 @@ impl ByteRangeSource for VirtualBed {
                 let mut hard = vec![255u8; self.n_samples]; // 255 = missing
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard)?;
 
-                if *self
-                    .plan
-                    .is_haploid
-                    .get(out_idx)
-                    .unwrap_or(&false)
-                {
-                    enforce_haploidy(&mut hard, &self.sex_by_sample);
+                if let Some(kind) = self.plan.haploidy(out_idx) {
+                    if !matches!(kind, HaploidyKind::Diploid) {
+                        enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
+                    }
                 }
 
                 // Pack to bytes and store in cache.
