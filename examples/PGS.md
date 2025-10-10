@@ -72,3 +72,14 @@ Here's one example:
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/bbe62bb4-6f93-4953-b441-c31ef1859804" />
 
 This is not too bad given that we are using microarray data.
+
+Now let's check the correlation matrix of the scores. We expect moderate correlations.
+
+```
+import pandas as pd, matplotlib.pyplot as plt
+c=pd.read_csv('../../arrays.sscore',sep='\t').filter(regex='_AVG$').corr()
+plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); plt.xticks(range(len(c)),c.columns,rotation=90); plt.yticks(range(len(c)),c.columns); plt.tight_layout(); plt.show()
+```
+
+<img width="390" height="379" alt="image" src="https://github.com/user-attachments/assets/96f101be-c18f-494f-bdd6-4550364c6644" />
+
