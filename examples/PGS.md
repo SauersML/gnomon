@@ -71,4 +71,4 @@ Here's one example:
 
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/bbe62bb4-6f93-4953-b441-c31ef1859804" />
 
-This is not to bad given that we are using microarray data.
+This is not too bad given that we are using microarray data.
