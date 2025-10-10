@@ -1484,10 +1484,26 @@ impl PrefetchState {
         guard.attached = 1;
         guard.head = 0;
         guard.len = 0;
+        drop(guard);
+        self.space_available.notify_all();
         Ok(PrefetchTap {
             state: Arc::clone(self),
             active: true,
         })
+    }
+
+    fn wait_for_first_attachment(&self) -> io::Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        while guard.attached == 0 && !guard.shutting_down {
+            guard = self.space_available.wait(guard).unwrap();
+        }
+        if guard.shutting_down {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "spool shutting down",
+            ));
+        }
+        Ok(())
     }
 
     fn detach(&self) {
@@ -1644,6 +1660,12 @@ fn run_spool_thread(
     let mut writer = BufWriter::new(File::create(&temp_path)?);
     let mut buffer = vec![0u8; PREFETCH_CHUNK_SIZE];
 
+    if let Err(err) = state.wait_for_first_attachment() {
+        state.record_error(err.kind(), err.to_string());
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
     let result: io::Result<()> = (|| {
         loop {
             let read = source.read(&mut buffer)?;
@@ -1727,6 +1749,10 @@ impl VcfLikeVariantBlockSource {
         VariantIoError,
     > {
         let path = self.parts[idx].clone();
+        if is_http_path(&path) {
+            return create_variant_reader_for_file(&path);
+        }
+
         if is_remote_path(&path) {
             if self.spool_entries.len() <= idx {
                 self.spool_entries.resize(idx + 1, None);
@@ -2532,6 +2558,12 @@ fn count_bim_records(path: &Path) -> Result<usize, PlinkIoError> {
 fn is_remote_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("gs://") || s.starts_with("http://") || s.starts_with("https://"))
+        .unwrap_or(false)
+}
+
+fn is_http_path(path: &Path) -> bool {
+    path.to_str()
+        .map(|s| s.starts_with("http://") || s.starts_with("https://"))
         .unwrap_or(false)
 }
 
