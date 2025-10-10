@@ -511,30 +511,6 @@ impl VariantBlockSource for DatasetBlockSource {
             Self::Variants(source) => source.progress_bytes(),
         }
     }
-
-    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
-        if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
-            return None;
-        }
-        if self.metrics_per_part.is_empty() {
-            return None;
-        }
-        let mut total_read = 0u64;
-        let mut aggregated_total = Some(0u64);
-        for metrics in &self.metrics_per_part {
-            let (read, total) = metrics.snapshot();
-            total_read = total_read.saturating_add(read);
-            match (aggregated_total, total) {
-                (Some(acc), Some(value)) => {
-                    aggregated_total = Some(acc.saturating_add(value));
-                }
-                _ => {
-                    aggregated_total = None;
-                }
-            }
-        }
-        Some((total_read, aggregated_total))
-    }
 }
 
 impl DatasetBlockSource {
@@ -1284,7 +1260,7 @@ impl VcfLikeVariantBlockSource {
             return Ok(root.clone());
         }
 
-        let mut root = std::env::temp_dir();
+        let mut root = env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1296,7 +1272,7 @@ impl VcfLikeVariantBlockSource {
     }
 
     fn spool_part(&mut self, idx: usize) -> Result<SpoolEntry, VariantIoError> {
-        let path = &self.parts[idx];
+        let path = self.parts[idx].clone();
         let root = self.ensure_spool_root().map_err(VariantIoError::Io)?;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1307,7 +1283,7 @@ impl VcfLikeVariantBlockSource {
             spool_path.set_extension(ext);
         }
 
-        let mut source = open_variant_source(path).map_err(VariantIoError::from)?;
+        let mut source = open_variant_source(&path).map_err(VariantIoError::from)?;
         let mut file = File::create(&spool_path).map_err(VariantIoError::Io)?;
         if let Err(err) = io::copy(&mut source, &mut file) {
             let _ = fs::remove_file(&spool_path);
@@ -1332,8 +1308,8 @@ impl VcfLikeVariantBlockSource {
         ),
         VariantIoError,
     > {
-        let path = &self.parts[idx];
-        if is_remote_path(path) {
+        let path = self.parts[idx].clone();
+        if is_remote_path(&path) {
             if self.spool_entries.len() <= idx {
                 self.spool_entries.resize(idx + 1, None);
             }
@@ -1354,7 +1330,7 @@ impl VcfLikeVariantBlockSource {
             self.spool_entries.resize(idx + 1, None);
         }
 
-        create_variant_reader_for_file(path)
+        create_variant_reader_for_file(&path)
     }
 
     fn new(
@@ -1552,10 +1528,11 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
             return Ok(0);
         }
 
-        let filled = match &self.selection_plan {
+        let selection_plan = self.selection_plan.clone();
+        let filled = match selection_plan {
             SelectionPlan::All => self.next_block_all(max_variants, storage)?,
             SelectionPlan::ByIndices(indices) => {
-                self.next_block_indices(indices, max_variants, storage)?
+                self.next_block_indices(&indices, max_variants, storage)?
             }
             SelectionPlan::ByKeys(filter) => {
                 self.next_block_keys(filter.as_ref(), max_variants, storage)?
@@ -1567,6 +1544,36 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         }
 
         Ok(filled)
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        VcfLikeVariantBlockSource::progress_bytes(self)
+    }
+}
+
+impl VcfLikeVariantBlockSource {
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            return None;
+        }
+        if self.metrics_per_part.is_empty() {
+            return None;
+        }
+        let mut total_read = 0u64;
+        let mut aggregated_total = Some(0u64);
+        for metrics in &self.metrics_per_part {
+            let (read, total) = metrics.snapshot();
+            total_read = total_read.saturating_add(read);
+            match (aggregated_total, total) {
+                (Some(acc), Some(value)) => {
+                    aggregated_total = Some(acc.saturating_add(value));
+                }
+                _ => {
+                    aggregated_total = None;
+                }
+            }
+        }
+        Some((total_read, aggregated_total))
     }
 
     fn next_block_all(

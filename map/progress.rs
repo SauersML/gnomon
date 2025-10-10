@@ -1,5 +1,4 @@
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
@@ -207,10 +206,14 @@ impl ManagedStageBar {
     }
 
     fn set_estimate(&mut self, estimated_total: usize) {
-        if let StageBarMode::Spinner { approximate } = &mut self.mode {
-            *approximate = Some(estimated_total as u64);
-            self.refresh_spinner_message(*approximate);
-        }
+        let new_value = match &mut self.mode {
+            StageBarMode::Spinner { approximate } => {
+                *approximate = Some(estimated_total as u64);
+                *approximate
+            }
+            StageBarMode::Determinate { .. } => return,
+        };
+        self.refresh_spinner_message(new_value);
     }
 
     fn refresh_spinner_message(&self, approximate: Option<u64>) {

@@ -826,18 +826,6 @@ where
         unsafe { *self.observed_variants.get() }
     }
 
-    fn effective_n_variants(&self) -> usize {
-        self.observed_n_variants()
-            .or_else(|| {
-                if self.n_variants_hint > 0 {
-                    Some(self.n_variants_hint)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0)
-    }
-
     fn stats_computed(&self) -> bool {
         unsafe { (*self.stats.get()).is_finalized() }
     }
