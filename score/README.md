@@ -19,6 +19,11 @@ Or use a score from PGS catalog:
 ./gnomon/target/release/gnomon score --score "PGS003725" arrays
 ```
 
+Or stream the data:
+```
+./gnomon/target/release/gnomon score --score "PGS003725" gs://fc-aou-datasets-controlled/v8/microarray/plink/*
+```
+
 Optionally, use a keep file:
 ```
 awk '{print $2}' arrays.fam | head -n 256 > keep.txt
