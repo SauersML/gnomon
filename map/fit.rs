@@ -1030,13 +1030,7 @@ where
 
         let stats_ready = self.stats_computed();
         let mut observed = unsafe { *self.observed_variants.get() };
-        let to_usize = |value: u64| -> usize {
-            if value > usize::MAX as u64 {
-                usize::MAX
-            } else {
-                value as usize
-            }
-        };
+        let mut used_byte_progress = false;
 
         loop {
             let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
@@ -1092,10 +1086,8 @@ where
             if !stats_ready {
                 if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
                     if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                        if let Some(total) = total_bytes {
-                            handle.set_total(to_usize(total));
-                        }
-                        handle.advance(to_usize(bytes_read));
+                        used_byte_progress = true;
+                        handle.advance_bytes(bytes_read, total_bytes);
                     } else {
                         handle.advance(processed);
                     }
@@ -1122,7 +1114,9 @@ where
 
         if !stats_ready {
             if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
-                handle.set_total(processed);
+                if !used_byte_progress {
+                    handle.set_total(processed);
+                }
             }
             self.mark_stats_computed();
         }
@@ -1415,13 +1409,7 @@ where
 
     let mut processed = 0usize;
     let mut observed = operator.observed_n_variants();
-    let to_usize = |value: u64| -> usize {
-        if value > usize::MAX as u64 {
-            usize::MAX
-        } else {
-            value as usize
-        }
-    };
+    let mut used_byte_progress = false;
 
     loop {
         let filled = source
@@ -1469,10 +1457,8 @@ where
 
         if let Some(handle) = progress {
             if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                if let Some(total) = total_bytes {
-                    handle.set_total(to_usize(total));
-                }
-                handle.advance(to_usize(bytes_read));
+                used_byte_progress = true;
+                handle.advance_bytes(bytes_read, total_bytes);
             } else {
                 handle.advance(processed);
             }
@@ -1497,7 +1483,9 @@ where
             *operator.observed_variants.get() = observed;
         }
         if let Some(handle) = progress {
-            handle.set_total(processed);
+            if !used_byte_progress {
+                handle.set_total(processed);
+            }
         }
     }
 

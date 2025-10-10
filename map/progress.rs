@@ -1,4 +1,4 @@
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
@@ -48,6 +48,14 @@ pub trait FitProgressObserver: Send + Sync {
     fn on_stage_finish(&self, stage: FitProgressStage) {
         let _ = stage;
     }
+    fn on_stage_bytes(
+        &self,
+        stage: FitProgressStage,
+        processed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) {
+        let _ = (stage, processed_bytes, total_bytes);
+    }
 }
 
 #[derive(Default)]
@@ -87,6 +95,11 @@ where
 
     pub fn set_total(&self, total_variants: usize) {
         self.observer.on_stage_total(self.stage, total_variants);
+    }
+
+    pub fn advance_bytes(&self, processed_bytes: u64, total_bytes: Option<u64>) {
+        self.observer
+            .on_stage_bytes(self.stage, processed_bytes, total_bytes);
     }
 
     pub fn finish(self) {
@@ -158,10 +171,17 @@ enum StageBarMode {
     Spinner { approximate: Option<u64> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageUnits {
+    Variants,
+    Bytes,
+}
+
 struct ManagedStageBar {
     stage: FitProgressStage,
     bar: ProgressBar,
     mode: StageBarMode,
+    units: StageUnits,
 }
 
 impl ManagedStageBar {
@@ -178,6 +198,7 @@ impl ManagedStageBar {
                 mode: StageBarMode::Determinate {
                     total: total as u64,
                 },
+                units: StageUnits::Variants,
             }
         } else {
             let bar = ProgressBar::new_spinner();
@@ -189,11 +210,13 @@ impl ManagedStageBar {
                 stage,
                 bar,
                 mode: StageBarMode::Spinner { approximate: None },
+                units: StageUnits::Variants,
             }
         }
     }
 
     fn update(&self, processed_variants: usize) {
+        debug_assert!(self.units == StageUnits::Variants);
         match &self.mode {
             StageBarMode::Determinate { total } => {
                 let capped = processed_variants.min(*total as usize) as u64;
@@ -206,6 +229,9 @@ impl ManagedStageBar {
     }
 
     fn set_estimate(&mut self, estimated_total: usize) {
+        if self.units != StageUnits::Variants {
+            return;
+        }
         let new_value = match &mut self.mode {
             StageBarMode::Spinner { approximate } => {
                 *approximate = Some(estimated_total as u64);
@@ -217,6 +243,9 @@ impl ManagedStageBar {
     }
 
     fn refresh_spinner_message(&self, approximate: Option<u64>) {
+        if self.units != StageUnits::Variants {
+            return;
+        }
         let base_message = ConsoleFitProgress::stage_message(self.stage);
         if let Some(approx) = approximate {
             self.bar
@@ -239,6 +268,55 @@ impl ManagedStageBar {
         self.bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
         self.bar.set_position(current);
         self.mode = StageBarMode::Determinate { total };
+        self.units = StageUnits::Variants;
+    }
+
+    fn update_bytes(&mut self, processed_bytes: u64, total_bytes: Option<u64>) {
+        self.units = StageUnits::Bytes;
+
+        match (total_bytes, &mut self.mode) {
+            (Some(total), StageBarMode::Determinate { total: existing }) => {
+                if *existing != total {
+                    self.bar.set_length(total);
+                    *existing = total;
+                }
+                self.bar.set_style(determinate_style());
+            }
+            (Some(total), _) => {
+                self.bar.set_style(determinate_style());
+                self.bar.set_length(total);
+                self.bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                self.mode = StageBarMode::Determinate { total };
+            }
+            (None, StageBarMode::Spinner { approximate }) => {
+                if approximate.is_some() {
+                    *approximate = None;
+                }
+                self.bar.set_style(spinner_style());
+            }
+            (None, _) => {
+                self.bar.set_style(spinner_style());
+                self.bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                self.mode = StageBarMode::Spinner { approximate: None };
+            }
+        }
+
+        let position = match (&self.mode, total_bytes) {
+            (StageBarMode::Determinate { total }, _) => processed_bytes.min(*total),
+            (StageBarMode::Spinner { .. }, _) => processed_bytes,
+        };
+        self.bar.set_position(position);
+
+        let base_message = ConsoleFitProgress::stage_message(self.stage);
+        let message = match total_bytes {
+            Some(total) => format!(
+                "{base_message} ({} / {} read)",
+                HumanBytes(processed_bytes),
+                HumanBytes(total)
+            ),
+            None => format!("{base_message} ({} read)", HumanBytes(processed_bytes)),
+        };
+        self.bar.set_message(message);
     }
 
     fn finish(self, message: &'static str) {
@@ -320,6 +398,23 @@ impl FitProgressObserver for ConsoleFitProgress {
         } else {
             log::warn!(
                 "received progress update for stage '{}' with no active progress bar",
+                stage
+            );
+        }
+    }
+
+    fn on_stage_bytes(
+        &self,
+        stage: FitProgressStage,
+        processed_bytes: u64,
+        total_bytes: Option<u64>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(bar) = inner.get_mut(&stage) {
+            bar.update_bytes(processed_bytes, total_bytes);
+        } else {
+            log::warn!(
+                "received byte progress update for stage '{}' with no active progress bar",
                 stage
             );
         }
