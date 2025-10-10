@@ -344,3 +344,53 @@ cases=bq.Client().query(
 
 PGS003852 has an accuracy by itself of 0.619311 for this new case definition, while the multi-PGS + covariates model has a cross-validated AUC of 0.648.
 
+Let's plot risk in each decline of the multivariate model.
+```
+import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import roc_auc_score
+
+d=pd.read_csv('../../arrays.sscore',sep='\t').set_index('#IID'); d.index=d.index.astype(str)
+pgs=[c for c in d.columns if c.endswith('_AVG') and c!='PGS004303_AVG']
+
+if 'covars' not in globals():
+    NUM_PCS=16; pc_cols=[f"PC{i}" for i in range(1,NUM_PCS+1)]
+    so={"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
+    pcs=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",sep="\t",storage_options=so,usecols=["research_id","pca_features"])
+    parse=lambda s,k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")]+[np.nan]*k)[:k]
+    pc_df=pd.DataFrame(pcs["pca_features"].apply(parse).to_list(),columns=pc_cols).assign(person_id=pcs["research_id"].astype(str)).set_index("person_id")
+    sex=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",sep="\t",storage_options=so,usecols=["research_id","dragen_sex_ploidy"])
+    sex_df=sex.assign(person_id=sex["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"].map({"XX":0,"XY":1}).to_frame("sex").dropna()
+    covars=pc_df.join(sex_df,how="inner").filter(pc_cols+["sex"]).dropna()
+covars=covars.copy(); covars.index=covars.index.astype(str)
+
+if 'cases' not in globals(): raise NameError("Variable 'cases' not found.")
+case_set=set(pd.Series(cases,dtype=str))
+
+Xy=covars.join(d[pgs],how="inner").dropna()
+y=Xy.index.to_series().isin(case_set).astype('i1').to_numpy()
+X=Xy.to_numpy()
+
+cv=StratifiedKFold(n_splits=15,shuffle=True,random_state=42)
+mdl=make_pipeline(StandardScaler(),LogisticRegression(solver="lbfgs",max_iter=1000))
+p=cross_val_predict(mdl,X,y,cv=cv,method="predict_proba")[:,1]
+auc=roc_auc_score(y,p)
+print(pd.DataFrame([{"n":int(len(y)),"cases":int(y.sum()),"controls":int(len(y)-y.sum()),"predictors":X.shape[1],"AUROC":float(auc)}]).to_string(index=False))
+
+dec=pd.qcut(p,10,labels=False,duplicates='drop')+1
+g=pd.DataFrame({"decile":dec,"y":y,"p":p}).groupby("decile").agg(n=("y","size"),cases=("y","sum"),obs_risk=("y","mean"),pred_risk=("p","mean")).reset_index()
+print(g[["decile","n","cases","obs_risk","pred_risk"]].to_string(index=False,float_format=lambda x:f"{x:.4f}"))
+
+plt.figure(figsize=(7,4.5))
+plt.bar(g["decile"],g["obs_risk"],width=0.9,label="Observed",color="#4C78A8")
+plt.plot(g["decile"],g["pred_risk"],marker="o",linewidth=2,label="Predicted",color="#F58518")
+plt.xlabel("Risk decile (low → high)"); plt.ylabel("Event rate"); plt.title("Decile risk: observed vs predicted")
+plt.xticks(g["decile"]); plt.legend(); plt.tight_layout(); plt.show()
+```
+
+<img width="690" height="440" alt="image" src="https://github.com/user-attachments/assets/d5e0e3ac-2028-4553-be52-5cc328ef6b94" />
+
+
