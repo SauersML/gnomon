@@ -6,15 +6,21 @@
 //!   - `.bim` / `.fam` → `TextSource` (pull-based line iterator)
 //!
 //! ## Fixed semantics (“best options”, no knobs)
-//! - **Multiallelic**: always **split** every ALT; never drop.
+//! - **Multiallelic**: always **split** every ALT; never drop. Variant
+//!   order in the virtual outputs matches `.pvar`, expanded in **ALT
+//!   order** and with multiallelics deterministically split.
 //! - **Allele orientation**: **A1 = ALT**, **A2 = REF** (per split ALT).
+//!   The virtual `.bim` follows the PLINK 1.9 contract with `cM = 0` and
+//!   synthesised IDs when needed.
 //! - **Genotype basis**: prefer hard-calls; otherwise **hard-call from
 //!   dosage** using **nearest-integer with ±0.10 tolerance**, else
 //!   **missing**.
-//! - **Ploidy**: autosomes+PAR diploid; obvious haploid regions coerced;
-//!   heterozygotes in haploid contexts become **missing**.
-//! - **Variant order**: preserve `.pvar` input order; expand multi-ALT
-//!   rows in **ALT order**.
+//! - **Ploidy**: autosomes+PAR diploid; `X` (non-PAR), `Y`, and `MT`
+//!   treated as haploid for males. Heterozygotes in these contexts are
+//!   coerced to **missing** before PLINK 1.9 packing.
+//! - **.bed encoding**: exact PLINK 1.9 2-bit codes (`00`=hom ALT, `01`
+//!   missing, `10` het, `11` hom REF; least-significant bit first within
+//!   each byte).
 //! - **Split IDs**: if `ID != "."` → `ID__ALT=<ALT>`; else
 //!   `CHR:POS:REF:ALT`.
 
@@ -89,8 +95,20 @@ pub fn open_virtual_plink19_from_sources(
     // 3) Construct PGEN decoder (pure-Rust subset; extend as needed).
     let pgen_decoder = PgenDecoder::new(pgen.clone(), psam_info.n_samples, plan.in_variants)?;
 
+    let sex_by_sample_arc: Arc<[u8]> = Arc::from(
+        psam_info
+            .sex_by_sample
+            .clone()
+            .into_boxed_slice(),
+    );
+
     // 4) Publish virtual streams
-    let bed = Arc::new(VirtualBed::new(pgen_decoder, plan.clone(), psam_info.n_samples));
+    let bed = Arc::new(VirtualBed::new(
+        pgen_decoder,
+        plan.clone(),
+        psam_info.n_samples,
+        sex_by_sample_arc,
+    ));
 
     // Re-open the text sidecars for streaming transforms (we consumed the planning pass).
     let bim: Box<dyn TextSource> = match pvar_path_hint {
@@ -112,7 +130,8 @@ pub fn open_virtual_plink19_from_sources(
 #[derive(Clone)]
 struct PsamInfo {
     n_samples: usize,
-    _columns: PsamColumns, // available for future ploidy/sex handling
+    columns: PsamColumns,
+    sex_by_sample: Vec<u8>,
 }
 
 #[derive(Clone, Default)]
@@ -128,42 +147,69 @@ struct PsamColumns {
 impl PsamInfo {
     fn from_psam(source: &mut dyn TextSource) -> Result<Self, PipelineError> {
         // `.psam` may have multiple header lines; only the **final** header line
-        // begins with `#FID` or `#IID`. We scan until we see such a line,
-        // then count rows.
+        // begins with `#FID` or `#IID`. We track the last header encountered and
+        // parse rows as we stream them to capture per-sample sex information.
         let mut header: Option<Vec<String>> = None;
-
-        // We’ll stash the first data line (if we encounter it) to count properly.
-        let mut first_data_seen = false;
+        let mut cols_cache: Option<PsamColumns> = None;
+        let mut sex_by_sample: Vec<u8> = Vec::new();
 
         while let Some(line) = source.next_line()? {
             let s = str::from_utf8(line)
-                .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam header: {e}")))?;
+                .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam: {e}")))?;
             if s.starts_with('#') {
                 let cols = s.trim_start_matches('#').trim();
                 if !cols.is_empty() {
                     header = Some(cols.split_whitespace().map(|t| t.to_string()).collect());
+                    cols_cache = None; // reset; only the final header counts
                 }
                 continue;
-            } else {
-                // first data line consumed; we've stepped one line into data
-                first_data_seen = true;
-                break;
             }
+
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let header_vec = header
+                .as_ref()
+                .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
+            if cols_cache.is_none() {
+                cols_cache = Some(PsamColumns::from_header(header_vec)?);
+            }
+            let cols = cols_cache.as_ref().unwrap();
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            let sex_code = cols
+                .sex_idx
+                .and_then(|idx| fields.get(idx).copied())
+                .map(parse_sex_token)
+                .unwrap_or(0);
+            sex_by_sample.push(sex_code);
         }
 
-        let header =
-            header.ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
-        let cols = PsamColumns::from_header(&header)?;
-
-        let mut n = if first_data_seen { 1 } else { 0 };
-        while let Some(_line) = source.next_line()? {
-            n += 1;
-        }
+        let header_vec = header
+            .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
+        let columns = if let Some(cached) = cols_cache {
+            cached
+        } else {
+            PsamColumns::from_header(&header_vec)?
+        };
 
         Ok(Self {
-            n_samples: n,
-            _columns: cols,
+            n_samples: sex_by_sample.len(),
+            columns,
+            sex_by_sample,
         })
+    }
+}
+
+fn parse_sex_token(token: &str) -> u8 {
+    match token.trim() {
+        "1" => 1,
+        "2" => 2,
+        "M" | "m" => 1,
+        "F" | "f" => 2,
+        "0" | "NA" | "na" | "Na" | "nA" | "." => 0,
+        _ => 0,
     }
 }
 
@@ -204,11 +250,14 @@ struct VariantPlan {
     out_variants: usize,
     /// Dense mapping: out_idx → (in_idx, alt_ordinal_1based).
     out_to_in: Vec<(u32, u16)>,
+    /// Per-output variant haploidy flag (true if haploid for male samples).
+    is_haploid: Vec<bool>,
 }
 
 impl VariantPlan {
     fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
+        let mut haploid: Vec<bool> = Vec::with_capacity(1 << 20);
         let mut have_header = false;
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
@@ -232,18 +281,42 @@ impl VariantPlan {
                 continue;
             }
             let mut fields = s.split('\t');
-            let _chrom = fields.next().ok_or_else(|| ioerr(".pvar missing #CHROM"))?;
-            let _pos = fields.next().ok_or_else(|| ioerr(".pvar missing POS"))?;
-            let _id = fields.next().ok_or_else(|| ioerr(".pvar missing ID"))?;
-            let _refa = fields.next().ok_or_else(|| ioerr(".pvar missing REF"))?;
-            let alt = fields.next().ok_or_else(|| ioerr(".pvar missing ALT"))?;
+            let chrom = fields
+                .next()
+                .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
+                .trim();
+            let _pos = fields
+                .next()
+                .ok_or_else(|| ioerr(".pvar missing POS"))?
+                .trim();
+            let _id = fields
+                .next()
+                .ok_or_else(|| ioerr(".pvar missing ID"))?
+                .trim();
+            let _refa = fields
+                .next()
+                .ok_or_else(|| ioerr(".pvar missing REF"))?
+                .trim();
+            let alt = fields
+                .next()
+                .ok_or_else(|| ioerr(".pvar missing ALT"))?
+                .trim();
+
+            let chrom_upper = chrom.to_ascii_uppercase();
+            let is_haploid_variant = match chrom_upper.as_str() {
+                "XY" => false,
+                "X" | "Y" | "MT" => true,
+                _ => false,
+            };
 
             // ALT may be comma-separated (multi-ALT).
             let mut alt_ord: u16 = 1;
             let mut emitted_any = false;
             for a in alt.split(',') {
-                if !a.is_empty() {
+                let alt_trimmed = a.trim();
+                if !alt_trimmed.is_empty() {
                     out_to_in.push((in_idx, alt_ord));
+                    haploid.push(is_haploid_variant);
                     alt_ord += 1;
                     emitted_any = true;
                 }
@@ -262,6 +335,7 @@ impl VariantPlan {
             in_variants,
             out_variants: out_to_in.len(),
             out_to_in,
+            is_haploid: haploid,
         })
     }
 
@@ -360,25 +434,31 @@ impl TextSource for VirtualBim {
                     let chr = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
+                        .trim()
                         .to_string();
                     let pos = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing POS"))?
+                        .trim()
                         .to_string();
                     let id = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing ID"))?
+                        .trim()
                         .to_string();
                     let refa = fields
                         .next()
                         .ok_or_else(|| ioerr(".pvar missing REF"))?
+                        .trim()
                         .to_string();
                     let alt = fields
                         .next()
-                        .ok_or_else(|| ioerr(".pvar missing ALT"))?;
+                        .ok_or_else(|| ioerr(".pvar missing ALT"))?
+                        .trim();
 
                     self.current_alts.clear();
                     for a in alt.split(',') {
+                        let a = a.trim();
                         if !a.is_empty() {
                             self.current_alts.push(a.to_string());
                         }
@@ -404,7 +484,8 @@ struct VirtualFam {
     inner: Box<dyn TextSource>,
     header_cols: Option<Vec<String>>,
     header_resolved: bool,
-    carry_buf: Option<Box<[u8]>>,
+    first_row_raw: Option<Box<[u8]>>,
+    pending_line: Option<Box<[u8]>>,
 }
 
 impl VirtualFam {
@@ -414,7 +495,8 @@ impl VirtualFam {
             inner,
             header_cols: None,
             header_resolved: false,
-            carry_buf: None,
+            first_row_raw: None,
+            pending_line: None,
         })
     }
 
@@ -442,7 +524,7 @@ impl VirtualFam {
                         self.header_cols = last_header;
                         self.header_resolved = true;
                         let carry = bytes.to_vec().into_boxed_slice();
-                        self.carry_buf = Some(carry);
+                        self.first_row_raw = Some(carry);
                         return Ok(());
                     }
                 }
@@ -460,6 +542,7 @@ impl TextSource for VirtualFam {
     }
 
     fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+        self.pending_line = None;
         self.ensure_header()?;
         let cols = self
             .header_cols
@@ -468,13 +551,13 @@ impl TextSource for VirtualFam {
         let idx = PsamColumns::from_header(&cols)?;
 
         // If we stashed a first data row during header parsing, consume it now.
-        if let Some(carry) = self.carry_buf.take() {
-            let s = String::from_utf8(carry.to_vec())
+        if let Some(raw) = self.first_row_raw.take() {
+            let vec = raw.into_vec();
+            let s = String::from_utf8(vec)
                 .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam row: {e}")))?;
             let line = fam_map_line(&s, &idx)?;
-            let buf = line.into_bytes().into_boxed_slice();
-            self.carry_buf = Some(buf);
-            return Ok(self.carry_buf.as_deref());
+            self.pending_line = Some(line.into_bytes().into_boxed_slice());
+            return Ok(self.pending_line.as_deref());
         }
 
         // Stream rows: map to FID IID PAT MAT SEX PHENO, with defaults.
@@ -488,8 +571,8 @@ impl TextSource for VirtualFam {
                     return self.next_line();
                 }
                 let line = fam_map_line(s, &idx)?;
-                self.carry_buf = Some(line.into_bytes().into_boxed_slice());
-                Ok(self.carry_buf.as_deref())
+                self.pending_line = Some(line.into_bytes().into_boxed_slice());
+                Ok(self.pending_line.as_deref())
             }
         }
     }
@@ -525,17 +608,25 @@ struct VirtualBed {
     block_bytes: usize, // ceil(n_samples / 4)
     // small LRU of packed blocks by out-variant index
     cache: Arc<Mutex<BlockCache>>,
+    sex_by_sample: Arc<[u8]>,
 }
 
 impl VirtualBed {
-    fn new(decoder: PgenDecoder, plan: VariantPlan, n_samples: usize) -> Self {
+    fn new(
+        decoder: PgenDecoder,
+        plan: VariantPlan,
+        n_samples: usize,
+        sex_by_sample: Arc<[u8]>,
+    ) -> Self {
         let block_bytes = (n_samples + 3) / 4;
+        debug_assert_eq!(sex_by_sample.len(), n_samples);
         Self {
             inner: Arc::new(Mutex::new(decoder)),
             plan,
             n_samples,
             block_bytes,
-            cache: Arc::new(Mutex::new(BlockCache::new(64))), // tiny cache
+            cache: Arc::new(Mutex::new(BlockCache::new(256))),
+            sex_by_sample,
         }
     }
 
@@ -546,9 +637,9 @@ impl VirtualBed {
 
     /// Pack 0/1/2/255 hard-calls (A1 dosage) into PLINK 1.9 2-bit codes.
     /// Codes (LSB-first per 2-bit field):
-    ///   00 hom-A1 (A1 dosage 0)
+    ///   00 hom-A1 (A1 dosage 2)
     ///   10 het     (A1 dosage 1)
-    ///   11 hom-A2 (A1 dosage 2)
+    ///   11 hom-A2 (A1 dosage 0)
     ///   01 missing
     fn pack_to_block(dst: &mut [u8], hardcalls: &[u8]) {
         debug_assert_eq!(dst.len(), (hardcalls.len() + 3) / 4);
@@ -559,9 +650,9 @@ impl VirtualBed {
                 let idx = base + j;
                 let code = if idx < hardcalls.len() {
                     match hardcalls[idx] {
-                        0 => 0b00,
+                        2 => 0b00,
                         1 => 0b10,
-                        2 => 0b11,
+                        0 => 0b11,
                         _ => 0b01, // 255 or anything else → missing
                     }
                 } else {
@@ -570,6 +661,15 @@ impl VirtualBed {
                 byte |= code << (2 * j);
             }
             dst[chunk_i] = byte;
+        }
+    }
+}
+
+fn enforce_haploidy(hardcalls: &mut [u8], sex_by_sample: &[u8]) {
+    let n = hardcalls.len().min(sex_by_sample.len());
+    for i in 0..n {
+        if sex_by_sample[i] == 1 && hardcalls[i] == 1 {
+            hardcalls[i] = 255;
         }
     }
 }
@@ -640,6 +740,15 @@ impl ByteRangeSource for VirtualBed {
                     .ok_or_else(|| ioerr("VariantPlan mapping out of bounds"))?;
                 let mut hard = vec![255u8; self.n_samples]; // 255 = missing
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard)?;
+
+                if *self
+                    .plan
+                    .is_haploid
+                    .get(out_idx)
+                    .unwrap_or(&false)
+                {
+                    enforce_haploidy(&mut hard, &self.sex_by_sample);
+                }
 
                 // Pack to bytes and store in cache.
                 let mut block = vec![0u8; self.block_bytes];
@@ -944,9 +1053,9 @@ impl PgenDecoder {
 
 fn unpack_2bit_block_to_hardcalls(block: &[u8], dst: &mut [u8], n: usize) {
     // 2-bit codes (LSB-first per field):
-    // 00 -> 0
+    // 00 -> 2
     // 10 -> 1
-    // 11 -> 2
+    // 11 -> 0
     // 01 -> 255 (missing)
     let mut i = 0usize;
     for byte in block {
@@ -957,9 +1066,9 @@ fn unpack_2bit_block_to_hardcalls(block: &[u8], dst: &mut [u8], n: usize) {
             }
             let code = (b >> (2 * j)) & 0b11;
             dst[i] = match code {
-                0b00 => 0,
+                0b00 => 2,
                 0b10 => 1,
-                0b11 => 2,
+                0b11 => 0,
                 _ => 255,
             };
             i += 1;
@@ -1009,10 +1118,10 @@ mod tests {
         let hard = [0u8, 1, 2, 255, 0, 0, 1, 2, 255, 255];
         let mut block = vec![0u8; (hard.len() + 3) / 4];
         VirtualBed::pack_to_block(&mut block, &hard);
-        // byte0 packs samples 0..3: codes 00,10,11,01 => 0b00011001 = 0x19
-        assert_eq!(block[0], 0x19);
-        // byte1 packs 4..7: 00,00,10,11 => 0b11001000 = 0xC8
-        assert_eq!(block[1], 0xC8);
+        // byte0 packs samples 0..3: codes 11,10,00,01 => 0b01001011 = 0x4B
+        assert_eq!(block[0], 0x4B);
+        // byte1 packs 4..7: 11,11,10,00 => 0b00101111 = 0x2F
+        assert_eq!(block[1], 0x2F);
         // byte2 packs 8..9 (+ 2 missings): 01,01,01,01 => 0b01010101 = 0x55
         assert_eq!(block[2], 0x55);
 
