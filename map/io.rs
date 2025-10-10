@@ -1343,7 +1343,17 @@ impl SpoolEntry {
         if let Some(err) = self.state.error() {
             return Err(err);
         }
-        let tap = self.state.attach()?;
+        let tap = match self.state.attach() {
+            Ok(tap) => tap,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                let (reader, compression, format, metrics) =
+                    self.open_local_reader().map_err(|source_err| {
+                        io::Error::new(io::ErrorKind::Other, source_err.to_string())
+                    })?;
+                return Ok((reader, compression, format, metrics));
+            }
+            Err(err) => return Err(err),
+        };
         let reader = match self.format {
             VariantFormat::Bcf => {
                 let reader: Box<dyn Read + Send> = match self.compression {
@@ -1484,10 +1494,36 @@ impl PrefetchState {
         guard.attached = 1;
         guard.head = 0;
         guard.len = 0;
+        self.space_available.notify_all();
+        drop(guard);
         Ok(PrefetchTap {
             state: Arc::clone(self),
             active: true,
         })
+    }
+
+    fn wait_for_first_attachment(&self) -> io::Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        while guard.attached == 0 && guard.error.is_none() && !guard.done && !guard.shutting_down {
+            guard = self.space_available.wait(guard).unwrap();
+        }
+        if let Some((kind, message)) = guard.error.clone() {
+            return Err(io::Error::new(kind, message));
+        }
+        if guard.shutting_down {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "spool shutting down",
+            ));
+        }
+        if guard.attached == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "spool already complete",
+            ));
+        }
+        drop(guard);
+        Ok(())
     }
 
     fn detach(&self) {
@@ -1643,6 +1679,8 @@ fn run_spool_thread(
 ) -> io::Result<()> {
     let mut writer = BufWriter::new(File::create(&temp_path)?);
     let mut buffer = vec![0u8; PREFETCH_CHUNK_SIZE];
+
+    state.wait_for_first_attachment()?;
 
     let result: io::Result<()> = (|| {
         loop {
