@@ -1341,8 +1341,19 @@ struct HttpByteRangeSource {
 
 impl HttpByteRangeSource {
     fn new(url: &str) -> Result<Self, PipelineError> {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+
         let client = Client::builder()
             .user_agent(HTTP_USER_AGENT)
+            .brotli(false)
+            .gzip(false)
+            .deflate(false)
+            .zstd(false)
+            .default_headers(default_headers)
             .build()
             .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))?;
         let len = Self::fetch_length(&client, url)?;
