@@ -7,7 +7,9 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::map::fit::{HwePcaModel, VariantBlockSource};
@@ -15,8 +17,8 @@ use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
-    BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, list_variant_paths,
-    open_bed_source, open_text_source, open_variant_source,
+    BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
+    list_variant_paths, open_bed_source, open_text_source, open_variant_source,
 };
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
@@ -1241,14 +1243,433 @@ pub struct VcfLikeVariantBlockSource {
     metrics_per_part: Vec<Arc<ReadMetrics>>,
     emitted: usize,
     processed: usize,
-    spool_entries: Vec<Option<SpoolEntry>>,
+    spool_entries: Vec<Option<Arc<SpoolEntry>>>,
     spool_root: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
 struct SpoolEntry {
-    path: PathBuf,
-    complete: bool,
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    compression: VariantCompression,
+    format: VariantFormat,
+    metrics: Arc<ReadMetrics>,
+    completion: Arc<AtomicBool>,
+    state: Arc<PrefetchState>,
+    handle: Mutex<Option<thread::JoinHandle<io::Result<()>>>>,
+}
+
+impl SpoolEntry {
+    fn spawn(
+        idx: usize,
+        remote_path: &Path,
+        spool_root: &Path,
+    ) -> Result<Arc<Self>, VariantIoError> {
+        let source = open_variant_source(remote_path)?;
+        let compression = source.compression();
+        let format = source.format();
+        let metrics = source.metrics();
+        let (final_path, temp_path) = Self::paths_for(idx, remote_path, spool_root);
+        let state = Arc::new(PrefetchState::new(PREFETCH_RING_CAPACITY));
+        let completion = Arc::new(AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_completion = Arc::clone(&completion);
+        let thread_final = final_path.clone();
+        let thread_temp = temp_path.clone();
+        let handle = thread::Builder::new()
+            .name("variant-spool".to_string())
+            .spawn(move || {
+                run_spool_thread(
+                    source,
+                    thread_temp,
+                    thread_final,
+                    thread_state,
+                    thread_completion,
+                )
+            })?;
+
+        Ok(Arc::new(Self {
+            final_path,
+            temp_path,
+            compression,
+            format,
+            metrics,
+            completion,
+            state,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+
+    fn paths_for(idx: usize, remote_path: &Path, spool_root: &Path) -> (PathBuf, PathBuf) {
+        let name = remote_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "variants".to_string());
+        let final_name = format!("part{}_{}", idx, name);
+        let final_path = spool_root.join(final_name);
+        let temp_extension = final_path
+            .extension()
+            .map(|ext| {
+                let mut ext = ext.to_os_string();
+                ext.push(".spooling");
+                ext
+            })
+            .unwrap_or_else(|| OsString::from("spooling"));
+        let temp_path = final_path.with_extension(temp_extension);
+        (final_path, temp_path)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completion.load(Ordering::Acquire)
+    }
+
+    fn error(&self) -> Option<io::Error> {
+        self.state.error()
+    }
+
+    fn attach_reader(
+        &self,
+    ) -> io::Result<(
+        VariantStreamReader,
+        VariantCompression,
+        VariantFormat,
+        Arc<ReadMetrics>,
+    )> {
+        if self.is_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "spool already complete",
+            ));
+        }
+        if let Some(err) = self.state.error() {
+            return Err(err);
+        }
+        let tap = self.state.attach()?;
+        let reader = match self.format {
+            VariantFormat::Bcf => {
+                let reader: Box<dyn Read + Send> = match self.compression {
+                    VariantCompression::Plain => Box::new(tap),
+                    VariantCompression::Bgzf => Box::new(BgzfReader::new(tap)),
+                };
+                VariantStreamReader::Bcf(BcfReader::from(reader))
+            }
+            VariantFormat::Vcf => {
+                let reader: Box<dyn BufRead + Send> = match self.compression {
+                    VariantCompression::Plain => Box::new(BufReader::new(tap)),
+                    VariantCompression::Bgzf => Box::new(BgzfReader::new(BufReader::new(tap))),
+                };
+                VariantStreamReader::Vcf(VcfReader::new(reader))
+            }
+        };
+        Ok((
+            reader,
+            self.compression,
+            self.format,
+            Arc::clone(&self.metrics),
+        ))
+    }
+
+    fn open_local_reader(
+        &self,
+    ) -> Result<
+        (
+            VariantStreamReader,
+            VariantCompression,
+            VariantFormat,
+            Arc<ReadMetrics>,
+        ),
+        VariantIoError,
+    > {
+        let file = File::open(&self.final_path)?;
+        let reader = match self.format {
+            VariantFormat::Bcf => {
+                let reader: Box<dyn Read + Send> = match self.compression {
+                    VariantCompression::Plain => Box::new(file),
+                    VariantCompression::Bgzf => Box::new(BgzfReader::new(file)),
+                };
+                VariantStreamReader::Bcf(BcfReader::from(reader))
+            }
+            VariantFormat::Vcf => {
+                let reader: Box<dyn BufRead + Send> = match self.compression {
+                    VariantCompression::Plain => Box::new(BufReader::new(file)),
+                    VariantCompression::Bgzf => Box::new(BgzfReader::new(BufReader::new(file))),
+                };
+                VariantStreamReader::Vcf(VcfReader::new(reader))
+            }
+        };
+        Ok((
+            reader,
+            self.compression,
+            self.format,
+            Arc::clone(&self.metrics),
+        ))
+    }
+
+    fn shutdown(&self) {
+        self.state.cancel();
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        if self.is_complete() {
+            return;
+        }
+        if self.error().is_some() {
+            let _ = fs::remove_file(&self.final_path);
+        }
+        let _ = fs::remove_file(&self.temp_path);
+    }
+}
+
+impl fmt::Debug for SpoolEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpoolEntry")
+            .field("final_path", &self.final_path)
+            .field("complete", &self.is_complete())
+            .finish()
+    }
+}
+
+const PREFETCH_RING_CAPACITY: usize = 16 * 1024 * 1024;
+const PREFETCH_CHUNK_SIZE: usize = 256 * 1024;
+
+struct PrefetchState {
+    inner: Mutex<PrefetchInner>,
+    data_ready: Condvar,
+    space_available: Condvar,
+}
+
+struct PrefetchInner {
+    buffer: Vec<u8>,
+    head: usize,
+    len: usize,
+    attached: usize,
+    done: bool,
+    shutting_down: bool,
+    error: Option<(io::ErrorKind, String)>,
+}
+
+impl PrefetchState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(PrefetchInner {
+                buffer: vec![0u8; capacity],
+                head: 0,
+                len: 0,
+                attached: 0,
+                done: false,
+                shutting_down: false,
+                error: None,
+            }),
+            data_ready: Condvar::new(),
+            space_available: Condvar::new(),
+        }
+    }
+
+    fn attach(self: &Arc<Self>) -> io::Result<PrefetchTap> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some((kind, message)) = guard.error.clone() {
+            return Err(io::Error::new(kind, message));
+        }
+        if guard.done {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "spool already complete",
+            ));
+        }
+        if guard.attached > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "spool already has an attached reader",
+            ));
+        }
+        guard.attached = 1;
+        guard.head = 0;
+        guard.len = 0;
+        Ok(PrefetchTap {
+            state: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn detach(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.attached > 0 {
+            guard.attached -= 1;
+        }
+        guard.head = 0;
+        guard.len = 0;
+        self.space_available.notify_all();
+        self.data_ready.notify_all();
+    }
+
+    fn push_chunk(&self, data: &[u8]) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < data.len() {
+            let mut guard = self.inner.lock().unwrap();
+            while guard.attached > 0 && guard.len == guard.buffer.len() && !guard.shutting_down {
+                guard = self.space_available.wait(guard).unwrap();
+            }
+            if guard.shutting_down {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "spool shutting down",
+                ));
+            }
+            if guard.attached == 0 {
+                guard.head = 0;
+                guard.len = 0;
+                break;
+            }
+            let capacity = guard.buffer.len();
+            let tail = (guard.head + guard.len) % capacity;
+            let available = capacity - guard.len;
+            let chunk = available.min(data.len() - offset);
+            if chunk == 0 {
+                continue;
+            }
+            let first = (capacity - tail).min(chunk);
+            guard.buffer[tail..tail + first].copy_from_slice(&data[offset..offset + first]);
+            guard.len += first;
+            offset += first;
+
+            if first < chunk {
+                let second = chunk - first;
+                guard.buffer[..second].copy_from_slice(&data[offset..offset + second]);
+                guard.len += second;
+                offset += second;
+            }
+
+            drop(guard);
+            self.data_ready.notify_all();
+        }
+        Ok(())
+    }
+
+    fn mark_done(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.done = true;
+        self.data_ready.notify_all();
+        self.space_available.notify_all();
+    }
+
+    fn record_error(&self, kind: io::ErrorKind, message: String) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.error = Some((kind, message));
+        guard.done = true;
+        self.data_ready.notify_all();
+        self.space_available.notify_all();
+    }
+
+    fn cancel(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.shutting_down = true;
+        self.data_ready.notify_all();
+        self.space_available.notify_all();
+    }
+
+    fn error(&self) -> Option<io::Error> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .error
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+}
+
+struct PrefetchTap {
+    state: Arc<PrefetchState>,
+    active: bool,
+}
+
+impl Read for PrefetchTap {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let mut guard = self.state.inner.lock().unwrap();
+            while guard.len == 0 && guard.error.is_none() && !guard.done {
+                guard = self.state.data_ready.wait(guard).unwrap();
+            }
+
+            if let Some((kind, message)) = guard.error.clone() {
+                return Err(io::Error::new(kind, message));
+            }
+
+            if guard.len == 0 {
+                if guard.done {
+                    return Ok(0);
+                }
+                continue;
+            }
+
+            let capacity = guard.buffer.len();
+            let to_read = buf.len().min(guard.len);
+            let first = (capacity - guard.head).min(to_read);
+            buf[..first].copy_from_slice(&guard.buffer[guard.head..guard.head + first]);
+            guard.head = (guard.head + first) % capacity;
+            guard.len -= first;
+
+            if first < to_read {
+                let second = to_read - first;
+                buf[first..first + second]
+                    .copy_from_slice(&guard.buffer[guard.head..guard.head + second]);
+                guard.head = (guard.head + second) % capacity;
+                guard.len -= second;
+            }
+
+            drop(guard);
+            self.state.space_available.notify_all();
+            return Ok(to_read);
+        }
+    }
+}
+
+impl Drop for PrefetchTap {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.detach();
+            self.active = false;
+        }
+    }
+}
+
+fn run_spool_thread(
+    mut source: VariantSource,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    state: Arc<PrefetchState>,
+    completion: Arc<AtomicBool>,
+) -> io::Result<()> {
+    let mut writer = BufWriter::new(File::create(&temp_path)?);
+    let mut buffer = vec![0u8; PREFETCH_CHUNK_SIZE];
+
+    let result: io::Result<()> = (|| {
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read])?;
+            state.push_chunk(&buffer[..read])?;
+        }
+        writer.flush()?;
+        fs::rename(&temp_path, &final_path)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            state.mark_done();
+            completion.store(true, Ordering::Release);
+            Ok(())
+        }
+        Err(err) => {
+            state.record_error(err.kind(), err.to_string());
+            let _ = fs::remove_file(&temp_path);
+            Err(err)
+        }
+    }
 }
 
 impl std::fmt::Debug for VcfLikeVariantBlockSource {
@@ -1287,31 +1708,10 @@ impl VcfLikeVariantBlockSource {
         Ok(root)
     }
 
-    fn spool_part(&mut self, idx: usize) -> Result<SpoolEntry, VariantIoError> {
+    fn spool_part(&mut self, idx: usize) -> Result<Arc<SpoolEntry>, VariantIoError> {
         let path = self.parts[idx].clone();
         let root = self.ensure_spool_root().map_err(VariantIoError::Io)?;
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let mut spool_path = root.join(format!("part{}_{}", idx, unique));
-        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
-            spool_path.set_file_name(format!("part{}_{}_{}", idx, unique, file_name));
-        } else if let Some(ext) = path.extension() {
-            spool_path.set_extension(ext);
-        }
-
-        let mut source = open_variant_source(&path).map_err(VariantIoError::from)?;
-        let mut file = File::create(&spool_path).map_err(VariantIoError::Io)?;
-        if let Err(err) = io::copy(&mut source, &mut file) {
-            let _ = fs::remove_file(&spool_path);
-            return Err(VariantIoError::Io(err));
-        }
-
-        Ok(SpoolEntry {
-            path: spool_path,
-            complete: true,
-        })
+        SpoolEntry::spawn(idx, &path, &root)
     }
 
     fn reader_for_part(
@@ -1333,15 +1733,28 @@ impl VcfLikeVariantBlockSource {
             }
 
             if let Some(entry) = self.spool_entries[idx].as_ref() {
-                if entry.complete {
-                    return create_variant_reader_for_file(&entry.path);
+                if entry.is_complete() {
+                    return entry.open_local_reader();
+                }
+
+                match entry.attach_reader() {
+                    Ok(result) => return Ok(result),
+                    Err(err) => {
+                        if entry.is_complete() {
+                            return entry.open_local_reader();
+                        }
+                        if let Some(source_err) = entry.error() {
+                            return Err(VariantIoError::Io(source_err));
+                        }
+                        return Err(VariantIoError::Io(err));
+                    }
                 }
             }
 
             let entry = self.spool_part(idx)?;
-            let reader = create_variant_reader_for_file(&entry.path)?;
+            let result = entry.attach_reader().map_err(VariantIoError::Io)?;
             self.spool_entries[idx] = Some(entry);
-            return Ok(reader);
+            return Ok(result);
         }
 
         if self.spool_entries.len() <= idx {
@@ -1402,11 +1815,11 @@ impl VcfLikeVariantBlockSource {
 
     fn open_part(&mut self, idx: usize) -> Result<(), VariantIoError> {
         self.part_idx = idx;
+        self.reader = None;
+        self.compression = None;
+        self.format = None;
+        self.header = None;
         if idx >= self.parts.len() {
-            self.reader = None;
-            self.compression = None;
-            self.format = None;
-            self.header = None;
             return Ok(());
         }
 
@@ -1762,13 +2175,11 @@ impl VcfLikeVariantBlockSource {
 
 impl Drop for VcfLikeVariantBlockSource {
     fn drop(&mut self) {
-        for entry in &self.spool_entries {
-            if let Some(entry) = entry {
-                let _ = fs::remove_file(&entry.path);
-            }
+        for entry in self.spool_entries.drain(..).flatten() {
+            entry.shutdown();
         }
         if let Some(root) = &self.spool_root {
-            let _ = fs::remove_dir_all(root);
+            let _ = fs::remove_dir(root);
         }
     }
 }
