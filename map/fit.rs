@@ -1244,7 +1244,11 @@ where
     let mut eigvecs = Mat::zeros(n, target);
     let mut eigvals = vec![0.0f64; target];
 
-    let scratch = partial_eigen_scratch(operator, target, par, params);
+    // The partial eigensolver can increase its working subspace dimension up to
+    // `params.max_dim` during restarts. The scratch allocator must therefore be
+    // sized for the worst-case dimension rather than the requested target, or
+    // faer's internal workspace requests will overflow the provided buffer.
+    let scratch = partial_eigen_scratch(operator, params.max_dim, par, params);
     let mut mem = MemBuffer::new(scratch);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
