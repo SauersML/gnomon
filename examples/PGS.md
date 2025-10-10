@@ -150,7 +150,7 @@ pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided
 | PGS003386_AVG | 447,278 | 3,192 |  444,086 |     1.095 | 1.63e-07 | 0.526 |    3.09e-07 |         0.07% | 3.29e-07 |
 | PGS004303_AVG | 447,278 | 3,192 |  444,086 |     1.027 |    0.070 | 0.507 |       0.096 |         0.01% |    0.141 |
 
-The GenoBoost method (PGS004303), which uses non-additive models, doesn't perform well relative to the others. The ICD10 codes included in the construction of PGS004303 were similar to ours: C18,C19,C20.
+The GenoBoost method (PGS004303), which uses non-additive models, doesn't perform well relative to the others. The ICD-10 codes included in the construction of PGS004303 were similar to ours: C18,C19,C20.
 
 The best performing scores are PGS003852, PGS003979, and PGS003433. One thing common to each of these scores is that the associated study involves colorectal cancer specifically (as opposed to being general and studying many diseases at once).
 
@@ -264,26 +264,83 @@ pd.DataFrame([{"n": int(len(y)), "cases": int(y.sum()), "controls": int(len(y)-y
 
 This yields an AUROC of 0.617375. (Adding a ridge penalty gives a similar value of 0.617.)
 
-Let's analyze a different subset of colorectal cancer-related ICD codes.
+Let's check the colorectal cancer-related ICD codes individually.
 
-**ICD-10**
+```
+import os
+from google.cloud import bigquery as bq
+import matplotlib.pyplot as plt
+
+cdr_id=os.environ["WORKSPACE_CDR"]
+codes=[f"C18.{i}" for i in range(10)]+["C19","C20"]+[f"153.{i}" for i in range(10)]+["154.0","154.1"]
+codes=[c.upper() for c in (codes+[c.replace(".","") for c in codes])]
+sql=f"""
+WITH code_list AS (
+  SELECT DISTINCT UPPER(code) AS code FROM UNNEST(@codes) AS code
+),
+norm_codes AS (
+  SELECT ANY_VALUE(code) AS code, REPLACE(code,'.','') AS code_n
+  FROM code_list
+  GROUP BY code_n
+),
+cond AS (
+  SELECT CAST(person_id AS STRING) person_id,
+         REPLACE(UPPER(TRIM(condition_source_value)),'.','') AS csv_n
+  FROM `{cdr_id}.condition_occurrence`
+  WHERE condition_source_value IS NOT NULL
+),
+joined AS (
+  SELECT nc.code AS code, c.person_id
+  FROM norm_codes nc
+  JOIN cond c ON c.csv_n = nc.code_n
+)
+SELECT code, COUNT(DISTINCT person_id) AS n_persons
+FROM joined
+GROUP BY code
+ORDER BY n_persons DESC, code
+"""
+code_counts=bq.Client().query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes","STRING",codes)])).to_dataframe()
+print(code_counts.to_string(index=False))
+print(code_counts[code_counts["n_persons"]<20].sort_values(["n_persons","code"]).to_string(index=False))
+df=code_counts[code_counts["n_persons"]>=20].sort_values("n_persons",ascending=True)
+plt.figure(figsize=(8, max(2, 0.3*len(df))))
+plt.barh(df["code"], df["n_persons"])
+plt.xlabel("Distinct persons")
+plt.ylabel("ICD code")
+plt.title("CRC ICD code counts (≥20 cases)")
+plt.tight_layout(); plt.show()
+```
+<img width="790" height="679" alt="image" src="https://github.com/user-attachments/assets/2e1d2983-d9e9-4268-a378-699b2f0cfd04" />
+
+We haven't assessed a few important codes.
+
+ICD-10
 - Z85.038 — Personal history of malignant neoplasm of large intestine.
 - Z85.04x — Personal history of malignant neoplasm of rectum/rectosigmoid junction/anal canal.
-- Z43.3* — Encounter for attention to colostomy (any 4th digit).
-- Z93.3* — Colostomy status (any 4th digit).
-- 0DTP* — Resection of rectum (approach-specific).
-- 0DTN* — Resection of sigmoid colon (approach-specific).
-- DD07* — Beam radiation of rectum (Radiation Therapy section).
-- DD05* — Beam radiation of colon (Radiation Therapy section).
-- DDY5* — Other radiation to colon (Radiation Therapy, modality-specific).
-- 0D1N0Z4 — Bypass sigmoid colon to cutaneous (colostomy creation), open approach.
-- 0D1L0Z4 — Bypass transverse colon to cutaneous (colostomy creation), open approach.
 
-**ICD-9**
-- 48.5x — Abdominoperineal resection (APR) of rectum (procedure family).
-- 48.6x — Anterior/low anterior and other resections of rectum (procedure family).
-- 45.7x — Segmental colectomies (e.g., right, transverse, left hemicolectomy; sigmoidectomy).
-- 45.8x — Total intra-abdominal colectomy.
-- 46.1x — Colostomy creation.
-- 46.5x — Closure of intestinal stoma (stoma takedown).
+```
+cdr_id=os.environ["WORKSPACE_CDR"]
+codes_exact=["Z85.038","V10.05"]
+codes_exact=[c.upper() for c in (codes_exact+[c.replace(".","") for c in codes_exact])]
+
+sql=f"""
+SELECT DISTINCT CAST(person_id AS STRING) person_id
+FROM `{cdr_id}.observation`
+WHERE observation_source_value IS NOT NULL
+  AND (
+    UPPER(TRIM(observation_source_value)) IN UNNEST(@codes_exact)
+    OR REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]','') IN UNNEST(@codes_exact)
+    OR STARTS_WITH(REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]',''), @z8503_prefix)
+  )
+"""
+cases=bq.Client().query(
+    sql,
+    job_config=bq.QueryJobConfig(query_parameters=[
+        bq.ArrayQueryParameter("codes_exact","STRING",codes_exact),
+        bq.ScalarQueryParameter("z8503_prefix","STRING","Z8503"),
+    ])
+).to_dataframe()["person_id"].astype(str)
+```
+
+PGS003852 has an accuracy by itself of 0.619311 for this new case definition, while the multi-PGS + covariates model has a cross-validated AUC of 0.648.
 
