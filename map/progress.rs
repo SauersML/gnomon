@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
@@ -209,17 +210,23 @@ impl ManagedStageBar {
             approximate,
         } = &mut self.mode
         {
-            *approximate = Some(estimated_total as u64);
-            self.refresh_spinner_message(*base_message, *approximate);
+            let message = {
+                *approximate = Some(estimated_total as u64);
+                let base_message = *base_message;
+                let approximate = *approximate;
+                Self::spinner_message(base_message, approximate)
+            };
+            self.bar.set_message(message);
         }
     }
 
-    fn refresh_spinner_message(&self, base_message: &'static str, approximate: Option<u64>) {
-        if let Some(approx) = approximate {
-            self.bar
-                .set_message(format!("{base_message} (≈{} variants)", approx));
-        } else {
-            self.bar.set_message(base_message);
+    fn spinner_message(
+        base_message: &'static str,
+        approximate: Option<u64>,
+    ) -> Cow<'static, str> {
+        match approximate {
+            Some(approx) => Cow::Owned(format!("{base_message} (≈{} variants)", approx)),
+            None => Cow::Borrowed(base_message),
         }
     }
 
@@ -328,7 +335,6 @@ enum ProjectionStageBar {
         bar: ProgressBar,
     },
     Spinner {
-        base_message: &'static str,
         bar: ProgressBar,
     },
 }
@@ -351,10 +357,7 @@ impl ProjectionStageBar {
             bar.set_style(spinner_style());
             bar.set_message(ConsoleProjectionProgress::stage_message(stage));
             bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-            Self::Spinner {
-                base_message: ConsoleProjectionProgress::stage_message(stage),
-                bar,
-            }
+            Self::Spinner { bar }
         }
     }
 

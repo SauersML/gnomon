@@ -234,7 +234,8 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
-    let result = projector.project_with_options_and_progress(&mut source, &options, &progress)?;
+    let result =
+        projector.project_with_options_and_progress(&mut source, &options, &*progress)?;
 
     let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
 
