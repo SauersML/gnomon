@@ -50,3 +50,12 @@ This should take 11 minutes to run, and output a file called:
 ```
 arrays.sscore
 ```
+Let's open a Jupyter analysis notebook.
+```
+!head ../../arrays.sscore
+```
+
+This shows us the columns of the score output:
+```
+#IID	PGS000765_AVG	PGS000765_MISSING_PCT	PGS003386_AVG	PGS003386_MISSING_PCT	PGS003433_AVG	PGS003433_MISSING_PCT	PGS003852_AVG	PGS003852_MISSING_PCT	PGS003979_AVG	PGS003979_MISSING_PCT	PGS004303_AVG	PGS004303_MISSING_PCT	PGS004904_AVG	PGS004904_MISSING_PCT
+```
