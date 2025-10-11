@@ -136,6 +136,7 @@ pub struct PreparationResult {
     /// Flags indicating whether the required BIM indices correspond to complex contexts.
     required_is_complex: Vec<u8>,
     /// Mapping of kept byte positions used for complex variant spooling.
+    /// Entries are sorted and unique to allow linear compaction during streaming.
     spool_compact_byte_index: Vec<u32>,
     /// Dense lookup table mapping original byte indices to compact spool indices.
     spool_dense_map: Vec<i32>,

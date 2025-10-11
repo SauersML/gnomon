@@ -551,38 +551,13 @@ pub fn prepare_for_computation(
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let bytes_per_variant_usize = bytes_per_variant as usize;
     let (spool_compact_byte_index, spool_dense_map) =
-        match &person_subset {
-            PersonSubset::All => {
-                let mut compact = Vec::with_capacity(bytes_per_variant_usize);
-                let mut dense = Vec::with_capacity(bytes_per_variant_usize);
-                for i in 0..bytes_per_variant_usize {
-                    compact.push(u32::try_from(i).expect(
-                        "Too many bytes per variant to represent in spool_compact_byte_index",
-                    ));
-                    dense.push(
-                        i32::try_from(i)
-                            .expect("Too many bytes per variant to represent in spool_dense_map"),
-                    );
-                }
-                (compact, dense)
-            }
-            PersonSubset::Indices(indices) => {
-                let mut unique_bytes: BTreeSet<u32> = BTreeSet::new();
-                for &fam_idx in indices {
-                    unique_bytes.insert(fam_idx / 4);
-                }
-                let compact: Vec<u32> = unique_bytes.into_iter().collect();
-                let mut dense = vec![-1i32; bytes_per_variant_usize];
-                for (compact_idx, &orig_byte_idx) in compact.iter().enumerate() {
-                    if let Some(slot) = dense.get_mut(orig_byte_idx as usize) {
-                        *slot = i32::try_from(compact_idx)
-                            .expect("Too many kept individuals to compact into spool_dense_map");
-                    }
-                }
-                (compact, dense)
-            }
-        };
+        build_spool_maps(&person_subset, bytes_per_variant_usize);
     let spool_bytes_per_variant = spool_compact_byte_index.len() as u64;
+    debug_assert_eq!(
+        spool_bytes_per_variant as usize,
+        spool_compact_byte_index.len(),
+        "spool bytes per variant must equal compact index length"
+    );
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
 
@@ -638,6 +613,89 @@ fn build_fileset_paths(prefixes: &[PathBuf]) -> Result<Vec<FilesetPaths>, PrepEr
             Ok(FilesetPaths { bed, bim, fam })
         })
         .collect()
+}
+
+/// Builds the compacted spool index structures for the selected cohort subset.
+///
+/// The returned `Vec<u32>` is guaranteed to be sorted and unique, providing the
+/// exact byte positions (in the original PLINK layout) that contain at least one
+/// kept individual. The dense map mirrors the original byte indices and either
+/// contains the compacted index or `-1` if no kept person resides in that byte.
+fn build_spool_maps(
+    person_subset: &PersonSubset,
+    bytes_per_variant_usize: usize,
+) -> (Vec<u32>, Vec<i32>) {
+    match person_subset {
+        PersonSubset::All => {
+            let mut compact = Vec::with_capacity(bytes_per_variant_usize);
+            let mut dense = Vec::with_capacity(bytes_per_variant_usize);
+            for i in 0..bytes_per_variant_usize {
+                compact.push(
+                    u32::try_from(i).expect(
+                        "Too many bytes per variant to represent in spool_compact_byte_index",
+                    ),
+                );
+                dense.push(
+                    i32::try_from(i)
+                        .expect("Too many bytes per variant to represent in spool_dense_map"),
+                );
+            }
+            (compact, dense)
+        }
+        PersonSubset::Indices(indices) => {
+            let mut unique_bytes: BTreeSet<u32> = BTreeSet::new();
+            for &fam_idx in indices {
+                unique_bytes.insert(fam_idx / 4);
+            }
+            let compact: Vec<u32> = unique_bytes.into_iter().collect();
+            let mut dense = vec![-1i32; bytes_per_variant_usize];
+            for (compact_idx, &orig_byte_idx) in compact.iter().enumerate() {
+                if let Some(slot) = dense.get_mut(orig_byte_idx as usize) {
+                    *slot = i32::try_from(compact_idx)
+                        .expect("Too many kept individuals to compact into spool_dense_map");
+                }
+            }
+            (compact, dense)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_spool_maps_all_people_identity_mapping() {
+        let bytes_per_variant = 3;
+        let (compact, dense) = build_spool_maps(&PersonSubset::All, bytes_per_variant);
+        assert_eq!(compact, vec![0, 1, 2]);
+        assert_eq!(dense, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn build_spool_maps_subset_compacts_sorted_unique_bytes() {
+        let indices = vec![0, 1, 8, 9];
+        let bytes_per_variant = 4; // enough room for indices up to 3
+        let (compact, dense) =
+            build_spool_maps(&PersonSubset::Indices(indices.clone()), bytes_per_variant);
+
+        // The compact list must stay sorted and unique regardless of input order.
+        assert_eq!(compact, vec![0, 2]);
+        assert!(compact.windows(2).all(|w| w[0] < w[1]));
+
+        // Dense map should point to the compact slots for kept bytes and -1 elsewhere.
+        assert_eq!(dense.len(), bytes_per_variant);
+        assert_eq!(dense[0], 0);
+        assert_eq!(dense[1], -1);
+        assert_eq!(dense[2], 1);
+        assert_eq!(dense[3], -1);
+
+        // Every kept fam index should resolve to a compact entry.
+        for fam_idx in indices {
+            let orig_byte = (fam_idx / 4) as usize;
+            assert!(dense[orig_byte] >= 0);
+        }
+    }
 }
 
 fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {

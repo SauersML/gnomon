@@ -32,6 +32,8 @@ pub struct SpoolPlan<'a> {
     pub is_complex_for_required: &'a [u8],
     pub compact_byte_index: &'a [u32],
     pub bytes_per_spooled_variant: u64,
+    pub bytes_per_spooled_variant_usize: usize,
+    pub scratch: Vec<u8>,
     pub file: &'a mut BufWriter<File>,
     pub offsets: &'a mut AHashMap<BimRowIndex, u64>,
     pub cursor: &'a mut u64,
@@ -58,15 +60,41 @@ impl<'a> SpoolPlan<'a> {
         let offset_for_variant = *self.cursor;
         self.offsets.insert(bim_row_idx, offset_for_variant);
 
-        for &orig_byte_idx in self.compact_byte_index.iter() {
-            let byte = buffer
-                .get(orig_byte_idx as usize)
-                .copied()
-                .unwrap_or_default();
-            self.file
-                .write_all(std::slice::from_ref(&byte))
-                .map_err(|e| PipelineError::Io(format!("Failed to write complex spool: {e}")))?;
+        if self.bytes_per_spooled_variant_usize == 0 {
+            return Ok(());
         }
+
+        debug_assert_eq!(
+            self.bytes_per_spooled_variant as usize, self.bytes_per_spooled_variant_usize,
+            "cached spool byte counts must match"
+        );
+        debug_assert_eq!(
+            self.scratch.len(),
+            self.bytes_per_spooled_variant_usize,
+            "scratch buffer must be sized to the spooled variant stride"
+        );
+
+        for (dst_idx, &orig_byte_idx) in self.compact_byte_index.iter().enumerate() {
+            debug_assert!(
+                dst_idx < self.scratch.len(),
+                "scratch index {} out of bounds for buffer of length {}",
+                dst_idx,
+                self.scratch.len()
+            );
+            let byte_index = orig_byte_idx as usize;
+            debug_assert!(
+                byte_index < buffer.len(),
+                "original byte index {} out of bounds for buffer of length {}",
+                byte_index,
+                buffer.len()
+            );
+            // Safety: debug assertion above guarantees the index is within bounds.
+            self.scratch[dst_idx] = unsafe { *buffer.get_unchecked(byte_index) };
+        }
+
+        self.file
+            .write_all(&self.scratch[..self.bytes_per_spooled_variant_usize])
+            .map_err(|e| PipelineError::Io(format!("Failed to write complex spool: {e}")))?;
 
         *self.cursor += self.bytes_per_spooled_variant;
         Ok(())

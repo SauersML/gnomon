@@ -10,18 +10,20 @@ use ahash::AHashMap;
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use num_cpus;
+use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // --- Pipeline Tuning Parameters ---
 
@@ -253,7 +255,8 @@ fn run_single_file_pipeline(
                 spool_dir.display()
             ))
         })?;
-        let path = spool_dir.join(format!("{}.complex_spool.bin", spool_stem));
+        let filename = unique_spool_filename(&spool_stem);
+        let path = spool_dir.join(&filename);
         let file = File::create(&path).map_err(|e| {
             PipelineError::Io(format!(
                 "Failed to create spool file {}: {e}",
@@ -272,12 +275,18 @@ fn run_single_file_pipeline(
             (complex_variant_count * spool_bytes_per_variant) as f64 / (1024.0 * 1024.0)
         };
         eprintln!(
-            "> Spooling complex genotypes locally ({} variants, {} bytes/variant ≈ {:.2} MiB)...",
-            complex_variant_count, spool_bytes_per_variant, approx_mb
+            "> Spooling complex genotypes locally: {} variants × {} B ≈ {:.2} MiB to {}",
+            complex_variant_count,
+            spool_bytes_per_variant,
+            approx_mb,
+            path.display()
         );
+        let offsets_capacity = usize::try_from(complex_variant_count)
+            .unwrap_or(usize::MAX / 2)
+            .max(1);
         spool_state = Some(SpoolState {
             writer: BufWriter::with_capacity(SPOOL_BUFFER_SIZE, file),
-            offsets: AHashMap::with_capacity(prep_result.complex_rules.len()),
+            offsets: AHashMap::with_capacity(offsets_capacity),
             cursor: 0,
         });
         spool_path = Some(path);
@@ -324,15 +333,7 @@ fn run_single_file_pipeline(
                                 let state = local_spool_state
                                     .as_mut()
                                     .expect("spool state missing despite spooling enabled");
-                                Some(io::SpoolPlan {
-                                    is_complex_for_required: prep_result.required_is_complex(),
-                                    compact_byte_index: prep_result.spool_compact_byte_index(),
-                                    bytes_per_spooled_variant: prep_result
-                                        .spool_bytes_per_variant(),
-                                    file: &mut state.writer,
-                                    offsets: &mut state.offsets,
-                                    cursor: &mut state.cursor,
-                                })
+                                Some(create_spool_plan(prep_result.as_ref(), state)?)
                             } else {
                                 None
                             };
@@ -363,15 +364,7 @@ fn run_single_file_pipeline(
                                 let state = local_spool_state
                                     .as_mut()
                                     .expect("spool state missing despite spooling enabled");
-                                Some(io::SpoolPlan {
-                                    is_complex_for_required: prep_result.required_is_complex(),
-                                    compact_byte_index: prep_result.spool_compact_byte_index(),
-                                    bytes_per_spooled_variant: prep_result
-                                        .spool_bytes_per_variant(),
-                                    file: &mut state.writer,
-                                    offsets: &mut state.offsets,
-                                    cursor: &mut state.cursor,
-                                })
+                                Some(create_spool_plan(prep_result.as_ref(), state)?)
                             } else {
                                 None
                             };
@@ -432,9 +425,15 @@ fn run_single_file_pipeline(
     let ((mut final_scores, mut final_counts), mut spool_state) = final_result?;
 
     if !prep_result.complex_rules.is_empty() {
+        let resolver_label = if should_spool {
+            "spooled mmap"
+        } else {
+            "single-file mmap"
+        };
         eprintln!(
-            "> Resolving {} unique complex variant rule(s)...",
-            prep_result.complex_rules.len()
+            "> Resolving {} unique complex variant rule(s) with {} resolver...",
+            prep_result.complex_rules.len(),
+            resolver_label
         );
         if should_spool {
             let spool_file_path = spool_path
@@ -447,23 +446,38 @@ fn run_single_file_pipeline(
                 PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
             })?;
             drop(state.writer);
-            let spool_file = File::open(&spool_file_path).map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to open complex variant spool {}: {e}",
-                    spool_file_path.display()
-                ))
-            })?;
-            let mmap = unsafe { Mmap::map(&spool_file) }.map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to memory-map complex variant spool {}: {e}",
-                    spool_file_path.display()
-                ))
-            })?;
+            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            let mmap = if spool_bytes_per_variant == 0 {
+                let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to allocate anonymous mapping for empty complex spool: {e}"
+                    ))
+                })?;
+                anon.copy_from_slice(&[0u8]);
+                anon.make_read_only().map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to convert anonymous mapping to read-only: {e}"
+                    ))
+                })?
+            } else {
+                let spool_file = File::open(&spool_file_path).map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to open complex variant spool {}: {e}",
+                        spool_file_path.display()
+                    ))
+                })?;
+                unsafe { Mmap::map(&spool_file) }.map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to memory-map complex variant spool {}: {e}",
+                        spool_file_path.display()
+                    ))
+                })?
+            };
             let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
             let resolver = ComplexVariantResolver::from_spool(
                 Arc::new(mmap),
                 state.offsets,
-                prep_result.spool_bytes_per_variant(),
+                spool_bytes_per_variant,
                 dense_map,
             );
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
@@ -471,7 +485,18 @@ fn run_single_file_pipeline(
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             if !keep_spool {
-                let _ = fs::remove_file(&spool_file_path);
+                if let Err(e) = fs::remove_file(&spool_file_path) {
+                    eprintln!(
+                        "> Warning: Failed to delete complex spool {}: {}",
+                        spool_file_path.display(),
+                        e
+                    );
+                }
+            } else {
+                eprintln!(
+                    "> GNOMON_KEEP_SPOOL set; preserving complex spool at {}",
+                    spool_file_path.display()
+                );
             }
         } else {
             let resolver = ComplexVariantResolver::from_single_source(bed_source.clone());
@@ -572,7 +597,8 @@ fn run_multi_file_pipeline(
                 spool_dir.display()
             ))
         })?;
-        let path = spool_dir.join(format!("{}.complex_spool.bin", spool_stem));
+        let filename = unique_spool_filename(&spool_stem);
+        let path = spool_dir.join(&filename);
         let file = File::create(&path).map_err(|e| {
             PipelineError::Io(format!(
                 "Failed to create spool file {}: {e}",
@@ -591,12 +617,18 @@ fn run_multi_file_pipeline(
             (complex_variant_count * spool_bytes_per_variant) as f64 / (1024.0 * 1024.0)
         };
         eprintln!(
-            "> Spooling complex genotypes locally ({} variants, {} bytes/variant ≈ {:.2} MiB)...",
-            complex_variant_count, spool_bytes_per_variant, approx_mb
+            "> Spooling complex genotypes locally: {} variants × {} B ≈ {:.2} MiB to {}",
+            complex_variant_count,
+            spool_bytes_per_variant,
+            approx_mb,
+            path.display()
         );
+        let offsets_capacity = usize::try_from(complex_variant_count)
+            .unwrap_or(usize::MAX / 2)
+            .max(1);
         spool_state = Some(SpoolState {
             writer: BufWriter::with_capacity(SPOOL_BUFFER_SIZE, file),
-            offsets: AHashMap::with_capacity(prep_result.complex_rules.len()),
+            offsets: AHashMap::with_capacity(offsets_capacity),
             cursor: 0,
         });
         spool_path = Some(path);
@@ -643,15 +675,7 @@ fn run_multi_file_pipeline(
                                 let state = local_spool_state
                                     .as_mut()
                                     .expect("spool state missing despite spooling enabled");
-                                Some(io::SpoolPlan {
-                                    is_complex_for_required: prep_result.required_is_complex(),
-                                    compact_byte_index: prep_result.spool_compact_byte_index(),
-                                    bytes_per_spooled_variant: prep_result
-                                        .spool_bytes_per_variant(),
-                                    file: &mut state.writer,
-                                    offsets: &mut state.offsets,
-                                    cursor: &mut state.cursor,
-                                })
+                                Some(create_spool_plan(prep_result.as_ref(), state)?)
                             } else {
                                 None
                             };
@@ -683,15 +707,7 @@ fn run_multi_file_pipeline(
                                 let state = local_spool_state
                                     .as_mut()
                                     .expect("spool state missing despite spooling enabled");
-                                Some(io::SpoolPlan {
-                                    is_complex_for_required: prep_result.required_is_complex(),
-                                    compact_byte_index: prep_result.spool_compact_byte_index(),
-                                    bytes_per_spooled_variant: prep_result
-                                        .spool_bytes_per_variant(),
-                                    file: &mut state.writer,
-                                    offsets: &mut state.offsets,
-                                    cursor: &mut state.cursor,
-                                })
+                                Some(create_spool_plan(prep_result.as_ref(), state)?)
                             } else {
                                 None
                             };
@@ -754,9 +770,15 @@ fn run_multi_file_pipeline(
     let ((mut final_scores, mut final_counts), mut spool_state) = final_result?;
 
     if !prep_result.complex_rules.is_empty() {
+        let resolver_label = if should_spool {
+            "spooled mmap"
+        } else {
+            "multi-file mmap"
+        };
         eprintln!(
-            "> Resolving {} unique complex variant rule(s)...",
-            prep_result.complex_rules.len()
+            "> Resolving {} unique complex variant rule(s) with {} resolver...",
+            prep_result.complex_rules.len(),
+            resolver_label
         );
         if should_spool {
             let spool_file_path = spool_path
@@ -769,23 +791,38 @@ fn run_multi_file_pipeline(
                 PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
             })?;
             drop(state.writer);
-            let spool_file = File::open(&spool_file_path).map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to open complex variant spool {}: {e}",
-                    spool_file_path.display()
-                ))
-            })?;
-            let mmap = unsafe { Mmap::map(&spool_file) }.map_err(|e| {
-                PipelineError::Io(format!(
-                    "Failed to memory-map complex variant spool {}: {e}",
-                    spool_file_path.display()
-                ))
-            })?;
+            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            let mmap = if spool_bytes_per_variant == 0 {
+                let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to allocate anonymous mapping for empty complex spool: {e}"
+                    ))
+                })?;
+                anon.copy_from_slice(&[0u8]);
+                anon.make_read_only().map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to convert anonymous mapping to read-only: {e}"
+                    ))
+                })?
+            } else {
+                let spool_file = File::open(&spool_file_path).map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to open complex variant spool {}: {e}",
+                        spool_file_path.display()
+                    ))
+                })?;
+                unsafe { Mmap::map(&spool_file) }.map_err(|e| {
+                    PipelineError::Io(format!(
+                        "Failed to memory-map complex variant spool {}: {e}",
+                        spool_file_path.display()
+                    ))
+                })?
+            };
             let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
             let resolver = ComplexVariantResolver::from_spool(
                 Arc::new(mmap),
                 state.offsets,
-                prep_result.spool_bytes_per_variant(),
+                spool_bytes_per_variant,
                 dense_map,
             );
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
@@ -793,7 +830,18 @@ fn run_multi_file_pipeline(
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             if !keep_spool {
-                let _ = fs::remove_file(&spool_file_path);
+                if let Err(e) = fs::remove_file(&spool_file_path) {
+                    eprintln!(
+                        "> Warning: Failed to delete complex spool {}: {}",
+                        spool_file_path.display(),
+                        e
+                    );
+                }
+            } else {
+                eprintln!(
+                    "> GNOMON_KEEP_SPOOL set; preserving complex spool at {}",
+                    spool_file_path.display()
+                );
             }
         } else {
             let resolver = ComplexVariantResolver::from_multi_sources(
@@ -824,6 +872,68 @@ fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         (dir, stem)
+    }
+}
+
+fn unique_spool_filename(stem: &str) -> String {
+    let pid = process::id();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    let timestamp = now.as_nanos();
+    let mut rng = thread_rng();
+    let random_component: u32 = rng.next_u32();
+    format!(
+        "{}.{}.{}.{}.complex_spool.bin",
+        stem, pid, timestamp, random_component
+    )
+}
+
+fn create_spool_plan<'a>(
+    prep_result: &'a PreparationResult,
+    state: &'a mut SpoolState,
+) -> Result<io::SpoolPlan<'a>, PipelineError> {
+    let stride = prep_result.spool_bytes_per_variant();
+    let stride_usize = usize::try_from(stride).map_err(|_| {
+        PipelineError::Compute(format!(
+            "spool stride of {} bytes does not fit on this platform",
+            stride
+        ))
+    })?;
+    Ok(io::SpoolPlan {
+        is_complex_for_required: prep_result.required_is_complex(),
+        compact_byte_index: prep_result.spool_compact_byte_index(),
+        bytes_per_spooled_variant: stride,
+        bytes_per_spooled_variant_usize: stride_usize,
+        scratch: vec![0u8; stride_usize],
+        file: &mut state.writer,
+        offsets: &mut state.offsets,
+        cursor: &mut state.cursor,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_spool_destination_remote_paths_default_to_current_dir() {
+        let (dir, stem) = derive_spool_destination(Path::new("gs://bucket/data/sample.bed"));
+        assert_eq!(dir, Path::new("."));
+        assert_eq!(stem, "sample");
+
+        let (dir_http, stem_http) =
+            derive_spool_destination(Path::new("https://example.com/study/run"));
+        assert_eq!(dir_http, Path::new("."));
+        assert_eq!(stem_http, "run");
+    }
+
+    #[test]
+    fn derive_spool_destination_local_paths_use_parent_directory() {
+        let path = Path::new("/tmp/project/cohort1.bed");
+        let (dir, stem) = derive_spool_destination(path);
+        assert_eq!(dir, Path::new("/tmp/project"));
+        assert_eq!(stem, "cohort1");
     }
 }
 
