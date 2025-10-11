@@ -10,6 +10,8 @@ pub mod shared {
     pub use super::files;
 }
 
+pub mod adapt_plink2;
+
 #[path = "../score/mod.rs"]
 pub mod score;
 
