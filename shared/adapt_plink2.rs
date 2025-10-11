@@ -114,7 +114,13 @@ pub fn open_virtual_plink19_from_sources(
             pgen.clone()
         }
         _ => {
-            let decoder = PgenDecoder::new(pgen.clone(), header, psam_info.n_samples, plan.in_variants)?;
+            let decoder = PgenDecoder::new(
+                pgen.clone(),
+                header,
+                psam_info.n_samples,
+                plan.in_variants,
+                plan.alts_per_in.clone(),
+            )?;
             let sex_by_sample_arc: Arc<[u8]> = Arc::from(
                 psam_info
                     .sex_by_sample
@@ -305,11 +311,32 @@ impl PsamColumns {
     }
 }
 
+fn coerce_pheno_token(tok: &str) -> String {
+    let t = tok.trim();
+    if t.is_empty() {
+        return "-9".to_string();
+    }
+    if t.eq_ignore_ascii_case("na")
+        || t.eq_ignore_ascii_case("nan")
+        || t == "."
+        || t.eq_ignore_ascii_case("none")
+    {
+        return "-9".to_string();
+    }
+    if t.parse::<f64>().is_ok() {
+        t.to_string()
+    } else {
+        "-9".to_string()
+    }
+}
+
 impl FamRow {
     fn from_fields(fields: &[&str], cols: &PsamColumns) -> FamRow {
         let default = |val: &str| val.to_string();
         let get_opt = |idx: Option<usize>| idx.and_then(|i| fields.get(i)).map(|s| (*s).to_string());
-        let iid = get_opt(cols.iid_idx).or_else(|| get_opt(cols.fid_idx)).unwrap_or_else(|| "0".to_string());
+        let iid = get_opt(cols.iid_idx)
+            .or_else(|| get_opt(cols.fid_idx))
+            .unwrap_or_else(|| "0".to_string());
         let fid = get_opt(cols.fid_idx).unwrap_or_else(|| iid.clone());
         let pat = get_opt(cols.pat_idx).unwrap_or_else(|| default("0"));
         let mat = get_opt(cols.mat_idx).unwrap_or_else(|| default("0"));
@@ -318,7 +345,7 @@ impl FamRow {
             .pheno1_idx
             .and_then(|i| fields.get(i))
             .or_else(|| cols.pheno_idx.and_then(|i| fields.get(i)))
-            .map(|s| (*s).to_string())
+            .map(|s| coerce_pheno_token(s))
             .unwrap_or_else(|| "-9".to_string());
         FamRow {
             fid,
@@ -357,6 +384,8 @@ struct VariantPlan {
     haploidy: Vec<HaploidyKind>,
     /// BIM lines corresponding to each output variant.
     bim_lines: Vec<BimLine>,
+    /// ALT allele count per input variant.
+    alts_per_in: Vec<u16>,
 }
 
 #[derive(Clone)]
@@ -451,6 +480,7 @@ impl VariantPlan {
         let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
         let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
         let mut bim_lines: Vec<BimLine> = Vec::with_capacity(1 << 20);
+        let mut alts_per_in: Vec<u16> = Vec::with_capacity(1 << 16);
         let mut header_cols: Option<PvarCols> = None;
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
@@ -510,6 +540,13 @@ impl VariantPlan {
             let out_start = out_to_in.len();
             let mut alt_ord: u16 = 1;
             let mut emitted = 0usize;
+            let alt_cnt = alt_raw
+                .split(',')
+                .filter(|a| {
+                    let t = a.trim();
+                    !t.is_empty() && t != &"."
+                })
+                .count() as u16;
             for alt in alt_raw.split(',') {
                 let alt = alt.trim();
                 if alt.is_empty() || alt == "." {
@@ -535,6 +572,7 @@ impl VariantPlan {
                 out_end,
             });
 
+            alts_per_in.push(alt_cnt);
             in_idx += 1;
             in_variants += 1;
         }
@@ -561,6 +599,7 @@ impl VariantPlan {
             out_to_in,
             haploidy,
             bim_lines,
+            alts_per_in,
         })
     }
 
@@ -576,6 +615,14 @@ impl VariantPlan {
 
     fn bim_lines(&self) -> &[BimLine] {
         &self.bim_lines
+    }
+
+    #[inline]
+    fn alt_count_of_in(&self, in_idx: u32) -> u16 {
+        self.alts_per_in
+            .get(in_idx as usize)
+            .copied()
+            .unwrap_or(1)
     }
 }
 
@@ -912,6 +959,10 @@ impl ByteRangeSource for VirtualBed {
                     .plan
                     .mapping(out_idx)
                     .ok_or_else(|| ioerr("VariantPlan mapping out of bounds"))?;
+                let alt_count = self.plan.alt_count_of_in(in_idx);
+                if alt_count != 0 && alt_ord > alt_count {
+                    return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
+                }
                 let mut hard = vec![255u8; self.n_samples]; // 255 = missing
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard)?;
 
@@ -1060,14 +1111,15 @@ struct PgenHeader {
 
 impl PgenHeader {
     fn parse(src: &dyn ByteRangeSource) -> Result<Self, PipelineError> {
-        let mut magic = [0u8; 3];
         if src.len() < 3 {
-            return Err(PipelineError::Io("PGEN file too small".into()));
+            return Err(ioerr("PGEN file too small"));
         }
+        let mut magic = [0u8; 3];
         src.read_at(0, &mut magic)?;
         if magic[0] != 0x6c || magic[1] != 0x1b {
-            return Err(PipelineError::Io("Not a PGEN (bad magic)".into()));
+            return Err(ioerr("Not a PGEN (bad magic)"));
         }
+
         let mode = match magic[2] {
             0x01 => PgenMode::Bed,
             0x02 => PgenMode::FixHard,
@@ -1076,14 +1128,10 @@ impl PgenHeader {
             0x10 => PgenMode::Var,
             0x11 => PgenMode::VarIgnorable,
             0x20 | 0x21 => {
-                return Err(PipelineError::Io(
-                    "PGEN external index modes (0x20/0x21) are not supported".into(),
-                ))
+                return Err(ioerr("External index modes (0x20/0x21) unsupported here"))
             }
             other => {
-                return Err(PipelineError::Io(format!(
-                    "Unsupported PGEN mode 0x{other:02x}"
-                )))
+                return Err(PipelineError::Io(format!("Unsupported PGEN mode 0x{other:02x}")))
             }
         };
 
@@ -1093,9 +1141,9 @@ impl PgenHeader {
                 m_variants: 0,
                 n_samples: 0,
                 fmt_byte: 0,
-                block_offsets: Vec::new(),
-                rec_types: Vec::new(),
-                rec_lens: Vec::new(),
+                block_offsets: vec![],
+                rec_types: vec![],
+                rec_lens: vec![],
             });
         }
 
@@ -1108,9 +1156,9 @@ impl PgenHeader {
                 m_variants,
                 n_samples,
                 fmt_byte: 0,
-                block_offsets: Vec::new(),
-                rec_types: Vec::new(),
-                rec_lens: Vec::new(),
+                block_offsets: vec![],
+                rec_types: vec![],
+                rec_lens: vec![],
             });
         }
 
@@ -1119,14 +1167,6 @@ impl PgenHeader {
             src.read_at(11, &mut b)?;
             b[0]
         };
-        let blocks = ((m_variants as u64) + ((1u64 << 16) - 1)) >> 16;
-        let mut block_offsets = Vec::with_capacity(blocks as usize);
-        let mut off = 12u64;
-        for _ in 0..blocks {
-            block_offsets.push(read_le_u64(src, off)?);
-            off += 8;
-        }
-
         let type_bits = if (fmt & 0x0f) <= 3 { 4 } else { 8 };
         let len_bytes = match fmt & 0x07 {
             0 | 4 => 1,
@@ -1135,46 +1175,87 @@ impl PgenHeader {
             3 | 7 => 4,
             _ => unreachable!(),
         };
+        let ac_bytes = match (fmt >> 4) & 0x03 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => unreachable!(),
+        };
+        let ref_flag_mode = (fmt >> 6) & 0x03;
 
-        let mut rec_types = Vec::with_capacity(m_variants as usize);
-        if type_bits == 4 {
-            let n_bytes = ((m_variants as usize) + 1) / 2;
-            let mut buf = vec![0u8; n_bytes];
-            src.read_at(off, &mut buf)?;
-            off += n_bytes as u64;
-            for (i, &byte) in buf.iter().enumerate() {
-                rec_types.push(byte & 0x0f);
-                if (2 * i + 1) < m_variants as usize {
-                    rec_types.push((byte >> 4) & 0x0f);
+        let blocks = ((m_variants as u64) + ((1u64 << 16) - 1)) >> 16;
+        let mut block_offsets = Vec::with_capacity(blocks as usize);
+        let mut off = 12u64;
+        for _ in 0..blocks {
+            block_offsets.push(read_le_u64(src, off)?);
+            off += 8;
+        }
+
+        let mut rec_types = vec![0u8; m_variants as usize];
+        let mut rec_lens = vec![0u32; m_variants as usize];
+
+        let mut idx = 0usize;
+        for _ in 0..blocks {
+            let remain = (m_variants as usize) - idx;
+            let cnt = remain.min(1 << 16);
+
+            // types per block
+            if type_bits == 4 {
+                let nbytes = (cnt + 1) / 2;
+                let mut buf = vec![0u8; nbytes];
+                src.read_at(off, &mut buf)?;
+                off += nbytes as u64;
+                for (i, byte) in buf.into_iter().enumerate() {
+                    let base = idx + 2 * i;
+                    if base < idx + cnt {
+                        rec_types[base] = byte & 0x0f;
+                    }
+                    if base + 1 < idx + cnt {
+                        rec_types[base + 1] = (byte >> 4) & 0x0f;
+                    }
+                }
+            } else {
+                let nbytes = cnt;
+                src.read_at(off, &mut rec_types[idx..idx + cnt])?;
+                off += nbytes as u64;
+            }
+
+            if len_bytes > 0 {
+                let nbytes = cnt * (len_bytes as usize);
+                let mut buf = vec![0u8; nbytes];
+                if nbytes > 0 {
+                    src.read_at(off, &mut buf)?;
+                }
+                off += nbytes as u64;
+                for i in 0..cnt {
+                    let start = i * (len_bytes as usize);
+                    let len = match len_bytes {
+                        1 => u32::from(buf[start]),
+                        2 => u32::from_le_bytes([buf[start], buf[start + 1], 0, 0]),
+                        3 => u32::from_le_bytes([buf[start], buf[start + 1], buf[start + 2], 0]),
+                        4 => u32::from_le_bytes([
+                            buf[start],
+                            buf[start + 1],
+                            buf[start + 2],
+                            buf[start + 3],
+                        ]),
+                        _ => unreachable!(),
+                    };
+                    rec_lens[idx + i] = len;
                 }
             }
-        } else {
-            let mut buf = vec![0u8; m_variants as usize];
-            src.read_at(off, &mut buf)?;
-            off += m_variants as u64;
-            rec_types.extend(buf);
-        }
 
-        let mut rec_lens = Vec::with_capacity(m_variants as usize);
-        let mut buf = vec![0u8; (m_variants as usize) * (len_bytes as usize)];
-        if !buf.is_empty() {
-            src.read_at(off, &mut buf)?;
-        }
-        for i in 0..(m_variants as usize) {
-            let start = i * (len_bytes as usize);
-            let len = match len_bytes {
-                1 => u32::from(buf[start]),
-                2 => u32::from_le_bytes([buf[start], buf[start + 1], 0, 0]),
-                3 => u32::from_le_bytes([buf[start], buf[start + 1], buf[start + 2], 0]),
-                4 => u32::from_le_bytes([
-                    buf[start],
-                    buf[start + 1],
-                    buf[start + 2],
-                    buf[start + 3],
-                ]),
-                _ => unreachable!(),
-            };
-            rec_lens.push(len);
+            if ac_bytes > 0 {
+                let nbytes = cnt * (ac_bytes as usize);
+                off += nbytes as u64;
+            }
+            if ref_flag_mode == 3 {
+                let nbytes = (cnt + 7) / 8;
+                off += nbytes as u64;
+            }
+
+            idx += cnt;
         }
 
         Ok(Self {
@@ -1189,11 +1270,292 @@ impl PgenHeader {
     }
 }
 
+#[inline]
+fn read_base128_varint(buf: &[u8], cursor: &mut usize) -> Result<u64, PipelineError> {
+    let mut out: u64 = 0;
+    let mut shift = 0;
+    loop {
+        if *cursor >= buf.len() {
+            return Err(ioerr("Unexpected EOF in varint"));
+        }
+        let b = buf[*cursor];
+        *cursor += 1;
+        out |= ((b & 0x7f) as u64) << shift;
+        if (b & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(ioerr("Varint too large"));
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn read_u24_le(buf: &[u8], cursor: &mut usize) -> Result<u32, PipelineError> {
+    if *cursor + 3 > buf.len() {
+        return Err(ioerr("EOF in u24"));
+    }
+    let v = u32::from_le_bytes([buf[*cursor], buf[*cursor + 1], buf[*cursor + 2], 0]);
+    *cursor += 3;
+    Ok(v)
+}
+
+#[inline]
+fn read_bitarray_indices(
+    buf: &[u8],
+    cursor: &mut usize,
+    nbits: usize,
+) -> Result<Vec<usize>, PipelineError> {
+    let nbytes = (nbits + 7) / 8;
+    if *cursor + nbytes > buf.len() {
+        return Err(ioerr("EOF in bitarray"));
+    }
+    let mut out = Vec::with_capacity(nbits.min(1024));
+    for (j, &byte) in buf[*cursor..*cursor + nbytes].iter().enumerate() {
+        for b in 0..8 {
+            let bit = j * 8 + b;
+            if bit >= nbits {
+                break;
+            }
+            if (byte >> b) & 1 == 1 {
+                out.push(bit);
+            }
+        }
+    }
+    *cursor += nbytes;
+    Ok(out)
+}
+
+#[inline]
+fn read_packed_fixed_width(
+    buf: &[u8],
+    cursor: &mut usize,
+    width_bits: usize,
+    count: usize,
+) -> Result<Vec<u32>, PipelineError> {
+    if width_bits == 0 {
+        return Ok(vec![0; count]);
+    }
+    let total_bits = width_bits * count;
+    let nbytes = (total_bits + 7) / 8;
+    if *cursor + nbytes > buf.len() {
+        return Err(ioerr("EOF in packed values"));
+    }
+    let slice = &buf[*cursor..*cursor + nbytes];
+    let mut out = Vec::with_capacity(count);
+    let mut bitpos = 0usize;
+    for _ in 0..count {
+        let mut acc = 0u32;
+        for k in 0..width_bits {
+            let bp = bitpos + k;
+            let byte = slice[bp >> 3];
+            let bit = (byte >> (bp & 7)) & 1;
+            acc |= (bit as u32) << k;
+        }
+        out.push(acc);
+        bitpos += width_bits;
+    }
+    *cursor += nbytes;
+    Ok(out)
+}
+
+#[inline]
+fn sample_id_bytes(n_samples: usize) -> usize {
+    if n_samples <= (1 << 8) {
+        1
+    } else if n_samples <= (1 << 16) {
+        2
+    } else if n_samples <= (1 << 24) {
+        3
+    } else {
+        4
+    }
+}
+
+fn difflist_ids(
+    buf: &[u8],
+    cursor: &mut usize,
+    n_samples: usize,
+) -> Result<Vec<u32>, PipelineError> {
+    let l = read_base128_varint(buf, cursor)? as usize;
+    if l == 0 {
+        return Ok(vec![]);
+    }
+    let g = (l + 63) / 64;
+    let sid_bytes = sample_id_bytes(n_samples);
+    let mut first_ids = Vec::with_capacity(g);
+    for _ in 0..g {
+        let v = match sid_bytes {
+            1 => {
+                if *cursor >= buf.len() {
+                    return Err(ioerr("EOF in u8 first-ID"));
+                }
+                let v = buf[*cursor] as u32;
+                *cursor += 1;
+                v
+            }
+            2 => {
+                if *cursor + 2 > buf.len() {
+                    return Err(ioerr("EOF in u16 first-ID"));
+                }
+                let v = u16::from_le_bytes([buf[*cursor], buf[*cursor + 1]]) as u32;
+                *cursor += 2;
+                v
+            }
+            3 => read_u24_le(buf, cursor)?,
+            _ => {
+                if *cursor + 4 > buf.len() {
+                    return Err(ioerr("EOF in u32 first-ID"));
+                }
+                let v = u32::from_le_bytes([
+                    buf[*cursor],
+                    buf[*cursor + 1],
+                    buf[*cursor + 2],
+                    buf[*cursor + 3],
+                ]);
+                *cursor += 4;
+                v
+            }
+        };
+        first_ids.push(v);
+    }
+    if g > 1 {
+        if *cursor + (g - 1) > buf.len() {
+            return Err(ioerr("EOF in difflist group sizes"));
+        }
+        *cursor += g - 1;
+    }
+
+    let m = l - g;
+    let mut deltas = Vec::with_capacity(m);
+    for _ in 0..m {
+        deltas.push(read_base128_varint(buf, cursor)? as u32);
+    }
+
+    let mut out = vec![0u32; l];
+    let mut di = 0usize;
+    for gi in 0..g {
+        let start = gi * 64;
+        out[start] = first_ids[gi];
+        let end = ((gi + 1) * 64).min(l);
+        for k in start + 1..end {
+            out[k] = out[k - 1] + deltas[di];
+            di += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn difflist_pairs(
+    buf: &[u8],
+    cursor: &mut usize,
+    n_samples: usize,
+) -> Result<Vec<(u32, u8)>, PipelineError> {
+    let l = read_base128_varint(buf, cursor)? as usize;
+    if l == 0 {
+        return Ok(vec![]);
+    }
+    let g = (l + 63) / 64;
+    let sid_bytes = sample_id_bytes(n_samples);
+    let mut first_ids = Vec::with_capacity(g);
+    for _ in 0..g {
+        let v = match sid_bytes {
+            1 => {
+                if *cursor >= buf.len() {
+                    return Err(ioerr("EOF in u8 first-ID"));
+                }
+                let v = buf[*cursor] as u32;
+                *cursor += 1;
+                v
+            }
+            2 => {
+                if *cursor + 2 > buf.len() {
+                    return Err(ioerr("EOF in u16 first-ID"));
+                }
+                let v = u16::from_le_bytes([buf[*cursor], buf[*cursor + 1]]) as u32;
+                *cursor += 2;
+                v
+            }
+            3 => read_u24_le(buf, cursor)?,
+            _ => {
+                if *cursor + 4 > buf.len() {
+                    return Err(ioerr("EOF in u32 first-ID"));
+                }
+                let v = u32::from_le_bytes([
+                    buf[*cursor],
+                    buf[*cursor + 1],
+                    buf[*cursor + 2],
+                    buf[*cursor + 3],
+                ]);
+                *cursor += 4;
+                v
+            }
+        };
+        first_ids.push(v);
+    }
+    if g > 1 {
+        if *cursor + (g - 1) > buf.len() {
+            return Err(ioerr("EOF in difflist group sizes"));
+        }
+        *cursor += g - 1;
+    }
+
+    let vals_packed = ((l + 3) / 4) as usize;
+    if *cursor + vals_packed > buf.len() {
+        return Err(ioerr("EOF in difflist values"));
+    }
+    let mut vals = Vec::with_capacity(l);
+    for i in 0..vals_packed {
+        let b = buf[*cursor + i];
+        vals.push(b & 0b11);
+        if vals.len() == l {
+            break;
+        }
+        vals.push((b >> 2) & 0b11);
+        if vals.len() == l {
+            break;
+        }
+        vals.push((b >> 4) & 0b11);
+        if vals.len() == l {
+            break;
+        }
+        vals.push((b >> 6) & 0b11);
+    }
+    *cursor += vals_packed;
+
+    let m = l - g;
+    let mut deltas = Vec::with_capacity(m);
+    for _ in 0..m {
+        deltas.push(read_base128_varint(buf, cursor)? as u32);
+    }
+
+    let mut ids = vec![0u32; l];
+    let mut di = 0usize;
+    for gi in 0..g {
+        let start = gi * 64;
+        ids[start] = first_ids[gi];
+        let end = ((gi + 1) * 64).min(l);
+        for k in start + 1..end {
+            ids[k] = ids[k - 1] + deltas[di];
+            di += 1;
+        }
+    }
+
+    Ok(ids
+        .into_iter()
+        .zip(vals.into_iter().map(|v| v as u8))
+        .collect())
+}
+
 struct PgenDecoder {
     src: Arc<dyn ByteRangeSource>,
     hdr: PgenHeader,
     n: usize,
     scratch: Vec<u8>,
+    anchor_cats: Option<Vec<u8>>,
+    alt_counts: Vec<u16>,
 }
 
 impl PgenDecoder {
@@ -1202,17 +1564,12 @@ impl PgenDecoder {
         hdr: PgenHeader,
         n_samples_from_psam: usize,
         in_variants: usize,
+        alt_counts: Vec<u16>,
     ) -> Result<Self, PipelineError> {
         match hdr.mode {
-            PgenMode::Bed => {
-                return Err(PipelineError::Io(
-                    "PGEN mode 0x01 should be handled as passthrough BED".into(),
-                ))
-            }
+            PgenMode::Bed => return Err(ioerr("Mode 0x01 passthrough handled elsewhere")),
             PgenMode::FixDosage | PgenMode::FixPhDosage => {
-                return Err(PipelineError::Io(
-                    "Fixed-width dosage modes (0x03/0x04) do not carry hard-calls".into(),
-                ))
+                return Err(ioerr("Fixed-width dosage modes carry no hard-calls"));
             }
             _ => {}
         }
@@ -1224,11 +1581,20 @@ impl PgenDecoder {
             )));
         }
 
+        if hdr.n_samples as usize != n_samples_from_psam && hdr.n_samples != 0 {
+            return Err(PipelineError::Io(format!(
+                "Sample count mismatch: .pgen {0} vs .psam {1}",
+                hdr.n_samples, n_samples_from_psam
+            )));
+        }
+
         Ok(Self {
             src,
             hdr,
             n: n_samples_from_psam,
             scratch: Vec::new(),
+            anchor_cats: None,
+            alt_counts,
         })
     }
 
@@ -1236,9 +1602,7 @@ impl PgenDecoder {
         match self.hdr.mode {
             PgenMode::FixHard => {
                 let rec_len = (self.n + 3) / 4;
-                let header_bytes = 12u64;
-                let off = header_bytes + (idx as u64) * (rec_len as u64);
-                Ok((off, rec_len, 0))
+                Ok((12 + (idx as u64) * (rec_len as u64), rec_len, 0))
             }
             PgenMode::Var | PgenMode::VarIgnorable => {
                 let block_idx = idx >> 16;
@@ -1246,31 +1610,30 @@ impl PgenDecoder {
                     .hdr
                     .block_offsets
                     .get(block_idx)
-                    .ok_or_else(|| ioerr("PGEN block offset missing"))?;
+                    .ok_or_else(|| ioerr("Missing block offset"))?;
                 let mut off = block_off;
                 let mut cursor = block_idx << 16;
                 while cursor < idx {
-                    let len = *self
+                    off += *self
                         .hdr
                         .rec_lens
                         .get(cursor)
-                        .ok_or_else(|| ioerr("PGEN record length missing"))? as u64;
-                    off += len;
+                        .ok_or_else(|| ioerr("Missing rec_len"))? as u64;
                     cursor += 1;
                 }
                 let rec_len = *self
                     .hdr
                     .rec_lens
                     .get(idx)
-                    .ok_or_else(|| ioerr("PGEN record length missing"))? as usize;
+                    .ok_or_else(|| ioerr("Missing rec_len"))? as usize;
                 let rec_ty = *self
                     .hdr
                     .rec_types
                     .get(idx)
-                    .ok_or_else(|| ioerr("PGEN record type missing"))?;
+                    .ok_or_else(|| ioerr("Missing rec_type"))?;
                 Ok((off, rec_len, rec_ty))
             }
-            _ => Err(ioerr("Unsupported PGEN mode for offset lookup")),
+            _ => Err(ioerr("Unsupported PGEN mode")),
         }
     }
 
@@ -1281,13 +1644,11 @@ impl PgenDecoder {
         dst: &mut [u8],
     ) -> Result<(), PipelineError> {
         if dst.len() != self.n {
-            return Err(PipelineError::Compute(
-                "Hardcall buffer length must equal sample count".into(),
-            ));
+            return Err(ioerr("Hardcall buffer length must equal sample count"));
         }
         let idx = in_idx as usize;
         if idx >= self.hdr.m_variants as usize {
-            return Err(PipelineError::Compute("Variant index out of bounds".into()));
+            return Err(ioerr("Variant index out of bounds"));
         }
 
         let (off, len, rec_ty) = self.record_offset_len(idx)?;
@@ -1295,114 +1656,448 @@ impl PgenDecoder {
             self.scratch.resize(len, 0);
         }
         self.src.read_at(off, &mut self.scratch[..len])?;
+        let buf = &self.scratch[..len];
+        let mut cursor = 0usize;
 
-        match self.hdr.mode {
-            PgenMode::FixHard => {
-                unpack_pgen2bit_to_a1dosage(&self.scratch[..len], dst, self.n);
-                project_alt_ordinal(dst, alt_ord_1b)?;
-                return Ok(());
+        let mut cats = vec![3u8; self.n];
+        let main_kind = rec_ty & 0x07;
+        match main_kind {
+            0 => {
+                let need = (self.n + 3) / 4;
+                if need > len {
+                    return Err(ioerr("Truncated type-0 main track"));
+                }
+                unpack_pgen2bit_to_categories(&buf[cursor..cursor + need], &mut cats, self.n);
+                cursor += need;
             }
-            PgenMode::Var | PgenMode::VarIgnorable => {
-                let main_kind = rec_ty & 0x07;
-                match main_kind {
-                    0 => {
-                        let need = (self.n + 3) / 4;
-                        if need > len {
-                            return Err(ioerr("PGEN type-0 record truncated"));
-                        }
-                        unpack_pgen2bit_to_a1dosage(&self.scratch[..need], dst, self.n);
-                        if alt_ord_1b > 1 {
-                            return Err(PipelineError::Io(
-                                "ALT ordinal >1 requires multiallelic patch decoding".into(),
-                            ));
-                        }
-                        if (rec_ty & 0b0000_1000) != 0 {
-                            return Err(PipelineError::Io(
-                                "Multiallelic patch present; decoder does not implement it".into(),
-                            ));
-                        }
-                        if (rec_ty & 0b0001_0000) != 0 {
-                            return Err(PipelineError::Io(
-                                "Hardcall phase present; not supported".into(),
-                            ));
-                        }
-                        if (rec_ty & 0b0110_0000) != 0 {
-                            return Err(PipelineError::Io(
-                                "Dosage tracks present; not supported in this build".into(),
-                            ));
-                        }
-                    }
-                    4 => {
-                        return Err(PipelineError::Io(format!(
-                            "Unsupported main-track type 4 at variant {idx}"
-                        )))
-                    }
-                    other => {
-                        return Err(PipelineError::Io(format!(
-                            "Unsupported main-track type {other} at variant {idx}"
-                        )))
+            1 => {
+                if cursor >= len {
+                    return Err(ioerr("Truncated type-1 header byte"));
+                }
+                let pair = buf[cursor];
+                cursor += 1;
+                let (low, high) = match pair {
+                    1 => (0u8, 1),
+                    2 => (0, 2),
+                    3 => (0, 3),
+                    5 => (1, 2),
+                    6 => (1, 3),
+                    9 => (2, 3),
+                    _ => return Err(ioerr("Invalid 1-bit pair code")),
+                };
+                let idxs = read_bitarray_indices(buf, &mut cursor, self.n)?;
+                for i in 0..self.n {
+                    cats[i] = low;
+                }
+                for bit in idxs {
+                    if bit < self.n {
+                        cats[bit] = high;
                     }
                 }
-                project_alt_ordinal(dst, alt_ord_1b)?;
-                return Ok(());
+                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
+                for (sid, val) in pairs {
+                    if (sid as usize) < self.n {
+                        cats[sid as usize] = val;
+                    }
+                }
             }
-            _ => {}
+            2 | 3 => {
+                if (idx & 0xffff) == 0 {
+                    return Err(ioerr("LD-compressed record at block start"));
+                }
+                let anchor = self
+                    .anchor_cats
+                    .as_ref()
+                    .ok_or_else(|| ioerr("Missing LD anchor"))?
+                    .clone();
+                let mut base = anchor;
+                if main_kind == 3 {
+                    for c in &mut base {
+                        if *c == 0 {
+                            *c = 2;
+                        } else if *c == 2 {
+                            *c = 0;
+                        }
+                    }
+                }
+                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
+                for (sid, val) in pairs {
+                    if (sid as usize) < self.n {
+                        base[sid as usize] = val;
+                    }
+                }
+                if main_kind == 3 {
+                    for c in &mut base {
+                        if *c == 0 {
+                            *c = 2;
+                        } else if *c == 2 {
+                            *c = 0;
+                        }
+                    }
+                }
+                cats.copy_from_slice(&base);
+            }
+            4 | 6 | 7 => {
+                let x = match main_kind {
+                    4 => 0u8,
+                    6 => 2,
+                    7 => 3,
+                    _ => unreachable!(),
+                };
+                for i in 0..self.n {
+                    cats[i] = x;
+                }
+                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
+                for (sid, val) in pairs {
+                    if (sid as usize) < self.n {
+                        cats[sid as usize] = val;
+                    }
+                }
+            }
+            _ => {
+                return Err(PipelineError::Io(format!(
+                    "Unsupported main-track type {}",
+                    main_kind
+                )));
+            }
         }
 
-        Err(ioerr("Unsupported PGEN mode for decoding"))
+        let has_multiallelic = (rec_ty & 0b0000_1000) != 0;
+        let alt_count = self.alt_counts.get(idx).copied().unwrap_or(1);
+        let mut a1dosage = vec![255u8; self.n];
+        if has_multiallelic {
+            apply_multiallelic_and_project(
+                buf,
+                &mut cursor,
+                self.n,
+                &mut cats,
+                alt_count,
+                alt_ord_1b,
+                &mut a1dosage,
+            )?;
+        } else {
+            cats_to_a1dosage(&mut a1dosage, &cats);
+        }
+
+        if (rec_ty & 0b0001_0000) != 0 {
+            if cursor >= len {
+                return Err(ioerr("EOF in phase header"));
+            }
+            let start = cursor;
+            let first_byte = buf[cursor];
+            cursor += 1;
+            let phasepresent = (first_byte & 1) == 1;
+            let h = cats.iter().filter(|&&c| c == 1).count();
+            let p = h; // safe upper bound when presence mask is sparse
+            let total_bits = 1 + if phasepresent { h } else { 0 } + p;
+            let bytes_needed = (total_bits + 7) / 8;
+            if start + bytes_needed > len {
+                return Err(ioerr("EOF in phase track"));
+            }
+            cursor = start + bytes_needed;
+        }
+
+        let has_dosage = (rec_ty & 0b0110_0000) != 0;
+        if has_dosage && (alt_count <= 1 || alt_ord_1b == 1) {
+            let b5 = (rec_ty & 0b0010_0000) != 0;
+            let b6 = (rec_ty & 0b0100_0000) != 0;
+
+            if b5 && !b6 {
+                let ids = difflist_ids(buf, &mut cursor, self.n)?;
+                let cnt = ids.len();
+                let need = cnt * 2;
+                if cursor + need > len {
+                    return Err(ioerr("EOF in dosage values"));
+                }
+                for (i, sid) in ids.iter().enumerate() {
+                    if (*sid as usize) < self.n {
+                        let v = u16::from_le_bytes([
+                            buf[cursor + 2 * i],
+                            buf[cursor + 2 * i + 1],
+                        ]);
+                        if a1dosage[*sid as usize] == 255 && v != 65535 {
+                            a1dosage[*sid as usize] = u16_to_hardcall_biallelic(v, 2.0);
+                        }
+                    }
+                }
+                cursor += need;
+            } else if !b5 && b6 {
+                let need = self.n * 2;
+                if cursor + need > len {
+                    return Err(ioerr("EOF in dense dosage values"));
+                }
+                for s in 0..self.n {
+                    let v = u16::from_le_bytes([
+                        buf[cursor + 2 * s],
+                        buf[cursor + 2 * s + 1],
+                    ]);
+                    if a1dosage[s] == 255 && v != 65535 {
+                        a1dosage[s] = u16_to_hardcall_biallelic(v, 2.0);
+                    }
+                }
+                cursor += need;
+            } else {
+                let present = read_bitarray_indices(buf, &mut cursor, self.n)?;
+                let cnt = present.len();
+                let need = cnt * 2;
+                if cursor + need > len {
+                    return Err(ioerr("EOF in sparse dosage values"));
+                }
+                for (i, s) in present.into_iter().enumerate() {
+                    if s < self.n {
+                        let v = u16::from_le_bytes([
+                            buf[cursor + 2 * i],
+                            buf[cursor + 2 * i + 1],
+                        ]);
+                        if a1dosage[s] == 255 && v != 65535 {
+                            a1dosage[s] = u16_to_hardcall_biallelic(v, 2.0);
+                        }
+                    }
+                }
+                cursor += need;
+            }
+        }
+
+        if !matches!(main_kind, 2 | 3) {
+            self.anchor_cats = Some(cats.clone());
+        }
+
+        dst.copy_from_slice(&a1dosage);
+        Ok(())
     }
 }
 
-fn unpack_pgen2bit_to_a1dosage(block: &[u8], dst: &mut [u8], n: usize) {
+fn unpack_pgen2bit_to_categories(block: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0usize;
     for &byte in block {
         for shift in 0..4 {
             if i >= n {
                 return;
             }
-            match (byte >> (2 * shift)) & 0b11 {
-                0 => dst[i] = 0,
-                1 => dst[i] = 1,
-                2 => dst[i] = 2,
-                _ => dst[i] = 255,
-            }
+            dst[i] = (byte >> (2 * shift)) & 0b11;
             i += 1;
         }
     }
 }
 
-fn project_alt_ordinal(dst: &mut [u8], alt_ord_1b: u16) -> Result<(), PipelineError> {
-    if alt_ord_1b > 1 {
-        return Err(PipelineError::Io(
-            "ALT ordinal >1 requires multiallelic patch decoding, which is not implemented".into(),
-        ));
+#[inline]
+fn cats_to_a1dosage(dst: &mut [u8], cats: &[u8]) {
+    for (d, c) in dst.iter_mut().zip(cats) {
+        *d = match *c {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 255,
+        };
     }
+}
+
+#[inline]
+fn collect_cat_ids(cats: &[u8], cat: u8) -> Vec<u32> {
+    let mut out = Vec::new();
+    for (i, &c) in cats.iter().enumerate() {
+        if c == cat {
+            out.push(i as u32);
+        }
+    }
+    out
+}
+
+fn apply_multiallelic_and_project(
+    record: &[u8],
+    cursor: &mut usize,
+    n: usize,
+    cats: &mut [u8],
+    alt_count: u16,
+    alt_ord_1b: u16,
+    out: &mut [u8],
+) -> Result<(), PipelineError> {
+    if alt_count <= 1 || alt_ord_1b == 1 {
+        cats_to_a1dosage(out, cats);
+        return Ok(());
+    }
+
+    if *cursor >= record.len() {
+        return Err(ioerr("EOF before multiallelic patch header"));
+    }
+    let fmt_byte = record[*cursor];
+    *cursor += 1;
+    let cat1_fmt = (fmt_byte & 0x0f) as u8;
+    let cat2_fmt = (fmt_byte >> 4) & 0x0f;
+
+    let cat1_ids = collect_cat_ids(cats, 1);
+    let cat2_ids = collect_cat_ids(cats, 2);
+
+    let mut cat1_override: Vec<(u32, u16)> = Vec::new();
+    if cat1_fmt != 15 {
+        match cat1_fmt {
+            0 => {
+                let set_indices = read_bitarray_indices(record, cursor, cat1_ids.len())?;
+                let k = set_indices.len();
+                let width = match alt_count {
+                    2 => 0,
+                    3 => 1,
+                    4..=5 => 2,
+                    6..=17 => 4,
+                    18..=257 => 8,
+                    258..=65537 => 16,
+                    _ => 24,
+                } as usize;
+                let vals = read_packed_fixed_width(record, cursor, width, k)?;
+                for (idx_in_list, v) in set_indices.into_iter().zip(vals.into_iter()) {
+                    let sid = cat1_ids[idx_in_list];
+                    let altj = if width == 0 { 2 } else { (v as u16) + 2 };
+                    cat1_override.push((sid, altj));
+                }
+            }
+            1 => {
+                let sids = difflist_ids(record, cursor, n)?;
+                let k = sids.len();
+                let width = match alt_count {
+                    2 => 0,
+                    3 => 1,
+                    4..=5 => 2,
+                    6..=17 => 4,
+                    18..=257 => 8,
+                    258..=65537 => 16,
+                    _ => 24,
+                } as usize;
+                let vals = read_packed_fixed_width(record, cursor, width, k)?;
+                for (sid, v) in sids.into_iter().zip(vals.into_iter()) {
+                    let altj = if width == 0 { 2 } else { (v as u16) + 2 };
+                    cat1_override.push((sid, altj));
+                }
+            }
+            _ => return Err(ioerr("Unsupported multiallelic cat1 patch format")),
+        }
+    }
+
+    let mut cat2_override: Vec<(u32, (u16, u16))> = Vec::new();
+    if cat2_fmt != 15 {
+        match cat2_fmt {
+            0 => {
+                let set_indices = read_bitarray_indices(record, cursor, cat2_ids.len())?;
+                let k = set_indices.len();
+                if alt_count == 2 {
+                    let hom2_flags = read_bitarray_indices(record, cursor, k)?;
+                    let mut is_hom2 = vec![false; k];
+                    for pos in hom2_flags {
+                        if pos < k {
+                            is_hom2[pos] = true;
+                        }
+                    }
+                    for (flag, idx_in_list) in is_hom2.into_iter().zip(set_indices.into_iter()) {
+                        let sid = cat2_ids[idx_in_list];
+                        let pair = if flag { (2, 2) } else { (1, 2) };
+                        cat2_override.push((sid, pair));
+                    }
+                } else {
+                    let width = match alt_count {
+                        3..=4 => 2,
+                        5..=16 => 4,
+                        17..=256 => 8,
+                        257..=65536 => 16,
+                        _ => 24,
+                    } as usize;
+                    let vals = read_packed_fixed_width(record, cursor, width, 2 * k)?;
+                    for i in 0..k {
+                        let sid = cat2_ids[set_indices[i]];
+                        let lo = (vals[2 * i] as u16) + 1;
+                        let hi = (vals[2 * i + 1] as u16) + 1;
+                        let pair = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                        cat2_override.push((sid, pair));
+                    }
+                }
+            }
+            1 => {
+                let sids = difflist_ids(record, cursor, n)?;
+                let k = sids.len();
+                if alt_count == 2 {
+                    let hom2_flags = read_bitarray_indices(record, cursor, k)?;
+                    let mut is_hom2 = vec![false; k];
+                    for pos in hom2_flags {
+                        if pos < k {
+                            is_hom2[pos] = true;
+                        }
+                    }
+                    for (flag, sid) in is_hom2.into_iter().zip(sids.into_iter()) {
+                        let pair = if flag { (2, 2) } else { (1, 2) };
+                        cat2_override.push((sid, pair));
+                    }
+                } else {
+                    let width = match alt_count {
+                        3..=4 => 2,
+                        5..=16 => 4,
+                        17..=256 => 8,
+                        257..=65536 => 16,
+                        _ => 24,
+                    } as usize;
+                    let vals = read_packed_fixed_width(record, cursor, width, 2 * k)?;
+                    for i in 0..k {
+                        let sid = sids[i];
+                        let lo = (vals[2 * i] as u16) + 1;
+                        let hi = (vals[2 * i + 1] as u16) + 1;
+                        let pair = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                        cat2_override.push((sid, pair));
+                    }
+                }
+            }
+            _ => return Err(ioerr("Unsupported multiallelic cat2 patch format")),
+        }
+    }
+
+    cat1_override.sort_unstable_by_key(|x| x.0);
+    cat2_override.sort_unstable_by_key(|x| x.0);
+
+    for i in 0..n {
+        let c = cats[i];
+        out[i] = match c {
+            0 => 0,
+            3 => 255,
+            1 => {
+                let mut altj = 1u16;
+                if let Ok(pos) = cat1_override.binary_search_by_key(&(i as u32), |(sid, _)| *sid) {
+                    altj = cat1_override[pos].1;
+                }
+                if altj == alt_ord_1b { 1 } else { 0 }
+            }
+            2 => {
+                let mut pair = (1u16, 1u16);
+                if let Ok(pos) = cat2_override.binary_search_by_key(&(i as u32), |(sid, _)| *sid) {
+                    pair = cat2_override[pos].1;
+                }
+                let mut dose = 0u8;
+                if pair.0 == alt_ord_1b {
+                    dose += 1;
+                }
+                if pair.1 == alt_ord_1b {
+                    dose += 1;
+                }
+                dose
+            }
+            _ => 255,
+        };
+    }
+
     Ok(())
 }
 
-fn dosage_bytes_to_hardcalls(ds_bytes: &[u8], dst: &mut [u8]) {
-    for (i, &b) in ds_bytes.iter().enumerate() {
-        if b == 255 {
-            dst[i] = 255;
-            continue;
-        }
-        let v = b as i32;
-        let d0 = (v - 0).abs();
-        let d1 = (v - 100).abs();
-        let d2 = (v - 200).abs();
-        let (min_d, arg) = if d0 <= d1 && d0 <= d2 {
-            (d0, 0u8)
-        } else if d1 <= d2 {
-            (d1, 1u8)
-        } else {
-            (d2, 2u8)
-        };
-        if min_d <= 10 {
-            dst[i] = arg;
-        } else {
-            dst[i] = 255;
+fn u16_to_hardcall_biallelic(v: u16, max_dosage: f32) -> u8 {
+    if v == 65535 {
+        return 255;
+    }
+    let ds = (v as f32) * (1.0 / 32768.0) * max_dosage;
+    let candidates = [0.0f32, 1.0, 2.0];
+    let mut best = 255u8;
+    let mut best_d = f32::INFINITY;
+    for (i, &c) in candidates.iter().enumerate() {
+        let d = (ds - c).abs();
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
         }
     }
+    if best_d <= 0.10 { best } else { 255 }
 }
 
 fn unpack_plink1_block(block: &[u8], dst: &mut [u8], n: usize) {
@@ -1447,10 +2142,15 @@ mod tests {
     }
 
     #[test]
-    fn dosage_to_hardcalls_rule() {
-        let ds = [0u8, 9, 11, 100, 109, 111, 200, 255];
-        let mut out = vec![0u8; ds.len()];
-        dosage_bytes_to_hardcalls(&ds, &mut out);
-        assert_eq!(out, vec![0, 0, 255, 1, 1, 255, 2, 255]);
+    fn dosage_u16_rounding() {
+        let vals = [
+            (((0.05 / 2.0) * 32768.0) as u16, 0u8),
+            (((1.00 / 2.0) * 32768.0) as u16, 1u8),
+            (((1.09 / 2.0) * 32768.0) as u16, 1u8),
+            (((2.00 / 2.0) * 32768.0) as u16, 2u8),
+        ];
+        for (v, expect) in vals {
+            assert_eq!(u16_to_hardcall_biallelic(v, 2.0), expect);
+        }
     }
 }
