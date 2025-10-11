@@ -1216,10 +1216,6 @@ mod tests {
         }
         temp_file.flush()?;
 
-        if std::env::var("GNOMON_FAST_HGDP_TEST").unwrap_or_default() == "1" {
-            return Ok(());
-        }
-
         run_fit_and_project_hgdp_chr20(Some(temp_file.path()))
     }
 }
