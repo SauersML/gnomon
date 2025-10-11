@@ -27,6 +27,7 @@ use gnomon::types::{
 
 use crossbeam_queue::ArrayQueue;
 use rand::seq::{SliceRandom, index};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,6 +55,8 @@ fn setup_benchmark_context(
 ) -> Arc<PreparationResult> {
     // The .bed data is ALWAYS based on the total number of people in the .fam file.
     let bytes_per_variant = ((total_num_people as u64) + 3) / 4;
+    let bytes_per_variant_usize = usize::try_from(bytes_per_variant)
+        .expect("bytes per variant should fit into usize for benchmarking");
     let stride = (num_scores + kernel::LANE_COUNT - 1) / kernel::LANE_COUNT * kernel::LANE_COUNT;
 
     let matrix_size = num_variants * stride;
@@ -97,6 +100,29 @@ fn setup_benchmark_context(
     }
     // --- End subset logic ---
 
+    let (spool_compact_byte_index, spool_dense_map) = match &person_subset {
+        PersonSubset::All => {
+            let compact: Vec<u32> = (0..bytes_per_variant_usize).map(|i| i as u32).collect();
+            let dense: Vec<i32> = (0..bytes_per_variant_usize).map(|i| i as i32).collect();
+            (compact, dense)
+        }
+        PersonSubset::Indices(indices) => {
+            let mut unique_bytes = BTreeSet::new();
+            for &fam_idx in indices {
+                unique_bytes.insert(fam_idx / 4);
+            }
+            let compact: Vec<u32> = unique_bytes.into_iter().collect();
+            let mut dense = vec![-1; bytes_per_variant_usize];
+            for (compact_idx, &orig_byte_idx) in compact.iter().enumerate() {
+                if let Some(slot) = dense.get_mut(orig_byte_idx as usize) {
+                    *slot = compact_idx as i32;
+                }
+            }
+            (compact, dense)
+        }
+    };
+    let spool_bytes_per_variant = spool_compact_byte_index.len() as u64;
+
     let prep_result = PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
@@ -117,6 +143,10 @@ fn setup_benchmark_context(
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
+        vec![],
+        spool_compact_byte_index,
+        spool_dense_map,
+        spool_bytes_per_variant,
         PipelineKind::SingleFile(PathBuf::from("benchmark")),
     );
     Arc::new(prep_result)

@@ -107,9 +107,17 @@ impl ComplexVariantResolver {
                 }
                 let compact_idx = dense_map[orig_byte_idx];
                 if compact_idx < 0 {
+                    // Defensive: queries should target kept individuals only, but if we miss
+                    // a guard higher up we fall back to a standard PLINK "missing" genotype.
                     return Ok(0b01);
                 }
                 let final_byte_offset = offset + compact_idx as u64;
+                debug_assert!(
+                    (compact_idx as u64) < *bytes_per_spooled_variant,
+                    "compact index {} exceeds spool stride {}",
+                    compact_idx,
+                    bytes_per_spooled_variant
+                );
                 if final_byte_offset >= offset + bytes_per_spooled_variant {
                     return Err(PipelineError::Io(format!(
                         "Computed spool offset {} beyond variant stride {} for BIM row {}.",
@@ -191,6 +199,72 @@ pub enum ResolutionMethod {
     PreferMatchingAlleleStructure {
         chosen_dosage: f64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memmap2::MmapOptions;
+
+    #[test]
+    fn spool_resolver_returns_expected_genotypes() {
+        let mut offsets = AHashMap::new();
+        offsets.insert(BimRowIndex(0), 0);
+        offsets.insert(BimRowIndex(1), 2);
+
+        let spool_bytes_per_variant = 2;
+        let spool_data = vec![0xD2, 0x1B, 0x55, 0xF0];
+        let mut mmap_mut = MmapOptions::new()
+            .len(spool_data.len())
+            .map_anon()
+            .expect("failed to allocate test spool buffer");
+        mmap_mut.copy_from_slice(&spool_data);
+        let mmap = mmap_mut
+            .make_read_only()
+            .expect("failed to convert test spool mapping to read-only");
+        let dense_map = Arc::new(vec![0, -1, 1]);
+        let resolver = ComplexVariantResolver::from_spool(
+            Arc::new(mmap),
+            offsets,
+            spool_bytes_per_variant,
+            dense_map,
+        );
+
+        // Variant 0 pulls bytes from offsets 0 and 1.
+        assert_eq!(
+            resolver
+                .get_packed_genotype(3, BimRowIndex(0), 0)
+                .expect("genotype lookup should succeed"),
+            0b10
+        );
+        assert_eq!(
+            resolver
+                .get_packed_genotype(3, BimRowIndex(0), 8)
+                .expect("genotype lookup should succeed"),
+            0b11
+        );
+        // fam_index 5 corresponds to a byte that was pruned from the spool.
+        assert_eq!(
+            resolver
+                .get_packed_genotype(3, BimRowIndex(0), 5)
+                .expect("fallback missing genotype"),
+            0b01
+        );
+
+        // Variant 1 pulls bytes from offsets 2 and 3.
+        assert_eq!(
+            resolver
+                .get_packed_genotype(3, BimRowIndex(1), 0)
+                .expect("genotype lookup should succeed"),
+            0b01
+        );
+        assert_eq!(
+            resolver
+                .get_packed_genotype(3, BimRowIndex(1), 9)
+                .expect("genotype lookup should succeed"),
+            0b00
+        );
+    }
 }
 
 /// A private struct holding the raw data for one conflicting source of evidence.
