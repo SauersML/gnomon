@@ -1,8 +1,9 @@
 use crate::score::io::BedSource;
 use crate::score::pipeline::{PipelineError, ScopeGuard};
 use crate::score::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,12 @@ pub enum ComplexVariantResolver {
     MultiFile {
         sources: Vec<BedSource>,
         boundaries: Vec<FilesetBoundary>,
+    },
+    Spool {
+        mmap: Arc<Mmap>,
+        offsets: AHashMap<BimRowIndex, u64>,
+        bytes_per_spooled_variant: u64,
+        dense_map: Arc<Vec<i32>>,
     },
 }
 
@@ -44,6 +51,20 @@ impl ComplexVariantResolver {
         })
     }
 
+    pub fn from_spool(
+        mmap: Arc<Mmap>,
+        offsets: AHashMap<BimRowIndex, u64>,
+        bytes_per_spooled_variant: u64,
+        dense_map: Arc<Vec<i32>>,
+    ) -> Self {
+        Self::Spool {
+            mmap,
+            offsets,
+            bytes_per_spooled_variant,
+            dense_map,
+        }
+    }
+
     /// Fetches a packed genotype for a given person and global variant index.
     /// This is the fast, central lookup method used by the parallel resolver.
     #[inline(always)]
@@ -64,6 +85,40 @@ impl ComplexVariantResolver {
                 let boundary = &boundaries[fileset_idx];
                 let local_index = bim_row_index.0 - boundary.starting_global_index;
                 (&sources[fileset_idx], local_index)
+            }
+            ComplexVariantResolver::Spool {
+                mmap,
+                offsets,
+                bytes_per_spooled_variant,
+                dense_map,
+            } => {
+                let offset = offsets.get(&bim_row_index).copied().ok_or_else(|| {
+                    PipelineError::Io(format!(
+                        "Missing spool offset for BIM row {} while resolving complex variant.",
+                        bim_row_index.0
+                    ))
+                })?;
+                let orig_byte_idx = (fam_index / 4) as usize;
+                if orig_byte_idx >= dense_map.len() {
+                    return Err(PipelineError::Io(format!(
+                        "Family index {} out of bounds for complex spool lookup.",
+                        fam_index
+                    )));
+                }
+                let compact_idx = dense_map[orig_byte_idx];
+                if compact_idx < 0 {
+                    return Ok(0b01);
+                }
+                let final_byte_offset = offset + compact_idx as u64;
+                if final_byte_offset >= offset + bytes_per_spooled_variant {
+                    return Err(PipelineError::Io(format!(
+                        "Computed spool offset {} beyond variant stride {} for BIM row {}.",
+                        final_byte_offset, bytes_per_spooled_variant, bim_row_index.0
+                    )));
+                }
+                let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset as usize) };
+                let bit_offset_in_byte = (fam_index % 4) * 2;
+                return Ok((packed_byte >> bit_offset_in_byte) & 0b11);
             }
         };
 

@@ -133,6 +133,14 @@ pub struct PreparationResult {
     pub num_reconciled_variants: usize,
     /// The number of bytes per variant in the .bed file, calculated as CEIL(total_people_in_fam / 4).
     pub bytes_per_variant: u64,
+    /// Flags indicating whether the required BIM indices correspond to complex contexts.
+    required_is_complex: Vec<u8>,
+    /// Mapping of kept byte positions used for complex variant spooling.
+    spool_compact_byte_index: Vec<u32>,
+    /// Dense lookup table mapping original byte indices to compact spool indices.
+    spool_dense_map: Vec<i32>,
+    /// The number of bytes written per spooled variant row.
+    spool_bytes_per_variant: u64,
     /// The type-safe representation of the I/O pipeline strategy.
     pub pipeline_kind: PipelineKind,
 }
@@ -159,6 +167,10 @@ impl PreparationResult {
         bytes_per_variant: u64,
         person_fam_to_output_idx: Vec<Option<u32>>,
         output_idx_to_fam_idx: Vec<u32>,
+        required_is_complex: Vec<u8>,
+        spool_compact_byte_index: Vec<u32>,
+        spool_dense_map: Vec<i32>,
+        spool_bytes_per_variant: u64,
         pipeline_kind: PipelineKind,
     ) -> Self {
         Self {
@@ -179,6 +191,10 @@ impl PreparationResult {
             bytes_per_variant,
             person_fam_to_output_idx,
             output_idx_to_fam_idx,
+            required_is_complex,
+            spool_compact_byte_index,
+            spool_dense_map,
+            spool_bytes_per_variant,
             pipeline_kind,
         }
     }
@@ -198,6 +214,26 @@ impl PreparationResult {
     #[inline(always)]
     pub fn stride(&self) -> usize {
         self.stride
+    }
+
+    #[inline(always)]
+    pub fn required_is_complex(&self) -> &[u8] {
+        &self.required_is_complex
+    }
+
+    #[inline(always)]
+    pub fn spool_compact_byte_index(&self) -> &[u32] {
+        &self.spool_compact_byte_index
+    }
+
+    #[inline(always)]
+    pub fn spool_dense_map(&self) -> &[i32] {
+        &self.spool_dense_map
+    }
+
+    #[inline(always)]
+    pub fn spool_bytes_per_variant(&self) -> u64 {
+        self.spool_bytes_per_variant
     }
 }
 

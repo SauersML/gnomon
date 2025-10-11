@@ -488,9 +488,11 @@ pub fn prepare_for_computation(
 
     let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
     all_required_indices.extend(simple_path_data.keys());
+    let mut complex_bim_indices: AHashSet<BimRowIndex> = AHashSet::new();
     for rule in &final_complex_rules {
         for (bim_idx, _, _) in &rule.possible_contexts {
             all_required_indices.insert(*bim_idx);
+            complex_bim_indices.insert(*bim_idx);
         }
     }
 
@@ -500,6 +502,10 @@ pub fn prepare_for_computation(
 
     let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
     let num_reconciled_variants = required_bim_indices.len();
+    let required_is_complex: Vec<u8> = required_bim_indices
+        .iter()
+        .map(|idx| u8::from(complex_bim_indices.contains(idx)))
+        .collect();
 
     let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
@@ -543,6 +549,40 @@ pub fn prepare_for_computation(
 
     // --- Stage 5: Final assembly ---
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
+    let bytes_per_variant_usize = bytes_per_variant as usize;
+    let (spool_compact_byte_index, spool_dense_map) =
+        match &person_subset {
+            PersonSubset::All => {
+                let mut compact = Vec::with_capacity(bytes_per_variant_usize);
+                let mut dense = Vec::with_capacity(bytes_per_variant_usize);
+                for i in 0..bytes_per_variant_usize {
+                    compact.push(u32::try_from(i).expect(
+                        "Too many bytes per variant to represent in spool_compact_byte_index",
+                    ));
+                    dense.push(
+                        i32::try_from(i)
+                            .expect("Too many bytes per variant to represent in spool_dense_map"),
+                    );
+                }
+                (compact, dense)
+            }
+            PersonSubset::Indices(indices) => {
+                let mut unique_bytes: BTreeSet<u32> = BTreeSet::new();
+                for &fam_idx in indices {
+                    unique_bytes.insert(fam_idx / 4);
+                }
+                let compact: Vec<u32> = unique_bytes.into_iter().collect();
+                let mut dense = vec![-1i32; bytes_per_variant_usize];
+                for (compact_idx, &orig_byte_idx) in compact.iter().enumerate() {
+                    if let Some(slot) = dense.get_mut(orig_byte_idx as usize) {
+                        *slot = i32::try_from(compact_idx)
+                            .expect("Too many kept individuals to compact into spool_dense_map");
+                    }
+                }
+                (compact, dense)
+            }
+        };
+    let spool_bytes_per_variant = spool_compact_byte_index.len() as u64;
     let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
 
@@ -576,6 +616,10 @@ pub fn prepare_for_computation(
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
+        required_is_complex,
+        spool_compact_byte_index,
+        spool_dense_map,
+        spool_bytes_per_variant,
         pipeline_kind,
     ))
 }
